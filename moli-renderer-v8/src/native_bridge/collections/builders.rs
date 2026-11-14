@@ -1,6 +1,7 @@
 use super::*;
 use crate::native_bridge::element::element_attribute_for_object;
 use crate::util::throw_type_error;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiFunctionTemplate;
 
 pub(in crate::native_bridge) const STATIC_COLLECTION_LENGTH_SLOT: &str =
@@ -11,7 +12,7 @@ pub(in crate::native_bridge::collections) const STATIC_HANDLE_COLLECTION_ID_INTE
 const STATIC_HANDLE_NODE_LIST_EAGER_LIMIT: usize = 1_000;
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "HTMLOptionsCollection", enumerable)]
+#[webapi(interface = web_api_interfaces::HTMLOptionsCollection, enumerable)]
 struct OptionsCollectionPrototypeDeclaration {
     #[webapi(
         intrinsic_data_property = v8::Intrinsic::ArrayProtoValues,
@@ -41,7 +42,7 @@ struct OptionsCollectionPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "RadioNodeList", enumerable)]
+#[webapi(interface = web_api_interfaces::RadioNodeList, enumerable)]
 struct RadioNodeListPrototypeDeclaration {
     #[webapi(
         intrinsic_data_property = v8::Intrinsic::ArrayProtoValues,
@@ -58,7 +59,7 @@ struct RadioNodeListPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "HTMLCollection")]
+#[webapi(interface = web_api_interfaces::HTMLCollection)]
 struct HtmlCollectionPrototypeMembersDeclaration {
     #[webapi(
         accessor_property,
@@ -91,12 +92,12 @@ struct HtmlCollectionPrototypeMembersDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "NodeList")]
+#[webapi(interface = web_api_interfaces::NodeList)]
 struct NodeListPrototypeMembersDeclaration {
     #[webapi(accessor_property, enumerable, getter = node_list_length_getter)]
     length: (),
 
-    #[webapi(method, length = 1, callback = node_list_item_callback)]
+    #[webapi(method, length = 1, enumerable, callback = node_list_item_callback)]
     item: (),
 
     #[webapi(
@@ -131,7 +132,7 @@ struct NodeListPrototypeMembersDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "HTMLFormControlsCollection")]
+#[webapi(interface = web_api_interfaces::HTMLFormControlsCollection)]
 struct FormControlsCollectionPrototypeDeclaration {
     #[webapi(
         intrinsic_data_property = v8::Intrinsic::ArrayProtoValues,
@@ -141,7 +142,7 @@ struct FormControlsCollectionPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "HTMLAllCollection")]
+#[webapi(interface = web_api_interfaces::HTMLAllCollection)]
 struct HtmlAllCollectionPrototypeDeclaration {
     #[webapi(
         intrinsic_data_property = v8::Intrinsic::ArrayProtoValues,
@@ -153,7 +154,7 @@ struct HtmlAllCollectionPrototypeDeclaration {
 /// Build a static NodeList wrapper from a slice of DOM handles.
 pub(in crate::native_bridge) fn build_node_list_from_handles<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handles: &[DomHandle],
 ) -> v8::Local<'s, v8::Object> {
     if handles.len() <= STATIC_HANDLE_NODE_LIST_EAGER_LIMIT {
@@ -175,7 +176,7 @@ pub(in crate::native_bridge) fn build_node_list_from_handles<'s>(
 /// Build a live NodeList or HTMLCollection wrapper for a DOM node query.
 pub(in crate::native_bridge) fn build_live_collection_for_node<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     root: DomHandle,
     collection_kind: CollectionKind,
     query_kind: LiveCollectionQueryKind,
@@ -205,7 +206,7 @@ pub(in crate::native_bridge) fn build_live_collection_for_node<'s>(
 
 pub(in crate::native_bridge) fn build_live_html_children_collection_for_node<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     root: DomHandle,
 ) -> v8::Local<'s, v8::Object> {
     build_live_collection_for_node(
@@ -221,7 +222,7 @@ pub(in crate::native_bridge) fn build_live_html_children_collection_for_node<'s>
 
 pub(in crate::native_bridge) fn build_live_child_node_list_for_node<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     root: DomHandle,
 ) -> v8::Local<'s, v8::Object> {
     build_live_collection_for_node(
@@ -238,7 +239,7 @@ pub(in crate::native_bridge) fn build_live_child_node_list_for_node<'s>(
 /// Build a static collection (NodeList / HTMLCollection) V8 object from pre-resolved values.
 pub(in crate::native_bridge) fn build_collection_wrapper<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     items: &[v8::Global<v8::Value>],
     kind: CollectionKind,
 ) -> v8::Local<'s, v8::Object> {
@@ -302,9 +303,9 @@ pub(in crate::native_bridge) fn build_collection_wrapper<'s>(
     wrapper
 }
 
-fn build_static_handle_node_list_wrapper<'s>(
+pub(crate) fn build_static_handle_node_list_wrapper<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handles: &[DomHandle],
 ) -> v8::Local<'s, v8::Object> {
     let template = {
@@ -333,11 +334,16 @@ fn build_static_handle_node_list_wrapper<'s>(
     );
     set_collection_prototype(scope, wrapper, CollectionKind::NodeList);
 
-    let collection_id = {
+    let collections = {
         let host = unsafe { &mut *runtime_ptr };
-        host.native_bridge_mut()
-            .register_static_handle_collection(handles.to_vec())
+        host.native_bridge_mut().static_handle_collection_store()
     };
+    let collection_id = collections.borrow_mut().register(handles.to_vec());
+    // Mutation records create short-lived snapshots frequently. Release the
+    // native handle vector when its wrapper dies, without retaining the host.
+    crate::v8_finalizer::track_context_owned_v8_finalizer(scope, wrapper, move || {
+        collections.borrow_mut().remove(collection_id);
+    });
     assert!(
         wrapper.set_internal_field(
             STATIC_HANDLE_COLLECTION_ID_INTERNAL_FIELD,
@@ -355,9 +361,25 @@ fn build_static_handle_node_list_wrapper<'s>(
 }
 
 /// Build a live-resolving NodeList or HTMLCollection V8 object (queries DOM on each access).
+pub(in crate::native_bridge) fn build_live_collection_wrapper_for_receiver<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    receiver: v8::Local<'_, v8::Object>,
+    descriptor: LiveCollectionDescriptor,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let context = receiver.get_creation_context(scope)?;
+    let scope = &mut v8::ContextScope::new(scope, context);
+    Some(build_live_collection_wrapper(
+        scope,
+        runtime_ptr,
+        descriptor,
+    ))
+}
+
+/// Build a live collection in the current realm, preserving that realm's cache.
 pub(in crate::native_bridge) fn build_live_collection_wrapper<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     descriptor: LiveCollectionDescriptor,
 ) -> v8::Local<'s, v8::Object> {
     {
@@ -391,7 +413,7 @@ pub(in crate::native_bridge) fn build_live_collection_wrapper<'s>(
 
 fn instantiate_live_collection_wrapper<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     collection_id: u32,
     collection_kind: CollectionKind,
 ) -> v8::Local<'s, v8::Object> {
@@ -418,7 +440,7 @@ fn instantiate_live_collection_wrapper<'s>(
 fn document_all_named_collection_parts(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
-) -> Option<(*mut JsContextHost, u32)> {
+) -> Option<(*mut PageScriptHost, u32)> {
     let object = v8::Local::<v8::Object>::try_from(value).ok()?;
     let (runtime_ptr, descriptor) = live_collection_descriptor_from_object(scope, object).ok()?;
     if descriptor.collection_kind != CollectionKind::HtmlCollection
@@ -482,18 +504,13 @@ fn define_html_collection_named_properties(
     }
 }
 
-fn set_collection_prototype(
-    scope: &mut v8::PinScope<'_, '_>,
-    wrapper: v8::Local<'_, v8::Object>,
+fn set_collection_prototype<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    wrapper: v8::Local<'s, v8::Object>,
     kind: CollectionKind,
 ) {
-    let prototype_name = match kind {
-        CollectionKind::NodeList => "NodeList",
-        CollectionKind::HtmlCollection => "HTMLCollection",
-        CollectionKind::FormControlsCollection => "HTMLFormControlsCollection",
-        CollectionKind::OptionsCollection => "HTMLOptionsCollection",
-        CollectionKind::RadioNodeList => "RadioNodeList",
-    };
+    initialize_collection_identity(scope, wrapper, kind);
+    let prototype_name = collection_interface_name(kind);
     set_named_constructor_prototype(scope, wrapper, prototype_name);
 }
 

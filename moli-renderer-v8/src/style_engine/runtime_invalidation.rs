@@ -1,7 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use dom::ElementState as StyloElementState;
 use moli_selector::StyloStyleSourceScope as StyleSourceScope;
+use smallvec::SmallVec;
 
 use crate::{
     document_runtime::DomHandle, dom::native::DomHost, protocol_types::EmulatedMediaOverrides,
@@ -18,7 +19,9 @@ use super::{
     cause::PendingStyleInvalidationCause,
     document_world::DocumentStyleWorld,
     eligibility::child_list_effects_have_current_topology,
-    mutation_effect::detached_style_subtree_roots_for_mutations,
+    mutation_effect::{
+        detached_style_subtree_roots_for_mutations, normalized_deferred_structural_mutation_effects,
+    },
     schedule::queue_style_invalidation_for_scope,
     scope::{
         mutation_effects_have_source_scope, source_scope_for_custom_state_change,
@@ -28,7 +31,16 @@ use super::{
 
 const IMMEDIATE_STRUCTURAL_MUTATION_EFFECT_LIMIT: usize = 256;
 
+type StyleMutationGroups<'a> = SmallVec<[(DomHandle, Cow<'a, [StyleMutationEffect]>); 1]>;
+
 impl MoliStyleEngine {
+    pub(crate) fn document_has_style_state(&self, document: DomHandle) -> bool {
+        let Some(world) = self.document_worlds.active_world(document) else {
+            return false;
+        };
+        world_has_style_state(self, &world)
+    }
+
     #[cfg(test)]
     pub(crate) fn invalidate_for_mutations(
         &mut self,
@@ -63,11 +75,12 @@ impl MoliStyleEngine {
         let mut deferred_us = 0u128;
         let mut detached_cleanup_us = 0u128;
         let mut queue_us = 0u128;
-        for (document, document_effects) in grouped_effects {
+        for (document, document_effects) in &grouped_effects {
+            let document = *document;
+            let document_effects = document_effects.as_ref();
             let world = self.world_for_document(document);
             let no_cached_style_started = profile_enabled.then(std::time::Instant::now);
-            if self.style_invalidation_without_cached_styles_is_complete(&document_effects, &world)
-            {
+            if self.style_invalidation_without_cached_styles_is_complete(document_effects, &world) {
                 no_cached_style_us += no_cached_style_started
                     .map(|started| started.elapsed().as_micros())
                     .unwrap_or_default();
@@ -76,30 +89,28 @@ impl MoliStyleEngine {
             no_cached_style_us += no_cached_style_started
                 .map(|started| started.elapsed().as_micros())
                 .unwrap_or_default();
-            if should_defer_structural_mutations(&document_effects) {
+            if should_defer_structural_mutations(document_effects) {
                 let deferred_started = profile_enabled.then(std::time::Instant::now);
-                world.document_state.bump_target_context_epoch();
-                world.pending_structural_mutations.push(
-                    &document_effects,
-                    emulated_media,
-                    viewport,
-                );
+                world.document_state.note_style_input_change();
+                world
+                    .pending_structural_mutations
+                    .push(document_effects, emulated_media, viewport);
                 deferred_us += deferred_started
                     .map(|started| started.elapsed().as_micros())
                     .unwrap_or_default();
                 continue;
             }
             let detached_cleanup_started = profile_enabled.then(std::time::Instant::now);
-            self.invalidate_detached_style_subtrees_for_mutations(host, &document_effects);
+            self.invalidate_detached_style_subtrees_for_mutations(host, document_effects);
             detached_cleanup_us += detached_cleanup_started
                 .map(|started| started.elapsed().as_micros())
                 .unwrap_or_default();
             let queue_started = profile_enabled.then(std::time::Instant::now);
             self.queue_style_invalidation_for_mutations(
-                document,
                 &world,
                 host,
-                &document_effects,
+                document_effects,
+                document_effects,
                 emulated_media,
                 viewport,
             );
@@ -135,16 +146,16 @@ impl MoliStyleEngine {
             return false;
         }
         if mutation_effects_have_source_scope(effects) {
-            world.document_state.bump_target_context_epoch();
+            world.document_state.note_style_input_change();
         }
         true
     }
 
     fn queue_style_invalidation_for_mutations(
         &self,
-        document: DomHandle,
         world: &DocumentStyleWorld,
         host: &DomHost,
+        scope_effects: &[StyleMutationEffect],
         effects: &[StyleMutationEffect],
         emulated_media: &EmulatedMediaOverrides,
         viewport: StyleViewport,
@@ -152,7 +163,9 @@ impl MoliStyleEngine {
         let profile_enabled = moli_trace::cpu_profile_enabled();
         let total_started = profile_enabled.then(std::time::Instant::now);
         let source_scope_started = profile_enabled.then(std::time::Instant::now);
-        let source_scope = source_scope_for_mutations(host, effects);
+        // The retained cause may omit exhausted fragment history, but source
+        // ownership still comes from every original mutation handle.
+        let source_scope = source_scope_for_mutations(host, scope_effects);
         let source_scope_us = source_scope_started
             .map(|started| started.elapsed().as_micros())
             .unwrap_or_default();
@@ -167,7 +180,7 @@ impl MoliStyleEngine {
             .unwrap_or_default();
         let queue_scope_started = profile_enabled.then(std::time::Instant::now);
         self.queue_style_invalidation_scope(
-            document,
+            world.document,
             world,
             host,
             emulated_media,
@@ -220,15 +233,21 @@ impl MoliStyleEngine {
         emulated_media: &EmulatedMediaOverrides,
         viewport: StyleViewport,
     ) {
+        // Even an exhausted ordinary fragment can have removed previously
+        // styled descendants. Retire those inputs before filtering history.
         self.invalidate_detached_style_subtrees_for_mutations(host, effects);
-        if effects.len() <= IMMEDIATE_STRUCTURAL_MUTATION_EFFECT_LIMIT
-            && child_list_effects_have_current_topology(host, effects)
+        let normalized = normalized_deferred_structural_mutation_effects(host, effects);
+        if !mutation_effects_have_source_scope(&normalized) {
+            return;
+        }
+        if normalized.len() <= IMMEDIATE_STRUCTURAL_MUTATION_EFFECT_LIMIT
+            && child_list_effects_have_current_topology(host, &normalized)
         {
             self.queue_style_invalidation_for_mutations(
-                document,
                 world,
                 host,
                 effects,
+                &normalized,
                 emulated_media,
                 viewport,
             );
@@ -506,6 +525,7 @@ impl MoliStyleEngine {
         let Some(world) = self.owner_document_world(host, root) else {
             return;
         };
+        world.document_state.note_visual_input_change();
         self.invalidation_cleanup_for_world(&world)
             .invalidate_inline_style_subtree(host, root);
     }
@@ -514,6 +534,7 @@ impl MoliStyleEngine {
         let Some(world) = self.owner_document_world(host, root) else {
             return;
         };
+        world.document_state.note_visual_input_change();
         self.invalidation_cleanup_for_world(&world)
             .invalidate_subtrees_and_shadow_cascade_data(host, [root]);
     }
@@ -533,7 +554,7 @@ impl MoliStyleEngine {
         };
         let source_stores = world.borrow_source_stores();
         if !world_has_style_state(self, world) {
-            world.document_state.bump_target_context_epoch();
+            world.document_state.note_style_input_change();
             return;
         }
         queue_style_invalidation_for_scope(
@@ -607,11 +628,33 @@ fn should_defer_structural_mutations(effects: &[StyleMutationEffect]) -> bool {
     super::mutation_effect::style_mutation_effects_are_child_list_structural(effects)
 }
 
-fn style_mutation_effects_by_owner_document(
+#[inline]
+fn style_mutation_effects_by_owner_document<'a>(
     host: &DomHost,
-    effects: &[StyleMutationEffect],
-) -> Vec<(DomHandle, Vec<StyleMutationEffect>)> {
-    let mut groups = Vec::<(DomHandle, Vec<StyleMutationEffect>)>::new();
+    effects: &'a [StyleMutationEffect],
+) -> StyleMutationGroups<'a> {
+    // A single-node effect already belongs to one document. Subtree effects
+    // have no single owner here and continue through the batch grouping path.
+    if let [effect] = effects
+        && let Some(document) = owner_document_for_mutation_effect(host, effect)
+    {
+        // Borrowing also avoids the inner effect buffer and effect clones;
+        // the outer SmallVec only avoids the document-group allocation.
+        // A/B on fixed local WeChat HTML (2026-10-06, release, JS/CSS/subframes
+        // disabled, 200 balanced randomized pairs, identical outer SmallVec):
+        // owned Vec -> borrowed: 161.87 -> 156.24 ms; owned inner SmallVec ->
+        // borrowed: 159.61 -> 157.12 ms. Paired-saving 95% bootstrap CIs were
+        // [3.15, 6.58] and [0.19, 3.14] ms, respectively, for this workload.
+        return SmallVec::from_buf([(document, Cow::Borrowed(effects))]);
+    }
+    group_batched_style_mutation_effects_by_owner_document(host, effects)
+}
+
+fn group_batched_style_mutation_effects_by_owner_document<'a>(
+    host: &DomHost,
+    effects: &'a [StyleMutationEffect],
+) -> StyleMutationGroups<'a> {
+    let mut groups = SmallVec::new();
     for effect in effects {
         match effect {
             StyleMutationEffect::ConnectedSubtrees { roots } => {
@@ -638,7 +681,7 @@ fn style_mutation_effects_by_owner_document(
 
 fn push_subtree_effects_by_owner_document(
     host: &DomHost,
-    groups: &mut Vec<(DomHandle, Vec<StyleMutationEffect>)>,
+    groups: &mut StyleMutationGroups<'_>,
     roots: &Arc<[DomHandle]>,
     make_effect: impl Fn(Arc<[DomHandle]>) -> StyleMutationEffect,
 ) {
@@ -674,7 +717,7 @@ fn push_subtree_effects_by_owner_document(
 }
 
 fn push_document_effect(
-    groups: &mut Vec<(DomHandle, Vec<StyleMutationEffect>)>,
+    groups: &mut StyleMutationGroups<'_>,
     document: DomHandle,
     effect: StyleMutationEffect,
 ) {
@@ -682,9 +725,9 @@ fn push_document_effect(
         .iter_mut()
         .find(|(group_document, _)| *group_document == document)
     {
-        group_effects.push(effect);
+        group_effects.to_mut().push(effect);
     } else {
-        groups.push((document, vec![effect]));
+        groups.push((document, Cow::Owned(vec![effect])));
     }
 }
 
@@ -861,7 +904,7 @@ mod tests {
                 .find(|(candidate, _)| *candidate == expected_document)
                 .expect("each owner document should have a mutation group");
             assert!(matches!(
-                effects.as_slice(),
+                effects.as_ref(),
                 [StyleMutationEffect::ConnectedSubtrees { roots }]
                     if roots.as_ref() == [expected_root]
             ));

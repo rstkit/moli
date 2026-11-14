@@ -1,23 +1,20 @@
 use super::backing_store::{canvas_like_has_context, canvas_like_pixels_copy};
-use super::offscreen::offscreen_canvas_receiver_branded;
 use super::*;
 use crate::context_bootstrap::new_dom_exception_value;
 use crate::util::{
     callback_data_index_value, callback_data_item, get_private_value, set_private_value,
 };
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
-const IMAGE_BITMAP_BRAND_SLOT: &str = "__moliImageBitmapBrand";
 const IMAGE_BITMAP_WIDTH_SLOT: &str = "__moliImageBitmapWidth";
 const IMAGE_BITMAP_HEIGHT_SLOT: &str = "__moliImageBitmapHeight";
 
 const IMAGE_BITMAP_DIMENSION_SLOTS: &[&str] = &[IMAGE_BITMAP_WIDTH_SLOT, IMAGE_BITMAP_HEIGHT_SLOT];
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ImageBitmap")]
+#[webapi(interface = web_api_interfaces::ImageBitmap)]
 struct ImageBitmapObjectDeclaration {
-    #[webapi(slot = IMAGE_BITMAP_BRAND_SLOT, init = true)]
-    brand: (),
     #[webapi(slot = IMAGE_BITMAP_WIDTH_SLOT)]
     width: f64,
     #[webapi(slot = IMAGE_BITMAP_HEIGHT_SLOT)]
@@ -25,7 +22,7 @@ struct ImageBitmapObjectDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "ImageBitmap", enumerable)]
+#[webapi(interface = web_api_interfaces::ImageBitmap, enumerable, receiver)]
 struct ImageBitmapPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -76,7 +73,7 @@ pub(crate) fn window_create_image_bitmap_callback<'s>(
         );
         return;
     };
-    if !offscreen_canvas_receiver_branded(scope, source) {
+    if !web_api_interfaces::OffscreenCanvas::is_instance(scope, source) {
         throw_type_error(
             scope,
             "Failed to execute 'createImageBitmap' on 'Window': The provided value is not a valid image source.",
@@ -145,10 +142,6 @@ fn image_bitmap_dimension_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !image_bitmap_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(slot) = callback_data_item(
         scope,
         &args,
@@ -169,20 +162,8 @@ fn image_bitmap_close_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !image_bitmap_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     for slot in IMAGE_BITMAP_DIMENSION_SLOTS {
         set_private_value(scope, args.this(), slot, v8::Number::new(scope, 0.0).into());
     }
     rv.set_undefined();
-}
-
-fn image_bitmap_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, IMAGE_BITMAP_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }

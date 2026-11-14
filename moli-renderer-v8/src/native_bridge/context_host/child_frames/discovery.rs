@@ -1,5 +1,11 @@
 use super::*;
 use crate::dom::native::Node;
+use crate::native_bridge::element::parse_url_with_document_query_encoding;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Frame ids are exposed to CDP and BiDi, where they address frames across
+// Pages and user contexts. Do not reuse them when a document is replaced.
+static NEXT_CHILD_BROWSING_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildFrameOwnerElementKind {
@@ -22,7 +28,7 @@ impl ChildFrameOwnerElementKind {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(in crate::native_bridge::context_host) fn child_browsing_context_initial_live_bootstrap(
         attribute_bootstrap: &ChildBrowsingContextBootstrap,
     ) -> ChildBrowsingContextBootstrap {
@@ -47,18 +53,15 @@ impl JsContextHost {
         &self,
         handle: DomHandle,
     ) -> Option<ChildFrameOwnerElementKind> {
-        [
-            ("iframe", ChildFrameOwnerElementKind::Iframe),
-            ("frame", ChildFrameOwnerElementKind::Frame),
-            ("embed", ChildFrameOwnerElementKind::Embed),
-            ("object", ChildFrameOwnerElementKind::Object),
-        ]
-        .into_iter()
-        .find_map(|(name, kind)| {
-            self.dom_host()
-                .is_html_element_named(handle, name)
-                .then_some(kind)
-        })
+        let element = self.dom_host().node(handle)?.as_element()?;
+        let kind = match element.local_name() {
+            "iframe" => ChildFrameOwnerElementKind::Iframe,
+            "frame" => ChildFrameOwnerElementKind::Frame,
+            "embed" => ChildFrameOwnerElementKind::Embed,
+            "object" => ChildFrameOwnerElementKind::Object,
+            _ => return None,
+        };
+        (element.namespace() == "http://www.w3.org/1999/xhtml").then_some(kind)
     }
 
     pub(crate) fn frame_owner_attribute_requires_child_refresh(
@@ -95,10 +98,18 @@ impl JsContextHost {
             .is_some_and(|kind| attribute_name.eq_ignore_ascii_case(kind.navigation_attribute()))
     }
 
-    pub(in crate::native_bridge::context_host) fn child_browsing_context_host_is_active(
-        &self,
-        handle: DomHandle,
-    ) -> bool {
+    pub(crate) fn child_browsing_context_host_is_active(&self, handle: DomHandle) -> bool {
+        if self
+            .dom_host()
+            .owner_document_handle(handle)
+            .is_some_and(|document| {
+                self.subframe_loading_disabled_documents
+                    .borrow()
+                    .contains_key(&document)
+            })
+        {
+            return false;
+        }
         self.dom_host().is_connected(handle)
             || self
                 .lightweight_popup_id_for_node_owner_document(handle)
@@ -144,6 +155,12 @@ impl JsContextHost {
             .unwrap_or_else(|_| Url::parse("about:blank").expect("static about:blank should parse"))
     }
 
+    fn resolve_child_frame_owner_attribute_url(&self, handle: DomHandle, raw: &str) -> Url {
+        let base = self.document_base_url_for_child_context(handle);
+        parse_url_with_document_query_encoding(self, handle, &base, raw)
+            .unwrap_or_else(|_| Url::parse("about:blank").expect("static about:blank should parse"))
+    }
+
     pub(in crate::native_bridge::context_host) fn child_browsing_context_bootstrap_for_handle(
         &self,
         handle: DomHandle,
@@ -184,7 +201,7 @@ impl JsContextHost {
                 .then_some(ChildBrowsingContextBootstrap::AboutBlank);
         }
 
-        let url = self.resolve_child_browsing_context_url(handle, raw_url);
+        let url = self.resolve_child_frame_owner_attribute_url(handle, raw_url);
         if !kind.always_hosts_document()
             && (self.embedded_content_is_inside_media_element(handle)
                 || !self.embedded_content_selects_nested_document(handle, raw_url, &url))
@@ -225,13 +242,15 @@ impl JsContextHost {
             // Blink also defaults an unclassified plug-in element URL to a frame.
             return true;
         };
-        if moli_web_mime::is_image_mime(&mime) {
+        // SVG is an XML document when embedded by object/embed, even though
+        // its MIME type is also in the image family.
+        if moli_web_mime::is_image_mime(&mime) && !moli_web_mime::is_svg_image_mime(&mime) {
             return false;
         }
         moli_web_mime::is_html_document_mime(&mime)
-            || moli_web_mime::is_dom_parser_xml_mime(&mime)
+            || moli_web_mime::is_xml_document_mime(&mime)
             || moli_web_mime::is_text_mime(&mime)
-            || moli_web_mime::is_json_module_mime(&mime)
+            || moli_web_mime::is_json_mime(&mime)
             || moli_web_mime::is_javascript_mime(&mime)
     }
 
@@ -252,6 +271,11 @@ impl JsContextHost {
         if self.is_child_browsing_context_host_handle(root) {
             out.push(root);
         }
+        // Disconnected hosts no longer use the connected-tree candidate index.
+        // Their shadow trees still contain browsing contexts to unload and retire.
+        if let Some(shadow_root) = self.dom_host().shadow_root_handle(root) {
+            self.collect_child_browsing_context_host_handles(shadow_root, out);
+        }
         for child in self.dom_host().child_handles(root) {
             self.collect_child_browsing_context_host_handles(child, out);
         }
@@ -260,8 +284,7 @@ impl JsContextHost {
     pub(in crate::native_bridge::context_host) fn next_child_browsing_context_frame_id(
         &mut self,
     ) -> String {
-        let next_id = self.next_child_browsing_context_id;
-        self.next_child_browsing_context_id += 1;
+        let next_id = NEXT_CHILD_BROWSING_CONTEXT_ID.fetch_add(1, Ordering::Relaxed);
         format!("child-browsing-context-{next_id}")
     }
 }

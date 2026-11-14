@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::SubresourceInterceptionClasses;
 
 use crate::{
     page_resource_completion::{
@@ -13,9 +14,9 @@ use crate::{
 };
 
 fn register_intercepted_fetch(page_vm: &mut PageVm, request_url: &Url) -> u64 {
-    page_vm
-        .vm_mut()
-        .set_fetch_subresource_interception(true, Some(SubresourceResourceType::Fetch));
+    page_vm.vm_mut().set_fetch_subresource_interception(
+        SubresourceInterceptionClasses::for_resource_type(SubresourceResourceType::Fetch),
+    );
     page_vm
         .vm_mut()
         .eval(&format!(
@@ -41,13 +42,13 @@ fn failed_fetch_completion(internal_id: u64, request_url: &Url) -> AsyncSubresou
         internal_id,
         request_url: request_url.clone(),
         request_method: "GET".to_owned(),
-        request_headers: Vec::new(),
+        request_headers: Vec::new().into(),
         request_body: None,
         response_status_text: None,
         skip_fetch_security_validation: false,
         response_filter: None,
         network_error_text: Some("typed test failure".to_owned()),
-        result: Err("typed test failure".to_owned()),
+        result: Err("typed test failure".to_owned()).into(),
     }))
 }
 
@@ -197,9 +198,9 @@ async fn selected_streaming_chunk_settles_reader_reaction_at_its_own_task_end() 
         let request_url = Url::parse("https://example.com/typed-stream-checkpoint").unwrap();
         let mut page_vm = test_page_vm();
         let root_document = page_vm.document_lifecycle.identity().document;
-        page_vm
-            .vm_mut()
-            .set_fetch_subresource_interception(true, Some(SubresourceResourceType::Fetch));
+        page_vm.vm_mut().set_fetch_subresource_interception(
+            SubresourceInterceptionClasses::for_resource_type(SubresourceResourceType::Fetch),
+        );
         page_vm.vm_mut().eval(&format!(
             r#"
 globalThis.__typedStreamState = "pending";
@@ -226,22 +227,26 @@ fetch({:?})
                 root_document,
                 AsyncSubresourceFetchEvent::StreamingStarted(Box::new(
                     AsyncSubresourceStreamingStarted {
+                        skip_fetch_security_validation: false,
+                        response_filter: None,
                         internal_id,
                         request_url: request_url.clone(),
                         request_method: "GET".to_owned(),
-                        request_headers: Vec::new(),
+                        request_headers: Vec::new().into(),
                         request_body: None,
                         body_source_id,
                         network_request_headers: None,
                         head: moli_fetch::ResponseHead {
+                            status_text: None,
                             final_url: request_url,
                             status: 200,
-                            headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                            headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
                             request_cookie_report: None,
                             cookie_set_reports: Vec::new(),
                             redirected: false,
                             redirect_chain: Vec::new(),
                             from_cache: false,
+                            cache_state: Default::default(),
                             negotiated_http_version: None,
                         },
                     },
@@ -438,22 +443,26 @@ async fn streaming_finish_requires_matching_request_and_body_source_identity() {
 
         let started = AsyncSubresourceFetchEvent::StreamingStarted(Box::new(
             AsyncSubresourceStreamingStarted {
+                skip_fetch_security_validation: false,
+                response_filter: None,
                 internal_id,
                 request_url: request_url.clone(),
                 request_method: "GET".to_owned(),
-                request_headers: Vec::new(),
+                request_headers: Vec::new().into(),
                 request_body: None,
                 body_source_id,
                 network_request_headers: None,
                 head: moli_fetch::ResponseHead {
+                    status_text: None,
                     final_url: request_url,
                     status: 200,
-                    headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                    headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
                     request_cookie_report: None,
                     cookie_set_reports: Vec::new(),
                     redirected: false,
                     redirect_chain: Vec::new(),
                     from_cache: false,
+                    cache_state: Default::default(),
                     negotiated_http_version: None,
                 },
             },
@@ -548,7 +557,7 @@ async fn stale_observed_network_record_is_captured_without_consuming_current_req
             document_url,
             request_url.clone(),
             "OPTIONS".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             "retired preflight failed".to_owned(),

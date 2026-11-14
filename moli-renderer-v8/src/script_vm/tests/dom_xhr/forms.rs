@@ -2,6 +2,9 @@ use super::*;
 
 mod dialog;
 mod event_activation;
+mod named_lookup;
+mod select_state_styles;
+mod wrappers;
 
 #[test]
 fn object_set_custom_validity_updates_validity_state() {
@@ -55,6 +58,67 @@ fn input_type_enumerated_attribute_preserves_raw_value_and_exposes_canonical_sta
     assert_eq!(
         result,
         "email/EMAIL|text/ datetime-local |text/unknown|datetime-local/datetime-local|text/null"
+    );
+}
+
+#[test]
+fn email_value_keeps_ascii_domain_case_and_literal_percent_sequences() {
+    let mut vm = new_storage_test_vm("https://email-ascii.test/");
+    let result = vm
+        .eval(
+            r#"
+        (() => {
+            const input = document.createElement('input');
+            input.type = 'email';
+            input.multiple = true;
+            input.value = ' User@EXAMPLE.TEST , User@%65xample.test , User@exämple%2e.test ';
+            return input.value;
+        })()
+    "#,
+        )
+        .unwrap();
+    assert_eq!(
+        result,
+        "User@EXAMPLE.TEST,User@%65xample.test,User@exämple%2e.test"
+    );
+}
+
+#[test]
+fn email_multiple_value_sanitization_tracks_attribute_state() {
+    let mut vm = new_storage_test_vm("https://email-multiple-sanitization.test/");
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const input = document.createElement('input');
+  input.type = 'email';
+  input.multiple = true;
+  input.value = '  first@example.com  , second@example.test  ';
+  const multipleValue = input.value;
+
+  input.multiple = false;
+  input.value = 'first@example.com , second@example.test';
+  const singleValue = input.value;
+
+  input.multiple = true;
+  const multipleAfterToggle = input.value;
+
+  const idn = document.createElement('input');
+  idn.setAttribute('value', 'test@exämle.com');
+  idn.type = 'email';
+  const idnSingle = idn.value;
+  idn.multiple = true;
+  idn.value = 'test@exämle.com, user@お.com';
+  return [multipleValue, singleValue, multipleAfterToggle, idnSingle, idn.value].join('|');
+})()
+"#,
+        )
+        .expect("email multiple sanitizer probe should evaluate");
+
+    assert_eq!(
+        result,
+        "first@example.com,second@example.test|first@example.com , second@example.test|first@example.com,second@example.test|test@xn--exmle-hra.com|test@xn--exmle-hra.com,user@xn--t8j.com"
     );
 }
 
@@ -1230,7 +1294,7 @@ fn form_reset_clears_option_selectedness_dirty_flag() {
 
 #[test]
 fn form_reset_event_uses_form_wrapper_realm_after_cross_frame_move() {
-    let mut vm = new_storage_test_vm("https://form-reset-event-realm.test/");
+    let mut vm = new_storage_html_test_vm("https://form-reset-event-realm.test/");
 
     let result = vm
         .eval(
@@ -1826,9 +1890,9 @@ fn abort_signal_internal_id_is_not_page_visible_or_forgeable() {
     hasVisibleSlot: "__lmAbortSignalId" in signal,
     ownNames: Object.getOwnPropertyNames(signal),
     signalMethods: [
-      methodDescriptor(AbortSignal.prototype, "addEventListener"),
-      methodDescriptor(AbortSignal.prototype, "removeEventListener"),
-      methodDescriptor(AbortSignal.prototype, "dispatchEvent"),
+      methodDescriptor(Object.getPrototypeOf(AbortSignal.prototype), "addEventListener"),
+      methodDescriptor(Object.getPrototypeOf(AbortSignal.prototype), "removeEventListener"),
+      methodDescriptor(Object.getPrototypeOf(AbortSignal.prototype), "dispatchEvent"),
       methodDescriptor(AbortSignal.prototype, "throwIfAborted")
     ],
     signalAccessors: [
@@ -1850,7 +1914,7 @@ fn abort_signal_internal_id_is_not_page_visible_or_forgeable() {
     staticAbortAborted: staticAbortSignal.aborted,
     staticAbortReason: staticAbortSignal.reason,
     anyForged: probe(() => AbortSignal.any([forged])),
-    getterForged: abortedGetter.call(forged)
+    getterForged: probe(() => abortedGetter.call(forged))
   });
 })()
 "#,
@@ -1859,7 +1923,7 @@ fn abort_signal_internal_id_is_not_page_visible_or_forgeable() {
 
     assert_eq!(
         result,
-        r#"{"hasVisibleSlot":false,"ownNames":[],"signalMethods":["addEventListener:function:addEventListener:2:true:true:true","removeEventListener:function:removeEventListener:2:true:true:true","dispatchEvent:function:dispatchEvent:1:true:true:true","throwIfAborted:function:throwIfAborted:0:true:true:true"],"signalAccessors":["aborted:function:get aborted:0:true:undefined:true","reason:function:get reason:0:true:undefined:true","onabort:function:get onabort:0:true:function:true"],"controllerMethods":["abort:function:abort:0:true:true:true"],"controllerAccessors":["signal:function:get signal:0:true:undefined:true"],"constructorMethods":["abort:function:abort:1:true:true:true","timeout:function:timeout:1:true:true:true","any:function:any:1:true:true:true"],"staticAbortAborted":true,"staticAbortReason":"static-reason","anyForged":"TypeError","getterForged":false}"#
+        r#"{"hasVisibleSlot":false,"ownNames":[],"signalMethods":["addEventListener:function:addEventListener:2:true:true:true","removeEventListener:function:removeEventListener:2:true:true:true","dispatchEvent:function:dispatchEvent:1:true:true:true","throwIfAborted:function:throwIfAborted:0:true:true:true"],"signalAccessors":["aborted:function:get aborted:0:true:undefined:true","reason:function:get reason:0:true:undefined:true","onabort:function:get onabort:0:true:function:true"],"controllerMethods":["abort:function:abort:0:true:true:true"],"controllerAccessors":["signal:function:get signal:0:true:undefined:true"],"constructorMethods":["abort:function:abort:0:true:true:true","timeout:function:timeout:1:true:true:true","any:function:any:1:true:true:true"],"staticAbortAborted":true,"staticAbortReason":"static-reason","anyForged":"TypeError","getterForged":"TypeError"}"#
     );
 }
 
@@ -2495,7 +2559,7 @@ async fn child_click_uses_pre_dispatch_button_activation_target_after_dom_remova
     );
     assert_eq!(
         server.finish_targets().await,
-        vec!["/path/does_not_exist.html"]
+        vec!["/path/does_not_exist.html?"]
     );
 }
 
@@ -2754,7 +2818,7 @@ async fn programmatic_form_submit_keeps_successive_distinct_child_targets() {
     assert!(
         requests
             .iter()
-            .all(|request| request == "GET /path/formaction.html HTTP/1.1"),
+            .all(|request| request == "GET /path/formaction.html? HTTP/1.1"),
         "unexpected multi-target form requests: {requests:?}"
     );
 }
@@ -2776,7 +2840,8 @@ fn submit_event_constructor_surface() {
     submitter: button
   });
   const desc = Object.getOwnPropertyDescriptor(SubmitEvent.prototype, 'submitter');
-  const created = document.createEvent('SubmitEvent');
+  let creationError;
+  try { document.createEvent('SubmitEvent'); } catch (error) { creationError = error; }
   return [
     typeof SubmitEvent,
     SubmitEvent.length,
@@ -2793,8 +2858,8 @@ fn submit_event_constructor_surface() {
     Object.prototype.toString.call(second),
     typeof desc.get,
     desc.set === undefined,
-    created instanceof SubmitEvent,
-    created.submitter === null
+    creationError instanceof DOMException,
+    creationError.name === 'NotSupportedError'
   ].join('|');
 })()
 "#,
@@ -2808,7 +2873,7 @@ fn submit_event_constructor_surface() {
 }
 #[test]
 fn live_form_request_submit_dispatches_submit_event_with_submitter() {
-    let mut vm = new_storage_test_vm("https://submit-event-requestsubmit.test/");
+    let mut vm = new_storage_html_test_vm("https://submit-event-requestsubmit.test/");
 
     let result = vm
         .eval(
@@ -3704,7 +3769,7 @@ fn anchor_download_synthetic_click_records_pending_download_without_navigation()
 
 #[test]
 fn trusted_alt_click_downloads_an_anchor_without_a_download_attribute() {
-    let mut vm = new_parsed_test_vm(
+    let mut vm = new_rendered_test_vm(
         "https://anchor-alt-download.test/path/index.html",
         r#"<!doctype html><html><head><style>
             body { margin: 0; }
@@ -3713,6 +3778,9 @@ fn trusted_alt_click_downloads_an_anchor_without_a_download_attribute() {
             <a id="download_link" href="/download.txt">download</a>
         </body></html>"#,
     );
+
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
 
     vm.dispatch_mouse_event_at_point_with_pointer_and_modifiers(
         20.0,
@@ -3725,6 +3793,7 @@ fn trusted_alt_click_downloads_an_anchor_without_a_download_attribute() {
         0.0,
         crate::runtime::RendererPointerEventProperties::default(),
         1,
+        false,
     )
     .expect("alt mousedown should dispatch");
     let outcome = vm
@@ -3739,6 +3808,7 @@ fn trusted_alt_click_downloads_an_anchor_without_a_download_attribute() {
             0.0,
             crate::runtime::RendererPointerEventProperties::default(),
             1,
+            false,
         )
         .expect("alt mouseup should dispatch");
 
@@ -3771,6 +3841,9 @@ fn alt_input_does_not_turn_window_open_into_a_download_or_background_popup() {
     )
     .expect("Alt window.open fixture should initialize");
 
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
+
     vm.dispatch_mouse_event_at_point_with_pointer_and_modifiers(
         20.0,
         20.0,
@@ -3782,6 +3855,7 @@ fn alt_input_does_not_turn_window_open_into_a_download_or_background_popup() {
         0.0,
         crate::runtime::RendererPointerEventProperties::default(),
         1,
+        false,
     )
     .expect("Alt mousedown should dispatch");
     let outcome = vm
@@ -3796,6 +3870,7 @@ fn alt_input_does_not_turn_window_open_into_a_download_or_background_popup() {
             0.0,
             crate::runtime::RendererPointerEventProperties::default(),
             1,
+            false,
         )
         .expect("Alt mouseup should dispatch");
 
@@ -3835,6 +3910,10 @@ fn window_open_in_click_listener_uses_current_input_event() {
 "#,
         )
         .expect("trusted window.open fixture should initialize");
+
+    trusted
+        .publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
     trusted
         .dispatch_mouse_event_at_point_with_pointer_and_modifiers(
             20.0,
@@ -3847,6 +3926,7 @@ fn window_open_in_click_listener_uses_current_input_event() {
             0.0,
             crate::runtime::RendererPointerEventProperties::default(),
             platform_modifier,
+            false,
         )
         .expect("new-tab-modified mousedown should dispatch");
     trusted
@@ -3861,6 +3941,7 @@ fn window_open_in_click_listener_uses_current_input_event() {
             0.0,
             crate::runtime::RendererPointerEventProperties::default(),
             platform_modifier,
+            false,
         )
         .expect("new-tab-modified mouseup should dispatch");
     let trusted_popups = trusted.take_pending_popup_activations();
@@ -3936,6 +4017,9 @@ fn current_mouseup_input_covers_pointer_mouse_click_and_microtask_callbacks() {
     )
     .expect("current input scope fixture should initialize");
 
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
+
     vm.dispatch_mouse_event_at_point_with_pointer_and_modifiers(
         20.0,
         20.0,
@@ -3947,6 +4031,7 @@ fn current_mouseup_input_covers_pointer_mouse_click_and_microtask_callbacks() {
         0.0,
         crate::runtime::RendererPointerEventProperties::default(),
         platform_modifier,
+        false,
     )
     .expect("new-tab-modified mousedown should dispatch");
     vm.dispatch_mouse_event_at_point_with_pointer_and_modifiers(
@@ -3960,6 +4045,7 @@ fn current_mouseup_input_covers_pointer_mouse_click_and_microtask_callbacks() {
         0.0,
         crate::runtime::RendererPointerEventProperties::default(),
         platform_modifier,
+        false,
     )
     .expect("new-tab-modified mouseup should dispatch");
 
@@ -4012,6 +4098,9 @@ fn middle_auxclick_runs_the_anchor_default_action_in_the_background() {
     )
     .expect("auxclick listener should install");
 
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
+
     vm.dispatch_mouse_event_at_point(20.0, 20.0, "mousedown", 1, None, 0.0, 0.0)
         .expect("middle mousedown should dispatch");
     let outcome = vm
@@ -4058,6 +4147,9 @@ fn canceling_middle_auxclick_suppresses_the_anchor_default_action() {
         'installed'"#,
     )
     .expect("canceling auxclick listener should install");
+
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
 
     vm.dispatch_mouse_event_at_point(20.0, 20.0, "mousedown", 1, None, 0.0, 0.0)
         .expect("middle mousedown should dispatch");
@@ -4177,13 +4269,13 @@ fn keyboard_activation_click_preserves_modifiers() {
 
     assert_eq!(
         result,
-        "true|box:1:true:true:false:false|button:1:true:true:false:false"
+        "true|box:0:true:true:false:false|button:0:true:true:false:false"
     );
 }
 
 #[test]
 fn image_submit_click_coordinates_use_live_layout_geometry() {
-    let mut vm = new_parsed_test_vm(
+    let mut vm = new_rendered_test_vm(
         "https://image-submit-coordinates.test/path/index.html",
         r#"<!doctype html><html><head><style>
             body { margin: 0; }
@@ -4213,6 +4305,9 @@ form.addEventListener('submit', event => {
     )
     .expect("image submit coordinate fixture should initialize");
 
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
+
     vm.dispatch_mouse_event_at_point(125.4, 68.6, "mousedown", 0, None, 0.0, 0.0)
         .expect("image submitter mousedown should dispatch");
     let outcome = vm
@@ -4228,12 +4323,15 @@ form.addEventListener('submit', event => {
 
 #[test]
 fn button_click_listener_window_open_self_reports_top_level_navigation() {
-    let mut vm = new_parsed_test_vm(
+    let mut vm = new_rendered_test_vm(
         "https://button-open-self-outcome.test/path/index.html",
         r#"<html><body>
             <button id="go" type="button" onclick="window.open('/next', '_self')">go</button>
         </body></html>"#,
     );
+
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
 
     vm.dispatch_mouse_event_at_point(20.0, 20.0, "mousedown", 0, None, 0.0, 0.0)
         .expect("button mousedown should dispatch");
@@ -4335,7 +4433,7 @@ fn file_input_click_returns_pending_file_chooser_activation() {
     const FILE_INPUT_HIT_X: f64 = 20.0;
     const FILE_INPUT_HIT_Y: f64 = 20.0;
 
-    let mut vm = new_parsed_test_vm(
+    let mut vm = new_rendered_test_vm(
         "https://file-input-click.test/path/index.html",
         r#"<html><body>
             <input id="picker" type="file" multiple>
@@ -4346,6 +4444,9 @@ fn file_input_click_returns_pending_file_chooser_activation() {
     );
     let source_document = lifecycle.identity();
     vm.set_root_document_lifecycle(lifecycle);
+
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
     vm.dispatch_mouse_event_at_point(
         FILE_INPUT_HIT_X,
         FILE_INPUT_HIT_Y,
@@ -4525,7 +4626,7 @@ fn label_click_for_file_input_returns_pending_file_chooser_activation() {
     const LABEL_HIT_X: f64 = 20.0;
     const LABEL_HIT_Y: f64 = 20.0;
 
-    let mut vm = new_parsed_test_vm(
+    let mut vm = new_rendered_test_vm(
         "https://file-label-click.test/path/index.html",
         r#"<html><body>
             <label for="picker" style="display:block;width:120px;height:40px">Choose file</label>
@@ -4537,6 +4638,9 @@ fn label_click_for_file_input_returns_pending_file_chooser_activation() {
     );
     let source_document = lifecycle.identity();
     vm.set_root_document_lifecycle(lifecycle);
+
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
     vm.dispatch_mouse_event_at_point(LABEL_HIT_X, LABEL_HIT_Y, "mousedown", 0, None, 0.0, 0.0)
         .expect("label mousedown should dispatch");
     let outcome = vm
@@ -4678,7 +4782,7 @@ fn pointer_click_enters_shadow_root_for_label_activation() {
     // this fixture. Hit inside the label rather than the intervening margin.
     const LABEL_HIT_Y: f64 = 35.0;
 
-    let mut vm = new_parsed_test_vm(
+    let mut vm = new_rendered_test_vm(
         "https://shadow-label-click.test/path/index.html",
         r#"<html><body><div id="host" class="h-screen"></div></body></html>"#,
     );
@@ -4698,6 +4802,9 @@ root.appendChild(label);
 "#,
     )
     .expect("shadow label setup should evaluate");
+
+    vm.publish_layout_for_test()
+        .expect("publish geometry before coordinate input");
 
     vm.dispatch_mouse_event_at_point(LABEL_HIT_X, LABEL_HIT_Y, "mousedown", 0, None, 0.0, 0.0)
         .expect("shadow label mousedown should dispatch");
@@ -4754,6 +4861,648 @@ fn submit_button_click_queues_pending_top_level_location_navigation() {
         "default form submission should not synthesize a history seed"
     );
 }
+
+#[test]
+fn enter_implicitly_submits_single_search_input_without_a_submit_button() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-search-submit.test/",
+        r#"<html><body>
+            <form action="/search">
+              <button type="button">toggle</button>
+              <input id="query" name="q" type="search" value="Nvidia RTX 4090">
+            </form>
+        </body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__submitterWasNull = false;
+document.querySelector('form').addEventListener('submit', event => {
+  window.__submitterWasNull = event.submitter === null;
+});
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("implicit submission fixture should initialize");
+
+    let outcome = vm
+        .dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert!(outcome.handled);
+    assert!(outcome.triggered_top_level_navigation);
+    assert_eq!(
+        vm.eval("String(window.__submitterWasNull)")
+            .expect("submitter state should evaluate"),
+        "true"
+    );
+    let pending = vm
+        .take_pending_location_navigation_with_seed()
+        .expect("implicit submission should queue a location navigation");
+    assert_eq!(
+        pending.url.as_str(),
+        "https://implicit-search-submit.test/search?q=Nvidia+RTX+4090"
+    );
+}
+
+#[test]
+fn enter_implicitly_clicks_the_default_submit_button() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-default-button.test/",
+        r#"<html><body>
+            <form action="/search">
+              <input id="query" name="q" type="search" value="moli">
+              <button id="submitter" type="submit" name="source" value="header">Search</button>
+            </form>
+        </body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__events = [];
+const submitter = document.getElementById('submitter');
+submitter.addEventListener('click', event => {
+  __events.push(`click:${event.detail}`);
+});
+document.querySelector('form').addEventListener('submit', event => {
+  __events.push(`submit:${event.submitter === submitter}`);
+});
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("default submit button fixture should initialize");
+
+    let outcome = vm
+        .dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert!(outcome.handled);
+    assert!(outcome.triggered_top_level_navigation);
+    assert_eq!(
+        vm.eval("`${__events.join('|')}|focus:${document.activeElement.id}`")
+            .expect("implicit activation events should evaluate"),
+        "click:0|submit:true|focus:query"
+    );
+    let pending = vm
+        .take_pending_location_navigation_with_seed()
+        .expect("default submit button should queue a location navigation");
+    assert_eq!(
+        pending.url.as_str(),
+        "https://implicit-default-button.test/search?q=moli&source=header"
+    );
+}
+
+#[test]
+fn enter_does_not_implicitly_submit_multiple_blocking_inputs_without_a_submit_button() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-multiple-inputs.test/",
+        r#"<html><body>
+            <form action="/search">
+              <input id="query" name="q" type="search" value="moli">
+              <input name="scope" type="text" value="all">
+            </form>
+        </body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__submitCount = 0;
+document.querySelector('form').addEventListener('submit', () => __submitCount++);
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("multiple blocker fixture should initialize");
+
+    let outcome = vm
+        .dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert!(outcome.handled);
+    assert!(!outcome.triggered_top_level_navigation);
+    assert_eq!(
+        vm.eval("String(window.__submitCount)")
+            .expect("submit count should evaluate"),
+        "0"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn canceling_an_implicit_submit_event_prevents_navigation() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-canceled-submit.test/",
+        r#"<html><body>
+            <form action="/search">
+              <input id="query" name="q" type="search" value="moli">
+            </form>
+        </body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__submitCount = 0;
+document.querySelector('form').addEventListener('submit', event => {
+  __submitCount++;
+  event.preventDefault();
+});
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("canceled implicit submission fixture should initialize");
+
+    let outcome = vm
+        .dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert!(outcome.handled);
+    assert!(!outcome.triggered_top_level_navigation);
+    assert_eq!(
+        vm.eval("String(window.__submitCount)")
+            .expect("submit count should evaluate"),
+        "1"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn disabled_default_submit_button_suppresses_implicit_submission() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-disabled-default.test/",
+        r#"<html><body><form action="/search">
+            <input id="query" name="q" type="search" value="moli">
+            <button id="disabled" type="submit" disabled>Disabled</button>
+            <button id="second" type="submit">Second</button>
+        </form></body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__events = [];
+for (const id of ['disabled', 'second']) {
+  document.getElementById(id).addEventListener('click', () => __events.push(`click:${id}`));
+}
+document.querySelector('form').addEventListener('submit', () => __events.push('submit'));
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("disabled default button fixture should initialize");
+
+    vm.dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert_eq!(
+        vm.eval("`${__events.join('|')}|focus:${document.activeElement.id}`")
+            .expect("disabled default state should evaluate"),
+        "|focus:query"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn external_form_owned_submit_button_participates_in_document_tree_order() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-external-default.test/",
+        r#"<html><body>
+            <button id="external" type="submit" form="search">External</button>
+            <form id="search">
+              <input id="query" name="q" type="search" value="moli">
+              <button id="inside" type="submit">Inside</button>
+            </form>
+        </body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__events = [];
+for (const id of ['external', 'inside']) {
+  document.getElementById(id).addEventListener('click', event => {
+    __events.push(`click:${id}:${event.detail}:${event.isTrusted}`);
+  });
+}
+document.getElementById('search').addEventListener('submit', event => {
+  __events.push(`submit:${event.submitter.id}`);
+  event.preventDefault();
+});
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("external default button fixture should initialize");
+
+    vm.dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert_eq!(
+        vm.eval("`${__events.join('|')}|focus:${document.activeElement.id}`")
+            .expect("external default state should evaluate"),
+        "click:external:0:true|submit:external|focus:query"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn image_input_is_the_default_submit_button_and_serializes_click_coordinates() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-image-default.test/",
+        r#"<html><body><form action="/search">
+            <input id="query" name="q" type="search" value="moli">
+            <input id="image" name="photo" type="image" style="width:20px;height:20px">
+            <button id="second" name="wrong" value="yes" type="submit">Second</button>
+        </form></body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__events = [];
+document.getElementById('image').addEventListener('click', event => {
+  __events.push(`click:image:${event.detail}:${event.isTrusted}`);
+});
+document.querySelector('form').addEventListener('submit', event => {
+  __events.push(`submit:${event.submitter.id}`);
+});
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("image default button fixture should initialize");
+
+    let outcome = vm
+        .dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert!(outcome.triggered_top_level_navigation);
+    assert_eq!(
+        vm.eval("`${__events.join('|')}|focus:${document.activeElement.id}`")
+            .expect("image default state should evaluate"),
+        "click:image:0:true|submit:image|focus:query"
+    );
+    let pending = vm
+        .take_pending_location_navigation_with_seed()
+        .expect("image default button should queue a location navigation");
+    assert_eq!(
+        pending.url.as_str(),
+        "https://implicit-image-default.test/search?q=moli&photo.x=0&photo.y=0"
+    );
+}
+
+#[test]
+fn raw_keydown_waits_for_the_character_phase_before_implicit_submission() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-character-phase.test/",
+        r#"<html><body><form><input id="query" type="search"></form></body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__events = [];
+document.querySelector('form').addEventListener('submit', event => {
+  __events.push('submit');
+  event.preventDefault();
+});
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("character phase fixture should initialize");
+
+    vm.dispatch_key_event("keydown", "Enter", "Enter", "", 0, false, false)
+        .expect("raw Enter keydown should dispatch");
+    assert_eq!(
+        vm.eval("__events.join('|')")
+            .expect("raw keydown event state should evaluate"),
+        ""
+    );
+
+    vm.dispatch_key_event("keypress", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter character phase should dispatch");
+    assert_eq!(
+        vm.eval("__events.join('|')")
+            .expect("character phase event state should evaluate"),
+        "submit"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn canceling_keydown_or_keypress_prevents_implicit_submission() {
+    for canceled_event in ["keydown", "keypress"] {
+        let mut vm = new_parsed_test_vm(
+            "https://implicit-canceled-key-event.test/",
+            r#"<html><body><form><input id="query" type="search"></form></body></html>"#,
+        );
+        vm.eval(&format!(
+            r#"
+window.__submitCount = 0;
+const query = document.getElementById('query');
+query.addEventListener('{canceled_event}', event => event.preventDefault());
+document.querySelector('form').addEventListener('submit', () => __submitCount++);
+query.focus();
+"#
+        ))
+        .expect("canceled key event fixture should initialize");
+
+        vm.dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+            .expect("Enter keydown should dispatch");
+
+        assert_eq!(
+            vm.eval("String(window.__submitCount)")
+                .expect("submit count should evaluate"),
+            "0",
+            "canceling {canceled_event} must suppress implicit submission"
+        );
+        assert!(vm.take_pending_location_navigation_with_seed().is_none());
+    }
+}
+
+#[test]
+fn enter_beforeinput_precedes_implicit_submission_and_can_cancel_it() {
+    for with_button in [false, true] {
+        for (event_name, key, code) in [
+            ("keydown", "Enter", "Enter"),
+            ("keypress", "Enter", "Enter"),
+            ("keypress", "", ""),
+        ] {
+            for cancel_beforeinput in [false, true] {
+                let mut vm = new_parsed_test_vm(
+                    "https://implicit-beforeinput.test/",
+                    r#"<html><body><form>
+                        <input id="query" name="q" value="moli">
+                        <button id="submitter" type="submit">Search</button>
+                    </form></body></html>"#,
+                );
+                vm.eval(&format!(
+                    r#"
+window.__events = [];
+window.__beforeInput = null;
+const query = document.getElementById('query');
+const submitter = document.getElementById('submitter');
+if (!{with_button}) submitter.remove();
+for (const type of ['keydown', 'keypress', 'keyup', 'input']) {{
+  query.addEventListener(type, () => __events.push(type));
+}}
+query.addEventListener('beforeinput', event => {{
+  __events.push('beforeinput');
+  __beforeInput = [event instanceof InputEvent, event.target === query,
+    event.inputType, event.data, event.bubbles, event.cancelable,
+    event.composed, event.isTrusted];
+  if ({cancel_beforeinput}) event.preventDefault();
+}});
+submitter.addEventListener('click', () => __events.push('click'));
+document.querySelector('form').addEventListener('submit', event => {{
+  __events.push('submit');
+  event.preventDefault();
+}});
+query.focus();
+"#
+                ))
+                .expect("implicit beforeinput fixture should initialize");
+
+                let outcome = vm
+                    .dispatch_key_event(event_name, key, code, "\r", 0, false, true)
+                    .expect("Enter character phase should dispatch");
+                vm.dispatch_key_event("keyup", "Enter", "Enter", "", 0, false, false)
+                    .expect("Enter keyup should dispatch");
+
+                let mut expected = Vec::new();
+                if event_name == "keydown" {
+                    expected.push("keydown");
+                }
+                expected.extend(["keypress", "beforeinput"]);
+                if !cancel_beforeinput {
+                    if with_button {
+                        expected.push("click");
+                    }
+                    expected.push("submit");
+                }
+                expected.push("keyup");
+                assert_eq!(
+                    vm.eval("__events.join('|')")
+                        .expect("implicit beforeinput event order should evaluate"),
+                    expected.join("|"),
+                    "with_button={with_button}, event_name={event_name}, key={key:?}, cancel_beforeinput={cancel_beforeinput}"
+                );
+                assert_eq!(
+                    vm.eval("JSON.stringify(__beforeInput)")
+                        .expect("Enter beforeinput properties should evaluate"),
+                    r#"[true,true,"insertLineBreak",null,true,true,true,true]"#
+                );
+                assert_eq!(
+                    vm.eval("query.value")
+                        .expect("input value should remain unchanged"),
+                    "moli"
+                );
+                assert!(!outcome.triggered_top_level_navigation);
+                assert!(vm.take_pending_location_navigation_with_seed().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn canceled_raw_keydown_suppresses_only_its_following_implicit_submit_char_phase() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-canceled-raw-keydown.test/",
+        r#"<html><body><form><input id="query" type="search"></form></body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__cancelKeydown = true;
+window.__submitCount = 0;
+const query = document.getElementById('query');
+query.addEventListener('keydown', event => {
+  if (__cancelKeydown) event.preventDefault();
+});
+document.querySelector('form').addEventListener('submit', event => {
+  __submitCount++;
+  event.preventDefault();
+});
+query.focus();
+"#,
+    )
+    .expect("canceled raw keydown fixture should initialize");
+
+    vm.dispatch_key_event("keydown", "Enter", "Enter", "", 0, false, false)
+        .expect("canceled raw Enter keydown should dispatch");
+    vm.dispatch_key_event("keypress", "", "", "\r", 0, false, true)
+        .expect("suppressed Enter character phase should settle");
+    assert_eq!(
+        vm.eval("String(window.__submitCount)")
+            .expect("suppressed submit count should evaluate"),
+        "0"
+    );
+
+    vm.eval("window.__cancelKeydown = false")
+        .expect("keydown cancellation should disable");
+    vm.dispatch_key_event("keydown", "Enter", "Enter", "", 0, false, false)
+        .expect("allowed raw Enter keydown should dispatch");
+    vm.dispatch_key_event("keypress", "", "", "\r", 0, false, true)
+        .expect("allowed Enter character phase should dispatch");
+    assert_eq!(
+        vm.eval("String(window.__submitCount)")
+            .expect("allowed submit count should evaluate"),
+        "1"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn implicit_submission_runs_constraint_validation() {
+    let mut vm = new_parsed_test_vm(
+        "https://implicit-constraint-validation.test/",
+        r#"<html><body><form action="/search">
+            <input id="query" name="q" type="search" required>
+            <button id="submitter" type="submit">Search</button>
+        </form></body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__events = [];
+document.getElementById('submitter').addEventListener('click', () => __events.push('click'));
+document.getElementById('query').addEventListener('invalid', () => __events.push('invalid'));
+document.querySelector('form').addEventListener('submit', () => __events.push('submit'));
+document.getElementById('query').focus();
+"#,
+    )
+    .expect("constraint validation fixture should initialize");
+
+    vm.dispatch_key_event("keydown", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter keydown should dispatch");
+
+    assert_eq!(
+        vm.eval("__events.join('|')")
+            .expect("constraint validation events should evaluate"),
+        "click|invalid"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn textarea_enter_inserts_one_newline_during_the_character_phase_without_submitting() {
+    let mut vm = new_parsed_test_vm(
+        "https://textarea-enter-character-phase.test/",
+        r#"<html><body><form><textarea id="editor">x</textarea></form></body></html>"#,
+    );
+    vm.eval(
+        r#"
+window.__submitCount = 0;
+document.querySelector('form').addEventListener('submit', () => __submitCount++);
+const editor = document.getElementById('editor');
+editor.focus();
+editor.setSelectionRange(1, 1);
+"#,
+    )
+    .expect("textarea Enter fixture should initialize");
+
+    vm.dispatch_key_event("keydown", "Enter", "Enter", "", 0, false, false)
+        .expect("raw Enter keydown should dispatch");
+    assert_eq!(
+        vm.eval("document.getElementById('editor').value")
+            .expect("textarea value after raw keydown should evaluate"),
+        "x"
+    );
+
+    vm.dispatch_key_event("keypress", "Enter", "Enter", "\r", 0, false, true)
+        .expect("Enter character phase should dispatch");
+    assert_eq!(
+        vm.eval("`${document.getElementById('editor').value}|${__submitCount}`")
+            .expect("textarea character phase state should evaluate"),
+        "x\n|0"
+    );
+    assert!(vm.take_pending_location_navigation_with_seed().is_none());
+}
+
+#[test]
+fn carriage_return_in_character_text_preserves_text_without_implicit_submission() {
+    for (control, expected_value) in [
+        (r#"<input id="editor">"#, "a b"),
+        (r#"<textarea id="editor"></textarea>"#, "a\nb"),
+    ] {
+        for (event_name, key, code) in [
+            ("keydown", "a", "KeyA"),
+            ("keydown", "", ""),
+            ("keypress", "a", ""),
+            ("keypress", "", ""),
+        ] {
+            for text in ["a\rb", "a\r\nb"] {
+                let mut vm = new_parsed_test_vm(
+                    "https://carriage-return-character-text.test/",
+                    &format!(
+                        r#"<html><body><form>{control}
+                            <button id="submitter" type="submit">Submit</button>
+                        </form></body></html>"#
+                    ),
+                );
+                vm.eval(
+                    r#"
+window.__events = [];
+const editor = document.getElementById('editor');
+for (const type of ['beforeinput', 'input']) {
+  editor.addEventListener(type, () => __events.push(type));
+}
+document.getElementById('submitter').addEventListener('click', () => __events.push('click'));
+document.querySelector('form').addEventListener('submit', event => {
+  __events.push('submit');
+  event.preventDefault();
+});
+editor.focus();
+"#,
+                )
+                .expect("carriage return text fixture should initialize");
+
+                let outcome = vm
+                    .dispatch_key_event(event_name, key, code, text, 0, false, true)
+                    .expect("character text should dispatch");
+
+                assert_eq!(
+                    vm.eval("editor.value")
+                        .expect("control value should evaluate"),
+                    expected_value,
+                    "control={control}, event_name={event_name}, key={key:?}, text={text:?}"
+                );
+                assert_eq!(
+                    vm.eval("__events.join('|')")
+                        .expect("text insertion events should evaluate"),
+                    "beforeinput|input"
+                );
+                assert!(!outcome.triggered_top_level_navigation);
+                assert!(vm.take_pending_location_navigation_with_seed().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn standalone_carriage_return_character_preserves_enter_default_actions() {
+    for (control, expected_value, expected_submit_count) in [
+        (r#"<input id="editor">"#, "", 1),
+        (r#"<textarea id="editor"></textarea>"#, "\n", 0),
+    ] {
+        let mut vm = new_parsed_test_vm(
+            "https://standalone-carriage-return.test/",
+            &format!(r#"<html><body><form>{control}</form></body></html>"#),
+        );
+        vm.eval(
+            r#"
+window.__submitCount = 0;
+document.querySelector('form').addEventListener('submit', event => {
+  __submitCount++;
+  event.preventDefault();
+});
+document.getElementById('editor').focus();
+"#,
+        )
+        .expect("standalone carriage return fixture should initialize");
+
+        let outcome = vm
+            .dispatch_key_event("keypress", "", "", "\r", 0, false, true)
+            .expect("keyless Enter character phase should dispatch");
+
+        assert_eq!(
+            vm.eval("document.getElementById('editor').value")
+                .expect("control value should evaluate"),
+            expected_value,
+            "control={control}"
+        );
+        assert_eq!(
+            vm.eval("String(__submitCount)")
+                .expect("submit count should evaluate"),
+            expected_submit_count.to_string(),
+            "control={control}"
+        );
+        assert!(!outcome.triggered_top_level_navigation);
+        assert!(vm.take_pending_location_navigation_with_seed().is_none());
+    }
+}
+
 #[test]
 fn empty_get_form_submit_replaces_existing_action_query() {
     let mut vm = new_storage_test_vm("https://form-empty-get.test/path/index.html");
@@ -4782,6 +5531,101 @@ fn empty_get_form_submit_replaces_existing_action_query() {
         .expect("empty GET form submit should queue a pending location navigation");
     assert_eq!(pending.url.as_str(), "https://form-empty-get.test/submit?");
 }
+
+#[test]
+fn textarea_hard_wrap_applies_to_disconnected_form_entries() {
+    let mut vm = new_storage_test_vm("https://textarea-disconnected-hard-wrap.test/");
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const form = document.createElement("form");
+  const textarea = form.appendChild(document.createElement("textarea"));
+  textarea.name = "value";
+  textarea.wrap = "HaRd";
+  textarea.cols = 2;
+  textarea.value = "é🙂x";
+  const data = new FormData(form);
+  return JSON.stringify([textarea.value, data.get("value")]);
+})()
+"#,
+        )
+        .expect("disconnected form entries should apply textarea hard wrapping");
+    assert_eq!(result, r#"["é🙂x","é🙂\nx"]"#);
+}
+
+#[test]
+fn textarea_hard_wrap_is_ascii_case_insensitive_in_form_entries() {
+    let mut vm = new_storage_test_vm("https://textarea-hard-wrap.test/path/index.html");
+
+    let form_data_values = vm
+        .eval(
+            r#"
+(() => {
+  const root = document.documentElement || document.appendChild(document.createElement('html'));
+  const body = document.body || root.appendChild(document.createElement('body'));
+  const form = document.createElement('form');
+  form.action = '/submit';
+  const add = (name, wrap, cols, value) => {
+    const textarea = document.createElement('textarea');
+    textarea.name = name;
+    textarea.setAttribute('wrap', wrap);
+    textarea.setAttribute('cols', cols);
+    textarea.value = value;
+    form.append(textarea);
+    return textarea;
+  };
+  const lower = add('lower', 'hard', '7', 'hello world');
+  add('mixed', 'HaRd', '7', 'hello world');
+  add('soft', 'SoFt', '7', 'hello world');
+  add('invalid', 'ſoft', '7', 'hello world');
+  add('existing', 'HARD', '3', 'ab\ncdef');
+  body.append(form);
+  const data = new FormData(form);
+  const visible = value => value.replaceAll('\n', '<LF>');
+  const result = [
+    lower.value.includes('\n'),
+    ...['lower', 'mixed', 'soft', 'invalid', 'existing'].map(name => visible(data.get(name)))
+  ].join('|');
+  form.submit();
+  return result;
+})()
+"#,
+        )
+        .expect("textarea hard-wrap form submission should evaluate");
+
+    assert_eq!(
+        form_data_values,
+        "false|hello w<LF>orld|hello w<LF>orld|hello world|hello world|ab<LF>cde<LF>f"
+    );
+
+    let pending = vm
+        .take_pending_location_navigation_with_seed()
+        .expect("textarea GET submission should queue a pending navigation");
+    let values = pending
+        .url
+        .query_pairs()
+        .into_owned()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(
+        values.get("lower").map(String::as_str),
+        Some("hello w\r\norld")
+    );
+    assert_eq!(
+        values.get("mixed").map(String::as_str),
+        Some("hello w\r\norld")
+    );
+    assert_eq!(values.get("soft").map(String::as_str), Some("hello world"));
+    assert_eq!(
+        values.get("invalid").map(String::as_str),
+        Some("hello world")
+    );
+    assert_eq!(
+        values.get("existing").map(String::as_str),
+        Some("ab\r\ncde\r\nf")
+    );
+}
+
 #[test]
 fn get_form_submit_dispatches_cancelable_navigate_event_with_source_element() {
     let mut vm = new_storage_test_vm("https://form-get-navigate.test/path/index.html");
@@ -5051,7 +5895,7 @@ fn collection_webidl_members_live_on_interface_prototypes() {
 
     assert_eq!(
         result,
-        r#"{"own":{"htmlLength":false,"nodeLength":false,"optionsLength":false,"optionsSelectedIndex":false,"optionsAdd":false,"radioValue":false},"chains":[true,true],"accessors":{"htmlLength":"get length:0:::true:true","nodeLength":"get length:0:::true:true","optionsLength":"get length:0:set length:1:true:true","selectedIndex":"get selectedIndex:0:set selectedIndex:1:true:true","radioValue":"get value:0:set value:1:true:true"},"methods":{"htmlItem":"item:1:true:true:true","namedItem":"namedItem:1:true:true:true","nodeItem":"item:1:false:true:true","add":"add:1:true:true:true","remove":"remove:1:true:true:true"},"borrowed":[2,1,"second",false,true],"forged":["TypeError","TypeError","TypeError"],"crossBrand":["TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError"],"tags":["[object HTMLOptionsCollection]","[object RadioNodeList]"]}"#
+        r#"{"own":{"htmlLength":false,"nodeLength":false,"optionsLength":false,"optionsSelectedIndex":false,"optionsAdd":false,"radioValue":false},"chains":[true,true],"accessors":{"htmlLength":"get length:0:::true:true","nodeLength":"get length:0:::true:true","optionsLength":"get length:0:set length:1:true:true","selectedIndex":"get selectedIndex:0:set selectedIndex:1:true:true","radioValue":"get value:0:set value:1:true:true"},"methods":{"htmlItem":"item:1:true:true:true","namedItem":"namedItem:1:true:true:true","nodeItem":"item:1:true:true:true","add":"add:1:true:true:true","remove":"remove:1:true:true:true"},"borrowed":[2,1,"second",false,true],"forged":["TypeError","TypeError","TypeError"],"crossBrand":["TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError","TypeError"],"tags":["[object HTMLOptionsCollection]","[object RadioNodeList]"]}"#
     );
 }
 
@@ -5173,4 +6017,123 @@ fn disconnected_radio_groups_follow_tree_roots_and_form_owners() {
         result,
         "true|true:false|true|true:false|true|true|true:true|false:true"
     );
+}
+
+#[test]
+fn native_form_keywords_resolve_from_owner_for_get_and_post() {
+    for depth in 0usize..=2 {
+        for target in ["_self", "_PARENT", "_top"] {
+            for method in ["get", "post"] {
+                for api in ["submit", "requestSubmit"] {
+                    let mut vm = new_parsed_test_vm(
+                        "https://form-target.test/source",
+                        "<!doctype html><body></body>",
+                    );
+                    vm.eval(&format!(r#"
+                        (() => {{
+                            let source=document;
+                            for(let i=0;i<{depth};i++) {{
+                                const frame=source.createElement('iframe');
+                                (source.body||source.documentElement||source).appendChild(frame);
+                                frame.srcdoc='<body></body>';
+                                source=frame.contentDocument;
+                            }}
+                            const form=source.createElement('form');
+                            form.method={method:?};form.target={target:?};
+                            form.action='https://form-target.test/submitted';
+                            const input=source.createElement('input');input.name='value';input.value='b';
+                            form.appendChild(input);source.body.appendChild(form);
+                            HTMLFormElement.prototype[{api:?}].call(form);
+                        }})()
+                    "#)).expect("cross-realm native form submission");
+                    let expected_depth = match target {
+                        "_top" => 0,
+                        "_PARENT" => depth.saturating_sub(1),
+                        _ => depth,
+                    };
+                    let expected_url = if method == "get" {
+                        "https://form-target.test/submitted?value=b"
+                    } else {
+                        "https://form-target.test/submitted"
+                    };
+                    let description =
+                        format!("depth={depth} target={target} method={method} api={api}");
+                    let root_pending = vm.take_pending_location_navigation_with_seed();
+                    if expected_depth == 0 {
+                        let pending = root_pending.expect(&description);
+                        assert_eq!(pending.url.as_str(), expected_url, "{description}");
+                        assert_eq!(
+                            pending.request_method,
+                            method.to_ascii_uppercase(),
+                            "{description}"
+                        );
+                        assert_eq!(
+                            pending.request_body.as_deref(),
+                            (method == "post").then_some(&b"value=b"[..]),
+                            "{description}"
+                        );
+                    } else {
+                        assert!(
+                            root_pending.is_none(),
+                            "{description}: must retain top document"
+                        );
+                    }
+                    let mut parent_handle = None;
+                    for index in 0..depth {
+                        let host = vm._context_host.borrow();
+                        let handle = parent_handle
+                            .map_or_else(
+                                || host.child_browsing_context_handle_by_index(0),
+                                |parent| {
+                                    host.child_browsing_context_child_frame_handle_by_index(
+                                        parent, 0,
+                                    )
+                                },
+                            )
+                            .expect(&description);
+                        parent_handle = Some(handle);
+                        let pending =
+                            host.child_browsing_context_pending_live_navigation_for_test(handle);
+                        if expected_depth != index + 1 {
+                            assert!(
+                                pending.is_none(),
+                                "{description}: unexpected frame {index} navigation: {pending:?}"
+                            );
+                            continue;
+                        }
+                        use crate::native_bridge::ChildBrowsingContextBootstrap;
+                        match pending.expect(&description) {
+                            ChildBrowsingContextBootstrap::Url(url) if method == "get" => {
+                                assert_eq!(url.as_str(), expected_url, "{description}")
+                            }
+                            ChildBrowsingContextBootstrap::Request(request) => {
+                                assert_eq!(request.url.as_str(), expected_url, "{description}");
+                                assert_eq!(
+                                    request.method,
+                                    method.to_ascii_uppercase(),
+                                    "{description}"
+                                );
+                                assert_eq!(
+                                    request.body.as_deref(),
+                                    (method == "post").then_some(&b"value=b"[..]),
+                                    "{description}"
+                                );
+                                if method == "post" {
+                                    assert_eq!(
+                                        request.request_headers,
+                                        vec![(
+                                            "Content-Type".into(),
+                                            "application/x-www-form-urlencoded".into()
+                                        )],
+                                        "{description}"
+                                    );
+                                }
+                            }
+                            other => panic!("{description}: unexpected request {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

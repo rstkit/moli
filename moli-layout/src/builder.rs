@@ -13,13 +13,14 @@ use std::{
 };
 
 use crate::{
-    LayoutAnonymousReason, LayoutBoxId, LayoutBoxKind, LayoutCapabilityDiagnostic, LayoutDisplay,
-    LayoutElementCategory, LayoutElementSemantics, LayoutError, LayoutPseudo, LayoutSource,
-    LayoutSourceKind, LayoutStyleResolver, LayoutWorld, ResolvedLayoutPseudoStyle,
-    ResolvedLayoutStyle,
+    AnonymousInlineRunRole, ChildBoxPolicy, LayoutAnonymousReason, LayoutAnonymousStyleContext,
+    LayoutBoxId, LayoutBoxKind, LayoutCapabilityDiagnostic, LayoutDisplay, LayoutElementCategory,
+    LayoutElementSemantics, LayoutError, LayoutPseudo, LayoutSource, LayoutSourceKind,
+    LayoutStyleResolver, LayoutWorld, ResolvedLayoutPseudoStyle, ResolvedLayoutStyle,
     form::form_control_context,
     replaced::ReplacedContext,
-    style::{InlineWhiteSpaceCollapse, LayoutOverflowMode},
+    style::LayoutOverflowMode,
+    text_is_ignorable_in_anonymous_run,
     world::{ViewportDefiningBox, ViewportScrollPolicy},
 };
 use style::values::generics::image::GenericImage;
@@ -50,17 +51,6 @@ where
     source_root: Option<S::NodeId>,
     root_is_html: bool,
     viewport_body_candidate: Option<ViewportBodyCandidate<S::NodeId>>,
-}
-
-/// Selects both the generated wrapper and its whitespace-suppression rule.
-/// Mixed block/inline flow follows `white-space-collapse`; Flex and Grid omit
-/// an all-CSS-whitespace text sequence before generating an anonymous item,
-/// even when the inherited whitespace mode preserves those characters.
-#[derive(Clone, Copy)]
-enum AnonymousInlineRunRole {
-    MixedFlow,
-    FlexItem,
-    GridItem,
 }
 
 impl AnonymousInlineRunRole {
@@ -101,6 +91,7 @@ where
     }
 
     fn build(mut self) -> Result<LayoutWorld<S::NodeId>, LayoutError> {
+        let profile_started = moli_trace::cpu_profile_enabled().then(std::time::Instant::now);
         let source_root = self.source.root();
         let source_label = self.source.label(source_root);
         if let Some(parent) = self.source.flat_parent(source_root) {
@@ -137,7 +128,9 @@ where
             root_style.force_display_none();
         }
         if root_semantics.is_replaced() {
-            root_style.mark_replaced();
+            root_style.mark_replaced(
+                root_semantics.replaced == Some(crate::LayoutReplacedKind::FormControl),
+            );
         } else if matches!(
             root_semantics.category,
             crate::LayoutElementCategory::FormControl(crate::LayoutFormControlKind::Button)
@@ -162,6 +155,7 @@ where
             root.source = None;
         }
         let mut world = LayoutWorld::new(root, self.source.root_is_document_element());
+        world.quirks_mode = self.source.quirks_mode();
         let root_box = world.root();
         if root_generates_principal_box {
             world.map_source(source_root, root_box);
@@ -172,7 +166,10 @@ where
         if !matches!(
             root_style.display(),
             LayoutDisplay::None | LayoutDisplay::Contents
-        ) && !is_leaf_element(&root_semantics, root_kind, &root_style)
+        ) && root_semantics
+            .category
+            .child_box_policy(root_semantics.is_replaced(), root_style.display())
+            != ChildBoxPolicy::None
         {
             self.populate_root(
                 &mut world,
@@ -184,9 +181,28 @@ where
             )?;
         }
 
+        let construction_finished = profile_started.map(|_| std::time::Instant::now());
+        let allocated_box_count = world.boxes.len();
         world.compact_reachable();
         self.finalize_viewport_scroll_policy(&mut world);
+        let finalization_finished = profile_started.map(|_| std::time::Instant::now());
         world.validate_invariants()?;
+        if let (Some(started), Some(constructed), Some(finalized)) = (
+            profile_started,
+            construction_finished,
+            finalization_finished,
+        ) {
+            tracing::info!(
+                target: "moli_cpu_profile",
+                stage = "layout_box_construction",
+                root = ?source_root,
+                construction_us = constructed.duration_since(started).as_micros(),
+                finalization_us = finalized.duration_since(constructed).as_micros(),
+                validation_us = finalized.elapsed().as_micros(),
+                allocated_box_count,
+                compacted_box_count = world.boxes.len(),
+            );
+        }
         world.css_image_references = self.css_image_references;
         Ok(world)
     }
@@ -285,7 +301,9 @@ where
             }
             let metrics = self.source.replaced_metrics(source_node);
             if semantics.is_replaced() {
-                style.mark_replaced();
+                style.mark_replaced(
+                    semantics.replaced == Some(crate::LayoutReplacedKind::FormControl),
+                );
             } else if matches!(
                 semantics.category,
                 crate::LayoutElementCategory::FormControl(crate::LayoutFormControlKind::Button)
@@ -319,9 +337,20 @@ where
                         metrics,
                     );
                     let id = world.allocate(box_node);
+                    if matches!(
+                        semantics.category,
+                        crate::LayoutElementCategory::FormControl(_)
+                    ) {
+                        world.boxes[id.index()].text_selection =
+                            self.source.text_selection(source_node);
+                    }
                     world.map_source(source_node, id);
 
-                    if is_leaf_element(&semantics, kind, &style) {
+                    if semantics
+                        .category
+                        .child_box_policy(semantics.is_replaced(), style.display())
+                        == ChildBoxPolicy::None
+                    {
                         return Ok(vec![id]);
                     }
 
@@ -375,6 +404,7 @@ where
             root_style.viewport_scrollbar_gutter(),
             root_style.scrollbar_colors(),
             root_style.uses_horizontal_writing_mode(),
+            self.source.disables_viewport_user_scrolling(),
         );
     }
 
@@ -544,23 +574,28 @@ where
         // parent for containing-block and CSSOM ancestry.
         world.record_structural_children(box_id, &children)?;
         let table_role = self.table_role(world, box_id)?;
-        let children = if table_role == Some(TableBoxRole::Column) {
-            Vec::new()
-        } else if table_role == Some(TableBoxRole::ColumnGroup) {
-            self.normalize_table_column_group(world, children)?
-        } else if matches!(
-            table_role,
-            Some(TableBoxRole::Root | TableBoxRole::RowGroup | TableBoxRole::Row)
-        ) {
-            self.normalize_structural_table_children(
-                world,
-                owner,
-                parent_style,
-                table_role.expect("matched structural table role"),
-                children,
-            )?
-        } else {
-            self.normalize_missing_table_parents(world, owner, parent_style, children)?
+        let children = match LayoutElementCategory::Generic
+            .child_box_policy(false, parent_style.display())
+        {
+            ChildBoxPolicy::None => Vec::new(),
+            ChildBoxPolicy::ColumnsOnly => self.normalize_table_column_group(world, children)?,
+            ChildBoxPolicy::All
+                if matches!(
+                    table_role,
+                    Some(TableBoxRole::Root | TableBoxRole::RowGroup | TableBoxRole::Row)
+                ) =>
+            {
+                self.normalize_structural_table_children(
+                    world,
+                    owner,
+                    parent_style,
+                    table_role.expect("matched structural table role"),
+                    children,
+                )?
+            }
+            ChildBoxPolicy::All => {
+                self.normalize_missing_table_parents(world, owner, parent_style, children)?
+            }
         };
 
         if allow_inline_split
@@ -746,9 +781,21 @@ where
             if has_inline {
                 return Ok(children);
             }
+            // A structural inline shares its parent's formatting context.
+            // Its nonempty whitespace can survive between outside siblings;
+            // leave collapsing to the complete inline normalization pass.
+            // Empty generated text still does not create a text child.
+            let preserve_whitespace = parent_style.display().is_inline_flow();
             return Ok(children
                 .into_iter()
-                .filter(|id| !self.is_ignorable_whitespace_text(world, *id))
+                .filter(|id| {
+                    !self.is_ignorable_whitespace_text(world, *id)
+                        || (preserve_whitespace
+                            && world.boxes[id.index()]
+                                .text
+                                .as_deref()
+                                .is_some_and(|text| !text.is_empty()))
+                })
                 .collect());
         }
         if !has_inline {
@@ -864,9 +911,10 @@ where
             run.clear();
             return Ok(());
         }
-        let style = self
-            .styles
-            .anonymous_style(owner, parent_style, LayoutDisplay::Block)?;
+        let style = self.styles.anonymous_style(
+            LayoutAnonymousStyleContext::new(owner, parent_style),
+            LayoutDisplay::Block,
+        )?;
         let mut anonymous = LayoutWorld::new_box(
             None,
             Some(owner),
@@ -1125,7 +1173,10 @@ where
             return Ok(last);
         }
 
-        let style = self.styles.anonymous_style(owner, parent_style, display)?;
+        let style = self.styles.anonymous_style(
+            LayoutAnonymousStyleContext::new(owner, parent_style),
+            display,
+        )?;
         let id = world.allocate(LayoutWorld::new_box(
             None,
             Some(owner),
@@ -1174,18 +1225,7 @@ where
         let layout_box = world
             .box_by_id(id)
             .ok_or(LayoutError::InvalidBoxReference { index: id.index() })?;
-        Ok(match layout_box.style.display() {
-            LayoutDisplay::Table | LayoutDisplay::InlineTable => Some(TableBoxRole::Root),
-            LayoutDisplay::TableCaption => Some(TableBoxRole::Caption),
-            LayoutDisplay::TableRowGroup
-            | LayoutDisplay::TableHeaderGroup
-            | LayoutDisplay::TableFooterGroup => Some(TableBoxRole::RowGroup),
-            LayoutDisplay::TableColumnGroup => Some(TableBoxRole::ColumnGroup),
-            LayoutDisplay::TableColumn => Some(TableBoxRole::Column),
-            LayoutDisplay::TableRow => Some(TableBoxRole::Row),
-            LayoutDisplay::TableCell => Some(TableBoxRole::Cell),
-            _ => None,
-        })
+        Ok(TableBoxRole::from_display(layout_box.style.display()))
     }
 
     fn is_inline_in_flow(&self, world: &LayoutWorld<S::NodeId>, id: LayoutBoxId) -> bool {
@@ -1362,40 +1402,6 @@ fn build_replaced_context(
     })
 }
 
-fn whitespace_text_is_ignorable(text: &str, mode: InlineWhiteSpaceCollapse) -> bool {
-    if text.is_empty() {
-        return true;
-    }
-    if !text_contains_only_css_whitespace(text) {
-        return false;
-    }
-    match mode {
-        InlineWhiteSpaceCollapse::Collapse => true,
-        InlineWhiteSpaceCollapse::PreserveBreaks => !text
-            .chars()
-            .any(|character| matches!(character, '\n' | '\r' | '\u{000C}')),
-        InlineWhiteSpaceCollapse::Preserve | InlineWhiteSpaceCollapse::BreakSpaces => false,
-    }
-}
-
-fn text_contains_only_css_whitespace(text: &str) -> bool {
-    text.chars()
-        .all(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000C}'))
-}
-
-fn text_is_ignorable_in_anonymous_run(
-    text: &str,
-    mode: InlineWhiteSpaceCollapse,
-    run_role: AnonymousInlineRunRole,
-) -> bool {
-    match run_role {
-        AnonymousInlineRunRole::MixedFlow => whitespace_text_is_ignorable(text, mode),
-        AnonymousInlineRunRole::FlexItem | AnonymousInlineRunRole::GridItem => {
-            text_contains_only_css_whitespace(text)
-        }
-    }
-}
-
 fn principal_kind(
     semantics: &LayoutElementSemantics,
     style: &ResolvedLayoutStyle,
@@ -1436,52 +1442,7 @@ fn principal_kind(
     }
 }
 
-fn is_leaf_element(
-    semantics: &LayoutElementSemantics,
-    kind: LayoutBoxKind,
-    style: &ResolvedLayoutStyle,
-) -> bool {
-    semantics.is_replaced()
-        || semantics.category == LayoutElementCategory::LineBreak
-        || kind == LayoutBoxKind::TableColumn
-        || style.display() == LayoutDisplay::TableColumn
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TableBoxRole {
-    Root,
-    Caption,
-    RowGroup,
-    ColumnGroup,
-    Column,
-    Row,
-    Cell,
-}
-
-impl TableBoxRole {
-    const fn requires_parent(self) -> bool {
-        !matches!(self, Self::Root)
-    }
-
-    const fn is_direct_table_child(self) -> bool {
-        matches!(
-            self,
-            Self::Caption | Self::RowGroup | Self::ColumnGroup | Self::Column
-        )
-    }
-
-    const fn debug_name(self) -> &'static str {
-        match self {
-            Self::Root => "table-root",
-            Self::Caption => "table-caption",
-            Self::RowGroup => "table-row-group",
-            Self::ColumnGroup => "table-column-group",
-            Self::Column => "table-column",
-            Self::Row => "table-row",
-            Self::Cell => "table-cell",
-        }
-    }
-}
+use crate::table_role::TableRole as TableBoxRole;
 
 fn push_diagnostic(
     diagnostics: &mut Vec<LayoutCapabilityDiagnostic>,
@@ -1489,74 +1450,5 @@ fn push_diagnostic(
 ) {
     if !diagnostics.contains(&diagnostic) {
         diagnostics.push(diagnostic);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        AnonymousInlineRunRole, InlineWhiteSpaceCollapse, text_contains_only_css_whitespace,
-        text_is_ignorable_in_anonymous_run, whitespace_text_is_ignorable,
-    };
-
-    #[test]
-    fn only_collapsible_whitespace_is_ignorable_during_box_construction() {
-        assert!(whitespace_text_is_ignorable(
-            " \t\n",
-            InlineWhiteSpaceCollapse::Collapse,
-        ));
-        assert!(whitespace_text_is_ignorable(
-            " \t",
-            InlineWhiteSpaceCollapse::PreserveBreaks,
-        ));
-        assert!(!whitespace_text_is_ignorable(
-            "\n",
-            InlineWhiteSpaceCollapse::PreserveBreaks,
-        ));
-        assert!(!whitespace_text_is_ignorable(
-            "\n",
-            InlineWhiteSpaceCollapse::Preserve,
-        ));
-        assert!(!whitespace_text_is_ignorable(
-            " ",
-            InlineWhiteSpaceCollapse::BreakSpaces,
-        ));
-        assert!(!whitespace_text_is_ignorable(
-            "\u{00a0}",
-            InlineWhiteSpaceCollapse::Collapse,
-        ));
-    }
-
-    #[test]
-    fn flex_and_grid_item_runs_ignore_css_whitespace_independently_of_collapse_mode() {
-        assert!(text_contains_only_css_whitespace(" \t\n\r\u{000C}"));
-        assert!(!text_contains_only_css_whitespace("\u{00a0}"));
-
-        for role in [
-            AnonymousInlineRunRole::FlexItem,
-            AnonymousInlineRunRole::GridItem,
-        ] {
-            assert!(text_is_ignorable_in_anonymous_run(
-                " \t\n\r\u{000C}",
-                InlineWhiteSpaceCollapse::Preserve,
-                role,
-            ));
-            assert!(!text_is_ignorable_in_anonymous_run(
-                "\u{00a0}",
-                InlineWhiteSpaceCollapse::Collapse,
-                role,
-            ));
-            assert!(!text_is_ignorable_in_anonymous_run(
-                " text ",
-                InlineWhiteSpaceCollapse::Preserve,
-                role,
-            ));
-        }
-
-        assert!(!text_is_ignorable_in_anonymous_run(
-            " \n",
-            InlineWhiteSpaceCollapse::Preserve,
-            AnonymousInlineRunRole::MixedFlow,
-        ));
     }
 }

@@ -3,20 +3,18 @@
 mod callback;
 mod dom_access;
 mod intersection;
+mod mutation_record;
 mod schedule;
 
-pub(crate) use callback::ObserverCallbackId;
-#[cfg(test)]
-pub(crate) use dom_access::callback_binding_count_for_test;
+pub(crate) use mutation_record::install_template_bindings as install_mutation_record_template_bindings;
+
 pub(crate) use dom_access::{
-    ObserverCallbackResidence, ObserverStoreAccessToken, activate_performance_observer_callback,
-    active_performance_observer_callbacks, callback_is_current,
-    coalesce_child_list_replacement_records, deactivate_performance_observer_callback,
-    flush_slotchange_microtask, prepare_callback, queue_intersection_checks,
-    queue_mutation_records, register_callback, retire_context_token,
+    ObserverStoreAccessToken, coalesce_child_list_replacement_records, flush_slotchange_microtask,
+    queue_intersection_checks, queue_mutation_records, retire_context_token,
     retire_execution_context_owner,
 };
 
+use crate::web_api_interfaces;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -30,23 +28,23 @@ use crate::dom::native::{
     DomHost, DomMutationEffects, DomMutationRecord, DomMutationRecordKind, NativeNodeId,
 };
 use crate::webidl;
+use indexmap::IndexSet;
 use moli_css_parse::{normalize_root_margin, root_margin_components};
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 use super::{
-    context_bootstrap::build_dom_rect_object,
-    host::report_event_callback_exception,
-    native_bridge::document::{DETACHED_STATE_SLOT, detached_native_handle_for_runtime},
-    native_bridge::{JsContextHost, callback_value_dom_handle, wrapped_handle_value},
+    context_bootstrap::{build_dom_rect_object, throw_dom_exception_value},
+    native_bridge::document::detached_native_handle_for_runtime,
+    native_bridge::{PageScriptHost, callback_value_dom_handle, wrapped_handle_value},
     native_bridge::{
         compute_mock_intersection_client_rect, compute_mock_intersection_scrollport_client_rect,
     },
     util::{
         callback_data_index_value, callback_data_item, context_host_ptr_from_global_bridge,
-        get_private_object, get_private_value, global_constructor_prototype, serialize_v8_array,
-        serialize_v8_iter_array, throw_range_error, throw_type_error, v8_string, v8str,
+        get_private_value, serialize_v8_array, serialize_v8_iter_array, set_private_value,
+        throw_range_error, throw_type_error, v8_string, v8str,
     },
-    window_webidl_callback::WindowWebIdlCallbackFunctionOutcome,
+    webidl_callback_execution::PreparedWebIdlCallbackExecution,
 };
 
 const MUTATION_OBSERVER_ID_SLOT: &str = "__lmMutationObserverId";
@@ -82,22 +80,7 @@ const ROOTLESS_IO_VERTICAL_GEOMETRY_PROPERTIES: [&str; 18] = [
 ];
 
 #[derive(WebApiObject)]
-#[webapi(interface = "MutationRecord", data_properties, enumerable)]
-struct MutationRecordDeclaration<'scope> {
-    target: v8::Local<'scope, v8::Value>,
-    #[webapi(data_property = "type")]
-    record_type: v8::Local<'scope, v8::Value>,
-    attribute_name: v8::Local<'scope, v8::Value>,
-    attribute_namespace: v8::Local<'scope, v8::Value>,
-    old_value: v8::Local<'scope, v8::Value>,
-    added_nodes: v8::Local<'scope, v8::Value>,
-    removed_nodes: v8::Local<'scope, v8::Value>,
-    previous_sibling: v8::Local<'scope, v8::Value>,
-    next_sibling: v8::Local<'scope, v8::Value>,
-}
-
-#[derive(WebApiObject)]
-#[webapi(interface = "IntersectionObserverEntry")]
+#[webapi(interface = web_api_interfaces::IntersectionObserverEntry)]
 struct IntersectionObserverEntryDeclaration<'scope> {
     #[webapi(slot = "__moliIntersectionEntryTarget")]
     target: v8::Local<'scope, v8::Value>,
@@ -118,7 +101,7 @@ struct IntersectionObserverEntryDeclaration<'scope> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "IntersectionObserver", enumerable)]
+#[webapi(interface = web_api_interfaces::IntersectionObserver, enumerable, receiver)]
 struct IntersectionObserverPrototypeAccessorsDeclaration {
     #[webapi(accessor_property, getter = intersection_observer_attribute_getter_callback, data = callback_data_index_value(scope, 0))]
     root: (),
@@ -135,7 +118,11 @@ struct IntersectionObserverPrototypeAccessorsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "IntersectionObserverEntry", enumerable, receiver = is_intersection_observer_entry)]
+#[webapi(
+    interface = web_api_interfaces::IntersectionObserverEntry,
+    enumerable,
+    receiver
+)]
 struct IntersectionObserverEntryPrototypeAccessorsDeclaration {
     #[webapi(accessor_property, getter = intersection_observer_entry_attribute_getter_callback, data = callback_data_index_value(scope, 0))]
     time: (),
@@ -157,7 +144,6 @@ struct IntersectionObserverEntryPrototypeAccessorsDeclaration {
 
 #[derive(Default)]
 pub(super) struct ObserverStore {
-    callback_registry: callback::ObserverCallbackRegistry,
     next_mutation_observer_id: u32,
     mutation_observers: HashMap<u32, MutationObserverState>,
     mutation_delivery_scheduled: bool,
@@ -311,6 +297,54 @@ pub(super) struct MutationObserverOptions {
     attribute_filter: Option<HashSet<String>>,
 }
 
+impl TryFrom<MutationObserverInit> for MutationObserverOptions {
+    type Error = &'static str;
+
+    fn try_from(init: MutationObserverInit) -> Result<Self, Self::Error> {
+        let attributes = init
+            .attributes
+            .unwrap_or(init.attribute_old_value.is_some() || init.attribute_filter.is_some());
+        let character_data = init
+            .character_data
+            .unwrap_or(init.character_data_old_value.is_some());
+        let attribute_old_value = init.attribute_old_value.unwrap_or(false);
+        let character_data_old_value = init.character_data_old_value.unwrap_or(false);
+
+        if !init.child_list && !attributes && !character_data {
+            return Err(
+                "Failed to execute 'observe' on 'MutationObserver': at least one of childList, attributes, or characterData must be true.",
+            );
+        }
+        if !attributes && (attribute_old_value || init.attribute_filter.is_some()) {
+            return Err(
+                "Failed to execute 'observe' on 'MutationObserver': attributeOldValue and attributeFilter require attributes to be true.",
+            );
+        }
+        if !character_data && character_data_old_value {
+            return Err(
+                "Failed to execute 'observe' on 'MutationObserver': characterDataOldValue requires characterData to be true.",
+            );
+        }
+
+        Ok(Self {
+            child_list: init.child_list,
+            attributes,
+            character_data,
+            subtree: init.subtree,
+            attribute_old_value,
+            character_data_old_value,
+            // Native mutation local names are UTF-8. Ill-formed UTF-16 entries
+            // cannot match them; retain the filter even if no entries can match.
+            attribute_filter: init.attribute_filter.map(|names| {
+                names
+                    .into_iter()
+                    .filter_map(|name| String::from_utf16(&name.0).ok())
+                    .collect()
+            }),
+        })
+    }
+}
+
 #[derive(Clone)]
 struct QueuedMutationRecord {
     target: NativeNodeId,
@@ -351,7 +385,8 @@ enum QueuedMutationRecordKind {
 struct IntersectionObserverState {
     observer: v8::Global<v8::Object>,
     callback: callback::ObserverCallback,
-    observed_targets: HashSet<NativeNodeId>,
+    // Preserve observation order; duplicate observe() leaves the position unchanged.
+    observed_targets: IndexSet<NativeNodeId>,
     queued_entries: Vec<QueuedIntersectionEntry>,
     last_reported_entries: HashMap<NativeNodeId, LastReportedIntersection>,
     options: IntersectionObserverOptions,
@@ -398,19 +433,44 @@ struct MutationObserverConstructorArgs {
     callback: webidl::WebIdlCallbackFunction,
 }
 
+#[derive(Default, webidl::WebIdlDictionary)]
+#[webidl(prefix = "MutationObserverInit")]
+struct MutationObserverInit {
+    #[webidl(sequence, converter = "raw")]
+    attribute_filter: Option<Vec<webidl::DomString16>>,
+    attribute_old_value: Option<bool>,
+    attributes: Option<bool>,
+    character_data: Option<bool>,
+    character_data_old_value: Option<bool>,
+    #[webidl(default = false)]
+    child_list: bool,
+    #[webidl(default = false)]
+    subtree: bool,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "MutationObserver.observe")]
+struct MutationObserverObserveArgs<'s> {
+    #[webidl(required, interface = web_api_interfaces::Node)]
+    target: v8::Local<'s, v8::Object>,
+    #[webidl(dictionary, default = MutationObserverInit::default())]
+    options: MutationObserverInit,
+}
+
 #[derive(webidl::WebIdlDictionary)]
 #[webidl(prefix = "IntersectionObserverInit")]
-struct IntersectionObserverInitMembers<'s> {
-    #[webidl(legacy_nullish, converter = "raw")]
-    root: Option<v8::Local<'s, v8::Value>>,
+struct IntersectionObserverInitMembers {
+    // The derive converts members in lexical order of their final JavaScript names.
+    #[webidl(default = 0)]
+    delay: i32,
+    #[webidl(with = intersection_observer_root_member)]
+    root: Option<NativeNodeId>,
     #[webidl(default = "0px")]
     root_margin: String,
     #[webidl(default = "0px")]
     scroll_margin: String,
-    #[webidl(legacy_nullish, converter = "raw")]
-    threshold: Option<v8::Local<'s, v8::Value>>,
-    #[webidl(default = 0)]
-    delay: i32,
+    #[webidl(with = intersection_observer_threshold_member)]
+    threshold: Vec<f64>,
     #[webidl(default = false)]
     track_visibility: bool,
 }
@@ -470,7 +530,7 @@ impl ObserverStore {
                 queued_records: Vec::new(),
             },
         );
-        define_hidden_value(
+        set_private_value(
             scope,
             observer,
             MUTATION_OBSERVER_ID_SLOT,
@@ -655,13 +715,13 @@ impl ObserverStore {
             IntersectionObserverState {
                 observer: v8::Global::new(scope, observer),
                 callback,
-                observed_targets: HashSet::new(),
+                observed_targets: IndexSet::new(),
                 queued_entries: Vec::new(),
                 last_reported_entries: HashMap::new(),
                 options,
             },
         );
-        define_hidden_value(
+        set_private_value(
             scope,
             observer,
             INTERSECTION_OBSERVER_ID_SLOT,
@@ -695,7 +755,7 @@ impl ObserverStore {
         let Some(state) = self.intersection_observers.get_mut(&id) else {
             return;
         };
-        state.observed_targets.remove(&target);
+        state.observed_targets.shift_remove(&target);
         state
             .queued_entries
             .retain(|queued| queued.target != target);
@@ -748,6 +808,7 @@ impl ObserverStore {
     fn collect_mutation_deliveries<'s>(
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
+        host_ptr: *mut PageScriptHost,
     ) -> Vec<MutationObserverDelivery<'s>> {
         let mut deliveries = Vec::new();
         let mut ids: Vec<_> = self.mutation_observers.keys().copied().collect();
@@ -760,10 +821,13 @@ impl ObserverStore {
                 continue;
             }
             let records = mem::take(&mut state.queued_records);
+            let Some(callback) = state.callback.prepare(scope, host_ptr) else {
+                continue;
+            };
             let observer = v8::Local::new(scope, &state.observer);
             deliveries.push(MutationObserverDelivery {
                 observer,
-                callback: state.callback.prepare(scope),
+                callback,
                 records,
             });
         }
@@ -773,6 +837,7 @@ impl ObserverStore {
     fn collect_intersection_deliveries<'s>(
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
+        host_ptr: *mut PageScriptHost,
     ) -> Vec<IntersectionObserverDelivery<'s>> {
         let mut deliveries = Vec::new();
         for state in self.intersection_observers.values_mut() {
@@ -780,10 +845,13 @@ impl ObserverStore {
                 continue;
             }
             let entries = mem::take(&mut state.queued_entries);
+            let Some(callback) = state.callback.prepare(scope, host_ptr) else {
+                continue;
+            };
             let observer = v8::Local::new(scope, &state.observer);
             deliveries.push(IntersectionObserverDelivery {
                 observer,
-                callback: state.callback.prepare(scope),
+                callback,
                 entries,
                 options: state.options.clone(),
             });
@@ -795,20 +863,14 @@ impl ObserverStore {
         &mut self,
         owner: crate::native_bridge::WindowExecutionContextOwner,
     ) -> usize {
-        self.callback_registry
-            .retire_execution_context_owner(owner)
-            .saturating_add(self.retain_callbacks(|callback| !callback.is_owned_by(owner)))
+        self.retain_callbacks(|callback| !callback.is_owned_by(owner))
     }
 
     fn retire_context_token(
         &mut self,
         context_token: crate::native_bridge::RuntimeObservableContextToken,
     ) -> usize {
-        self.callback_registry
-            .retire_context_token(context_token)
-            .saturating_add(
-                self.retain_callbacks(|callback| !callback.belongs_to_context_token(context_token)),
-            )
+        self.retain_callbacks(|callback| !callback.belongs_to_context_token(context_token))
     }
 
     fn retain_callbacks(
@@ -827,83 +889,67 @@ impl ObserverStore {
 
 struct MutationObserverDelivery<'s> {
     observer: v8::Local<'s, v8::Object>,
-    callback: callback::PreparedObserverCallback,
+    callback: PreparedWebIdlCallbackExecution,
     records: Vec<QueuedMutationRecord>,
 }
 
 struct IntersectionObserverDelivery<'s> {
     observer: v8::Local<'s, v8::Object>,
-    callback: callback::PreparedObserverCallback,
+    callback: PreparedWebIdlCallbackExecution,
     entries: Vec<QueuedIntersectionEntry>,
     options: IntersectionObserverOptions,
 }
 
 fn invoke_mutation_deliveries<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     deliveries: Vec<MutationObserverDelivery<'s>>,
 ) {
     for delivery in deliveries {
-        if !delivery.callback.is_current(unsafe { &*host_ptr }) {
+        if !delivery.callback.is_current(scope) {
             continue;
         }
-        let records_array = build_mutation_records_array(scope, host_ptr, &delivery.records);
+        let callback_context = delivery.callback.relevant_context(scope);
+        let records_array = {
+            let scope = &mut v8::ContextScope::new(scope, callback_context);
+            build_mutation_records_array(scope, host_ptr, &delivery.records)
+        };
         let observer_value: v8::Local<'_, v8::Value> = delivery.observer.into();
-        match delivery.callback.invoke(
+        delivery.callback.invoke_and_report(
             scope,
-            host_ptr,
+            "mutationobserver",
             "MutationObserver callback",
             observer_value,
             &[records_array.into(), observer_value],
-        ) {
-            WindowWebIdlCallbackFunctionOutcome::Threw(report) => {
-                report_event_callback_exception(
-                    scope,
-                    host_ptr,
-                    "mutationobserver",
-                    delivery.callback.relevant_identity(),
-                    None,
-                    &report,
-                );
-            }
-            WindowWebIdlCallbackFunctionOutcome::Returned
-            | WindowWebIdlCallbackFunctionOutcome::Retired => {}
-        }
+        );
     }
 }
 
 fn invoke_intersection_deliveries<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     deliveries: Vec<IntersectionObserverDelivery<'s>>,
 ) {
     for delivery in deliveries {
-        if !delivery.callback.is_current(unsafe { &*host_ptr }) {
+        if !delivery.callback.is_current(scope) {
             continue;
         }
-        let entries =
-            build_intersection_entries_array(scope, host_ptr, &delivery.options, &delivery.entries);
+        let callback_context = delivery.callback.relevant_context(scope);
+        // Web IDL argument conversion uses the callback's relevant Realm,
+        // which can differ from the observer's creation Realm. Enter it before
+        // projecting native targets and binding the entry/rect/array wrappers.
+        let entries = {
+            let scope = &mut v8::ContextScope::new(scope, callback_context);
+            build_intersection_entries_array(scope, host_ptr, &delivery.options, &delivery.entries)
+        };
         let observer_value: v8::Local<'_, v8::Value> = delivery.observer.into();
-        match delivery.callback.invoke(
+        delivery.callback.invoke_and_report(
             scope,
-            host_ptr,
+            "intersectionobserver",
             "IntersectionObserver callback",
             observer_value,
             &[entries.into(), observer_value],
-        ) {
-            WindowWebIdlCallbackFunctionOutcome::Threw(report) => {
-                report_event_callback_exception(
-                    scope,
-                    host_ptr,
-                    "intersectionobserver",
-                    delivery.callback.relevant_identity(),
-                    None,
-                    &report,
-                );
-            }
-            WindowWebIdlCallbackFunctionOutcome::Returned
-            | WindowWebIdlCallbackFunctionOutcome::Retired => {}
-        }
+        );
     }
 }
 
@@ -1002,8 +1048,7 @@ impl MutationObserverRegistration {
                     return false;
                 }
                 self.options.attribute_filter.as_ref().is_none_or(|filter| {
-                    filter.contains(mutation.local_name())
-                        || filter.contains(&mutation.local_name().to_ascii_lowercase())
+                    mutation.namespace().is_none() && filter.contains(mutation.local_name())
                 })
             }
             DomMutationRecordKind::CharacterData { .. } => self.options.character_data,
@@ -1073,34 +1118,31 @@ pub(super) fn mutation_observer_observe_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let raw_target = args.get(0);
+    let Some(parsed) = webidl::parse_args::<MutationObserverObserveArgs>(scope, &args) else {
+        return;
+    };
+    let options = match MutationObserverOptions::try_from(parsed.options) {
+        Ok(options) => options,
+        Err(message) => {
+            throw_type_error(scope, message);
+            return;
+        }
+    };
+    let raw_target = moli_webapi_declare::web_api_object_target(scope, parsed.target)
+        .unwrap_or(parsed.target)
+        .into();
     let Some(target) = callback_value_dom_handle(scope, raw_target)
         .or_else(|| detached_native_target_handle(scope, raw_target))
     else {
         if is_detached_node_value(scope, raw_target) {
-            match parse_mutation_observer_options(scope, args.get(1)) {
-                Ok(_) => {
-                    rv.set_undefined();
-                    return;
-                }
-                Err(message) => {
-                    throw_type_error(scope, message);
-                    return;
-                }
-            }
+            rv.set_undefined();
+            return;
         }
         throw_type_error(
             scope,
             "Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.",
         );
         return;
-    };
-    let options = match parse_mutation_observer_options(scope, args.get(1)) {
-        Ok(options) => options,
-        Err(message) => {
-            throw_type_error(scope, message);
-            return;
-        }
     };
     let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
         rv.set_undefined();
@@ -1128,7 +1170,7 @@ fn is_detached_node_value<'s>(
     };
     let object = v8::Global::new(scope, object);
     let object = v8::Local::new(scope, object);
-    get_private_object(scope, object, DETACHED_STATE_SLOT).is_some()
+    crate::native_bridge::receiver_has_detached_state(scope, object)
 }
 
 pub(super) fn mutation_observer_disconnect_callback(
@@ -1180,16 +1222,14 @@ pub(super) fn intersection_observer_constructor_callback<'s>(
         rv.set_undefined();
         return;
     };
-    let options = match parse_intersection_observer_options(scope, parsed.options, |root| {
-        dom_access::is_intersection_root(host_ptr, root)
-    }) {
+    let options = match parse_intersection_observer_options(scope, parsed.options) {
         Ok(options) => options,
         Err(IntersectionObserverOptionsError::Range(message)) => {
             throw_range_error(scope, message);
             return;
         }
-        Err(IntersectionObserverOptionsError::Type(message)) => {
-            throw_type_error(scope, &message);
+        Err(IntersectionObserverOptionsError::Syntax(message)) => {
+            throw_dom_exception_value(scope, message, "SyntaxError");
             return;
         }
         Err(IntersectionObserverOptionsError::WebIdl(error)) => {
@@ -1197,23 +1237,23 @@ pub(super) fn intersection_observer_constructor_callback<'s>(
             return;
         }
     };
-    dom_access::init_intersection_observer(
-        scope,
-        host_ptr,
-        args.this(),
-        parsed.callback,
-        options.clone(),
-    );
-    define_intersection_observer_slots(scope, host_ptr, args.this(), &options);
+    if define_intersection_observer_slots(scope, host_ptr, args.this(), &options).is_none() {
+        return;
+    }
+    dom_access::init_intersection_observer(scope, host_ptr, args.this(), parsed.callback, options);
     rv.set(args.this().into());
 }
 
-pub(super) fn intersection_observer_observe_callback(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn intersection_observer_observe_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(target) = callback_value_dom_handle(scope, args.get(0)) else {
+    let Some(target) = crate::native_bridge::branded_node_handle(
+        scope,
+        args.get(0),
+        web_api_interfaces::Element::DESCRIPTOR,
+    ) else {
         throw_type_error(
             scope,
             "Failed to execute 'observe' on 'IntersectionObserver': parameter 1 is not of type 'Element'.",
@@ -1234,12 +1274,16 @@ pub(super) fn intersection_observer_observe_callback(
     rv.set_undefined();
 }
 
-pub(super) fn intersection_observer_unobserve_callback(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn intersection_observer_unobserve_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(target) = callback_value_dom_handle(scope, args.get(0)) else {
+    let Some(target) = crate::native_bridge::branded_node_handle(
+        scope,
+        args.get(0),
+        web_api_interfaces::Element::DESCRIPTOR,
+    ) else {
         throw_type_error(
             scope,
             "Failed to execute 'unobserve' on 'IntersectionObserver': parameter 1 is not of type 'Element'.",
@@ -1291,13 +1335,13 @@ pub(super) fn intersection_observer_take_records_callback(
 
 fn build_mutation_records_array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     records: &[QueuedMutationRecord],
 ) -> v8::Local<'s, v8::Array> {
     let values = records
         .iter()
         .map(|record| {
-            build_mutation_record_object(scope, host_ptr, record)
+            mutation_record::build_object(scope, host_ptr, record)
                 .map(v8::Local::<v8::Value>::from)
                 .unwrap_or_else(|| v8::null(scope).into())
         })
@@ -1305,113 +1349,9 @@ fn build_mutation_records_array<'s>(
     serialize_v8_iter_array(scope, values).unwrap_or_else(|| v8::Array::new(scope, 0))
 }
 
-fn build_mutation_record_object<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
-    record: &QueuedMutationRecord,
-) -> Option<v8::Local<'s, v8::Object>> {
-    let target = wrap_node_handle(scope, host_ptr, record.target)?;
-    let (
-        record_type,
-        attribute_name,
-        attribute_namespace,
-        old_value,
-        added_nodes,
-        removed_nodes,
-        previous_sibling,
-        next_sibling,
-    ) = match &record.kind {
-        QueuedMutationRecordKind::Attributes {
-            attribute_name,
-            attribute_namespace,
-            old_value,
-        } => {
-            let attribute_namespace_value = attribute_namespace
-                .as_ref()
-                .and_then(|namespace| v8_string(scope, namespace))
-                .map(v8::Local::<v8::Value>::from)
-                .unwrap_or_else(|| v8::null(scope).into());
-            let added_nodes = empty_node_list_like(scope);
-            let removed_nodes = empty_node_list_like(scope);
-            (
-                v8str(scope, "attributes").into(),
-                v8_string(scope, attribute_name)?.into(),
-                attribute_namespace_value,
-                old_value
-                    .as_ref()
-                    .and_then(|value| v8_string(scope, value))
-                    .map(v8::Local::<v8::Value>::from)
-                    .unwrap_or_else(|| v8::null(scope).into()),
-                added_nodes.into(),
-                removed_nodes.into(),
-                v8::null(scope).into(),
-                v8::null(scope).into(),
-            )
-        }
-        QueuedMutationRecordKind::CharacterData { old_value } => {
-            let added_nodes = empty_node_list_like(scope);
-            let removed_nodes = empty_node_list_like(scope);
-            (
-                v8str(scope, "characterData").into(),
-                v8::null(scope).into(),
-                v8::null(scope).into(),
-                old_value
-                    .as_ref()
-                    .and_then(|value| v8_string(scope, value))
-                    .map(v8::Local::<v8::Value>::from)
-                    .unwrap_or_else(|| v8::null(scope).into()),
-                added_nodes.into(),
-                removed_nodes.into(),
-                v8::null(scope).into(),
-                v8::null(scope).into(),
-            )
-        }
-        QueuedMutationRecordKind::ChildList {
-            added_nodes,
-            removed_nodes,
-            previous_sibling,
-            next_sibling,
-        } => {
-            let added_nodes = build_node_array(scope, host_ptr, added_nodes);
-            let removed_nodes = build_node_array(scope, host_ptr, removed_nodes);
-            let previous_sibling = previous_sibling
-                .and_then(|handle| wrap_node_handle(scope, host_ptr, handle))
-                .map(v8::Local::<v8::Value>::from)
-                .unwrap_or_else(|| v8::null(scope).into());
-            let next_sibling = next_sibling
-                .and_then(|handle| wrap_node_handle(scope, host_ptr, handle))
-                .map(v8::Local::<v8::Value>::from)
-                .unwrap_or_else(|| v8::null(scope).into());
-            (
-                v8str(scope, "childList").into(),
-                v8::null(scope).into(),
-                v8::null(scope).into(),
-                v8::null(scope).into(),
-                added_nodes.into(),
-                removed_nodes.into(),
-                previous_sibling,
-                next_sibling,
-            )
-        }
-    };
-    MutationRecordDeclaration {
-        target: target.into(),
-        record_type,
-        attribute_name,
-        attribute_namespace,
-        old_value,
-        added_nodes,
-        removed_nodes,
-        previous_sibling,
-        next_sibling,
-    }
-    .bind(scope)
-    .ok()
-}
-
 fn build_intersection_entries_array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     options: &IntersectionObserverOptions,
     entries: &[QueuedIntersectionEntry],
 ) -> v8::Local<'s, v8::Array> {
@@ -1429,7 +1369,7 @@ fn build_intersection_entries_array<'s>(
 
 fn build_intersection_entry_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     options: &IntersectionObserverOptions,
     entry: QueuedIntersectionEntry,
 ) -> Option<v8::Local<'s, v8::Object>> {
@@ -1501,116 +1441,58 @@ fn create_rect_object<'s>(
     build_dom_rect_object(scope, x, y, width, height)
 }
 
-fn build_node_array<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
-    handles: &[NativeNodeId],
-) -> v8::Local<'s, v8::Array> {
-    let values = handles
-        .iter()
-        .copied()
-        .map(|handle| {
-            wrap_node_handle(scope, host_ptr, handle)
-                .map(v8::Local::<v8::Value>::from)
-                .unwrap_or_else(|| v8::null(scope).into())
-        })
-        .collect::<Vec<_>>();
-    let array =
-        serialize_v8_array(scope, values.as_slice()).unwrap_or_else(|| v8::Array::new(scope, 0));
-    if let Some(prototype) = global_constructor_prototype(scope, "NodeList") {
-        let _ = array.set_prototype(scope, prototype.into());
-    }
-    array
-}
-
-fn empty_node_list_like<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Array> {
-    let array = v8::Array::new(scope, 0);
-    if let Some(prototype) = global_constructor_prototype(scope, "NodeList") {
-        let _ = array.set_prototype(scope, prototype.into());
-    }
-    array
-}
-
 fn wrap_node_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: NativeNodeId,
 ) -> Option<v8::Local<'s, v8::Object>> {
     wrapped_handle_value(scope, host_ptr, handle)
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
 }
 
-fn parse_mutation_observer_options(
-    scope: &mut v8::PinScope<'_, '_>,
-    value: v8::Local<'_, v8::Value>,
-) -> Result<MutationObserverOptions, &'static str> {
-    let object = v8::Local::<v8::Object>::try_from(value).map_err(
-        |_| "Failed to execute 'observe' on 'MutationObserver': parameter 2 is not an object.",
-    )?;
-    let attributes_specified = has_property(scope, object, "attributes");
-    let attributes_enabled = bool_option(scope, object, "attributes");
-    let character_data_specified = has_property(scope, object, "characterData");
-    let character_data_enabled = bool_option(scope, object, "characterData");
-    let mut options = MutationObserverOptions {
-        child_list: bool_option(scope, object, "childList"),
-        attributes: attributes_enabled,
-        character_data: character_data_enabled,
-        subtree: bool_option(scope, object, "subtree"),
-        attribute_old_value: bool_option(scope, object, "attributeOldValue"),
-        character_data_old_value: bool_option(scope, object, "characterDataOldValue"),
-        attribute_filter: string_set_option(scope, object, "attributeFilter"),
-    };
-
-    if attributes_specified
-        && !attributes_enabled
-        && (options.attribute_old_value || options.attribute_filter.is_some())
-    {
-        return Err(
-            "Failed to execute 'observe' on 'MutationObserver': attributeOldValue and attributeFilter require attributes to be true.",
-        );
-    }
-    if character_data_specified && !character_data_enabled && options.character_data_old_value {
-        return Err(
-            "Failed to execute 'observe' on 'MutationObserver': characterDataOldValue requires characterData to be true.",
-        );
-    }
-
-    if !attributes_specified && (options.attribute_old_value || options.attribute_filter.is_some())
-    {
-        options.attributes = true;
-    }
-    if !character_data_specified && options.character_data_old_value {
-        options.character_data = true;
-    }
-    if !options.child_list && !options.attributes && !options.character_data {
-        return Err(
-            "Failed to execute 'observe' on 'MutationObserver': at least one of childList, attributes, or characterData must be true.",
-        );
-    }
-    Ok(options)
-}
-
-fn has_property(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<'_, v8::Object>,
-    key: &str,
-) -> bool {
-    let Some(key) = v8_string(scope, key) else {
-        return false;
-    };
-    object.has(scope, key.into()).unwrap_or(false)
-}
-
 enum IntersectionObserverOptionsError {
-    Type(String),
+    Syntax(&'static str),
     WebIdl(webidl::WebIdlError),
     Range(&'static str),
+}
+
+fn intersection_observer_root_member<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    member: &'static str,
+) -> Result<Option<NativeNodeId>, webidl::WebIdlError> {
+    let Some(value) = webidl::legacy_optional_member::<v8::Local<'s, v8::Value>>(
+        scope,
+        object,
+        member,
+        webidl::Context::member("IntersectionObserverInit", member),
+    )?
+    else {
+        return Ok(None);
+    };
+    let root = crate::native_bridge::branded_node_handle(
+        scope,
+        value,
+        web_api_interfaces::Node::DESCRIPTOR,
+    )
+    .ok_or_else(|| {
+        webidl::WebIdlError::custom_message(
+            "Failed to construct 'IntersectionObserver': root is not a Node.",
+        )
+    })?;
+    let valid = context_host_ptr_from_global_bridge(scope)
+        .is_some_and(|host_ptr| dom_access::is_intersection_root(host_ptr, root));
+    if !valid {
+        return Err(webidl::WebIdlError::custom_message(
+            "Failed to construct 'IntersectionObserver': root must be an Element or Document.",
+        ));
+    }
+    Ok(Some(root))
 }
 
 fn parse_intersection_observer_options<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: Option<v8::Local<'s, v8::Value>>,
-    mut root_is_valid: impl FnMut(NativeNodeId) -> bool,
 ) -> Result<IntersectionObserverOptions, IntersectionObserverOptionsError> {
     let Some(value) = value else {
         return Ok(IntersectionObserverOptions::default());
@@ -1625,36 +1507,23 @@ fn parse_intersection_observer_options<'s>(
         Err(error) => return Err(IntersectionObserverOptionsError::WebIdl(error)),
     };
 
-    let mut options = IntersectionObserverOptions::default();
-    if let Some(root_value) = init.root {
-        let Some(root) = callback_value_dom_handle(scope, root_value) else {
-            return Err(IntersectionObserverOptionsError::Type(
-                "Failed to construct 'IntersectionObserver': root is not a Node.".to_owned(),
-            ));
-        };
-        if !root_is_valid(root) {
-            return Err(IntersectionObserverOptionsError::Type(
-                "Failed to construct 'IntersectionObserver': root must be an Element or Document."
-                    .to_owned(),
-            ));
-        }
-        options.root = Some(root);
-    }
+    let mut options = IntersectionObserverOptions {
+        root: init.root,
+        ..IntersectionObserverOptions::default()
+    };
 
-    options.root_margin = normalize_root_margin(&init.root_margin).ok_or_else(|| {
-        IntersectionObserverOptionsError::Type(
-            "Failed to construct 'IntersectionObserver': rootMargin must contain 1 to 4 px or percentage values.".to_owned(),
-        )
-    })?;
-    options.scroll_margin = normalize_root_margin(&init.scroll_margin).ok_or_else(|| {
-        IntersectionObserverOptionsError::Type(
-            "Failed to construct 'IntersectionObserver': scrollMargin must contain 1 to 4 px or percentage values.".to_owned(),
-        )
-    })?;
+    options.root_margin = normalize_root_margin(&init.root_margin).ok_or(
+        IntersectionObserverOptionsError::Syntax(
+            "Failed to construct 'IntersectionObserver': rootMargin must contain 1 to 4 px or percentage values.",
+        ),
+    )?;
+    options.scroll_margin = normalize_root_margin(&init.scroll_margin).ok_or(
+        IntersectionObserverOptionsError::Syntax(
+            "Failed to construct 'IntersectionObserver': scrollMargin must contain 1 to 4 px or percentage values.",
+        ),
+    )?;
 
-    if let Some(thresholds) = threshold_option(scope, init.threshold)? {
-        options.thresholds = thresholds;
-    }
+    options.thresholds = normalize_intersection_thresholds(init.threshold)?;
     options.delay = init.delay;
     options.track_visibility = init.track_visibility;
     if options.track_visibility && options.delay < 100 {
@@ -1664,99 +1533,63 @@ fn parse_intersection_observer_options<'s>(
     Ok(options)
 }
 
-fn bool_option(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<'_, v8::Object>,
-    key: &str,
-) -> bool {
-    let Some(key) = v8_string(scope, key) else {
-        return false;
-    };
-    object
-        .get(scope, key.into())
-        .is_some_and(|value| value.boolean_value(scope))
-}
-
-fn threshold_option<'s>(
+fn intersection_observer_threshold_member<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    value: Option<v8::Local<'s, v8::Value>>,
-) -> Result<Option<Vec<f64>>, IntersectionObserverOptionsError> {
-    let Some(value) = value else { return Ok(None) };
+    object: v8::Local<'s, v8::Object>,
+    member: &'static str,
+) -> Result<Vec<f64>, webidl::WebIdlError> {
+    let context = webidl::Context::member("IntersectionObserverInit", member);
+    let Some(value) =
+        webidl::optional_member::<v8::Local<'s, v8::Value>>(scope, object, member, context)?
+    else {
+        return Ok(vec![0.0]);
+    };
 
-    let mut thresholds = if value.is_object() {
-        webidl::convert::<webidl::Sequence<webidl::Double>>(
-            scope,
-            value,
-            webidl::Context::member("IntersectionObserverInit", "threshold"),
-        )
-        .map_err(IntersectionObserverOptionsError::WebIdl)?
-        .0
-        .into_iter()
-        .map(|value| validate_intersection_threshold(value.0))
-        .collect::<Result<Vec<_>, _>>()?
+    // Convert the union at its dictionary position, reading @@iterator once.
+    if let Some(sequence) =
+        webidl::convert_optional_sequence::<webidl::Double>(scope, value, context, &())?
+    {
+        Ok(sequence.0.into_iter().map(|value| value.0).collect())
     } else {
-        vec![threshold_number(scope, value)?]
-    };
-    thresholds.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
-    thresholds.dedup_by(|left, right| left.total_cmp(right) == Ordering::Equal);
-    if thresholds.is_empty() {
-        thresholds.push(0.0);
+        Ok(vec![
+            webidl::convert::<webidl::Double>(scope, value, context)?.0,
+        ])
     }
-    Ok(Some(thresholds))
 }
 
-fn threshold_number<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Result<f64, IntersectionObserverOptionsError> {
-    let Some(number) = value.number_value(scope) else {
-        return Err(IntersectionObserverOptionsError::Type(
-            "Failed to construct 'IntersectionObserver': threshold must be a number.".to_owned(),
-        ));
-    };
-    validate_intersection_threshold(number)
-}
-
-fn validate_intersection_threshold(number: f64) -> Result<f64, IntersectionObserverOptionsError> {
-    if !number.is_finite() || !(0.0..=1.0).contains(&number) {
+fn normalize_intersection_thresholds(
+    mut thresholds: Vec<f64>,
+) -> Result<Vec<f64>, IntersectionObserverOptionsError> {
+    // WebIDL conversion has completed; constructor validation follows margins.
+    if thresholds
+        .iter()
+        .any(|number| !(0.0..=1.0).contains(number))
+    {
         return Err(IntersectionObserverOptionsError::Range(
             "Failed to construct 'IntersectionObserver': threshold must be between 0 and 1.",
         ));
     }
-    Ok(number)
-}
-
-fn string_set_option(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<'_, v8::Object>,
-    key: &str,
-) -> Option<HashSet<String>> {
-    let key = v8_string(scope, key)?;
-    let value = object.get(scope, key.into())?;
-    let array = v8::Local::<v8::Array>::try_from(value).ok()?;
-    let mut result = HashSet::new();
-    for index in 0..array.length() {
-        let entry = array.get_index(scope, index)?;
-        let text = entry.to_string(scope)?.to_rust_string_lossy(scope);
-        result.insert(text);
+    thresholds.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    if thresholds.is_empty() {
+        thresholds.push(0.0);
     }
-    Some(result)
+    Ok(thresholds)
 }
 
 fn define_intersection_observer_slots(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     observer: v8::Local<'_, v8::Object>,
     options: &IntersectionObserverOptions,
-) {
+) -> Option<()> {
     let root_value = options
         .root
         .and_then(|handle| wrap_node_handle(scope, host_ptr, handle))
         .map(v8::Local::<v8::Value>::from)
         .unwrap_or_else(|| v8::null(scope).into());
-    define_hidden_value(scope, observer, INTERSECTION_OBSERVER_ROOT_SLOT, root_value);
+    set_private_value(scope, observer, INTERSECTION_OBSERVER_ROOT_SLOT, root_value);
     if let Some(root_margin) = v8_string(scope, &options.root_margin) {
-        define_hidden_value(
+        set_private_value(
             scope,
             observer,
             INTERSECTION_OBSERVER_ROOT_MARGIN_SLOT,
@@ -1764,33 +1597,36 @@ fn define_intersection_observer_slots(
         );
     }
     if let Some(scroll_margin) = v8_string(scope, &options.scroll_margin) {
-        define_hidden_value(
+        set_private_value(
             scope,
             observer,
             INTERSECTION_OBSERVER_SCROLL_MARGIN_SLOT,
             scroll_margin.into(),
         );
     }
-    let thresholds = crate::util::serialize_v8_array(scope, options.thresholds.as_slice())
-        .unwrap_or_else(|| v8::Array::new(scope, 0));
-    define_hidden_value(
+    let thresholds = crate::util::serialize_v8_array(scope, options.thresholds.as_slice())?;
+    if thresholds.set_integrity_level(scope, v8::IntegrityLevel::Frozen) != Some(true) {
+        return None;
+    }
+    set_private_value(
         scope,
         observer,
         INTERSECTION_OBSERVER_THRESHOLDS_SLOT,
         thresholds.into(),
     );
-    define_hidden_value(
+    set_private_value(
         scope,
         observer,
         INTERSECTION_OBSERVER_DELAY_SLOT,
         v8::Integer::new(scope, options.delay).into(),
     );
-    define_hidden_value(
+    set_private_value(
         scope,
         observer,
         INTERSECTION_OBSERVER_TRACK_VISIBILITY_SLOT,
         v8::Boolean::new(scope, options.track_visibility).into(),
     );
+    Some(())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1876,7 +1712,7 @@ impl IntersectionRectData {
 }
 
 fn rect_from_intersection_geometry(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: NativeNodeId,
 ) -> IntersectionRectData {
     let rect = compute_mock_intersection_client_rect(runtime, handle);
@@ -1930,7 +1766,7 @@ fn rootless_target_has_hidden_class_hint(dom_host: &DomHost, target: NativeNodeI
         })
 }
 
-fn scrollport_rect(runtime: &JsContextHost, handle: NativeNodeId) -> IntersectionRectData {
+fn scrollport_rect(runtime: &PageScriptHost, handle: NativeNodeId) -> IntersectionRectData {
     let rect = compute_mock_intersection_scrollport_client_rect(runtime, handle);
     IntersectionRectData::new(rect.left, rect.top, rect.width, rect.height)
 }
@@ -1950,7 +1786,7 @@ fn node_establishes_scroll_clip(
 
 fn clip_intersection_by_scroll_ancestors(
     cache: &mut RootlessIntersectionGeometryCache,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     dom_host: &DomHost,
     target: NativeNodeId,
     stop_root: Option<NativeNodeId>,
@@ -1977,7 +1813,7 @@ fn clip_intersection_by_scroll_ancestors(
 
 fn clip_bounds_by_scroll_ancestors(
     cache: &mut RootlessIntersectionGeometryCache,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     dom_host: &DomHost,
     target: NativeNodeId,
     stop_root: Option<NativeNodeId>,
@@ -2221,7 +2057,7 @@ fn rootless_content_flow_top(
 
 fn rootless_intersection_target_rect(
     cache: &mut RootlessIntersectionGeometryCache,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     dom_host: &DomHost,
     target: NativeNodeId,
     root_rect: IntersectionRectData,
@@ -2288,7 +2124,7 @@ fn queue_intersection_entry(
 }
 
 fn mock_intersection_entry_metrics(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     dom_host: &DomHost,
     target: NativeNodeId,
     options: &IntersectionObserverOptions,
@@ -2445,44 +2281,33 @@ fn mutation_observer_id_from_object(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
 ) -> Option<u32> {
-    hidden_numeric_id(scope, object, MUTATION_OBSERVER_ID_SLOT)
+    let object = v8::Local::new(scope, object);
+    let object = moli_webapi_declare::web_api_object_target(scope, object)?;
+    observer_id_from_private_slot(scope, object, MUTATION_OBSERVER_ID_SLOT)
 }
 
 fn intersection_observer_id_from_object(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
 ) -> Option<u32> {
-    hidden_numeric_id(scope, object, INTERSECTION_OBSERVER_ID_SLOT)
+    observer_id_from_private_slot(scope, object, INTERSECTION_OBSERVER_ID_SLOT)
 }
 
-fn hidden_numeric_id(
+fn observer_id_from_private_slot(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
     key: &str,
 ) -> Option<u32> {
-    let key = v8_string(scope, key)?;
-    object
-        .get(scope, key.into())
+    let object = v8::Local::new(scope, object);
+    get_private_value(scope, object, key)
         .and_then(|value| value.number_value(scope))
         .filter(|value| value.is_finite() && *value >= 1.0)
         .map(|value| value as u32)
 }
 
-fn define_hidden_value(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<'_, v8::Object>,
-    key: &str,
-    value: v8::Local<'_, v8::Value>,
-) {
-    let Some(key) = v8_string(scope, key) else {
-        return;
-    };
-    let _ = object.define_own_property(scope, key.into(), value, v8::PropertyAttribute::DONT_ENUM);
-}
-
-fn intersection_observer_attribute_getter_callback(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+fn intersection_observer_attribute_getter_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let Some(name) = callback_data_item(
@@ -2507,17 +2332,8 @@ fn intersection_observer_attribute_getter_callback(
         }
     };
     rv.set(
-        args.this()
-            .get(scope, v8str(scope, slot).into())
-            .unwrap_or_else(|| v8::undefined(scope).into()),
+        get_private_value(scope, args.this(), slot).unwrap_or_else(|| v8::undefined(scope).into()),
     );
-}
-
-fn is_intersection_observer_entry<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, "__moliIntersectionEntryTime").is_some()
 }
 
 fn intersection_observer_entry_attribute_getter_callback<'s>(
@@ -2585,7 +2401,7 @@ mod tests {
     #[test]
     fn root_margin_helpers_are_available_to_observer_runtime() {
         assert_eq!(
-            normalize_root_margin("10px /*comment*/ 5% 0 -2.5px").as_deref(),
+            normalize_root_margin("10px /*comment*/ 5% 0px -2.5px").as_deref(),
             Some("10px 5% 0px -2.5px")
         );
         assert_eq!(

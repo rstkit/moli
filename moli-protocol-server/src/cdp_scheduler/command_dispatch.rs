@@ -1,92 +1,34 @@
-use moli_protocol::{BackgroundProtocolEvent, CdpSchedulerEvent};
+use moli_protocol::{BackgroundProtocolEvent, RendererOutputDependencies};
 
 use super::{CommandOutputReleasePermit, ProtocolOutputSequence};
 
-pub(crate) struct CommandDispatchState {
-    replies: ProtocolOutputSequence,
-}
-
+/// Reply output and its explicit release authority. Published work is already
+/// owned by the scheduler and cannot be stranded inside this reply.
 pub(crate) struct CommandTurnOutput {
     protocol_output: ProtocolOutputSequence,
     post_renderer_output: ProtocolOutputSequence,
     renderer_output_boundary: Option<moli_core::RendererOutputFence>,
     post_response_events: Vec<BackgroundProtocolEvent>,
-    post_flush_scheduler_events: Vec<CdpSchedulerEvent>,
-    renderer_output_predecessor: Option<moli_core::RendererOutputFence>,
+    renderer_output_dependencies: RendererOutputDependencies,
     output_release_permit: Option<CommandOutputReleasePermit>,
 }
 
-impl CommandDispatchState {
-    pub(crate) fn pending_command() -> Self {
-        Self {
-            replies: ProtocolOutputSequence::empty(),
-        }
-    }
-
-    pub(crate) fn complete_with_turn_output(
-        mut self,
-        turn_output: CommandTurnOutput,
-    ) -> CommandTurnOutput {
-        let (
-            replies,
-            post_renderer_output,
-            renderer_output_boundary,
-            post_response_events,
-            scheduler_events,
-            renderer_output_predecessor,
-            output_release_permit,
-        ) = turn_output.into_parts();
-        self.replies = replies;
-        CommandTurnOutput::new_with_post_response_events_and_permit(
-            self.replies,
-            post_response_events,
-            scheduler_events,
-            output_release_permit,
-        )
-        .with_renderer_output_boundary(renderer_output_boundary, post_renderer_output)
-        .with_renderer_output_predecessor(renderer_output_predecessor)
-    }
-}
-
 impl CommandTurnOutput {
-    pub(super) fn new(
-        protocol_output: ProtocolOutputSequence,
-        post_flush_scheduler_events: Vec<CdpSchedulerEvent>,
-    ) -> Self {
-        Self::new_with_post_response_events(
-            protocol_output,
-            Vec::new(),
-            post_flush_scheduler_events,
-        )
+    pub(super) fn new(protocol_output: ProtocolOutputSequence) -> Self {
+        Self::new_with_post_response_events(protocol_output, Vec::new())
     }
 
     pub(super) fn new_with_post_response_events(
         protocol_output: ProtocolOutputSequence,
         post_response_events: Vec<BackgroundProtocolEvent>,
-        post_flush_scheduler_events: Vec<CdpSchedulerEvent>,
-    ) -> Self {
-        Self::new_with_post_response_events_and_permit(
-            protocol_output,
-            post_response_events,
-            post_flush_scheduler_events,
-            None,
-        )
-    }
-
-    pub(super) fn new_with_post_response_events_and_permit(
-        protocol_output: ProtocolOutputSequence,
-        post_response_events: Vec<BackgroundProtocolEvent>,
-        post_flush_scheduler_events: Vec<CdpSchedulerEvent>,
-        output_release_permit: Option<CommandOutputReleasePermit>,
     ) -> Self {
         Self {
             protocol_output,
             post_renderer_output: ProtocolOutputSequence::empty(),
             renderer_output_boundary: None,
             post_response_events,
-            post_flush_scheduler_events,
-            renderer_output_predecessor: None,
-            output_release_permit,
+            renderer_output_dependencies: RendererOutputDependencies::default(),
+            output_release_permit: None,
         }
     }
 
@@ -120,24 +62,30 @@ impl CommandTurnOutput {
         predecessor: Option<moli_core::RendererOutputFence>,
     ) -> Self {
         if let Some(predecessor) = predecessor {
-            predecessor.merge_into_same_stream_tail(&mut self.renderer_output_predecessor);
+            self.renderer_output_dependencies
+                .add_same_stream(predecessor);
         }
         self
     }
 
-    pub(crate) fn take_renderer_output_predecessor(
-        &mut self,
-    ) -> Option<moli_core::RendererOutputFence> {
-        self.renderer_output_predecessor.take()
+    pub(crate) fn with_renderer_output_dependencies(
+        mut self,
+        dependencies: RendererOutputDependencies,
+    ) -> Self {
+        self.renderer_output_dependencies.merge(dependencies);
+        self
+    }
+
+    pub(crate) fn take_renderer_output_dependencies(&mut self) -> RendererOutputDependencies {
+        std::mem::take(&mut self.renderer_output_dependencies)
     }
 
     /// Place output projected from the command's exact renderer cause before
     /// the command response carried by this turn.
     ///
-    /// The frozen sequence has already been split by its domain-declared
-    /// `BeforeResponse`/`AfterResponse` order. Only the former reaches this
-    /// method; the latter remains in the command barrier until the response
-    /// flush consumes its single-use permit.
+    /// Only explicitly post-response Inspector messages remain in the exact
+    /// command barrier until response delivery consumes its single-use permit.
+    /// Owner work has already been transferred to the scheduler.
     pub(crate) fn prepend_protocol_output(&mut self, output: ProtocolOutputSequence) {
         if output.is_empty() {
             return;
@@ -154,8 +102,7 @@ impl CommandTurnOutput {
         ProtocolOutputSequence,
         Option<moli_core::RendererOutputFence>,
         Vec<BackgroundProtocolEvent>,
-        Vec<CdpSchedulerEvent>,
-        Option<moli_core::RendererOutputFence>,
+        RendererOutputDependencies,
         Option<CommandOutputReleasePermit>,
     ) {
         (
@@ -163,8 +110,7 @@ impl CommandTurnOutput {
             self.post_renderer_output,
             self.renderer_output_boundary,
             self.post_response_events,
-            self.post_flush_scheduler_events,
-            self.renderer_output_predecessor,
+            self.renderer_output_dependencies,
             self.output_release_permit,
         )
     }

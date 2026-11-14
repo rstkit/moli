@@ -1,5 +1,6 @@
 //! Nested pause-loop coordination and causal Inspector output routing.
 
+use moli_inspector_json::InspectorJson;
 use std::{
     collections::{HashSet, VecDeque},
     sync::{Arc, Weak},
@@ -32,8 +33,8 @@ use causality::{
 pub(crate) use causality::{
     RendererInspectorPauseCommandOutputRoute, RendererInspectorPauseNotificationRoute,
 };
-pub(crate) use loop_state::RendererInspectorPauseLoopPolicy;
 use loop_state::RendererInspectorPausePhase;
+pub(crate) use loop_state::{RendererInspectorPauseExitReason, RendererInspectorPauseLoopPolicy};
 
 #[derive(Clone)]
 pub(crate) struct RendererInspectorPauseBridge {
@@ -56,6 +57,7 @@ struct RendererInspectorPauseBridgeState {
     pause_loop_policy: RendererInspectorPauseLoopPolicy,
     quit_requested: bool,
     session_detach_arms: usize,
+    document_replacements: usize,
     target_closed: bool,
     pending_prefaces: VecDeque<RendererInspectorPausePreface>,
     paused_sessions_awaiting_resumed: HashSet<(RendererDevToolsAgentToken, DevToolsSessionKey)>,
@@ -125,6 +127,7 @@ impl RendererInspectorPauseBridge {
                 pause_loop_policy: RendererInspectorPauseLoopPolicy::MainAndIo,
                 quit_requested: false,
                 session_detach_arms: 0,
+                document_replacements: 0,
                 target_closed: false,
                 pending_prefaces: VecDeque::new(),
                 paused_sessions_awaiting_resumed: HashSet::new(),
@@ -147,6 +150,7 @@ impl std::fmt::Debug for RendererInspectorPauseBridge {
             .field("pause_loop_policy", &state.pause_loop_policy)
             .field("quit_requested", &state.quit_requested)
             .field("session_detach_arms", &state.session_detach_arms)
+            .field("document_replacements", &state.document_replacements)
             .field("target_closed", &state.target_closed)
             .field("pending_prefaces", &state.pending_prefaces.len())
             .field(
@@ -359,14 +363,44 @@ impl RendererInspectorPauseBridge {
         Some(state.pause_loop_policy)
     }
 
-    pub(crate) fn wait_for_pause_work<T>(&self, mut claim: impl FnMut() -> Option<T>) -> Option<T> {
+    pub(crate) fn begin_document_replacement(&self) -> bool {
+        let mut state = self.shared.state.lock();
+        if state.target_closed {
+            return false;
+        }
+        state.document_replacements += 1;
+        self.shared.pause_loop_wake.notify_all();
+        true
+    }
+
+    pub(crate) fn finish_document_replacement(&self) {
+        let mut state = self.shared.state.lock();
+        state.document_replacements = state
+            .document_replacements
+            .checked_sub(1)
+            .expect("document replacement scope must be balanced");
+    }
+
+    pub(crate) fn wait_for_pause_work<T>(
+        &self,
+        mut claim: impl FnMut() -> Option<T>,
+    ) -> Result<T, RendererInspectorPauseExitReason> {
         let mut state = self.shared.state.lock();
         loop {
-            if state.target_closed || state.quit_requested || state.session_detach_arms != 0 {
-                return None;
+            if state.target_closed {
+                return Err(RendererInspectorPauseExitReason::TargetClosed);
+            }
+            if state.document_replacements != 0 {
+                return Err(RendererInspectorPauseExitReason::DocumentReplacement);
+            }
+            if state.session_detach_arms != 0 {
+                return Err(RendererInspectorPauseExitReason::SessionDetached);
+            }
+            if state.quit_requested {
+                return Err(RendererInspectorPauseExitReason::Resumed);
             }
             if let Some(work) = claim() {
-                return Some(work);
+                return Ok(work);
             }
             self.shared.pause_loop_wake.wait(&mut state);
         }
@@ -465,9 +499,9 @@ impl RendererInspectorPauseBridge {
         &self,
         agent_token: RendererDevToolsAgentToken,
         session: &DevToolsSessionKey,
-        message: &Value,
+        message: &InspectorJson,
     ) -> RendererInspectorPauseNotificationRoute {
-        let method = message.get("method").and_then(Value::as_str);
+        let method = message.method();
         let is_paused_notification = method == Some("Debugger.paused");
         let is_resumed_notification = method == Some("Debugger.resumed");
         let session_route = (agent_token, session.clone());
@@ -519,6 +553,7 @@ impl RendererInspectorPauseBridge {
         }
         if is_paused_notification {
             let is_instrumentation_pause = message
+                .value()
                 .get("params")
                 .and_then(|params| params.get("reason"))
                 .and_then(Value::as_str)
@@ -583,7 +618,7 @@ impl RendererInspectorPauseBridge {
 impl RendererInspectorSessionOutboundRoute {
     pub(crate) fn route_notification(
         &self,
-        message: &Value,
+        message: &InspectorJson,
     ) -> RendererInspectorPauseNotificationRoute {
         self.target
             .pause_ref()

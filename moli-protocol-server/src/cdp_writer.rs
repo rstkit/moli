@@ -1,4 +1,5 @@
-use std::time::Instant;
+use moli_inspector_json::InspectorJson;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, stream::SplitSink};
@@ -17,6 +18,7 @@ mod tests;
 const DEFAULT_WRITER_QUEUE_CAPACITY: usize = 1024;
 const DEFAULT_MAX_PENDING_WRITER_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_WRITER_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+const WRITER_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct CdpSocketSink {
@@ -35,6 +37,7 @@ struct ProtocolOutputEnvelope {
 
 enum SocketWriterCommand {
     Output(ProtocolOutputEnvelope),
+    Flush(oneshot::Sender<bool>),
     CloseAfterFlush,
 }
 
@@ -84,8 +87,21 @@ fn spawn_socket_sink_with_limits(
                     command
                 }
             };
-            let SocketWriterCommand::Output(envelope) = command else {
-                break;
+            let envelope = match command {
+                SocketWriterCommand::Output(envelope) => envelope,
+                SocketWriterCommand::CloseAfterFlush => break,
+                SocketWriterCommand::Flush(completed) => {
+                    let flushed = tokio::select! {
+                        biased;
+                        _ = close_rx.changed() => false,
+                        result = socket.flush() => result.is_ok(),
+                    };
+                    let _ = completed.send(flushed);
+                    if !flushed {
+                        break;
+                    }
+                    continue;
+                }
             };
             let ProtocolOutputEnvelope {
                 message,
@@ -131,10 +147,10 @@ fn spawn_socket_sink_with_limits(
         }
         match close_signal {
             SocketCloseSignal::PeerCloseReceived => {
-                let _ = socket.flush().await;
+                let _ = tokio::time::timeout(WRITER_CLOSE_TIMEOUT, socket.flush()).await;
             }
             SocketCloseSignal::Open | SocketCloseSignal::ImmediateClose => {
-                let _ = socket.close().await;
+                let _ = tokio::time::timeout(WRITER_CLOSE_TIMEOUT, socket.close()).await;
             }
         }
         notify_socket_writer_finished(&mut finished_tx);
@@ -151,7 +167,22 @@ fn spawn_socket_sink_with_limits(
 }
 
 impl CdpSocketSink {
-    pub(crate) fn enqueue_owned_message(&self, message: Value) -> bool {
+    /// Confirms that every preceding output was flushed by the sole writer.
+    /// Callers must bound their wait.
+    pub(crate) async fn flush(&self) -> bool {
+        let (completed, receiver) = oneshot::channel();
+        if self
+            .output_tx
+            .send(SocketWriterCommand::Flush(completed))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        receiver.await.unwrap_or(false)
+    }
+
+    pub(crate) fn enqueue_owned_message(&self, message: impl Into<InspectorJson>) -> bool {
         let available_pending_bytes = self.pending_byte_budget.available();
         let serialization_limit = self.max_message_bytes.min(available_pending_bytes);
         let message = match serialize_owned_message_with_limit(message, serialization_limit) {
@@ -259,9 +290,13 @@ struct OwnedOuterHtmlResponse {
 }
 
 fn serialize_owned_message_with_limit(
-    message: Value,
+    message: impl Into<InspectorJson>,
     limit: usize,
 ) -> Result<String, BoundedJsonError> {
+    let message = match message.into().into_parsed() {
+        Ok(value) => value,
+        Err(raw) => return to_string_with_limit(&raw, limit),
+    };
     let response = match take_owned_outer_html_response(message) {
         Ok(response) => response,
         Err(message) => return to_string_with_limit(&message, limit),
@@ -339,7 +374,15 @@ pub(crate) struct StalledCdpSocketWriter {
 
 #[cfg(test)]
 impl StalledCdpSocketWriter {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.output_rx.is_empty()
+    }
+
     pub(crate) fn take_message(&mut self) -> serde_json::Value {
+        serde_json::from_str(&self.take_text()).expect("queued CDP output JSON")
+    }
+
+    pub(crate) fn take_text(&mut self) -> String {
         let command = self
             .output_rx
             .try_recv()
@@ -347,7 +390,7 @@ impl StalledCdpSocketWriter {
         let SocketWriterCommand::Output(envelope) = command else {
             panic!("stalled CDP writer received close before output");
         };
-        serde_json::from_str(&envelope.message).expect("queued CDP output JSON")
+        envelope.message
     }
 
     pub(crate) fn is_open(&self) -> bool {

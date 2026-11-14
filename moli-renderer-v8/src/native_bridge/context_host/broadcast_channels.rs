@@ -1,7 +1,7 @@
 use super::*;
 use crate::{broadcast_channel_runtime::SharedBroadcastChannelRegistry, types::BroadcastChannelId};
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn broadcast_channel_registry(&self) -> SharedBroadcastChannelRegistry {
         self.broadcast_channel_registry.clone()
     }
@@ -48,6 +48,26 @@ impl JsContextHost {
             .iter()
             .filter_map(|(channel_id, entry)| {
                 (entry.identity.owner() == owner).then_some(*channel_id)
+            })
+            .collect::<Vec<_>>();
+        let closed_count = channel_ids.len();
+        for channel_id in channel_ids {
+            self.broadcast_channel_wrappers.remove(&channel_id);
+            self.broadcast_channel_registry
+                .close_broadcast_channel(channel_id);
+        }
+        closed_count
+    }
+
+    pub(crate) fn close_broadcast_channels_for_context_token(
+        &mut self,
+        context_token: RuntimeObservableContextToken,
+    ) -> usize {
+        let channel_ids = self
+            .broadcast_channel_wrappers
+            .iter()
+            .filter_map(|(channel_id, entry)| {
+                (entry.identity.realm_token() == context_token).then_some(*channel_id)
             })
             .collect::<Vec<_>>();
         let closed_count = channel_ids.len();

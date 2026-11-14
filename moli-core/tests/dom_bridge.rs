@@ -119,6 +119,74 @@ async fn builds_dom_structure_and_exposes_script_nodes() -> Result<()> {
 }
 
 #[tokio::test]
+async fn finishing_older_document_snapshot_preserves_newer_cached_page_state() -> Result<()> {
+    let server = FixtureServer::spawn().await?;
+    let browser = Browser::new(AppConfig::default())?;
+    let mut page = browser.fetch(&server.url("/static")).await?;
+    let document_isolate_identity = page.document_isolate_identity_for_diagnostics();
+    let document_url = page.final_url().clone();
+    let attachment = page.renderer_agent_attachment_id();
+    assert_eq!(attachment, None);
+
+    page.evaluate_runtime_expression_async("document.title = 'older'")
+        .await?;
+    assert_eq!(page.document_title(), "older");
+    let older = page
+        .start_document_node_snapshot_for_document(None, true, -1, true)?
+        .wait()
+        .await?;
+    assert_eq!(older.renderer_agent_attachment_id(), attachment);
+
+    // Hold the frozen older completion while the renderer captures the newer
+    // title in the same document and attachment.
+    page.evaluate_runtime_expression_async("document.title = 'newer'")
+        .await?;
+    let newer = page
+        .start_document_node_snapshot_for_document(None, true, -1, true)?
+        .wait()
+        .await?;
+    assert_eq!(newer.renderer_agent_attachment_id(), attachment);
+    assert_eq!(page.renderer_agent_attachment_id(), attachment);
+    assert_eq!(
+        page.document_isolate_identity_for_diagnostics(),
+        document_isolate_identity
+    );
+    assert_eq!(page.final_url(), &document_url);
+
+    let newer = page
+        .finish_document_node_snapshot_for_document(newer)?
+        .context("newer document snapshot should exist")?;
+    let newer_title = find_snapshot_node(&newer.snapshot, &mut |node| node.local_name == "title")
+        .context("newer document snapshot should contain its title")?;
+    assert_eq!(newer_title.children.len(), 1);
+    assert_eq!(newer_title.children[0].node_value, "newer");
+    assert_eq!(page.document_title(), "newer");
+
+    let older = page
+        .finish_document_node_snapshot_for_document(older)?
+        .context("older document snapshot should exist")?;
+    let older_title = find_snapshot_node(&older.snapshot, &mut |node| node.local_name == "title")
+        .context("older document snapshot should contain its title")?;
+    assert_eq!(older_title.children.len(), 1);
+    assert_eq!(older_title.children[0].node_value, "older");
+    assert_eq!(older.snapshot.node_id, newer.snapshot.node_id);
+    assert_eq!(page.renderer_agent_attachment_id(), attachment);
+    assert_eq!(
+        page.document_isolate_identity_for_diagnostics(),
+        document_isolate_identity
+    );
+    assert_eq!(page.final_url(), &document_url);
+    assert_eq!(
+        page.document_title(),
+        "newer",
+        "finishing an older snapshot must not roll back the cached Page state"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn range_exposes_constructor_create_range_and_clone_contents_basics() -> Result<()> {
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
@@ -189,6 +257,12 @@ async fn range_internal_algorithms_ignore_page_tampered_methods() -> Result<()> 
 
     let mut page = browser
         .fetch(&server.url("/compat/range-internal-algorithms-ignore-page-tampered-methods"))
+        .await?;
+
+    let capture = page.start_capture_screenshot()?;
+    let captured = capture.wait().await?;
+    page.finish_capture_screenshot(captured)?;
+    page.evaluate_runtime_expression_async("runGeometryProbe()")
         .await?;
 
     assert!(
@@ -690,7 +764,7 @@ async fn selection_contains_node_ignores_page_tampered_node_contains() -> Result
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/selection-contains-node-ignores-page-tampered-node-contains"))
         .await?;
 
@@ -753,7 +827,7 @@ async fn selection_set_base_and_extent_ignores_page_tampered_compare_document_po
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url(
             "/compat/selection-set-base-and-extent-ignores-page-tampered-compare-document-position",
         ))

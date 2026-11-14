@@ -63,6 +63,8 @@ async fn history_keeps_action_window_but_document_open_cancels_it() {
         local_executor
             .run(async move {
                 let mut page_vm = page_vm;
+                page_vm.vm_mut().eval("const root=document.documentElement || document.appendChild(document.createElement('html'));")?;
+                page_vm.vm_mut().publish_layout_for_test()?;
                 let initial_document = page_vm.document_lifecycle.identity();
                 let outcome = page_vm.queue_wheel_event(
                     10.0,
@@ -1218,6 +1220,69 @@ location.href
 }
 
 #[tokio::test]
+async fn javascript_location_navigation_honors_enforced_trusted_types() {
+    run_page_vm_async_test(async move {
+        let mut page_vm = test_page_vm_with_document_url(
+            Url::parse("https://javascript-location-trusted-types.test/start.html").unwrap(),
+        );
+        page_vm
+            .vm_mut()
+            .set_response_content_security_policies(&[
+                "require-trusted-types-for 'script'".to_owned(),
+            ]);
+        let local_executor = page_vm.local_executor.clone();
+
+        let observed = local_executor
+            .run(async move {
+                page_vm.vm_mut().eval(
+                    r#"
+globalThis.__jsUrlRan = false;
+globalThis.__jsUrlViolations = [];
+document.addEventListener("securitypolicyviolation", event => {
+  globalThis.__jsUrlViolations.push({
+    sample: event.sample,
+    disposition: event.disposition,
+  });
+});
+location.href = "javascript:globalThis.__jsUrlRan=true";
+"queued"
+"#,
+                )?;
+                assert!(page_vm.vm().has_pending_location_navigation());
+
+                let mut pending_document_lifecycle_turn = None;
+                let outcome = page_vm
+                    .follow_pending_location_navigation_one_turn_async(
+                        &mut pending_document_lifecycle_turn,
+                        PageVmInitStage::Load,
+                    )
+                    .await?;
+                assert!(matches!(
+                    outcome,
+                    crate::runtime::PageVmFollowNavigationTurnOutcome::Completed
+                ));
+                assert_eq!(
+                    page_vm
+                        .vm_mut()
+                        .drain_pre_domcontentloaded_content_security_policy_violation_tasks_for_test(),
+                    1
+                );
+                page_vm.vm_mut().eval(
+                    "JSON.stringify({ ran: globalThis.__jsUrlRan, violations: globalThis.__jsUrlViolations, href: location.href })",
+                )
+            })
+            .await
+            .expect("Trusted Types javascript location navigation should settle");
+
+        assert_eq!(
+            observed,
+            r#"{"ran":false,"violations":[{"sample":"Location href|globalThis.__jsUrlRan=true","disposition":"enforce"}],"href":"https://javascript-location-trusted-types.test/start.html"}"#
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn javascript_string_completion_restarts_renderer_lifecycle_on_same_document_token() {
     run_page_vm_async_test(async move {
         let page_vm = test_page_vm_with_document_url(
@@ -1461,10 +1526,7 @@ window.addEventListener("pageshow", () => {
                     .eval("__stopLoadingLifecycleEvents.length = 0; 'cleared'")?;
 
                 let reply = page_vm
-                    .dispatch_renderer_page_command_async(
-                        RendererPageCommand::StopDocumentLifecycle,
-                    )
-                    .await?;
+                    .dispatch_renderer_page_command(RendererPageCommand::StopDocumentLifecycle)?;
                 assert!(matches!(reply, RendererPageReply::Unit));
                 assert_eq!(
                     page_vm.vm_mut().eval(
@@ -2883,22 +2945,12 @@ fn page_resource_namespace_rejects_real_page_vm_replacement_owner_collisions() {
     run_page_vm_large_stack_async_test(
         "page-resource-real-replacement-owner-collision",
         || async move {
-            let replacement_markup =
-                "<!doctype html><html><head></head><body></body></html>".to_owned();
-            let (base_url, server) = spawn_path_response_http_server(vec![
-                (
-                    "/replacement.html",
-                    "HTTP/1.1 200 OK",
-                    replacement_markup,
-                    Duration::ZERO,
-                ),
-                (
-                    "/replacement-child-pending.html",
-                    "HTTP/1.1 200 OK",
-                    "<!doctype html><p>replacement child response</p>".to_owned(),
-                    Duration::from_millis(100),
-                ),
-            ])
+            let (base_url, server) = spawn_path_response_http_server(vec![(
+                "/replacement-child-pending.html",
+                "HTTP/1.1 200 OK",
+                "<!doctype html><p>replacement child response</p>".to_owned(),
+                Duration::from_millis(100),
+            )])
             .await;
             let loader = crate::network::ResourceRequestClient::new(&FetchConfig::default())
                 .expect("loader");
@@ -2911,7 +2963,10 @@ fn page_resource_namespace_rejects_real_page_vm_replacement_owner_collisions() {
                 runtime_hooks,
             );
             let local_executor = page_vm.local_executor.clone();
-            let replacement_url = format!("{base_url}/replacement.html");
+            // The root replacement needs complete parser input in one standalone
+            // turn. Keep the real HTTP child request below for stale-terminal checks.
+            let replacement_url =
+                "data:text/html,<!doctype html><html><head></head><body></body></html>";
             let replacement_child_url = format!("{base_url}/replacement-child-pending.html");
 
             local_executor
@@ -3065,7 +3120,8 @@ document.body.appendChild(replacementFrame);
                                     ),
                                     source_bytes: None,
                                     network_result: None,
-                                },
+                                    network_request_handle: None,
+},
                             ),
                             MainParserDeferredClassicSourceNetworkAttribution::new(
                                 Url::parse("https://old-document.test/").unwrap(),
@@ -3306,30 +3362,37 @@ document.body.appendChild(replacementFrame);
                         "dynamic import must retain script initiator attribution after replacement"
                     );
 
+                    let request_url = Url::parse("https://old-document.test/child.css").unwrap();
+                    let graph = Arc::new(
+                        crate::stylesheet_blocking::StylesheetImportGraphFetchResult::new(
+                            false,
+                            vec![crate::stylesheet_blocking::StylesheetImportNetworkResult::new(
+                                request_url.clone(),
+                                0.0,
+                                crate::stylesheet_blocking::StylesheetFetchTerminal::network_error(
+                                    "retired child stylesheet failed",
+                                ),
+                            )],
+                        ),
+                    );
                     queue.enqueue_local_for_test(
                         RendererPageResourceCompletion::child_blocking_stylesheet(
                             old_root_document,
                             ChildBlockingStylesheetLoadCompletion {
+                                csp_violations: Vec::new(),
+                                load_delay_token: crate::frame_owner_model::DocumentLoadDelayTokenId(1),
                                 child_handle: old_child_handle,
                                 owner: old_child_owner,
-                                signature: crate::DocumentBlockingStylesheetSignature::
-                                    ParserCreatedStyleImport { urls: Vec::new() },
-                                network_results: vec![ChildBlockingStylesheetNetworkResult {
-                                    frame_id: Some("retired-child-frame".to_owned()),
-                                    document_url: Url::parse(
-                                        "https://old-document.test/child",
-                                    )
-                                    .unwrap(),
-                                    request_url: Url::parse(
-                                        "https://old-document.test/child.css",
-                                    )
-                                    .unwrap(),
-                                    initiator_type: SubresourceRequestInitiatorType::Parser,
-                                    terminal: crate::stylesheet_blocking::
-                                        StylesheetFetchTerminal::network_error(
-                                            "retired child stylesheet failed",
-                                        ),
-                                }],
+                                signature: crate::DocumentBlockingStylesheetSignature::Link {
+                                    url: request_url,
+                                    options: Default::default(),
+                                },
+                                frame_id: Some("retired-child-frame".to_owned()),
+                                document_url: Url::parse(
+                                    "https://old-document.test/child",
+                                )
+                                .unwrap(),
+                                graph,
                             },
                         ),
                     );
@@ -3656,6 +3719,22 @@ fn runtime_evaluate_without_enable_uses_inspector_default_context() {
 }
 
 #[test]
+fn page_native_inspector_owns_object_namespaces_and_groups() {
+    let mut page_vm = test_page_vm();
+    crate::inspector_session::tests::object_lifecycle::assert_object_namespaces_and_groups(
+        |session, request| {
+            page_vm
+                .vm_mut()
+                .dispatch_inspector_protocol_message_for_session(Some(session), request)
+                .expect("Page native Inspector dispatch")
+                .into_iter()
+                .map(RendererRuntimeInspectorMessage::into_v8_inspector_message)
+                .collect()
+        },
+    );
+}
+
+#[test]
 fn runtime_stack_capture_follows_session_lifecycle() {
     let mut page_vm = test_page_vm();
     crate::inspector_session::tests::assert_session_lifecycle(|request| {
@@ -3825,7 +3904,7 @@ fn page_report_capture_reuses_unchanged_network_report() {
                     document_url,
                     request_url.clone(),
                     "GET".to_owned(),
-                    Vec::new(),
+                    Vec::new().into(),
                     None,
                     SubresourceResourceType::Fetch,
                     None,
@@ -3916,7 +3995,9 @@ fn serialize_html_reads_current_document_after_document_open() {
         .vm()
         .current_main_document_task_owner()
         .expect("initial document owner");
-    let before_html = page_vm.serialize_html();
+    let before_html = page_vm
+        .serialize_html(crate::RendererHtmlSerializeOptions::default())
+        .unwrap();
     assert!(before_html.contains(">before<"));
 
     page_vm
@@ -3932,7 +4013,9 @@ document.close();"#,
         .vm()
         .current_main_document_task_owner()
         .expect("replacement document owner");
-    let after_html = page_vm.serialize_html();
+    let after_html = page_vm
+        .serialize_html(crate::RendererHtmlSerializeOptions::default())
+        .unwrap();
 
     assert_ne!(before_owner.document_id, after_owner.document_id);
     assert!(

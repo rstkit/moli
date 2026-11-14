@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_selector::StyleRuleNamespaceContext;
 use moli_webapi_declare::WebApiObject;
@@ -22,13 +23,9 @@ pub const CSS_STYLE_SHEET_ADOPTED_OWNER_KEYS_SLOT: &str = "__moliCssStyleSheetAd
 
 pub const CSS_STYLE_SHEET_ADOPTED_OWNER_ARRAYS_SLOT: &str = "__moliCssStyleSheetAdoptedOwnerArrays";
 
-pub const CSS_STYLE_SHEET_BRAND_SLOT: &str = "__moliCssStyleSheetBrand";
-
 pub const CSS_STYLE_SHEET_ID_SLOT: &str = "__moliCssStyleSheetId";
 
 pub const CSS_STYLE_SHEET_WRAPPER_LEASE_ID_SLOT: &str = "__moliCssStyleSheetWrapperLeaseId";
-
-pub const CSS_RULE_BRAND_SLOT: &str = "__moliCssRuleBrand";
 
 pub const CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT: &str = "__moliCssRuleDetachedSnapshotText";
 
@@ -129,11 +126,7 @@ pub const CSS_MEDIA_LIST_OWNER_KIND_SLOT: &str = "__moliCssMediaListOwnerKind";
 
 pub const CSS_MEDIA_LIST_LENGTH_SLOT: &str = "__moliCssMediaListLength";
 
-pub const STYLE_SHEET_LIST_BRAND_SLOT: &str = "__moliStyleSheetListBrand";
-
 pub const STYLE_SHEET_LIST_LENGTH_SLOT: &str = "__moliStyleSheetListLength";
-
-pub const CSS_RULE_LIST_BRAND_SLOT: &str = "__moliCssRuleListBrand";
 
 pub const CSS_RULE_LIST_LENGTH_SLOT: &str = "__moliCssRuleListLength";
 
@@ -224,7 +217,7 @@ pub enum CssRulePdbDeclarationKind {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSRule")]
+#[webapi(interface = web_api_interfaces::CSSRule)]
 pub struct CssRuleConstantsDeclaration {
     #[webapi(constant = "UNKNOWN_RULE", value = CSS_RULE_UNKNOWN_RULE_TYPE)]
     pub unknown_rule: (),
@@ -285,37 +278,29 @@ pub struct CssRuleConstantsDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSStyleSheet")]
+#[webapi(interface = web_api_interfaces::CSSStyleSheet)]
 pub struct CssStyleSheetDeclaration<'scope> {
-    #[webapi(slot = CSS_STYLE_SHEET_BRAND_SLOT, init = true)]
-    pub brand: (),
     #[webapi(slot = CSS_STYLE_SHEET_RULES_SLOT)]
     pub rules: v8::Local<'scope, v8::Value>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "StyleSheetList")]
+#[webapi(interface = web_api_interfaces::StyleSheetList)]
 pub struct StyleSheetListDeclaration {
-    #[webapi(slot = STYLE_SHEET_LIST_BRAND_SLOT, init = true)]
-    pub brand: (),
     #[webapi(slot = STYLE_SHEET_LIST_LENGTH_SLOT, init = 0)]
     pub length: (),
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSRuleList")]
+#[webapi(interface = web_api_interfaces::CSSRuleList)]
 pub struct CssRuleListDeclaration {
-    #[webapi(slot = CSS_RULE_LIST_BRAND_SLOT, init = true)]
-    pub brand: (),
     #[webapi(slot = CSS_RULE_LIST_LENGTH_SLOT)]
     pub length: u32,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSRule")]
+#[webapi(interface = web_api_interfaces::CSSRule)]
 pub struct CssAtRuleDeclaration<'scope> {
-    #[webapi(slot = CSS_RULE_BRAND_SLOT)]
-    pub brand: bool,
     #[webapi(slot = CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT)]
     pub css_text: String,
     #[webapi(slot = CSS_AT_RULE_TYPE_SLOT)]
@@ -327,10 +312,8 @@ pub struct CssAtRuleDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSMarginRule")]
+#[webapi(interface = web_api_interfaces::CSSMarginRule)]
 pub struct CssMarginRuleDeclaration<'scope> {
-    #[webapi(slot = CSS_RULE_BRAND_SLOT)]
-    pub brand: bool,
     #[webapi(slot = CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT)]
     pub css_text: String,
     #[webapi(slot = CSS_MARGIN_RULE_NAME_SLOT)]
@@ -344,10 +327,8 @@ pub struct CssMarginRuleDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSKeyframeRule")]
+#[webapi(interface = web_api_interfaces::CSSKeyframeRule)]
 pub struct CssKeyframeRuleDeclaration<'scope> {
-    #[webapi(slot = CSS_RULE_BRAND_SLOT)]
-    pub brand: bool,
     #[webapi(slot = CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT)]
     pub css_text: String,
     #[webapi(slot = CSS_KEYFRAME_RULE_KEY_TEXT_SLOT)]
@@ -361,10 +342,8 @@ pub struct CssKeyframeRuleDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSFontFeatureValuesRule")]
+#[webapi(interface = web_api_interfaces::CSSFontFeatureValuesRule)]
 pub struct CssFontFeatureValuesRuleDeclaration<'scope> {
-    #[webapi(slot = CSS_RULE_BRAND_SLOT)]
-    pub brand: bool,
     #[webapi(slot = CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT)]
     pub css_text: String,
     #[webapi(slot = CSS_FONT_FEATURE_VALUES_RULE_FONT_FAMILY_SLOT)]
@@ -376,10 +355,8 @@ pub struct CssFontFeatureValuesRuleDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSPropertyRule")]
+#[webapi(interface = web_api_interfaces::CSSPropertyRule)]
 pub struct CssPropertyRuleDeclaration<'scope> {
-    #[webapi(slot = CSS_RULE_BRAND_SLOT)]
-    pub brand: bool,
     #[webapi(slot = CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT)]
     pub css_text: String,
     #[webapi(slot = CSS_AT_RULE_TYPE_SLOT)]
@@ -399,10 +376,8 @@ pub struct CssPropertyRuleDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSStyleRule")]
+#[webapi(interface = web_api_interfaces::CSSStyleRule)]
 pub struct CssStyleRuleDeclaration<'scope> {
-    #[webapi(slot = CSS_RULE_BRAND_SLOT)]
-    pub brand: bool,
     #[webapi(slot = CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT)]
     pub css_text: String,
     #[webapi(slot = CSS_STYLE_RULE_SELECTOR_TEXT_SLOT)]
@@ -416,10 +391,8 @@ pub struct CssStyleRuleDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CSSNestedDeclarations")]
+#[webapi(interface = web_api_interfaces::CSSNestedDeclarations)]
 pub struct CssNestedDeclarationsRuleDeclaration<'scope> {
-    #[webapi(slot = CSS_RULE_BRAND_SLOT)]
-    pub brand: bool,
     #[webapi(slot = CSS_RULE_DETACHED_SNAPSHOT_TEXT_SLOT)]
     pub css_text: String,
     #[webapi(slot = CSS_NESTED_DECLARATIONS_STYLE_TEXT_SLOT)]
@@ -431,7 +404,7 @@ pub struct CssNestedDeclarationsRuleDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "MediaList")]
+#[webapi(interface = web_api_interfaces::MediaList)]
 pub struct MediaListDeclaration<'scope> {
     #[webapi(slot = CSS_MEDIA_LIST_OWNER_RULE_SLOT)]
     pub owner: v8::Local<'scope, v8::Object>,
@@ -440,7 +413,7 @@ pub struct MediaListDeclaration<'scope> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "StyleSheet", enumerable)]
+#[webapi(interface = web_api_interfaces::StyleSheet, enumerable)]
 pub struct StyleSheetBasePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_style_sheet_type_getter_callback)]
     r#type: (),
@@ -467,7 +440,7 @@ pub struct StyleSheetBasePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSStyleSheet", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSStyleSheet, enumerable)]
 pub struct CssStyleSheetPrototypeDeclaration {
     #[webapi(accessor_property, getter = css_style_sheet_css_rules_getter_callback)]
     pub css_rules: (),
@@ -490,7 +463,7 @@ pub struct CssStyleSheetPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "StyleSheetList", enumerable)]
+#[webapi(interface = web_api_interfaces::StyleSheetList, enumerable)]
 pub struct StyleSheetListPrototypeDeclaration {
     #[webapi(accessor_property, getter = style_sheet_list_length_getter_callback)]
     pub length: (),
@@ -504,7 +477,7 @@ pub struct StyleSheetListPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSRuleList", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSRuleList, enumerable)]
 pub struct CssRuleListPrototypeDeclaration {
     #[webapi(accessor_property, getter = css_rule_list_length_getter_callback)]
     pub length: (),
@@ -518,7 +491,7 @@ pub struct CssRuleListPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MediaList", enumerable)]
+#[webapi(interface = web_api_interfaces::MediaList, enumerable)]
 pub struct MediaListPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -551,7 +524,7 @@ pub struct LinkStylePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSRule, enumerable)]
 pub struct CssRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_rule_type_getter_callback)]
     r#type: (),
@@ -568,7 +541,7 @@ pub struct CssRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSGroupingRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSGroupingRule, enumerable, receiver)]
 pub struct CssGroupingRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_grouping_rule_css_rules_getter_callback)]
     pub css_rules: (),
@@ -579,14 +552,14 @@ pub struct CssGroupingRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSConditionRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSConditionRule, enumerable)]
 pub struct CssConditionRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_condition_rule_condition_text_getter_callback)]
     pub condition_text: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSMediaRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSMediaRule, enumerable)]
 pub struct CssMediaRulePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -599,14 +572,14 @@ pub struct CssMediaRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSSupportsRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSSupportsRule, enumerable)]
 pub struct CssSupportsRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_supports_rule_matches_getter_callback)]
     pub matches: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSContainerRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSContainerRule, enumerable, receiver = web_api_interfaces::CSSContainerRule::is_instance)]
 pub struct CssContainerRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_container_rule_container_name_getter_callback)]
     pub container_name: (),
@@ -615,21 +588,21 @@ pub struct CssContainerRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSLayerBlockRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSLayerBlockRule, enumerable)]
 pub struct CssLayerBlockRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_layer_block_rule_name_getter_callback)]
     pub name: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSLayerStatementRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSLayerStatementRule, enumerable)]
 pub struct CssLayerStatementRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_layer_statement_rule_name_list_getter_callback)]
     pub name_list: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSScopeRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSScopeRule, enumerable)]
 pub struct CssScopeRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_scope_rule_start_getter_callback)]
     pub start: (),
@@ -638,7 +611,7 @@ pub struct CssScopeRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSImportRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSImportRule, enumerable)]
 pub struct CssImportRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_import_rule_href_getter_callback)]
     pub href: (),
@@ -657,7 +630,7 @@ pub struct CssImportRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSFontFaceRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSFontFaceRule, enumerable)]
 pub struct CssFontFaceRulePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -668,7 +641,7 @@ pub struct CssFontFaceRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSMarginRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSMarginRule, enumerable)]
 pub struct CssMarginRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_margin_rule_name_getter_callback)]
     pub name: (),
@@ -681,7 +654,7 @@ pub struct CssMarginRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSFontFeatureValuesRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSFontFeatureValuesRule, enumerable, receiver)]
 pub struct CssFontFeatureValuesRulePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -707,7 +680,7 @@ pub struct CssFontFeatureValuesRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSPropertyRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSPropertyRule, enumerable, receiver = web_api_interfaces::CSSPropertyRule::is_instance)]
 pub struct CssPropertyRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_property_rule_name_getter_callback)]
     pub name: (),
@@ -723,7 +696,7 @@ pub struct CssPropertyRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSPageRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSPageRule, enumerable)]
 pub struct CssPageRulePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -740,7 +713,7 @@ pub struct CssPageRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSKeyframesRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSKeyframesRule, enumerable, receiver)]
 pub struct CssKeyframesRulePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -766,7 +739,7 @@ pub struct CssKeyframesRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSKeyframeRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSKeyframeRule, enumerable, receiver)]
 pub struct CssKeyframeRulePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -783,7 +756,7 @@ pub struct CssKeyframeRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSNamespaceRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSNamespaceRule, enumerable)]
 pub struct CssNamespaceRulePrototypeDeclaration {
     #[webapi(
         accessor_property = "namespaceURI",
@@ -795,14 +768,14 @@ pub struct CssNamespaceRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSCounterStyleRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSCounterStyleRule, enumerable)]
 pub struct CssCounterStyleRulePrototypeDeclaration {
     #[webapi(accessor_property, getter = css_counter_style_rule_name_getter_callback)]
     pub name: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSStyleRule", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSStyleRule, enumerable)]
 pub struct CssStyleRulePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -821,7 +794,7 @@ pub struct CssStyleRulePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSNestedDeclarations", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSNestedDeclarations, enumerable)]
 pub struct CssNestedDeclarationsPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -901,13 +874,6 @@ pub struct CssKeyframesRuleDeleteRuleArgs {
 pub struct CssKeyframesRuleFindRuleArgs {
     #[webidl(required)]
     pub key: String,
-}
-
-#[derive(webidl::WebIdlArgs)]
-#[webidl(prefix = "CSSKeyframeRule.keyText")]
-pub struct CssKeyframeRuleKeyTextArgs {
-    #[webidl(required)]
-    pub key_text: String,
 }
 
 #[derive(webidl::WebIdlArgs)]

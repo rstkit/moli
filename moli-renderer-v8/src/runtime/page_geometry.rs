@@ -1,23 +1,8 @@
-use anyhow::{Context, Result, anyhow};
-use moli_layout::{LayoutFlushReason, LayoutQuery, LayoutQueryAnswer, LayoutQueryBatch};
-
 use super::{PageVm, RendererLayoutMetrics};
 
 impl PageVm {
-    pub(crate) fn layout_metrics(&mut self) -> Result<RendererLayoutMetrics> {
-        let answers = self
-            .vm_mut()
-            .observable_geometry_batch_for_current_document(
-                LayoutFlushReason::CdpGeometry,
-                &LayoutQueryBatch::new(vec![LayoutQuery::DocumentMetrics]),
-            )
-            .context("failed to produce document layout metrics")?;
-        let Some(LayoutQueryAnswer::DocumentMetrics(metrics)) = answers.answers.into_iter().next()
-        else {
-            return Err(anyhow!(
-                "geometry provider returned a mismatched document metrics answer"
-            ));
-        };
+    pub(crate) fn layout_metrics(&self) -> anyhow::Result<RendererLayoutMetrics> {
+        let metrics = self.vm().document_metrics_for_current_document()?;
         Ok(RendererLayoutMetrics {
             viewport_width: metrics.viewport.css_width,
             viewport_height: metrics.viewport.css_height,

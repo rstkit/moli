@@ -4,9 +4,10 @@ use moli_cookie_jar::{NetworkCookieRequestContext, new_shared_browser_cookie_sto
 use url::Url;
 
 use crate::{
-    BrowserNavigationRequestKind, BrowserRequestMetadata, FetchConfig, Request, RequestAuth,
-    RequestAuthScheme, RequestAuthTarget, RequestCredentialsMode, RequestMode, RequestResourceType,
-    ScriptFetchRequestMetadata, cookie_header_for_request, outgoing_request_headers,
+    BrowserNavigationRequestKind, BrowserRequestMetadata, CookieHeaderPolicy, FetchConfig, Request,
+    RequestAuth, RequestAuthScheme, RequestAuthTarget, RequestCredentialsMode, RequestMode,
+    RequestResourceType, ScriptFetchRequestMetadata, SubresourceRequestMetadata,
+    cookie_header_for_request, outgoing_request_headers,
 };
 
 #[test]
@@ -15,7 +16,7 @@ fn host_only_cookie_uses_default_path_and_path_boundary_matching() {
     let response_url = Url::parse("http://example.com/scoped/index.html").unwrap();
     jar.store_response_headers(
         &response_url,
-        &[("set-cookie".to_owned(), "scope=1; HttpOnly".to_owned())],
+        &[("set-cookie".to_owned(), b"scope=1; HttpOnly".to_vec())],
     );
 
     assert_eq!(
@@ -41,14 +42,14 @@ fn cookie_replacement_uses_name_domain_and_path_key() {
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "theme=light; Path=/account".to_owned(),
+            b"theme=light; Path=/account".to_vec(),
         )],
     );
     jar.store_response_headers(
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "theme=dark; Path=/account".to_owned(),
+            b"theme=dark; Path=/account".to_vec(),
         )],
     );
 
@@ -67,7 +68,7 @@ fn invalid_domain_cookie_is_ignored() {
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "session=bad; Domain=other.com; Path=/".to_owned(),
+            b"session=bad; Domain=other.com; Path=/".to_vec(),
         )],
     );
 
@@ -86,7 +87,7 @@ fn secure_cookie_only_matches_https_requests() {
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "session=secure; Path=/; Secure".to_owned(),
+            b"session=secure; Path=/; Secure".to_vec(),
         )],
     );
 
@@ -107,13 +108,13 @@ fn max_age_zero_removes_existing_cookie_immediately() {
 
     jar.store_response_headers(
         &response_url,
-        &[("set-cookie".to_owned(), "flash=1; Path=/".to_owned())],
+        &[("set-cookie".to_owned(), b"flash=1; Path=/".to_vec())],
     );
     jar.store_response_headers(
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "flash=gone; Path=/; Max-Age=0".to_owned(),
+            b"flash=gone; Path=/; Max-Age=0".to_vec(),
         )],
     );
 
@@ -130,7 +131,7 @@ fn host_only_cookie_does_not_match_subdomains() {
 
     jar.store_response_headers(
         &response_url,
-        &[("set-cookie".to_owned(), "hostonly=1; Path=/".to_owned())],
+        &[("set-cookie".to_owned(), b"hostonly=1; Path=/".to_vec())],
     );
 
     assert_eq!(
@@ -148,7 +149,7 @@ fn domain_cookie_matches_subdomains_and_normalizes_leading_dot() {
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "shared=1; Domain=.example.com; Path=/".to_owned(),
+            b"shared=1; Domain=.example.com; Path=/".to_vec(),
         )],
     );
 
@@ -167,7 +168,7 @@ fn invalid_cookie_path_falls_back_to_default_request_path() {
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "fallback=1; Path=relative".to_owned(),
+            b"fallback=1; Path=relative".to_vec(),
         )],
     );
 
@@ -188,13 +189,13 @@ fn expires_in_past_removes_cookie_immediately() {
 
     jar.store_response_headers(
         &response_url,
-        &[("set-cookie".to_owned(), "session=1; Path=/".to_owned())],
+        &[("set-cookie".to_owned(), b"session=1; Path=/".to_vec())],
     );
     jar.store_response_headers(
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "session=gone; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT".to_owned(),
+            b"session=gone; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT".to_vec(),
         )],
     );
 
@@ -211,13 +212,13 @@ fn cookies_with_longer_paths_are_sent_first_and_can_coexist() {
 
     jar.store_response_headers(
         &response_url,
-        &[("set-cookie".to_owned(), "mode=base; Path=/app".to_owned())],
+        &[("set-cookie".to_owned(), b"mode=base; Path=/app".to_vec())],
     );
     jar.store_response_headers(
         &response_url,
         &[(
             "set-cookie".to_owned(),
-            "mode=deep; Path=/app/admin".to_owned(),
+            b"mode=deep; Path=/app/admin".to_vec(),
         )],
     );
 
@@ -234,12 +235,12 @@ fn request_cookie_header_reads_from_canonical_cookie_core() {
     let request_url = Url::parse("https://example.com/app/panel").unwrap();
 
     {
-        let mut jar = cookie_store.lock();
+        let mut jar = cookie_store.lock().unwrap();
         jar.store_response_headers(
             &response_url,
             &[(
                 "set-cookie".to_owned(),
-                "sid=server; Path=/app; Secure".to_owned(),
+                b"sid=server; Path=/app; Secure".to_vec(),
             )],
         );
     }
@@ -324,6 +325,128 @@ fn outgoing_request_headers_skip_default_cookie_when_store_cookie_exists() {
 }
 
 #[test]
+fn outgoing_request_headers_preserve_explicit_cookies_for_curl_policy() {
+    for manual_in_config in [false, true] {
+        let mut config = FetchConfig::default();
+        let headers = if manual_in_config {
+            config.push_default_request_header("Cookie", "manual=1");
+            vec![]
+        } else {
+            vec![("Cookie".to_owned(), "manual=1".to_owned())]
+        };
+        let request = Request::new("GET", "https://example.com/app/panel", None, headers)
+            .unwrap()
+            .with_additional_cookies(Some("literal=one".to_owned()))
+            .with_cookie_header_policy(CookieHeaderPolicy::PreserveExplicit);
+        assert_eq!(
+            outgoing_request_headers(&config, &request, Some("sid=server")),
+            vec![
+                ("Cookie".to_owned(), "sid=server".to_owned()),
+                ("Cookie".to_owned(), "manual=1".to_owned()),
+            ]
+        );
+    }
+}
+
+#[test]
+fn literal_cookies_obey_browser_credentials_for_both_configuration_sources() {
+    let origin = Url::parse("https://app.test/page").unwrap();
+    for in_config in [false, true] {
+        let mut config = FetchConfig::default();
+        if in_config {
+            config.set_additional_cookies(Some("session=literal".to_owned()));
+            config.bind_additional_cookie_scope(&Request::get(origin.as_str()).unwrap());
+        }
+        for target in ["https://app.test/resource", "https://app.test:444/resource"] {
+            for credentials in [
+                RequestCredentialsMode::Omit,
+                RequestCredentialsMode::SameOrigin,
+                RequestCredentialsMode::Include,
+            ] {
+                let mut request = Request::get(target)
+                    .unwrap()
+                    .with_request_origin(moli_url::WebOrigin::from_url(&origin))
+                    .with_credentials_mode(credentials);
+                if !in_config {
+                    request = request.with_additional_cookies(Some("session=literal".to_owned()));
+                }
+                let expected = match credentials {
+                    RequestCredentialsMode::Include => Some("session=literal"),
+                    RequestCredentialsMode::SameOrigin
+                        if target.starts_with("https://app.test/") =>
+                    {
+                        Some("session=literal")
+                    }
+                    _ => None,
+                };
+                let headers = outgoing_request_headers(&config, &request, None);
+                assert_eq!(
+                    header_value(&headers, "cookie"),
+                    expected,
+                    "{target}, {credentials:?}, in_config={in_config}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn configured_literal_cookie_scope_is_pinned_and_shared_by_config_clones() {
+    let mut config = FetchConfig::default();
+    config.set_additional_cookies(Some("session=literal".to_owned()));
+    let cloned = config.clone();
+    let automatic = |url: &str| {
+        Request::new("GET", url, None, Vec::new())
+            .unwrap()
+            .with_request_mode(RequestMode::NoCors)
+            .with_credentials_mode(RequestCredentialsMode::Include)
+    };
+    let page = Request::get("https://app.test/start").unwrap();
+
+    for request in [
+        automatic("https://tracker.test/early-fetch"),
+        Request::get("https://tracker.test/iframe")
+            .unwrap()
+            .with_subframe_navigation_cookie_context(),
+        Request::get("data:text/html,initial").unwrap(),
+    ] {
+        config.bind_additional_cookie_scope(&request);
+        assert_eq!(
+            header_value(&outgoing_request_headers(&config, &request, None), "cookie"),
+            None
+        );
+    }
+    // Header inspection itself cannot choose the default host.
+    assert_eq!(
+        header_value(&outgoing_request_headers(&config, &page, None), "cookie"),
+        None
+    );
+    config.bind_additional_cookie_scope(&page);
+    assert_eq!(config, cloned);
+
+    cloned.bind_additional_cookie_scope(&Request::get("https://tracker.test/later").unwrap());
+    for candidate in [&config, &cloned] {
+        for (target, expected) in [
+            ("https://APP.test/asset", Some("session=literal")),
+            ("https://app.test:8443/asset", Some("session=literal")),
+            ("http://app.test/asset", Some("session=literal")),
+            ("https://sub.app.test/asset", None),
+            ("https://tracker.test/asset", None),
+        ] {
+            let headers = outgoing_request_headers(candidate, &automatic(target), None);
+            assert_eq!(header_value(&headers, "cookie"), expected, "{target}");
+        }
+        let headers = outgoing_request_headers(
+            candidate,
+            &automatic("https://tracker.test/asset"),
+            Some("target=stored"),
+        );
+        assert_eq!(header_value(&headers, "cookie"), Some("target=stored"));
+    }
+    assert_eq!(config, cloned);
+}
+
+#[test]
 fn outgoing_request_headers_keep_default_cookie_without_store_cookie() {
     let mut config = FetchConfig::default();
     config.push_default_request_header("Cookie", "manual=1");
@@ -391,7 +514,11 @@ fn outgoing_request_headers_preserve_duplicate_default_headers_in_order() {
 fn top_level_navigation_request(request_url: &str, initiator_url: Option<&str>) -> Request {
     let request = Request::get(request_url).unwrap();
     if let Some(initiator_url) = initiator_url {
-        request.with_initiator_url(&Url::parse(initiator_url).unwrap())
+        request
+            .with_initiator_url(&Url::parse(initiator_url).unwrap())
+            .with_request_origin(moli_url::WebOrigin::from_url(
+                &Url::parse(initiator_url).unwrap(),
+            ))
     } else {
         request
     }
@@ -429,7 +556,7 @@ fn top_level_navigation_headers_default_to_browser_style_document_navigation() {
     );
     assert_eq!(
         header_value(&headers, "sec-ch-ua"),
-        Some("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")
+        Some("\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"")
     );
     assert_eq!(header_value(&headers, "referer"), None);
     assert_eq!(header_value(&headers, "cache-control"), None);
@@ -565,7 +692,10 @@ fn generic_subresource_requests_do_not_inherit_browser_headers_without_metadata(
     let config = FetchConfig::default();
     let request = Request::new("GET", "https://example.com/app.js", None, vec![])
         .unwrap()
-        .with_initiator_url(&Url::parse("https://example.com/docs").unwrap());
+        .with_initiator_url(&Url::parse("https://example.com/docs").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/docs").unwrap(),
+        ));
 
     let headers = outgoing_request_headers(&config, &request, None);
 
@@ -591,6 +721,9 @@ fn browser_fetch_and_xhr_subresource_headers_match_chromium_same_origin_shape() 
             .with_initiator_url(
                 &Url::parse("https://example.com/docs/page.html?x=1#section").unwrap(),
             )
+            .with_request_origin(moli_url::WebOrigin::from_url(
+                &Url::parse("https://example.com/").unwrap(),
+            ))
             .with_browser_request_metadata(metadata);
 
         let headers = outgoing_request_headers(&config, &request, None);
@@ -610,7 +743,7 @@ fn browser_fetch_and_xhr_subresource_headers_match_chromium_same_origin_shape() 
         assert_eq!(header_value(&headers, "origin"), None);
         assert_eq!(
             header_value(&headers, "sec-ch-ua"),
-            Some("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")
+            Some("\"Not:A-Brand\";v=\"8\", \"Chromium\";v=\"156\", \"Google Chrome\";v=\"156\"")
         );
         assert_eq!(header_value(&headers, "sec-ch-ua-mobile"), Some("?0"));
         assert_eq!(
@@ -630,6 +763,9 @@ fn browser_audio_worklet_subresource_headers_use_audioworklet_destination() {
     let request = Request::new("GET", "https://example.com/worklet.js", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://example.com/docs/page.html").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/docs/page.html").unwrap(),
+        ))
         .with_browser_request_metadata(BrowserRequestMetadata::AudioWorklet);
 
     let headers = outgoing_request_headers(&config, &request, None);
@@ -657,6 +793,9 @@ fn browser_media_subresource_headers_preserve_audio_video_destinations() {
         let request = Request::new("GET", "https://cdn.example/media", None, vec![])
             .unwrap()
             .with_initiator_url(&Url::parse("https://example.com/page").unwrap())
+            .with_request_origin(moli_url::WebOrigin::from_url(
+                &Url::parse("https://example.com/page").unwrap(),
+            ))
             .with_request_mode(RequestMode::NoCors)
             .with_resource_type(RequestResourceType::Media)
             .with_browser_request_metadata(metadata);
@@ -676,6 +815,9 @@ fn browser_image_subresource_headers_use_image_accept_and_destination() {
     let request = Request::new("GET", "https://cdn.example/hero.png", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://example.com/page").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/page").unwrap(),
+        ))
         .with_request_mode(RequestMode::NoCors)
         .with_resource_type(RequestResourceType::Image)
         .with_browser_request_metadata(BrowserRequestMetadata::Image);
@@ -697,6 +839,9 @@ fn browser_font_subresource_headers_use_cors_font_destination() {
     let request = Request::new("GET", "https://cdn.example/demo.woff2", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://example.com/page").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/page").unwrap(),
+        ))
         .with_request_mode(RequestMode::Cors)
         .with_credentials_mode(RequestCredentialsMode::SameOrigin)
         .with_resource_type(RequestResourceType::Font)
@@ -720,6 +865,9 @@ fn browser_text_track_headers_use_vtt_accept_and_track_destination() {
     let request = Request::new("GET", "https://cdn.example/captions.vtt", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://cdn.example/page").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://cdn.example/page").unwrap(),
+        ))
         .with_request_mode(RequestMode::SameOrigin)
         .with_resource_type(RequestResourceType::TextTrack)
         .with_browser_request_metadata(BrowserRequestMetadata::TextTrack);
@@ -744,6 +892,9 @@ fn browser_json_module_subresource_headers_use_json_destination() {
     let request = Request::new("GET", "https://example.com/data.json", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://example.com/docs/page.html").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/docs/page.html").unwrap(),
+        ))
         .with_browser_request_metadata(BrowserRequestMetadata::JsonModule);
 
     let headers = outgoing_request_headers(&config, &request, None);
@@ -759,11 +910,40 @@ fn browser_json_module_subresource_headers_use_json_destination() {
 }
 
 #[test]
+fn browser_text_module_subresource_headers_use_text_destination() {
+    let config = FetchConfig::default();
+    let request = Request::new("GET", "https://example.com/data.json", None, vec![])
+        .unwrap()
+        .with_initiator_url(&Url::parse("https://example.com/docs/page.html").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/docs/page.html").unwrap(),
+        ))
+        .with_browser_request_metadata(BrowserRequestMetadata::TextModule);
+
+    let headers = outgoing_request_headers(&config, &request, None);
+
+    assert_eq!(
+        header_value(&headers, "accept"),
+        Some("text/plain,*/*;q=0.5")
+    );
+    assert_eq!(
+        header_value(&headers, "sec-fetch-site"),
+        Some("same-origin")
+    );
+    assert_eq!(header_value(&headers, "sec-fetch-mode"), Some("cors"));
+    assert_eq!(header_value(&headers, "sec-fetch-dest"), Some("text"));
+    assert_eq!(header_value(&headers, "origin"), None);
+}
+
+#[test]
 fn browser_manifest_subresource_headers_match_chromium() {
     let config = FetchConfig::default();
     let request = Request::new("GET", "https://example.com/app.webmanifest", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://example.com/docs/page.html").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/docs/page.html").unwrap(),
+        ))
         .with_request_mode(RequestMode::Cors)
         .with_credentials_mode(RequestCredentialsMode::Omit)
         .with_resource_type(RequestResourceType::Manifest)
@@ -787,6 +967,9 @@ fn browser_style_module_subresource_headers_use_style_destination() {
     let request = Request::new("GET", "https://example.com/sheet.css", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://example.com/docs/page.html").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/docs/page.html").unwrap(),
+        ))
         .with_browser_request_metadata(BrowserRequestMetadata::StyleModule);
 
     let headers = outgoing_request_headers(&config, &request, None);
@@ -808,6 +991,7 @@ fn browser_stylesheet_subresource_headers_follow_request_mode() {
     let plain = Request::new("GET", "https://cdn.example.test/plain.css", None, vec![])
         .unwrap()
         .with_initiator_url(&initiator)
+        .with_request_origin(moli_url::WebOrigin::from_url(&initiator))
         .with_request_mode(crate::RequestMode::NoCors)
         .with_browser_request_metadata(BrowserRequestMetadata::Style);
     let anonymous = Request::new(
@@ -818,6 +1002,7 @@ fn browser_stylesheet_subresource_headers_follow_request_mode() {
     )
     .unwrap()
     .with_initiator_url(&initiator)
+    .with_request_origin(moli_url::WebOrigin::from_url(&initiator))
     .with_request_mode(crate::RequestMode::Cors)
     .with_credentials_mode(crate::RequestCredentialsMode::SameOrigin)
     .with_browser_request_metadata(BrowserRequestMetadata::Style);
@@ -855,6 +1040,9 @@ fn browser_fetch_subresource_headers_use_cross_site_sec_fetch_site_when_needed()
     let request = Request::new("GET", "https://www.zhihu.com/api/v4/feed", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://sub.example.com/docs/page.html").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://sub.example.com/docs/page.html").unwrap(),
+        ))
         .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
 
     let headers = outgoing_request_headers(&config, &request, None);
@@ -878,6 +1066,9 @@ fn browser_fetch_subresource_headers_use_request_mode_for_sec_fetch_mode() {
     let request = Request::new("GET", "https://www.zhihu.com/api/v4/feed", None, vec![])
         .unwrap()
         .with_initiator_url(&Url::parse("https://sub.example.com/docs/page.html").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://sub.example.com/docs/page.html").unwrap(),
+        ))
         .with_request_mode(RequestMode::NoCors)
         .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
 
@@ -899,6 +1090,9 @@ fn browser_beacon_subresource_headers_use_no_cors_shape() {
     )
     .unwrap()
     .with_initiator_url(&Url::parse("https://sub.example.com/docs/page.html").unwrap())
+    .with_request_origin(moli_url::WebOrigin::from_url(
+        &Url::parse("https://sub.example.com/docs/page.html").unwrap(),
+    ))
     .with_resource_type(crate::RequestResourceType::Beacon)
     .with_request_mode(RequestMode::NoCors)
     .with_browser_request_metadata(BrowserRequestMetadata::Beacon);
@@ -928,6 +1122,9 @@ fn browser_ping_subresource_headers_use_no_cors_shape() {
     )
     .unwrap()
     .with_initiator_url(&Url::parse("https://sub.example.com/docs/page.html").unwrap())
+    .with_request_origin(moli_url::WebOrigin::from_url(
+        &Url::parse("https://sub.example.com/docs/page.html").unwrap(),
+    ))
     .with_resource_type(crate::RequestResourceType::Ping)
     .with_request_mode(RequestMode::NoCors)
     .with_browser_request_metadata(BrowserRequestMetadata::Ping);
@@ -951,13 +1148,17 @@ fn explicit_navigation_headers_override_browser_defaults() {
     let mut request = Request::get("https://example.com/docs")
         .unwrap()
         .with_initiator_url(&Url::parse("https://example.com/source").unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse("https://example.com/source").unwrap(),
+        ))
         .with_top_level_navigation_cookie_context();
     request.request_headers = vec![
         ("Accept-Language".to_owned(), "zh-CN,zh;q=0.9".to_owned()),
         ("Sec-Fetch-Site".to_owned(), "cross-site".to_owned()),
         ("Sec-Fetch-User".to_owned(), "?0".to_owned()),
         ("Cache-Control".to_owned(), "no-cache".to_owned()),
-    ];
+    ]
+    .into();
 
     let headers = outgoing_request_headers(&config, &request, None);
 
@@ -995,6 +1196,9 @@ fn script_request_with_referrer_policies(
     Request::new("GET", request_url, None, request_headers)
         .unwrap()
         .with_initiator_url(&Url::parse(initiator_url).unwrap())
+        .with_request_origin(moli_url::WebOrigin::from_url(
+            &Url::parse(initiator_url).unwrap(),
+        ))
         .with_script_fetch_metadata(ScriptFetchRequestMetadata {
             referrer_policy: referrer_policy.map(str::to_owned),
             document_referrer_policy: document_referrer_policy.map(str::to_owned),
@@ -1181,18 +1385,240 @@ fn script_referrer_policy_uses_origin_when_full_referrer_is_too_long() {
 }
 
 #[test]
+fn fetch_referrer_source_is_independent_of_cookie_scope() -> anyhow::Result<()> {
+    let document = Url::parse("https://document.test/source?private=1#fragment")?;
+    let cookie_origin = Url::parse("https://cookie.test/")?;
+    let config = FetchConfig::default();
+    for (selection, expected) in [
+        (None, Some("https://document.test/source?private=1")),
+        (
+            Some("about:client"),
+            Some("https://document.test/source?private=1"),
+        ),
+        (Some(""), None),
+        (
+            Some("https://selected.test/explicit?value=1#fragment"),
+            Some("https://selected.test/explicit?value=1"),
+        ),
+    ] {
+        // Worker fetch selects the Fetch referrer before supplying the client
+        // URL, whereas Window fetch initializes the client URL first.
+        for client_first in [false, true] {
+            let mut request = Request::get("https://document.test/endpoint")?
+                .with_subresource_request_metadata(SubresourceRequestMetadata {
+                    referrer_policy: Some("unsafe-url".to_owned()),
+                    ..Default::default()
+                });
+            if client_first {
+                request = request.with_initiator_url(&document);
+            }
+            if let Some(selection) = selection {
+                request = request.with_fetch_referrer(selection)?;
+            }
+            if !client_first {
+                request = request.with_initiator_url(&document);
+            }
+            for replace_scope in [false, true] {
+                let context = if replace_scope {
+                    NetworkCookieRequestContext::subresource("GET")
+                        .with_initiator_url(&request.url, &cookie_origin)
+                } else {
+                    request
+                        .cookie_context
+                        .clone()
+                        .with_cookie_initiator_origin(&request.url, &cookie_origin)
+                };
+                let request = request.clone().with_cookie_context(context);
+                assert_eq!(
+                    request.cookie_context.initiator_url.as_ref(),
+                    Some(&cookie_origin)
+                );
+                assert_eq!(
+                    request.referrer_header_value(&request.url).as_deref(),
+                    expected
+                );
+                let headers = outgoing_request_headers(&config, &request, None);
+                assert_eq!(header_value(&headers, "referer"), expected);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn fetch_referrer_inheritance_retains_the_source_client() -> anyhow::Result<()> {
+    let document = Url::parse("https://document.test/source?private=1#fragment")?;
+    let other_document = Url::parse("https://other.test/page")?;
+    let source = Request::get("https://target.test/endpoint")?
+        .with_initiator_url(&document)
+        .with_subresource_request_metadata(SubresourceRequestMetadata {
+            referrer_policy: Some("unsafe-url".to_owned()),
+            ..Default::default()
+        });
+    let derived = Request::new("OPTIONS", source.url.as_str(), None, Vec::new())?
+        .with_initiator_url(&other_document)
+        .with_referrer_from(&source);
+    assert_eq!(
+        derived.cookie_context.initiator_url.as_ref(),
+        Some(&other_document)
+    );
+    assert_eq!(
+        header_value(
+            &outgoing_request_headers(&FetchConfig::default(), &derived, None),
+            "referer"
+        ),
+        Some("https://document.test/source?private=1")
+    );
+    Ok(())
+}
+
+#[test]
+fn fetch_referrer_selection_survives_navigation_default_initialization() -> anyhow::Result<()> {
+    let document = Url::parse("https://document.test/source")?;
+    for (selection, expected) in [
+        ("about:client", None),
+        ("", None),
+        (
+            "https://selected.test/explicit",
+            Some("https://selected.test/explicit"),
+        ),
+    ] {
+        let request = Request::get("https://target.test/endpoint")?
+            .with_initiator_url(&document)
+            .with_subresource_request_metadata(SubresourceRequestMetadata {
+                referrer_policy: Some("unsafe-url".to_owned()),
+                ..Default::default()
+            })
+            .with_fetch_referrer(selection)?
+            .with_top_level_navigation_cookie_context();
+        assert_eq!(
+            request.referrer_header_value(&request.url).as_deref(),
+            expected
+        );
+        let request = request.with_initiator_url(&document);
+        let expected = match selection {
+            "about:client" => Some("https://document.test/source"),
+            _ => expected,
+        };
+        assert_eq!(
+            request.referrer_header_value(&request.url).as_deref(),
+            expected
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fetch_referrer_selection_preserves_request_identity() -> anyhow::Result<()> {
+    let initiator = Url::parse("https://origin.test/context/page?source=1#fragment")?;
+    let target = Url::parse("https://target.test/echo")?;
+    let request = Request::new_browser("POST", target, None, Vec::new(), (&initiator).into())
+        .with_initiator_url(&initiator)
+        .with_network_partition_key(Some("original-partition".to_owned()))
+        .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
+        .with_subresource_request_metadata(SubresourceRequestMetadata {
+            referrer_policy: Some("unsafe-url".to_owned()),
+            ..Default::default()
+        })
+        .with_fetch_referrer("https://user:secret@target.test/selected?q=1#private")?;
+    let headers = outgoing_request_headers(&FetchConfig::default(), &request, None);
+    assert_eq!(
+        header_value(&headers, "referer"),
+        Some("https://target.test/selected?q=1")
+    );
+    assert_eq!(
+        header_value(&headers, "origin"),
+        Some("https://origin.test")
+    );
+    assert_eq!(header_value(&headers, "sec-fetch-site"), Some("cross-site"));
+    assert_eq!(
+        request.cookie_context.initiator_url.as_ref(),
+        Some(&initiator)
+    );
+    assert_eq!(request.network_partition_key(), Some("original-partition"));
+
+    let omitted = request.clone().with_fetch_referrer("")?;
+    assert_eq!(omitted.referrer_header_value(&omitted.url), None);
+    let client = omitted.with_fetch_referrer("about:client")?;
+    assert_eq!(
+        client.referrer_header_value(&client.url).as_deref(),
+        Some("https://origin.test/context/page?source=1")
+    );
+    assert!(request.with_fetch_referrer("invalid relative URL").is_err());
+    Ok(())
+}
+
+#[test]
+fn fetch_referrer_inheritance_copies_policy_without_integrity() -> anyhow::Result<()> {
+    let initiator = Url::parse("https://origin.test/context/page")?;
+    for (referrer, policy, expected) in [
+        (
+            "https://origin.test/selected?q=1#private",
+            Some("unsafe-url"),
+            Some("https://origin.test/selected?q=1"),
+        ),
+        (
+            "https://origin.test/selected",
+            Some("origin"),
+            Some("https://origin.test/"),
+        ),
+        ("https://origin.test/selected", Some("no-referrer"), None),
+        (
+            "https://origin.test/selected",
+            None,
+            Some("https://origin.test/selected"),
+        ),
+        (
+            "about:client",
+            None,
+            Some("https://origin.test/context/page"),
+        ),
+        ("", None, None),
+    ] {
+        let source = Request::new("GET", "https://target.test/echo", None, Vec::new())?
+            .with_initiator_url(&initiator)
+            .with_subresource_request_metadata(SubresourceRequestMetadata {
+                referrer_policy: policy.map(str::to_owned),
+                document_referrer_policy: Some("unsafe-url".to_owned()),
+                integrity: Some("source-integrity".to_owned()),
+            })
+            .with_fetch_referrer(referrer)?;
+        let derived = Request::new("OPTIONS", source.url.as_str(), None, Vec::new())?
+            .with_initiator_url(&initiator)
+            .with_referrer_from(&source);
+        assert_eq!(
+            derived.referrer_header_value(&derived.url).as_deref(),
+            expected
+        );
+        assert_eq!(
+            derived.subresource_request_metadata().unwrap().integrity,
+            None
+        );
+        assert_eq!(
+            source
+                .subresource_request_metadata()
+                .unwrap()
+                .integrity
+                .as_deref(),
+            Some("source-integrity")
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn request_cookie_header_includes_document_cookie_mutations() {
     let cookie_store = new_shared_browser_cookie_store();
     let response_url = Url::parse("https://example.com/app/index.html").unwrap();
     let request_url = Url::parse("https://example.com/app/panel").unwrap();
 
     {
-        let mut jar = cookie_store.lock();
+        let mut jar = cookie_store.lock().unwrap();
         jar.store_response_headers(
             &response_url,
             &[(
                 "set-cookie".to_owned(),
-                "sid=server; Path=/app; Secure".to_owned(),
+                b"sid=server; Path=/app; Secure".to_vec(),
             )],
         );
         jar.set_document_cookie(&response_url, "sid=client; Path=/app");

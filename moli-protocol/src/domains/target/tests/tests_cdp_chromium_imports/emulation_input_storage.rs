@@ -61,6 +61,7 @@ async fn rust_cdp_chromium_import_emulation_device_metrics_affect_layout_metrics
         "data:text/html,<body>metrics</body>".to_owned(),
     )
     .await;
+    ctx.capture_fixture_layout(Some(&attached.session_id)).await;
     ctx.process_async(json!({
         "id": 117_007,
         "method": "Page.getLayoutMetrics",
@@ -269,7 +270,7 @@ async fn rust_cdp_chromium_import_emulation_device_metrics_hot_apply_window_surf
         &mut ctx,
         &attached.session_id,
         117_107,
-        "JSON.stringify({innerWidth, innerHeight, devicePixelRatio})",
+        "JSON.stringify({innerWidth, innerHeight, outerWidth, outerHeight, devicePixelRatio})",
     )
     .await;
     let original_payload: Value = serde_json::from_str(
@@ -287,7 +288,7 @@ async fn rust_cdp_chromium_import_emulation_device_metrics_hot_apply_window_surf
             "width": 375,
             "height": 667,
             "deviceScaleFactor": 2,
-            "mobile": true,
+            "mobile": false,
             "screenWidth": 400,
             "screenHeight": 700
         }
@@ -318,8 +319,8 @@ async fn rust_cdp_chromium_import_emulation_device_metrics_hot_apply_window_surf
     .expect("viewport payload json");
     assert_eq!(payload["innerWidth"], 375);
     assert_eq!(payload["innerHeight"], 667);
-    assert_eq!(payload["outerWidth"], 375);
-    assert_eq!(payload["outerHeight"], 667);
+    assert_eq!(payload["outerWidth"], original_payload["outerWidth"]);
+    assert_eq!(payload["outerHeight"], original_payload["outerHeight"]);
     assert_eq!(payload["devicePixelRatio"], 2);
     assert_eq!(payload["screenWidth"], 400);
     assert_eq!(payload["screenHeight"], 700);
@@ -335,7 +336,7 @@ async fn rust_cdp_chromium_import_emulation_device_metrics_hot_apply_window_surf
         &mut ctx,
         &attached.session_id,
         117_111,
-        "JSON.stringify({innerWidth, innerHeight, devicePixelRatio})",
+        "JSON.stringify({innerWidth, innerHeight, outerWidth, outerHeight, devicePixelRatio})",
     )
     .await;
     let cleared_payload: Value = serde_json::from_str(
@@ -457,6 +458,15 @@ async fn rust_cdp_capability_input_dispatch_mouse_event_uses_layout_hit_testing(
         "data:text/html,<button id='btn' onclick='window.__clicked = true' style='position:absolute;left:0;top:0;width:100px;height:100px'>go</button>".to_owned(),
     )
     .await;
+    ctx.capture_fixture_layout(Some(&attached.session_id)).await;
+    let geometry = evaluate_return_by_value(
+        &mut ctx,
+        &attached.session_id,
+        120_004,
+        "document.elementFromPoint(0, 0) !== null",
+    )
+    .await;
+    assert_eq!(geometry["result"]["result"]["value"], true);
     for (offset, event_type, buttons) in [(0, "mousePressed", 1), (1, "mouseReleased", 0)] {
         ctx.process_async(json!({
             "id": 120_006 + offset,

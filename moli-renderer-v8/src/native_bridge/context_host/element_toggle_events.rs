@@ -1,5 +1,5 @@
 use super::window_document_tasks::{ExactWindowDocumentTaskLedger, PendingExactWindowDocumentTask};
-use super::{JsContextHost, WindowDocumentTaskTarget};
+use super::{PageScriptHost, WindowDocumentTaskTarget};
 use crate::{
     document_runtime::DomHandle,
     page_task_queue::{
@@ -22,7 +22,7 @@ pub(super) type ElementToggleEventState = ExactWindowDocumentTaskLedger<
     PendingElementToggleEventPayload,
 >;
 
-impl JsContextHost {
+impl PageScriptHost {
     /// Queue one element `toggle` task on the shared DOM-manipulation source.
     ///
     /// Repeated changes to the same element cancel the old closure and append a
@@ -41,6 +41,42 @@ impl JsContextHost {
         let Some(target) = self.window_document_task_target_for_node(scope, element) else {
             return false;
         };
+        self.queue_element_toggle_event_for_target(
+            target, kind, element, old_state, new_state, source,
+        )
+    }
+
+    pub(crate) fn queue_native_parser_details_toggle_event(&mut self, element: DomHandle) {
+        if !self.dom_host().is_html_element_named(element, "details")
+            || self.dom_host().get_attribute(element, "open").is_none()
+        {
+            return;
+        }
+        let Some(target) = self
+            .owner_dispatch_scope_for_node(element)
+            .and_then(|owner| self.current_window_document_task_target_for_dispatch_scope(owner))
+        else {
+            return;
+        };
+        self.queue_element_toggle_event_for_target(
+            target,
+            RendererPageElementToggleEventKind::Details,
+            element,
+            RendererPageElementToggleEventState::Closed,
+            RendererPageElementToggleEventState::Open,
+            None,
+        );
+    }
+
+    fn queue_element_toggle_event_for_target(
+        &mut self,
+        target: WindowDocumentTaskTarget,
+        kind: RendererPageElementToggleEventKind,
+        element: DomHandle,
+        old_state: RendererPageElementToggleEventState,
+        new_state: RendererPageElementToggleEventState,
+        source: Option<DomHandle>,
+    ) -> bool {
         let existing_index = self
             .element_toggle_events
             .find_slot_index(target, kind, |pending| pending.element == element);
@@ -141,7 +177,7 @@ impl JsContextHost {
     pub(crate) fn dispatch_authorized_element_toggle_event(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         target: WindowDocumentTaskTarget,
         data: RendererPageElementToggleEventData,
     ) -> bool {

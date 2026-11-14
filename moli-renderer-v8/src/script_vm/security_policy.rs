@@ -1,12 +1,9 @@
-use std::pin::pin;
-
 use anyhow::Result;
 
 use super::ScriptVm;
 use crate::{
     context_bootstrap::{TrustedTypesCodeGenerationCheck, trusted_types_code_generation_check},
     document_runtime::DocumentContentSecurityPolicyViolation,
-    native_bridge::JsContextHost,
     page_task_queue::ContentSecurityPolicyViolationEventTask,
     util::context_host_ptr_from_global_bridge,
 };
@@ -22,6 +19,61 @@ pub(super) enum ContentSecurityPolicyViolationBodyExecution {
 }
 
 impl ScriptVm {
+    pub(crate) fn module_fetch_csp_context_for_child_owner(
+        &self,
+        owner: crate::frame_owner_model::FrameDocumentOwner,
+        realm: crate::frame_owner_model::FrameRealmId,
+        request_url: &url::Url,
+        kind: crate::module_runtime::ModuleKind,
+        metadata: &crate::module_runtime::ModuleFetchMetadata,
+    ) -> Option<crate::content_security_policy::ModuleFetchCspContext> {
+        let host = self._context_host.borrow();
+        let task_owner = host.current_child_module_route_task_owner(owner, realm)?;
+        let target = host.current_child_module_fetch_target_for_realm(task_owner, realm)?;
+        host.module_fetch_csp_context_for_owner(
+            crate::native_bridge::OwnerDispatchScope::Child(target.child_handle()),
+            request_url,
+            kind,
+            metadata,
+        )
+    }
+
+    pub(in crate::script_vm) fn dispatch_captured_module_csp_violation(
+        &mut self,
+        owner: crate::native_bridge::OwnerDispatchScope,
+        violation: &DocumentContentSecurityPolicyViolation,
+    ) {
+        let result = self.with_default_context_scope(|scope, host_ptr| {
+            unsafe { &mut *host_ptr }
+                .dispatch_content_security_policy_violation_event_for_owner_best_effort(
+                    scope, host_ptr, owner, violation,
+                );
+            Ok(())
+        });
+        if let Err(error) = result {
+            self.record_runtime_warning(format_args!("module CSP report dispatch failed: {error}"));
+        }
+    }
+
+    pub(in crate::script_vm) fn queue_captured_module_csp_violation(
+        &mut self,
+        owner: crate::native_bridge::OwnerDispatchScope,
+        violation: DocumentContentSecurityPolicyViolation,
+    ) {
+        let target = {
+            let host = self._context_host.borrow();
+            host.current_main_document_task_owner()
+                .zip(host.current_window_document_task_target_for_dispatch_scope(owner))
+        };
+        if let Some((root_owner, target)) = target {
+            self.document_runtime
+                .enqueue_content_security_policy_violation_event_task(
+                    ContentSecurityPolicyViolationEventTask::for_window(
+                        root_owner, target, violation,
+                    ),
+                );
+        }
+    }
     pub(crate) fn queue_content_security_policy_violation_event_best_effort(
         &mut self,
         violation: &DocumentContentSecurityPolicyViolation,
@@ -38,17 +90,11 @@ impl ScriptVm {
         &mut self,
         violation: &DocumentContentSecurityPolicyViolation,
     ) -> Result<()> {
-        self.renderer_document_isolate
-            .with_entered_renderer_document_isolate(|isolate| {
-                let scope = pin!(v8::HandleScope::new(isolate));
-                let scope = &mut scope.init();
-                let context = v8::Local::new(scope, &self.page_default_context);
-                let scope = &mut v8::ContextScope::new(scope, context);
-                let host_ptr: *mut JsContextHost = (*self._context_host).as_ptr();
-                self.document_runtime
-                    .queue_content_security_policy_violation_event(scope, host_ptr, violation)?;
-                Ok(())
-            })
+        self.with_main_world_document_scope(|scope, host_ptr, document_runtime| {
+            document_runtime
+                .queue_content_security_policy_violation_event(scope, host_ptr, violation)?;
+            Ok(())
+        })
     }
 
     #[cfg(test)]
@@ -86,20 +132,35 @@ impl ScriptVm {
         if self.current_main_document_task_owner() != Some(task.owner()) {
             return ContentSecurityPolicyViolationBodyExecution::DiscardedStaleDocument;
         }
-        let result = self
-            .renderer_document_isolate
-            .with_entered_renderer_document_isolate(|isolate| {
-                let scope = pin!(v8::HandleScope::new(isolate));
-                let scope = &mut scope.init();
-                let context = v8::Local::new(scope, &self.page_default_context);
-                let scope = &mut v8::ContextScope::new(scope, context);
-                let host_ptr: *mut JsContextHost = (*self._context_host).as_ptr();
-                self.document_runtime
-                    .dispatch_content_security_policy_violation_event_page_task(
-                        scope, host_ptr, task,
-                    )?;
+        if let Some(target) = task.window_target() {
+            if !self
+                ._context_host
+                .borrow()
+                .window_document_owner_is_current_for_dispatch_scope(
+                    target.owner(),
+                    target.dispatch_scope(),
+                )
+            {
+                return ContentSecurityPolicyViolationBodyExecution::DiscardedStaleDocument;
+            }
+            let result = self.with_default_context_scope(|scope, host_ptr| {
+                unsafe { &mut *host_ptr }
+                    .dispatch_content_security_policy_violation_event_for_owner_best_effort(
+                        scope,
+                        host_ptr,
+                        target.dispatch_scope(),
+                        task.violation(),
+                    );
                 Ok(())
             });
+            return ContentSecurityPolicyViolationBodyExecution::DispatchAttempted(result);
+        }
+        let result = self.with_main_world_document_scope(|scope, host_ptr, document_runtime| {
+            document_runtime.dispatch_content_security_policy_violation_event_page_task(
+                scope, host_ptr, task,
+            )?;
+            Ok(())
+        });
         ContentSecurityPolicyViolationBodyExecution::DispatchAttempted(result)
     }
 
@@ -141,33 +202,76 @@ pub(super) unsafe extern "C" fn wasm_code_generation_check_callback(
     host.allows_wasm_code_generation_by_csp(scope)
 }
 
-pub(super) fn string_code_generation_check_callback<'s>(
+pub(crate) fn string_code_generation_check_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     source: v8::Local<'s, v8::Value>,
     is_code_like: bool,
 ) -> v8::ModifyCodeGenerationFromStringsResult<'s> {
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
-        return code_generation_result(true, None);
-    };
-    if crate::context_bootstrap::consume_internal_javascript_url_eval(scope) {
-        return code_generation_result(true, None);
+    let result = check_string_code_generation(scope, source, is_code_like);
+    if !result.codegen_allowed {
+        return result;
     }
-    let requires_trusted_types_for_script =
-        unsafe { &*host_ptr }.requires_trusted_types_for_script(scope);
-    let action = if requires_trusted_types_for_script {
-        if unsafe { &*host_ptr }.allows_trusted_types_eval(scope) {
+    let Some(source) = result
+        .modified_source
+        .or_else(|| v8::Local::<v8::String>::try_from(source).ok())
+    else {
+        return result;
+    };
+    let Some(partition) = crate::util::script_eval_cache_partition(scope) else {
+        return code_generation_result(false, None);
+    };
+    let modified_source = v8::String::concat(scope, source, partition);
+    code_generation_result(modified_source.is_some(), modified_source)
+}
+
+fn check_string_code_generation<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: v8::Local<'s, v8::Value>,
+    is_code_like: bool,
+) -> v8::ModifyCodeGenerationFromStringsResult<'s> {
+    let worker_trusted_types_requirements =
+        crate::worker::worker_trusted_types_for_script_requirements(scope);
+    let (trusted_types_requirements, allow_trusted_types_eval, host_ptr) =
+        if let Some(requirements) = worker_trusted_types_requirements {
+            (
+                requirements,
+                crate::worker::worker_allows_trusted_types_eval(scope).unwrap_or(false),
+                None,
+            )
+        } else {
+            let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+                return code_generation_result(true, None);
+            };
+            if crate::context_bootstrap::consume_internal_javascript_url_eval(scope) {
+                return code_generation_result(true, None);
+            }
+            (
+                unsafe { &*host_ptr }.trusted_types_for_script_requirements(scope),
+                unsafe { &*host_ptr }.allows_trusted_types_eval(scope),
+                Some(host_ptr),
+            )
+        };
+    let action = if trusted_types_requirements.requires_conversion() {
+        if allow_trusted_types_eval {
             // The keyword relaxes Trusted Types conversion, but it does not
             // override another CSP policy. The per-policy CSP gate still runs.
             if source.is_string() {
                 StringCodeGenerationPolicyAction::CheckCsp {
                     allow_trusted_types_eval: true,
+                    source: string_code_generation_source(scope, source),
                     modified_source: None,
                 }
             } else {
-                match trusted_types_code_generation_check(scope, source, is_code_like) {
+                match trusted_types_code_generation_check(
+                    scope,
+                    source,
+                    is_code_like,
+                    trusted_types_requirements,
+                ) {
                     TrustedTypesCodeGenerationCheck::AllowModified(source) => {
                         StringCodeGenerationPolicyAction::CheckCsp {
                             allow_trusted_types_eval: true,
+                            source: Some(source.clone()),
                             modified_source: Some(source),
                         }
                     }
@@ -180,26 +284,43 @@ pub(super) fn string_code_generation_check_callback<'s>(
                 }
             }
         } else {
-            let check = trusted_types_code_generation_check(scope, source, is_code_like);
+            let check = trusted_types_code_generation_check(
+                scope,
+                source,
+                is_code_like,
+                trusted_types_requirements,
+            );
             code_generation_action_from_trusted_types_check(check)
         }
     } else if is_code_like || !source.is_string() {
-        let check = trusted_types_code_generation_check(scope, source, is_code_like);
+        let check = trusted_types_code_generation_check(
+            scope,
+            source,
+            is_code_like,
+            trusted_types_requirements,
+        );
         code_generation_action_from_trusted_types_check(check)
     } else {
         match non_trusted_types_code_generation_source(source, is_code_like) {
             NonTrustedTypesCodeGenerationSource::String => {
                 StringCodeGenerationPolicyAction::CheckCsp {
                     allow_trusted_types_eval: false,
+                    source: string_code_generation_source(scope, source),
                     modified_source: None,
                 }
             }
             NonTrustedTypesCodeGenerationSource::CodeLikeObject
             | NonTrustedTypesCodeGenerationSource::PassThroughObject => {
-                match trusted_types_code_generation_check(scope, source, is_code_like) {
+                match trusted_types_code_generation_check(
+                    scope,
+                    source,
+                    is_code_like,
+                    trusted_types_requirements,
+                ) {
                     TrustedTypesCodeGenerationCheck::AllowModified(source) => {
                         StringCodeGenerationPolicyAction::CheckCsp {
                             allow_trusted_types_eval: false,
+                            source: Some(source.clone()),
                             modified_source: Some(source),
                         }
                     }
@@ -217,11 +338,23 @@ pub(super) fn string_code_generation_check_callback<'s>(
         StringCodeGenerationPolicyAction::AllowWithoutCsp => true,
         StringCodeGenerationPolicyAction::CheckCsp {
             allow_trusted_types_eval,
+            source,
             modified_source: replacement,
         } => {
-            if !unsafe { &mut *host_ptr }
-                .allows_eval_code_generation_by_csp(scope, allow_trusted_types_eval)
-            {
+            let allowed = match host_ptr {
+                Some(host_ptr) => unsafe { &mut *host_ptr }.allows_eval_code_generation_by_csp(
+                    scope,
+                    allow_trusted_types_eval,
+                    source.as_deref(),
+                ),
+                None => crate::worker::worker_allows_eval_code_generation_by_csp(
+                    scope,
+                    allow_trusted_types_eval,
+                    source.as_deref(),
+                )
+                .unwrap_or(false),
+            };
+            if !allowed {
                 return code_generation_result(false, None);
             }
             let replacement = match replacement {
@@ -254,6 +387,7 @@ enum StringCodeGenerationPolicyAction {
     AllowWithoutCsp,
     CheckCsp {
         allow_trusted_types_eval: bool,
+        source: Option<String>,
         modified_source: Option<String>,
     },
     Block,
@@ -269,11 +403,21 @@ fn code_generation_action_from_trusted_types_check(
         TrustedTypesCodeGenerationCheck::AllowModified(source) => {
             StringCodeGenerationPolicyAction::CheckCsp {
                 allow_trusted_types_eval: false,
+                source: Some(source.clone()),
                 modified_source: Some(source),
             }
         }
         TrustedTypesCodeGenerationCheck::Block => StringCodeGenerationPolicyAction::Block,
     }
+}
+
+fn string_code_generation_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    source: v8::Local<'_, v8::Value>,
+) -> Option<String> {
+    v8::Local::<v8::String>::try_from(source)
+        .ok()
+        .map(|source| source.to_rust_string_lossy(scope))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

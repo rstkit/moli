@@ -96,45 +96,6 @@ fn selection_contains_node_boundary_points<'s>(
     Some((parent, index, parent, index + 1, false))
 }
 
-fn range_belongs_to_current_document<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    selection: v8::Local<'s, v8::Object>,
-    start_node: v8::Local<'s, v8::Object>,
-    end_node: v8::Local<'s, v8::Object>,
-) -> bool {
-    let Some(document) =
-        selection_owner_document(scope, selection).or_else(|| current_document_object(scope))
-    else {
-        return true;
-    };
-    let start_root = selection_tree_root(scope, start_node);
-    let end_root = selection_tree_root(scope, end_node);
-    let document_value: v8::Local<'s, v8::Value> = document.into();
-    start_root.strict_equals(end_root.into()) && start_root.strict_equals(document_value)
-}
-
-fn selection_tree_root<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    node: v8::Local<'s, v8::Object>,
-) -> v8::Local<'s, v8::Object> {
-    let mut current = node;
-    loop {
-        if let Some(parent) = object_property_as_object(scope, current, "parentNode")
-            && !parent.strict_equals(current.into())
-        {
-            current = parent;
-            continue;
-        }
-        if object_number_property(scope, current, "nodeType").unwrap_or(0.0) as u32 == 11
-            && let Some(host) = object_property_as_object(scope, current, "host")
-        {
-            current = host;
-            continue;
-        }
-        return current;
-    }
-}
-
 pub(in crate::context_bootstrap) fn selection_get_range_at_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -159,7 +120,7 @@ pub(in crate::context_bootstrap) fn selection_get_range_at_callback<'s>(
             throw_index_size_error(scope, "Index or offset is out of range.");
             return;
         };
-        if !range_belongs_to_current_document(scope, args.this(), start_node, end_node) {
+        if !selection_range_belongs_to_document(scope, args.this(), start_node, end_node) {
             throw_index_size_error(scope, "Index or offset is out of range.");
             return;
         }
@@ -433,7 +394,7 @@ pub(in crate::context_bootstrap) fn selection_add_range_callback<'s>(
     else {
         return;
     };
-    if !range_belongs_to_current_document(scope, args.this(), start_node, end_node) {
+    if !selection_range_belongs_to_document(scope, args.this(), start_node, end_node) {
         return;
     }
     let start_offset = range_boundary_offset(scope, range, RangeBoundarySide::Start) as u32;

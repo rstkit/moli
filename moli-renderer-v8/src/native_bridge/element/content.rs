@@ -6,77 +6,43 @@ use crate::{
     dom::native::{Element, Node},
     style_engine::{ComputedDisplayKind, ComputedTextWrapModeKind, ComputedWhiteSpaceCollapseKind},
     util::v8_string,
+    web_api_interfaces, webidl,
 };
 
 use super::super::node::set_text_content_in_reaction_scope;
 use super::super::{
-    JsContextHost, document::set_detached_text_replacement_value,
+    PageScriptHost, document::set_detached_text_replacement_value,
     node::node_runtime_and_handle_from_object_or_detached, throw_dom_exception,
 };
 use super::{
     html_element_getter_receiver, html_element_setter_receiver, observable_sources_with_fragments,
     property_string_value,
     rendered_state::{
-        ElementBoxState, ElementContentVisibility, ElementRenderedState, ElementRenderedStyle,
+        ElementBoxState, ElementRenderedState, ElementRenderedStyle,
         rendered_child_participates_in_flat_tree,
     },
     styles::StyleObservation,
     trusted_types::{TrustedHtmlSink, trusted_html_sink_string},
 };
 
-fn get_html_options(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
-    value: v8::Local<'_, v8::Value>,
-) -> (bool, Vec<DomHandle>) {
-    if value.is_null_or_undefined() {
-        return (false, Vec::new());
-    }
-    let Ok(options) = v8::Local::<v8::Object>::try_from(value) else {
-        return (false, Vec::new());
-    };
-    let serializable_shadow_roots = options
-        .get(
-            scope,
-            crate::util::v8str(scope, "serializableShadowRoots").into(),
-        )
-        .is_some_and(|value| value.boolean_value(scope));
-    let Some(shadow_roots_value) =
-        options.get(scope, crate::util::v8str(scope, "shadowRoots").into())
-    else {
-        return (serializable_shadow_roots, Vec::new());
-    };
-    let Ok(shadow_roots) = v8::Local::<v8::Object>::try_from(shadow_roots_value) else {
-        return (serializable_shadow_roots, Vec::new());
-    };
-    let length = shadow_roots
-        .get(scope, crate::util::v8str(scope, "length").into())
-        .and_then(|value| value.uint32_value(scope))
-        .unwrap_or(0);
-    let mut handles = Vec::new();
-    for index in 0..length {
-        let Some(value) = shadow_roots.get_index(scope, index) else {
-            continue;
-        };
-        let Ok(object) = v8::Local::<v8::Object>::try_from(value) else {
-            continue;
-        };
-        let Ok((candidate_runtime_ptr, handle)) =
-            node_runtime_and_handle_from_object_or_detached(scope, object)
-        else {
-            continue;
-        };
-        if candidate_runtime_ptr == runtime_ptr
-            && unsafe { &*runtime_ptr }.dom_host().is_shadow_root(handle)
-        {
-            handles.push(handle);
-        }
-    }
-    (serializable_shadow_roots, handles)
+#[derive(Default, webidl::WebIdlDictionary)]
+#[webidl(prefix = "GetHTMLOptions")]
+struct GetHtmlOptions<'scope> {
+    #[webidl(name = "serializableShadowRoots", default = false)]
+    serializable_shadow_roots: bool,
+    #[webidl(name = "shadowRoots", sequence, interface = web_api_interfaces::ShadowRoot, default = Vec::new())]
+    shadow_roots: Vec<v8::Local<'scope, v8::Object>>,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "getHTML")]
+struct GetHtmlArgs<'scope> {
+    #[webidl(dictionary)]
+    options: GetHtmlOptions<'scope>,
 }
 
 pub(in crate::native_bridge) fn node_direct_text_content(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<String> {
     let dom = runtime.dom_host().dom();
@@ -452,7 +418,7 @@ enum SelectInnerTextTask {
 }
 
 fn append_option_inner_text(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     writer: &mut InnerTextWriter,
 ) {
@@ -471,7 +437,7 @@ fn append_option_inner_text(
 }
 
 fn append_select_descendants(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     inside_optgroup: bool,
     writer: &mut InnerTextWriter,
@@ -535,7 +501,7 @@ fn append_select_descendants(
 }
 
 fn append_select_inner_text(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     select: DomHandle,
     writer: &mut InnerTextWriter,
 ) {
@@ -574,7 +540,7 @@ fn rendered_element_ignores_dom_children(element: &Element) -> bool {
 }
 
 fn append_inner_text(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     style_scope: &mut StyleObservation<'_>,
     root: DomHandle,
     root_style: Option<ElementRenderedStyle>,
@@ -636,10 +602,7 @@ fn append_inner_text(
         let style = task
             .prepared_style
             .unwrap_or_else(|| ElementRenderedStyle::read_in_scope(style_scope, task.handle));
-        if style.display == ComputedDisplayKind::None
-            || (style.content_visibility == ElementContentVisibility::Hidden
-                && style.content_visibility_applicable)
-        {
+        if style.display == ComputedDisplayKind::None || style.hides_contents {
             continue;
         }
 
@@ -778,7 +741,7 @@ fn append_inner_text(
     }
 }
 
-fn inner_text_source_handles(runtime: &JsContextHost, root: DomHandle) -> Vec<DomHandle> {
+fn inner_text_source_handles(runtime: &PageScriptHost, root: DomHandle) -> Vec<DomHandle> {
     let mut sources = Vec::new();
     let mut pending = vec![root];
     while let Some(handle) = pending.pop() {
@@ -791,7 +754,7 @@ fn inner_text_source_handles(runtime: &JsContextHost, root: DomHandle) -> Vec<Do
 }
 
 fn node_inner_text(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Result<String, moli_layout::LayoutError> {
     let Some(node) = runtime.dom_host().node(handle) else {
@@ -802,12 +765,13 @@ fn node_inner_text(
     }
     let sources = inner_text_source_handles(runtime, handle);
     let rendered_text_sources = if let Some(document) = runtime.layout_document_for_source(handle) {
-        observable_sources_with_fragments(
-            runtime,
-            document,
-            &sources,
-            moli_layout::LayoutFlushReason::SynchronousGeometry,
-        )?
+        match observable_sources_with_fragments(runtime, document, &sources) {
+            Ok(sources) => sources,
+            Err(moli_layout::LayoutError::NoLayoutSnapshot) => {
+                return Ok(node.text_content(runtime.dom_host().dom()));
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         HashSet::new()
     };
@@ -832,14 +796,20 @@ fn node_inner_text(
     Ok(writer.finish())
 }
 
-fn node_inner_html(runtime: &JsContextHost, handle: DomHandle) -> Option<String> {
-    let scripting_enabled_for_node = |node| runtime.node_document_scripting_enabled(node);
-    runtime
-        .dom_host()
-        .get_html(handle, &scripting_enabled_for_node, false, &[])
+fn node_inner_html(runtime: &PageScriptHost, handle: DomHandle) -> Option<String> {
+    let dom_host = runtime.dom_host();
+    if dom_host
+        .node_document_is_html_document(handle)
+        .unwrap_or(true)
+    {
+        let scripting_enabled_for_node = |node| runtime.node_document_scripting_enabled(node);
+        dom_host.get_html(handle, &scripting_enabled_for_node, false, &[])
+    } else {
+        crate::xml_serializer::serialize_native_inner_html(dom_host, handle)
+    }
 }
 
-fn is_element_or_shadow_root_receiver(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_element_or_shadow_root_receiver(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -898,16 +868,25 @@ pub(in crate::native_bridge) fn node_outer_html_getter_function<'s>(
         rv.set_undefined();
         return;
     }
-    let scripting_enabled_for_node = |node| runtime.node_document_scripting_enabled(node);
-    let value = runtime
+    let value = if runtime
         .dom_host()
-        .outer_html_with_shadow_roots(
-            handle,
-            &scripting_enabled_for_node,
-            crate::dom::native::ShadowRootInclusion::None,
-            None,
-        )
-        .unwrap_or_default();
+        .node_document_is_html_document(handle)
+        .unwrap_or(true)
+    {
+        let scripting_enabled_for_node = |node| runtime.node_document_scripting_enabled(node);
+        runtime
+            .dom_host()
+            .outer_html_with_shadow_roots(
+                handle,
+                &scripting_enabled_for_node,
+                crate::dom::native::ShadowRootInclusion::None,
+                crate::dom::native::ShadowRootMarkupProfile::WebApi,
+                None,
+            )
+            .unwrap_or_default()
+    } else {
+        crate::xml_serializer::serialize_native_handle(runtime.dom_host(), handle)
+    };
     let Some(value) = v8_string(scope, &value) else {
         rv.set_null();
         return;
@@ -1044,8 +1023,7 @@ pub(in crate::native_bridge) fn node_get_html_callback<'s>(
         rv.set_undefined();
         return;
     };
-    let runtime = unsafe { &*runtime_ptr };
-    if !is_element_or_shadow_root_receiver(runtime, handle) {
+    if !is_element_or_shadow_root_receiver(unsafe { &*runtime_ptr }, handle) {
         crate::webidl::throw_type_error(
             scope,
             "Failed to execute 'getHTML' on 'Element': Illegal invocation.",
@@ -1053,8 +1031,31 @@ pub(in crate::native_bridge) fn node_get_html_callback<'s>(
         rv.set_undefined();
         return;
     }
-    let (serializable_shadow_roots, explicit_shadow_roots) =
-        get_html_options(scope, runtime_ptr, args.get(0));
+    // Dictionary getters and sequence iterators may mutate the DOM. Borrow
+    // native state only after their conversion has completed.
+    let Some(parsed) = webidl::parse_args::<GetHtmlArgs>(scope, &args) else {
+        return;
+    };
+    let GetHtmlOptions {
+        serializable_shadow_roots,
+        shadow_roots,
+    } = parsed.options;
+    let mut explicit_shadow_roots = Vec::with_capacity(shadow_roots.len());
+    for object in shadow_roots {
+        let Ok((candidate_runtime_ptr, shadow_root)) =
+            node_runtime_and_handle_from_object_or_detached(scope, object)
+        else {
+            continue;
+        };
+        if candidate_runtime_ptr == runtime_ptr
+            && unsafe { &*runtime_ptr }
+                .dom_host()
+                .is_shadow_root(shadow_root)
+        {
+            explicit_shadow_roots.push(shadow_root);
+        }
+    }
+    let runtime = unsafe { &*runtime_ptr };
     let should_serialize_registry_attribute =
         |_: DomHandle, shadow_root: DomHandle, _: &crate::dom::native::ShadowRootInit| {
             runtime.should_serialize_shadow_root_registry_attribute(shadow_root)

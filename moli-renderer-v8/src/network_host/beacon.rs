@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_fetch::{
     FetchCancelHandle, RequestCredentialsMode, RequestMode, RequestRedirectMode,
@@ -51,9 +52,11 @@ pub(crate) fn navigator_send_beacon_callback<'s>(
         resource_loader,
         frame_id,
         document_url,
+        base_url,
+        request_origin,
         network_partition_key,
     } = request_context;
-    let resolved_url = match resolve_context_url(&document_url, &raw_url, None) {
+    let resolved_url = match resolve_context_url(&base_url, &raw_url, None) {
         Ok(url) => url,
         Err(_) => {
             crate::util::throw_type_error(scope, "The URL argument is ill-formed or unsupported.");
@@ -68,12 +71,13 @@ pub(crate) fn navigator_send_beacon_callback<'s>(
     let mut request_headers = Vec::new();
     append_default_body_content_type(&mut request_headers, body_content_type.as_deref());
     request_headers = filter_headers_for_guard(&request_headers, HeadersGuard::RequestNoCors);
-    request_headers =
+    let request_headers =
         merge_subresource_request_headers(host.extra_http_headers(), &request_headers);
     let request_body_text = request_body_text(&body);
     let request_cookie_report = observe_subresource_request_cookie_report(
         resource_loader.request_client(),
         &document_url,
+        &request_origin,
         &resolved_url,
         "POST",
         RequestCredentialsMode::Include,
@@ -129,6 +133,7 @@ pub(crate) fn navigator_send_beacon_callback<'s>(
         match Request::new_bytes("POST", resolved_url.as_str(), body, request_headers.clone()) {
             Ok(request) => request
                 .with_initiator_url(&document_url)
+                .with_request_origin(request_origin.clone())
                 .with_resource_type(RequestResourceType::Beacon)
                 .with_browser_request_metadata(moli_fetch::BrowserRequestMetadata::Beacon)
                 .with_request_mode(RequestMode::NoCors)
@@ -144,6 +149,7 @@ pub(crate) fn navigator_send_beacon_callback<'s>(
     let cancel_handle = FetchCancelHandle::new();
     let network_context = AsyncSubresourceNetworkContext {
         frame_id: info.frame_id.clone(),
+        request_origin: request_origin.clone(),
         document_url: info.document_url.clone(),
         resource_type: info.resource_type,
         policy_context: Default::default(),
@@ -172,8 +178,8 @@ pub(crate) fn navigator_send_beacon_callback<'s>(
 }
 
 pub(crate) fn send_link_audit_ping(
-    scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
+    link: crate::document_runtime::DomHandle,
     ping_url: url::Url,
     destination_url: &str,
 ) {
@@ -181,7 +187,16 @@ pub(crate) fn send_link_audit_ping(
         return;
     }
     let host = unsafe { &mut *host_ptr };
-    let Some(request_context) = window_ping_request_context(scope, host) else {
+    let Some(owner) = host.owner_dispatch_scope_for_node(link) else {
+        return;
+    };
+    let Some(execution_context) = host.current_registered_window_execution_context_identity(owner)
+    else {
+        return;
+    };
+    let Some(request_context) =
+        window_ping_request_context_for_execution_context(host, execution_context)
+    else {
         return;
     };
     let WindowPingRequestContext {
@@ -189,6 +204,8 @@ pub(crate) fn send_link_audit_ping(
         resource_loader,
         frame_id,
         document_url,
+        base_url: _,
+        request_origin,
         network_partition_key,
     } = request_context;
     let mut request_headers = vec![
@@ -199,12 +216,13 @@ pub(crate) fn send_link_audit_ping(
     if document_url.scheme() == "http" || moli_url::same_origin(&document_url, &ping_url) {
         request_headers.push(("Ping-From".to_owned(), document_url.as_str().to_owned()));
     }
-    request_headers =
+    let request_headers =
         merge_subresource_request_headers(host.extra_http_headers(), &request_headers);
     let request_body = Some("PING".to_owned());
     let request_cookie_report = observe_subresource_request_cookie_report(
         resource_loader.request_client(),
         &document_url,
+        &request_origin,
         &ping_url,
         "POST",
         RequestCredentialsMode::Include,
@@ -220,7 +238,9 @@ pub(crate) fn send_link_audit_ping(
         method: "POST".to_owned(),
         request_headers: request_headers.clone(),
         request_body: request_body.clone(),
-        request_body_bytes: request_body.as_ref().map(|body| body.as_bytes().to_vec()),
+        request_body_bytes: request_body
+            .as_ref()
+            .map(|body| bytes::Bytes::copy_from_slice(body.as_bytes())),
         resource_type: SubresourceResourceType::Ping,
         request_cookie_report,
     };
@@ -255,11 +275,13 @@ pub(crate) fn send_link_audit_ping(
     let request = match Request::new_bytes(
         "POST",
         ping_url.as_str(),
-        Some(b"PING".to_vec()),
+        Some(bytes::Bytes::from_static(b"PING")),
         request_headers.clone(),
     ) {
         Ok(request) => request
+            .without_inferred_referrer()
             .with_initiator_url(&document_url)
+            .with_request_origin(request_origin.clone())
             .with_resource_type(RequestResourceType::Ping)
             .with_browser_request_metadata(moli_fetch::BrowserRequestMetadata::Ping)
             .with_request_mode(RequestMode::NoCors)
@@ -275,6 +297,7 @@ pub(crate) fn send_link_audit_ping(
     let cancel_handle = FetchCancelHandle::new();
     let network_context = AsyncSubresourceNetworkContext {
         frame_id: info.frame_id.clone(),
+        request_origin: request_origin.clone(),
         document_url: info.document_url.clone(),
         resource_type: info.resource_type,
         policy_context: Default::default(),
@@ -306,24 +329,41 @@ struct WindowPingRequestContext {
     resource_loader: crate::network::context::DocumentResourceLoader,
     frame_id: Option<String>,
     document_url: url::Url,
+    base_url: url::Url,
+    request_origin: moli_url::WebOrigin,
     network_partition_key: Option<String>,
 }
 
 fn window_ping_request_context(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
 ) -> Option<WindowPingRequestContext> {
     let execution_context = host.current_runtime_window_execution_context_identity(scope)?;
+    window_ping_request_context_for_execution_context(host, execution_context)
+}
+
+fn window_ping_request_context_for_execution_context(
+    host: &PageScriptHost,
+    execution_context: crate::native_bridge::WindowExecutionContextIdentity,
+) -> Option<WindowPingRequestContext> {
     let owner = execution_context.dispatch_scope();
     let resource_loader = host
         .document_resource_loader_for_dispatch_scope(owner)?
         .clone();
-    let (frame_id, document_url) = subresource_request_scope_for_owner(scope, host, owner)?;
+    let environment = host.subresource_request_environment(&resource_loader, owner)?;
+    let crate::network::context::SubresourceRequestEnvironment {
+        document_url,
+        base_url,
+        request_origin,
+        frame_id,
+    } = environment;
     Some(WindowPingRequestContext {
         execution_context,
         resource_loader,
         frame_id,
         document_url,
+        base_url,
+        request_origin,
         network_partition_key: active_subresource_network_partition_key(host, owner),
     })
 }
@@ -331,13 +371,13 @@ fn window_ping_request_context(
 fn navigator_beacon_body<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
-) -> Option<(Option<Vec<u8>>, Option<String>)> {
+) -> Option<(Option<bytes::Bytes>, Option<String>)> {
     if args.length() < 2 || args.get(1).is_null_or_undefined() {
         return Some((None, None));
     }
     let data = args.get(1);
     if let Ok(object) = v8::Local::<v8::Object>::try_from(data)
-        && crate::context_bootstrap::object_prototype_matches(scope, object, "ReadableStream")
+        && web_api_interfaces::ReadableStream::is_instance(scope, object)
     {
         crate::util::throw_type_error(scope, "sendBeacon cannot have a ReadableStream body.");
         return None;
@@ -347,10 +387,17 @@ fn navigator_beacon_body<'s>(
         data,
         webidl::Context::argument("Navigator.sendBeacon", 2),
     ) {
-        Ok(body) => Some((
-            body.as_ref().map(|body| body.bytes.clone()),
-            body.and_then(|body| body.content_type),
-        )),
+        Ok(Some(body)) => {
+            let bytes = match body.source.into_buffered_bytes(scope) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    crate::util::throw_type_error(scope, &error.to_string());
+                    return None;
+                }
+            };
+            Some((Some(bytes), body.content_type))
+        }
+        Ok(None) => Some((None, None)),
         Err(error) => {
             crate::util::throw_type_error(scope, &error.to_string());
             None
@@ -358,13 +405,13 @@ fn navigator_beacon_body<'s>(
     }
 }
 
-fn request_body_text(body: &Option<Vec<u8>>) -> Option<String> {
+fn request_body_text(body: &Option<bytes::Bytes>) -> Option<String> {
     body.as_ref()
         .map(|body| String::from_utf8_lossy(body).into_owned())
 }
 
 fn record_beacon_failure(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     info: PendingSubresourceFetchInfo,
     message: String,
 ) {

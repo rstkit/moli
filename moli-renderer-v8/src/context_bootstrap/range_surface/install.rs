@@ -15,19 +15,26 @@ use super::content::{
     range_surround_contents_callback, range_to_string_callback,
 };
 use super::geometry::{range_get_bounding_client_rect_callback, range_get_client_rects_callback};
-use super::*;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiFunctionTemplate;
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentRangePrototypeDeclaration {
     #[webapi(method, length = 0, callback = document_create_range_callback)]
     create_range: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Range", enumerable)]
-struct RangePrototypeMethodsDeclaration {
+#[webapi(interface = web_api_interfaces::Range, enumerable, receiver)]
+struct RangePrototypeDeclaration {
+    #[webapi(
+        accessor_property,
+        getter = super::accessors::range_attribute_getter_callback,
+        data = crate::util::callback_data_index_value(scope, 5)
+    )]
+    common_ancestor_container: (),
+
     #[webapi(method, length = 2, callback = range_set_start_callback)]
     set_start: (),
     #[webapi(method, length = 2, callback = range_set_end_callback)]
@@ -79,7 +86,7 @@ struct RangePrototypeMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "AbstractRange")]
+#[webapi(interface = web_api_interfaces::AbstractRange, receiver)]
 struct AbstractRangePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -116,17 +123,6 @@ struct AbstractRangePrototypeDeclaration {
         enumerable
     )]
     collapsed: (),
-    #[webapi(
-        accessor_property,
-        getter = super::accessors::range_attribute_getter_callback,
-        data = crate::util::callback_data_index_value(scope, 5),
-        enumerable
-    )]
-    common_ancestor_container: (),
-}
-
-pub(in crate::context_bootstrap) fn reset_range_runtime_state(scope: &mut v8::PinScope<'_, '_>) {
-    clear_live_range_registry(scope);
 }
 
 pub(in crate::context_bootstrap) fn install_range_template_bindings<'s>(
@@ -140,7 +136,7 @@ pub(in crate::context_bootstrap) fn install_range_template_bindings<'s>(
             DocumentRangePrototypeDeclaration::initialize_prototype_template(scope, prototype);
         }
         "Range" => {
-            RangePrototypeMethodsDeclaration::initialize_prototype_template(scope, prototype);
+            RangePrototypeDeclaration::initialize_prototype_template(scope, prototype);
         }
         "AbstractRange" => {
             AbstractRangePrototypeDeclaration::initialize_prototype_template(scope, prototype);

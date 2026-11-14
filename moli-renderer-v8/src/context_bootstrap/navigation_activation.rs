@@ -1,23 +1,22 @@
+use super::history_runtime::native;
 use super::location_history_storage::{
     NAVIGATION_ACTIVATION_SLOT, NAVIGATION_CURRENT_ENTRY_SLOT, NAVIGATION_TRANSITION_SLOT,
 };
-use super::navigation_entry::{
-    create_navigation_entry, history_entries, navigation_entry_public_token,
-    set_navigation_entry_document_id,
-};
+use super::navigation_entry::{history_entries, navigation_entry_public_token};
 use super::navigation_lifecycle::enqueue_navigation_lifecycle_microtask;
 use super::navigation_result::suppress_unhandled_rejection;
-use super::navigation_window::{
-    runtime_window_owner, set_runtime_window_owner, window_history_for_holder,
-};
+use super::navigation_seed::history_entry_from_snapshot;
+use super::navigation_window::{runtime_window_owner, window_history_for_holder};
 use super::*;
+use crate::context_bootstrap::navigation_entry::wrappers as entry_wrappers;
 use crate::native_bridge::{NavigationActivationSeed, NavigationHistorySerializedEntry};
 use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "NavigationActivation",
+    interface = web_api_interfaces::NavigationActivation,
     own_to_string_tag = "NavigationActivation",
     readonly_to_string_tag
 )]
@@ -34,7 +33,7 @@ struct NavigationActivationObjectDeclaration<'scope> {
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "NavigationTransition",
+    interface = web_api_interfaces::NavigationTransition,
     own_to_string_tag = "NavigationTransition",
     readonly_to_string_tag
 )]
@@ -59,7 +58,7 @@ struct NavigationTransitionObjectDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NavigationTransitionSettleDataDeclaration<'scope> {
     #[webapi(slot = NAVIGATION_TRANSITION_SETTLE_NAVIGATION_SLOT)]
     navigation: v8::Local<'scope, v8::Object>,
@@ -99,16 +98,16 @@ fn navigation_entry_matches_activation_snapshot<'s>(
     entry: v8::Local<'s, v8::Object>,
     snapshot: &NavigationHistorySerializedEntry,
 ) -> bool {
-    let current_id = get_own_static_property(scope, entry, "id")
-        .and_then(|value| value.to_string(scope))
-        .map(|value| value.to_rust_string_lossy(scope));
-    let current_key = get_own_static_property(scope, entry, "key")
-        .and_then(|value| value.to_string(scope))
-        .map(|value| value.to_rust_string_lossy(scope));
-    let snapshot_id = navigation_entry_public_token(&snapshot.id);
-    let snapshot_key = navigation_entry_public_token(&snapshot.key);
-    current_id.as_deref() == Some(snapshot_id.as_str())
-        && current_key.as_deref() == Some(snapshot_key.as_str())
+    native::entry(scope, entry)
+        .is_some_and(|entry| native_entry_matches_activation_snapshot(&entry.borrow(), snapshot))
+}
+
+fn native_entry_matches_activation_snapshot(
+    entry: &moli_history::HistoryEntry,
+    snapshot: &NavigationHistorySerializedEntry,
+) -> bool {
+    entry.id == navigation_entry_public_token(&snapshot.id)
+        && entry.key.as_str() == navigation_entry_public_token(&snapshot.key)
 }
 
 pub(super) fn navigation_entry_object_from_snapshot<'s>(
@@ -123,31 +122,13 @@ pub(super) fn navigation_entry_object_from_snapshot<'s>(
     if let Some(history) = window_history_for_holder(scope, owner)
         && let Some(entries) = history_entries(scope, history)
     {
-        for index in 0..entries.length() {
-            let Some(entry) = entries
-                .get_index(scope, index)
-                .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-            else {
-                continue;
-            };
-            if navigation_entry_matches_activation_snapshot(scope, entry, snapshot) {
-                return entry;
+        for entry in entries {
+            if native_entry_matches_activation_snapshot(&entry.borrow(), snapshot) {
+                return entry_wrappers::for_window(scope, owner, entry);
             }
         }
     }
-    let entry = create_navigation_entry(
-        scope,
-        &snapshot.url,
-        snapshot.history_state_json.as_deref(),
-        snapshot.navigation_state_json.as_deref(),
-        snapshot.referrer_policy.as_deref(),
-        snapshot.index,
-        &snapshot.id,
-        &snapshot.key,
-    );
-    set_navigation_entry_document_id(scope, entry, snapshot.document_id.as_str());
-    bind_navigation_entry_runtime_owner(scope, entry, owner);
-    entry
+    entry_wrappers::for_window(scope, owner, history_entry_from_snapshot(snapshot))
 }
 
 fn navigation_activation_entry_object<'s>(
@@ -161,22 +142,16 @@ fn navigation_activation_entry_object<'s>(
     navigation_entry_object_from_snapshot(scope, current_entry, &activation.entry)
 }
 
-pub(super) fn bind_navigation_entry_runtime_owner<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    entry: v8::Local<'s, v8::Object>,
-    owner: v8::Local<'s, v8::Object>,
-) {
-    set_runtime_window_owner(scope, entry, owner);
-}
-
 pub(super) fn create_navigation_activation_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    context: v8::Local<'s, v8::Context>,
     current_entry: v8::Local<'s, v8::Object>,
     activation: Option<&NavigationActivationSeed>,
 ) -> v8::Local<'s, v8::Value> {
     let Some(activation) = activation else {
         return v8::null(scope).into();
     };
+    let scope = &mut v8::ContextScope::new(scope, context);
     let entry = navigation_activation_entry_object(scope, current_entry, activation);
     let from = activation
         .from
@@ -190,6 +165,12 @@ pub(super) fn create_navigation_activation_object<'s>(
         .and_then(|value| v8_string(scope, value))
         .map(v8::Local::<v8::Value>::from)
         .unwrap_or_else(|| v8::null(scope).into());
+    let entry = entry_wrappers::in_realm(scope, entry, context);
+    let from = if let Ok(from) = v8::Local::<v8::Object>::try_from(from) {
+        entry_wrappers::in_realm(scope, from, context).into()
+    } else {
+        from
+    };
     NavigationActivationObjectDeclaration::new(entry, from, navigation_type)
         .bind(scope)
         .expect("NavigationActivation declaration should bind")
@@ -202,10 +183,17 @@ pub(super) fn install_navigation_activation_runtime_state<'s>(
     current_entry: v8::Local<'s, v8::Object>,
     activation: Option<&NavigationActivationSeed>,
 ) {
-    let activation_value = create_navigation_activation_object(scope, current_entry, activation);
-    let transition_value = v8::null(scope).into();
+    let context = navigation
+        .get_creation_context(scope)
+        .unwrap_or_else(|| scope.get_current_context());
+    let activation_value =
+        create_navigation_activation_object(scope, context, current_entry, activation);
     set_navigation_activation_value(scope, navigation, activation_value);
-    set_navigation_transition_value(scope, navigation, transition_value);
+    if super::shared_event_targets::shared_target_owner(scope, navigation)
+        .strict_equals(navigation.into())
+    {
+        set_navigation_transition_value(scope, navigation, v8::null(scope).into());
+    }
 }
 
 pub(super) fn install_navigation_transition<'s>(
@@ -215,12 +203,20 @@ pub(super) fn install_navigation_transition<'s>(
     to: Option<v8::Local<'s, v8::Object>>,
     navigation_type: &'static str,
 ) -> Option<v8::Local<'s, v8::PromiseResolver>> {
+    // Joint traversals can install another Window's transition from the
+    // initiating realm. The transition and both promises belong to Navigation.
+    let context = navigation.get_creation_context(scope)?;
+    let scope = &mut v8::ContextScope::new(scope, context);
     let resolver = v8::PromiseResolver::new(scope)?;
     let finished = resolver.get_promise(scope);
     suppress_unhandled_rejection(scope, finished);
     let committed_resolver = v8::PromiseResolver::new(scope)?;
     let committed = committed_resolver.get_promise(scope);
     suppress_unhandled_rejection(scope, committed);
+    let context = scope.get_current_context();
+    let from = entry_wrappers::in_realm(scope, from, context);
+    let to =
+        to.and_then(|to| super::navigation_events::navigation_destination_for_realm(scope, to));
     let transition = NavigationTransitionObjectDeclaration {
         from,
         to: to
@@ -243,6 +239,11 @@ pub(super) fn resolve_navigation_transition_committed<'s>(
     value: v8::Local<'s, v8::Value>,
 ) {
     if let Some(resolver) = take_navigation_transition_committed_resolver(scope, navigation) {
+        let context = resolver
+            .get_promise(scope)
+            .get_creation_context(scope)
+            .unwrap_or_else(|| scope.get_current_context());
+        let value = entry_wrappers::value_in_realm(scope, value, context);
         let _ = resolver.resolve(scope, value);
     }
 }
@@ -347,7 +348,7 @@ fn settle_navigation_transition_callback<'s>(
     }
 }
 
-fn navigation_transition_matches_resolver<'s>(
+pub(super) fn navigation_transition_matches_resolver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     navigation: v8::Local<'s, v8::Object>,
     resolver: v8::Local<'s, v8::PromiseResolver>,
@@ -362,8 +363,10 @@ pub(super) fn navigation_current_entry_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     navigation: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    get_private_value(scope, navigation, NAVIGATION_CURRENT_ENTRY_SLOT)
-        .filter(|value| !value.is_undefined())
+    let owner = runtime_window_owner(scope, navigation);
+    let entry = super::navigation_entry::navigation_current_entry(scope, owner)?;
+    let context = navigation.get_creation_context(scope)?;
+    Some(entry_wrappers::in_realm(scope, entry, context).into())
 }
 
 pub(super) fn navigation_activation_value<'s>(
@@ -378,15 +381,20 @@ pub(super) fn navigation_transition_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     navigation: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    get_private_value(scope, navigation, NAVIGATION_TRANSITION_SLOT)
-        .filter(|value| !value.is_undefined())
+    let context = navigation.get_creation_context(scope)?;
+    let Some(transition) = navigation_transition_object(scope, navigation) else {
+        return Some(v8::null(scope).into());
+    };
+    super::navigation_transition_worlds::transition_in_realm(scope, transition, context)
+        .map(Into::into)
 }
 
 fn navigation_transition_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     navigation: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    navigation_transition_value(scope, navigation)
+    let navigation = super::shared_event_targets::shared_target_owner(scope, navigation);
+    get_private_value(scope, navigation, NAVIGATION_TRANSITION_SLOT)
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
 }
 
@@ -403,6 +411,7 @@ fn set_navigation_transition_value<'s>(
     navigation: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
 ) {
+    let navigation = super::shared_event_targets::shared_target_owner(scope, navigation);
     set_private_value(scope, navigation, NAVIGATION_TRANSITION_SLOT, value);
 }
 
@@ -417,4 +426,52 @@ pub(super) fn set_navigation_current_entry(
         NAVIGATION_CURRENT_ENTRY_SLOT,
         entry.into(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_transition_and_promises_use_navigation_creation_realm() {
+        crate::ensure_v8_for_test();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let first = v8::Context::new(scope, Default::default());
+        let second = v8::Context::new(scope, Default::default());
+        for (owner, caller) in [(first, second), (second, first)] {
+            let (navigation, from) = {
+                let scope = &mut v8::ContextScope::new(scope, owner);
+                (v8::Object::new(scope), v8::Object::new(scope))
+            };
+            let scope = &mut v8::ContextScope::new(scope, caller);
+            let resolver = install_navigation_transition(scope, navigation, from, None, "traverse")
+                .expect("transition should be installed");
+            assert_eq!(scope.get_current_context(), caller);
+            let transition = navigation_transition_object(scope, navigation).unwrap();
+            assert_eq!(transition.get_creation_context(scope), Some(owner));
+            for name in ["committed", "finished"] {
+                let value = transition.get(scope, v8str(scope, name).into()).unwrap();
+                let promise = v8::Local::<v8::Promise>::try_from(value).unwrap();
+                assert_eq!(promise.get_creation_context(scope), Some(owner), "{name}");
+                if name == "finished" {
+                    assert_eq!(promise, resolver.get_promise(scope));
+                }
+            }
+            assert!(
+                transition
+                    .get(scope, v8str(scope, "from").into())
+                    .unwrap()
+                    .strict_equals(from.into())
+            );
+            resolve_navigation_transition_committed(scope, navigation, from.into());
+            let committed = transition
+                .get(scope, v8str(scope, "committed").into())
+                .unwrap();
+            let committed = v8::Local::<v8::Promise>::try_from(committed).unwrap();
+            assert_eq!(committed.state(), v8::PromiseState::Fulfilled);
+            assert!(committed.result(scope).strict_equals(from.into()));
+        }
+    }
 }

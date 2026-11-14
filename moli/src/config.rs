@@ -6,7 +6,9 @@ use moli_core::{
     page::{SubresourceJsonPathEquals, SubresourceJsonPathRegex, SubresourceResponseWaitCriteria},
     runtime::BrowserConfig,
 };
-use moli_fetch::{FetchConfig, WebBotAuthProfile, WebBotAuthSigner};
+use moli_fetch::{
+    FetchConfig, WebBotAuthProfile, WebBotAuthSigner, validate_http_host_resolve_entries,
+};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -29,6 +31,12 @@ impl AppConfig {
 
         match &cli.command {
             Commands::Fetch(args) => {
+                if (args.eval.is_some() || args.eval_file.is_some())
+                    && args.dump.is_none()
+                    && (args.with_base || args.with_frames || !args.strip_mode.is_empty())
+                {
+                    bail!("page output options with --eval or --eval-file require --dump");
+                }
                 if args.trace_network && args.dump != Some(DumpFormat::Json) {
                     bail!("--trace-network requires --dump json");
                 }
@@ -60,10 +68,16 @@ impl AppConfig {
             }
             Commands::Serve(args) => {
                 apply_common_args(&mut config, &args.common)?;
+                config.browser.set_debugger_enabled(args.debugger);
                 config.server.host = args.host.clone();
                 config.server.port = args.port;
                 config.server.timeout_secs = args.timeout;
+                config.server.remote_allow_origins = args.remote_allow_origins.clone();
+                if let Some(interval_ms) = args.screencast_interval {
+                    config.server.screencast_interval_ms = interval_ms;
+                }
             }
+            Commands::Import(_) => {}
         }
 
         Ok(config)
@@ -84,6 +98,10 @@ impl AppConfig {
 }
 
 fn apply_common_args(config: &mut AppConfig, common: &CommonArgs) -> Result<()> {
+    if common.scrollbars && !common.layout {
+        bail!("--scrollbars requires --layout or MOLI_LAYOUT=true");
+    }
+
     if let Some(log_level) = common.log_level {
         config.log_filter = log_level.as_tracing_filter().to_owned();
     }
@@ -182,10 +200,13 @@ fn apply_common_args(config: &mut AppConfig, common: &CommonArgs) -> Result<()> 
     } else {
         LayoutPolicy::Mock
     });
+    config
+        .browser
+        .set_scrollbars_hidden(common.layout && !common.scrollbars);
     config.fetch.cookie_files = common.cookie_file.clone();
     config.browser.fetch_mut().set_network_blocking(
         common.block_private_networks,
-        parse_block_cidrs(common.block_cidrs.as_deref()),
+        parse_block_cidrs(common.block_cidrs.as_deref())?,
     );
     config
         .browser
@@ -250,35 +271,19 @@ fn configure_web_bot_auth(fetch: &mut FetchConfig, common: &CommonArgs) -> Resul
     Ok(())
 }
 
-fn validate_http_host_resolve_entries(entries: &[String]) -> Result<()> {
-    for entry in entries {
-        validate_http_host_resolve_entry(entry)?;
-    }
-    Ok(())
-}
+fn parse_block_cidrs(raw: Option<&str>) -> Result<Vec<AnyIpCidr>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
 
-fn validate_http_host_resolve_entry(entry: &str) -> Result<()> {
-    let mut parts = entry.splitn(3, ':');
-    let host = parts.next().unwrap_or_default();
-    let port = parts.next().unwrap_or_default();
-    let address = parts.next().unwrap_or_default();
-
-    if host.is_empty() || port.is_empty() || address.is_empty() {
-        bail!("--http-host-resolve must be in HOST:PORT:ADDR form");
-    }
-    port.parse::<u16>()
-        .with_context(|| format!("invalid --http-host-resolve port in `{entry}`"))?;
-    Ok(())
-}
-
-fn parse_block_cidrs(raw: Option<&str>) -> Vec<AnyIpCidr> {
-    raw.into_iter()
-        .flat_map(|value| value.split(','))
-        .filter_map(|item| {
-            let trimmed = item.trim();
-            (!trimmed.is_empty())
-                .then(|| AnyIpCidr::from_str(trimmed).ok())
-                .flatten()
+    raw.split(',')
+        .map(|item| {
+            let item = item.trim();
+            if item.is_empty() {
+                bail!("invalid --block-cidrs entry: CIDR must not be empty");
+            }
+            AnyIpCidr::from_str(item)
+                .with_context(|| format!("invalid --block-cidrs entry `{item}`"))
         })
         .collect()
 }
@@ -346,6 +351,20 @@ mod tests {
     use crate::cli::{Cli, Commands};
     use clap::Parser;
     use std::path::Path;
+
+    #[test]
+    fn serve_debugger_pauses_are_opt_in() {
+        for (arguments, expected) in [
+            (vec!["moli", "serve"], false),
+            (vec!["moli", "serve", "--debugger"], true),
+        ] {
+            let cli = Cli::parse_from(arguments);
+            let config = AppConfig::from_cli(&cli).expect("serve configuration");
+            assert_eq!(config.browser.debugger_enabled(), expected);
+            let runtime = moli_core::runtime::NavigationRuntimeConfig::from(&config.browser);
+            assert_eq!(runtime.debugger_enabled(), expected);
+        }
+    }
 
     #[test]
     fn tls_credentials_reach_fetch_config_for_fetch_and_serve() {

@@ -1,3 +1,4 @@
+use crate::runtime::WorkerInspectorError;
 use crate::{
     RendererSyntheticResponseBody,
     shared_worker_runtime::{
@@ -6,6 +7,7 @@ use crate::{
     worker::{WorkerPendingFetchContinue, WorkerPendingXhrContinue},
     worker_owner_wake::WorkerOwnerWakeRoutes,
 };
+use anyhow::Result;
 use moli_shared_worker::{
     SharedWorkerClientId, SharedWorkerClientOwnerId, SharedWorkerDescriptor, SharedWorkerInstanceId,
 };
@@ -239,7 +241,7 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         request: WorkerPendingFetchContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> bool {
         self.shared_worker_runtime_if_initialized()
             .is_some_and(|runtime| {
@@ -257,7 +259,7 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         request: WorkerPendingXhrContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> bool {
         self.shared_worker_runtime_if_initialized()
             .is_some_and(|runtime| {
@@ -353,7 +355,7 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.shared_worker_runtime_if_initialized()
@@ -373,7 +375,7 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.shared_worker_runtime_if_initialized()
@@ -393,7 +395,7 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.shared_worker_runtime_if_initialized()
@@ -413,7 +415,7 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.shared_worker_runtime_if_initialized()
@@ -433,7 +435,7 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.shared_worker_runtime_if_initialized()
@@ -453,9 +455,9 @@ impl RendererBrowserContextRuntime {
         instance_id: SharedWorkerInstanceId,
         inspector_session_id: Option<String>,
         raw_json: String,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         let Some(runtime) = self.shared_worker_runtime_if_initialized() else {
-            return Err("SharedWorkerRuntimeUnavailable".to_owned());
+            return Err(WorkerInspectorError::SharedUnavailable.into());
         };
         runtime
             .dispatch_runtime_protocol_message(instance_id, inspector_session_id, raw_json)
@@ -468,9 +470,9 @@ impl RendererBrowserContextRuntime {
         inspector_session_id: Option<String>,
         raw_json: String,
         deferred_response: RendererRuntimeInspectorResponseSender,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         let Some(runtime) = self.shared_worker_runtime_if_initialized() else {
-            return Err("SharedWorkerRuntimeUnavailable".to_owned());
+            return Err(WorkerInspectorError::SharedUnavailable.into());
         };
         runtime
             .dispatch_runtime_protocol_message_with_deferred_response(
@@ -488,9 +490,9 @@ impl RendererBrowserContextRuntime {
         inspector_session_id: String,
         raw_json: String,
         response: RendererRuntimeInspectorResponseSender,
-    ) -> Result<crate::runtime::CompletedWorkerRuntimeInspectorCommandDispatch, String> {
+    ) -> Result<crate::runtime::CompletedWorkerRuntimeInspectorCommandDispatch> {
         let Some(runtime) = self.shared_worker_runtime_if_initialized() else {
-            return Err("SharedWorkerRuntimeUnavailable".to_owned());
+            return Err(WorkerInspectorError::SharedUnavailable.into());
         };
         runtime
             .dispatch_runtime_protocol_message_with_devtools_session_response(
@@ -506,9 +508,9 @@ impl RendererBrowserContextRuntime {
         &self,
         instance_id: SharedWorkerInstanceId,
         inspector_session_id: Option<String>,
-    ) -> bool {
+    ) -> Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>> {
         self.shared_worker_runtime_if_initialized()
-            .is_some_and(|runtime| {
+            .and_then(|runtime| {
                 runtime.detach_runtime_inspector_session(instance_id, inspector_session_id)
             })
     }

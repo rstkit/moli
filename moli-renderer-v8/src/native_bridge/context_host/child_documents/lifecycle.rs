@@ -1,4 +1,4 @@
-use super::super::JsContextHost;
+use super::super::PageScriptHost;
 
 #[derive(Clone, Copy)]
 enum ChildDocumentInteractiveScriptDisposition {
@@ -55,7 +55,7 @@ impl ChildDocumentCompleteBlockers {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     fn route_child_document_lifecycle_action(
         &self,
         action: FrameDocumentLifecycleAction,
@@ -124,7 +124,7 @@ impl JsContextHost {
                         .is_some_and(|element| element.is_image_resource_element())
             })
             .collect::<Vec<_>>();
-        let host_ptr = self as *mut JsContextHost;
+        let host_ptr = self as *mut PageScriptHost;
         for image_handle in image_handles {
             crate::native_bridge::element::queue_image_load_event_if_needed_with_initiator(
                 scope,
@@ -159,7 +159,7 @@ impl JsContextHost {
                         == Some(snapshot.document_handle)
             })
             .collect::<Vec<_>>();
-        let host_ptr = self as *mut JsContextHost;
+        let host_ptr = self as *mut PageScriptHost;
         for handle in handles {
             let Some(element) = self
                 .dom_host()
@@ -359,6 +359,7 @@ impl JsContextHost {
         let navigation = self
             .frame_owner_store
             .replace_current_child_navigation_load(child_handle)?;
+        crate::context_bootstrap::web_mcp::cancel_child_navigation(self, child_handle);
         tracing::debug!(
             ?child_handle,
             owner = ?navigation.owner(),
@@ -416,6 +417,7 @@ impl JsContextHost {
             );
             return false;
         };
+        crate::context_bootstrap::web_mcp::cancel_child_navigation(self, child_handle);
         tracing::debug!(
             ?child_handle,
             ?owner,
@@ -712,6 +714,17 @@ impl JsContextHost {
         {
             return FrameDocumentLifecycleTaskEffect::NotApplied;
         }
+        if let Some(document) = self
+            .child_browsing_context_document_handles
+            .get(&child_handle)
+            .copied()
+        {
+            crate::context_bootstrap::web_mcp::complete_navigation(
+                self,
+                document,
+                crate::native_bridge::WindowDocumentOwner::Frame(action.owner()),
+            );
+        }
         let event_dispatched = self
             .child_browsing_context_document_wrapper(scope, child_handle)
             .is_some_and(|document| {
@@ -862,7 +875,7 @@ impl JsContextHost {
             finished,
             "finished document-owned child unload lifecycle"
         );
-        unsafe { &mut *self.runtime }
+        unsafe { &mut *self.document_runtime }
             .cancel_window_execution_context_timers(execution_context_owner);
         true
     }
@@ -875,18 +888,21 @@ impl JsContextHost {
     /// dispatch pagehide/visibilitychange before unload while the parent
     /// document's listeners are still installed.
     fn dispatch_child_browsing_context_document_open_unload_lifecycle_if_needed(
-        &mut self,
         scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut Self,
         handle: DomHandle,
     ) {
-        let Some(window) = self.existing_child_browsing_context_window_wrapper(scope, handle)
+        let Some(window) =
+            unsafe { &mut *host_ptr }.existing_child_browsing_context_window_wrapper(scope, handle)
         else {
             return;
         };
-        let Some(document) = self.child_browsing_context_document_wrapper(scope, handle) else {
+        let Some(document) =
+            unsafe { &mut *host_ptr }.child_browsing_context_document_wrapper(scope, handle)
+        else {
             return;
         };
-        let Some(action) = self
+        let Some(action) = unsafe { &mut *host_ptr }
             .frame_owner_store
             .begin_current_child_document_unload(handle)
         else {
@@ -901,25 +917,28 @@ impl JsContextHost {
             let _ = call_object_method(scope, document, "dispatchEvent", &[event.into()]);
         }
         dispatch_unload_for_runtime_owner(scope, window);
-        let _ = self
+        let _ = unsafe { &mut *host_ptr }
             .frame_owner_store
             .finish_current_child_document_unload(action);
-        unsafe { &mut *self.runtime }
-            .cancel_window_execution_context_timers(execution_context_owner);
+        unsafe { &mut *host_ptr }.cancel_window_execution_context_timers(execution_context_owner);
     }
 
     pub(crate) fn dispatch_document_open_descendant_frame_unload_lifecycle(
-        &mut self,
         scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut Self,
         document_handle: DomHandle,
     ) {
-        let handles = self.child_browsing_context_handles_in_document_order();
+        let handles = unsafe { &*host_ptr }.child_browsing_context_handles_in_document_order();
         for handle in handles {
-            if self.dom_host().owner_document_handle(handle) != Some(document_handle) {
+            if unsafe { &*host_ptr }
+                .dom_host()
+                .owner_document_handle(handle)
+                != Some(document_handle)
+            {
                 continue;
             }
-            self.dispatch_child_browsing_context_document_open_unload_lifecycle_if_needed(
-                scope, handle,
+            Self::dispatch_child_browsing_context_document_open_unload_lifecycle_if_needed(
+                scope, host_ptr, handle,
             );
         }
     }
@@ -930,28 +949,46 @@ pub(in crate::native_bridge::context_host) fn dispatch_child_document_readiness_
     document: v8::Local<'s, v8::Object>,
     ready_state: DocumentReadyState,
 ) {
-    set_child_document_ready_state(scope, document, ready_state);
-    let _ =
-        dispatch_detached_simple_event(scope, document, "readystatechange", false, false, false);
+    if set_child_document_ready_state(scope, document, ready_state) {
+        let _ = dispatch_detached_simple_event(
+            scope,
+            document,
+            "readystatechange",
+            false,
+            false,
+            false,
+        );
+    }
 }
 
 fn set_child_document_ready_state<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     document: v8::Local<'s, v8::Object>,
     ready_state: DocumentReadyState,
-) {
-    if let Some(state) = get_private_object(scope, document, DETACHED_STATE_SLOT) {
+) -> bool {
+    let backing = crate::native_bridge::node::node_backing_object(scope, document);
+    if let Some(state) =
+        backing.and_then(|backing| get_private_object(scope, backing, DETACHED_STATE_SLOT))
+    {
         if let Some(value) = v8_string(scope, ready_state.as_str()) {
-            let _ = state.set(scope, v8str(scope, "readyState").into(), value.into());
+            let key = v8str(scope, "readyState").into();
+            if state
+                .get(scope, key)
+                .is_some_and(|old| old.strict_equals(value.into()))
+            {
+                return false;
+            }
+            return state.set(scope, key, value.into()) == Some(true);
         }
-        return;
+        return false;
     }
     if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
         && let Ok((object_host_ptr, document_handle)) =
             crate::native_bridge::node::node_runtime_and_handle_from_object(scope, document)
         && object_host_ptr == host_ptr
     {
-        let _ = unsafe { &mut *host_ptr }
+        return unsafe { &mut *host_ptr }
             .set_dom_document_ready_state_for_handle(document_handle, ready_state);
     }
+    false
 }

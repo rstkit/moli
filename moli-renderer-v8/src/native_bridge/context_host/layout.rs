@@ -1,19 +1,30 @@
 use moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE;
 use moli_layout::{
-    FrozenLayoutTree, GeometryProvider, LayoutAnswers, LayoutError, LayoutFlushReason,
-    LayoutPassRequest, LayoutPassResult, LayoutQuery, LayoutQueryAnswer, LayoutQueryBatch,
-    LayoutViewport,
+    FrozenLayoutTree, GeometryProvider, LayoutAnswers, LayoutError, LayoutPassRequest,
+    LayoutPassResult, LayoutQuery, LayoutQueryAnswer, LayoutQueryBatch, LayoutViewport,
 };
 
-use super::JsContextHost;
+use super::PageScriptHost;
 use super::layout_state::InferredFrameStyleViewportCacheKey;
 use crate::{
-    css_resource_urls::{CompletedStylesheetWebFont, StylesheetLoadBlockingResource},
+    css_resource_urls::{
+        CompletedStylesheetWebFont, StylesheetLoadBlockingResource, StylesheetSubresourceRequest,
+    },
     document_runtime::DomHandle,
     native_bridge::element::iframe_handle_viewport,
     script_vm::web_fonts::DocumentWebFontCompletion,
     style_engine::{StyleViewport, StyloStyleEnvironment},
 };
+
+/// Invalidation required by a changed native input. Publication is a separate
+/// owner decision; these changes retain the last frozen layout for readers.
+#[derive(Clone, Copy)]
+pub(crate) enum LayoutInputChange {
+    /// Media and viewport changes invalidate computed styles through Stylo.
+    StyleEnvironment,
+    /// Scrollbar policy and interactions change future geometry/paint output.
+    UsedGeometry,
+}
 
 /// Resets the entry flag on every return path, including unwinding.
 ///
@@ -46,7 +57,7 @@ pub(crate) struct LayoutSnapshotCacheObservability {
     pub(crate) cached: Option<(DomHandle, moli_layout::LayoutTreeRetentionMetrics)>,
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn set_layout_policy(&mut self, policy: moli_page_types::LayoutPolicy) {
         if !policy.uses_real_layout() {
             self.document_layout_state.get_mut().clear_latest_layout();
@@ -56,6 +67,33 @@ impl JsContextHost {
 
     pub(crate) const fn layout_policy(&self) -> moli_page_types::LayoutPolicy {
         self.layout_policy
+    }
+
+    pub(crate) fn set_scrollbars_hidden(&mut self, hidden: bool) -> bool {
+        let changed = self.scrollbars_hidden != hidden;
+        if changed {
+            self.scrollbars_hidden = hidden;
+            self.invalidate_layout_inputs(LayoutInputChange::UsedGeometry);
+        }
+        changed
+    }
+
+    pub(crate) fn invalidate_layout_inputs(&self, change: LayoutInputChange) {
+        match change {
+            LayoutInputChange::StyleEnvironment => self
+                .style_engine
+                .bump_target_context_epoch_for_document(self.document_handle()),
+            LayoutInputChange::UsedGeometry => {
+                self.clear_layout_rect_cache();
+                self.document_layout_state
+                    .borrow_mut()
+                    .mark_visual_state_dirty();
+            }
+        }
+    }
+
+    pub(crate) const fn scrollbars_hidden(&self) -> bool {
+        self.scrollbars_hidden
     }
 
     pub(crate) fn active_layout_document_handles(&self) -> Vec<DomHandle> {
@@ -81,15 +119,17 @@ impl JsContextHost {
         &self,
         document: crate::runtime::RendererDocumentLifecycleIdentity,
         viewport: moli_layout::PaintViewport,
+        base_background_color: [u8; 4],
     ) -> crate::runtime::RendererVisualStateToken {
         crate::runtime::RendererVisualStateToken::new(
             document,
             self.dom_host().dom_version(),
             self.style_engine
-                .computed_style_observation_generations(self.active_layout_document_handles()),
+                .visual_style_input_generations(self.active_layout_document_handles()),
             self.visual_state_generation(),
             self.visual_resource_generation(),
             viewport,
+            base_background_color,
         )
     }
 
@@ -98,7 +138,7 @@ impl JsContextHost {
     }
 
     pub(crate) fn layout_viewport_for_document(&self, document: DomHandle) -> LayoutViewport {
-        let surface = self.viewport_surface;
+        let surface = self.viewport_surface();
         let device_pixel_ratio = surface
             .map(|surface| surface.device_pixel_ratio as f32)
             .unwrap_or(DEFAULT_WINDOW_SURFACE_PROFILE.device_pixel_ratio as f32);
@@ -142,6 +182,27 @@ impl JsContextHost {
             .frame_viewport(frame)
     }
 
+    pub(crate) fn invalidate_published_frame_viewports(
+        &self,
+        frames: impl IntoIterator<Item = DomHandle>,
+    ) {
+        let frames = frames.into_iter().collect::<Vec<_>>();
+        if frames.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut state = self.document_layout_state.borrow_mut();
+            let changed =
+                state.update_frame_viewports(frames.into_iter().map(|frame| (frame, None)));
+            state.clear_latest_layout();
+            changed
+        };
+        if changed {
+            self.style_viewport_generation
+                .set(self.style_viewport_generation.get().saturating_add(1));
+        }
+    }
+
     #[cfg(debug_assertions)]
     pub(crate) fn style_viewport_generation(&self) -> u64 {
         self.style_viewport_generation.get()
@@ -154,7 +215,12 @@ impl JsContextHost {
     /// after the recursive pass succeeds. Advancing this input generation
     /// first also distinguishes an explicit main-Document capture viewport
     /// from ordinary DOM APIs selecting conflicting implicit viewports.
-    pub(crate) fn note_layout_style_viewport(&self, document: DomHandle, viewport: StyleViewport) {
+    pub(crate) fn note_layout_style_environment(
+        &self,
+        document: DomHandle,
+        viewport: StyleViewport,
+        environment_override: Option<StyloStyleEnvironment>,
+    ) {
         let matches_cached = if document == self.document_handle() {
             viewport == self.style_viewport()
         } else {
@@ -165,7 +231,10 @@ impl JsContextHost {
                         && viewport.height == Some(f64::from(cached.css_height))
                 })
         };
-        if !matches_cached {
+        let different_media = environment_override.is_some_and(|environment| {
+            environment != StyloStyleEnvironment::from_emulated_media(self.emulated_media())
+        });
+        if !matches_cached || different_media {
             self.style_viewport_generation
                 .set(self.style_viewport_generation.get().saturating_add(1));
         }
@@ -205,12 +274,81 @@ impl JsContextHost {
             .inferred_frame_style_viewport_cache_observability()
     }
 
-    pub(crate) fn with_fresh_layout_pass_for_document<T>(
+    /// Lazily publishes the first screen layout for this main Document.
+    ///
+    /// Every consumer shares the same recursive tree. Missing nodes or newly
+    /// navigated frames in an existing tree must not refresh the whole page.
+    pub(crate) fn ensure_initial_layout(&self) -> Result<(), LayoutError> {
+        if !self.layout_policy.uses_real_layout() {
+            return Ok(());
+        }
+        if self.layout_pass_active.get() {
+            return Err(LayoutError::ReentrantLayoutPass);
+        }
+        let document = self.document_handle();
+        if self
+            .document_layout_state
+            .borrow()
+            .latest_layout(document)
+            .is_some()
+        {
+            return Ok(());
+        }
+        let request = LayoutPassRequest::new(
+            self.layout_viewport_for_document(document),
+            moli_layout::LayoutFlushReason::SynchronousGeometry,
+        );
+        let pass = self
+            .build_layout_pass_for_document(document, request)?
+            .ok_or(LayoutError::NoLayoutRoot)?;
+        self.publish_layout_pass_for_document(document, pass);
+        Ok(())
+    }
+
+    /// FontFace and Canvas use the document's font service without requesting a
+    /// layout pass or changing the frozen synchronous DOM geometry snapshot.
+    pub(crate) fn with_font_services<T>(
+        &self,
+        document: DomHandle,
+        consume: impl FnOnce(&mut moli_layout::DocumentLayoutServices) -> T,
+    ) -> T {
+        self.document_layout_state
+            .borrow_mut()
+            .with_services_for_document(document, self.document_handle(), |services, _| {
+                consume(services)
+            })
+    }
+
+    pub(crate) fn invalidate_document_font_layout(&self, document: DomHandle) {
+        if document != self.document_handle()
+            && self
+                .child_browsing_context_host_for_document_handle(document)
+                .is_none()
+        {
+            return;
+        }
+        // A real font registration change invalidates sampled glyph advances.
+        // Unchanged registration and read-only projections retain the tree.
+        self.clear_layout_rect_cache();
+        self.document_layout_state
+            .borrow_mut()
+            .clear_latest_layout();
+    }
+
+    pub(crate) fn build_layout_pass_for_document(
         &self,
         document: DomHandle,
         request: LayoutPassRequest,
-        consume: impl FnOnce(&mut LayoutPassResult<DomHandle>) -> Result<T, LayoutError>,
-    ) -> Result<Option<T>, LayoutError> {
+    ) -> Result<Option<LayoutPassResult<DomHandle>>, LayoutError> {
+        self.build_layout_pass_for_document_in_environment(document, request, None)
+    }
+
+    pub(crate) fn build_layout_pass_for_document_in_environment(
+        &self,
+        document: DomHandle,
+        request: LayoutPassRequest,
+        environment_override: Option<StyloStyleEnvironment>,
+    ) -> Result<Option<LayoutPassResult<DomHandle>>, LayoutError> {
         let Some(root) = self
             .dom_host()
             .dom()
@@ -218,15 +356,13 @@ impl JsContextHost {
         else {
             return Ok(None);
         };
-        let pass_viewport = request.viewport;
         let _active = ActiveLayoutPass::enter(&self.layout_pass_active)?;
-        let mut pass = {
+        let pass = {
             let mut state = self.document_layout_state.borrow_mut();
             state.retain_live_embedded_document_services(|candidate| {
                 self.child_browsing_context_host_for_document_handle(candidate)
                     .is_some()
             });
-            state.retain_live_frame_viewports(|frame| self.child_browsing_context_is_live(frame));
             state.with_services_for_document(
                 document,
                 self.document_handle(),
@@ -237,6 +373,7 @@ impl JsContextHost {
                         services,
                         embedded_document_services,
                         request,
+                        environment_override,
                     )
                 },
             )?
@@ -282,59 +419,99 @@ impl JsContextHost {
             );
         }
         pass.validate_retention_budget()?;
-        let consumed = consume(&mut pass)?;
+        Ok(Some(pass))
+    }
+
+    pub(crate) fn publish_layout_pass_for_document(
+        &self,
+        document: DomHandle,
+        pass: LayoutPassResult<DomHandle>,
+    ) {
         let metrics = pass.metrics;
+        let pass_viewport = pass.viewport;
         let frame_viewports = self
             .child_browsing_context_handles_in_document_order()
             .into_iter()
-            .filter(|frame| self.dom_host().owner_document_handle(*frame) == Some(document))
-            .map(|frame| {
-                let viewport = pass
-                    .tree
-                    .local_content_box_for_source(frame)
-                    .map(|content| {
-                        LayoutViewport::new(
-                            css_viewport_dimension(f64::from(content.width)),
-                            css_viewport_dimension(f64::from(content.height)),
-                            pass_viewport.device_pixel_ratio,
-                        )
-                    });
-                (frame, viewport)
+            .filter_map(|frame| {
+                let owner = self.dom_host().owner_document_handle(frame)?;
+                let root = self
+                    .dom_host()
+                    .dom()
+                    .document_element_handle_for_document(owner)?;
+                // A fresh paint publishes nested frame trees too. Publish each
+                // frame's used content viewport from that same projection.
+                let tree = pass.tree.tree_for_root(root)?;
+                let viewport = tree.local_content_box_for_source(frame).map(|content| {
+                    LayoutViewport::new(
+                        css_viewport_dimension(f64::from(content.width)),
+                        css_viewport_dimension(f64::from(content.height)),
+                        pass_viewport.device_pixel_ratio,
+                    )
+                });
+                Some((frame, viewport))
             })
             .collect::<Vec<_>>();
         let tree = pass.into_tree();
         let frame_viewports_changed = {
             let mut state = self.document_layout_state.borrow_mut();
-            state.publish_latest_layout(document, tree);
+            state.retain_live_frame_viewports(|frame| self.child_browsing_context_is_live(frame));
             state.update_frame_viewports(frame_viewports)
         };
         if frame_viewports_changed {
             self.style_viewport_generation
                 .set(self.style_viewport_generation.get().saturating_add(1));
         }
+        self.document_layout_state
+            .borrow_mut()
+            .publish_latest_layout(document, tree);
         self.last_layout_pass_metrics.set(Some(metrics));
         self.layout_snapshot_cache_publishes
             .set(self.layout_snapshot_cache_publishes.get().saturating_add(1));
-        Ok(Some(consumed))
     }
 
     pub(crate) fn answer_layout_for_document(
         &self,
         document: DomHandle,
-        reason: LayoutFlushReason,
         queries: &LayoutQueryBatch<DomHandle>,
     ) -> Result<LayoutAnswers<DomHandle>, LayoutError> {
-        let viewport = self.layout_viewport_for_document(document);
-        self.answer_layout(document, reason, viewport, queries, false)
+        self.with_published_layout_for_document(document, |tree, metrics| {
+            tree.answer_queries_with(queries, metrics, |query| {
+                self.specialize_layout_query(tree, query)
+            })
+        })
     }
 
-    pub(crate) fn can_answer_layout_from_snapshot(&self, document: DomHandle) -> bool {
-        #[cfg(test)]
-        if self.force_fresh_layout_reads_for_test {
-            return false;
+    pub(crate) fn answer_layout_query_for_document(
+        &self,
+        document: DomHandle,
+        query: &LayoutQuery<DomHandle>,
+    ) -> Result<LayoutQueryAnswer<DomHandle>, LayoutError> {
+        self.with_published_layout_for_document(document, |tree, _| {
+            self.answer_layout_query(tree, query)
+        })
+    }
+
+    fn with_published_layout_for_document<T>(
+        &self,
+        document: DomHandle,
+        inspect: impl FnOnce(&FrozenLayoutTree<DomHandle>, moli_layout::LayoutPassMetrics) -> T,
+    ) -> Result<T, LayoutError> {
+        let value = self
+            .with_latest_layout_tree_for_document(document, |tree| {
+                self.last_layout_pass_metrics
+                    .get()
+                    .map(|metrics| inspect(tree, metrics))
+            })
+            .flatten();
+        if let Some(value) = value {
+            self.layout_snapshot_cache_hits
+                .set(self.layout_snapshot_cache_hits.get().saturating_add(1));
+            Ok(value)
+        } else {
+            self.layout_snapshot_cache_misses
+                .set(self.layout_snapshot_cache_misses.get().saturating_add(1));
+            Err(LayoutError::NoLayoutSnapshot)
         }
-        self.with_latest_layout_tree_for_document(document, |_| ())
-            .is_some()
     }
 
     /// Inspects the member tree for one exact Document in the single latest
@@ -357,125 +534,44 @@ impl JsContextHost {
         state
             .latest_layout(document)
             .or_else(|| root.and_then(|root| state.latest_layout_for_root(root)))
+            .filter(|tree| Some(tree.source_root()) == root)
             .map(inspect)
     }
 
-    pub(crate) fn answer_layout_at_viewport(
-        &self,
-        document: DomHandle,
-        reason: LayoutFlushReason,
-        viewport: LayoutViewport,
-        queries: &LayoutQueryBatch<DomHandle>,
-    ) -> Result<LayoutAnswers<DomHandle>, LayoutError> {
-        self.answer_layout(document, reason, viewport, queries, true)
-    }
-
-    /// Ensures one exact-viewport tree exists without manufacturing a geometry
-    /// query. Hit-test demands additionally require the complete embedded-frame
-    /// projection owned by that same frozen tree.
-    pub(crate) fn ensure_layout_at_viewport(
-        &self,
-        document: DomHandle,
-        reason: LayoutFlushReason,
-        viewport: LayoutViewport,
-    ) -> Result<(), LayoutError> {
-        #[cfg(test)]
-        let reuse_latest = !self.force_fresh_layout_reads_for_test;
-        #[cfg(not(test))]
-        let reuse_latest = true;
-        let cached = reuse_latest
-            && self
-                .with_latest_layout_tree_for_document(document, |tree| {
-                    layout_tree_satisfies_request(tree, reason, viewport, true)
-                })
-                .unwrap_or(false);
-        if cached {
-            self.layout_snapshot_cache_hits
-                .set(self.layout_snapshot_cache_hits.get().saturating_add(1));
-            return Ok(());
-        }
-
-        self.layout_snapshot_cache_misses
-            .set(self.layout_snapshot_cache_misses.get().saturating_add(1));
-        self.with_fresh_layout_pass_for_document(
-            document,
-            LayoutPassRequest::new(viewport, reason),
-            |_| Ok(()),
-        )?
-        .ok_or(LayoutError::NoLayoutRoot)
-    }
-
-    fn answer_layout(
-        &self,
-        document: DomHandle,
-        reason: LayoutFlushReason,
-        viewport: LayoutViewport,
-        queries: &LayoutQueryBatch<DomHandle>,
-        exact_viewport: bool,
-    ) -> Result<LayoutAnswers<DomHandle>, LayoutError> {
-        #[cfg(test)]
-        let reuse_latest = !self.force_fresh_layout_reads_for_test;
-        #[cfg(not(test))]
-        let reuse_latest = true;
-        let cached = if reuse_latest {
-            self.with_latest_layout_tree_for_document(document, |tree| {
-                if !layout_tree_satisfies_request(tree, reason, viewport, exact_viewport) {
-                    return None;
-                }
-                self.last_layout_pass_metrics
-                    .get()
-                    .map(|metrics| self.answer_layout_queries(tree, metrics, viewport, queries))
-            })
-            .flatten()
-        } else {
-            None
-        };
-        if let Some(answers) = cached {
-            self.layout_snapshot_cache_hits
-                .set(self.layout_snapshot_cache_hits.get().saturating_add(1));
-            return Ok(answers);
-        }
-
-        self.layout_snapshot_cache_misses
-            .set(self.layout_snapshot_cache_misses.get().saturating_add(1));
-        self.with_fresh_layout_pass_for_document(
-            document,
-            LayoutPassRequest::new(viewport, reason),
-            |pass| Ok(self.answer_layout_queries(&pass.tree, pass.metrics, viewport, queries)),
-        )?
-        .ok_or(LayoutError::NoLayoutRoot)
-    }
-
-    fn answer_layout_queries(
+    fn answer_layout_query(
         &self,
         tree: &FrozenLayoutTree<DomHandle>,
-        metrics: moli_layout::LayoutPassMetrics,
-        viewport: LayoutViewport,
-        queries: &LayoutQueryBatch<DomHandle>,
-    ) -> LayoutAnswers<DomHandle> {
-        let mut answers = tree.answer_queries(queries, metrics);
-        for (query, answer) in queries.queries.iter().zip(&mut answers.answers) {
-            match (query, answer) {
-                (LayoutQuery::DocumentMetrics, LayoutQueryAnswer::DocumentMetrics(metrics)) => {
-                    // The content extent and scroll position are sampled
-                    // geometry, but the viewport is explicit browser state.
-                    // Window/viewport protocol commands must observe a resize
-                    // immediately without forcing a new layout pass.
-                    metrics.viewport = viewport;
-                }
-                (
-                    LayoutQuery::ElementMetrics { source },
-                    LayoutQueryAnswer::ElementMetrics(metrics),
-                ) => {
-                    *metrics = tree.element_metrics_for_source_with_offset_parent_filter(
-                        *source,
-                        |candidate| self.offset_parent_candidate_is_exposed(*source, candidate),
-                    );
-                }
-                _ => {}
+        query: &LayoutQuery<DomHandle>,
+    ) -> LayoutQueryAnswer<DomHandle> {
+        self.specialize_layout_query(tree, query)
+            .unwrap_or_else(|| tree.answer_query(query))
+    }
+
+    fn specialize_layout_query(
+        &self,
+        tree: &FrozenLayoutTree<DomHandle>,
+        query: &LayoutQuery<DomHandle>,
+    ) -> Option<LayoutQueryAnswer<DomHandle>> {
+        // Geometry and its coordinate environment come from the same
+        // published frame, even after live viewport changes.
+        Some(match query {
+            LayoutQuery::ElementMetrics { source } => LayoutQueryAnswer::ElementMetrics(
+                tree.element_metrics_for_source_with_offset_parent_filter(*source, |candidate| {
+                    self.offset_parent_candidate_is_exposed(*source, candidate)
+                }),
+            ),
+            // An out-of-viewport point needs no fragment walk.
+            LayoutQuery::HitTest { point, .. } if !tree.viewport.contains(*point) => {
+                LayoutQueryAnswer::HitTest(None)
             }
-        }
-        answers
+            LayoutQuery::HitTestAll { point, .. } if !tree.viewport.contains(*point) => {
+                LayoutQueryAnswer::HitTestAll(Vec::new())
+            }
+            LayoutQuery::CaretPosition { point } if !tree.viewport.contains(*point) => {
+                LayoutQueryAnswer::CaretPosition(None)
+            }
+            _ => return None,
+        })
     }
 
     /// Blink exposes only offset-parent candidates whose TreeScope is one of
@@ -519,57 +615,119 @@ impl JsContextHost {
     }
 
     pub(crate) fn invalidate_layout_after_interaction_state_change(&self) {
-        self.clear_layout_rect_cache();
-        self.document_layout_state
-            .borrow_mut()
-            .clear_latest_layout();
+        self.invalidate_layout_inputs(LayoutInputChange::UsedGeometry);
     }
 
     pub(crate) fn document_web_font_resources_are_current(
         &self,
+        document: DomHandle,
         generation: crate::style_engine::StylesheetResourceGeneration,
     ) -> bool {
         self.document_layout_state
             .borrow()
-            .web_font_resources_are_current(generation)
+            .web_font_resources_are_current(document, self.document_handle(), generation)
+    }
+
+    pub(crate) fn document_web_font_sidecar_is_pristine(&self, document: DomHandle) -> bool {
+        self.document_layout_state
+            .borrow()
+            .web_font_sidecar_is_pristine(document, self.document_handle())
     }
 
     pub(crate) fn publish_document_web_font_resource_generation(
         &self,
+        document: DomHandle,
         generation: crate::style_engine::StylesheetResourceGeneration,
     ) {
         self.document_layout_state
             .borrow_mut()
-            .publish_web_font_resource_generation(generation);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn force_fresh_layout_reads_for_test(&mut self) {
-        self.force_fresh_layout_reads_for_test = true;
-        self.document_layout_state.get_mut().clear_latest_layout();
+            .publish_web_font_resource_generation(document, self.document_handle(), generation);
     }
 
     pub(crate) fn retain_document_web_font_slots<'a>(
         &self,
+        document: DomHandle,
         resources: impl IntoIterator<Item = &'a StylesheetLoadBlockingResource>,
     ) {
-        self.document_layout_state
-            .borrow_mut()
-            .retain_active_slots(resources);
+        let changed = self.document_layout_state.borrow_mut().retain_active_slots(
+            document,
+            self.document_handle(),
+            resources,
+        );
+        if changed {
+            self.invalidate_document_font_layout(document);
+        }
     }
 
     pub(crate) fn admit_document_web_font(
         &self,
+        document: DomHandle,
         resource: StylesheetLoadBlockingResource,
-    ) -> Option<StylesheetLoadBlockingResource> {
-        self.document_layout_state.borrow_mut().admit(resource)
+    ) -> Option<StylesheetSubresourceRequest> {
+        let prepared = self.document_layout_state.borrow_mut().admit(
+            document,
+            self.document_handle(),
+            resource,
+        );
+        if prepared.fonts_changed {
+            self.invalidate_document_font_layout(document);
+        }
+        prepared.request
     }
 
     pub(crate) fn complete_document_web_font(
         &self,
+        document: DomHandle,
         terminal: CompletedStylesheetWebFont,
     ) -> DocumentWebFontCompletion {
-        self.document_layout_state.borrow_mut().complete(terminal)
+        let completion = self.document_layout_state.borrow_mut().complete(
+            document,
+            self.document_handle(),
+            terminal,
+        );
+        if matches!(&completion, DocumentWebFontCompletion::Registered(_)) {
+            // Geometry sampled while the request was pending contains fallback
+            // glyph advances. Retire that tree before fonts.ready observers run.
+            self.document_layout_state
+                .borrow_mut()
+                .clear_latest_layout();
+        }
+        completion
+    }
+
+    pub(crate) fn document_web_fonts_have_pending_requests(&self, document: DomHandle) -> bool {
+        self.document_layout_state
+            .borrow()
+            .web_fonts_have_pending_requests(document, self.document_handle())
+    }
+
+    pub(crate) fn stylesheet_web_font_document(
+        &self,
+        binding: crate::frame_owner_model::StylesheetSubresourceLoadDelayBinding,
+    ) -> Option<DomHandle> {
+        if !self.stylesheet_subresource_load_delay_is_current(binding) {
+            return None;
+        }
+        match binding.child_handle() {
+            Some(child) => self.child_browsing_context_document_handle(child),
+            None => Some(self.document_handle()),
+        }
+    }
+
+    pub(super) fn retire_embedded_document_fonts(&self, document: DomHandle) {
+        self.document_layout_state
+            .borrow_mut()
+            .retire_embedded_document_fonts(document);
+    }
+
+    pub(crate) fn observe_document_font_face(
+        &self,
+        document: DomHandle,
+        font: &crate::css_resource_urls::StylesheetWebFont,
+    ) -> crate::font_loading::FontFaceLoad {
+        self.document_layout_state
+            .borrow_mut()
+            .observe_font(document, self.document_handle(), font)
     }
 
     #[cfg(test)]
@@ -595,6 +753,22 @@ impl JsContextHost {
     }
 
     #[cfg(test)]
+    pub(crate) fn register_layout_test_font(&self, family: &str, bytes: Vec<u8>) {
+        let document = self.document_handle();
+        self.document_layout_state
+            .borrow_mut()
+            .with_services_for_document(document, document, |services, _| {
+                services
+                    .register_web_font(moli_layout::WebFontRegistration::new(
+                        "layout-test-font",
+                        moli_layout::WebFontFace::new(family),
+                        bytes,
+                    ))
+                    .expect("valid layout test font");
+            });
+    }
+
+    #[cfg(test)]
     pub(crate) fn layout_snapshot_cache_observability_for_test(
         &self,
     ) -> LayoutSnapshotCacheObservability {
@@ -610,27 +784,15 @@ impl JsContextHost {
     }
 }
 
-fn layout_tree_satisfies_request(
-    tree: &FrozenLayoutTree<DomHandle>,
-    reason: LayoutFlushReason,
-    viewport: LayoutViewport,
-    exact_viewport: bool,
-) -> bool {
-    (!exact_viewport || tree.viewport == viewport)
-        && (!matches!(reason, LayoutFlushReason::HitTest) || tree.embedded_frames_complete())
-}
-
-impl GeometryProvider for JsContextHost {
+impl GeometryProvider for PageScriptHost {
     type NodeId = DomHandle;
 
     fn answer(
         &mut self,
-        reason: LayoutFlushReason,
-        viewport: LayoutViewport,
         queries: &LayoutQueryBatch<Self::NodeId>,
     ) -> Result<LayoutAnswers<Self::NodeId>, LayoutError> {
         let document = self.document_handle();
-        self.answer_layout(document, reason, viewport, queries, false)
+        self.answer_layout_for_document(document, queries)
     }
 }
 

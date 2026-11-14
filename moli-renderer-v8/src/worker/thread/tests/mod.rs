@@ -1,3 +1,17 @@
+mod abort_signal_events;
+mod callback_execution;
+mod error_reporting_guard;
+mod geometry_matrix_constructor_union;
+mod indexed_db_gc;
+
+mod exception_constructor_strings;
+mod native_exception_data;
+
+mod event_target_prototype;
+mod module_csp;
+mod notification_init;
+mod request_init;
+mod text_codecs;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,8 +50,8 @@ use crate::protocol_types::{
     SubresourceNetworkRequestHandle, SubresourceResourceType,
 };
 use crate::runtime::{
-    MaterializedServiceWorkerFetchResponseHead, ServiceWorkerEventId, ServiceWorkerFetchCompletion,
-    ServiceWorkerFetchEvent, ServiceWorkerFetchResult, ServiceWorkerGetNotificationsResult,
+    ServiceWorkerEventId, ServiceWorkerFetchCompletion, ServiceWorkerFetchEvent,
+    ServiceWorkerFetchResult, ServiceWorkerGetNotificationsResult,
     ServiceWorkerLifecycleCompletion, ServiceWorkerLifecycleEvent, ServiceWorkerLifecycleEventKind,
     ServiceWorkerMessageCompletion, ServiceWorkerMessageEvent,
     ServiceWorkerNavigationPreloadFailure, ServiceWorkerNavigationPreloadResponseStarted,
@@ -63,9 +77,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 #[tokio::test(flavor = "current_thread")]
 async fn worker_loader_shares_backend_without_sharing_page_policy() {
     let creator = ResourceRequestClient::new(&FetchConfig::default()).expect("creator loader");
-    creator.set_extra_http_headers(&[("x-owner".to_owned(), "page".to_owned())]);
+    creator.set_extra_http_headers(&vec![("x-owner".to_owned(), "page".to_owned())].into());
     let policy = WorkerNetworkPolicy {
-        extra_http_headers: vec![("x-owner".to_owned(), "worker".to_owned())],
+        extra_http_headers: vec![("x-owner".to_owned(), "worker".to_owned())].into(),
         network_offline: true,
         ..WorkerNetworkPolicy::default()
     };
@@ -90,6 +104,66 @@ async fn worker_loader_shares_backend_without_sharing_page_policy() {
             .snapshot()
             .network_offline()
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn existing_nested_worker_loaders_observe_one_live_interception_set() {
+    use crate::SubresourceInterceptionClasses as Classes;
+    use crate::types::SubresourceResourceType as Resource;
+
+    let creator = ResourceRequestClient::new(&FetchConfig::default()).unwrap();
+    let runner = crate::network::RendererResourceTaskRunner::from_current_tokio().unwrap();
+    let kind = super::WorkerGlobalKind::Dedicated {
+        name: "eligibility".into(),
+    };
+    let worker = resource_loader_for_worker_context(
+        creator.handle(),
+        &WorkerNetworkPolicy::default(),
+        &kind,
+        runner.clone(),
+    );
+    let nested = resource_loader_for_worker_context(
+        worker.request_client().clone(),
+        &WorkerNetworkPolicy::default(),
+        &kind,
+        runner,
+    );
+    let accepted_request = nested.request_client().frozen_request_client();
+    let popup = creator.fork_with_isolated_page_network_policy();
+
+    for classes in [
+        Classes::IMAGE | Classes::FONT,
+        Classes::FETCH_LIKE,
+        Classes::NONE,
+    ] {
+        creator
+            .page_network_policy()
+            .set_subresource_interception(classes);
+        for client in [
+            worker.request_client(),
+            nested.request_client(),
+            &accepted_request,
+        ] {
+            assert_eq!(
+                client
+                    .page_network_policy()
+                    .subresource_interception_config(),
+                classes
+            );
+            assert_eq!(
+                client
+                    .page_network_policy()
+                    .should_intercept_subresource(Resource::Xhr),
+                classes.intercepts(Resource::Xhr)
+            );
+        }
+        assert_eq!(
+            popup
+                .page_network_policy()
+                .subresource_interception_config(),
+            Classes::NONE
+        );
+    }
 }
 
 #[test]
@@ -138,7 +212,8 @@ fn serialize_test_value(expression: &str) -> V8StructuredClonePayload {
     let scope = &mut v8::ContextScope::new(scope, context);
     let source = v8::String::new(scope, expression).expect("v8 string allocation");
     let script = v8::Script::compile(scope, source, None).expect("test script should compile");
-    let value = script.run(scope).expect("test script should evaluate");
+    let value = crate::script_execution::execute_compiled_script(scope, script)
+        .expect("test script should evaluate");
     structured_serialize_value(scope, value)
         .expect("test value should serialize through structured clone")
 }
@@ -161,7 +236,8 @@ fn serialize_test_crypto_value(expression: &str) -> V8StructuredClonePayload {
         .expect("crypto runtime should install in test context");
     let source = v8::String::new(scope, expression).expect("test script should allocate");
     let script = v8::Script::compile(scope, source, None).expect("test script should compile");
-    let mut value = script.run(scope).expect("test script should evaluate");
+    let mut value = crate::script_execution::execute_compiled_script(scope, script)
+        .expect("test script should evaluate");
     if let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) {
         for _ in 0..8 {
             if promise.state() != v8::PromiseState::Pending {
@@ -195,7 +271,8 @@ fn serialize_test_post_message_value(expression: &str) -> V8StructuredClonePaylo
     let scope = &mut v8::ContextScope::new(scope, context);
     let source = v8::String::new(scope, expression).expect("v8 string allocation");
     let script = v8::Script::compile(scope, source, None).expect("test script should compile");
-    let value = script.run(scope).expect("test script should evaluate");
+    let value = crate::script_execution::execute_compiled_script(scope, script)
+        .expect("test script should evaluate");
     structured_serialize_value_for_post_message(scope, value, None, "Worker")
         .expect("test postMessage value should serialize through structured clone")
 }
@@ -226,7 +303,8 @@ fn inspect_payload(payload: &V8StructuredClonePayload, expression: &str) -> Stri
     let _ = global.set(scope, key.into(), value);
     let source = v8::String::new(scope, expression).expect("inspection expression");
     let script = v8::Script::compile(scope, source, None).expect("inspection should compile");
-    let result = script.run(scope).expect("inspection should run");
+    let result = crate::script_execution::execute_compiled_script(scope, script)
+        .expect("inspection should run");
     result.to_rust_string_lossy(scope)
 }
 
@@ -250,7 +328,8 @@ fn inspect_payload_with_image_data(payload: &V8StructuredClonePayload, expressio
     let _ = global.set(scope, key.into(), value);
     let source = v8::String::new(scope, expression).expect("inspection expression");
     let script = v8::Script::compile(scope, source, None).expect("inspection should compile");
-    let result = script.run(scope).expect("inspection should run");
+    let result = crate::script_execution::execute_compiled_script(scope, script)
+        .expect("inspection should run");
     result.to_rust_string_lossy(scope)
 }
 
@@ -842,12 +921,13 @@ fn pending_worker_fetch_continue(
     intercept_response: bool,
 ) -> WorkerPendingFetchContinue {
     WorkerPendingFetchContinue {
+        redirect_headers: None,
         fetch_id,
         internal_id,
         network_request_handle: Some(owner_assigned_request_handle(internal_id)),
         url: info.url.clone(),
         method: info.method.clone(),
-        body: info.request_body.clone(),
+        body: info.request_body_bytes.clone(),
         headers: info.request_headers.clone(),
         intercept_response,
         handle_auth_requests: false,
@@ -862,12 +942,13 @@ fn pending_worker_xhr_continue(
     intercept_response: bool,
 ) -> WorkerPendingXhrContinue {
     WorkerPendingXhrContinue {
+        redirect_headers: None,
         xhr_id,
         internal_id,
         network_request_handle: Some(owner_assigned_request_handle(internal_id)),
         url: info.url.clone(),
         method: info.method.clone(),
-        body: info.request_body.clone(),
+        body: info.request_body_bytes.clone(),
         headers: info.request_headers.clone(),
         intercept_response,
         handle_auth_requests: false,
@@ -1004,6 +1085,7 @@ async fn spawn_connection_drop_http_server(path: &'static str) -> (String, JoinH
 }
 
 async fn spawn_redirect_loop_http_server(path: &'static str) -> (String, JoinHandle<()>) {
+    // Keep each hop CORS-eligible so the test reaches the redirect limit.
     const REDIRECT_LOOP_REQUESTS: usize = 11;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1019,7 +1101,7 @@ async fn spawn_redirect_loop_http_server(path: &'static str) -> (String, JoinHan
                 .await
                 .expect("read worker redirect-loop request");
             let response = format!(
-                "HTTP/1.1 302 Found\r\nLocation: {path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                "HTTP/1.1 302 Found\r\nAccess-Control-Allow-Origin: *\r\nLocation: {path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );
             stream
                 .write_all(response.as_bytes())
@@ -1516,8 +1598,30 @@ fn service_worker_storage_apis_use_explicit_registration_storage_key() {
 
 // ─── Basic tests ────────────────────────────────────────────────────
 
+mod abort_signal_statics;
+mod indexed_db;
 mod lazy_storage;
 mod lifecycle;
+mod message_port_transfer;
 mod modules;
+mod strict_script_mime;
+
 mod network;
 mod postmessage;
+mod stream_clone_failures;
+
+mod canvas_transform_snapshots;
+mod geometry_point_transform;
+
+mod tls;
+
+mod canvas_fill_rect;
+mod xhr_failure;
+
+mod payment_events;
+
+mod performance_handler_order;
+
+mod performance_user_timing;
+
+mod abort_controller_receivers;

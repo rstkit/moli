@@ -1,3 +1,4 @@
+use super::super::constructors::illegal_constructor_callback;
 use super::super::navigation_window::{
     navigation_document_has_opaque_origin, runtime_window_owner,
 };
@@ -11,9 +12,11 @@ use super::methods::{
 };
 use super::slots::{location_href_slot, sync_location_object_fields};
 use super::*;
+use crate::context_bootstrap::exposed_interfaces::build_intrinsic_interface_instance;
 use crate::util::{callback_data_index_value, callback_data_item};
+use crate::web_api_interfaces;
 use anyhow::{Result, anyhow};
-use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
+use moli_webapi_declare::WebApiObject;
 
 #[derive(Clone, Copy)]
 enum LocationAttribute {
@@ -30,7 +33,7 @@ enum LocationAttribute {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Location")]
+#[webapi(interface = web_api_interfaces::Location, receiver)]
 struct LocationOwnSurfaceDeclaration {
     #[webapi(
         accessor_property,
@@ -158,54 +161,21 @@ struct LocationOwnSurfaceDeclaration {
     to_string: (),
 }
 
-#[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Location", constructor = "illegal", constructor_length = 0)]
-struct LocationConstructorTemplateDeclaration {}
-
-#[derive(WebApiObject)]
-#[webapi(interface = "Object")]
-struct LocationConstructorGlobalDeclaration<'scope> {
-    #[webapi(data_property = "Location")]
-    constructor: v8::Local<'scope, v8::Function>,
+pub(in crate::context_bootstrap) fn build_location_constructor_template<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+) -> v8::Local<'s, v8::FunctionTemplate> {
+    let template = v8::FunctionTemplate::builder(illegal_constructor_callback)
+        .length(0)
+        .build(scope);
+    let instance = template.instance_template(scope);
+    configure_location_instance_template(scope, instance);
+    template
 }
 
-#[derive(Default, WebApiObject)]
-#[webapi(interface = "Location")]
-struct LocationPrototypeMetadataDeclaration {
-    #[webapi(to_string_tag, init = string("Location"))]
-    to_string_tag: (),
-}
-
-pub(in crate::context_bootstrap) fn ensure_location_constructor_runtime_state<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    global: v8::Local<'s, v8::Object>,
-) -> Result<()> {
-    if global_constructor_prototype(scope, "Location").is_some() {
-        return Ok(());
-    }
-
-    let template = LocationConstructorTemplateDeclaration::build(scope);
-    let constructor = template
-        .get_function(scope)
-        .ok_or_else(|| anyhow!("failed to build Location constructor"))?;
-    LocationConstructorGlobalDeclaration::new(constructor)
-        .initialize(scope, global)
-        .map_err(|error| anyhow!("failed to initialize Location constructor global: {error}"))?;
-
-    let prototype = constructor
-        .get(scope, v8str(scope, "prototype").into())
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-        .ok_or_else(|| anyhow!("failed to extract Location.prototype"))?;
-    LocationPrototypeMetadataDeclaration::default()
-        .initialize(scope, prototype)
-        .map_err(|error| anyhow!("failed to initialize Location prototype metadata: {error}"))?;
-    Ok(())
-}
-
-pub(in crate::context_bootstrap) fn build_location_runtime_object<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> Result<v8::Local<'s, v8::Object>> {
-    let template = v8::ObjectTemplate::new(scope);
+fn configure_location_instance_template(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    template: v8::Local<'_, v8::ObjectTemplate>,
+) {
     let locked_property_attributes = || {
         v8::PropertyAttribute::READ_ONLY
             | v8::PropertyAttribute::DONT_ENUM
@@ -231,9 +201,13 @@ pub(in crate::context_bootstrap) fn build_location_runtime_object<'s>(
             .getter(location_same_origin_named_property_getter)
             .flags(v8::PropertyHandlerFlags::ONLY_INTERCEPT_STRINGS),
     );
-    template
-        .new_instance(scope)
-        .ok_or_else(|| anyhow!("failed to instantiate Location object template"))
+    template.set_immutable_proto();
+}
+
+pub(in crate::context_bootstrap) fn build_location_runtime_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Result<v8::Local<'s, v8::Object>> {
+    build_intrinsic_interface_instance(scope, "Location")
 }
 
 fn location_same_origin_named_property_getter(
@@ -250,9 +224,6 @@ pub(in crate::context_bootstrap) fn install_location_runtime_state<'s>(
     location: v8::Local<'s, v8::Object>,
     href: &str,
 ) -> Result<()> {
-    if let Some(prototype) = global_constructor_prototype(scope, "Location") {
-        let _ = location.set_prototype(scope, prototype.into());
-    }
     sync_location_object_fields(scope, location, href);
     // Location's legacy-unforgeable own properties are non-configurable.
     // Window resets refresh the backing slots on the existing object without
@@ -332,7 +303,7 @@ fn location_attribute_getter<'s>(
         LocationAttribute::Search => {
             let search = url::Url::parse(&current_href)
                 .ok()
-                .and_then(|url| url.query().map(|query| format!("?{query}")))
+                .map(|url| url::quirks::search(&url).to_owned())
                 .unwrap_or_default();
             set_return_string(scope, rv, &search);
         }
@@ -407,24 +378,13 @@ fn location_writable_attribute_setter_callback<'s>(
             navigate_location_object(scope, holder, LocationNavigationKind::Assign, Some(value));
         }
         LocationAttribute::Hash => {
-            let hash = if value.is_empty() {
-                String::new()
-            } else if value.starts_with('#') {
-                value
-            } else {
-                format!("#{value}")
-            };
-            let current = location_href_slot(scope, holder).unwrap_or_default();
-            let base = current
-                .find('#')
-                .map(|index| current[..index].to_owned())
-                .unwrap_or_else(|| current.clone());
-            let target = format!("{base}{hash}");
-            if target == current {
-                rv.set_undefined();
-                return;
-            }
-            navigate_location_object(scope, holder, LocationNavigationKind::Assign, Some(target));
+            navigate_modified_location_url(scope, holder, |current| {
+                let previous = current.fragment().unwrap_or_default().to_owned();
+                // Location.hash keeps an empty fragment, and compares the
+                // encoded result with an absent fragment treated as empty.
+                current.set_fragment(Some(value.strip_prefix('#').unwrap_or(&value)));
+                current.fragment().unwrap_or_default() != previous
+            });
         }
         LocationAttribute::Search => {
             let query = value.strip_prefix('?').unwrap_or(&value).to_owned();
@@ -444,10 +404,46 @@ fn location_writable_attribute_setter_callback<'s>(
             });
         }
         LocationAttribute::Protocol => {
-            let scheme = value.strip_suffix(':').unwrap_or(&value).to_owned();
-            navigate_modified_location_url(scope, holder, |current| {
-                current.set_scheme(&scheme).is_ok()
-            });
+            let Some(scheme) = location_protocol_scheme(&value) else {
+                crate::context_bootstrap::throw_dom_exception_value(
+                    scope,
+                    "The provided value is not a valid URL scheme.",
+                    "SyntaxError",
+                );
+                return;
+            };
+            let Some(current_href) = location_href_slot(scope, holder) else {
+                return;
+            };
+            let Ok(mut target) = url::Url::parse(&current_href) else {
+                return;
+            };
+            // Without credentials or a port, an HTTP(S)-to-file change would
+            // produce a non-HTTP(S) URL and stop here. Url::set_scheme rejects
+            // file changes more broadly (for any URL with an authority), so
+            // handle this non-navigating result before applying the scheme.
+            if scheme == "file"
+                && target.username().is_empty()
+                && target.password().is_none_or(str::is_empty)
+                && target.port().is_none()
+            {
+                return;
+            }
+            // Syntax was validated above. Rejected scheme replacements keep
+            // the original URL and are non-failing URL parser terminations;
+            // Location must still navigate if that URL remains HTTP(S).
+            let _ = target.set_scheme(&scheme);
+            if !matches!(target.scheme(), "http" | "https") {
+                return;
+            }
+            // Unlike the other component setters, protocol assignment must
+            // navigate even when parsing leaves the serialized URL unchanged.
+            navigate_location_object(
+                scope,
+                holder,
+                LocationNavigationKind::Assign,
+                Some(target.to_string()),
+            );
         }
         LocationAttribute::Host => {
             navigate_modified_location_url(scope, holder, |current| {
@@ -476,6 +472,28 @@ fn location_writable_attribute_setter_callback<'s>(
         LocationAttribute::AncestorOrigins | LocationAttribute::Origin => {}
     }
     rv.set_undefined();
+}
+
+fn location_protocol_scheme(value: &str) -> Option<String> {
+    // Basic URL parsing removes ASCII tab and newline code points before the
+    // scheme-state override runs. The first colon terminates that state, so
+    // values such as `https::::` and `http:gunk` both provide only the scheme
+    // before their first colon.
+    let normalized = value
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+        .collect::<String>();
+    let candidate = normalized.split(':').next().unwrap_or_default();
+    let mut characters = candidate.chars();
+    let first = characters.next()?;
+    if !first.is_ascii_alphabetic()
+        || !characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+    {
+        return None;
+    }
+    Some(candidate.to_ascii_lowercase())
 }
 
 fn location_hash_string(url: &url::Url) -> String {

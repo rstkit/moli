@@ -9,14 +9,10 @@
 //! existing owners.
 
 use crate::{
-    host::report_event_callback_exception,
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
     util::{context_host_ptr_from_global_bridge, v8_string},
     webidl,
-    window_webidl_callback::{
-        WindowWebIdlCallbackFunction, WindowWebIdlCallbackFunctionOutcome,
-        invoke_window_webidl_callback_function,
-    },
+    window_webidl_callback::WindowWebIdlCallbackFunction,
 };
 use moli_webidl_callback::WebIdlCallbackFunction;
 
@@ -49,7 +45,7 @@ pub(crate) struct DataTransferStringCallbackTask {
 impl DataTransferStringCallbackTask {
     pub(crate) fn new(
         scope: &mut v8::PinScope<'_, '_>,
-        host: &JsContextHost,
+        host: &PageScriptHost,
         callback: WebIdlCallbackFunction,
         value: String,
     ) -> Self {
@@ -62,41 +58,25 @@ impl DataTransferStringCallbackTask {
     pub(crate) fn invoke(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> DataTransferStringCallbackTaskEffect {
-        let callback = self.callback.prepare(scope);
-        let relevant_identity = callback.relevant_identity();
+        let Some(callback) = self.callback.prepare_execution(scope, host_ptr, None) else {
+            return DataTransferStringCallbackTaskEffect::CallbackNotInvoked;
+        };
         let Some(value) = v8_string(scope, &self.value) else {
             return DataTransferStringCallbackTaskEffect::CallbackNotInvoked;
         };
         let receiver = v8::undefined(scope);
-        match invoke_window_webidl_callback_function(
+        if callback.invoke_and_report(
             scope,
-            host_ptr,
-            "FunctionStringCallback",
-            "DataTransferItem.getAsString callback threw",
+            "datatransferitem",
             "DataTransferItem.getAsString callback",
-            &callback,
             receiver.into(),
             &[value.into()],
         ) {
-            WindowWebIdlCallbackFunctionOutcome::Returned => {
-                DataTransferStringCallbackTaskEffect::CallbackInvoked
-            }
-            WindowWebIdlCallbackFunctionOutcome::Threw(report) => {
-                report_event_callback_exception(
-                    scope,
-                    host_ptr,
-                    "datatransferitem",
-                    relevant_identity,
-                    None,
-                    &report,
-                );
-                DataTransferStringCallbackTaskEffect::CallbackInvoked
-            }
-            WindowWebIdlCallbackFunctionOutcome::Retired => {
-                DataTransferStringCallbackTaskEffect::CallbackNotInvoked
-            }
+            DataTransferStringCallbackTaskEffect::CallbackInvoked
+        } else {
+            DataTransferStringCallbackTaskEffect::CallbackNotInvoked
         }
     }
 }

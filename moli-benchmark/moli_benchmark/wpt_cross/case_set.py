@@ -1,17 +1,19 @@
 """Enumerate WPT cases that the cross-engine runner can execute.
 
-The default semantic profile selects testharness cases. Layout profiles add a
+The default semantic profile selects testharness cases and HTML crashtests.
+Crashtests use WPT's ``-crash`` filename flag or ``crashtests`` directory and
+do not require testharness.js. Layout profiles add a
 deterministic static subset and read upstream ``MANIFEST.json`` for reftest
 URLs, ``==`` / ``!=`` references, timeout metadata, and fuzzy bounds.
 
 A testharness case is selectable if:
 
 * The file does not live under one of the default excluded directory prefixes.
-* It is a navigable ``.html`` file, a selected ``.any.js`` global, or a
+* It is a navigable ``.html`` / ``.htm`` file, a selected ``.any.js`` global, or a
   ``.window.js`` / ``.worker.js`` script case that can be wrapped as a
   testharness page.
 * Its filename does not contain ``.tentative`` or ``.optional``.
-* Its filename does not end in ``-manual.html``.
+* Its filename does not end in ``-manual.html`` or ``-manual.htm``.
 * It is not under a ``resources`` support directory.
 * HTML cases reference ``/resources/testharness.js``.
 * The file body does NOT reference ``/resources/testdriver`` (testdriver
@@ -22,13 +24,13 @@ A testharness case is selectable if:
 * The file body and directly referenced relative scripts do NOT reference
   unsupported wptserve ``.py`` handlers.
 * The broad default file path does not contain ``.https.``, ``.h2.``,
-  ``.sub.``, or ``.serviceworker.`` substrings unless the case is in the
-  default Service Worker allowlist. Focused ``--dir-prefix`` runs may opt into
+  ``.sub.``, or ``.serviceworker.`` substrings unless the case is in a
+  default suite allowlist. Focused ``--dir-prefix`` runs may opt into
   ``.https.``, ``.sub.``, and ``.serviceworker.`` cases because the fixture
   server has local HTTP substitutions for those WPT features.
 
-The default set is blacklist-based: start from all upstream WPT HTML
-testharness cases the v1 static fixture server can serve, then drop areas
+The default set is blacklist-based: start from upstream WPT HTML testharness
+cases and crashtests the v1 static fixture server can serve, then drop areas
 that require a real layout, paint, compositor, media timeline, or canvas
 rasterizer. This keeps the baseline broad without letting rendering-only gaps
 dominate the signal.
@@ -45,10 +47,13 @@ media/canvas documents during the initial static baseline.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from html import unescape
 from html.parser import HTMLParser
+from itertools import chain
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urljoin, urlsplit
@@ -283,6 +288,12 @@ DEFAULT_SERVICE_WORKER_FILENAME_ALLOW_TOKENS: tuple[str, ...] = (
     ".serviceworker.",
 )
 
+DEFAULT_HTML_FILENAME_ALLOW_TOKENS_BY_DIR_PREFIX: tuple[
+    tuple[str, tuple[str, ...]], ...
+] = (
+    ("IndexedDB", (".https.", ".sub.")),
+)
+
 ANY_JS_GLOBAL_CHOICES: tuple[str, ...] = (
     "none",
     ANY_JS_WINDOW_GLOBAL,
@@ -295,10 +306,15 @@ ANY_JS_GLOBAL_CHOICES: tuple[str, ...] = (
 # of the runner contract. A non-``none`` ``--any-js-global`` remains an
 # explicit override for focused investigations.
 DEFAULT_ANY_JS_GLOBALS_BY_DIR_PREFIX: tuple[tuple[str, str], ...] = (
+    ("IndexedDB", "both"),
     ("compression", "both"),
     ("streams", "both"),
 )
-DEFAULT_SCRIPT_CASE_DIR_PREFIXES: tuple[str, ...] = ("compression", "streams")
+DEFAULT_SCRIPT_CASE_DIR_PREFIXES: tuple[str, ...] = (
+    "IndexedDB",
+    "compression",
+    "streams",
+)
 
 # The initial layout baseline deliberately starts with the CSS areas that are
 # both high-value for Moli and predominantly made up of deterministic, static
@@ -384,6 +400,22 @@ SUPPORTED_WASM_WEBAPI_WPTSERVE_HANDLER_REFERENCES: tuple[str, ...] = (
     "status.py",
 )
 WPTSERVE_HANDLER_TRAILING_BOUNDARY = r"(?=$|[?#'\"`)\]\}}\s,;])"
+SUPPORTED_FETCH_ABORT_WPTSERVE_HANDLER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(
+        rf"(?<![A-Za-z0-9_./-]){re.escape(prefix + name)}"
+        rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+    )
+    for prefix in ("/fetch/api/resources/", "../resources/")
+    for name in ("stash-put.py", "stash-take.py", "infinite-slow-response.py")
+)
+SUPPORTED_FETCH_RANGE_WPTSERVE_HANDLER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(
+        rf"(?<![A-Za-z0-9_./-]){re.escape(prefix + name)}"
+        rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+    )
+    for prefix in ("/fetch/range/resources/", "resources/", "./resources/")
+    for name in ("long-wav.py", "stash-take.py")
+)
 SUPPORTED_WASM_WEBAPI_WPTSERVE_HANDLER_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(
         rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
@@ -679,24 +711,16 @@ def _html_path_is_supported(
     explicit_dir_prefix: bool,
     include_tentative: bool,
 ) -> bool:
-    excluded = HTML_EXCLUDE_SUBSTRINGS
+    allowed: set[str] = set()
     if explicit_dir_prefix:
-        excluded = tuple(
-            token
-            for token in excluded
-            if token
-            not in {
-                ".https.",
-                ".sub.",
-                ".serviceworker.",
-            }
-        )
-    elif _is_default_service_worker_case(rel):
-        excluded = tuple(
-            token
-            for token in excluded
-            if token not in DEFAULT_SERVICE_WORKER_FILENAME_ALLOW_TOKENS
-        )
+        allowed.update({".https.", ".sub.", ".serviceworker."})
+    else:
+        if _is_default_service_worker_case(rel):
+            allowed.update(DEFAULT_SERVICE_WORKER_FILENAME_ALLOW_TOKENS)
+        for prefix, tokens in DEFAULT_HTML_FILENAME_ALLOW_TOKENS_BY_DIR_PREFIX:
+            if _matches_any_dir_prefix(rel, (prefix,)):
+                allowed.update(tokens)
+    excluded = tuple(token for token in HTML_EXCLUDE_SUBSTRINGS if token not in allowed)
     excluded = _filtered_exclude_tokens(
         excluded,
         include_tentative=include_tentative,
@@ -704,19 +728,330 @@ def _html_path_is_supported(
     return not any(token in rel for token in excluded)
 
 
+@lru_cache(maxsize=None)
+def _preload_count_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = "preload/resources/preload-count.py"
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
+
+
+@lru_cache(maxsize=None)
+def _common_echo_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = "common/echo.py"
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
+
+
+@lru_cache(maxsize=None)
+def _remote_context_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    references = []
+    for resource in (
+        "common/dispatcher/dispatcher.py",
+        "html/browsers/browsing-the-web/remote-context-helper/resources/executor-window.py",
+    ):
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    )
+
+
+@lru_cache(maxsize=None)
+def _iframe_stash_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = "html/semantics/embedded-content/the-iframe-element/stash.py"
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
+
+
+@lru_cache(maxsize=None)
+def _script_content_type_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = "html/semantics/scripting-1/the-script-element/serve-with-content-type.py"
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
+
+
+@lru_cache(maxsize=None)
+def _document_charset_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    references = []
+    for name in ("bogus-charset-http.py", "bogus-charset-http-valid-meta.py"):
+        resource = f"html/syntax/charset/resources/{name}"
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    )
+
+
+@lru_cache(maxsize=None)
+def _fetch_content_type_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = "fetch/content-type/resources/content-type.py"
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
+
+
+@lru_cache(maxsize=None)
+def _fetch_resource_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    names = (
+        "preflight.py", "clean-stash.py", "inspect-headers.py", "redirect.py",
+        "redirect-empty-location.py",
+    )
+    references = []
+    for name in names:
+        resource = "fetch/api/resources/" + name
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    patterns = [
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    ]
+    # The Fetch API's shared utils.js defines RESOURCES_DIR. Keep the
+    # concatenation intact in this match; a bare filename is not sufficient.
+    patterns.append(re.compile(
+        r"(?<![\w$.])RESOURCES_DIR\s*\+\s*['\"](?:"
+        + "|".join(re.escape(name) for name in names)
+        + rf"){WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+    ))
+    patterns.append(re.compile(
+        r"`\$\{\s*RESOURCES_DIR\s*\}(?:"
+        + "|".join(re.escape(name) for name in names)
+        + rf"){WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+    ))
+    return tuple(patterns)
+
+
+@lru_cache(maxsize=None)
+def _navigation_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = (
+        "navigation-api/navigation-methods/return-value/resources/"
+        "204-205-download-on-second-visit.py"
+    )
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
+
+
+@lru_cache(maxsize=None)
+def _json_module_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    references = []
+    for name in (
+        "json-module/load-error-events.py", "serve-json-then-js.py",
+    ):
+        resource = "html/semantics/scripting-1/the-script-element/" + name
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    )
+
+
+@lru_cache(maxsize=None)
+def _empty_location_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    names = ("redirect-empty-location.py",)
+    references = []
+    for name in names:
+        resource = "fetch/api/resources/" + name
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    patterns = [
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    ]
+    # The Fetch API's shared utils.js defines RESOURCES_DIR. Keep the
+    # concatenation intact in this match; a bare filename is not sufficient.
+    patterns.append(re.compile(
+        r"(?<![\w$.])RESOURCES_DIR\s*\+\s*['\"](?:"
+        + "|".join(re.escape(name) for name in names)
+        + rf"){WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+    ))
+    patterns.append(re.compile(
+        r"`\$\{\s*RESOURCES_DIR\s*\}(?:"
+        + "|".join(re.escape(name) for name in names)
+        + rf"){WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+    ))
+    return tuple(patterns)
+
+
+@lru_cache(maxsize=None)
+def _xhr_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    references = []
+    for name in (
+        "requri.py", "redirect.py", "headers.py", "inspect-headers.py", "echo-headers.py", "content.py",
+        "echo-content-type.py", "corsenabled.py", "win-1252-xml.py", "win-1252-html.py",
+        "access-control-basic-put-allow.py",
+        "access-control-preflight-request-allow-headers-returns-star.py",
+        "invalid-utf8-html.py", "shift-jis-html.py", "img-utf8-html.py",
+        "empty-div-utf8-html.py", "status.py", "last-modified.py",
+        "bad-chunk-encoding.py", "infinite-redirects.py",
+    ):
+        resource = f"xhr/resources/{name}"
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    )
+
+
+@lru_cache(maxsize=None)
+def _script_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    references = []
+    for name in (
+        "serve-with-content-type.py", "resources/load-error-events.py",
+        "json-module/load-error-events.py", "serve-json-then-js.py",
+    ):
+        resource = "html/semantics/scripting-1/the-script-element/" + name
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    )
+
+
+@lru_cache(maxsize=None)
+def _service_worker_script_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    references = []
+    resources = tuple(
+        "service-workers/service-worker/resources/" + name
+        for name in (
+            "redirect.py", "update-worker.py", "update-worker-from-file.py",
+            "mime-type-worker.py", "import-mime-type-worker.py", "malformed-worker.py",
+            "invalid-chunked-encoding.py", "invalid-chunked-encoding-with-flush.py",
+            "update-during-installation-worker.py",
+            "import-scripts-version.py", "import-scripts-get.py", "import-scripts-echo.py",
+            "subdir/import-scripts-echo.py", "scope2/import-scripts-echo.py",
+        )
+    ) + ("service-workers/service-worker/ServiceWorkerGlobalScope/resources/update-worker.py",)
+    for resource in resources:
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    )
+
+
 def _supported_wptserve_handler_references(
     rel: str | None,
 ) -> tuple[re.Pattern[str], ...]:
     supported: tuple[re.Pattern[str], ...] = ()
+    if rel is not None and rel.startswith("fetch/api/"):
+        supported += _empty_location_handler_reference_patterns(posixpath.dirname(rel))
+    if rel is not None:
+        supported += _common_echo_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _fetch_content_type_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _document_charset_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _iframe_stash_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _remote_context_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _preload_count_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _navigation_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _json_module_handler_reference_patterns(posixpath.dirname(rel) or ".")
+    if rel is not None:
+        supported += _script_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _service_worker_script_handler_reference_patterns(posixpath.dirname(rel) or ".")
+    if rel is not None and rel.rsplit("/", 1)[0] == "fetch/api/abort":
+        supported += SUPPORTED_FETCH_ABORT_WPTSERVE_HANDLER_PATTERNS
+    if rel is not None and rel.rsplit("/", 1)[0] == "fetch/range":
+        supported += SUPPORTED_FETCH_RANGE_WPTSERVE_HANDLER_PATTERNS
+    if rel is not None and rel.startswith("fetch/api/"):
+        supported += _fetch_resource_handler_reference_patterns(posixpath.dirname(rel))
     if rel is not None and rel.startswith("wasm/webapi/"):
         supported += SUPPORTED_WASM_WEBAPI_WPTSERVE_HANDLER_PATTERNS
+    if rel is not None:
+        supported += _script_load_error_handler_reference_patterns(posixpath.dirname(rel) or ".")
+        supported += _eventsource_handler_reference_patterns(posixpath.dirname(rel) or ".")
     if rel is not None and rel.startswith("xhr/"):
         supported += SUPPORTED_XHR_DELAY_WPTSERVE_HANDLER_PATTERNS
+        supported += _xhr_handler_reference_patterns(rel.rsplit("/", 1)[0])
     if rel is not None and rel.startswith(
         "html/semantics/scripting-1/the-script-element/module/"
     ):
         supported += SUPPORTED_MODULE_DELAY_WPTSERVE_HANDLER_PATTERNS
+    if rel is not None:
+        supported += _xhr_response_handler_reference_patterns(posixpath.dirname(rel) or ".")
     return supported
+
+
+@lru_cache(maxsize=None)
+def _xhr_response_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    references = []
+    for name in ("status.py", "last-modified.py", "corsenabled.py",
+                 "inspect-headers.py", "echo-headers.py", "content.py",
+                 "echo-content-type.py", "win-1252-xml.py", "win-1252-html.py",
+                 "invalid-utf8-html.py", "shift-jis-html.py", "img-utf8-html.py",
+                 "empty-div-utf8-html.py"):
+        resource = f"xhr/resources/{name}"
+        relative = posixpath.relpath(resource, directory)
+        references.extend(("/" + resource, relative, "./" + relative))
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in references
+    )
 
 
 def _has_unsupported_server_feature(
@@ -730,6 +1065,31 @@ def _has_unsupported_server_feature(
     for supported in _supported_wptserve_handler_references(rel):
         text = supported.sub("", text)
     return any(token in text for token in UNSUPPORTED_SERVER_FEATURE_SUBSTRINGS)
+
+
+@lru_cache(maxsize=None)
+def _eventsource_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = "eventsource/resources/message.py"
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
+
+
+def _script_load_error_handler_reference_patterns(directory: str) -> tuple[re.Pattern[str], ...]:
+    resource = "html/semantics/scripting-1/the-script-element/resources/load-error-events.py"
+    relative = posixpath.relpath(resource, directory)
+    return tuple(
+        re.compile(
+            rf"(?<![A-Za-z0-9_./-]){re.escape(reference)}"
+            rf"{WPTSERVE_HANDLER_TRAILING_BOUNDARY}"
+        )
+        for reference in ("/" + resource, relative, "./" + relative)
+    )
 
 
 def _local_wpt_resource_path(wpt_root: Path, case_path: Path, src: str) -> Path | None:
@@ -814,6 +1174,17 @@ def _any_js_allows_worker(meta: AnyJsMeta) -> bool:
     return not meta.globals or bool(meta.globals & {"worker", "dedicatedworker"})
 
 
+def _is_crashtest_path(rel: str) -> bool:
+    """Match WPT SourceFile.name_is_crashtest, including markup-only scope."""
+    path = Path(rel)
+    if path.suffix not in {".html", ".htm", ".xhtml", ".xht", ".xml", ".svg"}:
+        return False
+    type_flag = (
+        path.stem.rsplit("-", 1)[1].split(".", 1)[0] if "-" in path.stem else None
+    )
+    return type_flag == "crash" or "crashtests" in path.parts[:-1]
+
+
 def enumerate_cases(
     wpt_root: Path,
     *,
@@ -843,7 +1214,7 @@ def enumerate_cases(
         base = wpt_root / prefix
         if not base.exists():
             continue
-        for path in base.rglob("*.html"):
+        for path in chain(base.rglob("*.html"), base.rglob("*.htm")):
             if not path.is_file():
                 continue
             rel = path.relative_to(wpt_root).as_posix()
@@ -871,7 +1242,8 @@ def enumerate_cases(
                 include_tentative=include_tentative,
             ):
                 continue
-            if "/resources/testharness.js" not in head:
+            crashtest = _is_crashtest_path(rel)
+            if not crashtest and "/resources/testharness.js" not in head:
                 continue
             if "/resources/testdriver" in head:
                 continue
@@ -882,8 +1254,12 @@ def enumerate_cases(
                 continue
             timeout_multiplier = LONG_TIMEOUT_MULTIPLIER if parser.long_timeout else 1.0
             found.extend(
-                WptCase(case_path=case_path, timeout_multiplier=timeout_multiplier)
-                for case_path in _case_paths_for_variants(rel, parser)
+                WptCase(
+                    case_path=case_path,
+                    timeout_multiplier=timeout_multiplier,
+                    test_type="crashtest" if crashtest else "testharness",
+                )
+                for case_path in ([rel] if crashtest else _case_paths_for_variants(rel, parser))
             )
         for path in base.rglob("*.any.js"):
             if not path.is_file():
@@ -1123,7 +1499,7 @@ def _is_default_goal_container_query_case(rel: str) -> bool:
 
 def _is_manual_or_support_case(rel: str) -> bool:
     parts = rel.split("/")
-    return parts[-1].endswith("-manual.html") or any(
+    return parts[-1].endswith(("-manual.html", "-manual.htm")) or any(
         part in {"resources", "support"} for part in parts[:-1]
     )
 
@@ -1429,4 +1805,8 @@ def explicit_case(wpt_root: Path, case_path: str) -> WptCase:
     else:
         parser = _parse_case_html(source)
         timeout_multiplier = LONG_TIMEOUT_MULTIPLIER if parser.long_timeout else 1.0
-    return WptCase(case_path=normalized_case_path, timeout_multiplier=timeout_multiplier)
+    return WptCase(
+        case_path=normalized_case_path,
+        timeout_multiplier=timeout_multiplier,
+        test_type="crashtest" if _is_crashtest_path(source_case_path) else "testharness",
+    )

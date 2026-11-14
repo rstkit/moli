@@ -1,11 +1,12 @@
+use super::state_tree::owner_document_native_handle;
 use super::*;
 use crate::{
     native_bridge::document::detached_install::{
         install_detached_anchor_instance_properties,
         install_detached_form_associated_instance_properties,
         install_detached_form_control_instance_properties,
-        install_detached_form_instance_properties, install_detached_iframe_instance_properties,
-        install_detached_option_instance_properties, install_detached_select_instance_properties,
+        install_detached_iframe_instance_properties, install_detached_option_instance_properties,
+        install_detached_select_instance_properties,
         install_detached_text_replacement_instance_properties,
     },
     native_bridge::node::{remove_child_in_reaction_scope, remove_child_to_current_reaction_queue},
@@ -110,20 +111,6 @@ fn string_or_null<'s>(
     Some(match value {
         Some(value) => v8_string(scope, &value)?.into(),
         None => v8::null(scope).into(),
-    })
-}
-
-fn owner_document_native_handle<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
-    owner_document: v8::Local<'s, v8::Object>,
-) -> Option<DomHandle> {
-    detached_native_handle_for_runtime(scope, runtime_ptr, owner_document).or_else(|| {
-        node_runtime_and_handle_from_object(scope, owner_document)
-            .ok()
-            .and_then(|(node_runtime_ptr, handle)| {
-                (node_runtime_ptr == runtime_ptr).then_some(handle)
-            })
     })
 }
 
@@ -247,7 +234,7 @@ struct LiveNativeNodeSnapshot {
 }
 
 fn live_native_node_snapshot(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<LiveNativeNodeSnapshot> {
     let dom_host = unsafe { &*runtime_ptr }.dom_host();
@@ -486,7 +473,14 @@ fn adopt_live_node_as_detached_with_parent<'s>(
             // custom-element constructors that later receive the proxy through
             // the construction stack can still read/write id, style, and the
             // other own detached element surface.
-            install_detached_element_instance_properties(scope, node);
+            let uses_native_form_bindings =
+                local_name == "form" && raw_namespace_uri.as_deref() == Some(XHTML_NS);
+            // Native form templates already keep interface members on prototypes.
+            // Rebinding must preserve the user's own properties on the existing object.
+            if !uses_native_form_bindings {
+                install_detached_element_instance_properties(scope, node);
+                remove_detached_element_instance_selector_matching_methods(scope, node);
+            }
             if document_kind == "html"
                 && raw_namespace_uri
                     .as_deref()
@@ -496,24 +490,24 @@ fn adopt_live_node_as_detached_with_parent<'s>(
                 && allow_identity_replacement
                 && let Some(proxy) = generic_html_element_proxy(scope, node)
             {
-                mirror_detached_private_slots(scope, node, proxy);
                 node = proxy;
             }
             let preserve_custom_element_identity =
                 native_handle.is_some_and(|(runtime_ptr, handle)| {
                     crate::custom_elements::preserves_custom_element_identity(runtime_ptr, handle)
                 });
-            let preserve_xhtml_element_interface =
-                native_snapshot.is_some() && raw_namespace_uri.as_deref() == Some(XHTML_NS);
+            // Native wrappers already carry the interface selected from their
+            // namespace and local name. An XML owner Document does not turn
+            // SVG, MathML or XHTML elements into generic Elements.
+            let preserve_native_element_interface = native_snapshot.is_some();
             if document_kind != "html"
-                && !preserve_xhtml_element_interface
+                && !preserve_native_element_interface
                 && !preserve_custom_element_identity
             {
                 crate::detached_dom_surface::set_object_prototype(scope, node, "Element");
                 set_string_tag(scope, node, "Element");
             }
             copy_detached_element_bridge_members(scope, node);
-            remove_detached_element_instance_selector_matching_methods(scope, node);
             if document_kind == "html" && matches!(local_name.as_str(), "a" | "area") {
                 install_detached_anchor_instance_properties(scope, node);
             }
@@ -525,9 +519,6 @@ fn adopt_live_node_as_detached_with_parent<'s>(
             }
             if document_kind == "html" && local_name == "iframe" {
                 install_detached_iframe_instance_properties(scope, node);
-            }
-            if document_kind == "html" && local_name == "form" {
-                install_detached_form_instance_properties(scope, node);
             }
             if document_kind == "html"
                 && matches!(
@@ -543,10 +534,6 @@ fn adopt_live_node_as_detached_with_parent<'s>(
                 if allow_identity_replacement
                     && let Some(proxy) = select_html_element_proxy(scope, node)
                 {
-                    mirror_detached_private_slots(scope, node, proxy);
-                    if let Some((_, handle)) = native_handle {
-                        define_detached_native_handle(scope, proxy, handle);
-                    }
                     node = proxy;
                 }
             }
@@ -625,7 +612,7 @@ fn adopt_live_node_as_detached_with_parent<'s>(
 
 fn live_native_child_node_objects<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<Vec<v8::Local<'s, v8::Object>>> {
     let child_handles = unsafe { &*runtime_ptr }
@@ -795,6 +782,21 @@ fn detached_insert_node_with_current_queue_policy<'s>(
             "The operation would yield an invalid node tree.",
         ));
     }
+    let parent_is_document = detached_node_type(scope, parent) == Some(9);
+    // Pre-insert validates a Document before removing the input node. An
+    // existing root/doctype cannot be reinserted, even at its old position.
+    if parent_is_document
+        && matches!(child_type, 1 | 10)
+        && current_children
+            .iter()
+            .any(|candidate| candidate.strict_equals(child.into()))
+    {
+        return Err((
+            "HierarchyRequestError",
+            3,
+            "The operation would yield an invalid node tree.",
+        ));
+    }
     let prospective = current_children
         .iter()
         .copied()
@@ -817,14 +819,15 @@ fn detached_insert_node_with_current_queue_policy<'s>(
         insert_nodes.iter().copied(),
     );
 
-    if detached_node_type(scope, parent) == Some(9)
-        && !detached_validate_document_children(scope, &prospective)
-    {
+    if parent_is_document && !detached_validate_document_children(scope, &prospective) {
         return Err((
             "HierarchyRequestError",
             3,
             "The operation would yield an invalid node tree.",
         ));
+    }
+    if insert_nodes.is_empty() {
+        return Ok(child);
     }
 
     for node in &insert_nodes {
@@ -840,26 +843,29 @@ fn detached_insert_node_with_current_queue_policy<'s>(
             copy_detached_element_bridge_members(scope, *node);
             remove_detached_element_instance_selector_matching_methods(scope, *node);
         }
-        if parent_has_native_handle {
-            let inserted = if append_to_current_reaction_queue {
-                sync_detached_native_insert_appending_to_current_reaction_queue(
-                    scope,
-                    parent,
-                    *node,
-                    reference_child,
-                )
-            } else {
-                sync_detached_native_insert(scope, parent, *node, reference_child)
-            };
-            if !inserted {
-                return Err((
-                    "HierarchyRequestError",
-                    3,
-                    "The operation would yield an invalid node tree.",
-                ));
-            }
-        } else {
+        if !parent_has_native_handle {
             detached_set_parent(scope, *node, parent);
+        }
+    }
+    if parent_has_native_handle {
+        // Pass the fragment itself so the native mutation pipeline removes
+        // and inserts its children as a batch, with one record at each end.
+        let inserted = if append_to_current_reaction_queue {
+            sync_detached_native_insert_appending_to_current_reaction_queue(
+                scope,
+                parent,
+                child,
+                reference_child,
+            )
+        } else {
+            sync_detached_native_insert(scope, parent, child, reference_child)
+        };
+        if !inserted {
+            return Err((
+                "HierarchyRequestError",
+                3,
+                "The operation would yield an invalid node tree.",
+            ));
         }
     }
     for (offset, node) in insert_nodes.iter().enumerate() {
@@ -886,11 +892,6 @@ fn detached_insert_node_with_current_queue_policy<'s>(
         detached_replace_children_array(scope, parent, prospective_array);
     }
     detached_record_tree_mutation(scope, parent);
-    if !parent_has_native_handle {
-        for node in insert_nodes {
-            dispatch_detached_iframe_load_after_insert(scope, node);
-        }
-    }
     Ok(child)
 }
 
@@ -924,18 +925,4 @@ fn detached_pre_insert_contains<'s>(
         current = detached_parent_node_object(scope, candidate);
     }
     false
-}
-
-fn dispatch_detached_iframe_load_after_insert<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    node: v8::Local<'s, v8::Object>,
-) {
-    if detached_node_type(scope, node) == Some(1)
-        && detached_element_local_name(scope, node)
-            .is_some_and(|name| name.eq_ignore_ascii_case("iframe"))
-    {
-        let _ = crate::detached_event_target::dispatch_detached_simple_event(
-            scope, node, "load", false, false, false,
-        );
-    }
 }

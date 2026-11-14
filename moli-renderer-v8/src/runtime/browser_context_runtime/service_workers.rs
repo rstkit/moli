@@ -195,12 +195,8 @@ impl RendererBrowserContextRuntime {
         }
 
         let (direct_completion_tx, main_resource_completion_rx) = tokio::sync::oneshot::channel();
-        let request_body_text = request
-            .body
-            .as_ref()
-            .map(|body| String::from_utf8_lossy(body).into_owned());
         let redirect_mode =
-            main_resource_fetch_event_redirect_mode(destination, request.redirect_mode);
+            main_resource_fetch_event_redirect_mode(destination, request.redirect_mode());
         let dispatch = ServiceWorkerFetchDispatch {
             internal_id: 0,
             request: ServiceWorkerFetchRequest {
@@ -208,7 +204,7 @@ impl RendererBrowserContextRuntime {
                 resulting_client_id: Some(client_id),
                 url: request.url.clone(),
                 method: request.method.clone(),
-                headers: request.request_headers.clone(),
+                headers: request.request_headers.to_byte_strings(),
                 body: request.body.clone(),
                 destination,
                 request_mode: request.request_mode,
@@ -219,11 +215,11 @@ impl RendererBrowserContextRuntime {
                     == BrowserNavigationRequestKind::Reload,
                 metadata: service_worker_fetch_request_metadata(request),
             },
-            request_body_text,
             cors_preflight_request_headers: Vec::new(),
             request_cookie_report: None,
             network_context: AsyncSubresourceNetworkContext {
                 frame_id: None,
+                request_origin: request.browser_origin()?.clone(),
                 document_url: request.url.clone(),
                 resource_type: SubresourceResourceType::Fetch,
                 policy_context: Default::default(),
@@ -235,7 +231,10 @@ impl RendererBrowserContextRuntime {
             direct_completion_tx: Some(direct_completion_tx),
         };
 
-        if !self.dispatch_service_worker_fetch(dispatch) {
+        // Retain the upload's protocol text view and native request context,
+        // while keeping navigation FetchEvents in manual redirect mode.
+        let request = request.clone().with_redirect_mode(redirect_mode);
+        if !self.dispatch_service_worker_fetch_request(dispatch, request) {
             return Ok(None);
         }
 
@@ -247,29 +246,6 @@ impl RendererBrowserContextRuntime {
                 "service worker main resource fetch completion channel closed"
             )),
         }
-    }
-
-    pub(crate) async fn fetch_service_worker_subresource_for_client(
-        &self,
-        client_id: ServiceWorkerClientId,
-        document_url: Url,
-        request: &Request,
-        request_client: &ResourceRequestClient,
-        resource_task_runner: RendererResourceTaskRunner,
-        destination: ServiceWorkerRequestDestination,
-        resource_type: SubresourceResourceType,
-    ) -> Result<Option<crate::protocol_types::NavigationResponse>> {
-        self.fetch_service_worker_subresource_for_client_with_metadata(
-            client_id,
-            document_url,
-            request,
-            request_client,
-            resource_task_runner,
-            destination,
-            resource_type,
-        )
-        .await
-        .map(|response| response.map(|response| *response.response))
     }
 
     pub(crate) async fn fetch_service_worker_subresource_for_client_with_metadata(
@@ -295,10 +271,6 @@ impl RendererBrowserContextRuntime {
         let completion_tx =
             crate::page_task_queue::RendererResourceCompletionSender::direct_completion_only();
         let (direct_completion_tx, direct_completion_rx) = tokio::sync::oneshot::channel();
-        let request_body_text = request
-            .body
-            .as_ref()
-            .map(|body| String::from_utf8_lossy(body).into_owned());
         let dispatch = ServiceWorkerFetchDispatch {
             internal_id: 0,
             request: ServiceWorkerFetchRequest {
@@ -306,21 +278,21 @@ impl RendererBrowserContextRuntime {
                 resulting_client_id: None,
                 url: request.url.clone(),
                 method: request.method.clone(),
-                headers: request.request_headers.clone(),
+                headers: request.request_headers.to_byte_strings(),
                 body: request.body.clone(),
                 destination,
                 request_mode: request.request_mode,
                 credentials_mode: request.credentials_mode,
-                redirect_mode: request.redirect_mode,
+                redirect_mode: request.redirect_mode(),
                 priority: request.priority_hints.fetch_priority,
                 is_reload: false,
                 metadata: service_worker_fetch_request_metadata(request),
             },
-            request_body_text,
             cors_preflight_request_headers: Vec::new(),
             request_cookie_report: None,
             network_context: AsyncSubresourceNetworkContext {
                 frame_id: None,
+                request_origin: request.browser_origin()?.clone(),
                 document_url,
                 resource_type,
                 policy_context: Default::default(),
@@ -650,6 +622,15 @@ impl RendererBrowserContextRuntime {
     ) -> bool {
         self.service_worker_runtime_if_initialized()
             .is_some_and(|runtime| runtime.dispatch_controlled_fetch(dispatch))
+    }
+
+    pub(crate) fn dispatch_service_worker_fetch_request(
+        &self,
+        dispatch: ServiceWorkerFetchDispatch,
+        request: moli_fetch::Request,
+    ) -> bool {
+        self.service_worker_runtime_if_initialized()
+            .is_some_and(|runtime| runtime.dispatch_controlled_fetch_request(dispatch, request))
     }
 
     pub(crate) fn abort_service_worker_fetch(&self, internal_id: u64) -> bool {

@@ -11,6 +11,7 @@ pub(in crate::context_bootstrap) const WINDOW_ONUNHANDLEDREJECTION_SLOT: &str =
 pub(in crate::context_bootstrap) const WINDOW_ONREJECTIONHANDLED_SLOT: &str =
     "__moliWindowOnRejectionHandled";
 pub(in crate::context_bootstrap) const WINDOW_NAVIGATOR_SLOT: &str = "__moliWindowNavigator";
+pub(in crate::context_bootstrap) const WINDOW_EXTERNAL_SLOT: &str = "__moliWindowExternal";
 pub(in crate::context_bootstrap) const NAVIGATOR_RUNTIME_DATA_SLOT: &str =
     "__moliNavigatorRuntimeData";
 pub(in crate::context_bootstrap) const WINDOW_HISTORY_SLOT: &str = "__moliWindowHistory";
@@ -35,16 +36,8 @@ pub(in crate::context_bootstrap) const WINDOW_SELF_SLOT: &str = "__moliWindowSel
 pub(in crate::context_bootstrap) const WINDOW_PARENT_SLOT: &str = "__moliWindowParent";
 pub(in crate::context_bootstrap) const WINDOW_TOP_SLOT: &str = "__moliWindowTop";
 pub(in crate::context_bootstrap) const WINDOW_FRAMES_SLOT: &str = "__moliWindowFrames";
-pub(crate) const SIMPLE_EVENT_TARGET_SLOT: &str = "__moliEventTargetSlot";
-pub(crate) const SIMPLE_EVENT_TARGET_ORDERED_HANDLERS_SLOT: &str =
-    "__moliSimpleEventTargetOrderedHandlers";
-pub(in crate::context_bootstrap) const OFFLINE_AUDIO_LISTENERS_SLOT: &str =
-    "__moliOfflineAudioListeners";
-pub(in crate::context_bootstrap) const OFFLINE_AUDIO_BUFFER_SLOT: &str = "__moliOfflineAudioBuffer";
-pub(in crate::context_bootstrap) const SCREEN_EVENT_LISTENERS_SLOT: &str =
-    "__moliScreenEventListeners";
-pub(in crate::context_bootstrap) const SCREEN_ORIENTATION_EVENT_LISTENERS_SLOT: &str =
-    "__moliScreenOrientationEventListeners";
+// Each SimpleEventTarget stores its own listener registry directly under this key.
+pub(crate) const SIMPLE_EVENT_TARGET_LISTENERS_SLOT: &str = "__moliEventTargetListeners";
 pub(in crate::context_bootstrap) const DOM_IMPLEMENTATION_SINGLETON_SLOT: &str =
     "__moliDOMImplementationSingleton";
 pub(in crate::context_bootstrap) const URL_HREF_SLOT: &str = "__moliUrlHref";
@@ -72,32 +65,17 @@ pub(in crate::context_bootstrap) const MESSAGE_CHANNEL_PORT2_SLOT: &str =
 pub(in crate::context_bootstrap) const MESSAGE_PORT_PEER_SLOT: &str = "__moliMessagePortPeer";
 pub(in crate::context_bootstrap) const MESSAGE_PORT_ONMESSAGE_HANDLER_SLOT: &str =
     "__lmMessagePortOnmessageHandler";
-pub(in crate::context_bootstrap) const MESSAGE_PORT_ONMESSAGE_ORDER_SLOT: &str =
-    "__lmMessagePortOnmessageOrder";
 pub(in crate::context_bootstrap) const MESSAGE_PORT_ONMESSAGEERROR_HANDLER_SLOT: &str =
     "__lmMessagePortOnmessageerrorHandler";
-pub(in crate::context_bootstrap) const MESSAGE_PORT_ONMESSAGEERROR_ORDER_SLOT: &str =
-    "__lmMessagePortOnmessageerrorOrder";
 pub(in crate::context_bootstrap) const MESSAGE_PORT_ONCLOSE_HANDLER_SLOT: &str =
     "__lmMessagePortOncloseHandler";
-pub(in crate::context_bootstrap) const MESSAGE_PORT_ONCLOSE_ORDER_SLOT: &str =
-    "__lmMessagePortOncloseOrder";
-pub(in crate::context_bootstrap) const MESSAGE_PORT_NEXT_LISTENER_ORDER_SLOT: &str =
-    "__lmMessagePortNextListenerOrder";
 pub(in crate::context_bootstrap) const MESSAGE_PORT_STARTED_SLOT: &str = "__moliMessagePortStarted";
 pub(in crate::context_bootstrap) const MESSAGE_PORT_CLOSED_SLOT: &str = "__moliMessagePortClosed";
-pub(in crate::context_bootstrap) const FILE_READER_LISTENERS_SLOT: &str =
-    "__moliFileReaderListeners";
-pub(in crate::context_bootstrap) const FILE_READER_QUEUE_SLOT: &str = "__moliFileReaderQueue";
-pub(in crate::context_bootstrap) const FILE_READER_SCHEDULED_SLOT: &str =
-    "__moliFileReaderScheduled";
 pub(in crate::context_bootstrap) const FILE_READER_PENDING_RESULT_SLOT: &str =
     "__moliFileReaderPendingResult";
 pub(in crate::context_bootstrap) const FILE_READER_PENDING_TOTAL_SLOT: &str =
     "__moliFileReaderPendingTotal";
 pub(in crate::context_bootstrap) const FILE_READER_READ_ID_SLOT: &str = "__moliFileReaderReadId";
-pub(in crate::context_bootstrap) const FILE_READER_TASK_PHASE_SLOT: &str =
-    "__moliFileReaderTaskPhase";
 pub(in crate::context_bootstrap) const RESIZE_OBSERVER_CALLBACK_ID_SLOT: &str =
     "__moliResizeObserverCallbackId";
 pub(in crate::context_bootstrap) const RESIZE_OBSERVER_CALLBACK_VALUE_SLOT: &str =
@@ -110,10 +88,6 @@ pub(in crate::context_bootstrap) const RESIZE_OBSERVER_TARGETS_SLOT: &str =
     "__moliResizeObserverTargets";
 pub(in crate::context_bootstrap) const RESIZE_OBSERVER_PENDING_TARGETS_SLOT: &str =
     "__moliResizeObserverPendingTargets";
-pub(in crate::context_bootstrap) const RESIZE_OBSERVER_QUEUE_SLOT: &str =
-    "__moliResizeObserverQueue";
-pub(in crate::context_bootstrap) const RESIZE_OBSERVER_REGISTRY_SLOT: &str =
-    "__moliResizeObservers";
 pub(in crate::context_bootstrap) const RESIZE_OBSERVER_SCHEDULED_SLOT: &str =
     "__moliResizeObserverScheduled";
 pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_CALLBACK_ID_SLOT: &str =
@@ -128,14 +102,20 @@ pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_PENDING_SLOT: &str =
     "__moliPerformanceObserverPending";
 pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_TYPE_SLOT: &str =
     "__moliPerformanceObserverType";
+pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_MODE_SLOT: &str =
+    "__moliPerformanceObserverMode";
 pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_ENTRY_TYPES_SLOT: &str =
     "__moliPerformanceObserverEntryTypes";
 pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_ACTIVE_SLOT: &str =
     "__moliPerformanceObserverActive";
 pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_SCHEDULED_SLOT: &str =
     "__moliPerformanceObserverScheduled";
+pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_REQUIRES_DROPPED_ENTRIES_SLOT: &str =
+    "__moliPerformanceObserverRequiresDroppedEntries";
 pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_QUEUE_SLOT: &str =
     "__moliPerformanceObserverQueue";
+pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_SUPPORTED_ENTRY_TYPES_SLOT: &str =
+    "__moliPerformanceObserverSupportedEntryTypes";
 pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_LIST_ENTRIES_SLOT: &str =
     "__moliPerformanceEntryListEntries";
 pub(in crate::context_bootstrap) const PERFORMANCE_ENTRIES_SLOT: &str = "__moliPerformanceEntries";
@@ -145,8 +125,6 @@ pub(in crate::context_bootstrap) const MEDIA_QUERY_LIST_MATCHES_SLOT: &str =
     "__moliMediaQueryListMatches";
 pub(in crate::context_bootstrap) const MEDIA_QUERY_LIST_ONCHANGE_SLOT: &str =
     "__moliMediaQueryListOnchange";
-pub(in crate::context_bootstrap) const MEDIA_QUERY_LIST_LISTENERS_SLOT: &str =
-    "__moliMediaQueryListListeners";
 pub(in crate::context_bootstrap) const MEDIA_QUERY_LIST_REGISTRY_SLOT: &str =
     "__moliMediaQueryLists";
 pub(in crate::context_bootstrap) const CRYPTO_KEY_KIND_SLOT: &str = "__moliCryptoKeyKind";

@@ -12,8 +12,13 @@ use html5ever::{
 };
 use url::Url;
 
+use moli_script::script_element_nonce_is_nonceable;
 use parking_lot::Mutex;
 
+use crate::modulepreload::{
+    ModulepreloadAsState, modulepreload_as_state_from_attribute,
+    modulepreload_media_attribute_matches, resolve_parser_network_resource_url,
+};
 use crate::network::ResourceRequestClient;
 use crate::page_task_queue::RendererOwnerWakeSender;
 use crate::parser::{PreparedScript, ScriptSource};
@@ -27,7 +32,7 @@ use crate::runtime::page_vm::{
 };
 use crate::service_worker_runtime::ServiceWorkerClientId;
 use crate::stylesheet_blocking::{
-    DocumentBlockingStylesheetSignature, DocumentOwnedBlockingStylesheetDiscoveryInput,
+    DocumentBlockingStylesheetSignature, DocumentOwnedStylesheetDiscoveryInput,
     StylesheetFetchOptions, StylesheetResourceKey, link_rel_includes_token,
 };
 use crate::types::SharedNavigationResponseResult;
@@ -230,6 +235,7 @@ impl BufferedDocumentPreloadState {
     fn start_preloads_for_requests(
         &mut self,
         requests: Vec<BufferedScriptPreloadRequest>,
+        request_origin: &moli_url::WebOrigin,
         loader: &ResourceRequestClient,
         service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
     ) {
@@ -251,6 +257,7 @@ impl BufferedDocumentPreloadState {
             let load = if let Some(context) = service_worker_context {
                 crate::planning::spawn_service_worker_aware_external_script_source_load(
                     script,
+                    request_origin.clone(),
                     loader.clone(),
                     resource_task_runner.clone(),
                     Some(document_character_set),
@@ -263,6 +270,7 @@ impl BufferedDocumentPreloadState {
             } else {
                 SharedScriptSourceLoad::spawn_with_request_resource_type_and_owner_wake(
                     script,
+                    request_origin.clone(),
                     loader.clone(),
                     resource_task_runner.clone(),
                     Some(document_character_set),
@@ -317,6 +325,7 @@ impl BufferedDocumentPreloadState {
     fn schedule_preloads_for_requests(
         &mut self,
         requests: Vec<BufferedScriptPreloadRequest>,
+        navigation_url: &Url,
         loader: &ResourceRequestClient,
         service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
     ) {
@@ -333,7 +342,15 @@ impl BufferedDocumentPreloadState {
         // would issue a second fetch. PageVm bootstrap drains these descriptors
         // into the native module map as soon as the Document owner exists.
         self.queue_script_preloads_for_owner_admission(owner_admitted);
-        self.start_preloads_for_requests(legacy_preloads, loader, service_worker_context);
+        // Requests requiring Document policy (including response CSP) are
+        // deferred above. Only the navigation's ordinary tuple origin is
+        // needed for the remaining requests before realm creation.
+        self.start_preloads_for_requests(
+            legacy_preloads,
+            &moli_url::WebOrigin::from_url(navigation_url),
+            loader,
+            service_worker_context,
+        );
     }
 
     pub(super) fn set_document_character_set(&mut self, document_character_set: &str) {
@@ -375,7 +392,12 @@ impl BufferedDocumentPreloadState {
         let batch = scanner.scan_chunk(html);
         self.meta_csp_preload_gate
             .note_scanner_seen(batch.discovered_meta_csp_count);
-        self.schedule_preloads_for_requests(batch.script_requests, loader, service_worker_context);
+        self.schedule_preloads_for_requests(
+            batch.script_requests,
+            final_url,
+            loader,
+            service_worker_context,
+        );
         self.queue_stylesheet_preloads_for_owner_admission(batch.stylesheet_requests);
         self.queue_image_preloads_for_owner_admission(batch.image_requests);
     }
@@ -408,7 +430,7 @@ impl BufferedDocumentPreloadState {
             .filter(prebootstrap_preload_request_is_dcl_relevant)
             .collect::<Vec<_>>();
         let request_count = requests.len();
-        self.schedule_preloads_for_requests(requests, loader, service_worker_context);
+        self.schedule_preloads_for_requests(requests, final_url, loader, service_worker_context);
         self.queue_stylesheet_preloads_for_owner_admission(batch.stylesheet_requests);
         self.queue_image_preloads_for_owner_admission(batch.image_requests);
         if let Some(started) = timing_started
@@ -457,7 +479,12 @@ impl BufferedDocumentPreloadState {
         let batch = scanner.scan_chunk(html);
         self.meta_csp_preload_gate
             .note_scanner_seen(batch.discovered_meta_csp_count);
-        self.schedule_preloads_for_requests(batch.script_requests, loader, service_worker_context);
+        self.schedule_preloads_for_requests(
+            batch.script_requests,
+            final_url,
+            loader,
+            service_worker_context,
+        );
     }
 
     pub(super) fn reset_insertion_scan(&mut self) {
@@ -498,13 +525,23 @@ impl BufferedDocumentPreloadState {
 
     pub(super) fn claim_pending_stylesheet_preloads_for_parser(
         &mut self,
-        inputs: &[DocumentOwnedBlockingStylesheetDiscoveryInput],
+        inputs: &[DocumentOwnedStylesheetDiscoveryInput],
     ) {
         let claimed_resources = inputs
             .iter()
             .filter_map(|input| match input.signature() {
                 DocumentBlockingStylesheetSignature::Link { url, options } => {
-                    Some(options.resource_key(url.clone()))
+                    // The scanner runs ahead of the parser and cannot know the
+                    // Document's final quirks mode. MIME compatibility changes
+                    // response processing, not the request metadata, so claim
+                    // the buffered descriptor using the scanner's neutral
+                    // processing mode before it starts a duplicate fetch.
+                    Some(
+                        options
+                            .clone()
+                            .with_quirks_mode_mime_compatibility(false)
+                            .resource_key(url.clone()),
+                    )
                 }
                 DocumentBlockingStylesheetSignature::ParserCreatedStyleImport { .. } => None,
             })
@@ -742,14 +779,14 @@ fn buffered_script_kind_from_type(script_type: Option<&str>) -> crate::types::Sc
 fn html_attr_value(attrs: &[Attribute], name: &str) -> Option<String> {
     attrs
         .iter()
-        .find(|attr| attr.name.local.as_ref().eq_ignore_ascii_case(name))
+        .find(|attr| AsRef::<str>::as_ref(&attr.name.local).eq_ignore_ascii_case(name))
         .map(|attr| attr.value.to_string())
 }
 
 fn html_attr_present(attrs: &[Attribute], name: &str) -> bool {
     attrs
         .iter()
-        .any(|attr| attr.name.local.as_ref().eq_ignore_ascii_case(name))
+        .any(|attr| AsRef::<str>::as_ref(&attr.name.local).eq_ignore_ascii_case(name))
 }
 
 #[derive(Default)]
@@ -980,7 +1017,16 @@ fn admit_script_preloads(
     let (native_modules, legacy_preloads): (Vec<_>, Vec<_>) = admitted
         .into_iter()
         .partition(|request| request.kind_hint == crate::types::ScriptKind::Module);
-    state.start_preloads_for_requests(legacy_preloads, loader, service_worker_context);
+    let request_origin = page_vm
+        .main_document_resource_loader()
+        .fetch_context()
+        .request_origin();
+    state.start_preloads_for_requests(
+        legacy_preloads,
+        &request_origin,
+        loader,
+        service_worker_context,
+    );
     for request in native_modules {
         let request_url = request.url.clone();
         if let Err(error) = page_vm
@@ -1059,7 +1105,6 @@ impl BufferedScriptPreloadRequest {
             );
         crate::module_runtime::NativeModuleSingleFetchRequest::new(
             self.url.clone(),
-            self.url,
             self.initiator_url,
             module_key,
             fetch_metadata,
@@ -1253,6 +1298,7 @@ struct HtmlPreloadScannerSink {
     meta_csp_mode: MetaCspScannerMode,
     seen_meta_csp_count: Cell<usize>,
     reported_meta_csp_count: Cell<usize>,
+    seen_import_map: Cell<bool>,
     template_depth: Cell<usize>,
     picture_depth: Cell<usize>,
 }
@@ -1268,6 +1314,7 @@ impl HtmlPreloadScannerSink {
             meta_csp_mode,
             seen_meta_csp_count: Cell::new(0),
             reported_meta_csp_count: Cell::new(0),
+            seen_import_map: Cell::new(false),
             template_depth: Cell::new(0),
             picture_depth: Cell::new(0),
         }
@@ -1302,6 +1349,9 @@ impl HtmlPreloadScannerSink {
 
         let kind_hint =
             buffered_script_kind_from_type(html_attr_value(&tag.attrs, "type").as_deref());
+        if matches!(kind_hint, crate::types::ScriptKind::Module) && self.seen_import_map.get() {
+            return;
+        }
         if html_attr_present(&tag.attrs, "nomodule")
             && matches!(kind_hint, crate::types::ScriptKind::Classic)
         {
@@ -1320,13 +1370,26 @@ impl HtmlPreloadScannerSink {
         if url.scheme() == "data" {
             return;
         }
+        let nonce = html_attr_value(&tag.attrs, "nonce");
+        let nonce = script_element_nonce_is_nonceable(
+            nonce.as_deref(),
+            tag.had_duplicate_attributes,
+            tag.attrs.iter().map(|attribute| {
+                (
+                    AsRef::<str>::as_ref(&attribute.name.local),
+                    attribute.value.as_ref(),
+                )
+            }),
+        )
+        .then_some(nonce.as_deref())
+        .flatten();
         let mut requests = self.requests.borrow_mut();
         let fetch_metadata = crate::planning::ScriptFetchMetadata::from_script_attributes(
             html_attr_value(&tag.attrs, "crossorigin").as_deref(),
             html_attr_value(&tag.attrs, "referrerpolicy").as_deref(),
             html_attr_value(&tag.attrs, "charset").as_deref(),
             html_attr_value(&tag.attrs, "integrity").as_deref(),
-            html_attr_value(&tag.attrs, "nonce").as_deref(),
+            nonce,
             html_attr_value(&tag.attrs, "fetchpriority").as_deref(),
         );
         let Some(key) = BufferedScriptPreloadKey::new(url.clone(), kind_hint, &fetch_metadata)
@@ -1349,6 +1412,67 @@ impl HtmlPreloadScannerSink {
                     mode_hint,
                     self.image_fetched.get(),
                 ),
+                fetch_metadata,
+            });
+        }
+    }
+
+    fn maybe_note_import_map(&self, tag: &Tag) {
+        if matches!(
+            buffered_script_kind_from_type(html_attr_value(&tag.attrs, "type").as_deref()),
+            crate::types::ScriptKind::ImportMap
+        ) {
+            self.seen_import_map.set(true);
+        }
+    }
+
+    fn maybe_collect_modulepreload(&self, tag: &Tag) {
+        if self.seen_import_map.get()
+            || (matches!(self.meta_csp_mode, MetaCspScannerMode::StopAfterMeta)
+                && self.seen_meta_csp_count.get() != 0)
+        {
+            return;
+        }
+        let Some(rel) = html_attr_value(&tag.attrs, "rel") else {
+            return;
+        };
+        if !link_rel_includes_token(&rel, "modulepreload")
+            || modulepreload_as_state_from_attribute(html_attr_value(&tag.attrs, "as").as_deref())
+                != ModulepreloadAsState::ScriptLike
+            || !modulepreload_media_attribute_matches(
+                html_attr_value(&tag.attrs, "media").as_deref(),
+            )
+        {
+            return;
+        }
+        let Some(href) = html_attr_value(&tag.attrs, "href") else {
+            return;
+        };
+        let Some(url) = resolve_parser_network_resource_url(&self.base_url.borrow(), &href) else {
+            return;
+        };
+        let kind_hint = crate::types::ScriptKind::Module;
+        let mode_hint = crate::types::ScriptMode::ModuleInOrder;
+        let fetch_metadata = crate::planning::ScriptFetchMetadata::from_script_attributes(
+            html_attr_value(&tag.attrs, "crossorigin").as_deref(),
+            html_attr_value(&tag.attrs, "referrerpolicy").as_deref(),
+            None,
+            html_attr_value(&tag.attrs, "integrity").as_deref(),
+            html_attr_value(&tag.attrs, "nonce").as_deref(),
+            html_attr_value(&tag.attrs, "fetchpriority").as_deref(),
+        );
+        let Some(key) = BufferedScriptPreloadKey::new(url.clone(), kind_hint, &fetch_metadata)
+        else {
+            return;
+        };
+        let mut requests = self.requests.borrow_mut();
+        if requests.seen.insert(BufferedPreloadKey::Script(key)) {
+            requests.script_requests.push(BufferedScriptPreloadRequest {
+                url,
+                initiator_url: self.final_url.clone(),
+                kind_hint,
+                mode_hint,
+                resource_type_hint: moli_fetch::RequestResourceType::Script,
                 fetch_metadata,
             });
         }
@@ -1386,7 +1510,7 @@ impl HtmlPreloadScannerSink {
         let is_style_preload = link_rel_includes_token(&rel, "preload")
             && html_attr_value(&tag.attrs, "as")
                 .as_deref()
-                .is_some_and(|value| value.trim().eq_ignore_ascii_case("style"));
+                .is_some_and(|value| value.eq_ignore_ascii_case("style"));
         if !is_stylesheet && !is_style_preload {
             return;
         }
@@ -1435,7 +1559,7 @@ impl HtmlPreloadScannerSink {
     }
 
     fn maybe_note_image_fetch(&self, tag: &Tag) {
-        if tag.name.as_ref() == "img"
+        if AsRef::<str>::as_ref(&tag.name) == "img"
             && (html_attr_value(&tag.attrs, "src")
                 .as_deref()
                 .is_some_and(|src| !src.trim().is_empty())
@@ -1487,7 +1611,7 @@ impl HtmlPreloadScannerSink {
     }
 
     fn maybe_note_meta_csp(&self, tag: &Tag) {
-        if tag.name.as_ref() == "meta"
+        if AsRef::<str>::as_ref(&tag.name) == "meta"
             && html_attr_value(&tag.attrs, "http-equiv")
                 .as_deref()
                 .is_some_and(|value| value.eq_ignore_ascii_case("content-security-policy"))
@@ -1525,7 +1649,7 @@ impl TokenSink for HtmlPreloadScannerSink {
         let Token::TagToken(tag) = token else {
             return TokenSinkResult::Continue;
         };
-        if tag.name.as_ref() == "template" {
+        if AsRef::<str>::as_ref(&tag.name) == "template" {
             match tag.kind {
                 TagKind::StartTag => {
                     self.template_depth
@@ -1545,7 +1669,7 @@ impl TokenSink for HtmlPreloadScannerSink {
                 TokenSinkResult::Continue
             };
         }
-        if tag.name.as_ref() == "picture" {
+        if AsRef::<str>::as_ref(&tag.name) == "picture" {
             match tag.kind {
                 TagKind::StartTag => {
                     self.picture_depth
@@ -1563,16 +1687,18 @@ impl TokenSink for HtmlPreloadScannerSink {
         }
 
         self.maybe_note_meta_csp(&tag);
-        match tag.name.as_ref() {
+        match AsRef::<str>::as_ref(&tag.name) {
             "base" => {
                 self.maybe_update_base_url(&tag);
                 TokenSinkResult::Continue
             }
             "script" => {
+                self.maybe_note_import_map(&tag);
                 self.maybe_collect_script_preload(&tag);
                 TokenSinkResult::RawData(ScriptData)
             }
             "link" => {
+                self.maybe_collect_modulepreload(&tag);
                 self.maybe_collect_stylesheet_preload(&tag);
                 TokenSinkResult::Continue
             }
@@ -1586,7 +1712,7 @@ impl TokenSink for HtmlPreloadScannerSink {
 }
 
 fn tokenizer_state_for_preload_scanner_tag(tag: &Tag) -> TokenSinkResult<()> {
-    match tag.name.as_ref() {
+    match AsRef::<str>::as_ref(&tag.name) {
         "script" => TokenSinkResult::RawData(ScriptData),
         "noscript" | "style" | "xmp" | "iframe" | "noembed" | "noframes" => {
             TokenSinkResult::RawData(Rawtext)

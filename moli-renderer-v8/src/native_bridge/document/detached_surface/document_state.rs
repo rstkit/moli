@@ -188,14 +188,9 @@ pub(in crate::native_bridge) fn bridge_detached_document_url_callback<'a>(
 pub(in crate::native_bridge) fn bridge_detached_document_uri_callback<'a>(
     scope: &mut v8::PinScope<'a, '_>,
     args: v8::FunctionCallbackArguments<'a>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
+    rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Ok(document) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
-        rv.set_empty_string();
-        return;
-    };
-    let value = detached_document_state_string(scope, document, "documentURI", "about:blank");
-    set_string_return_value(scope, &mut rv, &value);
+    bridge_detached_document_url_callback(scope, args, rv);
 }
 
 pub(in crate::native_bridge) fn bridge_detached_document_base_uri_callback<'a>(
@@ -220,37 +215,58 @@ pub(in crate::native_bridge) fn bridge_detached_document_content_type_callback<'
         rv.set_empty_string();
         return;
     };
-    let content_type = detached_document_content_type_value(scope, document);
+    let Some(content_type) = detached_document_content_type_value(scope, document) else {
+        rv.set_empty_string();
+        return;
+    };
     set_string_return_value(scope, &mut rv, &content_type);
 }
 
 pub(in crate::native_bridge::document) fn detached_document_content_type_value<'a>(
     scope: &mut v8::PinScope<'a, '_>,
     document: v8::Local<'a, v8::Object>,
-) -> String {
-    let explicit_content_type = detached_document_state_string(scope, document, "contentType", "");
-    if !explicit_content_type.is_empty() {
-        return explicit_content_type;
-    }
+) -> Option<String> {
+    let runtime_ptr = context_host_ptr_from_global_bridge(scope)?;
+    let handle = detached_native_handle_for_runtime(scope, runtime_ptr, document)?;
+    unsafe { &*runtime_ptr }
+        .dom_host()
+        .document_content_type_for_handle(handle)
+        .map(str::to_owned)
+}
 
-    let document_kind = detached_document_state_string(scope, document, "documentKind", "xml");
-    let root_namespace = detached_document_element_object(scope, document)
-        .and_then(|root| detached_element_namespace_uri(scope, root))
-        .or_else(|| {
-            let namespace =
-                detached_document_state_string(scope, document, "creationNamespace", "");
-            (!namespace.is_empty()).then_some(namespace)
-        });
-    if document_kind.eq_ignore_ascii_case("html") {
-        "text/html"
-    } else if root_namespace.as_deref() == Some(XHTML_NS) {
-        "application/xhtml+xml"
-    } else if root_namespace.as_deref() == Some(SVG_NS) {
-        "image/svg+xml"
-    } else {
-        "application/xml"
-    }
-    .to_owned()
+pub(in crate::native_bridge::document) fn set_detached_document_content_type<'a>(
+    scope: &mut v8::PinScope<'a, '_>,
+    document: v8::Local<'a, v8::Object>,
+    content_type: &str,
+) -> Option<()> {
+    let runtime_ptr = context_host_ptr_from_global_bridge(scope)?;
+    let handle = detached_native_handle_for_runtime(scope, runtime_ptr, document)?;
+    let dom_host = unsafe { &mut *runtime_ptr }.dom_host_mut();
+    dom_host.document_content_type_for_handle(handle)?;
+    dom_host.set_document_content_type_for_handle(handle, content_type);
+    Some(())
+}
+
+pub(in crate::native_bridge::document) fn detached_document_character_set_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
+) -> Option<String> {
+    let (runtime_ptr, handle) = document_receiver_runtime_and_handle(scope, document)?;
+    unsafe { &*runtime_ptr }
+        .document_character_set_for_handle(handle)
+        .map(str::to_owned)
+}
+
+pub(in crate::native_bridge::document) fn set_detached_document_character_set<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
+    character_set: &str,
+) -> Option<()> {
+    let (runtime_ptr, handle) = document_receiver_runtime_and_handle(scope, document)?;
+    unsafe { &mut *runtime_ptr }
+        .dom_host_mut()
+        .set_document_character_set_for_handle(handle, character_set);
+    Some(())
 }
 
 pub(in crate::native_bridge) fn bridge_detached_document_character_set_callback<'a>(
@@ -262,16 +278,23 @@ pub(in crate::native_bridge) fn bridge_detached_document_character_set_callback<
         rv.set_empty_string();
         return;
     };
-    let character_set = detached_document_state_string(scope, document, "characterSet", "UTF-8");
+    let Some(character_set) = detached_document_character_set_value(scope, document) else {
+        rv.set_empty_string();
+        return;
+    };
     set_string_return_value(scope, &mut rv, &character_set);
 }
 
 pub(in crate::native_bridge) fn bridge_detached_document_compat_mode_callback<'a>(
     scope: &mut v8::PinScope<'a, '_>,
-    _args: v8::FunctionCallbackArguments<'a>,
+    args: v8::FunctionCallbackArguments<'a>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    set_string_return_value(scope, &mut rv, "CSS1Compat");
+    let compat_mode = v8::Local::<v8::Object>::try_from(args.get(0))
+        .ok()
+        .map(|document| detached_document_state_string(scope, document, "compatMode", "CSS1Compat"))
+        .unwrap_or_else(|| "CSS1Compat".to_owned());
+    set_string_return_value(scope, &mut rv, &compat_mode);
 }
 
 pub(in crate::native_bridge) fn bridge_detached_document_referrer_callback<'a>(

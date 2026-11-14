@@ -1,12 +1,17 @@
-use serde_json::json;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmulatedDeviceMetrics {
     pub width: u32,
     pub height: u32,
+    pub view: Option<moli_page_types::EmulatedView>,
+    pub outer_width: u32,
+    pub outer_height: u32,
     pub device_scale_factor: f64,
     pub screen_width: u32,
     pub screen_height: u32,
+    pub screen_avail_height: u32,
+    pub window_x: i32,
+    pub window_y: i32,
+    pub screen_orientation: moli_page_types::ScreenOrientation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,83 +29,11 @@ impl EmulatedNetworkConditions {
     }
 }
 
-const DEFAULT_VIEWPORT_WIDTH: u32 = 1920;
-const DEFAULT_VIEWPORT_HEIGHT: u32 = 1080;
-const DEFAULT_SCREEN_WIDTH: u32 = 1920;
-const DEFAULT_SCREEN_HEIGHT: u32 = 1080;
-const DEFAULT_SCREEN_AVAIL_HEIGHT: u32 = 1040;
-
-fn screen_avail_height_from_screen_height(screen_height: u32) -> u32 {
-    screen_height.min(DEFAULT_SCREEN_AVAIL_HEIGHT)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EmulatedViewportSurface {
-    pub inner_width: u32,
-    pub inner_height: u32,
-    pub outer_width: u32,
-    pub outer_height: u32,
-    pub device_pixel_ratio: f64,
-    pub screen_width: u32,
-    pub screen_height: u32,
-    pub screen_avail_width: u32,
-    pub screen_avail_height: u32,
-}
-
-impl Default for EmulatedViewportSurface {
-    fn default() -> Self {
-        Self {
-            inner_width: DEFAULT_VIEWPORT_WIDTH,
-            inner_height: DEFAULT_VIEWPORT_HEIGHT,
-            outer_width: DEFAULT_VIEWPORT_WIDTH,
-            outer_height: DEFAULT_VIEWPORT_HEIGHT,
-            device_pixel_ratio: 1.0,
-            screen_width: DEFAULT_SCREEN_WIDTH,
-            screen_height: DEFAULT_SCREEN_HEIGHT,
-            screen_avail_width: DEFAULT_SCREEN_WIDTH,
-            screen_avail_height: screen_avail_height_from_screen_height(DEFAULT_SCREEN_HEIGHT),
-        }
-    }
-}
-
-impl EmulatedViewportSurface {
-    pub(crate) fn from_metrics(metrics: Option<&EmulatedDeviceMetrics>) -> Self {
-        metrics.map_or_else(Self::default, EmulatedDeviceMetrics::viewport_surface)
-    }
-
-    pub(crate) fn to_page_viewport_surface(&self) -> moli_core::page::ViewportSurface {
-        moli_core::page::ViewportSurface {
-            inner_width: self.inner_width,
-            inner_height: self.inner_height,
-            outer_width: self.outer_width,
-            outer_height: self.outer_height,
-            device_pixel_ratio: self.device_pixel_ratio,
-            screen_width: self.screen_width,
-            screen_height: self.screen_height,
-            screen_avail_width: self.screen_avail_width,
-            screen_avail_height: self.screen_avail_height,
-        }
-    }
-
-    pub(crate) fn as_json_string(&self) -> String {
-        json!({
-            "innerWidth": self.inner_width,
-            "innerHeight": self.inner_height,
-            "outerWidth": self.outer_width,
-            "outerHeight": self.outer_height,
-            "devicePixelRatio": self.device_pixel_ratio,
-            "screenWidth": self.screen_width,
-            "screenHeight": self.screen_height,
-            "screenAvailWidth": self.screen_avail_width,
-            "screenAvailHeight": self.screen_avail_height,
-        })
-        .to_string()
-    }
-}
+pub(crate) type EmulatedViewportSurface = moli_page_types::ViewportSurface;
 
 impl EmulatedDeviceMetrics {
     pub(crate) fn screen_avail_height(&self) -> u32 {
-        screen_avail_height_from_screen_height(self.screen_height)
+        self.screen_avail_height
     }
 
     pub(crate) fn device_pixel_ratio(&self) -> f64 {
@@ -115,104 +48,19 @@ impl EmulatedDeviceMetrics {
         EmulatedViewportSurface {
             inner_width: self.width,
             inner_height: self.height,
-            outer_width: self.width,
-            outer_height: self.height,
+            outer_width: self.outer_width,
+            outer_height: self.outer_height,
             device_pixel_ratio: self.device_pixel_ratio(),
             screen_width: self.screen_width,
             screen_height: self.screen_height,
             screen_avail_width: self.screen_width,
             screen_avail_height: self.screen_avail_height(),
+            window_x: self.window_x,
+            window_y: self.window_y,
+            screen_orientation: self.screen_orientation,
+            emulated_view: self.view,
         }
     }
-}
-
-pub(crate) fn viewport_surface_install_script(
-    surface: &EmulatedViewportSurface,
-    remember_original_descriptors: bool,
-) -> String {
-    let descriptor_setup = if remember_original_descriptors {
-        r#"
-  const storeKey = '__moliDeviceMetricsOriginalDescriptors';
-  const descriptors = globalThis[storeKey] || {};
-  try {
-    Object.defineProperty(globalThis, storeKey, {
-      configurable: true,
-      value: descriptors,
-    });
-  } catch (_) {
-  }
-  const rememberViewportSurfaceDescriptor = (scope, object, property) => {
-    if (!object) {
-      return;
-    }
-    const key = `${scope}.${property}`;
-    if (Object.prototype.hasOwnProperty.call(descriptors, key)) {
-      return;
-    }
-    descriptors[key] = {
-      existed: Object.prototype.hasOwnProperty.call(object, property),
-      descriptor: Object.getOwnPropertyDescriptor(object, property),
-    };
-  };
-"#
-    } else {
-        r#"
-  const rememberViewportSurfaceDescriptor = (_scope, _object, _property) => {};
-"#
-    };
-    format!(
-        r#"
-(() => {{
-  const surface = {surface};
-  {descriptor_setup}
-  let isTopLevelWindow = true;
-  try {{
-    isTopLevelWindow = globalThis.parent === globalThis;
-  }} catch (_) {{
-  }}
-  const defineViewportSurfaceGetter = (object, property, value) => {{
-    if (!object) {{
-      return;
-    }}
-    try {{
-      Object.defineProperty(object, property, {{
-        configurable: true,
-        get: () => value,
-      }});
-    }} catch (_) {{
-    }}
-  }};
-  const installViewportSurfaceGetter = (scope, object, property, value) => {{
-    rememberViewportSurfaceDescriptor(scope, object, property);
-    defineViewportSurfaceGetter(object, property, value);
-  }};
-  const windowValues = [
-    ['innerWidth', surface.innerWidth, true],
-    ['innerHeight', surface.innerHeight, true],
-    ['outerWidth', surface.outerWidth, false],
-    ['outerHeight', surface.outerHeight, false],
-    ['devicePixelRatio', surface.devicePixelRatio, false],
-  ];
-  const screenValues = [
-    ['width', surface.screenWidth],
-    ['height', surface.screenHeight],
-    ['availWidth', surface.screenAvailWidth],
-    ['availHeight', surface.screenAvailHeight],
-  ];
-  for (const [property, value, topLevelOnly] of windowValues) {{
-    if (topLevelOnly && !isTopLevelWindow) {{
-      continue;
-    }}
-    installViewportSurfaceGetter('window', globalThis, property, value);
-  }}
-  for (const [property, value] of screenValues) {{
-    installViewportSurfaceGetter('screen', globalThis.screen, property, value);
-  }}
-}})();
-"#,
-        surface = surface.as_json_string(),
-        descriptor_setup = descriptor_setup,
-    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,6 +94,7 @@ pub struct EmulatedMediaOverrides {
     pub media: Option<String>,
     pub color_scheme: Option<String>,
     pub reduced_motion: Option<String>,
+    pub reduced_transparency: Option<String>,
     pub forced_colors: Option<String>,
     pub contrast: Option<String>,
 }
@@ -256,6 +105,7 @@ impl From<EmulatedMediaOverrides> for moli_core::page::EmulatedMediaOverrides {
             media: value.media,
             color_scheme: value.color_scheme,
             reduced_motion: value.reduced_motion,
+            reduced_transparency: value.reduced_transparency,
             forced_colors: value.forced_colors,
             contrast: value.contrast,
         }
@@ -268,6 +118,7 @@ impl From<&EmulatedMediaOverrides> for moli_core::page::EmulatedMediaOverrides {
             media: value.media.clone(),
             color_scheme: value.color_scheme.clone(),
             reduced_motion: value.reduced_motion.clone(),
+            reduced_transparency: value.reduced_transparency.clone(),
             forced_colors: value.forced_colors.clone(),
             contrast: value.contrast.clone(),
         }
@@ -279,33 +130,18 @@ impl From<&EmulatedMediaOverrides> for moli_core::page::EmulatedMediaOverrides {
 /// A DevTools session keeps its own raw Emulation handler state separately.
 /// Commands copy the calling handler's value into this shared surface, just as
 /// Chromium's per-session Emulation handlers update one target-wide renderer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct EffectiveTargetEmulationState {
+    pub(crate) default_background_color: Option<[u8; 4]>,
     pub(crate) network_conditions: Option<EmulatedNetworkConditions>,
     pub(crate) geolocation_override: Option<EmulatedGeolocationOverrideState>,
     pub(crate) emulated_media: EmulatedMediaOverrides,
     pub(crate) emulated_device_metrics: Option<EmulatedDeviceMetrics>,
-    pub(crate) cpu_throttling_rate: f64,
-    pub(crate) touch_emulation_enabled: bool,
+    pub(crate) max_touch_points: u32,
     pub(crate) emit_touch_events_for_mouse: bool,
     pub(crate) focus_emulation_enabled: bool,
     pub(crate) script_execution_disabled: bool,
-}
-
-impl Default for EffectiveTargetEmulationState {
-    fn default() -> Self {
-        Self {
-            network_conditions: None,
-            geolocation_override: None,
-            emulated_media: EmulatedMediaOverrides::default(),
-            emulated_device_metrics: None,
-            cpu_throttling_rate: 1.0,
-            touch_emulation_enabled: false,
-            emit_touch_events_for_mouse: false,
-            focus_emulation_enabled: false,
-            script_execution_disabled: false,
-        }
-    }
+    pub(crate) scrollbars_hidden: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -314,10 +150,11 @@ pub(crate) struct EffectiveTargetEmulationStateDelta {
     pub(crate) geolocation_override: bool,
     pub(crate) emulated_media: bool,
     pub(crate) emulated_device_metrics: bool,
-    pub(crate) cpu_throttling_rate: bool,
-    pub(crate) touch_emulation_enabled: bool,
+    pub(crate) max_touch_points: bool,
+    pub(crate) navigator_queries: bool,
     pub(crate) focus_emulation_enabled: bool,
     pub(crate) script_execution_disabled: bool,
+    pub(crate) scrollbars_hidden: bool,
 }
 
 impl EffectiveTargetEmulationStateDelta {
@@ -325,7 +162,8 @@ impl EffectiveTargetEmulationStateDelta {
         self.network_conditions
             || self.geolocation_override
             || self.emulated_device_metrics
-            || self.touch_emulation_enabled
+            || self.max_touch_points
+            || self.navigator_queries
             || self.focus_emulation_enabled
     }
 }
@@ -348,14 +186,12 @@ impl EffectiveTargetEmulationState {
         // Blink clears media on every Emulation handler disable. Keep the
         // target-wide side effect while retaining each handler's raw copy.
         self.emulated_media = EmulatedMediaOverrides::default();
+        self.default_background_color = None;
         if raw.emulated_device_metrics.is_some() {
             self.emulated_device_metrics = None;
         }
-        if raw.cpu_throttling_rate != 1.0 {
-            self.cpu_throttling_rate = 1.0;
-        }
-        if raw.touch_emulation_enabled {
-            self.touch_emulation_enabled = false;
+        if raw.max_touch_points != 0 {
+            self.max_touch_points = 0;
         }
         if raw.emit_touch_events_for_mouse {
             self.emit_touch_events_for_mouse = false;
@@ -366,43 +202,46 @@ impl EffectiveTargetEmulationState {
         // Blink also sends the shared renderer an unconditional script
         // execution reset when any Emulation handler is disabled.
         self.script_execution_disabled = false;
+        if raw.scrollbars_hidden {
+            self.scrollbars_hidden = false;
+        }
         EffectiveTargetEmulationStateDelta {
             network_conditions: previous.network_conditions != self.network_conditions,
             geolocation_override: previous.geolocation_override != self.geolocation_override,
             emulated_media: previous.emulated_media != self.emulated_media,
             emulated_device_metrics: previous.emulated_device_metrics
                 != self.emulated_device_metrics,
-            cpu_throttling_rate: previous.cpu_throttling_rate != self.cpu_throttling_rate,
-            touch_emulation_enabled: previous.touch_emulation_enabled
-                != self.touch_emulation_enabled,
+            max_touch_points: previous.max_touch_points != self.max_touch_points,
+            navigator_queries: false,
             focus_emulation_enabled: previous.focus_emulation_enabled
                 != self.focus_emulation_enabled,
             script_execution_disabled: previous.script_execution_disabled
                 != self.script_execution_disabled,
+            scrollbars_hidden: previous.scrollbars_hidden != self.scrollbars_hidden,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        EffectiveTargetEmulationState, EmulatedDeviceMetrics, EmulatedViewportSurface,
-        screen_avail_height_from_screen_height, viewport_surface_install_script,
-    };
-
-    #[test]
-    fn screen_available_height_never_exceeds_zero_screen_height() {
-        assert_eq!(screen_avail_height_from_screen_height(0), 0);
-    }
+    use super::{EffectiveTargetEmulationState, EmulatedDeviceMetrics};
 
     #[test]
     fn device_pixel_ratio_normalizes_non_positive_and_non_finite_values() {
         let mut metrics = EmulatedDeviceMetrics {
             width: 800,
             height: 600,
+            view: None,
+            outer_width: 800,
+            outer_height: 600,
             device_scale_factor: 2.0,
             screen_width: 800,
             screen_height: 600,
+            screen_avail_height: 600,
+
+            window_x: 0,
+            window_y: 0,
+            screen_orientation: Default::default(),
         };
         assert_eq!(metrics.device_pixel_ratio(), 2.0);
 
@@ -414,16 +253,6 @@ mod tests {
 
         metrics.device_scale_factor = f64::NAN;
         assert_eq!(metrics.device_pixel_ratio(), 1.0);
-    }
-
-    #[test]
-    fn viewport_surface_install_script_uses_plain_helper_store() {
-        let script = viewport_surface_install_script(&EmulatedViewportSurface::default(), true);
-
-        assert!(!script.contains("Object.create(null)"));
-        assert!(script.contains("globalThis.parent === globalThis"));
-        assert!(script.contains("['innerWidth', surface.innerWidth, true]"));
-        assert!(script.contains("if (topLevelOnly && !isTopLevelWindow)"));
     }
 
     #[test]

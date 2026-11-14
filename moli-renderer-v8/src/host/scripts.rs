@@ -316,6 +316,10 @@ impl HostScriptScheduler {
         &self.module_owner
     }
 
+    pub(crate) fn clear_module_owner_for_context_teardown(&mut self) {
+        self.module_owner.clear_for_context_teardown();
+    }
+
     fn default_page_task_execution_kind_for_source(
         source: ScriptHandleSource,
     ) -> ScriptPageTaskExecutionKind {
@@ -601,13 +605,6 @@ impl HostScriptScheduler {
         self.module_owner.native_module_source(entry_id)
     }
 
-    pub(crate) fn native_module_source_for(
-        &self,
-        module: v8::Local<'_, v8::Module>,
-    ) -> Option<(ModuleMapKey, ModuleSource)> {
-        self.module_owner.native_module_source_for(module)
-    }
-
     pub(crate) fn native_module_wasm_record_for(
         &self,
         module: v8::Local<'_, v8::Module>,
@@ -685,13 +682,6 @@ impl HostScriptScheduler {
         entry_id: ModuleEntryId,
     ) -> Option<v8::Global<v8::Module>> {
         self.module_owner.native_compiled_module(entry_id)
-    }
-
-    pub(crate) fn native_module_url_for(
-        &self,
-        module: v8::Local<'_, v8::Module>,
-    ) -> Option<url::Url> {
-        self.module_owner.native_module_url_for(module)
     }
 
     pub(crate) fn mark_native_module_instantiated(&mut self, entry_id: ModuleEntryId) {
@@ -1456,15 +1446,11 @@ impl HostScriptScheduler {
         )
     }
 
-    fn register_dynamic_import_map(
-        &mut self,
-        preparation: &RuntimeScriptPreparationContext,
-        source: &str,
-    ) {
-        if let Err(message) = self.register_import_map(source, &preparation.base_url) {
+    pub(crate) fn register_dynamic_import_map(&mut self, base_url: &Url, source: &str) {
+        if let Err(message) = self.register_import_map(source, base_url) {
             let work = self.plan_window_script_failure_report_lifecycle_work(
                 &message,
-                Some(preparation.base_url.as_str()),
+                Some(base_url.as_str()),
                 None,
             );
             self.enqueue_post_parse_lifecycle_work(work);
@@ -1518,7 +1504,7 @@ impl HostScriptScheduler {
         mode: ScriptMode,
     ) -> std::result::Result<PreparedScript, String> {
         let position = self.next_dynamic_position();
-        let script = build_runtime_prepared_script(
+        let mut script = build_runtime_prepared_script(
             preparation,
             NativeNodeId::new(node_id.index()),
             position,
@@ -1528,6 +1514,12 @@ impl HostScriptScheduler {
             kind,
             mode,
         )?;
+        if script.kind == ScriptKind::Module
+            && script.source_kind == ScriptSourceKind::External
+            && script.fetch_metadata.integrity.is_none()
+        {
+            script.fetch_metadata.integrity = self.resolve_module_integrity(&script.url);
+        }
         if let Some(state) = self.script_handles.get_mut(host_script_handle) {
             state.followup_lane = Self::followup_lane_for_script(state.source, script.mode);
             if Self::queued_script_waits_until_dom_content_loaded(
@@ -1637,17 +1629,13 @@ impl HostScriptScheduler {
     #[cfg(test)]
     pub(crate) fn drain_dynamic_scripts(&mut self) -> DynamicScriptBatch {
         DynamicScriptBatch {
-            in_order: self.pending_dynamic_in_order_scripts.drain(..).collect(),
-            importmap_in_order: self
-                .pending_dynamic_importmap_in_order_scripts
-                .drain(..)
-                .collect(),
-            module_in_order: self
-                .pending_dynamic_module_in_order_scripts
-                .drain(..)
-                .collect(),
-            async_scripts: self.pending_dynamic_async_scripts.drain(..).collect(),
-            failed_scripts: self.pending_failed_dynamic_scripts.drain(..).collect(),
+            in_order: std::mem::take(&mut self.pending_dynamic_in_order_scripts),
+            importmap_in_order: std::mem::take(
+                &mut self.pending_dynamic_importmap_in_order_scripts,
+            ),
+            module_in_order: std::mem::take(&mut self.pending_dynamic_module_in_order_scripts),
+            async_scripts: std::mem::take(&mut self.pending_dynamic_async_scripts),
+            failed_scripts: std::mem::take(&mut self.pending_failed_dynamic_scripts),
         }
     }
 

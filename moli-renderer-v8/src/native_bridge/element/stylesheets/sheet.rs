@@ -17,7 +17,7 @@ pub(super) const STYLE_SHEET_CACHE_SLOT: &str = "__moliStyleSheet";
 fn sync_sheet_from_linked_source<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     sheet: v8::Local<'s, v8::Object>,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     source: &crate::style_engine::StyloStylesheetSource,
 ) -> bool {
     let Some(stylesheet) = source
@@ -35,7 +35,7 @@ fn sync_sheet_from_linked_source<'s>(
 fn sync_csp_blocked_link_sheet_metadata<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     sheet: v8::Local<'s, v8::Object>,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
 ) {
     if let Some(disposition) = crate::stylesheet_blocking::stylesheet_link_disposition(
@@ -48,7 +48,7 @@ fn sync_csp_blocked_link_sheet_metadata<'s>(
 }
 
 fn linked_stylesheet_source(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
 ) -> Option<crate::style_engine::StyloStylesheetSource> {
     runtime.linked_stylesheet_source_for_owner(handle)
@@ -57,7 +57,7 @@ fn linked_stylesheet_source(
 fn sync_linked_sheet_media_from_owner<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     sheet: v8::Local<'s, v8::Object>,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
 ) {
     let media = runtime
@@ -150,13 +150,6 @@ pub(crate) fn style_sheet_for_element<'s>(
     if !owner_is_connected {
         return None;
     }
-    if is_style && detached_owner && runtime.owner_style_sheet_source(handle).is_none() {
-        // DOMParser/createHTMLDocument trees do not pass through the active
-        // document's initial owner lifecycle. Install their source lazily into
-        // the existing owner-document style world instead of creating a
-        // text-only CSSStyleSheet shell.
-        runtime.sync_owner_style_sheet_text(handle);
-    }
     if is_style && runtime.owner_style_sheet_source(handle).is_none() {
         return None;
     }
@@ -175,7 +168,8 @@ pub(crate) fn style_sheet_for_element<'s>(
         && let Ok(existing) = v8::Local::<v8::Object>::try_from(existing)
     {
         if is_style {
-            if let Some(stylesheet) = owner_live_stylesheet.as_ref() {
+            {
+                let stylesheet = owner_live_stylesheet.as_ref()?;
                 if css_style_sheet_id(scope, existing) == Some(stylesheet.id()) {
                     set_css_style_sheet_owner_node(scope, existing, receiver);
                     set_css_style_sheet_origin_clean(scope, existing, true);
@@ -184,8 +178,6 @@ pub(crate) fn style_sheet_for_element<'s>(
                 crate::context_bootstrap::clear_css_style_sheet_owner_node(scope, existing);
                 let undefined = v8::undefined(scope);
                 set_private_value(scope, receiver, STYLE_SHEET_CACHE_SLOT, undefined.into());
-            } else {
-                return None;
             }
         } else if let Some(source) = linked_source.as_ref() {
             if !sync_sheet_from_linked_source(scope, existing, runtime, source) {
@@ -207,10 +199,9 @@ pub(crate) fn style_sheet_for_element<'s>(
     let sheet = new_css_style_sheet_object(scope);
     set_css_style_sheet_owner_node(scope, sheet, receiver);
     if is_style {
-        if let Some(stylesheet) = owner_live_stylesheet {
+        {
+            let stylesheet = owner_live_stylesheet?;
             bind_css_style_sheet_to_live_stylesheet(scope, sheet, stylesheet);
-        } else {
-            return None;
         }
         set_css_style_sheet_origin_clean(scope, sheet, true);
     } else if let Some(source) = linked_source.as_ref() {
@@ -273,7 +264,7 @@ pub(crate) fn sync_cached_style_sheet_media_from_owner<'s>(
 fn style_sheet_for_processing_instruction<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
-    runtime: &mut crate::native_bridge::JsContextHost,
+    runtime: &mut crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
     target: &str,
     data: &str,

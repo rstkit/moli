@@ -1,6 +1,6 @@
 use super::shared::append_console_message;
 use super::*;
-use crate::{document_runtime::EventTargetHandle, native_bridge::JsContextHost};
+use crate::{document_runtime::EventTargetHandle, native_bridge::PageScriptHost};
 
 mod accessors;
 mod console;
@@ -8,10 +8,26 @@ mod error;
 mod install;
 mod promise;
 
+pub(crate) const SECURE_GLOBAL_EVENT_HANDLER_PROPERTIES: &[&str] = &["onpointerrawupdate"];
+
+pub(crate) const SECURE_WINDOW_EVENT_HANDLER_PROPERTIES: &[&str] = &[
+    "ondevicemotion",
+    "ondeviceorientation",
+    "ondeviceorientationabsolute",
+];
+
 pub(crate) const WINDOW_EVENT_HANDLER_PROPERTIES: &[&str] = &[
     "onabort",
     "onafterprint",
+    "onanimationcancel",
+    "onanimationend",
+    "onanimationiteration",
+    "onanimationstart",
+    "onauxclick",
+    "onbeforeinput",
+    "onbeforematch",
     "onbeforeprint",
+    "onbeforetoggle",
     "onbeforeunload",
     "onblur",
     "oncancel",
@@ -20,7 +36,13 @@ pub(crate) const WINDOW_EVENT_HANDLER_PROPERTIES: &[&str] = &[
     "onchange",
     "onclick",
     "onclose",
+    "oncommand",
+    "oncontextlost",
     "oncontextmenu",
+    "oncontextrestored",
+    "oncopy",
+    "oncuechange",
+    "oncut",
     "ondblclick",
     "ondrag",
     "ondragend",
@@ -34,19 +56,28 @@ pub(crate) const WINDOW_EVENT_HANDLER_PROPERTIES: &[&str] = &[
     "onended",
     "onerror",
     "onfocus",
+    "onformdata",
+    "ongamepadconnected",
+    "ongamepaddisconnected",
+    "ongotpointercapture",
     "onhashchange",
     "oninput",
     "oninvalid",
     "onkeydown",
     "onkeypress",
     "onkeyup",
+    "onlanguagechange",
     "onload",
     "onloadeddata",
     "onloadedmetadata",
     "onloadstart",
+    "onlostpointercapture",
     "onmessage",
+    "onmessageerror",
     "onmousedown",
     "onmousemove",
+    "onmouseenter",
+    "onmouseleave",
     "onmouseout",
     "onmouseover",
     "onmouseup",
@@ -54,34 +85,66 @@ pub(crate) const WINDOW_EVENT_HANDLER_PROPERTIES: &[&str] = &[
     "onoffline",
     "ononline",
     "onpagehide",
+    "onpagereveal",
     "onpageshow",
+    "onpageswap",
+    "onpaste",
     "onpause",
     "onplay",
     "onplaying",
+    "onpointercancel",
+    "onpointerdown",
+    "onpointerenter",
+    "onpointerleave",
+    "onpointermove",
+    "onpointerout",
+    "onpointerover",
+    "onpointerup",
     "onpopstate",
     "onprogress",
     "onratechange",
+    "onrejectionhandled",
     "onreset",
     "onresize",
     "onscroll",
+    "onscrollend",
+    "onsecuritypolicyviolation",
     "onseeked",
     "onseeking",
     "onselect",
+    "onselectionchange",
+    "onselectstart",
+    "onslotchange",
     "onstalled",
     "onstorage",
     "onsubmit",
     "onsuspend",
     "ontimeupdate",
+    "ontoggle",
     "ontouchcancel",
     "ontouchend",
     "ontouchmove",
     "ontouchstart",
+    "ontransitioncancel",
+    "ontransitionend",
+    "ontransitionrun",
+    "ontransitionstart",
     "onunhandledrejection",
     "onunload",
     "onvolumechange",
     "onwaiting",
-    "onrejectionhandled",
+    "onwebkitanimationend",
+    "onwebkitanimationiteration",
+    "onwebkitanimationstart",
+    "onwebkittransitionend",
+    "onwheel",
 ];
+
+pub(crate) fn is_window_event_handler_property(property: &str) -> bool {
+    WINDOW_EVENT_HANDLER_PROPERTIES.contains(&property)
+        || SECURE_WINDOW_EVENT_HANDLER_PROPERTIES.contains(&property)
+        || SECURE_GLOBAL_EVENT_HANDLER_PROPERTIES.contains(&property)
+}
 
 pub(crate) use accessors::{
     set_window_body_onerror_handler_compiled, set_window_onerror_handler_value,
@@ -104,5 +167,14 @@ pub(super) use error::window_report_error_callback;
 pub(crate) use error::{
     dispatch_window_error_event_with_details, dispatch_window_report_error_message,
 };
+pub(crate) use install::event_handler_property_is_exposed;
 pub(super) use install::install_window_global_accessors;
+pub(crate) use install::{
+    clear_simple_window_event_handler_values, install_simple_window_event_handlers,
+};
 pub(crate) use promise::dispatch_window_promise_rejection_event;
+
+pub(in crate::context_bootstrap) use install::{
+    finalize_secure_global_event_handler_realm_bindings,
+    install_secure_window_event_handler_accessors,
+};

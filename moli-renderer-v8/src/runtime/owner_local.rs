@@ -16,6 +16,7 @@ fn remove_page(token: RendererPageToken) {
 
 #[doc(hidden)]
 pub struct RendererAttachedPage {
+    pub(super) vm_creation_id: u64,
     pub(super) token: RendererPageToken,
     pub(super) devtools_agent_token: RendererDevToolsAgentToken,
     pub(super) page_context_cancel_tx: RendererPageContextCancelSender,
@@ -41,10 +42,12 @@ impl RendererAttachedPage {
             "committed-Document parser continuation can only be armed once"
         );
         let token = self.token;
+        let vm_creation_id = self.vm_creation_id;
         self.committed_document_post_response_continuation = Some(
             RendererPageCommandPostResponseContinuation::new(move || {
                 let _ = page_wake_tx.send(RendererOwnerWake::committed_document_parser_unblocked(
                     token,
+                    vm_creation_id,
                 ));
             }),
         );
@@ -83,6 +86,46 @@ impl RendererAttachedPage {
     }
 }
 
+/// The committed Document of an existing Page. This value carries no Page
+/// close authority; the original RendererPageHandle remains the sole owner.
+pub struct RendererPageReplacementCommit {
+    pub(super) token: RendererPageToken,
+    pub(super) slot: RendererPageSlotHandle,
+    pub(super) vm_creation_id: u64,
+    pub(super) devtools_agent_token: RendererDevToolsAgentToken,
+    pub(super) javascript_dialog_broker: RendererJavaScriptDialogBroker,
+    pub(super) devtools_target: crate::devtools::target::RendererDevToolsTargetHandle,
+    pub(super) page_state: Arc<RendererPageState>,
+    pub(super) creation_diagnostics: RendererPageCreationDiagnostics,
+    pub(super) creation_artifacts: RendererPageCreationArtifacts,
+    pub(super) pending_download: Option<RendererPendingDownloadActivation>,
+    pub(super) committed_document_post_response_continuation:
+        Option<RendererPageCommandPostResponseContinuation>,
+}
+
+impl RendererPageReplacementCommit {
+    pub fn take_pending_download(&mut self) -> Option<RendererPendingDownloadActivation> {
+        self.pending_download.take()
+    }
+
+    pub(super) fn defer_committed_document_parser_until_response(
+        &mut self,
+        page_wake_tx: tokio::sync::mpsc::UnboundedSender<RendererOwnerWake>,
+    ) {
+        assert!(self.committed_document_post_response_continuation.is_none());
+        let token = self.token;
+        let vm_creation_id = self.vm_creation_id;
+        self.committed_document_post_response_continuation = Some(
+            RendererPageCommandPostResponseContinuation::new(move || {
+                let _ = page_wake_tx.send(RendererOwnerWake::committed_document_parser_unblocked(
+                    token,
+                    vm_creation_id,
+                ));
+            }),
+        );
+    }
+}
+
 pub struct RendererPageHandle {
     local_executor: JsLocalExecutor,
     render_runtime: RenderRuntimeHandle,
@@ -97,9 +140,88 @@ pub struct RendererPageHandle {
     _not_send: PhantomData<Rc<()>>,
 }
 
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub enum RendererPageAccessError {
+    #[error("Renderer Document is no longer current")]
+    DocumentReplaced,
+    #[error("renderer local host page {} is already running an owner turn", .page_id.as_u64())]
+    Busy { page_id: super::PageId },
+    #[error("renderer local host no longer tracks page {}", .page_id.as_u64())]
+    Missing { page_id: super::PageId },
+    #[error("renderer local host page {} is retiring", .page_id.as_u64())]
+    Retiring { page_id: super::PageId },
+}
+
+/// A revocable command capability for one exact native Document. It keeps
+/// neither a Page handle nor the renderer runtime owner alive.
+#[derive(Clone, Debug)]
+pub struct RendererDocumentCommandTarget {
+    pub(super) render_runtime: RenderRuntimeHandle,
+    pub(super) token: RendererPageToken,
+    pub(super) document: RendererDocumentLifecycleIdentity,
+}
+
+/// Target-owned request policy that may change after native commit admission
+/// but before the browser has observed the new Document's identity.
+/// This deliberately grants no Document query or request-settlement access.
+#[derive(Clone, Debug)]
+pub enum RendererPageRequestPolicyUpdate {
+    FetchInterception {
+        classes: crate::SubresourceInterceptionClasses,
+    },
+    BlockedUrls(Vec<String>),
+}
+
+impl RendererPageRequestPolicyUpdate {
+    pub(super) fn into_command(self) -> RendererPageCommand {
+        match self {
+            Self::FetchInterception { classes } => {
+                RendererPageCommand::SetFetchSubresourceInterception { classes }
+            }
+            Self::BlockedUrls(patterns) => RendererPageCommand::SetBlockedUrlPatterns(patterns),
+        }
+    }
+}
+
+impl PartialEq for RendererDocumentCommandTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.token == other.token && self.document == other.document
+    }
+}
+
+impl Eq for RendererDocumentCommandTarget {}
+
+impl RendererDocumentCommandTarget {
+    pub fn document(&self) -> RendererDocumentLifecycleIdentity {
+        self.document
+    }
+
+    pub fn enqueue(&self, command: RendererPageCommand) -> Result<RendererPageCommandPending> {
+        let reply = self
+            .render_runtime
+            .enqueue(RendererOwnerCommand::RunProtocolPageCommand {
+                token: self.token,
+                command: RendererPageCommand::ForDocument {
+                    source_document: self.document,
+                    command: Box::new(command),
+                },
+            })?;
+        Ok(RendererPageCommandPending::from_owner_reply(reply))
+    }
+}
+
 pub struct RendererPageCommandPending {
     dispatch: RendererPageCommandPendingDispatch,
     javascript_dialog_watch: Option<RendererJavaScriptDialogWatch>,
+}
+
+impl RendererPageCommandPending {
+    pub(super) fn from_owner_reply(reply: oneshot::Receiver<Result<RendererOwnerReply>>) -> Self {
+        Self {
+            dispatch: RendererPageCommandPendingDispatch::Owner(reply),
+            javascript_dialog_watch: None,
+        }
+    }
 }
 
 enum RendererPageCommandPendingDispatch {
@@ -167,6 +289,20 @@ impl RendererPageHandle {
             .expect("renderer page handle should remain open while in use")
     }
 
+    pub fn document_command_target(
+        &self,
+        document: RendererDocumentLifecycleIdentity,
+    ) -> Result<RendererDocumentCommandTarget> {
+        if self.token().page_id != document.frame.page_id {
+            return Err(super::page_commands::DocumentCommandError::WrongPage.into());
+        }
+        Ok(RendererDocumentCommandTarget {
+            render_runtime: self.render_runtime.clone(),
+            token: self.token(),
+            document,
+        })
+    }
+
     pub fn page_id(&self) -> u64 {
         self.token().page_id.as_u64()
     }
@@ -195,6 +331,37 @@ impl RendererPageHandle {
         &mut self,
     ) -> Option<RendererPageCommandPostResponseContinuation> {
         self.committed_document_post_response_continuation.take()
+    }
+
+    pub fn adopt_document_replacement(
+        &mut self,
+        replacement: RendererPageReplacementCommit,
+    ) -> Result<(
+        Arc<RendererPageState>,
+        RendererPageCreationDiagnostics,
+        RendererPageCreationArtifacts,
+    )> {
+        anyhow::ensure!(
+            self.token() == replacement.token,
+            "replacement Document belongs to a different Page"
+        );
+        let stable = replacement.slot.entry();
+        anyhow::ensure!(
+            stable.is_active() && stable.vm_creation_id() == replacement.vm_creation_id,
+            "replacement Document was superseded before its handle was adopted"
+        );
+        // The old Document detached its Inspector bindings at commit. Detaching
+        // by Page ID here would instead detach the new Document of the same Page.
+        self.devtools_agent_token = replacement.devtools_agent_token;
+        self.javascript_dialog_broker = replacement.javascript_dialog_broker;
+        self.devtools_target = replacement.devtools_target;
+        self.committed_document_post_response_continuation =
+            replacement.committed_document_post_response_continuation;
+        Ok((
+            replacement.page_state,
+            replacement.creation_diagnostics,
+            replacement.creation_artifacts,
+        ))
     }
 
     pub fn take_pending_modal_javascript_dialogs(&self) -> Vec<RendererPendingJavaScriptDialog> {
@@ -269,6 +436,34 @@ impl RendererPageHandle {
 
     pub fn runtime_inspector_pause_active(&self) -> bool {
         self.devtools_target.pause_ref().is_pause_active()
+    }
+
+    /// Reserves a Document against this Page's current committed generation.
+    /// This does not detach the current realm or transfer Page close authority.
+    #[cfg(test)]
+    pub(crate) async fn reserve_replacement_document_for_navigation(
+        &self,
+    ) -> Result<RendererPageReservationToken> {
+        let target = self.document_replacement_target(moli_fetch::FetchCancelHandle::new());
+        let scope = target.replacement.clone().begin()?;
+        target.reserve(scope).await
+    }
+
+    /// Captures a non-owning Page target without entering the renderer. Pass
+    /// this to response preparation only after downloads and cancellations
+    /// have been classified; preparation owns the old Document's pause wake.
+    pub fn document_replacement_target(
+        &self,
+        cancellation: moli_fetch::FetchCancelHandle,
+    ) -> super::RendererPageReplacementTarget {
+        super::RendererPageReplacementTarget {
+            render_runtime: self.render_runtime.clone(),
+            token: self.token(),
+            replacement: super::RendererDocumentReplacement::new(
+                self.devtools_target.pause(),
+                cancellation,
+            ),
+        }
     }
 
     /// Enqueues the DevTools IO-agent script policy without borrowing the
@@ -532,7 +727,7 @@ impl RendererPageHandle {
         let Some(token) = self.token else {
             return Ok(());
         };
-        let terminated_active_execution = self
+        let requested_execution_interrupt = self
             .devtools_target
             .close("Inspector target closed with its Page handle");
         self.javascript_dialog_broker.dismiss_pending();
@@ -540,7 +735,7 @@ impl RendererPageHandle {
             .cancel(RendererPageContextCancelReason::PageClosed);
         tracing::debug!(
             page_id = token.page_id.as_u64(),
-            terminated_active_execution,
+            requested_execution_interrupt,
             "closing renderer page handle"
         );
 

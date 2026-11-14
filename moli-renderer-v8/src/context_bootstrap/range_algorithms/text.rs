@@ -1,5 +1,6 @@
 use super::ordering::point_order_handles;
 use super::*;
+use crate::native_bridge::document::XHTML_NS;
 use crate::native_bridge::element::{
     StyleMode, observable_sources_with_fragments, style_property_value,
 };
@@ -51,6 +52,31 @@ pub(in crate::context_bootstrap) fn range_selection_string_contents<'s>(
                 range_boundary_offset(scope, range, RangeBoundarySide::End) as u32,
             )
         };
+    range_selection_string_contents_for_boundaries(
+        scope,
+        RangeBoundaryHandles {
+            start: RangeBoundaryHandle {
+                container: start,
+                offset: start_offset,
+            },
+            end: RangeBoundaryHandle {
+                container: end,
+                offset: end_offset,
+            },
+        },
+    )
+}
+
+pub(super) fn range_selection_string_contents_for_boundaries(
+    scope: &mut v8::PinScope<'_, '_>,
+    boundaries: RangeBoundaryHandles,
+) -> Option<String> {
+    let (start, start_offset, end, end_offset) = (
+        boundaries.start.container,
+        boundaries.start.offset,
+        boundaries.end.container,
+        boundaries.end.offset,
+    );
     if start == end && start_offset == end_offset {
         return Some(String::new());
     }
@@ -61,24 +87,21 @@ pub(in crate::context_bootstrap) fn range_selection_string_contents<'s>(
     let mut text_sources = Vec::new();
     collect_selection_text_sources(runtime, root, &mut text_sources);
     let document = runtime.layout_document_for_source(start)?;
-    let rendered_text_sources = match observable_sources_with_fragments(
-        runtime,
-        document,
-        &text_sources,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    ) {
-        Ok(rendered) => rendered,
-        Err(error) => {
-            let message = format!("Layout failed while serializing Selection: {error}");
-            if let Some(message) = crate::util::v8_string(scope, &message) {
-                let exception = v8::Exception::error(scope, message);
-                scope.throw_exception(exception);
+    let rendered_text_sources =
+        match observable_sources_with_fragments(runtime, document, &text_sources) {
+            Ok(rendered) => rendered,
+            Err(moli_layout::LayoutError::NoLayoutSnapshot) => return Some(String::new()),
+            Err(error) => {
+                let message = format!("Layout failed while serializing Selection: {error}");
+                if let Some(message) = crate::util::v8_string(scope, &message) {
+                    let exception = v8::Exception::error(scope, message);
+                    scope.throw_exception(exception);
+                }
+                return None;
             }
-            return None;
-        }
-    };
+        };
     let root_state = SelectionTextState {
-        active_modal_dialog: selection_text_active_modal_dialog(runtime),
+        active_modal_dialog: selection_text_active_modal_dialog(runtime, document),
         ..Default::default()
     };
     let mut out = String::new();
@@ -100,7 +123,7 @@ pub(in crate::context_bootstrap) fn range_selection_string_contents<'s>(
 }
 
 fn collect_selection_text_sources(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     root: DomHandle,
     out: &mut Vec<DomHandle>,
 ) {
@@ -197,7 +220,7 @@ struct RangeTextBounds {
 
 fn append_selection_rendered_text(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
     bounds: RangeTextBounds,
     state: SelectionTextState,
@@ -227,7 +250,11 @@ fn append_selection_rendered_text(
                 if selection_text_element_is_hidden(runtime, handle) {
                     return Some(());
                 }
-                if selection_text_element_is_inert(runtime, handle) {
+                if selection_text_element_is_inert(runtime, handle)
+                    && !state.active_modal_dialog.is_some_and(|dialog| {
+                        selection_text_descendant_or_self(runtime, dialog, handle)
+                    })
+                {
                     return Some(());
                 }
                 if element.is_html_element("head")
@@ -345,8 +372,8 @@ fn selection_node_may_intersect_range(
     Some(starts_before_range_end && ends_after_range_start)
 }
 
-fn selection_text_element_is_hidden(
-    runtime: &crate::native_bridge::JsContextHost,
+pub(crate) fn selection_text_element_is_hidden(
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
 ) -> bool {
     style_property_value(runtime, handle, StyleMode::Computed, "display") == "none"
@@ -354,64 +381,60 @@ fn selection_text_element_is_hidden(
 }
 
 fn selection_text_element_is_inert(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
 ) -> bool {
     runtime
         .dom_host()
         .node(handle)
         .and_then(|node| node.as_element())
-        .is_some_and(|element| element.attribute("inert").is_some())
+        .is_some_and(|element| {
+            element.namespace() == XHTML_NS && element.attribute("inert").is_some()
+        })
 }
 
 fn selection_text_has_inert_ancestor(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
+    modal_escape_root: Option<DomHandle>,
 ) -> bool {
     let mut current = Some(handle);
     while let Some(handle) = current {
         if selection_text_element_is_inert(runtime, handle) {
             return true;
         }
-        current = runtime.dom_host().parent_node(handle);
+        if Some(handle) == modal_escape_root {
+            return false;
+        }
+        current = selection_text_flat_tree_parent(runtime, handle);
     }
     false
 }
 
 fn selection_text_active_modal_dialog(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
+    document: DomHandle,
 ) -> Option<DomHandle> {
     runtime
         .dom_host()
-        .dom()
-        .nodes()
-        .iter()
-        .rev()
-        .find_map(|node| {
-            if !node.is_connected() {
-                return None;
-            }
-            let element = node.as_element()?;
-            (element.is_html_element("dialog")
-                && element.dialog_modal()
-                && element.attribute("open").is_some())
-            .then_some(node.id())
-        })
+        .active_modal_dialog_for_document(document)
 }
 
 fn selection_text_is_inert(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
     state: SelectionTextState,
 ) -> bool {
-    selection_text_has_inert_ancestor(runtime, handle)
-        || state
-            .active_modal_dialog
-            .is_some_and(|dialog| !selection_text_descendant_or_self(runtime, handle, dialog))
+    let modal_escape_root = match state.active_modal_dialog {
+        Some(dialog) if selection_text_descendant_or_self(runtime, handle, dialog) => Some(dialog),
+        Some(_) => return true,
+        None => None,
+    };
+    selection_text_has_inert_ancestor(runtime, handle, modal_escape_root)
 }
 
 fn selection_text_descendant_or_self(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
     ancestor: DomHandle,
 ) -> bool {
@@ -420,13 +443,24 @@ fn selection_text_descendant_or_self(
         if handle == ancestor {
             return true;
         }
-        current = runtime.dom_host().parent_node(handle);
+        current = selection_text_flat_tree_parent(runtime, handle);
     }
     false
 }
 
+fn selection_text_flat_tree_parent(
+    runtime: &crate::native_bridge::PageScriptHost,
+    handle: DomHandle,
+) -> Option<DomHandle> {
+    let parent = runtime.dom_host().composed_parent(handle)?;
+    if runtime.dom_host().is_shadow_root(parent) {
+        return runtime.dom_host().shadow_root_host(parent);
+    }
+    Some(parent)
+}
+
 fn selection_text_user_select_value(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
 ) -> Option<String> {
     let value = inline_css_property_value(runtime, handle, "user-select")
@@ -443,7 +477,7 @@ fn selection_text_user_select_value(
 }
 
 fn selection_text_content_visibility_value(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
 ) -> Option<String> {
     let value =
@@ -457,7 +491,7 @@ fn selection_text_content_visibility_value(
 }
 
 fn inline_css_property_value(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: DomHandle,
     property: &str,
 ) -> Option<String> {
@@ -495,11 +529,7 @@ fn append_rendered_text_node(out: &mut String, text: &str) {
     let trailing = &text[last_non_ws..];
     let body = collapse_whitespace(&text[first_non_ws..last_non_ws]);
 
-    if leading.chars().any(char::is_whitespace)
-        && !leading.contains('\n')
-        && !out.is_empty()
-        && !out.ends_with([' ', '\n'])
-    {
+    if leading.chars().any(char::is_whitespace) && !out.is_empty() && !out.ends_with([' ', '\n']) {
         out.push(' ');
     }
     out.push_str(&body);

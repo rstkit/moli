@@ -1,3 +1,4 @@
+use crate::web_api_interfaces;
 use crate::{
     custom_elements,
     dom::native::{DocumentTitleSetterTarget, Node},
@@ -16,9 +17,9 @@ use super::node::{
     node_runtime_and_handle_from_object_or_detached,
 };
 use super::{
-    JsContextHost, callback_arg_namespace, callback_arg_string, collections,
-    identity::{CollectionKind, LiveCollectionDescriptor, LiveCollectionQueryKind},
-    runtime_ptr_from_object, set_wrapped_handle_or_null, throw_dom_exception,
+    PageScriptHost, callback_arg_namespace, callback_arg_string, collections,
+    identity::{CollectionKind, LiveCollectionQueryKind},
+    runtime_ptr_from_object, set_wrapped_handle_or_null_for_receiver, throw_dom_exception,
     validate_attribute_name, validate_element_name, validate_qualified_element_name_and_namespace,
     validate_qualified_name_and_namespace,
 };
@@ -33,6 +34,7 @@ mod detached_install;
 mod detached_objects;
 mod detached_surface;
 mod hit_test;
+mod insert_html;
 mod lifecycle;
 mod live_collections;
 mod queries;
@@ -112,7 +114,10 @@ pub(in crate::native_bridge) use attributes::{
     detached_get_attribute_node_method_callback, detached_get_attribute_node_ns_method_callback,
     detached_remove_attribute_node_method_callback, detached_set_attribute_node_method_callback,
 };
-use attributes::{live_attr_cache_object, namespace_attr_cache_key, set_attr_cache_entry};
+use attributes::{
+    live_attr_cache_object, namespace_attr_cache_key, new_document_attr_object,
+    set_attr_cache_entry,
+};
 pub(crate) use attributes::{
     live_get_attribute_node_object, live_named_node_map_wrapper, new_attr_object,
 };
@@ -128,6 +133,8 @@ pub(super) use construction::{
 };
 pub(crate) use cookies::{document_cookie_for_receiver, set_document_cookie_for_receiver};
 pub(crate) use css_state::install_adopted_style_sheets_array_primordials;
+#[cfg(test)]
+pub(crate) use css_state::take_owner_font_face_projection_count_for_test;
 pub(in crate::native_bridge) use css_state::{
     AdoptedStyleSheetsArrayOwner, install_adopted_style_sheets_array_mutation_methods,
     normalize_adopted_style_sheets_assignment,
@@ -141,21 +148,18 @@ pub(crate) use css_state::{
     node_document_adopted_style_sheets_getter_function,
     node_document_adopted_style_sheets_setter_function, node_document_style_sheets_getter_function,
 };
-pub(in crate::native_bridge::document) use custom_element_options::parse_import_node_options;
 pub(in crate::native_bridge) use custom_element_options::validate_registry_association_for_document;
-pub(crate) use detached_install::detached_iframe_current_content_document_handle;
+pub(in crate::native_bridge::document) use custom_element_options::{
+    CreateElementOptions, DocumentCreateElementArgs, DocumentCreateElementNsArgs,
+    parse_import_node_options,
+};
 pub(super) use detached_install::install_detached_bridge_methods;
 pub(in crate::native_bridge) use detached_install::{
     clear_detached_iframe_cached_context, clear_detached_iframe_cached_context_for_handle,
-    detached_form_owner_object, detached_form_reset_callback, detached_form_submit_callback,
-    detached_iframe_content_document, detached_iframe_content_window,
-    detached_label_control_object, detached_shadow_root_for_host, set_detached_node_text_content,
-    set_detached_text_replacement_value,
+    detached_form_owner_object, detached_label_control_object, detached_shadow_root_for_host,
+    set_detached_node_text_content, set_detached_text_replacement_value,
 };
 use detached_install::{
-    detached_document_anchors_value, detached_document_applets_value,
-    detached_document_embeds_value, detached_document_forms_value, detached_document_images_value,
-    detached_document_links_value, detached_document_scripts_value,
     install_detached_character_data_instance_properties,
     install_detached_document_instance_properties,
     install_detached_document_type_instance_properties,
@@ -166,20 +170,21 @@ pub(in crate::native_bridge::document) use detached_objects::*;
 pub(crate) use detached_objects::{
     build_detached_cdata_section_object, build_detached_document_object_from_dom_host,
     build_detached_document_object_from_dom_host_with_content_type, detached_node_is_connected,
-    is_valid_pi_target, preserve_detached_element_bridge_for_custom_prototype,
-    read_detached_native_attribute, read_detached_native_attribute_names,
-    read_detached_native_attribute_snapshot, read_detached_native_has_attribute,
+    detached_record_native_tree_mutations, is_valid_pi_target,
+    preserve_detached_element_bridge_for_custom_prototype, read_detached_native_attribute,
+    read_detached_native_attribute_names, read_detached_native_attribute_snapshot,
+    read_detached_native_has_attribute,
     remove_detached_native_attribute_appending_to_current_reaction_queue,
     remove_detached_native_attribute_ns_appending_to_current_reaction_queue,
-    with_detached_native_element_reaction_scope,
     write_detached_native_attribute_appending_to_current_reaction_queue,
     write_detached_native_attribute_ns_appending_to_current_reaction_queue,
 };
 pub(in crate::native_bridge) use detached_objects::{
-    define_detached_native_handle, detached_append_child_method_callback,
-    detached_clone_node_method_callback, detached_doctype_name, detached_doctype_public_id,
-    detached_doctype_system_id, detached_insert_before_method_callback,
-    detached_parent_node_object, detached_processing_instruction_target,
+    canonical_detached_node_object, define_detached_native_handle,
+    detached_append_child_method_callback, detached_clone_node_method_callback,
+    detached_doctype_name, detached_doctype_public_id, detached_doctype_system_id,
+    detached_insert_before_method_callback, detached_parent_node_object,
+    detached_processing_instruction_target, detached_record_tree_mutation,
     detached_remove_child_method_callback, detached_replace_child_method_callback,
     detached_set_owner_document,
 };
@@ -207,7 +212,7 @@ pub(in crate::native_bridge) use detached_objects::{
 pub(in crate::native_bridge) use detached_objects::{
     detached_shadow_root_active_element_value, detached_shadow_root_selection_value,
 };
-pub(in crate::native_bridge::document) use detached_surface::detached_document_content_type_value;
+pub(in crate::native_bridge::document) use detached_surface::create_detached_element_for_document;
 pub(super) use detached_surface::{
     bridge_adopt_node_into_document_callback, bridge_clone_node_into_document_callback,
     bridge_create_cdata_section_not_supported_callback, bridge_create_detached_comment_callback,
@@ -219,9 +224,8 @@ pub(super) use detached_surface::{
     bridge_detached_character_data_getter_callback, bridge_detached_character_data_setter_callback,
     bridge_detached_child_element_count_callback, bridge_detached_child_nodes_callback,
     bridge_detached_children_callback, bridge_detached_clone_node_callback,
-    bridge_detached_contains_callback, bridge_detached_create_cdata_section_callback,
-    bridge_detached_create_comment_callback, bridge_detached_create_document_fragment_callback,
-    bridge_detached_create_element_callback,
+    bridge_detached_create_cdata_section_callback, bridge_detached_create_comment_callback,
+    bridge_detached_create_document_fragment_callback,
     bridge_detached_create_processing_instruction_callback, bridge_detached_create_text_callback,
     bridge_detached_doctype_name_callback, bridge_detached_doctype_public_id_callback,
     bridge_detached_doctype_system_id_callback, bridge_detached_document_base_uri_callback,
@@ -239,8 +243,7 @@ pub(super) use detached_surface::{
     bridge_detached_get_attribute_names_callback, bridge_detached_get_attribute_ns_callback,
     bridge_detached_has_attribute_callback, bridge_detached_has_attribute_ns_callback,
     bridge_detached_has_child_nodes_callback, bridge_detached_insert_before_callback,
-    bridge_detached_is_connected_callback, bridge_detached_is_equal_node_callback,
-    bridge_detached_is_same_node_callback, bridge_detached_last_child_callback,
+    bridge_detached_is_connected_callback, bridge_detached_last_child_callback,
     bridge_detached_last_element_child_callback, bridge_detached_move_before_callback,
     bridge_detached_next_element_sibling_callback, bridge_detached_next_sibling_callback,
     bridge_detached_node_name_callback, bridge_detached_node_type_callback,
@@ -262,6 +265,9 @@ pub(super) use detached_surface::{
 };
 pub(in crate::native_bridge) use detached_surface::{
     detached_element_local_name, detached_element_namespace_uri, detached_element_prefix,
+};
+pub(in crate::native_bridge::document) use detached_surface::{
+    set_detached_document_character_set, set_detached_document_content_type,
 };
 pub(crate) use hit_test::install_caret_position_template_bindings;
 pub(super) use hit_test::{
@@ -289,8 +295,9 @@ pub(super) use queries::{
     bridge_detached_get_elements_by_tag_name_ns_callback, bridge_detached_matches_callback,
     bridge_detached_query_selector_all_callback, bridge_detached_query_selector_callback,
     bridge_document_getter, bridge_get_element_by_id_callback, node_create_node_iterator_callback,
-    node_create_tree_walker_callback, node_document_create_ns_resolver_callback,
-    node_document_evaluate_callback, node_get_element_by_id_callback,
+    node_create_tree_walker_callback, node_document_create_expression_callback,
+    node_document_create_ns_resolver_callback, node_document_evaluate_callback,
+    node_get_element_by_id_callback,
 };
 pub(super) use state::{
     node_document_active_element_getter_function, throw_document_domain_security_error,
@@ -299,13 +306,15 @@ pub(in crate::native_bridge::document) use structure::set_document_body_for_nati
 
 pub(crate) const XHTML_NS: &str = "http://www.w3.org/1999/xhtml";
 pub(crate) const SVG_NS: &str = "http://www.w3.org/2000/svg";
+pub(crate) const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
+pub(crate) const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentMetadataPrototypeDeclaration {
     #[webapi(accessor_property = "URL", getter = document_url_getter_function)]
     url: (),
-    #[webapi(accessor_property = "documentURI", getter = document_uri_getter_function)]
+    #[webapi(accessor_property = "documentURI", getter = document_url_getter_function)]
     document_uri: (),
     #[webapi(accessor_property = "readyState", getter = document_ready_state_getter_function)]
     ready_state: (),
@@ -324,12 +333,12 @@ struct DocumentMetadataPrototypeDeclaration {
         getter = document_last_modified_getter_function
     )]
     last_modified: (),
-    #[webapi(accessor_property, getter = document_referrer_getter_function, receiver = super::receivers::document)]
+    #[webapi(accessor_property, getter = document_referrer_getter_function)]
     referrer: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentStructurePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -342,6 +351,11 @@ struct DocumentStructurePrototypeDeclaration {
         getter = document_document_element_getter_function
     )]
     document_element: (),
+    #[webapi(
+        accessor_property = "rootElement",
+        getter = document_root_element_getter_function
+    )]
+    root_element: (),
     #[webapi(accessor_property, getter = document_doctype_getter_function)]
     doctype: (),
     #[webapi(accessor_property, getter = document_head_getter_function)]
@@ -355,7 +369,7 @@ struct DocumentStructurePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentViewPrototypeDeclaration {
     #[webapi(
         accessor_property = "defaultView",
@@ -365,7 +379,7 @@ struct DocumentViewPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentFocusPrototypeDeclaration {
     #[webapi(
         accessor_property = "activeElement",
@@ -375,7 +389,7 @@ struct DocumentFocusPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentStatePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -399,6 +413,11 @@ struct DocumentStatePrototypeDeclaration {
     #[webapi(accessor_property, getter = document_prerendering_getter_function)]
     prerendering: (),
     #[webapi(
+        accessor_property = "wasDiscarded",
+        getter = document_was_discarded_getter_function
+    )]
+    was_discarded: (),
+    #[webapi(
         accessor_property,
         getter = document_domain_getter_function,
         setter = document_domain_setter_function
@@ -412,7 +431,7 @@ struct DocumentStatePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentCollectionAccessorsPrototypeDeclaration {
     #[webapi(accessor_property, getter = document_forms_getter_function)]
     forms: (),
@@ -433,7 +452,7 @@ struct DocumentCollectionAccessorsPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document")]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentCollectionQueryPrototypeDeclaration {
     #[webapi(
         method,
@@ -462,7 +481,7 @@ struct DocumentCollectionQueryPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentObsoleteMethodsPrototypeDeclaration {
     #[webapi(method, length = 0, callback = document_obsolete_noop_callback)]
     clear: (),
@@ -473,7 +492,7 @@ struct DocumentObsoleteMethodsPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "DocumentFragment")]
+#[webapi(interface = web_api_interfaces::DocumentFragment)]
 struct DocumentFragmentCollectionQueryPrototypeDeclaration {
     #[webapi(method, length = 1, callback = node_get_element_by_id_callback)]
     get_element_by_id: (),
@@ -506,7 +525,7 @@ struct DocumentFragmentCollectionQueryPrototypeDeclaration {
 fn document_receiver_runtime_and_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     let Ok((runtime_ptr, handle)) =
         node_runtime_and_handle_from_object_or_detached(scope, receiver)
     else {
@@ -545,7 +564,7 @@ fn set_document_string_return_value(
 fn set_document_node_return_value_for_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     rv: &mut v8::ReturnValue<'s, v8::Value>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     receiver: v8::Local<'s, v8::Object>,
     handle: Option<DomHandle>,
 ) {
@@ -559,7 +578,7 @@ fn set_document_node_return_value_for_receiver<'s>(
             None => rv.set_null(),
         }
     } else {
-        set_wrapped_handle_or_null(scope, rv, runtime_ptr, Some(handle));
+        set_wrapped_handle_or_null_for_receiver(scope, rv, runtime_ptr, receiver, Some(handle));
     }
 }
 
@@ -580,7 +599,7 @@ fn document_title_getter_function<'s>(
 
 pub(in crate::native_bridge) fn set_document_title_for_handle_appending_to_current_reaction_queue(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     title_text: &str,
 ) {
@@ -656,7 +675,7 @@ fn document_title_setter_function<'s>(
 ) {
     let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, args.this())
     else {
-        rv.set_undefined();
+        throw_type_error(scope, "Illegal invocation");
         return;
     };
     let Some(value) = args.get(0).to_string(scope) else {
@@ -695,6 +714,31 @@ fn document_document_element_getter_function<'s>(
     set_document_node_return_value_for_receiver(scope, &mut rv, runtime_ptr, receiver, element);
 }
 
+fn document_root_element_getter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let receiver = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("generated receiver check validates native Document identity");
+    let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, receiver) else {
+        rv.set_null();
+        return;
+    };
+    let runtime = unsafe { &*runtime_ptr };
+    let dom = runtime.dom_host().dom();
+    let root = dom
+        .node(handle)
+        .and_then(Node::as_document)
+        .and_then(|document| document.document_element_handle(dom, handle))
+        .filter(|root| {
+            dom.node(*root).is_some_and(|node| {
+                node.namespace() == Some(SVG_NS) && node.local_name() == Some("svg")
+            })
+        });
+    set_document_node_return_value_for_receiver(scope, &mut rv, runtime_ptr, receiver, root);
+}
+
 fn document_doctype_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -725,7 +769,7 @@ fn document_head_getter_function<'s>(
 ) {
     let receiver = args.this();
     let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, receiver) else {
-        rv.set_null();
+        throw_type_error(scope, "Illegal invocation");
         return;
     };
     let runtime = unsafe { &*runtime_ptr };
@@ -786,30 +830,6 @@ fn document_url_getter_function<'s>(
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
     let receiver = args.this();
-    if let Some(url) = detached_state_string(scope, receiver, "url") {
-        set_document_string_return_value(scope, &mut rv, &url);
-        return;
-    }
-    let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, receiver) else {
-        rv.set_undefined();
-        return;
-    };
-    let url = unsafe { &*runtime_ptr }
-        .document_url_for_handle(handle)
-        .to_string();
-    set_document_string_return_value(scope, &mut rv, &url);
-}
-
-fn document_uri_getter_function<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s, v8::Value>,
-) {
-    let receiver = args.this();
-    if let Some(url) = detached_state_string(scope, receiver, "documentURI") {
-        set_document_string_return_value(scope, &mut rv, &url);
-        return;
-    }
     let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, receiver) else {
         rv.set_undefined();
         return;
@@ -838,63 +858,6 @@ fn document_ready_state_getter_function<'s>(
     set_document_string_return_value(scope, &mut rv, &ready_state);
 }
 
-fn document_content_type_for_receiver<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-    runtime: &JsContextHost,
-    handle: DomHandle,
-) -> String {
-    if let Some(content_type) =
-        detached_state_string(scope, receiver, "contentType").filter(|value| !value.is_empty())
-    {
-        return content_type;
-    }
-    let Some(document) = runtime.dom_host().node(handle).and_then(Node::as_document) else {
-        return runtime
-            .dom_host()
-            .document_content_type_for_handle(handle)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "application/xml".to_owned());
-    };
-    if document.is_html_document() {
-        let content_type = document.content_type();
-        return if content_type.is_empty() {
-            "text/html".to_owned()
-        } else {
-            content_type.to_owned()
-        };
-    }
-    if let Some(creation_namespace) = detached_state_string(scope, receiver, "creationNamespace")
-        .filter(|value| !value.is_empty())
-    {
-        if creation_namespace == XHTML_NS {
-            return "application/xhtml+xml".to_owned();
-        }
-        if creation_namespace == SVG_NS {
-            return "image/svg+xml".to_owned();
-        }
-    }
-    if let Some(content_type) = runtime.dom_host().document_content_type_for_handle(handle) {
-        return content_type.to_owned();
-    }
-    let root_namespace = document
-        .document_element_handle(runtime.dom_host().dom(), handle)
-        .and_then(|root| runtime.dom_host().node(root))
-        .and_then(Node::as_element)
-        .map(|element| element.namespace().to_owned());
-    if root_namespace.as_deref() == Some(XHTML_NS) {
-        "application/xhtml+xml".to_owned()
-    } else if root_namespace.as_deref() == Some(SVG_NS) {
-        "image/svg+xml".to_owned()
-    } else {
-        runtime
-            .dom_host()
-            .document_content_type_for_handle(handle)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "application/xml".to_owned())
-    }
-}
-
 fn document_content_type_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -906,8 +869,11 @@ fn document_content_type_getter_function<'s>(
         return;
     };
     let runtime = unsafe { &*runtime_ptr };
-    let content_type = document_content_type_for_receiver(scope, receiver, runtime, handle);
-    set_document_string_return_value(scope, &mut rv, &content_type);
+    let Some(content_type) = runtime.dom_host().document_content_type_for_handle(handle) else {
+        rv.set_undefined();
+        return;
+    };
+    set_document_string_return_value(scope, &mut rv, content_type);
 }
 
 fn document_character_set_getter_function<'s>(
@@ -916,20 +882,14 @@ fn document_character_set_getter_function<'s>(
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
     let receiver = args.this();
-    if detached_state_object(scope, receiver).is_some() {
-        let character_set = detached_state_string(scope, receiver, "characterSet")
-            .unwrap_or_else(|| "UTF-8".into());
-        set_document_string_return_value(scope, &mut rv, &character_set);
-        return;
-    }
     let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, receiver) else {
         rv.set_undefined();
         return;
     };
     let runtime = unsafe { &*runtime_ptr };
     let character_set = runtime
-        .child_browsing_context_character_set_for_document_handle(handle)
-        .unwrap_or_else(|| runtime.document_character_set())
+        .document_character_set_for_handle(handle)
+        .unwrap_or("UTF-8")
         .to_owned();
     set_document_string_return_value(scope, &mut rv, &character_set);
 }
@@ -967,13 +927,16 @@ fn document_last_modified_getter_function<'s>(
         return;
     };
     let runtime = unsafe { &*runtime_ptr };
-    let value = moli_time::format_document_last_modified_value(
-        runtime
-            .dom_host()
-            .document_source_last_modified_for_handle(handle),
-        moli_time::unix_epoch_millis(),
-        runtime.timezone_override(),
-    );
+    let format = |timestamp| {
+        let offset = v8::icu::default_time_zone_offset_seconds(timestamp)?;
+        moli_time::format_document_last_modified_value(timestamp, offset)
+    };
+    let value = runtime
+        .dom_host()
+        .document_source_last_modified_for_handle(handle)
+        .and_then(format)
+        .or_else(|| format(moli_time::unix_epoch_millis()))
+        .unwrap_or_else(|| "01/01/1970 00:00:00".to_owned());
     set_document_string_return_value(scope, &mut rv, &value);
 }
 
@@ -991,6 +954,14 @@ fn document_referrer_getter_function<'s>(
     let referrer = runtime
         .child_browsing_context_referrer_for_document_handle(handle)
         .or_else(|| runtime.lightweight_popup_referrer_for_document_handle(handle))
+        .or_else(|| {
+            (handle == runtime.document_handle()).then(|| {
+                runtime
+                    .document_policy_container()
+                    .document_referrer
+                    .as_str()
+            })
+        })
         .unwrap_or("");
     set_document_string_return_value(scope, &mut rv, referrer);
 }
@@ -1060,47 +1031,39 @@ fn document_current_script_getter_function<'s>(
         return;
     }
     let current_script = current_script_handle_for_document(runtime, handle);
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, current_script);
+    set_wrapped_handle_or_null_for_receiver(
+        scope,
+        &mut rv,
+        runtime_ptr,
+        args.this(),
+        current_script,
+    );
 }
 
 fn current_script_handle_for_document(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     document_handle: DomHandle,
 ) -> Option<DomHandle> {
-    if let Some(script) = runtime.current_inline_script_handle()
-        && current_script_belongs_to_document(runtime, script, document_handle)
+    if runtime
+        .child_browsing_context_host_for_document_handle(document_handle)
+        .is_some()
     {
-        return current_script_is_visible_for_document(runtime, script, document_handle)
-            .then_some(script);
+        // This stack belongs to the execution Document. A script can change
+        // its node document or tree while its currentScript value stays set.
+        return runtime.child_current_script_handle_for_document(document_handle);
     }
-    if let Some(script) = runtime.child_current_script_handle_for_document(document_handle) {
-        return current_script_is_visible_for_document(runtime, script, document_handle)
-            .then_some(script);
+    if document_handle != runtime.dom_host().document_handle() {
+        return None;
     }
+    // The executing Document owns currentScript, even if the script is adopted
+    // into another Document before its execution finishes.
+    let dom = runtime.dom_host();
     runtime
-        .current_script_handle()
-        .filter(|script| current_script_is_visible_for_document(runtime, *script, document_handle))
-}
-
-fn current_script_is_visible_for_document(
-    runtime: &JsContextHost,
-    script: DomHandle,
-    document_handle: DomHandle,
-) -> bool {
-    let dom = runtime.dom_host();
-    current_script_belongs_to_document(runtime, script, document_handle)
-        && (!dom.is_connected(script) || dom.containing_shadow_root(script).is_none())
-}
-
-fn current_script_belongs_to_document(
-    runtime: &JsContextHost,
-    script: DomHandle,
-    document_handle: DomHandle,
-) -> bool {
-    let dom = runtime.dom_host();
-    dom.node(script)
-        .and_then(Node::owner_document)
-        .is_some_and(|owner_document| owner_document == document_handle)
+        .current_inline_script_handle()
+        .or_else(|| runtime.current_script_handle())
+        .filter(|script| {
+            !dom.is_connected(*script) || dom.containing_shadow_root(*script).is_none()
+        })
 }
 
 fn document_hidden_getter_function<'s>(
@@ -1108,11 +1071,14 @@ fn document_hidden_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if document_receiver_runtime_and_handle(scope, args.this()).is_none() {
+    let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, args.this())
+    else {
         rv.set_undefined();
         return;
-    }
-    rv.set_bool(false);
+    };
+    let visible = unsafe { &*runtime_ptr }.document_activity().visible
+        && unsafe { &*runtime_ptr }.document_has_browsing_context(handle);
+    rv.set_bool(!visible);
 }
 
 fn document_visibility_state_getter_function<'s>(
@@ -1120,11 +1086,19 @@ fn document_visibility_state_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if document_receiver_runtime_and_handle(scope, args.this()).is_none() {
+    let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, args.this())
+    else {
         rv.set_undefined();
         return;
-    }
-    set_document_string_return_value(scope, &mut rv, "visible");
+    };
+    let state = if unsafe { &*runtime_ptr }.document_activity().visible
+        && unsafe { &*runtime_ptr }.document_has_browsing_context(handle)
+    {
+        "visible"
+    } else {
+        "hidden"
+    };
+    set_document_string_return_value(scope, &mut rv, state);
 }
 
 fn document_prerendering_getter_function<'s>(
@@ -1136,6 +1110,14 @@ fn document_prerendering_getter_function<'s>(
         rv.set_undefined();
         return;
     }
+    rv.set_bool(false);
+}
+
+fn document_was_discarded_getter_function<'s>(
+    _scope: &mut v8::PinScope<'s, '_>,
+    _args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
     rv.set_bool(false);
 }
 
@@ -1163,7 +1145,7 @@ fn document_forms_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Forms);
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Forms);
 }
 
 fn document_images_getter_function<'s>(
@@ -1171,7 +1153,7 @@ fn document_images_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Images);
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Images);
 }
 
 fn document_scripts_getter_function<'s>(
@@ -1179,7 +1161,7 @@ fn document_scripts_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Scripts);
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Scripts);
 }
 
 fn document_links_getter_function<'s>(
@@ -1187,7 +1169,7 @@ fn document_links_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Links);
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Links);
 }
 
 fn document_anchors_getter_function<'s>(
@@ -1195,7 +1177,7 @@ fn document_anchors_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Anchors);
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Anchors);
 }
 
 fn document_embeds_getter_function<'s>(
@@ -1203,7 +1185,7 @@ fn document_embeds_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Embeds);
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Embeds);
 }
 
 fn document_plugins_getter_function<'s>(
@@ -1211,7 +1193,7 @@ fn document_plugins_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Plugins);
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Embeds);
 }
 
 fn document_applets_getter_function<'s>(
@@ -1219,90 +1201,43 @@ fn document_applets_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    document_html_collection_getter(scope, args, rv, DocumentCollectionAccessorKind::Applets);
-}
-
-#[derive(Clone, Copy)]
-enum DocumentCollectionAccessorKind {
-    Forms,
-    Images,
-    Scripts,
-    Links,
-    Anchors,
-    Embeds,
-    Plugins,
-    Applets,
+    document_html_collection_getter(scope, args, rv, LiveCollectionQueryKind::Applets);
 }
 
 fn document_html_collection_getter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
-    kind: DocumentCollectionAccessorKind,
+    kind: LiveCollectionQueryKind,
 ) {
     let receiver = args.this();
     let Some((runtime_ptr, handle)) = document_receiver_runtime_and_handle(scope, receiver) else {
-        rv.set_undefined();
+        throw_type_error(
+            scope,
+            "Document collection getter called on incompatible receiver.",
+        );
         return;
     };
-    let runtime = unsafe { &*runtime_ptr };
-    if !is_html_document(runtime, handle) {
-        rv.set_undefined();
+    let Some(receiver) = canonical_detached_node_object(scope, receiver) else {
         return;
-    }
-    if detached_native_handle_for_runtime(scope, runtime_ptr, receiver).is_some() {
-        match detached_document_collection_for_kind(scope, receiver, kind) {
-            Some(collection) => rv.set(collection.into()),
-            None => rv.set_null(),
-        }
-        return;
-    }
-    let (query_kind, query, tag_name_html_document) = match kind {
-        DocumentCollectionAccessorKind::Forms => (LiveCollectionQueryKind::Forms, None, None),
-        DocumentCollectionAccessorKind::Images => (LiveCollectionQueryKind::Images, None, None),
-        DocumentCollectionAccessorKind::Scripts => (LiveCollectionQueryKind::Scripts, None, None),
-        DocumentCollectionAccessorKind::Links => (LiveCollectionQueryKind::Links, None, None),
-        DocumentCollectionAccessorKind::Anchors => (LiveCollectionQueryKind::Anchors, None, None),
-        DocumentCollectionAccessorKind::Embeds | DocumentCollectionAccessorKind::Plugins => (
-            LiveCollectionQueryKind::TagName,
-            Some("embed".to_owned()),
-            Some(true),
-        ),
-        DocumentCollectionAccessorKind::Applets => (
-            LiveCollectionQueryKind::TagName,
-            Some("__moli-never-match__".to_owned()),
-            Some(true),
-        ),
     };
-    let descriptor = LiveCollectionDescriptor {
-        collection_kind: CollectionKind::HtmlCollection,
-        query_kind,
-        root: handle,
-        query,
-        include_root: true,
-        tag_name_html_document,
-        resolution_cache: Default::default(),
-    };
-    let collection = collections::build_live_collection_wrapper(scope, runtime_ptr, descriptor);
+    // A child Document wrapper can precede its Window realm. Follow the
+    // associated Window once available, including through a borrowed getter.
+    let context = document_associated_window_for_object(scope, runtime_ptr, handle, receiver)
+        .and_then(|window| window.get_creation_context(scope))
+        .or_else(|| receiver.get_creation_context(scope))
+        .expect("Document must have a creation context");
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let collection = collections::build_live_collection_for_node(
+        scope,
+        runtime_ptr,
+        handle,
+        CollectionKind::HtmlCollection,
+        kind,
+        None,
+        false,
+    );
     rv.set(collection.into());
-}
-
-fn detached_document_collection_for_kind<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    document: v8::Local<'s, v8::Object>,
-    kind: DocumentCollectionAccessorKind,
-) -> Option<v8::Local<'s, v8::Object>> {
-    match kind {
-        DocumentCollectionAccessorKind::Forms => detached_document_forms_value(scope, document),
-        DocumentCollectionAccessorKind::Images => detached_document_images_value(scope, document),
-        DocumentCollectionAccessorKind::Scripts => detached_document_scripts_value(scope, document),
-        DocumentCollectionAccessorKind::Links => detached_document_links_value(scope, document),
-        DocumentCollectionAccessorKind::Anchors => detached_document_anchors_value(scope, document),
-        DocumentCollectionAccessorKind::Embeds | DocumentCollectionAccessorKind::Plugins => {
-            detached_document_embeds_value(scope, document)
-        }
-        DocumentCollectionAccessorKind::Applets => detached_document_applets_value(scope, document),
-    }
 }
 
 fn document_default_view_getter_function<'s>(
@@ -1316,22 +1251,48 @@ fn document_default_view_getter_function<'s>(
         rv.set_null();
         return;
     };
+    match document_associated_window_for_object(scope, runtime_ptr, handle, args.this()) {
+        Some(window) => rv.set(window.into()),
+        None => rv.set_null(),
+    }
+}
+
+fn document_associated_window_for_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    document: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
     let runtime = unsafe { &*runtime_ptr };
     if !node_is_document(runtime, handle) {
-        rv.set_null();
-        return;
+        return None;
     }
-    if let Some(window) = get_private_value(scope, args.this(), DOCUMENT_ASSOCIATED_WINDOW_SLOT)
-        && !window.is_null_or_undefined()
+    let backing = super::node::node_backing_object(scope, document)?;
+    if let Some(window) = get_private_value(scope, backing, DOCUMENT_ASSOCIATED_WINDOW_SLOT)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
     {
-        rv.set(window);
-        return;
+        return Some(window);
     }
     if runtime.dom_host().document_handle() != handle {
-        rv.set_null();
-        return;
+        return None;
     }
-    rv.set(scope.get_current_context().global(scope).into());
+    canonical_detached_node_object(scope, document)?
+        .get_creation_context(scope)
+        .map(|context| context.global(scope))
+}
+
+pub(crate) fn document_associated_window_for_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if !node_is_document(unsafe { &*runtime_ptr }, handle) {
+        return None;
+    }
+    let document = unsafe { &mut *runtime_ptr }
+        .native_bridge_mut()
+        .wrap_handle(scope, runtime_ptr, handle)?;
+    document_associated_window_for_object(scope, runtime_ptr, handle, document)
 }
 
 pub(in crate::native_bridge) fn set_document_associated_window<'s>(
@@ -1339,6 +1300,9 @@ pub(in crate::native_bridge) fn set_document_associated_window<'s>(
     document: v8::Local<'s, v8::Object>,
     window: v8::Local<'s, v8::Object>,
 ) {
+    let Some(document) = super::node::node_backing_object(scope, document) else {
+        return;
+    };
     set_private_value(
         scope,
         document,
@@ -1377,14 +1341,14 @@ pub(crate) fn install_document_template_bindings<'s>(
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document")]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentGetElementByIdTemplateDeclaration {
     #[webapi(method = "getElementById", length = 1, callback = node_get_element_by_id_callback)]
     get_element_by_id: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentPrototypeMethodsDeclaration {
     #[webapi(method = "createElement", length = 1, callback = node_create_element_callback)]
     create_element: (),
@@ -1504,17 +1468,21 @@ struct DocumentPrototypeMethodsDeclaration {
         callback = node_document_create_ns_resolver_callback
     )]
     create_ns_resolver: (),
-    #[webapi(method, length = 5, callback = node_document_evaluate_callback)]
+    #[webapi(method, length = 1, callback = node_document_create_expression_callback)]
+    create_expression: (),
+    #[webapi(method, length = 2, callback = node_document_evaluate_callback)]
     evaluate: (),
     #[webapi(
         method = "hasStorageAccess",
         length = 0,
+        returns_promise,
         callback = node_document_has_storage_access_callback
     )]
     has_storage_access: (),
     #[webapi(
         method = "requestStorageAccess",
         length = 0,
+        returns_promise,
         callback = node_document_request_storage_access_callback
     )]
     request_storage_access: (),
@@ -1538,7 +1506,7 @@ pub(in crate::native_bridge) fn node_document_has_storage_access_callback<'s>(
     else {
         return;
     };
-    // SAFETY: document_storage_access_resolver returns a live JsContextHost
+    // SAFETY: document_storage_access_resolver returns a live PageScriptHost
     // pointer from this isolate's native bridge wrapper.
     let has_access = document_storage_access_has_secure_context(scope, unsafe { &*runtime_ptr });
     let _ = resolver.resolve(scope, v8::Boolean::new(scope, has_access).into());
@@ -1554,7 +1522,7 @@ pub(in crate::native_bridge) fn node_document_request_storage_access_callback<'s
     else {
         return;
     };
-    // SAFETY: document_storage_access_resolver returns a live JsContextHost
+    // SAFETY: document_storage_access_resolver returns a live PageScriptHost
     // pointer from this isolate's native bridge wrapper.
     if !document_storage_access_has_secure_context(scope, unsafe { &*runtime_ptr }) {
         reject_document_storage_access_dom_exception(
@@ -1577,7 +1545,7 @@ fn document_storage_access_resolver<'s>(
     args: &v8::FunctionCallbackArguments<'s>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     method: &'static str,
-) -> Option<(v8::Local<'s, v8::PromiseResolver>, *mut JsContextHost)> {
+) -> Option<(v8::Local<'s, v8::PromiseResolver>, *mut PageScriptHost)> {
     let resolver = v8::PromiseResolver::new(scope)?;
     rv.set(resolver.get_promise(scope).into());
     let Ok((runtime_ptr, handle)) =
@@ -1587,13 +1555,13 @@ fn document_storage_access_resolver<'s>(
         return None;
     };
     // SAFETY: node_runtime_and_handle_from_object only returns a non-null
-    // JsContextHost pointer stored on a native bridge wrapper for this isolate.
+    // PageScriptHost pointer stored on a native bridge wrapper for this isolate.
     if !node_is_document(unsafe { &*runtime_ptr }, handle) {
         reject_document_storage_access_receiver(scope, resolver, method);
         return None;
     }
     // SAFETY: node_runtime_and_handle_from_object_or_detached only returns a
-    // non-null JsContextHost pointer from this isolate's native bridge state.
+    // non-null PageScriptHost pointer from this isolate's native bridge state.
     if !unsafe { &*runtime_ptr }.dom_host().is_connected(handle) {
         reject_document_storage_access_dom_exception(
             scope,
@@ -1608,7 +1576,7 @@ fn document_storage_access_resolver<'s>(
 
 fn document_storage_access_has_secure_context(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
 ) -> bool {
     let secure_context_url = runtime
         .current_runtime_window_execution_context_identity(scope)
@@ -1653,15 +1621,16 @@ fn detached_method_forward<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     helper_name: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    let receiver = canonical_detached_node_object(scope, args.this())?;
     let mut forwarded = Vec::with_capacity(args.length() as usize + 1);
-    forwarded.push(args.this().into());
+    forwarded.push(receiver.into());
     for index in 0..args.length() {
         forwarded.push(args.get(index));
     }
     call_global_bridge_method(scope, helper_name, &forwarded)
 }
 
-pub(super) fn is_html_document(runtime: &JsContextHost, handle: DomHandle) -> bool {
+pub(super) fn is_html_document(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)

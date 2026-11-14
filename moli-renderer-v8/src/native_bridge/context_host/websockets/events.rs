@@ -1,4 +1,4 @@
-use super::super::JsContextHost;
+use super::super::PageScriptHost;
 use crate::types::{
     ScriptNetworkOutputItem, SubresourceNetworkRecord, SubresourceResourceType,
     WebSocketFrameDirection, WebSocketFrameOpcode, WebSocketLifecycleEvent, WebSocketNetworkEvent,
@@ -7,14 +7,15 @@ use http::HeaderName;
 use moli_cookie_jar::StoredCookieSetReport;
 use moli_websocket::websocket_cookie_url;
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn record_websocket_open(
         &mut self,
         socket_id: u64,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: moli_fetch::ResponseHeaders,
     ) {
+        let response_headers = response_headers.into_iter().collect::<Vec<_>>();
         let cookie_set_reports =
             self.store_websocket_response_cookies(socket_id, &response_headers);
         let Some(state) = self.websockets.get_mut(&socket_id) else {
@@ -37,7 +38,7 @@ impl JsContextHost {
                 None,
                 SubresourceResourceType::WebSocket,
                 None,
-                Vec::new(),
+                Default::default(),
                 url,
                 response_status,
                 response_headers,
@@ -75,7 +76,7 @@ impl JsContextHost {
                 document_url,
                 url,
                 "GET".to_owned(),
-                Vec::new(),
+                Default::default(),
                 None,
                 SubresourceResourceType::WebSocket,
                 error_text,
@@ -153,7 +154,7 @@ impl JsContextHost {
     fn store_websocket_response_cookies(
         &self,
         socket_id: u64,
-        response_headers: &[(String, String)],
+        response_headers: &[(String, Vec<u8>)],
     ) -> Vec<StoredCookieSetReport> {
         if !response_headers
             .iter()
@@ -169,7 +170,19 @@ impl JsContextHost {
         };
         let response_cookie_url = websocket_cookie_url(&state.url);
         let cookie_store = loader.request_client().cookie_store();
-        let mut store = cookie_store.lock();
+        let mut store = match cookie_store.lock() {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(%error, "WebSocket response cookies could not access storage");
+                return response_headers
+                    .iter()
+                    .filter(|(name, _)| {
+                        response_header_name_is(name, &HeaderName::from_static("set-cookie"))
+                    })
+                    .map(|_| StoredCookieSetReport::store_unavailable())
+                    .collect();
+            }
+        };
         store.store_response_headers_with_reports(&response_cookie_url, response_headers)
     }
 }

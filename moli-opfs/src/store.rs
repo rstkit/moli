@@ -1102,7 +1102,7 @@ impl Opfs {
     fn take_owner_id(&self) -> OpfsResult<u64> {
         self.inner
             .next_owner_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| OpfsError::InvalidState)
@@ -1775,7 +1775,7 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> OpfsResult<()> {
     Ok(())
 }
 
-fn remove_file_if_exists(path: &Path, operation: &'static str) -> OpfsResult<()> {
+pub(super) fn remove_file_if_exists(path: &Path, operation: &'static str) -> OpfsResult<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),

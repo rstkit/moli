@@ -60,7 +60,7 @@ pub(crate) struct RendererPageTaskProducerSenders {
     service_worker: RendererPageServiceWorkerTaskSender,
 }
 
-/// Complete PageVm-stamped capability bundle installed in `JsContextHost`.
+/// Complete PageVm-stamped capability bundle installed in `PageScriptHost`.
 ///
 /// Keeping this bundle intact prevents positional sender tuples and makes a
 /// partially installed Window task surface unrepresentable. Resource
@@ -314,6 +314,12 @@ impl PageRuntimeTaskSource {
 
     pub(crate) fn identity_key(&self) -> usize {
         Rc::as_ptr(&self.page_task_producer_routes) as usize
+    }
+
+    pub(crate) fn next_top_level_navigation_handoff(
+        &self,
+    ) -> super::RendererTopLevelNavigationHandoff {
+        self.wake.next_top_level_navigation_handoff()
     }
 
     pub(crate) fn v8_foreground_task_sender(&self) -> Option<RendererPageV8ForegroundTaskSender> {

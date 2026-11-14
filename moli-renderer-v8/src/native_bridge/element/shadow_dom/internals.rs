@@ -1,10 +1,11 @@
+use crate::web_api_interfaces;
 use crate::{
     context_bootstrap::exposed_interfaces::ensure_intrinsic_interface_prototype,
     custom_elements,
     document_runtime::DomHandle,
     dom::native::Node,
     native_bridge::{
-        JsContextHost, collections,
+        PageScriptHost, collections,
         identity::{CollectionKind, LiveCollectionQueryKind},
     },
     snapshot_form_data_value,
@@ -39,7 +40,7 @@ const ELEMENT_INTERNALS_FORM_VALUE_SLOT: &str = "__moliElementInternalsFormValue
 const ELEMENT_INTERNALS_VALIDITY_SLOT: &str = "__moliElementInternalsValidity";
 const ELEMENT_INTERNALS_VALIDATION_MESSAGE_SLOT: &str = "__moliElementInternalsValidationMessage";
 #[derive(WebApiObject)]
-#[webapi(interface = "ElementInternals")]
+#[webapi(interface = web_api_interfaces::ElementInternals)]
 struct ElementInternalsDeclaration<'scope> {
     #[webapi(slot = ELEMENT_INTERNALS_TARGET_SLOT)]
     target: v8::Local<'scope, v8::Object>,
@@ -47,7 +48,7 @@ struct ElementInternalsDeclaration<'scope> {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "ElementInternals",
+    interface = web_api_interfaces::ElementInternals,
     enumerable,
     prototype_to_string_tag = "ElementInternals"
 )]
@@ -59,7 +60,7 @@ struct ElementInternalsCorePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ElementInternals", enumerable)]
+#[webapi(interface = web_api_interfaces::ElementInternals, enumerable)]
 struct ElementInternalsAccessibilityPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -407,7 +408,7 @@ struct ElementInternalsAccessibilityPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ElementInternals", enumerable)]
+#[webapi(interface = web_api_interfaces::ElementInternals, enumerable)]
 struct ElementInternalsFormPrototypeDeclaration {
     #[webapi(method, length = 1, callback = element_internals_set_form_value_callback)]
     set_form_value: (),
@@ -430,7 +431,7 @@ struct ElementInternalsFormPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ValidityState", data_properties, enumerable)]
+#[webapi(interface = web_api_interfaces::ValidityState, data_properties, enumerable)]
 struct ValidityStateDeclaration {
     value_missing: bool,
     type_mismatch: bool,
@@ -446,7 +447,7 @@ struct ValidityStateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ValidityState", data_properties, enumerable)]
+#[webapi(interface = web_api_interfaces::ValidityState, data_properties, enumerable)]
 struct ValidityStateFlagsUpdateDeclaration {
     value_missing: bool,
     type_mismatch: bool,
@@ -461,20 +462,20 @@ struct ValidityStateFlagsUpdateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ValidityState", data_properties, enumerable)]
+#[webapi(interface = web_api_interfaces::ValidityState, data_properties, enumerable)]
 struct ValidityStateValidUpdateDeclaration {
     valid: bool,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::CustomStateSet)]
 struct CustomStateSetObjectDeclaration<'s> {
     #[webapi(slot = CUSTOM_STATE_SET_BACKING_SLOT)]
     backing: v8::Local<'s, v8::Set>,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CustomStateSet", enumerable)]
+#[webapi(interface = web_api_interfaces::CustomStateSet, enumerable)]
 struct CustomStateSetPrototypeDeclaration {
     #[webapi(accessor_property, getter = custom_state_set_size_getter)]
     size: (),
@@ -614,7 +615,7 @@ pub(crate) fn element_internals_form_value_for_target<'s>(
 
 pub(crate) fn element_internals_validity_for_target_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> FormControlValidity {
     let Some(internals) = element_internals_for_target_handle(scope, runtime_ptr, handle) else {
@@ -625,7 +626,7 @@ pub(crate) fn element_internals_validity_for_target_handle<'s>(
 
 pub(crate) fn element_internals_validation_message_for_target_handle(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> String {
     let Some(internals) = element_internals_for_target_handle(scope, runtime_ptr, handle) else {
@@ -638,7 +639,7 @@ pub(crate) fn element_internals_validation_message_for_target_handle(
 }
 
 pub(crate) fn element_internals_will_validate_for_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> bool {
     internals_will_validate(runtime, handle)
@@ -646,7 +647,7 @@ pub(crate) fn element_internals_will_validate_for_handle(
 
 fn element_internals_for_target_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let target = unsafe { &mut *runtime_ptr }
@@ -682,12 +683,13 @@ fn element_internals_shadow_root_getter_callback<'s>(
         rv.set_null();
         return;
     }
-    let shadow_root = runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, root_handle)
-        .map(Into::into)
-        .unwrap_or_else(|| v8::null(scope).into());
-    rv.set(shadow_root);
+    crate::native_bridge::set_wrapped_handle_or_null_for_receiver(
+        scope,
+        &mut rv,
+        runtime_ptr,
+        args.this(),
+        Some(root_handle),
+    );
 }
 
 fn element_internals_states_getter_callback<'s>(
@@ -718,7 +720,7 @@ fn element_internals_states_getter_callback<'s>(
 fn custom_state_set_target<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     states: v8::Local<'s, v8::Object>,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     let target = get_private_object(scope, states, ELEMENT_INTERNALS_STATES_TARGET_SLOT)?;
     node_runtime_and_handle_from_object(scope, target).ok()
 }
@@ -749,7 +751,7 @@ fn require_custom_state_set_target<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     states: v8::Local<'s, v8::Object>,
     member: &str,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     custom_state_set_target(scope, states).or_else(|| {
         throw_type_error(
             scope,
@@ -1034,7 +1036,7 @@ fn element_internals_element_reference_value_setter_callback<'s>(
 fn ensure_form_associated_target<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     internals: v8::Local<'s, v8::Object>,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     let target = internals_target(scope, internals)?;
     let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, target) else {
         throw_form_not_supported(scope);
@@ -1173,13 +1175,13 @@ fn element_internals_form_getter_callback<'s>(
         rv.set_null();
         return;
     };
-    match unsafe { &mut *runtime_ptr }
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, form_handle)
-    {
-        Some(form) => rv.set(form.into()),
-        None => rv.set_null(),
-    }
+    crate::native_bridge::set_wrapped_handle_or_null_for_receiver(
+        scope,
+        &mut rv,
+        runtime_ptr,
+        args.this(),
+        Some(form_handle),
+    );
 }
 
 fn element_internals_will_validate_getter_callback<'s>(
@@ -1320,7 +1322,7 @@ fn validity_bool_property<'s>(
 
 fn validate_set_validity_anchor(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     target: DomHandle,
     anchor: v8::Local<'_, v8::Value>,
 ) -> bool {
@@ -1378,7 +1380,7 @@ fn validate_set_validity_anchor(
 }
 
 fn shadow_including_tree_contains(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     handle: DomHandle,
 ) -> bool {
@@ -1401,7 +1403,7 @@ fn shadow_including_tree_contains(
     }
 }
 
-fn internals_will_validate(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn internals_will_validate(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
         return false;
     };

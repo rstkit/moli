@@ -1,5 +1,5 @@
 use crate::{
-    document_runtime::EventTargetHandle, dom::native::Node, native_bridge::JsContextHost,
+    document_runtime::EventTargetHandle, dom::native::Node, native_bridge::PageScriptHost,
     util::v8_string,
 };
 
@@ -40,11 +40,13 @@ pub(in crate::native_bridge) fn body_onmessageerror_getter_function<'s>(
         rv.set_null();
         return;
     };
-    runtime.set_registered_event_handler_property(
+    let target_context = scope.get_current_context();
+    runtime.set_registered_content_attribute_event_handler_property(
         scope,
         EventTargetHandle::Window,
         MESSAGEERROR_EVENT_TYPE,
         Some(handler),
+        target_context,
     );
     rv.set(handler.into());
 }
@@ -77,7 +79,7 @@ pub(in crate::native_bridge) fn body_onmessageerror_setter_function<'s>(
 
 pub(crate) fn compile_window_body_onmessageerror_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
 ) -> Option<v8::Local<'s, v8::Function>> {
     let runtime = unsafe { &*host_ptr };
     let document_handle = runtime.document_handle();
@@ -90,7 +92,7 @@ pub(crate) fn compile_window_body_onmessageerror_attribute<'s>(
 }
 fn compile_body_onmessageerror_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     body_handle: crate::document_runtime::DomHandle,
 ) -> Option<v8::Local<'s, v8::Function>> {
     let runtime = unsafe { &*host_ptr };

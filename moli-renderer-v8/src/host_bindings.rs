@@ -9,13 +9,13 @@ use moli_webapi_declare::WebApiObject;
 
 use super::{
     document_runtime::DomHandle,
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
     util::{callback_arg_string, serialize_v8_array, v8_string, v8str},
 };
 use crate::{context_bootstrap::CHILD_BROWSING_CONTEXT_HANDLE_SLOT, util::get_private_value};
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct HostBindingsDeclaration<'scope> {
     external: v8::Local<'scope, v8::External>,
 
@@ -113,9 +113,9 @@ struct HostBindingsDeclaration<'scope> {
 
 pub(super) fn install_host_bindings(
     scope: &mut v8::PinScope<'_, '_>,
-    context_host: &mut JsContextHost,
+    context_host: &mut PageScriptHost,
 ) -> Result<()> {
-    let external = v8::External::new(scope, context_host as *mut JsContextHost as *mut c_void);
+    let external = v8::External::new(scope, context_host as *mut PageScriptHost as *mut c_void);
     let global = scope.get_current_context().global(scope);
     HostBindingsDeclaration::new(external)
         .initialize(scope, global)
@@ -124,10 +124,10 @@ pub(super) fn install_host_bindings(
 
 fn context_host_ptr_from_callback_data(
     data: v8::Local<'_, v8::Value>,
-) -> std::result::Result<*mut JsContextHost, String> {
+) -> std::result::Result<*mut PageScriptHost, String> {
     let external = v8::Local::<v8::External>::try_from(data)
         .map_err(|_| "host callback missing external context data".to_owned())?;
-    let host_ptr = external.value() as *mut JsContextHost;
+    let host_ptr = external.value() as *mut PageScriptHost;
     if host_ptr.is_null() {
         return Err("host callback context pointer was null".to_owned());
     }
@@ -156,7 +156,7 @@ fn callback_value_internal_node_reference_token(
 fn callback_value_dom_handle(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<'_, v8::Value>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     default_document: bool,
 ) -> Option<DomHandle> {
     if value.is_null_or_undefined() {
@@ -171,7 +171,7 @@ fn callback_arg_dom_handle(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
     index: i32,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     default_document: bool,
 ) -> Option<DomHandle> {
     callback_value_dom_handle(scope, args.get(index), host, default_document)
@@ -192,7 +192,7 @@ fn callback_arg_usize(
 fn set_wrapped_handle_or_null(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: Option<DomHandle>,
 ) {
     let Some(handle) = handle else {
@@ -212,7 +212,7 @@ fn set_wrapped_handle_or_null(
 fn set_wrapped_handle_array(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handles: &[DomHandle],
 ) {
     let mut values = Vec::with_capacity(handles.len());
@@ -302,8 +302,19 @@ fn host_lightweight_popup_id_for_object_callback(
         rv.set_null();
         return;
     };
-    let Some(popup_id) = crate::native_bridge::lightweight_popup_id_from_window(scope, object)
-    else {
+    let popup_id =
+        crate::native_bridge::lightweight_popup_id_from_window(scope, object).or_else(|| {
+            let context = object.get_creation_context(scope)?;
+            context.get_slot::<crate::util::MainDefaultWindowContext>()?;
+            if object != context.global(scope) {
+                return None;
+            }
+            let host = crate::util::context_host_ptr_from_context_slot(context)?;
+            unsafe { &*host }
+                .auxiliary_window()
+                .map(|window| window.id())
+        });
+    let Some(popup_id) = popup_id else {
         rv.set_null();
         return;
     };
@@ -444,7 +455,7 @@ fn host_prepare_script_start_callback(
         rv.set_undefined();
         return;
     };
-    match host.plan_and_commit_current_main_runtime_script_start(node, &host_script_handle) {
+    match host.plan_and_commit_current_main_runtime_script_start(scope, node, &host_script_handle) {
         Ok(Some(committed)) => {
             let (_, _, source) = committed.into_parts();
             if let Some(source) = v8_string(scope, &source) {
@@ -612,7 +623,7 @@ fn host_selector_debug_stats_callback(
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct SelectorDebugStatsDeclaration {
     query_selector: u32,
     query_selector_all: u32,

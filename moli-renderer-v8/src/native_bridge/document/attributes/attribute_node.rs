@@ -7,6 +7,7 @@ use crate::native_bridge::element::{
     set_live_element_attribute_appending_to_current_reaction_queue,
     set_live_element_attribute_ns_appending_to_current_reaction_queue,
 };
+use crate::native_bridge::node::node_runtime_and_handle_from_object_or_detached;
 use crate::native_bridge::node_runtime_and_handle_from_object;
 use crate::webidl;
 
@@ -108,6 +109,7 @@ pub(in crate::native_bridge::document) fn live_set_attribute_node<'s>(
     element: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    let element = canonical_detached_node_object(scope, element)?;
     let Ok(attr) = v8::Local::<v8::Object>::try_from(value) else {
         throw_dom_exception(
             scope,
@@ -257,6 +259,7 @@ pub(in crate::native_bridge::document) fn live_remove_attribute_node<'s>(
     element: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    let element = canonical_detached_node_object(scope, element)?;
     let Ok(attr) = v8::Local::<v8::Object>::try_from(value) else {
         throw_dom_exception(
             scope,
@@ -331,6 +334,7 @@ pub(in crate::native_bridge::document) fn detached_native_set_attribute_node<'s>
     element: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    let element = canonical_detached_node_object(scope, element)?;
     read_detached_native_attribute_snapshot(scope, element)?;
     let Ok(attr) = v8::Local::<v8::Object>::try_from(value) else {
         throw_dom_exception(
@@ -428,6 +432,7 @@ pub(in crate::native_bridge::document) fn detached_native_remove_attribute_node<
     element: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    let element = canonical_detached_node_object(scope, element)?;
     read_detached_native_attribute_snapshot(scope, element)?;
     let Ok(attr) = v8::Local::<v8::Object>::try_from(value) else {
         throw_dom_exception(
@@ -527,7 +532,7 @@ fn attr_metadata_from_native_attribute(attribute: &Attribute) -> DetachedAttrNod
 }
 
 fn live_native_attribute_metadata_for_target(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     metadata: &DetachedAttrNodeMetadata,
 ) -> Option<DetachedAttrNodeMetadata> {
@@ -544,7 +549,7 @@ fn live_native_attribute_metadata_for_target(
 }
 
 fn live_native_attribute_metadata_for_name(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     name: &str,
 ) -> Option<DetachedAttrNodeMetadata> {
@@ -566,7 +571,7 @@ fn live_native_attribute_metadata_for_name(
 }
 
 fn live_native_attribute_metadata_for_namespace(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     namespace_uri: Option<&str>,
     local_name: &str,
@@ -585,7 +590,7 @@ fn live_native_attribute_metadata_for_namespace(
 }
 
 fn live_native_attribute_value_for_target(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     metadata: &DetachedAttrNodeMetadata,
 ) -> Option<String> {
@@ -608,24 +613,18 @@ fn live_native_attr_object_from_metadata<'s>(
     let cache = live_attr_cache_object(scope, element)?;
     let namespace_key =
         namespace_attr_cache_key(metadata.namespace_uri.as_deref(), &metadata.local_name);
-    let attr = object_property_as_object(scope, cache, &namespace_key)
-        .or_else(|| {
-            live_attr_metadata_can_alias_qualified_name(metadata)
-                .then(|| object_property_as_object(scope, cache, &metadata.name))
-                .flatten()
-        })
-        .or_else(|| {
-            new_attr_object(
-                scope,
-                &metadata.name,
-                &metadata.value,
-                Some(element),
-                None,
-                metadata.namespace_uri.as_deref(),
-                metadata.prefix.as_deref(),
-                &metadata.local_name,
-            )
-        })?;
+    let attr = object_property_as_object(scope, cache, &namespace_key).or_else(|| {
+        new_attr_object(
+            scope,
+            &metadata.name,
+            &metadata.value,
+            Some(element),
+            None,
+            metadata.namespace_uri.as_deref(),
+            metadata.prefix.as_deref(),
+            &metadata.local_name,
+        )
+    })?;
     if let Some(state) = attr_state_object(scope, attr) {
         attach_attr_node(scope, state, element, &metadata.value);
     }
@@ -682,7 +681,7 @@ fn detach_replaced_live_attr_node<'s>(
 
 fn set_live_attribute_node_native(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     metadata: &DetachedAttrNodeMetadata,
 ) {
@@ -710,7 +709,7 @@ fn set_live_attribute_node_native(
 
 fn remove_live_attribute_node_native(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     metadata: &DetachedAttrNodeMetadata,
 ) {
@@ -732,7 +731,7 @@ fn remove_live_attribute_node_native(
     }
 }
 
-fn nullable_state_string<'s>(
+pub(super) fn nullable_state_string<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     state: v8::Local<'s, v8::Object>,
     property: &str,
@@ -748,30 +747,32 @@ fn nullable_state_string<'s>(
         .filter(|value| !value.is_empty())
 }
 
-fn native_attr_object_by_name<'s>(
+pub(in crate::native_bridge::document) fn native_attr_object_by_name<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     element: v8::Local<'s, v8::Object>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    read_detached_native_attribute_snapshot(scope, element)?
-        .into_iter()
-        .find(|attribute| attribute.name == name)
-        .and_then(|attribute| native_attr_object_from_snapshot(scope, element, &attribute))
+    let (runtime_ptr, handle) =
+        node_runtime_and_handle_from_object_or_detached(scope, element).ok()?;
+    let metadata = live_native_attribute_metadata_for_name(unsafe { &*runtime_ptr }, handle, name)?;
+    live_native_attr_object_from_metadata(scope, element, &metadata)
 }
 
-fn native_attr_object_by_namespace<'s>(
+pub(in crate::native_bridge::document) fn native_attr_object_by_namespace<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     element: v8::Local<'s, v8::Object>,
     namespace_uri: Option<&str>,
     local_name: &str,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    read_detached_native_attribute_snapshot(scope, element)?
-        .into_iter()
-        .find(|attribute| {
-            attribute.namespace_uri.as_deref() == namespace_uri
-                && attribute.local_name == local_name
-        })
-        .and_then(|attribute| native_attr_object_from_snapshot(scope, element, &attribute))
+    let (runtime_ptr, handle) =
+        node_runtime_and_handle_from_object_or_detached(scope, element).ok()?;
+    let metadata = live_native_attribute_metadata_for_namespace(
+        unsafe { &*runtime_ptr },
+        handle,
+        namespace_uri,
+        local_name,
+    )?;
+    live_native_attr_object_from_metadata(scope, element, &metadata)
 }
 
 pub(in crate::native_bridge::document) fn native_attr_object_from_snapshot<'s>(
@@ -779,27 +780,22 @@ pub(in crate::native_bridge::document) fn native_attr_object_from_snapshot<'s>(
     element: v8::Local<'s, v8::Object>,
     attribute: &DetachedNativeAttributeSnapshot,
 ) -> Option<v8::Local<'s, v8::Object>> {
+    let element = canonical_detached_node_object(scope, element)?;
     let cache = live_attr_cache_object(scope, element)?;
     let namespace_key =
         namespace_attr_cache_key(attribute.namespace_uri.as_deref(), &attribute.local_name);
-    let attr = object_property_as_object(scope, cache, &namespace_key)
-        .or_else(|| {
-            native_attr_can_alias_qualified_name(attribute)
-                .then(|| object_property_as_object(scope, cache, &attribute.name))
-                .flatten()
-        })
-        .or_else(|| {
-            new_attr_object(
-                scope,
-                &attribute.name,
-                &attribute.value,
-                Some(element),
-                None,
-                attribute.namespace_uri.as_deref(),
-                attribute.prefix.as_deref(),
-                &attribute.local_name,
-            )
-        })?;
+    let attr = object_property_as_object(scope, cache, &namespace_key).or_else(|| {
+        new_attr_object(
+            scope,
+            &attribute.name,
+            &attribute.value,
+            Some(element),
+            None,
+            attribute.namespace_uri.as_deref(),
+            attribute.prefix.as_deref(),
+            &attribute.local_name,
+        )
+    })?;
     if let Some(state) = attr_state_object(scope, attr) {
         attach_attr_node(scope, state, element, &attribute.value);
     }
@@ -830,12 +826,7 @@ fn cache_attached_attr_node<'s>(
     let namespace_key =
         namespace_attr_cache_key(metadata.namespace_uri.as_deref(), &metadata.local_name);
     set_attr_cache_entry(scope, cache, &namespace_key, attr);
-    if metadata.namespace_uri.is_none()
-        || metadata
-            .prefix
-            .as_deref()
-            .is_some_and(|prefix| !prefix.is_empty())
-    {
+    if live_attr_metadata_can_alias_qualified_name(metadata) {
         set_attr_cache_entry(scope, cache, &metadata.name, attr);
     }
 }
@@ -875,6 +866,29 @@ fn detach_attr_node<'s>(
     );
 }
 
+pub(in crate::native_bridge::document) fn new_document_attr_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
+    name: &str,
+    namespace: Option<&str>,
+    prefix: Option<&str>,
+    local_name: &str,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let context = crate::native_bridge::node_relevant_context(scope, document)
+        .unwrap_or_else(|| scope.get_current_context());
+    let target_scope = &mut v8::ContextScope::new(scope, context);
+    new_attr_object(
+        target_scope,
+        name,
+        "",
+        None,
+        Some(document),
+        namespace,
+        prefix,
+        local_name,
+    )
+}
+
 pub(in crate::native_bridge::document) fn detached_create_attribute_method_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -899,7 +913,7 @@ pub(in crate::native_bridge::document) fn detached_create_attribute_method_callb
         } else {
             parsed.name
         };
-    match new_attr_object(scope, &name, "", None, Some(args.this()), None, None, &name) {
+    match new_document_attr_object(scope, args.this(), &name, None, None, &name) {
         Some(attr) => rv.set(attr.into()),
         None => rv.set_null(),
     }
@@ -923,12 +937,10 @@ pub(in crate::native_bridge::document) fn detached_create_attribute_ns_method_ca
                 return;
             }
         };
-    match new_attr_object(
+    match new_document_attr_object(
         scope,
+        args.this(),
         &parsed.qualified_name,
-        "",
-        None,
-        Some(args.this()),
         namespace.as_deref(),
         prefix.as_deref(),
         &local_name,

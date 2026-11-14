@@ -1,15 +1,18 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
 
 use crate::{
     document_runtime::DomHandle,
     style_engine::{
-        FullStyleWorldSnapshot, PreparedStyleWorldUpdate, StyleObservationSnapshot, StyleViewport,
-        StyleWorldUpdatePlan, StyloComputedStyleSnapshot, StyloStyleEnvironment,
+        FullStyleWorldSnapshot, OwnedStyleSourceDocumentContext, PreparedStyleWorldUpdate,
+        StyleObservationSnapshot, StyleViewport, StyleWorldUpdatePlan, StyloComputedStyleSnapshot,
+        StyloStyleEnvironment,
     },
 };
 
-use super::super::super::super::JsContextHost;
-use super::super::style_viewport_for_document;
+use super::super::super::super::PageScriptHost;
+use super::super::{
+    ancestry::AncestorQueries, computed_style_flat_tree_step, style_viewport_for_document,
+};
 use super::sizing::LayoutSizeReads;
 use super::style_world::{
     StyleObservationKey, prepare_style_world_update, stylesheet_query_fallback,
@@ -48,7 +51,7 @@ impl StyleComputationContext {
 
     pub(super) fn resolved_read_document(
         self,
-        runtime: &JsContextHost,
+        runtime: &PageScriptHost,
         handle: DomHandle,
     ) -> DomHandle {
         runtime
@@ -66,11 +69,16 @@ impl StyleComputationContext {
 /// input is materialized only if that world must be updated or a specialized
 /// query needs it, then shared by every read in this observation.
 pub(crate) struct StyleObservation<'a> {
-    runtime: &'a JsContextHost,
+    runtime: &'a PageScriptHost,
+    #[cfg(test)]
+    read_count: usize,
     /// `None` resolves one stable context per touched Document. Layout and
     /// detached CSSOM snapshots use `Some` to pin an exact caller-owned
     /// viewport instead.
     fixed_context: Option<StyleComputationContext>,
+    /// A capture may observe a temporary media environment without changing
+    /// the Window's live environment or scheduling environment events.
+    environment_override: Option<StyloStyleEnvironment>,
     /// Explicit layout observations may intentionally use a caller-owned
     /// viewport that differs from the Window surface. They advance the style
     /// viewport input epoch, but do not become the baseline for ordinary DOM
@@ -83,10 +91,11 @@ pub(crate) struct StyleObservation<'a> {
     additional_drained_documents: Vec<DomHandle>,
     primary_document: Option<Rc<StyleObservationInputs<'a>>>,
     additional_documents: Vec<Rc<StyleObservationInputs<'a>>>,
+    flat_tree_membership: AncestorQueries<bool>,
 }
 
 pub(super) struct StyleObservationInputs<'a> {
-    runtime: &'a JsContextHost,
+    runtime: &'a PageScriptHost,
     key: StyleObservationKey,
     context: StyleComputationContext,
     /// Page-level media inputs are stable for one synchronous observation.
@@ -98,17 +107,19 @@ pub(super) struct StyleObservationInputs<'a> {
     prepared_update: RefCell<Option<Rc<PreparedStyleWorldUpdate>>>,
     stylesheet_query_snapshot: RefCell<Option<Rc<FullStyleWorldSnapshot>>>,
     layout_sizes: LayoutSizeReads,
+    shadow_roots: RefCell<AncestorQueries<Option<DomHandle>>>,
 }
 
 impl<'a> StyleObservationInputs<'a> {
     fn new(
-        runtime: &'a JsContextHost,
+        runtime: &'a PageScriptHost,
         source_document: Option<DomHandle>,
         context: StyleComputationContext,
         _tracks_persistent_world: bool,
         sizing_target: Option<DomHandle>,
+        environment_override: Option<StyloStyleEnvironment>,
     ) -> Self {
-        let environment = stylo_style_environment(runtime, source_document);
+        let environment = stylo_style_environment(runtime, source_document, environment_override);
         Self {
             runtime,
             key: StyleObservationKey::for_document(runtime, source_document),
@@ -119,6 +130,7 @@ impl<'a> StyleObservationInputs<'a> {
             prepared_update: RefCell::new(None),
             stylesheet_query_snapshot: RefCell::new(None),
             layout_sizes: LayoutSizeReads::new(sizing_target),
+            shadow_roots: RefCell::new(AncestorQueries::default()),
         }
     }
 
@@ -174,9 +186,28 @@ impl<'a> StyleObservationInputs<'a> {
 pub(super) trait RetainedStyleObservation {
     fn style_snapshot(&self, handle: DomHandle) -> Option<StyloComputedStyleSnapshot>;
     fn used_size(&self, handle: DomHandle) -> Option<moli_layout::LayoutUsedSize>;
+    fn containing_shadow_root(&self, handle: DomHandle) -> Option<DomHandle>;
 }
 
 impl RetainedStyleObservation for StyleObservationInputs<'_> {
+    fn containing_shadow_root(&self, handle: DomHandle) -> Option<DomHandle> {
+        let host = self.runtime.dom_host();
+        self.shadow_roots.borrow_mut().resolve(handle, |node| {
+            #[cfg(test)]
+            super::super::snapshot_tests::note_shadow_tree_step();
+            if host.is_shadow_root(node) {
+                return ControlFlow::Break(Some(node));
+            }
+            match host
+                .node(node)
+                .and_then(crate::dom::native::Node::parent_node)
+            {
+                Some(parent) => ControlFlow::Continue(parent),
+                None => ControlFlow::Break(None),
+            }
+        })
+    }
+
     fn used_size(&self, handle: DomHandle) -> Option<moli_layout::LayoutUsedSize> {
         self.layout_sizes
             .get(self.runtime, self.source_document(), handle)
@@ -227,7 +258,7 @@ impl RetainedStyleObservation for StyleObservationInputs<'_> {
 }
 
 impl<'a> StyleObservation<'a> {
-    pub(crate) fn new(runtime: &'a JsContextHost) -> Self {
+    pub(crate) fn new(runtime: &'a PageScriptHost) -> Self {
         Self::new_with_fixed_context(runtime, None, true, None)
     }
 
@@ -240,21 +271,24 @@ impl<'a> StyleObservation<'a> {
     /// scoped context keeps viewport units and media queries aligned with the
     /// numeric layout demand without mutating retained document state.
     pub(crate) fn new_for_document_viewport(
-        runtime: &'a JsContextHost,
+        runtime: &'a PageScriptHost,
         document: DomHandle,
         viewport: StyleViewport,
+        environment_override: Option<StyloStyleEnvironment>,
     ) -> Self {
-        runtime.note_layout_style_viewport(document, viewport);
-        Self::new_with_fixed_context(
+        runtime.note_layout_style_environment(document, viewport, environment_override);
+        let mut observation = Self::new_with_fixed_context(
             runtime,
             Some(StyleComputationContext::new(viewport).with_read_document(Some(document))),
             false,
             None,
-        )
+        );
+        observation.environment_override = environment_override;
+        observation
     }
 
     pub(super) fn new_for_element(
-        runtime: &'a JsContextHost,
+        runtime: &'a PageScriptHost,
         handle: DomHandle,
         context: Option<StyleComputationContext>,
     ) -> Self {
@@ -262,28 +296,81 @@ impl<'a> StyleObservation<'a> {
     }
 
     fn new_with_fixed_context(
-        runtime: &'a JsContextHost,
+        runtime: &'a PageScriptHost,
         fixed_context: Option<StyleComputationContext>,
         tracks_persistent_world: bool,
         sizing_target: Option<DomHandle>,
     ) -> Self {
         Self {
             runtime,
+            #[cfg(test)]
+            read_count: 0,
             fixed_context,
+            environment_override: None,
             tracks_persistent_world,
             sizing_target,
             drained_document: None,
             additional_drained_documents: Vec::new(),
             primary_document: None,
             additional_documents: Vec::new(),
+            flat_tree_membership: AncestorQueries::default(),
         }
     }
 
-    pub(crate) const fn runtime(&self) -> &'a JsContextHost {
+    pub(crate) const fn runtime(&self) -> &'a PageScriptHost {
         self.runtime
     }
 
+    pub(in crate::native_bridge::element::styles) fn prepare_targets(
+        &mut self,
+        handles: impl IntoIterator<Item = DomHandle>,
+    ) {
+        let mut documents = indexmap::IndexMap::<DomHandle, Vec<DomHandle>>::new();
+        for handle in handles {
+            if let Some(document) = self.runtime.dom_host().owner_document_handle(handle) {
+                documents.entry(document).or_default().push(handle);
+            }
+        }
+        for (document, handles) in documents {
+            // Materialize the style world from its shallow root, not an
+            // arbitrarily deep first target. The batch prepares the remaining
+            // requested paths in one borrowed Stylo context.
+            let root = self
+                .runtime
+                .dom_host()
+                .child_handles(document)
+                .find(|&node| {
+                    self.runtime
+                        .dom_host()
+                        .node(node)
+                        .is_some_and(crate::dom::native::Node::is_element)
+                })
+                .unwrap_or(handles[0]);
+            self.read(root);
+            self.runtime
+                .prepare_style_observation_targets(document, &handles);
+        }
+    }
+
+    pub(in crate::native_bridge::element::styles) fn target_is_in_flat_tree(
+        &mut self,
+        handle: DomHandle,
+    ) -> bool {
+        self.flat_tree_membership.resolve(handle, |node| {
+            computed_style_flat_tree_step(self.runtime, node)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn read_count_for_test(&self) -> usize {
+        self.read_count
+    }
+
     pub(crate) fn read(&mut self, handle: DomHandle) -> ComputedStyleRead<'a> {
+        #[cfg(test)]
+        {
+            self.read_count += 1;
+        }
         let read_document = self
             .fixed_context
             .unwrap_or_default()
@@ -395,6 +482,7 @@ impl<'a> StyleObservation<'a> {
             context,
             self.tracks_persistent_world,
             self.sizing_target,
+            self.environment_override,
         ));
         if self.primary_document.is_none() {
             self.primary_document = Some(Rc::clone(&observation));
@@ -410,11 +498,50 @@ impl<'a> StyleObservation<'a> {
 /// read observe the same retained ComputedStyle; Moli follows that model with
 /// canonical Stylo `ElementData` and a lazy observation-local slow path.
 pub(crate) struct ComputedStyleRead<'a> {
-    pub(super) runtime: &'a JsContextHost,
+    pub(super) runtime: &'a PageScriptHost,
     pub(super) handle: DomHandle,
     pub(super) context: StyleComputationContext,
     pub(super) observation_inputs: Rc<StyleObservationInputs<'a>>,
     pub(super) stylo_style: Option<StyloComputedStyleSnapshot>,
+}
+
+/// A document world already updated by the pass's initial style read. Layout
+/// remains synchronous; subsequent anonymous boxes only inherit and cascade.
+pub(crate) struct PreparedAnonymousStyleContext<'a> {
+    runtime: &'a PageScriptHost,
+    document: DomHandle,
+    document_context: OwnedStyleSourceDocumentContext,
+}
+
+impl<'a> PreparedAnonymousStyleContext<'a> {
+    pub(super) fn new(runtime: &'a PageScriptHost, document: DomHandle) -> Self {
+        Self {
+            runtime,
+            document,
+            document_context: runtime.style_source_document_context_for_read_document(document),
+        }
+    }
+
+    pub(crate) const fn document(&self) -> DomHandle {
+        self.document
+    }
+
+    pub(crate) fn computed_values(
+        &self,
+        owner: DomHandle,
+        parent_style: &style::properties::ComputedValues,
+        anonymous_kind: crate::style_engine::StyloAnonymousBoxKind,
+    ) -> Option<style::servo_arc::Arc<style::properties::ComputedValues>> {
+        self.runtime
+            .computed_anonymous_style_snapshot_from_current_observation(
+                owner,
+                parent_style,
+                anonymous_kind,
+                &self.document_context,
+                self.document,
+            )
+            .map(|snapshot| snapshot.computed_values())
+    }
 }
 
 #[cfg(test)]

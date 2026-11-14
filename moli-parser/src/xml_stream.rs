@@ -29,7 +29,9 @@ use crate::{
     ParserPlanningReadView, ParserPumpOutcome, ParserPumpStep, ParserScriptHandoff, ParserYield,
     PreparedScript,
     html::ParseHandle,
-    live_target::{ParserRuntimeDomSinks, ParserStreamHtmlTreeSinkTarget},
+    live_target::{
+        ParserMutationEffectDelivery, ParserRuntimeDomSinks, ParserStreamHtmlTreeSinkTarget,
+    },
     stream::prepare_parser_script_handoff_for_static_document,
     xml_tree_viewer::transform_parser_target_to_xml_tree_view,
 };
@@ -82,6 +84,20 @@ enum RawXmlParserStep {
     Script(NativeNodeId),
     BlockingStylesheet(NativeNodeId),
     InputDrained,
+}
+
+impl XmlStreamDocumentSink {
+    fn mutate_target(
+        &self,
+        mutation: impl FnOnce(&mut ParserStreamHtmlTreeSinkTarget) -> ParserMutationEffectDelivery,
+    ) {
+        let delivery = mutation(&mut self.target.borrow_mut().common);
+        delivery.consume();
+        let finish = self.target.borrow().common.mutation_finisher();
+        if let Some(finish) = finish {
+            let _ = finish();
+        }
+    }
 }
 
 impl XmlDocumentStream {
@@ -424,8 +440,7 @@ impl XmlParserSession {
         let discovered_modulepreload_link_candidates = target
             .common
             .drain_discovered_modulepreload_link_candidates();
-        let discovered_blocking_stylesheet_inputs =
-            target.common.drain_discovered_blocking_stylesheet_inputs();
+        let discovered_stylesheet_inputs = target.common.drain_discovered_stylesheet_inputs();
 
         let result = match raw_step {
             RawXmlParserStep::Script(node_id) => {
@@ -451,7 +466,7 @@ impl XmlParserSession {
             result,
             discovered_async_prefetch_scripts,
             discovered_modulepreload_link_candidates,
-            discovered_blocking_stylesheet_inputs,
+            discovered_stylesheet_inputs,
         }
     }
 
@@ -475,6 +490,7 @@ impl XmlParserSession {
         debug_assert!(input_buffer.is_empty());
         tokenizer.end();
         let mut target = tokenizer.sink.inner.sink.target.borrow_mut();
+        target.common.finish_construction();
         target.present_unstyled_top_level_document_if_needed();
         ParserFinishDiscoverySignals {
             parser_created_null_registry_elements: target
@@ -486,9 +502,7 @@ impl XmlParserSession {
             discovered_parser_meta_csp_candidates: target
                 .common
                 .drain_discovered_parser_meta_csp_candidates(),
-            discovered_blocking_stylesheet_inputs: target
-                .common
-                .drain_discovered_blocking_stylesheet_inputs(),
+            discovered_stylesheet_inputs: target.common.drain_discovered_stylesheet_inputs(),
         }
     }
 }
@@ -572,7 +586,9 @@ impl TreeSink for XmlStreamDocumentSink {
         Self: 'a;
 
     fn finish(self) -> Self::Output {
-        self.target.into_inner()
+        let target = self.target.into_inner();
+        target.common.finish_construction();
+        target
     }
 
     fn parse_error(&self, error: Cow<'static, str>) {
@@ -611,7 +627,7 @@ impl TreeSink for XmlStreamDocumentSink {
         XmlStreamParseHandle::element(
             target
                 .common
-                .create_element(html_name, html_attrs, html_flags),
+                .create_element(html_name, html_attrs, html_flags, None),
             element_name,
         )
     }
@@ -647,11 +663,13 @@ impl TreeSink for XmlStreamDocumentSink {
                 HtmlNodeOrText::AppendText(HtmlStrTendril::from(text.as_ref()))
             }
         };
-        self.target
-            .borrow_mut()
-            .common
-            .append(parent.inner.node_id(), child)
-            .consume();
+        self.mutate_target(|target| {
+            let parent_id = target
+                .template_contents_parent_handle(parent.inner.node_id())
+                .map(|handle| handle.node_id())
+                .unwrap_or_else(|| parent.inner.node_id());
+            target.append(parent_id, child)
+        });
     }
 
     fn append_before_sibling(&self, sibling: &Self::Handle, child: XmlNodeOrText<Self::Handle>) {
@@ -662,11 +680,7 @@ impl TreeSink for XmlStreamDocumentSink {
                 HtmlNodeOrText::AppendText(HtmlStrTendril::from(text.as_ref()))
             }
         };
-        self.target
-            .borrow_mut()
-            .common
-            .append_before_sibling(sibling.inner.node_id(), child)
-            .consume();
+        self.mutate_target(|target| target.append_before_sibling(sibling.inner.node_id(), child));
     }
 
     fn append_based_on_parent_node(
@@ -682,15 +696,13 @@ impl TreeSink for XmlStreamDocumentSink {
                 HtmlNodeOrText::AppendText(HtmlStrTendril::from(text.as_ref()))
             }
         };
-        self.target
-            .borrow_mut()
-            .common
-            .append_based_on_parent_node(
+        self.mutate_target(|target| {
+            target.append_based_on_parent_node(
                 element.inner.node_id(),
                 prev_element.inner.node_id(),
                 child,
             )
-            .consume();
+        });
     }
 
     fn append_doctype_to_document(
@@ -699,15 +711,13 @@ impl TreeSink for XmlStreamDocumentSink {
         public_id: StrTendril,
         system_id: StrTendril,
     ) {
-        self.target
-            .borrow_mut()
-            .common
-            .append_doctype(
+        self.mutate_target(|target| {
+            target.append_doctype(
                 name.to_string(),
                 public_id.to_string(),
                 system_id.to_string(),
             )
-            .consume();
+        });
     }
 
     fn mark_script_already_started(&self, node: &Self::Handle) {
@@ -719,9 +729,9 @@ impl TreeSink for XmlStreamDocumentSink {
 
     fn pop(&self, node: &Self::Handle) {
         let is_script = node.inner.element_name.as_ref().is_some_and(|name| {
-            name.local.as_ref() == "script"
+            AsRef::<str>::as_ref(&name.local) == "script"
                 && matches!(
-                    name.ns.as_ref(),
+                    AsRef::<str>::as_ref(&name.ns),
                     "http://www.w3.org/1999/xhtml" | "http://www.w3.org/2000/svg"
                 )
         });
@@ -756,19 +766,13 @@ impl TreeSink for XmlStreamDocumentSink {
     }
 
     fn remove_from_parent(&self, target: &Self::Handle) {
-        self.target
-            .borrow_mut()
-            .common
-            .remove_from_parent(target.inner.node_id())
-            .consume();
+        self.mutate_target(|parser| parser.remove_from_parent(target.inner.node_id()));
     }
 
     fn reparent_children(&self, node: &Self::Handle, new_parent: &Self::Handle) {
-        self.target
-            .borrow_mut()
-            .common
-            .reparent_children(node.inner.node_id(), new_parent.inner.node_id())
-            .consume();
+        self.mutate_target(|target| {
+            target.reparent_children(node.inner.node_id(), new_parent.inner.node_id())
+        });
     }
 }
 
@@ -787,9 +791,9 @@ fn xml_name_to_html(name: &XmlQualName) -> HtmlQualName {
     HtmlQualName::new(
         name.prefix
             .as_ref()
-            .map(|prefix| HtmlPrefix::from(prefix.as_ref())),
-        HtmlNamespace::from(name.ns.as_ref()),
-        HtmlLocalName::from(name.local.as_ref()),
+            .map(|prefix| HtmlPrefix::from(AsRef::<str>::as_ref(prefix))),
+        HtmlNamespace::from(AsRef::<str>::as_ref(&name.ns)),
+        HtmlLocalName::from(AsRef::<str>::as_ref(&name.local)),
     )
 }
 
@@ -800,22 +804,7 @@ fn xml_attribute_to_html(attribute: XmlAttribute) -> HtmlAttribute {
     }
 }
 
-fn split_xml_parser_input_prefix(input: String, max_bytes: usize) -> (String, Option<String>) {
-    if max_bytes == 0 || input.len() <= max_bytes {
-        return (input, None);
-    }
-    let mut split = input.len();
-    for (index, character) in input.char_indices() {
-        let end = index + character.len_utf8();
-        if end > max_bytes {
-            split = if index == 0 { end } else { index };
-            break;
-        }
-    }
-    let remainder = input[split..].to_owned();
-    let prefix = input[..split].to_owned();
-    (prefix, (!remainder.is_empty()).then_some(remainder))
-}
+use crate::input_prefix::split_parser_input_prefix as split_xml_parser_input_prefix;
 
 struct RuntimeXmlDomSinksParserStep<'a> {
     stream: &'a mut XmlDocumentStream,
@@ -968,6 +957,67 @@ mod tests {
     }
 
     #[test]
+    fn incremental_xhtml_appends_template_children_to_template_contents() {
+        let mut stream = XmlDocumentStream::new(test_url());
+        stream.append_to_end(
+            concat!(
+                "<html xmlns='http://www.w3.org/1999/xhtml'><body>",
+                "<template id='outer'>text<div id='outer-child'/>",
+                "<template id='inner'><span id='inner-child'/></template></template>",
+                "<p id='after'/></body></html>"
+            )
+            .to_owned(),
+        );
+        let document = stream.finish();
+        let outer = element_by_id(&document, "outer").expect("outer template");
+        let inner = element_by_id(&document, "inner").expect("inner template");
+        let outer_child = element_by_id(&document, "outer-child").expect("outer child");
+        let inner_child = element_by_id(&document, "inner-child").expect("inner child");
+        let after = element_by_id(&document, "after").expect("sibling after template");
+        let outer_contents = document
+            .node(outer)
+            .and_then(Node::as_element)
+            .and_then(moli_dom::native::Element::template_contents)
+            .expect("outer template contents");
+        let inner_contents = document
+            .node(inner)
+            .and_then(Node::as_element)
+            .and_then(moli_dom::native::Element::template_contents)
+            .expect("inner template contents");
+        let contents_document = document
+            .node(outer_contents)
+            .and_then(Node::owner_document)
+            .expect("template contents owner document");
+        let inner_contents_document = document
+            .node(inner_contents)
+            .and_then(Node::owner_document)
+            .expect("inner template contents owner document");
+
+        assert_eq!(document.child_ids(outer).count(), 0);
+        assert_eq!(document.child_ids(inner).count(), 0);
+        assert_eq!(
+            document.node(inner).and_then(Node::parent_node),
+            Some(outer_contents)
+        );
+        assert_eq!(
+            document.node(outer_child).and_then(Node::owner_document),
+            Some(contents_document)
+        );
+        assert_eq!(
+            document.node(inner_child).and_then(Node::owner_document),
+            Some(inner_contents_document)
+        );
+        assert_eq!(
+            document.node(inner).and_then(Node::owner_document),
+            Some(contents_document)
+        );
+        assert_eq!(
+            document.node(after).and_then(Node::owner_document),
+            Some(document.document_node_id())
+        );
+    }
+
+    #[test]
     fn incremental_xml_preserves_namespaces_across_many_single_byte_chunks() {
         let mut source = String::from("<root>");
         for index in 0..512 {
@@ -1095,6 +1145,19 @@ mod tests {
             .expect("viewer document element");
         assert_eq!(document_element.local_name(), "html");
         assert_eq!(document_element.namespace(), "http://www.w3.org/1999/xhtml");
+        let style = element_by_id(&document, "xml-viewer-style").expect("viewer stylesheet");
+        assert!(
+            !document.node(style).unwrap().flags().parser_created(),
+            "generated viewer nodes must use ordinary DOM construction"
+        );
+        assert!(
+            !document
+                .node(style)
+                .and_then(Node::as_element)
+                .unwrap()
+                .style_children_parsing(),
+            "the generated viewer stylesheet must finish construction before publication"
+        );
         let source_container = element_by_id(&document, "webkit-xml-viewer-source-xml")
             .expect("viewer source container");
         assert_eq!(

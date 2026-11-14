@@ -1,12 +1,13 @@
+use super::set_wrapped_traversal_node_or_null;
 use super::{
     algorithms::{node_iterator_next_node, node_iterator_previous_node},
     identity::node_iterator_snapshot_from_object,
 };
-use crate::native_bridge::bridge::{set_wrapped_handle_or_null, throw_dom_exception};
+use crate::native_bridge::bridge::throw_dom_exception;
 
-pub(super) fn node_iterator_root_getter(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn node_iterator_root_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let holder = args.this();
@@ -14,17 +15,18 @@ pub(super) fn node_iterator_root_getter(
         rv.set_null();
         return;
     };
-    set_wrapped_handle_or_null(
+    set_wrapped_traversal_node_or_null(
         scope,
         &mut rv,
         snapshot.runtime_ptr,
+        snapshot.state.root,
         Some(snapshot.state.root),
     );
 }
 
-pub(super) fn node_iterator_what_to_show_getter(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn node_iterator_what_to_show_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let holder = args.this();
@@ -35,9 +37,9 @@ pub(super) fn node_iterator_what_to_show_getter(
     rv.set(v8::Number::new(scope, snapshot.state.what_to_show as f64).into());
 }
 
-pub(super) fn node_iterator_filter_getter(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn node_iterator_filter_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let holder = args.this();
@@ -52,9 +54,9 @@ pub(super) fn node_iterator_filter_getter(
     rv.set(filter.value(scope));
 }
 
-pub(super) fn node_iterator_reference_node_getter(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn node_iterator_reference_node_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let holder = args.this();
@@ -62,17 +64,18 @@ pub(super) fn node_iterator_reference_node_getter(
         rv.set_null();
         return;
     };
-    set_wrapped_handle_or_null(
+    set_wrapped_traversal_node_or_null(
         scope,
         &mut rv,
         snapshot.runtime_ptr,
+        snapshot.state.root,
         Some(snapshot.state.reference_node),
     );
 }
 
-pub(super) fn node_iterator_pointer_before_reference_node_getter(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn node_iterator_pointer_before_reference_node_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let holder = args.this();
@@ -83,9 +86,9 @@ pub(super) fn node_iterator_pointer_before_reference_node_getter(
     rv.set_bool(snapshot.state.pointer_before_reference_node);
 }
 
-pub(super) fn node_iterator_next_node_callback(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn node_iterator_next_node_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let holder = args.this();
@@ -116,12 +119,18 @@ pub(super) fn node_iterator_next_node_callback(
     let bridge = unsafe { &mut *snapshot.runtime_ptr }.native_bridge_mut();
     bridge.set_node_iterator_position(snapshot.id, reference_node, pointer_before_reference_node);
     bridge.node_iterator_end(snapshot.id);
-    set_wrapped_handle_or_null(scope, &mut rv, snapshot.runtime_ptr, result);
+    set_wrapped_traversal_node_or_null(
+        scope,
+        &mut rv,
+        snapshot.runtime_ptr,
+        snapshot.state.root,
+        result,
+    );
 }
 
-pub(super) fn node_iterator_previous_node_callback(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(super) fn node_iterator_previous_node_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let holder = args.this();
@@ -152,7 +161,13 @@ pub(super) fn node_iterator_previous_node_callback(
     let bridge = unsafe { &mut *snapshot.runtime_ptr }.native_bridge_mut();
     bridge.set_node_iterator_position(snapshot.id, reference_node, pointer_before_reference_node);
     bridge.node_iterator_end(snapshot.id);
-    set_wrapped_handle_or_null(scope, &mut rv, snapshot.runtime_ptr, result);
+    set_wrapped_traversal_node_or_null(
+        scope,
+        &mut rv,
+        snapshot.runtime_ptr,
+        snapshot.state.root,
+        result,
+    );
 }
 
 pub(super) fn node_iterator_detach_callback(

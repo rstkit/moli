@@ -1,4 +1,9 @@
 use super::*;
+use crate::context_bootstrap::indexed_db::{
+    indexed_db_transaction_mode, indexed_db_transaction_status,
+};
+
+use moli_indexeddb::TransactionMode;
 
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "IDBObjectStore.delete")]
@@ -16,7 +21,20 @@ pub(in crate::context_bootstrap::indexed_db) fn idb_object_store_delete_callback
         return;
     };
     let store = args.this();
-    let Some((request, transaction)) = create_store_request(scope, store) else {
+    if crate::context_bootstrap::indexed_db::indexed_db_object_store_is_deleted(scope, store) {
+        let error = dom_exception_value(
+            scope,
+            "The object store has been deleted.",
+            "InvalidStateError",
+        );
+        scope.throw_exception(error);
+        return;
+    }
+    let Some(transaction) =
+        indexed_db_object_store_transaction(scope, store).filter(|transaction| {
+            indexed_db_transaction_status(scope, *transaction).is_some_and(|state| state.active)
+        })
+    else {
         let error = dom_exception_value(
             scope,
             "The transaction is not active.",
@@ -25,41 +43,38 @@ pub(in crate::context_bootstrap::indexed_db) fn idb_object_store_delete_callback
         scope.throw_exception(error);
         return;
     };
-    let Some(store_name) = indexed_db_object_store_name(scope, store) else {
-        rv.set(request.into());
+    if indexed_db_transaction_mode(scope, transaction) == Some(TransactionMode::ReadOnly) {
+        let error = dom_exception_value(scope, "The transaction is readonly.", "ReadOnlyError");
+        scope.throw_exception(error);
         return;
-    };
-    match parse_idb_key(scope, parsed.key) {
-        Ok(Some(_)) => {}
-        _ => {
-            throw_type_error(scope, "Failed to execute 'delete': invalid key.");
+    }
+    let query = match parse_key_or_range(scope, parsed.key) {
+        Ok(Some(query)) => query,
+        Ok(None) => {
+            let error = dom_exception_value(
+                scope,
+                "The query is not a valid key or key range.",
+                "DataError",
+            );
+            scope.throw_exception(error);
             return;
         }
-    }
-    if !object_bool_property(scope, transaction, INDEXED_DB_TRANSACTION_STARTED_SLOT)
-        .unwrap_or(false)
-    {
-        enqueue_transaction_operation(
-            scope,
-            transaction,
-            store,
-            request,
-            &store_name,
-            IndexedDbTransactionOperationInput::ObjectStoreDelete { key: parsed.key },
-        );
-        rv.set(request.into());
-        return;
-    }
-    let Some(handle) = transaction_handle_from_value(scope, transaction.into()) else {
-        let error = dom_exception_value(
-            scope,
-            "The transaction is not active.",
-            "TransactionInactiveError",
-        );
-        scope.throw_exception(error);
+        Err(error) => {
+            error.throw(scope);
+            return;
+        }
+    };
+    let Some(request) = create_request_object(scope, store.into(), transaction) else {
         return;
     };
-    execute_object_store_delete_request(scope, request, handle, &store_name, parsed.key);
+    queue_transaction_request(scope, transaction, request);
+    schedule_transaction_operation(
+        scope,
+        transaction,
+        store,
+        request,
+        IndexedDbTransactionOperation::ObjectStoreDelete { query },
+    );
     rv.set(request.into());
 }
 
@@ -69,42 +84,28 @@ pub(in crate::context_bootstrap::indexed_db) fn idb_object_store_clear_callback<
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
     let store = args.this();
-    let Some((request, transaction)) = create_store_request(scope, store) else {
-        let error = dom_exception_value(
-            scope,
-            "The transaction is not active.",
-            "TransactionInactiveError",
-        );
+    let Some(transaction) = object_store_active_transaction(scope, store) else {
+        return;
+    };
+    if indexed_db_transaction_mode(scope, transaction) == Some(TransactionMode::ReadOnly) {
+        let error = dom_exception_value(scope, "The transaction is readonly.", "ReadOnlyError");
         scope.throw_exception(error);
-        return;
-    };
-    let Some(store_name) = indexed_db_object_store_name(scope, store) else {
-        rv.set(request.into());
-        return;
-    };
-    if !object_bool_property(scope, transaction, INDEXED_DB_TRANSACTION_STARTED_SLOT)
-        .unwrap_or(false)
-    {
-        enqueue_transaction_operation(
-            scope,
-            transaction,
-            store,
-            request,
-            &store_name,
-            IndexedDbTransactionOperationInput::ObjectStoreClear,
-        );
-        rv.set(request.into());
         return;
     }
-    let Some(handle) = transaction_handle_from_value(scope, transaction.into()) else {
-        let error = dom_exception_value(
-            scope,
-            "The transaction is not active.",
-            "TransactionInactiveError",
-        );
-        scope.throw_exception(error);
+    let Some(context) = store.get_creation_context(scope) else {
         return;
     };
-    execute_object_store_clear_request(scope, request, handle, &store_name);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let Some(request) = create_request_object(scope, store.into(), transaction) else {
+        return;
+    };
+    queue_transaction_request(scope, transaction, request);
+    schedule_transaction_operation(
+        scope,
+        transaction,
+        store,
+        request,
+        IndexedDbTransactionOperation::ObjectStoreClear,
+    );
     rv.set(request.into());
 }

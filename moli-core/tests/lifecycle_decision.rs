@@ -207,14 +207,26 @@ async fn lifecycle_decider_does_not_extend_initial_stage_timeout() -> Result<()>
 #[tokio::test(flavor = "multi_thread")]
 async fn follow_navigation_grace_cannot_extend_fetch_timeout() -> Result<()> {
     let browser = Browser::new(AppConfig::default())?;
+    // Exercise an entered navigation-grace wait. Leave startup/scheduling
+    // margin under parallel load while keeping the fetch budget well below
+    // the ten-second grace that must never extend it.
+    let warm_page = executable_page(
+        browser
+            .fetch_request_document_allow_http_error(Request::get("about:blank")?)
+            .await?,
+    )?;
+    assert_eq!(warm_page.status(), 200);
+    let decider_was_called = Arc::new(Mutex::new(false));
+    let observed_decider = Arc::clone(&decider_was_called);
 
     let result = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         browser.fetch_document_with_lifecycle_decider(
             Request::get("about:blank")?,
             RenderedDomWaitUntil::Done,
-            Duration::from_millis(100),
-            |_| {
+            Duration::from_secs(1),
+            move |_| {
+                *observed_decider.lock() = true;
                 Ok(RendererLifecycleDecision::FollowNextDocument {
                     navigation_grace_ms: 10_000,
                 })
@@ -226,12 +238,16 @@ async fn follow_navigation_grace_cannot_extend_fetch_timeout() -> Result<()> {
     let error = result.expect_err("the original fetch timeout must interrupt successor grace");
 
     assert!(
-        format!("{error:#}").contains("timed out after 100 ms"),
+        format!("{error:#}").contains("timed out after 1000 ms"),
         "error={error:#}"
+    );
+    assert!(
+        *decider_was_called.lock(),
+        "the fetch deadline must interrupt the entered navigation grace"
     );
 
     let page = tokio::time::timeout(
-        Duration::from_secs(1),
+        Duration::from_secs(5),
         browser.fetch_request_document_allow_http_error(Request::get("about:blank")?),
     )
     .await
@@ -494,7 +510,7 @@ async fn http_error_navigation_wait_can_finish_the_current_document() -> Result<
     let browser = Browser::new(AppConfig::default())?;
     let url = server.url("/net/upstream/xhr/404");
 
-    let page = executable_page(
+    let mut page = executable_page(
         browser
             .fetch_document_with_lifecycle_decider(
                 Request::get(&url)?,

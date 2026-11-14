@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use moli_webapi_declare::DataPropertyDescriptorDeclaration;
 
 #[cfg(test)]
@@ -103,12 +104,9 @@ pub(crate) fn new_css_rule_list_object<'s>(
     let list = template
         .new_instance(scope)
         .expect("CSSRuleList object template should instantiate");
-    CssRuleListDeclaration {
-        brand: (),
-        length: 0,
-    }
-    .bind_into(scope, list)
-    .expect("CSSRuleList declaration should bind into list");
+    CssRuleListDeclaration { length: 0 }
+        .bind_into(scope, list)
+        .expect("CSSRuleList declaration should bind into list");
     reset_css_rule_list_materialized_items(scope, list);
     list
 }
@@ -418,7 +416,7 @@ pub(crate) fn ensure_css_rule_list_object<'s>(
     object: v8::Local<'s, v8::Object>,
     member: &'static str,
 ) -> bool {
-    if get_private_value(scope, object, CSS_RULE_LIST_BRAND_SLOT).is_some() {
+    if web_api_interfaces::CSSRuleList::is_instance(scope, object) {
         return true;
     }
     throw_type_error(
@@ -574,10 +572,8 @@ pub(crate) fn css_keyframes_rule_length_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !ensure_css_rule_object(scope, args.this(), "CSSKeyframesRule", "length") {
-        return;
-    }
-    let length = css_keyframes_rule_length(scope, args.this());
+    let this = css_rule_receiver(scope, &args);
+    let length = css_keyframes_rule_length(scope, this);
     rv.set(v8::Integer::new_from_unsigned(scope, length).into());
 }
 

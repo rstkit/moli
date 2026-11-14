@@ -1,3 +1,5 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
 use moli_owner_queue::{OwnerReadyTaskRoute, OwnerReadyTaskSource};
 
 use crate::{
@@ -60,7 +62,7 @@ impl RendererPageDedicatedWorkerClientEventOwner {
 /// their own P3 source is migrated.
 #[derive(Debug)]
 pub(crate) enum RendererDedicatedWorkerMessageEvent {
-    Message(crate::structured_clone::V8StructuredClonePayload),
+    Message(Box<crate::structured_clone::V8StructuredClonePayload>),
     Error {
         message: String,
         filename: String,
@@ -90,8 +92,8 @@ pub(crate) enum RendererDedicatedWorkerClientEvent {
         response_referrer_policy: Option<String>,
         network_partition_key: Option<String>,
         policy_context: SubresourcePolicyContext,
-        content_security_policies: Vec<String>,
-        content_security_report_only_policies: Vec<String>,
+        content_security_policies: Vec<ContentSecurityPolicy>,
+        content_security_report_only_policies: Vec<ContentSecurityPolicy>,
         content_security_reporting_endpoints:
             crate::content_security_policy::ContentSecurityPolicyReportingEndpoints,
     },

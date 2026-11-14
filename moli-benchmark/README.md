@@ -45,12 +45,75 @@ uv run moli-benchmark synthetic \
   --runs 5
 ```
 
+### WebMainBench fetch stability CI
+
+The `WebMainBench · 545 pages` job runs on pull requests, pushes to `main`, and
+manual CI runs. It reuses the verified HEAD release artifact and replays all
+545 frozen HTML pages with `moli fetch --dump markdown --wait done`, a 45-second
+page deadline, and a 55-second process watchdog. Cases run serially without
+retries. Each page must return nonempty Markdown; panics, crashes, timeouts,
+missing results, and unexpected errors fail the job.
+
+The [public dataset](https://huggingface.co/datasets/opendatalab/WebMainBench)
+is pinned to revision `5da0972e9b58d0c7891ae75053ced97c268f52e3` and SHA-256
+`0efaa4b49a45e320a27fe6e5a0b6aad5b57259fc3321ac3448519cacc74c537e`.
+Its original UTF-8 HTML, including inline scripts, is served over local HTTPS.
+The runner requires a fresh Linux network namespace with only loopback; missing
+fixture paths return 404 and external resources are unreachable. Original URLs
+are metadata, not live fetch targets.
+
+One known exception is recorded explicitly: case
+`ccb6033c-0a12-4f9c-8c68-794f26129841` redirects to `langrensha.163.com` and may
+return that host's DNS resolution error. Only this case and error combination
+is accepted; a different failure on that page still fails CI. A successful
+result on that page also passes. The gate checks every case, not a minimum
+aggregate success count.
+
+To run locally from the repository root, use Python 3.11+, `openssl`, `ip`, and
+`unshare` (Debian/Ubuntu packages `iproute2` and `util-linux`):
+
+```bash
+export PYTHONPATH="$PWD/moli-benchmark"
+python3 -m moli_benchmark.webmainbench download \
+  --output target/webmainbench-data/WebMainBench_545.jsonl
+unshare --user --map-root-user --net -- \
+  python3 -m moli_benchmark.webmainbench run \
+  --moli-bin target/release/moli \
+  --dataset target/webmainbench-data/WebMainBench_545.jsonl \
+  --output target/webmainbench-results \
+  --revision "$(git rev-parse HEAD)"
+```
+
+Use a new output directory for each run. On systems that disallow unprivileged
+user namespaces, use `sudo unshare --net -- env PYTHONPATH="$PYTHONPATH" python3 ...`
+as the CI job does. The runner refuses to run against an ordinary network.
+
+The job summary and the existing PR `CI Regression Report` comment report the
+verdict, completion/success counts, expected DNS failures, unexpected failures,
+panics, crashes, timeouts, and empty outputs. The comment includes bounded
+failure details and a link to the source run and artifacts. Missing or malformed
+reports remain visibly unavailable. As with the other aggregate checks, comments
+are updated for same-repository PRs by the trusted default-branch workflow;
+this integration takes effect after these workflow and renderer changes reach
+the default branch.
+
+The `webmainbench-results` artifact retains every page's Markdown, stderr, exit
+status, elapsed time, and HTML/output hashes for seven days, including when the
+check fails. Partial runs retain an incrementally flushed `results.jsonl` for
+diagnosis. This job checks fetch stability on Linux. Official content quality
+scoring is a separate local evaluation: dynamic page content and the upstream
+TEDS adapter issue make the raw composite score unsuitable as a CI threshold.
+
 ### Script-authored semantic WPT
 
 The default semantic profile includes both Window and DedicatedWorker variants
-of `streams/` and `compression/`, plus their `.window.js` and `.worker.js`
-cases. Secure-context `.any.js` cases use the fixture's trustworthy loopback
-origin. To run the complete compression suite through the CLI path:
+of `IndexedDB/`, `streams/` and `compression/`, plus their `.window.js` and
+`.worker.js` cases. The `all` profile keeps these script cases when adding
+layout coverage. SharedWorker and ServiceWorker globals require separate runner
+support. IndexedDB's `.https.html` and `.sub.html` cases also use the fixture's
+secure-context routing and template substitutions in the default profile.
+Secure-context `.any.js` cases use the fixture's trustworthy loopback
+origin. To run the compression Window and DedicatedWorker cases through the CLI path:
 
 ```bash
 uv run python -m moli_benchmark.wpt_cross \
@@ -62,6 +125,31 @@ uv run python -m moli_benchmark.wpt_cross \
 
 Use `--mode cdp` to check the same cases through CDP. Unsupported formats
 remain failures in the report; they are not filtered out of this suite.
+
+HTML crashtests, identified by WPT's `-crash` filename flag or a `crashtests`
+directory, are also included within the semantic profile's existing filters.
+Runs containing crashtests use CDP in `--mode auto`; explicit CLI mode rejects
+them. The runner waits for load, fonts, two animation frames, and removal of
+`test-wait`, dispatching `TestRendered` when needed. Reports record these as
+`crashtest` with zero subtests. An outstanding wait remains a timeout, and a
+renderer crash is reported even when the browser process stays alive.
+
+Explicit cases that reference `testdriver.js` use CDP in `--mode auto`.
+The CDP runner delivers trusted keyboard and mouse/pen input on an independent
+connection, so input can finish while a harness probe awaits a JavaScript
+promise. It supports `click`, ASCII and WebDriver special keys in `send_keys`,
+and keyboard, mouse/pen, wheel, and pause actions. Unsupported touch sources,
+pointer geometry properties, and cross-origin or transformed frame pointer
+coordinates reject the automation request. CLI mode cannot run these input
+cases. The bridge preserves the engine's DOM geometry and hit-test APIs.
+
+The fixture requires `openssl` and serves HTTP and HTTPS on independent ports.
+WSS uses the HTTPS listeners. `.https` tests and HTTPS/WSS template URLs retain
+those transports. Each run creates an ephemeral certificate authority: Moli
+uses `--ca-cert` with normal certificate and hostname verification; Chrome trusts
+only the fixture server public key, following upstream wptrunner's SPKI setup.
+No system trust store is modified. Engines without a fixture trust configuration
+report a setup error rather than silently substituting HTTP for HTTPS.
 
 ### Cross-engine layout WPT
 
@@ -352,6 +440,22 @@ npm run bench -- --help
 Run the command with `--help` to see fixture, public-site, sampling, and output
 options. The pull-request workflows under `.github/workflows/` are the source
 of truth for CI execution and permissions.
+
+## Sampling and failure evidence
+
+Resource samples retain process identities, read errors, and the raw observations
+used for CPU and memory totals. Missing or incomplete reads remain unavailable;
+they are not reported as zero. Thread CPU deltas and process clock ticks are
+recorded separately, including thread retirement and counter precision.
+
+Target shutdown seals the sampler before terminating the engine and records log
+reader EOF, cleanup errors, and timeout results. Startup and cancellation failures
+retain their original exceptions together with the evidence collected so far.
+Sequential CDP receive failures attach already observed messages through
+`cdp_receive_evidence`, without consuming extra messages or replacing the error.
+
+These records improve measurement validity and failure diagnosis. They do not
+change browser rendering policy or establish a performance improvement.
 
 ## Development
 

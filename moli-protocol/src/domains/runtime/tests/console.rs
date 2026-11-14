@@ -63,8 +63,7 @@ async fn runtime_discard_console_entries_is_page_target_local() {
     browser_context.set_active_target_id("TID-active");
     browser_context.attach_active_session("SID-active");
     browser_context.insert_page_target_host(background_target);
-    ctx.conn
-        .install_browser_context_fixture_for_test(browser_context);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser_context));
     ctx.install_navigation_fixture_for_session_owner(
         "data:text/html,<script>console.log('active-discard-peer')</script>",
         Some("SID-active"),
@@ -86,15 +85,16 @@ async fn runtime_discard_console_entries_is_page_target_local() {
     let discard = take_response_by_id(&mut ctx, 206_815);
     assert_eq!(discard["sessionId"], json!("SID-background"));
     assert_eq!(discard["result"], json!({}));
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .expect("browser context should exist")
-            .active_target_id(),
-        Some("TID-active"),
-        "background Runtime.discardConsoleEntries must not activate the target"
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .expect("browser context should exist")
+                .active_target_id(),
+            Some("TID-active"),
+            "background Runtime.discardConsoleEntries must not activate the target"
+        )
+    });
 
     ctx.sent.clear();
     ctx.process_async(json!({
@@ -217,7 +217,7 @@ async fn heap_profiler_agent_commands_dispatch_through_v8_on_loaded_page() {
             "method": method
         })
         .to_string();
-        let step = ctx.conn.start_command_dispatch(&raw);
+        let step = ctx.with_fixture(|conn| conn.start_command_dispatch(&raw));
         assert!(
             matches!(&step, CdpCommandTaskStep::Pending(_)),
             "{method} should dispatch to V8 HeapProfiler agent instead of completing as a protocol-side stub"
@@ -309,7 +309,7 @@ async fn failed_heap_profiler_sampling_command_does_not_create_typed_projection(
         "params": { "samplingInterval": -1 }
     })
     .to_string();
-    let step = ctx.conn.start_command_dispatch(&raw);
+    let step = ctx.with_fixture(|conn| conn.start_command_dispatch(&raw));
     assert!(
         matches!(&step, CdpCommandTaskStep::Pending(_)),
         "invalid sampling options should still reach the V8 HeapProfiler agent"
@@ -501,11 +501,12 @@ async fn deferred_heap_profiler_state_follows_renderer_owned_document_navigation
         "TID-heap-renderer-navigation",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context should exist")
-        .set_target_url(start_url);
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .expect("browser context should exist")
+            .set_target_url(start_url)
+    });
 
     ctx.process_async(json!({
         "id": 206_847,
@@ -514,18 +515,21 @@ async fn deferred_heap_profiler_state_follows_renderer_owned_document_navigation
     }))
     .await;
     assert_eq!(take_response_by_id(&mut ctx, 206_847)["result"], json!({}));
-    let inspector_state = &ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .expect("browser context")
-        .active_page_target()
-        .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
-        .inspector_session_state;
-    assert!(
-        inspector_state.v8_state.is_some(),
-        "successful HeapProfiler commands must persist an opaque V8 state cookie"
-    );
+    ctx.with_fixture(|conn| {
+        let inspector_state = {
+            &conn
+                .browser_context
+                .as_ref()
+                .expect("browser context")
+                .active_page_target()
+                .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
+                .inspector_session_state
+        };
+        assert!(
+            inspector_state.v8_state.is_some(),
+            "successful HeapProfiler commands must persist an opaque V8 state cookie"
+        );
+    });
 
     ctx.process_async(json!({
         "id": 206_848,
@@ -662,13 +666,13 @@ async fn heap_profiler_moli_diagnostics_reports_connection_state_without_loaded_
     );
     assert_eq!(
         isolate_scope["runtimeGetHeapUsageV8HeapScope"],
-        json!("page-vm-document-isolate"),
+        json!("related-page-document-isolate"),
         "diagnostics should label Runtime.getHeapUsage heap scope: {response:?}"
     );
     assert_eq!(
         isolate_scope["runtimeGetHeapUsageV8HeapIsTargetLocal"],
-        json!(true),
-        "diagnostics should make PageVM-local heap stats explicit: {response:?}"
+        json!(false),
+        "diagnostics should make related-Page heap sharing explicit: {response:?}"
     );
     assert_eq!(
         isolate_scope["runtimeGetHeapUsageMoliCountersScope"],
@@ -677,12 +681,12 @@ async fn heap_profiler_moli_diagnostics_reports_connection_state_without_loaded_
     );
     assert_eq!(
         isolate_scope["runtimeCollectGarbageScope"],
-        json!("page-vm-document-isolate"),
+        json!("related-page-document-isolate"),
         "diagnostics should label collectGarbage scope: {response:?}"
     );
     assert_eq!(
         isolate_scope["v8ForegroundTaskWakeScope"],
-        json!("page-vm-document-isolate"),
+        json!("page-runtime"),
         "diagnostics should label V8 foreground task wake scope: {response:?}"
     );
     assert_eq!(
@@ -831,12 +835,7 @@ async fn heap_profiler_moli_reset_idle_engine_only_resets_without_loaded_page() 
         "loaded targets should not be reset by the idle-engine diagnostic: {loaded_response:?}"
     );
 
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context")
-        .remove_active_page_target_async()
-        .await;
+    ctx.remove_active_fixture_target().await;
 
     ctx.process_async(json!({"id": 206_819, "method": "HeapProfiler.moliResetIdleEngine"}))
         .await;
@@ -947,13 +946,15 @@ async fn runtime_disable_stops_v8_runtime_console_api_events() {
 async fn runtime_console_api_called_continues_after_isolated_world_console() {
     let mut ctx = TestContext::new();
     with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
-    let bc = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("browser context should exist");
-    bc.set_active_target_id("TID-1");
-    bc.attach_active_session("SID-1");
+    ctx.with_fixture(|conn| {
+        let bc = {
+            conn.browser_context
+                .as_mut()
+                .expect("browser context should exist")
+        };
+        bc.set_active_target_id("TID-1");
+        bc.attach_active_session("SID-1");
+    });
     let default_context_id =
         enable_runtime_and_take_execution_context_id_async(&mut ctx, 206_820).await;
     let isolated_context_id = create_isolated_world_async(&mut ctx, 206_821, "utility").await;
@@ -1127,10 +1128,24 @@ async fn runtime_timer_cross_document_navigation_with_history_api_emits_full_con
     let auth_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let auth_addr = auth_listener.local_addr().unwrap();
     let auth_url = format!("http://{auth_addr}/auth");
+    let auth_commit_ready = std::sync::Arc::new(tokio::sync::Notify::new());
+    let auth_response_ready = auth_commit_ready.clone();
     let auth_server = tokio::spawn(async move {
-        axum::serve(auth_listener, Router::new().route("/auth", get(auth_page)))
-            .await
-            .unwrap();
+        axum::serve(
+            auth_listener,
+            Router::new().route(
+                "/auth",
+                get(move || {
+                    let ready = auth_response_ready.clone();
+                    async move {
+                        ready.notified().await;
+                        auth_page().await
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
     });
 
     let start_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1147,7 +1162,7 @@ async fn runtime_timer_cross_document_navigation_with_history_api_emits_full_con
                         (
                             [(CONTENT_TYPE.as_str(), "text/html; charset=utf-8")],
                             format!(
-                                "<!doctype html><html><title>start</title><body>start<script>setTimeout(() => location.href = '{}', 20);</script></body></html>",
+                                "<!doctype html><html><title>start</title><body>start<script>function armAuthNavigation() {{ setTimeout(() => location.href = '{}', 0); }}</script></body></html>",
                                 auth_url
                             ),
                         )
@@ -1160,19 +1175,30 @@ async fn runtime_timer_cross_document_navigation_with_history_api_emits_full_con
     });
 
     let start_url = format!("http://{start_addr}/start");
-    let mut ctx = TestContext::new();
-    with_loaded_http_document_async(&mut ctx, &start_url, "SID-1", "TID-1").await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context should exist")
-        .set_target_url(start_url);
-    ctx.enable_background_navigation_scheduler_for_test();
-    let _ = enable_runtime_and_take_execution_context_id_async(&mut ctx, 20_700).await;
-    ctx.sent.clear();
-
+    // Runtime observation is a prerequisite, not part of the navigation under
+    // test. Arm the zero-delay timer only after it is installed; otherwise the
+    // timer can move the source Page into a navigation handoff during setup.
     tokio::task::LocalSet::new()
         .run_until(async {
+            let mut ctx = TestContext::new();
+            with_loaded_http_document_async(&mut ctx, &start_url, "SID-1", "TID-1").await;
+            ctx.with_fixture(|conn| conn
+                .browser_context
+                .as_mut()
+                .expect("browser context should exist")
+                .set_target_url(start_url));
+            ctx.enable_background_navigation_scheduler_for_test();
+            let _ = enable_runtime_and_take_execution_context_id_async(&mut ctx, 20_700).await;
+            ctx.process_async(json!({
+                "id": 20_701,
+                "method": "Runtime.evaluate",
+                "params": {"expression": "armAuthNavigation(); 'armed'", "returnByValue": true}
+            })).await;
+            let armed = take_response_by_id(&mut ctx, 20_701);
+            assert_eq!(armed["result"]["result"]["value"], json!("armed"), "timer arming response: {armed}");
+            ctx.sent.clear();
+            auth_commit_ready.notify_one();
+
             wait_until_message(
                 &mut ctx,
                 Some("SID-1"),
@@ -1584,23 +1610,25 @@ async fn runtime_discard_console_entries_advances_background_owner_without_activ
     .await;
 
     let queue_console_entries = {
-        let runtime_slot = ctx
-            .conn
-            .runtime_session_owner_slot_mut(Some("SID-background"))
-            .expect("background runtime slot should exist");
-        runtime_slot.ingest_owner_page_observable_output_updates();
-        runtime_slot
-            .observable_output_queue_snapshot()
-            .expect("background observable queue should exist")
-            .observable_output_items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item,
-                    moli_core::page::ScriptObservableOutputItem::ConsoleMessage(_)
-                )
-            })
-            .count()
+        ctx.with_fixture(|conn| {
+            let runtime_slot = {
+                conn.runtime_session_owner_slot_mut(Some("SID-background"))
+                    .expect("background runtime slot should exist")
+            };
+            runtime_slot.ingest_owner_page_observable_output_updates();
+            runtime_slot
+                .observable_output_queue_snapshot()
+                .expect("background observable queue should exist")
+                .observable_output_items
+                .iter()
+                .filter(|item| {
+                    matches!(
+                        item,
+                        moli_core::page::ScriptObservableOutputItem::ConsoleMessage(_)
+                    )
+                })
+                .count()
+        })
     };
     assert_eq!(
         queue_console_entries, 1,
@@ -1615,26 +1643,28 @@ async fn runtime_discard_console_entries_advances_background_owner_without_activ
     .await;
     let response = take_response_by_id(&mut ctx, 534);
     assert_eq!(response["result"], json!({}));
-    let browser_context = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .expect("browser context should exist");
-    assert_eq!(
-        browser_context.active_target_id(),
-        Some("TID-active"),
-        "background Runtime.discardConsoleEntries should not activate the target"
-    );
-    assert_eq!(
-        browser_context
-            .background_target("TID-background")
-            .expect("background target must exist")
-            .owner_state
-            .runtime_observable_state
-            .emitted_console_entries(),
-        queue_console_entries,
-        "discardConsoleEntries should advance the background owner observable cursor"
-    );
+    ctx.with_fixture(|conn| {
+        let browser_context = {
+            conn.browser_context
+                .as_ref()
+                .expect("browser context should exist")
+        };
+        assert_eq!(
+            browser_context.active_target_id(),
+            Some("TID-active"),
+            "background Runtime.discardConsoleEntries should not activate the target"
+        );
+        assert_eq!(
+            browser_context
+                .background_target("TID-background")
+                .expect("background target must exist")
+                .owner_state
+                .runtime_observable_state
+                .emitted_console_entries(),
+            queue_console_entries,
+            "discardConsoleEntries should advance the background owner observable cursor"
+        );
+    });
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn background_runtime_get_heap_usage_reads_owner_page_without_activation() {
@@ -1672,12 +1702,13 @@ async fn background_runtime_get_heap_usage_reads_owner_page_without_activation()
         json!("SID-background"),
         "direct response should remain scoped to the background session"
     );
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(|browser_context| browser_context.active_target_id()),
-        Some("TID-active"),
-        "background Runtime.getHeapUsage should not activate the target"
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .and_then(|browser_context| browser_context.active_target_id()),
+            Some("TID-active"),
+            "background Runtime.getHeapUsage should not activate the target"
+        )
+    });
 }

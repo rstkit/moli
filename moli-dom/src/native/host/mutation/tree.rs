@@ -74,9 +74,27 @@ impl DomHost {
         parent: DomHandle,
         child: DomHandle,
     ) -> DomMutationEffects {
+        self.remove_child_effects_with_state_preservation(parent, child, false)
+    }
+
+    pub fn remove_child_preserving_state_effects(
+        &mut self,
+        parent: DomHandle,
+        child: DomHandle,
+    ) -> DomMutationEffects {
+        self.remove_child_effects_with_state_preservation(parent, child, true)
+    }
+
+    fn remove_child_effects_with_state_preservation(
+        &mut self,
+        parent: DomHandle,
+        child: DomHandle,
+        is_atomic_move: bool,
+    ) -> DomMutationEffects {
         let owner_document = self.owner_document_handle(parent);
         let records_enabled = self.mutation_records_enabled();
         let removed_tree_was_connected = self.is_connected(child);
+        let parser_form_owner_resets = self.parser_form_owner_resets_for_removed_subtrees(&[child]);
         let removal_context = self.subtree_removal_context(child);
         let removed_shadow_slot_assignment_snapshots = self
             .slot_assignment_snapshots_for_removed_shadow_tree_slots(&removal_context.shadow_slots);
@@ -96,21 +114,28 @@ impl DomHost {
             .unwrap_or_default();
         let previous_sibling = self.node(child).and_then(Node::prev_sibling);
         let next_sibling = self.node(child).and_then(Node::next_sibling);
-        let candidate_changes = self
-            .dom
-            .remove_child_with_stylesheet_candidate_changes(parent, child);
+        let candidate_changes = if is_atomic_move {
+            self.dom
+                .remove_child_preserving_state_with_stylesheet_candidate_changes(parent, child)
+        } else {
+            self.dom
+                .remove_child_with_stylesheet_candidate_changes(parent, child)
+        };
         if let Some(candidate_changes) = candidate_changes {
             self.invalidate_shadow_slot_name_index_for_tree_parent(parent);
             self.prune_disconnected_hovered_elements();
+            self.reset_parser_form_owners_after_subtree_removal(child, &parser_form_owner_resets);
             let mut effects = DomMutationEffects::changed();
             effects.extend_stylesheet_candidate_changes(candidate_changes);
             self.clear_popover_open_states(&removal_context.open_popovers, &mut effects);
-            effects.extend_stylesheet_owner_changes(
-                self.sync_shadow_tree_scopes_for_removed_subtree(
-                    &removal_context.shadow_hosts,
-                    removed_tree_was_connected,
-                ),
-            );
+            if !is_atomic_move {
+                effects.extend_stylesheet_owner_changes(
+                    self.sync_shadow_tree_scopes_for_removed_subtree(
+                        &removal_context.shadow_hosts,
+                        removed_tree_was_connected,
+                    ),
+                );
+            }
             self.record_mutation(MutationScope::QueryState);
             if let Some(document) = owner_document {
                 self.update_document_target_from_url(document);
@@ -205,6 +230,20 @@ impl DomHost {
         }
     }
 
+    fn clear_removed_shadow_modal_dialogs(&mut self, shadow_hosts: &[DomHandle]) {
+        let mut stack = shadow_hosts
+            .iter()
+            .filter_map(|host| self.shadow_root_handle(*host))
+            .collect::<Vec<_>>();
+        while let Some(handle) = stack.pop() {
+            self.dom.set_dialog_modal(handle, false);
+            stack.extend(self.child_handles(handle));
+            if let Some(root) = self.shadow_root_handle(handle) {
+                stack.push(root);
+            }
+        }
+    }
+
     pub fn insert_before(
         &mut self,
         parent: DomHandle,
@@ -220,6 +259,25 @@ impl DomHost {
         parent: DomHandle,
         child: DomHandle,
         reference_child: Option<DomHandle>,
+    ) -> DomMutationEffects {
+        self.insert_before_effects_with_state_preservation(parent, child, reference_child, false)
+    }
+
+    pub fn insert_before_preserving_state_effects(
+        &mut self,
+        parent: DomHandle,
+        child: DomHandle,
+        reference_child: Option<DomHandle>,
+    ) -> DomMutationEffects {
+        self.insert_before_effects_with_state_preservation(parent, child, reference_child, true)
+    }
+
+    fn insert_before_effects_with_state_preservation(
+        &mut self,
+        parent: DomHandle,
+        child: DomHandle,
+        reference_child: Option<DomHandle>,
+        is_atomic_move: bool,
     ) -> DomMutationEffects {
         let reference_child = if reference_child == Some(child) {
             self.node(child).and_then(Node::next_sibling)
@@ -316,6 +374,9 @@ impl DomHost {
         } else {
             inserted_fragment_children.clone()
         };
+        let had_implicit_removal = removal_record.is_some();
+        let parser_form_owner_resets =
+            self.parser_form_owner_resets_for_removed_subtrees(&inserted_roots);
         let checked_radio_form_owners_before_insert =
             self.checked_radio_form_owner_snapshots_in_subtrees(&inserted_roots);
         let inserted_option_owner_snapshots =
@@ -323,21 +384,51 @@ impl DomHost {
         let inserted_shadow_slot_assignment_snapshots =
             self.slot_assignment_snapshots_for_inserted_shadow_tree_slots(parent, &inserted_roots);
         let previous_shadow_root = self.containing_shadow_root(child);
-        let candidate_changes = self.dom.insert_before_with_stylesheet_candidate_changes(
-            parent,
-            child,
-            reference_child,
-        );
+        let candidate_changes = if is_atomic_move {
+            self.dom
+                .insert_before_preserving_state_with_stylesheet_candidate_changes(
+                    parent,
+                    child,
+                    reference_child,
+                )
+        } else {
+            self.dom
+                .insert_before_with_stylesheet_candidate_changes(parent, child, reference_child)
+        };
         if let Some(candidate_changes) = candidate_changes {
+            if inserted_fragment_children.is_empty()
+                && self.node(child).is_some_and(Node::is_document_fragment)
+            {
+                // The insertion was valid, but an empty fragment has no
+                // mutation payloads or tree invalidations. Keep the success
+                // flag used by appendChild/insertBefore callers.
+                return DomMutationEffects::changed();
+            }
+            if !is_atomic_move
+                && single_child_was_connected_before_insert
+                && let Some((_, _, context, _)) = implicit_removal_slot_state.as_ref()
+            {
+                // Shadow descendants are retargeted separately from the light tree.
+                // An ordinary append/insert ends their modal openings as well.
+                self.clear_removed_shadow_modal_dialogs(&context.shadow_hosts);
+            }
             if let Some(shadow_root) = previous_shadow_root {
                 self.invalidate_shadow_slot_name_index(shadow_root);
             }
             self.invalidate_shadow_slot_name_index_for_tree_parent(parent);
-            self.normalize_checked_radio_groups_after_form_owner_changes(
-                &checked_radio_form_owners_before_insert,
+            self.reset_parser_form_owners_after_subtree_insertion(
+                &inserted_roots,
+                had_implicit_removal,
+                &parser_form_owner_resets,
             );
             self.normalize_selected_options_after_owner_select_changes(
                 &inserted_option_owner_snapshots,
+            );
+            self.normalize_checked_radio_groups_after_form_owner_changes(
+                &checked_radio_form_owners_before_insert,
+            );
+            self.normalize_checked_radio_groups_after_form_owner_changes(
+                &checked_radio_form_owners_before_insert,
             );
             let new_owner_document = self.owner_document_handle(parent);
             let removed_connected_shadow_tree = single_child_was_connected_before_insert
@@ -556,6 +647,46 @@ impl DomHost {
         self.set_text_content_effects(handle, value).did_change()
     }
 
+    /// Appends parser character tokens while retaining the text node's capacity.
+    /// Old text is copied only when mutation records need its previous value.
+    pub fn append_text_to_text_node_effects(
+        &mut self,
+        handle: DomHandle,
+        value: &str,
+    ) -> DomMutationEffects {
+        if value.is_empty() {
+            return DomMutationEffects::default();
+        }
+        let records_enabled = self.mutation_records_enabled();
+        let Some(text) = self
+            .node_mut(handle)
+            .and_then(|node| node.data_mut().as_text_mut())
+        else {
+            return DomMutationEffects::default();
+        };
+        let old_value = records_enabled.then(|| text.data().to_owned());
+        text.append_data(value);
+        self.text_data_mutation_effects(handle, records_enabled, old_value)
+    }
+
+    fn text_data_mutation_effects(
+        &mut self,
+        handle: DomHandle,
+        records_enabled: bool,
+        old_value: Option<String>,
+    ) -> DomMutationEffects {
+        self.record_mutation(MutationScope::QueryState);
+        let mut effects = self.node_update_effects(handle);
+        effects.mark_style_character_data_mutation(handle);
+        if let Some(parent) = self.parent_node(handle) {
+            self.mark_stylesheet_owner_contents_change_for_parent(&mut effects, parent);
+        }
+        if records_enabled {
+            effects.mark_character_data_mutation(handle, old_value);
+        }
+        effects
+    }
+
     pub fn set_text_content_effects(
         &mut self,
         handle: DomHandle,
@@ -609,16 +740,7 @@ impl DomHost {
                 if !changed {
                     return DomMutationEffects::default();
                 }
-                self.record_mutation(MutationScope::QueryState);
-                let mut effects = self.node_update_effects(handle);
-                effects.mark_style_character_data_mutation(handle);
-                if let Some(parent) = self.parent_node(handle) {
-                    self.mark_stylesheet_owner_contents_change_for_parent(&mut effects, parent);
-                }
-                if records_enabled {
-                    effects.mark_character_data_mutation(handle, old_value);
-                }
-                effects
+                self.text_data_mutation_effects(handle, records_enabled, old_value)
             }
             NodeType::Element | NodeType::DocumentFragment => {
                 let children = self.child_handles(handle).collect::<Vec<_>>();
@@ -877,7 +999,9 @@ impl DomHost {
         effects: &mut DomMutationEffects,
         parent: DomHandle,
     ) {
-        if self.is_inline_style_sheet_owner(parent) {
+        if self.is_inline_style_sheet_owner(parent)
+            && !self.is_style_element_parsing_children(parent)
+        {
             effects.mark_stylesheet_owner_contents_change(
                 parent,
                 self.dom.stylesheet_candidate_tree_scope_for_node(parent),

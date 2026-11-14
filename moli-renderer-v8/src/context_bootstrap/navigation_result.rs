@@ -11,6 +11,7 @@ pub(super) use super::navigation_lifecycle::{
     perform_navigation_scroll_if_needed, reset_navigation_focus_if_unchanged,
 };
 use super::*;
+use crate::context_bootstrap::navigation_entry::wrappers as entry_wrappers;
 use crate::util::{get_private_value, set_private_value};
 use moli_webapi_declare::WebApiObject;
 
@@ -24,7 +25,7 @@ const NAVIGATION_ACTIVE_CROSS_DOCUMENT_PENDING_SLOT: &str =
     "__lmNavigationActiveCrossDocumentPending";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NavigationResultDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     committed: v8::Local<'scope, v8::Promise>,
@@ -33,7 +34,7 @@ struct NavigationResultDeclaration<'scope> {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NavigationResultFallbackDeclaration {
     #[webapi(data_property, enumerable, name = "committed", init = "undefined")]
     committed: (),
@@ -42,7 +43,7 @@ struct NavigationResultFallbackDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct CapturedPromiseResolverRecordDeclaration {
     #[webapi(data_property = "resolve", init = "undefined")]
     resolve: (),
@@ -51,7 +52,7 @@ struct CapturedPromiseResolverRecordDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct CapturedPromiseResolverFunctionsDeclaration<'scope> {
     #[webapi(data_property)]
     resolve: v8::Local<'scope, v8::Value>,
@@ -60,7 +61,7 @@ struct CapturedPromiseResolverFunctionsDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct CrossDocumentPendingNavigationDeclaration<'scope> {
     #[webapi(
         slot = CROSS_DOCUMENT_PENDING_ACTIVE_SLOT,
@@ -226,10 +227,18 @@ pub(super) fn queue_same_document_navigation_success<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     navigation: v8::Local<'s, v8::Object>,
     signal: Option<v8::Local<'s, v8::Object>>,
-    href: &str,
+    fallback_scroll_href: Option<&str>,
 ) {
     queue_same_document_navigation_finished(
-        scope, navigation, signal, None, None, None, None, None, href,
+        scope,
+        navigation,
+        signal,
+        None,
+        None,
+        None,
+        None,
+        None,
+        fallback_scroll_href.unwrap_or_default(),
     );
 }
 
@@ -292,18 +301,18 @@ pub(super) fn cancel_pending_same_document_navigation_finishes<'s>(
     let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
         return canceled;
     };
-    let host = unsafe { &mut *host_ptr };
-    let pending = host.take_pending_navigation_finished_results_for_navigation(scope, navigation);
+    let pending = unsafe { &mut *host_ptr }
+        .take_pending_navigation_finished_results_for_navigation(scope, navigation);
     if pending.is_empty() {
         return canceled;
     }
     canceled = true;
     for result in pending {
-        host.cancel_navigation_lifecycle_attempt(result.attempt_id);
+        unsafe { &mut *host_ptr }.cancel_navigation_lifecycle_attempt(result.attempt_id);
         let error = navigation_dom_exception(scope, "Navigation was canceled", "AbortError");
         if let Some(signal) = result.signal {
             let signal = v8::Local::new(scope, signal);
-            host.abort_signal(scope, signal, error);
+            crate::native_bridge::abort::abort_signal(scope, signal, error);
         }
         finish_navigation_error_events(scope, navigation, error, &result.href);
         if let (Some(resolve), Some(value)) = (result.committed_resolve, result.resolved_value) {
@@ -354,13 +363,13 @@ pub(super) fn cancel_active_cross_document_navigation<'s>(
     clear_active_cross_document_navigation(scope, navigation);
     let error = navigation_dom_exception(scope, "Navigation was canceled", "AbortError");
     if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
-        let host = unsafe { &mut *host_ptr };
+        // Remove the old load before abort listeners can start a successor.
+        unsafe { &mut *host_ptr }.clear_pending_location_navigation();
         if let Some(signal) = get_private_value(scope, data, CROSS_DOCUMENT_PENDING_SIGNAL_SLOT)
             .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
         {
-            host.abort_signal(scope, signal, error);
+            crate::native_bridge::abort::abort_signal(scope, signal, error);
         }
-        host.clear_pending_location_navigation();
     }
     finish_navigation_error_events(scope, navigation, error, &href);
     let receiver = v8::undefined(scope).into();
@@ -471,6 +480,8 @@ pub(super) fn navigation_immediate_result_with_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     resolved_value: v8::Local<'s, v8::Value>,
 ) -> v8::Local<'s, v8::Object> {
+    let context = scope.get_current_context();
+    let resolved_value = entry_wrappers::value_in_realm(scope, resolved_value, context);
     let Some(committed_resolver) = v8::PromiseResolver::new(scope) else {
         return navigation_result_fallback_object(scope);
     };
@@ -621,13 +632,13 @@ fn navigation_result_with_task_finished<'s>(
             let task = host
                 .take_pending_navigation_api_task(task_id)
                 .expect("a rejected Navigation API route must retain its Host-local payload");
-            reject_pending_navigation_api_task(scope, host, task.action);
+            reject_pending_navigation_api_task(scope, task.action);
         }
     } else {
         host.cancel_navigation_lifecycle_attempt(attempt_id);
         let error = navigation_dom_exception(scope, "Navigation was canceled", "AbortError");
         if let Some(signal) = signal {
-            host.abort_signal(scope, signal, error);
+            crate::native_bridge::abort::abort_signal(scope, signal, error);
         }
         finish_navigation_error_events(scope, navigation, error, href);
         settle_navigation_finished_rejected(scope, finished_reject, error);
@@ -688,17 +699,18 @@ pub(crate) fn apply_pending_navigation_finished_result<'s>(
 
 fn reject_pending_navigation_api_task<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host: &mut JsContextHost,
     action: crate::native_bridge::PendingNavigationApiTaskAction,
 ) {
     match action {
         crate::native_bridge::PendingNavigationApiTaskAction::FinishResult(result) => {
-            host.cancel_navigation_lifecycle_attempt(result.attempt_id);
+            if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
+                unsafe { &mut *host_ptr }.cancel_navigation_lifecycle_attempt(result.attempt_id);
+            }
             let navigation = v8::Local::new(scope, result.navigation);
             let error = navigation_dom_exception(scope, "Navigation was canceled", "AbortError");
             if let Some(signal) = result.signal {
                 let signal = v8::Local::new(scope, signal);
-                host.abort_signal(scope, signal, error);
+                crate::native_bridge::abort::abort_signal(scope, signal, error);
             }
             finish_navigation_error_events(scope, navigation, error, &result.href);
             if let Some(reject) = result.finished_reject {

@@ -1,3 +1,5 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
 mod registration;
 
 use crate::structured_clone::V8StructuredClonePayload;
@@ -9,6 +11,11 @@ pub(crate) enum WorkerOwnerScope {
     Top,
     Child(crate::document_runtime::DomHandle),
     LightweightPopup(u64),
+}
+
+pub(super) struct WorkerModuleStaticImportPolicySnapshot {
+    pub(super) initiator_url: url::Url,
+    pub(super) content_security_policies: Vec<ContentSecurityPolicy>,
 }
 
 pub(super) enum WorkerExecutionState {
@@ -26,8 +33,10 @@ pub(super) enum WorkerExecutionState {
         outside_settings_load: crate::network::loads::ResourceLoadLease,
         name: String,
         module_credentials_mode: moli_fetch::RequestCredentialsMode,
+        module_static_import_policy: Option<Box<WorkerModuleStaticImportPolicySnapshot>>,
         storage_key_top_level_site: String,
         creator_storage_key: MoliStorageKey,
+        creator_message_security: Option<crate::context_bootstrap::RuntimeMessageSourceSecurity>,
         reserved_service_worker_client_id:
             Option<crate::service_worker_runtime::ServiceWorkerClientId>,
     },

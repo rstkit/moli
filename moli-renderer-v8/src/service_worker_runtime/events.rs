@@ -418,7 +418,7 @@ impl ServiceWorkerClientFocusError {
     }
 
     pub(crate) fn inactive() -> Self {
-        Self::TypeError("The client is inactive.".to_owned())
+        Self::type_error("The client is inactive.")
     }
 
     pub(crate) fn type_error(message: impl Into<String>) -> Self {
@@ -470,8 +470,9 @@ pub(crate) struct ServiceWorkerFetchRequest {
     pub(crate) resulting_client_id: Option<ServiceWorkerClientId>,
     pub(crate) url: Url,
     pub(crate) method: String,
+    /// Isomorphically decoded wire bytes, ready for the worker's Fetch Headers.
     pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) body: Option<bytes::Bytes>,
     pub(crate) destination: ServiceWorkerRequestDestination,
     pub(crate) request_mode: moli_fetch::RequestMode,
     pub(crate) credentials_mode: moli_fetch::RequestCredentialsMode,
@@ -488,6 +489,7 @@ pub(crate) struct ServiceWorkerFetchRequestMetadata {
     pub(crate) referrer_policy: String,
     pub(crate) integrity: String,
     pub(crate) keepalive: bool,
+    pub(crate) use_cors_preflight: bool,
 }
 
 impl Default for ServiceWorkerFetchRequestMetadata {
@@ -498,6 +500,7 @@ impl Default for ServiceWorkerFetchRequestMetadata {
             referrer_policy: String::new(),
             integrity: String::new(),
             keepalive: false,
+            use_cors_preflight: false,
         }
     }
 }
@@ -507,28 +510,35 @@ pub(crate) fn service_worker_fetch_request_metadata(
 ) -> ServiceWorkerFetchRequestMetadata {
     let subresource_metadata = request.subresource_request_metadata();
     ServiceWorkerFetchRequestMetadata {
-        cache: service_worker_request_cache_label(request.cache_mode()).to_owned(),
-        referrer: if request.infers_referrer_from_initiator() {
-            "about:client".to_owned()
-        } else {
-            String::new()
-        },
-        referrer_policy: subresource_metadata
-            .and_then(|metadata| metadata.referrer_policy.clone())
+        // Native navigation already implements a soft reload through
+        // BrowserNavigationRequestKind and Cache-Control: max-age=0. Its
+        // Fetch Request representation exposes that policy as no-cache.
+        cache: service_worker_request_cache_label(
+            if request.request_mode == RequestMode::Navigate
+                && request.browser_navigation_kind()
+                    == moli_fetch::BrowserNavigationRequestKind::Reload
+                && request.cache_mode() == RequestCacheMode::Default
+            {
+                RequestCacheMode::Validate
+            } else {
+                request.cache_mode()
+            },
+        )
+        .to_owned(),
+        referrer: request
+            .referrer_header_value(&request.url)
             .unwrap_or_default(),
+        referrer_policy: request.effective_referrer_policy().to_owned(),
         integrity: subresource_metadata
             .and_then(|metadata| metadata.integrity.clone())
             .unwrap_or_default(),
         keepalive: false,
+        use_cors_preflight: request.use_cors_preflight(),
     }
 }
 
 fn service_worker_request_cache_label(cache_mode: RequestCacheMode) -> &'static str {
-    match cache_mode {
-        RequestCacheMode::Default => "default",
-        RequestCacheMode::Validate | RequestCacheMode::Bypass => "reload",
-        RequestCacheMode::NoStore => "no-store",
-    }
+    cache_mode.into()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -623,16 +633,7 @@ pub(crate) struct ServiceWorkerFetchEvent {
     pub(crate) navigation_preload_sent: bool,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ServiceWorkerFetchResponse {
-    pub(crate) final_url: Option<Url>,
-    pub(crate) response_type: String,
-    pub(crate) redirected: bool,
-    pub(crate) status: u16,
-    pub(crate) status_text: String,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) body: Vec<u8>,
-}
+pub(crate) use moli_fetch_types::FetchResponse as ServiceWorkerFetchResponse;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ServiceWorkerFetchResult {
@@ -661,6 +662,7 @@ pub(crate) struct ServiceWorkerNavigationPreloadResponseStarted {
     pub(crate) event_id: ServiceWorkerEventId,
     pub(crate) owner: ServiceWorkerRunOwner,
     pub(crate) request_url: Url,
+    pub(crate) request_method: String,
     pub(crate) request_mode: moli_fetch::RequestMode,
     pub(crate) body_source_id: NetworkBodySourceId,
     pub(crate) response_head: MaterializedServiceWorkerFetchResponseHead,
@@ -688,14 +690,7 @@ pub(crate) struct ServiceWorkerNavigationPreloadFailure {
     pub(crate) message: String,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct MaterializedServiceWorkerFetchResponseHead {
-    pub(crate) final_url: Option<Url>,
-    pub(crate) response_type: String,
-    pub(crate) redirected: bool,
-    pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
-}
+pub(crate) use moli_fetch_types::FetchResponseHead as MaterializedServiceWorkerFetchResponseHead;
 
 #[derive(Debug)]
 pub(crate) enum ServiceWorkerDirectFetchResult {
@@ -720,7 +715,6 @@ pub(crate) struct ServiceWorkerFetchCompletion {
 pub(crate) struct ServiceWorkerFetchDispatch {
     pub(crate) internal_id: u64,
     pub(crate) request: ServiceWorkerFetchRequest,
-    pub(crate) request_body_text: Option<String>,
     pub(crate) cors_preflight_request_headers: Vec<(String, String)>,
     pub(crate) request_cookie_report: Option<moli_cookie_jar::StoredCookieQueryReport>,
     pub(crate) network_context: AsyncSubresourceNetworkContext,
@@ -730,4 +724,145 @@ pub(crate) struct ServiceWorkerFetchDispatch {
     pub(crate) cancel_handle: moli_fetch::FetchCancelHandle,
     pub(crate) direct_completion_tx:
         Option<tokio::sync::oneshot::Sender<ServiceWorkerDirectFetchResult>>,
+}
+
+#[cfg(test)]
+mod referrer_tests {
+    use super::*;
+
+    #[test]
+    fn navigation_fetch_metadata_preserves_explicit_cache_modes_on_soft_reload() {
+        use moli_fetch::BrowserNavigationRequestKind as Kind;
+        for mode in [RequestMode::Navigate, RequestMode::Cors] {
+            for kind in [Kind::Navigate, Kind::Reload] {
+                for (cache, label) in [
+                    (RequestCacheMode::Default, "default"),
+                    (RequestCacheMode::Validate, "no-cache"),
+                    (RequestCacheMode::Bypass, "reload"),
+                    (RequestCacheMode::NoStore, "no-store"),
+                ] {
+                    let request = Request::get("https://example.test/document")
+                        .unwrap()
+                        .with_request_mode(mode)
+                        .with_browser_navigation_kind(kind)
+                        .with_cache_mode(cache);
+                    let metadata = service_worker_fetch_request_metadata(&request);
+                    let expected = if mode == RequestMode::Navigate
+                        && kind == Kind::Reload
+                        && cache == RequestCacheMode::Default
+                    {
+                        "no-cache"
+                    } else {
+                        label
+                    };
+                    assert_eq!(metadata.cache, expected, "{mode:?} {kind:?} {cache:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_fetch_event_metadata_resolves_referrer_policy_and_source() {
+        let source = Url::parse("https://user:password@origin.test/from?q=1#private").unwrap();
+        let full = "https://origin.test/from?q=1";
+        let default = "strict-origin-when-cross-origin";
+        for (target, policy, document_policy, referrer, expected_policy, expected_referrer) in [
+            (
+                "https://origin.test/resource",
+                None,
+                None,
+                None,
+                default,
+                full,
+            ),
+            (
+                "https://cross.test/resource",
+                None,
+                None,
+                None,
+                default,
+                "https://origin.test/",
+            ),
+            ("http://cross.test/resource", None, None, None, default, ""),
+            (
+                "https://origin.test/resource",
+                None,
+                Some("origin"),
+                None,
+                "origin",
+                "https://origin.test/",
+            ),
+            (
+                "https://origin.test/resource",
+                Some(""),
+                Some("no-referrer"),
+                None,
+                "no-referrer",
+                "",
+            ),
+            (
+                "https://origin.test/resource",
+                Some("unsafe-url"),
+                Some("no-referrer"),
+                None,
+                "unsafe-url",
+                full,
+            ),
+            (
+                "https://origin.test/resource",
+                Some("no-referrer"),
+                Some("unsafe-url"),
+                None,
+                "no-referrer",
+                "",
+            ),
+            (
+                "https://origin.test/resource",
+                None,
+                Some(""),
+                None,
+                default,
+                full,
+            ),
+            (
+                "https://origin.test/resource",
+                Some("unsafe-url"),
+                None,
+                Some(""),
+                "unsafe-url",
+                "",
+            ),
+            (
+                "https://origin.test/resource",
+                Some("unsafe-url"),
+                None,
+                Some("https://origin.test/selected#private"),
+                "unsafe-url",
+                "https://origin.test/selected",
+            ),
+        ] {
+            let mut request = Request::get(target)
+                .unwrap()
+                .with_initiator_url(&source)
+                .with_cache_mode(RequestCacheMode::Validate)
+                .with_use_cors_preflight(true)
+                .with_subresource_request_metadata(moli_fetch::SubresourceRequestMetadata {
+                    referrer_policy: policy.map(str::to_owned),
+                    document_referrer_policy: document_policy.map(str::to_owned),
+                    integrity: Some("sha384-test".to_owned()),
+                });
+            if let Some(referrer) = referrer {
+                request = request.with_fetch_referrer(referrer).unwrap();
+            }
+            let metadata = service_worker_fetch_request_metadata(&request);
+            assert_eq!(
+                metadata.referrer, expected_referrer,
+                "{target} {policy:?} {document_policy:?}"
+            );
+            assert_eq!(metadata.referrer_policy, expected_policy);
+            assert_eq!(metadata.cache, "no-cache");
+            assert_eq!(metadata.integrity, "sha384-test");
+            assert!(metadata.use_cors_preflight);
+        }
+    }
 }

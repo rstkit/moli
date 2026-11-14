@@ -1,24 +1,12 @@
-//! Shared browser-facing time helpers.
-//!
-//! Servo's date/time surfaces mostly lean on the `time` crate with large-date
-//! support. Keep the V8 bridge thin by centralizing browser timestamp and
-//! lightweight Date locale formatting behavior here.
-
+//! Shared browser clocks, timer scheduling, and timestamp formatting.
+//! Date parsing, Intl and timezone rules belong to native V8/ICU.
 use std::{
     sync::OnceLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 mod timers;
-
-pub use timers::{ReadyTimer, TimerId, TimerReadyAllowance, TimerScheduler};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DateLocaleFormatKind {
-    DateTime,
-    DateOnly,
-    TimeOnly,
-}
+pub use timers::{ReadyTimer, TimerId, TimerScheduler};
 
 pub fn unix_epoch_millis() -> f64 {
     SystemTime::now()
@@ -51,108 +39,63 @@ pub fn monotonic_timestamp_micros() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+// High Resolution Time requires the default, non-isolated clock to expose
+// no finer than 100 microseconds. Cross-origin-isolated realms may opt into
+// a finer clock later.
+const DOM_TIME_TICKS_PER_MILLISECOND: f64 = 10.0;
+
 pub fn coarsened_dom_time_millis(millis: f64) -> f64 {
-    // High Resolution Time requires the default, non-isolated clock to expose
-    // no finer than 100 microseconds. Keep the shared clock on that safe
-    // default; cross-origin-isolated realms may opt into a finer clock later.
-    const TEN_TICKS_PER_MILLISECOND: f64 = 10.0;
-    (millis * TEN_TICKS_PER_MILLISECOND).floor() / TEN_TICKS_PER_MILLISECOND
+    (millis * DOM_TIME_TICKS_PER_MILLISECOND).floor() / DOM_TIME_TICKS_PER_MILLISECOND
+}
+
+/// Remaining time between two timestamps on the same relative DOM timeline.
+/// Subtract in ticks so floating-point cancellation cannot expose sub-tick
+/// residuals or change the precision of the remaining duration.
+pub fn coarsened_dom_time_remaining_millis(deadline_millis: f64, now_millis: f64) -> f64 {
+    let deadline_ticks = (deadline_millis * DOM_TIME_TICKS_PER_MILLISECOND).floor();
+    let now_ticks = (now_millis * DOM_TIME_TICKS_PER_MILLISECOND).floor();
+    (deadline_ticks - now_ticks).max(0.0) / DOM_TIME_TICKS_PER_MILLISECOND
 }
 
 pub fn dom_time_since_origin_millis(time_origin: f64) -> f64 {
     coarsened_dom_time_millis((unix_epoch_millis() - time_origin).max(0.0))
 }
 
-pub fn format_date_locale_value(
-    timestamp_ms: f64,
-    kind: DateLocaleFormatKind,
-    locale_override: Option<&str>,
-    timezone_override: Option<&str>,
-) -> String {
-    let Some(datetime) = offset_datetime_from_unix_millis(timestamp_ms) else {
-        return "Invalid Date".to_owned();
-    };
-    let datetime = datetime.to_offset(resolve_time_zone_offset(timezone_override));
-    let month = u8::from(datetime.month());
-    let day = datetime.day();
-    let year = datetime.year();
-    let hour24 = datetime.hour();
-    let minute = datetime.minute();
-    let second = datetime.second();
-    let (hour12, meridiem) = match hour24 {
-        0 => (12, "AM"),
-        1..=11 => (hour24, "AM"),
-        12 => (12, "PM"),
-        _ => (hour24 - 12, "PM"),
-    };
-    let locale = locale_override.unwrap_or("en-US").to_ascii_lowercase();
-    let is_french_like = locale.starts_with("fr");
-
-    match kind {
-        DateLocaleFormatKind::DateTime if is_french_like => {
-            format!("{day:02}/{month:02}/{year} {hour24:02}:{minute:02}:{second:02}")
-        }
-        DateLocaleFormatKind::DateOnly if is_french_like => format!("{day:02}/{month:02}/{year}"),
-        DateLocaleFormatKind::TimeOnly if is_french_like => {
-            format!("{hour24:02}:{minute:02}:{second:02}")
-        }
-        DateLocaleFormatKind::DateTime => {
-            format!("{month}/{day}/{year}, {hour12}:{minute:02}:{second:02} {meridiem}")
-        }
-        DateLocaleFormatKind::DateOnly => format!("{month}/{day}/{year}"),
-        DateLocaleFormatKind::TimeOnly => format!("{hour12}:{minute:02}:{second:02} {meridiem}"),
-    }
-}
-
-/// Formats the source modification time exposed by `Document.lastModified`.
-///
-/// The HTML surface uses the user's local time zone unless CDP has installed
-/// an explicit override. A missing or unrepresentable source timestamp falls
-/// back to the supplied current timestamp so callers can preserve the spec's
-/// per-access fallback while tests remain deterministic.
+/// Formats HTML's fixed, locale-independent Document.lastModified surface.
+/// The caller supplies the timestamp-sensitive offset from the native
+/// environment. This crate does not carry a second timezone database.
 pub fn format_document_last_modified_value(
-    source_timestamp_ms: Option<f64>,
-    current_timestamp_ms: f64,
-    timezone_override: Option<&str>,
-) -> String {
-    let datetime = source_timestamp_ms
-        .and_then(offset_datetime_from_unix_millis)
-        .or_else(|| offset_datetime_from_unix_millis(current_timestamp_ms))
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-    let offset = match timezone_override {
-        Some(timezone) => resolve_time_zone_offset(Some(timezone)),
-        None => time::UtcOffset::local_offset_at(datetime).unwrap_or(time::UtcOffset::UTC),
-    };
-    let datetime = datetime.to_offset(offset);
+    timestamp_ms: f64,
+    offset_seconds: i32,
+) -> Option<String> {
+    let datetime = offset_datetime_from_unix_millis(timestamp_ms)?
+        .to_offset(time::UtcOffset::from_whole_seconds(offset_seconds).ok()?);
     let month = u8::from(datetime.month());
-
-    format!(
+    Some(format!(
         "{month:02}/{day:02}/{year:04} {hour:02}:{minute:02}:{second:02}",
         day = datetime.day(),
         year = datetime.year(),
         hour = datetime.hour(),
         minute = datetime.minute(),
         second = datetime.second(),
-    )
+    ))
 }
 
 fn offset_datetime_from_unix_millis(timestamp_ms: f64) -> Option<time::OffsetDateTime> {
     if !timestamp_ms.is_finite() {
         return None;
     }
-    let nanos = (timestamp_ms * 1_000_000.0).round();
-    if !nanos.is_finite() || nanos < i128::MIN as f64 || nanos > i128::MAX as f64 {
+    let whole_millis = timestamp_ms.trunc();
+    if whole_millis < i128::MIN as f64 || whole_millis > i128::MAX as f64 {
         return None;
     }
-    time::OffsetDateTime::from_unix_timestamp_nanos(nanos as i128).ok()
-}
-
-fn resolve_time_zone_offset(timezone_override: Option<&str>) -> time::UtcOffset {
-    match timezone_override.unwrap_or_default() {
-        "Asia/Shanghai" => time::UtcOffset::from_hms(8, 0, 0).unwrap_or(time::UtcOffset::UTC),
-        "UTC" | "Etc/UTC" | "GMT" => time::UtcOffset::UTC,
-        _ => time::UtcOffset::UTC,
-    }
+    // Multiplying an epoch-sized millisecond value by 1e6 in f64 first loses
+    // precision (current dates are already around 1.7e18 nanoseconds). Split
+    // the value before scaling so integral ECMAScript Date milliseconds remain
+    // exact and only the sub-millisecond remainder is rounded.
+    let whole_nanos = (whole_millis as i128).checked_mul(1_000_000)?;
+    let fractional_nanos = ((timestamp_ms - whole_millis) * 1_000_000.0).round() as i128;
+    time::OffsetDateTime::from_unix_timestamp_nanos(whole_nanos.checked_add(fractional_nanos)?).ok()
 }
 
 #[cfg(test)]
@@ -160,87 +103,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn date_locale_format_matches_existing_en_us_and_fr_surface() {
-        let timestamp = 1_704_067_384_005.0;
-
+    fn document_last_modified_formats_native_offsets_and_rejects_invalid_timestamps() {
         assert_eq!(
-            format_date_locale_value(timestamp, DateLocaleFormatKind::DateTime, None, Some("UTC")),
-            "1/1/2024, 12:03:04 AM"
+            format_document_last_modified_value(5_025_000.0, 28_800).as_deref(),
+            Some("01/01/1970 09:23:45")
         );
         assert_eq!(
-            format_date_locale_value(
-                timestamp,
-                DateLocaleFormatKind::DateOnly,
-                Some("fr-FR"),
-                Some("UTC")
-            ),
-            "01/01/2024"
+            format_document_last_modified_value(1_704_067_384_005.0, 0).as_deref(),
+            Some("01/01/2024 00:03:04")
         );
-        assert_eq!(
-            format_date_locale_value(
-                timestamp,
-                DateLocaleFormatKind::TimeOnly,
-                Some("fr"),
-                Some("UTC")
-            ),
-            "00:03:04"
-        );
-    }
-
-    #[test]
-    fn date_locale_timezone_override_shifts_display_time() {
-        assert_eq!(
-            format_date_locale_value(
-                0.0,
-                DateLocaleFormatKind::DateTime,
-                Some("en-US"),
-                Some("Asia/Shanghai")
-            ),
-            "1/1/1970, 8:00:00 AM"
-        );
-    }
-
-    #[test]
-    fn document_last_modified_uses_source_time_and_current_fallback() {
-        assert_eq!(
-            format_document_last_modified_value(Some(5_025_000.0), 0.0, Some("Asia/Shanghai")),
-            "01/01/1970 09:23:45"
-        );
-        assert_eq!(
-            format_document_last_modified_value(None, 1_704_067_384_005.0, Some("UTC")),
-            "01/01/2024 00:03:04"
-        );
-    }
-
-    #[test]
-    fn chromium_js_date_limits_stay_representable_with_large_dates() {
-        assert_eq!(
-            format_date_locale_value(
-                8_640_000_000_000_000.0,
-                DateLocaleFormatKind::DateTime,
-                Some("en-US"),
-                Some("UTC")
-            ),
-            "9/13/275760, 12:00:00 AM"
-        );
-        assert_eq!(
-            format_date_locale_value(
-                f64::INFINITY,
-                DateLocaleFormatKind::DateTime,
-                Some("en-US"),
-                Some("UTC")
-            ),
-            "Invalid Date"
-        );
-        assert_eq!(
-            format_date_locale_value(
-                f64::NAN,
-                DateLocaleFormatKind::DateTime,
-                Some("en-US"),
-                Some("UTC")
-            ),
-            "Invalid Date"
-        );
+        assert_eq!(format_document_last_modified_value(f64::NAN, 0), None);
+        assert_eq!(format_document_last_modified_value(f64::INFINITY, 0), None);
     }
 
     #[test]
@@ -252,6 +125,25 @@ mod tests {
             dom_time_since_origin_millis(unix_epoch_millis() + 1000.0),
             0.0
         );
+    }
+
+    #[test]
+    fn remaining_dom_time_uses_the_same_clock_buckets_as_performance_now() {
+        let first =
+            coarsened_dom_time_millis(24.381) + coarsened_dom_time_remaining_millis(74.331, 24.381);
+        let next =
+            coarsened_dom_time_millis(24.393) + coarsened_dom_time_remaining_millis(74.352, 24.393);
+        assert_eq!(first, 74.3);
+        assert_eq!(next, first);
+        assert_eq!(coarsened_dom_time_remaining_millis(74.331, 24.414), 49.9);
+    }
+
+    #[test]
+    fn remaining_dom_time_preserves_resolution_and_clamps_expired_deadlines() {
+        assert_eq!(coarsened_dom_time_remaining_millis(1.3, 1.2), 0.1);
+        assert_eq!(coarsened_dom_time_remaining_millis(1.31, 1.29), 0.1);
+        assert_eq!(coarsened_dom_time_remaining_millis(1.39, 1.399), 0.0);
+        assert_eq!(coarsened_dom_time_remaining_millis(1.3, 1.4), 0.0);
     }
 
     #[test]

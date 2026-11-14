@@ -44,6 +44,7 @@ pub(crate) enum ResourceLoadDisposition {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResourceLoadKind {
+    Document,
     Script,
     Stylesheet,
     Image,
@@ -63,6 +64,7 @@ pub(crate) enum ResourceLoadKind {
 impl From<SubresourceResourceType> for ResourceLoadKind {
     fn from(resource_type: SubresourceResourceType) -> Self {
         match resource_type {
+            SubresourceResourceType::Document => Self::Document,
             SubresourceResourceType::Script => Self::Script,
             SubresourceResourceType::Stylesheet => Self::Stylesheet,
             SubresourceResourceType::Image => Self::Image,
@@ -202,14 +204,16 @@ impl ResourceLoadRegistry {
     ) -> Arc<ResourceLoadRegistration> {
         let id = ResourceLoadId::next();
         let browser_runtime = request_client.browser_resource_runtime();
+        let task_runner = request_client.resource_task_runner();
         Arc::new(ResourceLoadRegistration {
             id,
             kind,
             disposition,
             request_client,
             browser_runtime,
-            task_runner: self.inner.task_runner.clone(),
+            task_runner,
             lifecycle: Mutex::new(ResourceLoadLifecycle {
+                auth_retry_budget: moli_fetch::AuthRetryBudget::default(),
                 cancel_handle,
                 consumer_cancel: None,
                 detached_keepalive,
@@ -357,6 +361,7 @@ impl ResourceLoadRegistry {
 }
 
 struct ResourceLoadLifecycle {
+    auth_retry_budget: moli_fetch::AuthRetryBudget,
     cancel_handle: Option<FetchCancelHandle>,
     consumer_cancel: Option<Box<dyn FnOnce() + Send + 'static>>,
     detached_keepalive: bool,
@@ -461,6 +466,15 @@ pub(crate) struct ResourceLoadLease {
 }
 
 impl ResourceLoadLease {
+    /// Lease clones and authentication continuations belong to the same request.
+    pub(crate) fn try_restart_with_auth(&self) -> bool {
+        self.registration
+            .lifecycle
+            .lock()
+            .auth_retry_budget
+            .try_restart()
+    }
+
     pub(crate) fn id_for_diagnostics(&self) -> u64 {
         self.registration.id.as_u64()
     }
@@ -561,13 +575,18 @@ impl ResourceLoadLease {
         self.registration.cancelled.load(Ordering::Acquire)
     }
 
-    pub(crate) fn response_completion_is_committed(&self) -> bool {
-        self.registration
+    pub(crate) fn cancel_if_response_pending(&self) -> bool {
+        let should_cancel = self
+            .registration
             .lifecycle
             .lock()
             .cancel_handle
             .as_ref()
-            .is_some_and(FetchCancelHandle::response_completion_is_committed)
+            .is_none_or(FetchCancelHandle::cancel_if_response_pending);
+        if should_cancel {
+            self.cancel();
+        }
+        should_cancel
     }
 
     pub(crate) fn is_detached_keepalive(&self) -> bool {
@@ -635,6 +654,35 @@ mod tests {
                 Some(cancel_handle),
             )
             .expect("active registry should accept loads")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authentication_budget_follows_lease_clones_but_not_other_requests() {
+        let registry = registry();
+        let first = lease(
+            &registry,
+            ResourceLoadDisposition::Ordinary,
+            FetchCancelHandle::new(),
+        );
+        let same_request = first.clone();
+        let other_request = lease(
+            &registry,
+            ResourceLoadDisposition::Ordinary,
+            FetchCancelHandle::new(),
+        );
+        for attempt in 0..31 {
+            let current = if attempt % 2 == 0 {
+                &first
+            } else {
+                &same_request
+            };
+            assert!(current.try_restart_with_auth());
+        }
+        assert!(!same_request.try_restart_with_auth());
+        for _ in 0..256 {
+            assert!(!first.try_restart_with_auth());
+        }
+        assert!(other_request.try_restart_with_auth());
     }
 
     #[tokio::test(flavor = "current_thread")]

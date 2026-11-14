@@ -19,7 +19,7 @@ use moli_dom::native::{
 };
 use moli_page_types::{ScriptMode, ScriptRun};
 use moli_stylesheet_blocking::{
-    DocumentBlockingStylesheetSignature, DocumentOwnedBlockingStylesheetDiscoveryInput,
+    DocumentBlockingStylesheetSignature, DocumentOwnedStylesheetDiscoveryInput,
 };
 
 use super::live_target::new_live_fragment_root_html_tree_sink_stream;
@@ -27,7 +27,7 @@ use super::live_target::{
     ParserDomMutationConsumer, ParserDomReadConsumer, ParserElementCreationConsumer,
     ParserMutationEffectConsumer, ParserMutationEffectDelivery, ParserRuntimeDomSinks,
     ParserStreamHtmlTreeSinkTarget, new_live_document_root_html_tree_sink_stream,
-    new_parser_stream_html_tree_sink_stream,
+    new_parser_stream_html_tree_sink_stream, new_parser_stream_html_tree_sink_target,
 };
 use super::{
     ParserSourcePosition, html_chunks,
@@ -67,7 +67,7 @@ struct ParserInputState {
 
 pub struct DocumentStream {
     inner: HtmlTreeSinkStream,
-    input: HtmlParserInputStream,
+    input: RefCell<HtmlParserInputStream>,
 }
 
 #[derive(Debug, Default)]
@@ -83,7 +83,8 @@ pub struct ParserPumpOutcome {
     pub result: ParserPumpStep,
     pub discovered_async_prefetch_scripts: Vec<PreparedScript>,
     pub discovered_modulepreload_link_candidates: Vec<NativeNodeId>,
-    pub discovered_blocking_stylesheet_inputs: Vec<DocumentOwnedBlockingStylesheetDiscoveryInput>,
+    /// Parser-created loads, including stylesheets whose media does not block scripts.
+    pub discovered_stylesheet_inputs: Vec<DocumentOwnedStylesheetDiscoveryInput>,
 }
 
 #[derive(Debug, Default)]
@@ -91,7 +92,8 @@ pub struct ParserFinishDiscoverySignals {
     pub parser_created_null_registry_elements: Vec<NativeNodeId>,
     pub discovered_modulepreload_link_candidates: Vec<NativeNodeId>,
     pub discovered_parser_meta_csp_candidates: Vec<NativeNodeId>,
-    pub discovered_blocking_stylesheet_inputs: Vec<DocumentOwnedBlockingStylesheetDiscoveryInput>,
+    /// Parser-created loads, including stylesheets whose media does not block scripts.
+    pub discovered_stylesheet_inputs: Vec<DocumentOwnedStylesheetDiscoveryInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +316,9 @@ pub struct ParserBlockingStylesheetPause {
 
 #[derive(Debug, Clone)]
 pub enum ParserYield {
+    /// A synchronous callback suspended or canceled this parser. The owner
+    /// already holds the blocker; this yield transfers no new work.
+    OwnerInterrupted,
     Script(Box<ParserScriptHandoff>),
     CustomElementConstruction(Box<ParserCustomElementConstructionHandoff>),
     BlockingStylesheet(ParserBlockingStylesheetPause),
@@ -370,6 +375,27 @@ pub(super) struct DocumentSink {
     // lines from the original document tail, so location fidelity only
     // degrades and never recovers for this parser session.
     source_positions_known: Cell<bool>,
+    current_script_nonceable: Cell<Option<bool>>,
+    html4_empty_system_id_quirks_override_pending: Cell<bool>,
+}
+
+const HTML4_QUIRKS_PUBLIC_ID_PREFIXES: [&str; 2] = [
+    "-//W3C//DTD HTML 4.01 Frameset//",
+    "-//W3C//DTD HTML 4.01 Transitional//",
+];
+
+fn html4_doctype_without_nonempty_system_id_requires_quirks(
+    name: &str,
+    public_id: &str,
+    system_id: &str,
+) -> bool {
+    name.eq_ignore_ascii_case("html")
+        && system_id.is_empty()
+        && HTML4_QUIRKS_PUBLIC_ID_PREFIXES.iter().any(|prefix| {
+            public_id
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        })
 }
 
 impl HtmlParser {
@@ -390,7 +416,7 @@ impl HtmlParser {
     }
 
     pub fn parse_dom_host(&self, final_url: Url, html: String) -> DomHost {
-        let mut stream = self.start_document(final_url);
+        let stream = self.start_document(final_url);
         for chunk in html_chunks(&html) {
             stream.feed(chunk);
         }
@@ -404,8 +430,7 @@ impl HtmlParser {
     ) -> NativeDom {
         let target =
             ParserStreamHtmlTreeSinkTarget::new_with_declarative_shadow_roots(final_url, false);
-        let mut stream =
-            HtmlTreeSinkStream::from_target_with_scripting(target, self.scripting_enabled);
+        let stream = HtmlTreeSinkStream::from_target_with_scripting(target, self.scripting_enabled);
         for chunk in html_chunks(&html) {
             stream.feed(chunk);
         }
@@ -414,6 +439,47 @@ impl HtmlParser {
 
     pub fn start_document(&self, final_url: Url) -> DocumentStream {
         DocumentStream::new_parser_stream(final_url, self.scripting_enabled)
+    }
+
+    /// Start a text document using the HTML tokenizer's plaintext state.
+    /// Subsequent chunks remain literal text inside the browser-owned `pre`.
+    pub fn start_text_document(&self, final_url: Url, content_type: &str) -> DocumentStream {
+        let stream =
+            DocumentStream::new_text_document(new_parser_stream_html_tree_sink_target(final_url));
+        stream.inner.initialize_text_document();
+        let mut host = stream.inner.take_parser_stream_dom_host();
+        let document_handle = host.document_handle();
+        host.set_document_content_type_for_handle(document_handle, content_type);
+        stream.inner.restore_parser_stream_dom_host(host);
+        stream
+    }
+
+    /// Initialize the same literal-text shell in an existing document. The
+    /// embedder owns that document's MIME metadata and live DOM callbacks.
+    pub fn start_live_text_document_root<T>(
+        &self,
+        final_url: Url,
+        document_handle: NativeNodeId,
+        consumer: &mut T,
+    ) -> DocumentStream
+    where
+        T: ParserDomReadConsumer
+            + ParserDomMutationConsumer
+            + ParserMutationEffectConsumer
+            + ParserElementCreationConsumer,
+    {
+        let stream = DocumentStream::new_text_document(
+            ParserStreamHtmlTreeSinkTarget::new_live_document_root(final_url, document_handle),
+        );
+        // SAFETY: the consumer is exclusively borrowed until the step guard
+        // removes the erased callbacks, including when initialization unwinds.
+        let sinks = unsafe { ParserRuntimeDomSinks::from_consumer(consumer) };
+        stream.inner.enter_runtime_dom_sinks_parse_step(sinks);
+        {
+            let step = RuntimeDomSinksParserStep { stream: &stream };
+            step.stream.inner.initialize_text_document();
+        }
+        stream
     }
 
     pub fn start_live_document_root(
@@ -461,7 +527,7 @@ impl HtmlParser {
         );
         let context_handle = ParseHandle::new_synthetic_fragment_context(Rc::new(context));
         let sink = DocumentSink::new(target);
-        let mut parser = HtmlParserSession::new_fragment(
+        let parser = HtmlParserSession::new_fragment(
             sink,
             html_parse_opts_with_scripting(scripting_enabled),
             context_handle,
@@ -504,7 +570,7 @@ impl HtmlParser {
             // SAFETY: `consumer` remains exclusively borrowed until the
             // constructor clears the sink bundle before returning.
             unsafe { ParserRuntimeDomSinks::from_consumer_without_element_creation(consumer) };
-        let mut stream = DocumentStream::new_live_fragment_root(
+        let stream = DocumentStream::new_live_fragment_root(
             final_url,
             fragment_handle,
             owner_document_handle,
@@ -529,10 +595,21 @@ impl Default for ParserInputQueue {
 }
 
 impl DocumentStream {
+    fn new_text_document(target: ParserStreamHtmlTreeSinkTarget) -> Self {
+        let mut options = html_parse_opts_with_scripting(false);
+        // The byte decoder has already consumed the transport BOM. In plaintext
+        // every remaining U+FEFF is content, including at a chunk boundary.
+        options.tokenizer.discard_bom = false;
+        Self {
+            inner: HtmlTreeSinkStream::from_target_with_options(target, options),
+            input: RefCell::default(),
+        }
+    }
+
     fn new_parser_stream(final_url: Url, scripting_enabled: bool) -> Self {
         Self {
             inner: new_parser_stream_html_tree_sink_stream(final_url, scripting_enabled),
-            input: HtmlParserInputStream::default(),
+            input: RefCell::default(),
         }
     }
 
@@ -547,7 +624,7 @@ impl DocumentStream {
                 document_handle,
                 scripting_enabled,
             ),
-            input: HtmlParserInputStream::default(),
+            input: RefCell::default(),
         }
     }
 
@@ -574,7 +651,7 @@ impl DocumentStream {
                 allow_declarative_shadow_roots,
                 scripting_enabled,
             ),
-            input: HtmlParserInputStream::default(),
+            input: RefCell::default(),
         }
     }
 
@@ -628,13 +705,13 @@ impl DocumentStream {
         )
     }
 
-    pub fn note_defined_autonomous_custom_element(&mut self, local_name: &str) {
+    pub fn note_defined_autonomous_custom_element(&self, local_name: &str) {
         self.inner
             .note_defined_autonomous_custom_element(local_name);
     }
 
     pub fn drain_pending_custom_element_construction_handoffs(
-        &mut self,
+        &self,
     ) -> Vec<ParserCustomElementConstructionHandoff> {
         self.inner
             .drain_pending_custom_element_construction_handoffs()
@@ -660,12 +737,12 @@ impl DocumentStream {
         self.inner.take_processed_insertion_meta_csp_count()
     }
 
-    pub fn feed(&mut self, chunk: &str) {
+    pub fn feed(&self, chunk: &str) {
         self.inner.feed(chunk)
     }
 
     fn feed_with_runtime_dom_consumer_without_element_creation<T>(
-        &mut self,
+        &self,
         chunk: &str,
         consumer: &mut T,
     ) where
@@ -676,7 +753,7 @@ impl DocumentStream {
         let sinks =
             unsafe { ParserRuntimeDomSinks::from_consumer_without_element_creation(consumer) };
         self.inner.enter_runtime_dom_sinks_parse_step(sinks);
-        let mut step = RuntimeDomSinksParserStep { stream: self };
+        let step = RuntimeDomSinksParserStep { stream: self };
         step.feed(chunk);
     }
 
@@ -685,9 +762,9 @@ impl DocumentStream {
     /// The tokenizer only receives a bounded prefix when the owner pumps the
     /// parser.  Appending while a script or stylesheet blocks parsing therefore
     /// cannot advance the DOM commit frontier.
-    pub fn append_to_end(&mut self, chunk: String) {
+    pub fn append_to_end(&self, chunk: String) {
         if !chunk.is_empty() {
-            self.input.end_segments.push_back(chunk);
+            self.input.borrow_mut().end_segments.push_back(chunk);
         }
     }
 
@@ -697,14 +774,20 @@ impl DocumentStream {
     /// continues writing while that input is blocked on a nested resource.
     /// The input must remain after the blocked frame's unconsumed tail rather
     /// than becoming a newer nested insertion.
-    pub fn append_to_current_inserted_input(&mut self, chunk: &str) -> bool {
+    pub fn append_to_current_inserted_input(&self, chunk: &str) -> bool {
         self.inner.append_to_current_inserted_input(chunk)
+    }
+
+    /// Insert at the active token's insertion point without opening a script
+    /// frame. A parser reaction appends after the current frame's unread tail.
+    pub fn append_at_current_insertion_point(&self, chunk: &str) {
+        self.inner.append_at_current_insertion_point(chunk);
     }
 
     pub fn has_pending_input(&self) -> bool {
         self.inner.has_script_input()
             || self.inner.has_buffered_input()
-            || !self.input.end_segments.is_empty()
+            || !self.input.borrow().end_segments.is_empty()
     }
 
     pub fn next_input_len(&self) -> usize {
@@ -715,14 +798,14 @@ impl DocumentStream {
                     .has_buffered_input()
                     .then(|| self.inner.buffered_input_len())
             })
-            .or_else(|| self.input.end_segments.front().map(String::len))
+            .or_else(|| self.input.borrow().end_segments.front().map(String::len))
             .unwrap_or_default()
     }
 
     pub fn snapshot_pending_input(&self) -> String {
         let mut pending = self.inner.snapshot_script_input();
         pending.push_str(&self.inner.snapshot_buffered_input());
-        for segment in &self.input.end_segments {
+        for segment in &self.input.borrow().end_segments {
             pending.push_str(segment);
         }
         pending
@@ -730,10 +813,10 @@ impl DocumentStream {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn queued_end_segment_count_for_testing(&self) -> usize {
-        self.input.end_segments.len()
+        self.input.borrow().end_segments.len()
     }
 
-    fn take_next_owned_input(&mut self, max_bytes: usize) -> (String, bool) {
+    fn take_next_owned_input(&self, max_bytes: usize) -> (String, bool) {
         if let Some(input) = self.inner.take_next_script_input() {
             // One parser insertion is an atomic source segment. Splitting it
             // outside html5ever would let a remainder jump ahead of bytes the
@@ -745,17 +828,17 @@ impl DocumentStream {
             return (String::new(), false);
         }
 
-        let Some(input) = self.input.end_segments.pop_front() else {
+        let Some(input) = self.input.borrow_mut().end_segments.pop_front() else {
             return (String::new(), false);
         };
         let (prefix, remainder) = split_parser_input_prefix(input, max_bytes);
         if let Some(remainder) = remainder {
-            self.input.end_segments.push_front(remainder);
+            self.input.borrow_mut().end_segments.push_front(remainder);
         }
         (prefix, false)
     }
 
-    pub fn pump_next_parser_step(&mut self, max_bytes: usize) -> ParserPumpOutcome {
+    pub fn pump_next_parser_step(&self, max_bytes: usize) -> ParserPumpOutcome {
         let (chunk, inserted_source) = self.take_next_owned_input(max_bytes);
         if inserted_source {
             self.inner.pump_parser_inserted_step(&chunk)
@@ -786,17 +869,17 @@ impl DocumentStream {
     /// Returning `ParserPumpStep::InputDrained` means:
     /// - the current input buffer has been consumed as far as html5ever can go for now
     /// - either there is no pending yield, or more bytes are needed before another boundary exists
-    pub fn pump_parser_step(&mut self, chunk: &str) -> ParserPumpOutcome {
+    pub fn pump_parser_step(&self, chunk: &str) -> ParserPumpOutcome {
         self.inner.pump_parser_step(chunk)
     }
 
     #[cfg(test)]
-    pub(crate) fn pump_parser_inserted_step(&mut self, chunk: &str) -> ParserPumpOutcome {
+    pub(crate) fn pump_parser_inserted_step(&self, chunk: &str) -> ParserPumpOutcome {
         self.inner.pump_parser_inserted_step(chunk)
     }
 
     pub fn pump_parser_step_with_runtime_dom_consumer<T>(
-        &mut self,
+        &self,
         chunk: &str,
         consumer: &mut T,
     ) -> ParserPumpOutcome
@@ -813,7 +896,7 @@ impl DocumentStream {
     }
 
     pub fn pump_next_parser_step_with_runtime_dom_consumer<T>(
-        &mut self,
+        &self,
         max_bytes: usize,
         consumer: &mut T,
     ) -> ParserPumpOutcome
@@ -827,12 +910,12 @@ impl DocumentStream {
         // parser-step Drop guard removes every erased callback before return.
         let sinks = unsafe { ParserRuntimeDomSinks::from_consumer(consumer) };
         self.inner.enter_runtime_dom_sinks_parse_step(sinks);
-        let mut step = RuntimeDomSinksParserStep { stream: self };
+        let step = RuntimeDomSinksParserStep { stream: self };
         step.pump_next_parser_step(max_bytes)
     }
 
     pub fn pump_parser_step_with_runtime_dom_consumer_without_element_creation<T>(
-        &mut self,
+        &self,
         chunk: &str,
         consumer: &mut T,
     ) -> ParserPumpOutcome
@@ -847,7 +930,7 @@ impl DocumentStream {
     }
 
     pub fn pump_parser_step_with_runtime_dom_consumers<T, E>(
-        &mut self,
+        &self,
         chunk: &str,
         consumer: &mut T,
         element_consumer: &mut E,
@@ -863,17 +946,17 @@ impl DocumentStream {
     }
 
     fn pump_parser_step_with_runtime_dom_sinks(
-        &mut self,
+        &self,
         chunk: &str,
         sinks: ParserRuntimeDomSinks,
     ) -> ParserPumpOutcome {
         self.inner.enter_runtime_dom_sinks_parse_step(sinks);
-        let mut step = RuntimeDomSinksParserStep { stream: self };
+        let step = RuntimeDomSinksParserStep { stream: self };
         step.pump_parser_step(chunk)
     }
 
     pub fn pump_parser_inserted_step_with_runtime_dom_consumer<T>(
-        &mut self,
+        &self,
         chunk: &str,
         consumer: &mut T,
     ) -> ParserPumpOutcome
@@ -890,12 +973,12 @@ impl DocumentStream {
     }
 
     fn pump_parser_inserted_step_with_runtime_dom_sinks(
-        &mut self,
+        &self,
         chunk: &str,
         sinks: ParserRuntimeDomSinks,
     ) -> ParserPumpOutcome {
         self.inner.enter_runtime_dom_sinks_parse_step(sinks);
-        let mut step = RuntimeDomSinksParserStep { stream: self };
+        let step = RuntimeDomSinksParserStep { stream: self };
         step.pump_parser_inserted_step(chunk)
     }
 
@@ -931,7 +1014,7 @@ impl DocumentStream {
     }
 
     fn finish_with_runtime_dom_sinks(
-        mut self,
+        self,
         sinks: ParserRuntimeDomSinks,
     ) -> ParserFinishDiscoverySignals {
         self.inner.enter_runtime_dom_sinks_parse_step(sinks);
@@ -954,23 +1037,21 @@ impl DocumentStream {
         self.inner.snapshot_parser_stream_dom_host()
     }
 
-    pub fn take_parser_stream_null_custom_element_registry_elements(
-        &mut self,
-    ) -> Vec<NativeNodeId> {
+    pub fn take_parser_stream_null_custom_element_registry_elements(&self) -> Vec<NativeNodeId> {
         self.inner
             .take_parser_stream_null_custom_element_registry_elements()
     }
 
-    pub fn take_parser_stream_dom_host(&mut self) -> DomHost {
+    pub fn take_parser_stream_dom_host(&self) -> DomHost {
         self.inner.take_parser_stream_dom_host()
     }
 
-    pub fn restore_parser_stream_dom_host(&mut self, dom_host: DomHost) {
+    pub fn restore_parser_stream_dom_host(&self, dom_host: DomHost) {
         self.inner.restore_parser_stream_dom_host(dom_host);
     }
 
     pub fn with_parser_stream_dom_host_for_bootstrap<R>(
-        &mut self,
+        &self,
         f: impl FnOnce(DomHost) -> std::result::Result<R, Box<(anyhow::Error, DomHost)>>,
     ) -> anyhow::Result<R> {
         let bootstrap_document = self.inner.take_parser_stream_dom_host();
@@ -986,29 +1067,29 @@ impl DocumentStream {
     }
 
     pub fn replace_parser_stream_document_from_snapshot(
-        &mut self,
+        &self,
         document: ParserStreamDocumentSnapshot,
     ) {
         self.inner.replace_parser_stream_document(document.into())
     }
 
-    pub fn drain_ready_parser_scripts(&mut self) -> Vec<NativeNodeId> {
+    pub fn drain_ready_parser_scripts(&self) -> Vec<NativeNodeId> {
         self.inner.drain_ready_parser_scripts()
     }
 
-    pub fn drain_discovered_async_prefetch_candidates(&mut self) -> Vec<NativeNodeId> {
+    pub fn drain_discovered_async_prefetch_candidates(&self) -> Vec<NativeNodeId> {
         self.inner.drain_discovered_async_prefetch_candidates()
     }
 
-    pub fn drain_discovered_modulepreload_link_candidates(&mut self) -> Vec<NativeNodeId> {
+    pub fn drain_discovered_modulepreload_link_candidates(&self) -> Vec<NativeNodeId> {
         self.inner.drain_discovered_modulepreload_link_candidates()
     }
 
-    pub fn drain_discovered_parser_meta_csp_candidates(&mut self) -> Vec<NativeNodeId> {
+    pub fn drain_discovered_parser_meta_csp_candidates(&self) -> Vec<NativeNodeId> {
         self.inner.drain_discovered_parser_meta_csp_candidates()
     }
 
-    pub fn mark_script_already_started(&mut self, node_id: NativeNodeId) {
+    pub fn mark_script_already_started(&self, node_id: NativeNodeId) {
         // The streaming parser and the live runtime intentionally share DOM snapshots during
         // parse-time execution. When runtime code claims ownership of a parser-discovered script
         // without executing it immediately (phase 2 `defer` / external `async`), we still need
@@ -1028,44 +1109,28 @@ impl DocumentStream {
 }
 
 struct RuntimeDomSinksParserStep<'a> {
-    stream: &'a mut DocumentStream,
+    stream: &'a DocumentStream,
 }
 
 impl RuntimeDomSinksParserStep<'_> {
-    fn feed(&mut self, chunk: &str) {
+    fn feed(&self, chunk: &str) {
         self.stream.inner.feed(chunk);
     }
 
-    fn pump_parser_step(&mut self, chunk: &str) -> ParserPumpOutcome {
+    fn pump_parser_step(&self, chunk: &str) -> ParserPumpOutcome {
         self.stream.pump_parser_step(chunk)
     }
 
-    fn pump_parser_inserted_step(&mut self, chunk: &str) -> ParserPumpOutcome {
+    fn pump_parser_inserted_step(&self, chunk: &str) -> ParserPumpOutcome {
         self.stream.inner.pump_parser_inserted_step(chunk)
     }
 
-    fn pump_next_parser_step(&mut self, max_bytes: usize) -> ParserPumpOutcome {
+    fn pump_next_parser_step(&self, max_bytes: usize) -> ParserPumpOutcome {
         self.stream.pump_next_parser_step(max_bytes)
     }
 }
 
-fn split_parser_input_prefix(input: String, max_bytes: usize) -> (String, Option<String>) {
-    if max_bytes == 0 || input.len() <= max_bytes {
-        return (input, None);
-    }
-
-    let mut split = input.len();
-    for (index, character) in input.char_indices() {
-        let end = index + character.len_utf8();
-        if end > max_bytes {
-            split = if index == 0 { end } else { index };
-            break;
-        }
-    }
-    let remainder = input[split..].to_owned();
-    let prefix = input[..split].to_owned();
-    (prefix, (!remainder.is_empty()).then_some(remainder))
-}
+use crate::input_prefix::split_parser_input_prefix;
 
 impl Drop for RuntimeDomSinksParserStep<'_> {
     fn drop(&mut self) {
@@ -1371,9 +1436,9 @@ impl ParseHandle {
 
     fn is_script_element(&self) -> bool {
         self.element_name.as_ref().is_some_and(|name| {
-            name.local.as_ref() == "script"
+            AsRef::<str>::as_ref(&name.local) == "script"
                 && matches!(
-                    name.ns.as_ref(),
+                    AsRef::<str>::as_ref(&name.ns),
                     "http://www.w3.org/1999/xhtml" | "http://www.w3.org/2000/svg"
                 )
         })
@@ -1413,11 +1478,25 @@ impl DocumentSink {
         delivery.consume();
     }
 
+    pub(super) fn finish_parser_dom_mutations(&self) -> std::ops::ControlFlow<()> {
+        // Do not retain the target borrow while invoking JavaScript. The tree
+        // builder calls this after updating its open-element stack, so nested
+        // document.write() sees the completed token's insertion state.
+        let finish = self.target.borrow().mutation_finisher();
+        finish.map_or(std::ops::ControlFlow::Continue(()), |finish| finish())
+    }
+
     pub(super) fn new(target: ParserStreamHtmlTreeSinkTarget) -> Self {
         Self {
             target: RefCell::new(target),
             source_positions_known: Cell::new(true),
+            current_script_nonceable: Cell::new(None),
+            html4_empty_system_id_quirks_override_pending: Cell::new(false),
         }
+    }
+
+    pub(super) fn replace_current_script_nonceable(&self, nonceable: Option<bool>) -> Option<bool> {
+        self.current_script_nonceable.replace(nonceable)
     }
 
     pub(super) fn snapshot_parser_stream_document(&self) -> NativeDom {
@@ -1504,12 +1583,6 @@ impl DocumentSink {
             .drain_pending_custom_element_construction_handoffs()
     }
 
-    pub(super) fn has_pending_custom_element_construction_handoff(&self) -> bool {
-        self.target
-            .borrow()
-            .has_pending_custom_element_construction_handoff()
-    }
-
     pub(super) fn pending_custom_element_construction_handoff_placeholder(
         &self,
     ) -> Option<NativeNodeId> {
@@ -1539,16 +1612,20 @@ impl DocumentSink {
             .pop_pending_blocking_stylesheet_pause()
     }
 
+    pub(super) fn finish_construction(&self) {
+        self.target.borrow().finish_construction();
+    }
+
     pub(super) fn begin_tree_builder_finish(&self) {
         self.target.borrow_mut().begin_tree_builder_finish();
     }
 
-    pub(super) fn drain_discovered_blocking_stylesheet_inputs(
+    pub(super) fn drain_discovered_stylesheet_inputs(
         &self,
-    ) -> Vec<DocumentOwnedBlockingStylesheetDiscoveryInput> {
+    ) -> Vec<DocumentOwnedStylesheetDiscoveryInput> {
         self.target
             .borrow_mut()
-            .drain_discovered_blocking_stylesheet_inputs()
+            .drain_discovered_stylesheet_inputs()
     }
 
     pub(super) fn captured_blocking_stylesheet_signatures(
@@ -1590,7 +1667,9 @@ impl TreeSink for DocumentSink {
         Self: 'a;
 
     fn finish(self) -> Self::Output {
-        self.target.into_inner()
+        let target = self.target.into_inner();
+        target.finish_construction();
+        target
     }
 
     fn parse_error(&self, err: Cow<'static, str>) {
@@ -1602,6 +1681,20 @@ impl TreeSink for DocumentSink {
     }
 
     fn set_quirks_mode(&self, mode: QuirksMode) {
+        // html5ever 0.39 distinguishes `Some("")` from a missing system ID
+        // when selecting HTML 4.01 limited-quirks mode. The HTML Standard now
+        // puts both in quirks mode. Keep the token and its parse-error state
+        // intact, and only correct the mode reported immediately after the
+        // initial doctype callback.
+        let mode = if self
+            .html4_empty_system_id_quirks_override_pending
+            .replace(false)
+            && mode == QuirksMode::LimitedQuirks
+        {
+            QuirksMode::Quirks
+        } else {
+            mode
+        };
         self.target.borrow_mut().set_html_quirks_mode(mode);
     }
 
@@ -1626,7 +1719,12 @@ impl TreeSink for DocumentSink {
         attrs: Vec<Attribute>,
         flags: ElementFlags,
     ) -> Self::Handle {
-        self.target.borrow_mut().create_element(name, attrs, flags)
+        self.target.borrow_mut().create_element(
+            name,
+            attrs,
+            flags,
+            self.current_script_nonceable.get(),
+        )
     }
 
     fn create_comment(&self, text: StrTendril) -> Self::Handle {
@@ -1664,6 +1762,16 @@ impl TreeSink for DocumentSink {
         public_id: StrTendril,
         system_id: StrTendril,
     ) {
+        // TreeSink receives an empty tendril for both a missing and an explicit
+        // empty system identifier. Those cases intentionally share the same
+        // quirks-mode outcome for these two HTML 4.01 public identifiers.
+        self.html4_empty_system_id_quirks_override_pending.set(
+            html4_doctype_without_nonempty_system_id_requires_quirks(
+                name.as_ref(),
+                public_id.as_ref(),
+                system_id.as_ref(),
+            ),
+        );
         self.mutate_target(|target| {
             target.append_doctype(
                 name.to_string(),
@@ -1784,6 +1892,83 @@ mod tests {
     const HTML_NS: &str = "http://www.w3.org/1999/xhtml";
     const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
 
+    #[test]
+    fn text_document_stream_preserves_literal_markup_and_leading_newline() {
+        let payload =
+            "\u{feff}\n<b>Gülçek</b>&amp;<script>window.executed=1</script></pre>\u{feff}";
+        for content_type in ["text/plain", "application/json", "application/problem+json"] {
+            let stream = HtmlParser::SCRIPTING_ENABLED.start_text_document(
+                Url::parse("https://example.test/data").unwrap(),
+                content_type,
+            );
+            for character in payload.chars() {
+                stream.feed(&character.to_string());
+            }
+            let document = stream.finish();
+            let pre = first_element_by_ns(&document, HTML_NS, "pre");
+            assert_eq!(document.text_content(pre).as_deref(), Some(payload));
+            assert_eq!(document.document().unwrap().content_type(), content_type);
+            for tag in ["b", "script"] {
+                assert!(
+                    document
+                        .elements_by_tag_name_ns(
+                            document.document_node_id(),
+                            Some(HTML_NS),
+                            tag,
+                            true
+                        )
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_document_shell_has_no_doctype_and_preserves_normalized_literal_text() {
+        for mime in [
+            "text/plain",
+            "application/json",
+            "application/problem+json",
+            "text/javascript",
+        ] {
+            let stream = HtmlParser::SCRIPTING_ENABLED
+                .start_text_document(Url::parse("https://example.test/data").unwrap(), mime);
+            for chunk in [
+                "\n<&amp;",
+                "\r",
+                "\nbeta\rgamma\0",
+                "</pre><script>bad()</script>",
+            ] {
+                stream.feed(chunk);
+            }
+            let document = stream.finish_dom_host();
+            let root = document.document_handle();
+            let children = document.child_handles(root).collect::<Vec<_>>();
+            assert_eq!(children.len(), 1, "no synthetic doctype: {mime}");
+            assert!(document.is_html_element_named(children[0], "html"));
+            let expected_mode = HtmlParser::SCRIPTING_ENABLED.parse_dom_host(
+                Url::parse("https://example.test/control").unwrap(),
+                "<!doctype html><p>control".to_owned(),
+            );
+            assert_eq!(
+                document.document_quirks_mode_for_handle(root),
+                expected_mode.document_quirks_mode_for_handle(expected_mode.document_handle())
+            );
+            assert_eq!(
+                document.text_content(root).as_deref(),
+                Some("\n<&amp;\nbeta\ngamma\u{fffd}</pre><script>bad()</script>")
+            );
+        }
+    }
+
+    #[test]
+    fn html_document_still_parses_markup_and_entities() {
+        let document = parse_test_document("<b>Gülçek&amp;</b>");
+        let bold = first_element_by_ns(&document, HTML_NS, "b");
+        assert_eq!(document.text_content(bold).as_deref(), Some("Gülçek&"));
+        assert_eq!(document.document().unwrap().content_type(), "text/html");
+    }
+
     fn parse_test_document(html: &str) -> NativeDom {
         HtmlParser::SCRIPTING_ENABLED.parse(
             Url::parse("https://example.test/").expect("test url"),
@@ -1792,7 +1977,7 @@ mod tests {
     }
 
     fn parse_test_document_with_scripting(html: &str, scripting_enabled: bool) -> NativeDom {
-        let mut stream = HtmlParser::with_scripting_enabled(scripting_enabled)
+        let stream = HtmlParser::with_scripting_enabled(scripting_enabled)
             .start_document(Url::parse("https://example.test/").expect("test url"));
         stream.feed(html);
         stream.finish()
@@ -1832,7 +2017,7 @@ mod tests {
             fragment_context
                 .element_name
                 .as_deref()
-                .map(|name| name.local.as_ref()),
+                .map(|name| AsRef::<str>::as_ref(&name.local)),
             Some("body")
         );
     }
@@ -1875,6 +2060,59 @@ mod tests {
                 .elements_by_tag_name_ns(enabled.document_node_id(), Some(HTML_NS), "main", true,)
                 .is_empty(),
             "body noscript markup must remain raw text when scripting is enabled"
+        );
+    }
+
+    #[test]
+    fn html4_empty_system_identifiers_trigger_quirks_mode() {
+        let mode = |html: &str| {
+            parse_test_document(html)
+                .document()
+                .expect("parsed document")
+                .quirks_mode()
+        };
+        let quirks = mode("<html></html>");
+        let no_quirks = mode("<!doctype html><html></html>");
+        let limited_quirks = mode(concat!(
+            "<!doctype html PUBLIC \"-//W3C//DTD HTML 4.01 Frameset//\" ",
+            "\"https://www.w3.org/TR/html4/frameset.dtd\"><html></html>",
+        ));
+
+        assert_ne!(quirks, no_quirks, "test must distinguish quirks mode");
+        assert_ne!(
+            quirks, limited_quirks,
+            "test must distinguish quirks from limited-quirks mode"
+        );
+        assert_ne!(
+            no_quirks, limited_quirks,
+            "test must distinguish no-quirks from limited-quirks mode"
+        );
+
+        for public_id in [
+            "-//W3C//DTD HTML 4.01 Frameset//",
+            "-//w3c//dtd html 4.01 transitional//",
+        ] {
+            let missing = format!("<!doctype html PUBLIC \"{public_id}\"><html></html>");
+            let empty = format!("<!doctype html PUBLIC \"{public_id}\" \"\"><html></html>");
+            let nonempty =
+                format!("<!doctype html PUBLIC \"{public_id}\" \"legacy.dtd\"><html></html>");
+
+            assert_eq!(mode(&missing), quirks, "missing system ID for {public_id}");
+            assert_eq!(mode(&empty), quirks, "empty system ID for {public_id}");
+            assert_eq!(
+                mode(&nonempty),
+                limited_quirks,
+                "nonempty system ID for {public_id}"
+            );
+        }
+
+        assert_eq!(
+            mode(concat!(
+                "<!doctype html PUBLIC \"-//W3C//DTD XHTML 1.0 Frameset//\" ",
+                "\"\"><html></html>",
+            )),
+            limited_quirks,
+            "an empty XHTML system ID must remain limited-quirks"
         );
     }
 
@@ -1962,6 +2200,78 @@ mod tests {
             "plain annotation-xml must not opt into HTML integration point parsing"
         );
     }
+    #[test]
+    fn customizable_select_preserves_option_wrapper_elements() {
+        let document = parse_test_document(concat!(
+            "<!doctype html>",
+            "<select>",
+            "<option>one</option>",
+            "<div id='wrapper'><option>two</option>",
+            "<div id='nested'><option>three</option></div></div>",
+            "</select>"
+        ));
+        let select = first_element_by_ns(&document, HTML_NS, "select");
+        let divs = document.elements_by_tag_name_ns(
+            document.document_node_id(),
+            Some(HTML_NS),
+            "div",
+            true,
+        );
+        let wrapper = divs
+            .iter()
+            .copied()
+            .find(|handle| document.get_attribute(*handle, "id").as_deref() == Some("wrapper"))
+            .expect("select wrapper div");
+        let nested = divs
+            .iter()
+            .copied()
+            .find(|handle| document.get_attribute(*handle, "id").as_deref() == Some("nested"))
+            .expect("nested select wrapper div");
+
+        assert_eq!(
+            document
+                .node(wrapper)
+                .and_then(|node| node.parent_node_id()),
+            Some(select)
+        );
+        assert_eq!(
+            document.node(nested).and_then(|node| node.parent_node_id()),
+            Some(wrapper)
+        );
+        assert_eq!(document.select_option_elements(select).len(), 3);
+
+        let fragment = HtmlParser::SCRIPTING_ENABLED
+            .parse_fragment_without_declarative_shadow_roots(
+                Url::parse("https://example.test/").expect("test url"),
+                HTML_NS,
+                "select",
+                "<div id='fragment-wrapper'><option>value</option></div>".to_owned(),
+            );
+        let fragment_wrapper = first_element_by_ns(&fragment, HTML_NS, "div");
+        let fragment_option = first_element_by_ns(&fragment, HTML_NS, "option");
+        assert_eq!(
+            fragment
+                .node(fragment_option)
+                .and_then(|node| node.parent_node_id()),
+            Some(fragment_wrapper),
+            "select innerHTML parsing should preserve option wrapper elements"
+        );
+    }
+
+    #[test]
+    fn decoded_parser_continues_after_meta_encoding_indicator() {
+        let document = parse_test_document(concat!(
+            "<!doctype html><meta charset='windows-1252'>",
+            "<div id='after-meta'></div>"
+        ));
+        let div = first_element_by_ns(&document, HTML_NS, "div");
+
+        assert_eq!(
+            document.get_attribute(div, "id").as_deref(),
+            Some("after-meta")
+        );
+    }
+
     #[test]
     fn parser_input_session_keeps_nested_pending_buffers_on_a_stack() {
         let queue = ParserInputQueue::default();

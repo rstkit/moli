@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiFunctionTemplate;
 use std::str::FromStr;
@@ -29,7 +30,7 @@ const WEBSOCKET_EVENT_HANDLERS: &[WebSocketEventHandler] = &[
 ];
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "WebSocket")]
+#[webapi(interface = web_api_interfaces::WebSocket, receiver)]
 struct WebSocketEventHandlerAccessorsDeclaration {
     #[webapi(
         accessor_property,
@@ -165,13 +166,9 @@ pub(super) fn websocket_binary_type_setter_function<'s>(
             return;
         }
     };
+    // Enum attribute setters ignore unknown tokens after DOMString conversion.
+    // Observable conversion errors still propagate above.
     let Ok(binary_type) = WebSocketBinaryType::from_str(&value) else {
-        super::helpers::throw_websocket_dom_exception(
-            scope,
-            "SyntaxError",
-            12,
-            "Failed to set 'binaryType' on 'WebSocket': The provided value is not a valid enum value of type BinaryType.",
-        );
         return;
     };
 
@@ -247,9 +244,7 @@ fn websocket_event_handler_getter_function<'s>(
         rv.set_null();
         return;
     };
-    let target = args.this();
-    let value = get_private_value(scope, target, handler.slot_name)
-        .or_else(|| target.get(scope, v8str(scope, handler.slot_name).into()))
+    let value = super::helpers::websocket_value_slot(scope, args.this(), handler.slot_name)
         .unwrap_or_else(|| v8::null(scope).into());
     if value.is_null_or_undefined() {
         rv.set_null();
@@ -271,19 +266,14 @@ fn websocket_event_handler_setter_function<'s>(
     ) else {
         return;
     };
-    let value = args.get(0);
-    let stored = if value.is_function() || value.is_object() {
-        value
-    } else {
-        v8::null(scope).into()
+    let Some(target) = moli_webapi_declare::web_api_object_target(scope, args.this()) else {
+        return;
     };
-    super::helpers::set_websocket_value_slot(scope, args.this(), handler.slot_name, stored);
-    simple_object_event_set_ordered_handler(
+    simple_object_event_set_handler(
         scope,
-        args.this(),
-        WEBSOCKET_LISTENERS_SLOT,
+        target,
         handler.event_type,
         handler.slot_name,
-        stored.is_function(),
+        args.get(0),
     );
 }

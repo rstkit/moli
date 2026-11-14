@@ -37,6 +37,35 @@ pub(in crate::runtime) fn has_current_render_runtime_owner_local_store() -> bool
     CURRENT_RENDER_RUNTIME_OWNER_LOCAL_STORE.with(|current_store| current_store.borrow().is_some())
 }
 
+pub(in crate::runtime) fn capture_document_environment_on_bound_owner_local_store(
+    id: u64,
+    environment: crate::script_vm::ScriptVmCapturedDocumentEnvironment,
+) {
+    with_bound_render_runtime_owner_local_store_session(|session| {
+        assert!(
+            session
+                .store
+                .captured_document_environments
+                .insert(id, environment)
+                .is_none()
+        );
+    });
+}
+
+pub(in crate::runtime) fn take_document_environment_on_bound_owner_local_store(
+    id: u64,
+    isolate_identity: usize,
+) -> Result<crate::script_vm::ScriptVmInitialDocumentEnvironment> {
+    with_bound_render_runtime_owner_local_store_session(|session| {
+        session
+            .store
+            .captured_document_environments
+            .remove(&id)
+            .ok_or_else(|| anyhow!("captured document environment is no longer available"))?
+            .take(isolate_identity)
+    })
+}
+
 pub(in crate::runtime) fn owner_local_store_session(
     store: &mut RendererOwnerLocalStore,
 ) -> RendererOwnerLocalStoreSession<'_> {
@@ -50,7 +79,7 @@ pub(in crate::runtime) fn install_page_vm_on_bound_owner_local_store(
     navigation_redirected: bool,
     navigation_redirect_count: usize,
     response_status: u16,
-    response_headers: Vec<(String, String)>,
+    response_headers: Vec<(String, Vec<u8>)>,
     vm: PageVm,
     pending_download: Option<RendererPendingDownloadActivation>,
     lifecycle_gate: Option<PageVmInitStage>,
@@ -78,7 +107,7 @@ pub(in crate::runtime) fn install_phase_one_blocked_page_on_bound_owner_local_st
     navigation_redirected: bool,
     navigation_redirect_count: usize,
     response_status: u16,
-    response_headers: Vec<(String, String)>,
+    response_headers: Vec<(String, Vec<u8>)>,
     pending_navigation: PageVmPendingPhaseOneNavigation,
     lifecycle_gate: Option<PageVmInitStage>,
 ) -> Result<RendererPendingPageCreation> {
@@ -130,12 +159,18 @@ pub(super) fn reserve_renderer_document_isolate_on_bound_owner_local_store(
     owner_local: &RendererOwnerLocalContext,
     page_id: PageId,
     page_runtime_task_source: crate::page_task_queue::PageRuntimeTaskSource,
+    window_identity: crate::runtime::RendererPageWindowIdentity,
 ) -> Result<(
     RendererDocumentIsolateBootstrap,
     RendererDocumentIsolateReservation,
 )> {
     with_bound_render_runtime_owner_local_store_session(|mut session| {
-        session.reserve_renderer_document_isolate(owner_local, page_id, page_runtime_task_source)
+        session.reserve_renderer_document_isolate(
+            owner_local,
+            page_id,
+            page_runtime_task_source,
+            window_identity,
+        )
     })
 }
 
@@ -432,7 +467,9 @@ pub(in crate::runtime) async fn dispatch_async_command_on_entry_via_local_task(
 pub(in crate::runtime) struct RendererPageCommandDispatch {
     pub(in crate::runtime) reply: RendererPageReply,
     pub(in crate::runtime) replacement_lifecycle: Option<DocumentLifecycleTurnOutcome>,
-    pub(in crate::runtime) turn_records: Vec<PendingRendererOutputRecord>,
+    /// Records already belong to the Page journal; only their exact completion
+    /// dependency crosses owner continuations.
+    pub(in crate::runtime) command_output_cursor: Option<RendererOutputCursor>,
 }
 
 pub(in crate::runtime) async fn advance_runtime_command_lifecycle_on_entry_via_local_task(
@@ -725,15 +762,27 @@ pub(super) fn page_ready_descriptor_snapshot(
         descriptors.push(action_window);
         due_deadline_was_ready = true;
     }
-    let timer_selection = if descriptors.is_empty() {
-        crate::page_task_queue::RendererPageTimerSelection::AnyReady
-    } else {
-        crate::page_task_queue::RendererPageTimerSelection::ExcludeUnexpiredIdleCallbacks
-    };
-    if let Some(timer) = entry
+    // An idle callback is eligible only when no ordinary task is ready,
+    // including a later deadline in the same timer heap. The earliest heap
+    // entry can be idle even though another timer has also become due.
+    let timer = entry
         .page_vm()
-        .due_page_timer_ready_descriptor(timer_selection)
-    {
+        .due_page_timer_ready_descriptor(
+            crate::page_task_queue::RendererPageTimerSelection::ExcludeUnexpiredIdleCallbacks,
+        )
+        .or_else(|| {
+            // A javascript: navigation can be waiting for its owner handoff
+            // rather than a typed source. Its pending slot is runnable work
+            // even before the handoff wake has been consumed.
+            if descriptors.is_empty() && entry.pending_javascript_navigation_handoff().is_none() {
+                entry.page_vm().due_page_timer_ready_descriptor(
+                    crate::page_task_queue::RendererPageTimerSelection::AnyReady,
+                )
+            } else {
+                None
+            }
+        });
+    if let Some(timer) = timer {
         descriptors.push(timer);
         due_deadline_was_ready = true;
     }
@@ -902,12 +951,21 @@ pub(in crate::runtime) fn observe_document_lifecycle_on_entry(
     entry.observe_document_lifecycle(document, target_stage)
 }
 
-pub(super) fn reconcile_page_creation_lifecycle_observation(
+pub(in crate::runtime) fn reconcile_navigation_follow_lifecycle_observation(
     observation: DocumentLifecycleObserverOutcome,
     has_pending_location_navigation: bool,
+    has_pending_navigation_from_observed_document: bool,
 ) -> DocumentLifecycleObserverOutcome {
     match observation {
         DocumentLifecycleObserverOutcome::Reached if has_pending_location_navigation => {
+            DocumentLifecycleObserverOutcome::NavigationPending
+        }
+        DocumentLifecycleObserverOutcome::Interrupted(termination)
+            if has_pending_navigation_from_observed_document
+                && termination.reason == crate::runtime::RendererDocumentTerminationReason::SupersededByCrossDocumentNavigation => {
+            // A queued browser task can start another navigation before the
+            // awaited milestone. Follow that exact Document's request;
+            // unrelated termination still interrupts the lifecycle wait.
             DocumentLifecycleObserverOutcome::NavigationPending
         }
         observation => observation,
@@ -929,4 +987,83 @@ impl Drop for RenderRuntimeOwnerLocalStoreBinding {
             current_store.borrow_mut().take();
         });
     }
+}
+
+pub(in crate::runtime) async fn finalize_prepared_page_replacement_on_entry_via_local_task(
+    local_executor: JsLocalExecutor,
+    token: RendererPageToken,
+    entry: LivePageEntry,
+) -> (
+    LivePageEntry,
+    Result<(
+        RendererPageReplacementCommit,
+        Option<super::RendererOutputPublication>,
+    )>,
+) {
+    run_entry_on_bound_owner_local_store_local_task(local_executor, entry, move |entry| {
+        Box::pin(async move {
+            let page_state = RendererOwnerLocalStore::commit_current_vm_page_state_on_entry(entry)?;
+            let initial_runtime_realms = entry.page_vm_mut().vm_mut().runtime_realm_inventory();
+            let devtools_agent_token = entry.page_vm().devtools_agent_token();
+            let javascript_dialog_broker = entry.page_vm().javascript_dialog_broker();
+            let devtools_target = entry.page_vm().devtools_target();
+            let creation_artifacts = entry.page_vm_mut().take_page_creation_artifacts();
+            // Resolve the current owner turn before capturing the fence. The
+            // previous published cursor cannot order this Document's context
+            // creation, preload output, or synchronous load before the reply.
+            let renderer_output = entry.page_vm_mut().settle_renderer_output_publication();
+            let renderer_output_predecessor = entry
+                .page_vm()
+                .renderer_output_tail_cursor()
+                .map(|cursor| entry.page_vm().declare_renderer_output_fence(cursor));
+            Ok((
+                RendererPageReplacementCommit {
+                    token,
+                    slot: entry.slot.clone(),
+                    vm_creation_id: entry.page_vm().creation_id,
+                    devtools_agent_token,
+                    javascript_dialog_broker,
+                    devtools_target,
+                    page_state,
+                    creation_diagnostics: RendererPageCreationDiagnostics {
+                        initial_runtime_realms,
+                        renderer_output_predecessor,
+                    },
+                    creation_artifacts,
+                    pending_download: None,
+                    committed_document_post_response_continuation: None,
+                },
+                renderer_output,
+            ))
+        })
+    })
+    .await
+}
+
+pub(in crate::runtime) fn stage_related_initial_empty_page_on_bound_owner_local_store(
+    owner: &RendererOwnerLocalContext,
+    scope: &mut v8::PinScope<'_, '_>,
+    pending: &RendererPendingAuxiliaryPage,
+    environment: &RendererPageScriptEnvironment,
+    bindings: &crate::native_bridge::bindings::NativeBridgeBindings,
+    init: RendererRelatedInitialEmptyPageInit,
+) -> Result<RendererPageScriptEnvironment> {
+    with_bound_render_runtime_owner_local_store_session(|session| {
+        session.store.stage_related_initial_empty_page(
+            owner,
+            scope,
+            pending,
+            environment,
+            bindings,
+            init,
+        )
+    })
+}
+
+pub(in crate::runtime) fn take_staged_auxiliary_page_on_bound_owner_local_store(
+    reservation: RendererPageReservationToken,
+) -> Option<PageVm> {
+    with_bound_render_runtime_owner_local_store_session(|session| {
+        session.store.take_staged_auxiliary_page(reservation)
+    })
 }

@@ -1,12 +1,15 @@
 use super::*;
-use crate::devtools_runtime::{
-    DevToolsAddNetworkInterceptCommand, DevToolsAuthChallengeAction, DevToolsAuthCredentials,
-    DevToolsCommand, DevToolsCommandContext, DevToolsCommandResult,
+use crate::automation::{
+    AutomationCommand, AutomationContext, AutomationResult, DevToolsAddNetworkInterceptCommand,
+    DevToolsAuthChallengeAction, DevToolsAuthCredentials,
     DevToolsContinueInterceptedResponseCommand, DevToolsContinueWithAuthCommand,
     DevToolsNetworkInterceptId, DevToolsNetworkInterceptPattern, DevToolsNetworkInterceptPhase,
-    DevToolsProtocol, DevToolsRequestId, DevToolsSessionId, DevToolsTargetId,
+    DevToolsRequestId, DevToolsSessionId, DevToolsTargetId, FrontendProtocol,
 };
-use crate::testing::drain_scheduler_events_like_scheduler;
+use crate::testing::collect_ready_scheduler_output;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
+mod auth_source_union;
 
 fn is_fetch_event_for_request(message: &serde_json::Value, method: &str, request_id: &str) -> bool {
     message["method"] == json!(method)
@@ -37,11 +40,18 @@ fn network_events_for_request<'a>(
         .collect()
 }
 
-fn assert_chromium_successful_http_extra_info(
-    ctx: &TestContext,
+async fn assert_chromium_successful_http_extra_info(
+    ctx: &mut TestContext,
     request_id: &str,
     expected_host: &str,
 ) {
+    wait_for_network_loading_finished(
+        ctx,
+        "SID-1",
+        request_id,
+        "HTTP response terminal before inspecting extra info",
+    )
+    .await;
     let requests = network_events_for_request(ctx, "Network.requestWillBeSent", request_id);
     assert_eq!(requests.len(), 1, "one browser-visible request");
 
@@ -152,12 +162,10 @@ async fn runtime_fetch_subresource_intercept_response_pauses_after_response_unti
     .await;
     let _ = take_response_by_id(&mut ctx, 384);
 
-    let request_paused = ctx
-        .sent
-        .iter()
-        .find(|message| message["method"] == json!("Fetch.requestPaused"))
-        .cloned()
-        .expect("request-stage pause");
+    let request_paused = ctx.take_first_matching("request-stage pause", |message| {
+        message["method"] == json!("Fetch.requestPaused")
+            && message["params"]["request"]["url"] == json!(api_url)
+    });
     let request_id = request_paused["params"]["requestId"]
         .as_str()
         .expect("request id")
@@ -167,7 +175,6 @@ async fn runtime_fetch_subresource_intercept_response_pauses_after_response_unti
         .expect("network id")
         .to_owned();
     assert_eq!(request_paused["params"]["request"]["url"], api_url);
-    ctx.sent.clear();
 
     ctx.process_async(json!({
         "id": 385,
@@ -196,7 +203,16 @@ async fn runtime_fetch_subresource_intercept_response_pauses_after_response_unti
         response_paused["params"]["responseHeaders"][0]["name"],
         "content-type"
     );
-    assert!(ctx.sent.is_empty());
+    assert!(
+        ctx.sent.iter().all(|message| {
+            matches!(
+                message["method"].as_str(),
+                Some("Network.requestWillBeSent" | "Network.requestWillBeSentExtraInfo")
+            ) && message["params"]["requestId"] == json!(network_id)
+        }),
+        "only the request prefix may precede continueResponse: {:?}",
+        ctx.sent
+    );
 
     ctx.process_async(json!({
         "id": 386,
@@ -208,8 +224,8 @@ async fn runtime_fetch_subresource_intercept_response_pauses_after_response_unti
     ctx.expect_result(
         386,
         json!({
-            "body": "fetch-response-stage",
-            "base64Encoded": false
+            "body": BASE64_STANDARD.encode("fetch-response-stage"),
+            "base64Encoded": true
         }),
         Some("SID-1"),
     );
@@ -234,7 +250,8 @@ async fn runtime_fetch_subresource_intercept_response_pauses_after_response_unti
         .expect("network request id")
         .to_owned();
     assert_eq!(request["params"]["type"], "Fetch");
-    assert_chromium_successful_http_extra_info(&ctx, &network_request_id, &addr.to_string());
+    assert_chromium_successful_http_extra_info(&mut ctx, &network_request_id, &addr.to_string())
+        .await;
     let response = ctx
         .sent
         .iter()
@@ -472,14 +489,18 @@ async fn runtime_child_frame_fetch_subresource_interception_uses_child_frame_att
     let mut ctx = TestContext::new();
     with_loaded_http_document(&mut ctx, &top_url, "SID-1", "TID-1").await;
     ctx.enable_page_events_for_test(Some("SID-1"));
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .active_page_target_mut()
-        .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
-        .runtime_session_state
-        .inspector_enabled = true;
+    {
+        let fixture_value = true;
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .unwrap()
+                .active_page_target_mut()
+                .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
+                .runtime_session_state
+                .inspector_enabled = fixture_value;
+        });
+    }
     ctx.sent.clear();
     let child_frame_id = child_frame_id_for_single_iframe_async(&mut ctx, 36_400).await;
 
@@ -491,14 +512,9 @@ async fn runtime_child_frame_fetch_subresource_interception_uses_child_frame_att
     .await;
     ctx.expect_result(36_401, json!({}), Some("SID-1"));
 
-    ctx.process_async(json!({
-        "id": 36_402,
-        "method": "Fetch.enable",
-        "sessionId": "SID-1"
-    }))
-    .await;
-    ctx.expect_result(36_402, json!({}), Some("SID-1"));
-    enable_runtime_async(&mut ctx, "SID-1", 36_403).await;
+    // Finish fixture navigation before enabling request interception;
+    // otherwise a late-starting child Document can itself pause here.
+    // Runtime.enable also clears events, so consume this exact terminal first.
     wait_until_message(
         &mut ctx,
         "SID-1",
@@ -509,6 +525,14 @@ async fn runtime_child_frame_fetch_subresource_interception_uses_child_frame_att
         },
     )
     .await;
+    ctx.process_async(json!({
+        "id": 36_402,
+        "method": "Fetch.enable",
+        "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(36_402, json!({}), Some("SID-1"));
+    enable_runtime_async(&mut ctx, "SID-1", 36_403).await;
 
     ctx.process_async(json!({
         "id": 36_404,
@@ -820,19 +844,20 @@ async fn runtime_xhr_subresource_intercept_response_pauses_after_response_until_
     .await;
     let _ = take_response_by_id(&mut ctx, 391);
 
-    let request_paused = ctx
-        .sent
-        .iter()
-        .find(|message| message["method"] == json!("Fetch.requestPaused"))
-        .cloned()
-        .expect("request-stage pause");
+    let request_paused = ctx.take_first_matching("request-stage pause", |message| {
+        message["method"] == json!("Fetch.requestPaused")
+            && message["params"]["request"]["url"] == json!(xhr_url)
+    });
     let request_id = request_paused["params"]["requestId"]
         .as_str()
         .expect("request id")
         .to_owned();
+    let network_id = request_paused["params"]["networkId"]
+        .as_str()
+        .expect("network id")
+        .to_owned();
     assert_eq!(request_paused["params"]["resourceType"], "XHR");
     assert_eq!(request_paused["params"]["request"]["url"], xhr_url);
-    ctx.sent.clear();
 
     ctx.process_async(json!({
         "id": 392,
@@ -856,7 +881,16 @@ async fn runtime_xhr_subresource_intercept_response_pauses_after_response_until_
     assert_eq!(response_paused["params"]["requestId"], request_id);
     assert_eq!(response_paused["params"]["resourceType"], "XHR");
     assert_eq!(response_paused["params"]["responseStatusCode"], 200);
-    assert!(ctx.sent.is_empty());
+    assert!(
+        ctx.sent.iter().all(|message| {
+            matches!(
+                message["method"].as_str(),
+                Some("Network.requestWillBeSent" | "Network.requestWillBeSentExtraInfo")
+            ) && message["params"]["requestId"] == json!(network_id)
+        }),
+        "only the request prefix may precede continueResponse: {:?}",
+        ctx.sent
+    );
 
     ctx.process_async(json!({
         "id": 393,
@@ -868,8 +902,8 @@ async fn runtime_xhr_subresource_intercept_response_pauses_after_response_until_
     ctx.expect_result(
         393,
         json!({
-            "body": "xhr-response-stage",
-            "base64Encoded": false
+            "body": BASE64_STANDARD.encode("xhr-response-stage"),
+            "base64Encoded": true
         }),
         Some("SID-1"),
     );
@@ -894,6 +928,8 @@ async fn runtime_xhr_subresource_intercept_response_pauses_after_response_until_
         .expect("network request id")
         .to_owned();
     assert_eq!(request["params"]["type"], "XHR");
+    assert_chromium_successful_http_extra_info(&mut ctx, &network_request_id, &addr.to_string())
+        .await;
     let response = ctx
         .sent
         .iter()
@@ -999,15 +1035,10 @@ async fn runtime_fetch_subresource_redirect_preserves_request_id_under_fetch_int
     .await;
     let _ = take_response_by_id(&mut ctx, 398);
 
-    let request_paused = ctx
-        .sent
-        .iter()
-        .find(|message| {
-            message["method"] == json!("Fetch.requestPaused")
-                && message["params"]["request"]["url"] == json!(start_url)
-        })
-        .cloned()
-        .expect("request-stage pause");
+    let request_paused = ctx.take_first_matching("request-stage pause", |message| {
+        message["method"] == json!("Fetch.requestPaused")
+            && message["params"]["request"]["url"] == json!(start_url)
+    });
     let request_id = request_paused["params"]["requestId"]
         .as_str()
         .expect("request id")
@@ -1016,7 +1047,6 @@ async fn runtime_fetch_subresource_redirect_preserves_request_id_under_fetch_int
         .as_str()
         .expect("network id")
         .to_owned();
-    ctx.sent.clear();
 
     ctx.process_async(json!({
         "id": 399,
@@ -1040,7 +1070,6 @@ async fn runtime_fetch_subresource_redirect_preserves_request_id_under_fetch_int
     assert_eq!(response_paused["params"]["requestId"], request_id);
     assert_eq!(response_paused["params"]["networkId"], network_id);
     assert_eq!(response_paused["params"]["responseStatusCode"], 200);
-    ctx.sent.clear();
 
     ctx.process_async(json!({
         "id": 400,
@@ -1051,6 +1080,8 @@ async fn runtime_fetch_subresource_redirect_preserves_request_id_under_fetch_int
     .await;
     ctx.expect_result(400, json!({}), Some("SID-1"));
 
+    // Both request starts belong to this transaction, including the prefix
+    // observed while the response is still intercepted.
     let fetch_requests = ctx
         .sent
         .iter()
@@ -1060,7 +1091,7 @@ async fn runtime_fetch_subresource_redirect_preserves_request_id_under_fetch_int
         })
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(fetch_requests.len(), 2);
+    assert_eq!(fetch_requests.len(), 2, "{fetch_requests:?}");
     assert_eq!(fetch_requests[0]["params"]["request"]["url"], start_url);
     assert_eq!(fetch_requests[1]["params"]["request"]["url"], final_url);
     assert_eq!(
@@ -1183,15 +1214,10 @@ async fn runtime_xhr_subresource_redirect_preserves_request_id_under_fetch_inter
     .await;
     let _ = take_response_by_id(&mut ctx, 404);
 
-    let request_paused = ctx
-        .sent
-        .iter()
-        .find(|message| {
-            message["method"] == json!("Fetch.requestPaused")
-                && message["params"]["request"]["url"] == json!(start_url)
-        })
-        .cloned()
-        .expect("request-stage pause");
+    let request_paused = ctx.take_first_matching("request-stage pause", |message| {
+        message["method"] == json!("Fetch.requestPaused")
+            && message["params"]["request"]["url"] == json!(start_url)
+    });
     let request_id = request_paused["params"]["requestId"]
         .as_str()
         .expect("request id")
@@ -1200,7 +1226,6 @@ async fn runtime_xhr_subresource_redirect_preserves_request_id_under_fetch_inter
         .as_str()
         .expect("network id")
         .to_owned();
-    ctx.sent.clear();
 
     ctx.process_async(json!({
         "id": 405,
@@ -1218,6 +1243,33 @@ async fn runtime_xhr_subresource_redirect_preserves_request_id_under_fetch_inter
     )
     .await;
 
+    let redirect_paused =
+        take_fetch_event_for_request(&mut ctx, "Fetch.requestPaused", &request_id);
+    assert_eq!(redirect_paused["params"]["responseStatusCode"], 307);
+    assert_eq!(redirect_paused["params"]["networkId"], network_id);
+    ctx.process_async(json!({"id":409,"method":"Fetch.continueResponse","sessionId":"SID-1","params":{"requestId":request_id}})).await;
+    ctx.expect_result(409, json!({}), Some("SID-1"));
+    let redirected = ctx
+        .wait_for_scheduler_message("redirect target's request interception", |message| {
+            message["method"] == "Fetch.requestPaused"
+                && message["params"]["request"]["url"] == final_url
+                && message["params"].get("responseStatusCode").is_none()
+        })
+        .await;
+    assert_eq!(redirected["params"]["networkId"], network_id);
+    let request_id = redirected["params"]["requestId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ctx.process_async(json!({"id":410,"method":"Fetch.continueRequest","sessionId":"SID-1","params":{"requestId":request_id,"interceptResponse":true}})).await;
+    ctx.expect_result(410, json!({}), Some("SID-1"));
+    wait_until_message(
+        &mut ctx,
+        "SID-1",
+        "final redirect response interception",
+        |message| is_fetch_event_for_request(message, "Fetch.requestPaused", &request_id),
+    )
+    .await;
     let response_paused =
         take_fetch_event_for_request(&mut ctx, "Fetch.requestPaused", &request_id);
     assert_eq!(response_paused["method"], "Fetch.requestPaused");
@@ -1225,7 +1277,6 @@ async fn runtime_xhr_subresource_redirect_preserves_request_id_under_fetch_inter
     assert_eq!(response_paused["params"]["networkId"], network_id);
     assert_eq!(response_paused["params"]["resourceType"], "XHR");
     assert_eq!(response_paused["params"]["responseStatusCode"], 200);
-    ctx.sent.clear();
 
     ctx.process_async(json!({
         "id": 406,
@@ -1235,6 +1286,12 @@ async fn runtime_xhr_subresource_redirect_preserves_request_id_under_fetch_inter
     }))
     .await;
     ctx.expect_result(406, json!({}), Some("SID-1"));
+
+    ctx.wait_for_scheduler_message("redirected XHR completed", |message| {
+        message["method"] == "Network.loadingFinished"
+            && message["params"]["requestId"] == network_id
+    })
+    .await;
 
     let xhr_requests = ctx
         .sent
@@ -1452,7 +1509,8 @@ async fn runtime_fetch_subresource_auth_required_then_continue_with_auth_resolve
         .expect("network request id")
         .to_owned();
     assert_eq!(network_request_id, network_id);
-    assert_chromium_successful_http_extra_info(&ctx, &network_request_id, &addr.to_string());
+    assert_chromium_successful_http_extra_info(&mut ctx, &network_request_id, &addr.to_string())
+        .await;
     let response = ctx
         .sent
         .iter()
@@ -1525,13 +1583,14 @@ async fn multiple_fetch_sessions_chain_subresource_auth_required_pauses() {
     let protected_url = format!("http://{addr}/protected");
     let mut ctx = TestContext::new();
     with_loaded_http_document(&mut ctx, &page_url, "SID-1", "TID-1").await;
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_mut()
-            .unwrap()
-            .assign_attached_session_to_target("TID-1", "SID-attached".to_owned())
-    );
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.browser_context
+                .as_mut()
+                .unwrap()
+                .assign_attached_session_to_target("TID-1", "SID-attached".to_owned())
+        })
+    });
 
     for (id, session_id) in [(35_970, "SID-1"), (35_971, "SID-attached")] {
         ctx.process_async(json!({
@@ -1797,10 +1856,10 @@ async fn run_cdp_fetch_then_bidi_network_auth_required_terminal_credentials_comp
     ctx.expect_result(35_980, json!({}), Some("SID-1"));
 
     let result = ctx
-        .execute_devtools_command_through_renderer_fence_for_test(
-            DevToolsCommand::AddNetworkIntercept(DevToolsAddNetworkInterceptCommand {
-                context: DevToolsCommandContext {
-                    protocol: DevToolsProtocol::WebDriverBidi,
+        .execute_automation_command_through_renderer_fence_for_test(
+            AutomationCommand::AddNetworkIntercept(DevToolsAddNetworkInterceptCommand {
+                context: AutomationContext {
+                    protocol: FrontendProtocol::WebDriverBidi,
                     session_id: Some(DevToolsSessionId::from("BIDI-SID")),
                     target_id: Some(DevToolsTargetId::from("TID-1")),
                     browser_context_id: None,
@@ -1815,20 +1874,20 @@ async fn run_cdp_fetch_then_bidi_network_auth_required_terminal_credentials_comp
         .await;
     assert_eq!(
         result.expect("BiDi add auth intercept should succeed"),
-        DevToolsCommandResult::AddNetworkIntercept(
-            crate::devtools_runtime::DevToolsAddNetworkInterceptResult {
+        AutomationResult::AddNetworkIntercept(
+            crate::automation::DevToolsAddNetworkInterceptResult {
                 intercept_id: DevToolsNetworkInterceptId::from("intercept-auth")
             }
         )
     );
     let protected_parsed_url = Url::parse(&protected_url).unwrap();
-    let auth_pause_sessions = ctx
-        .conn
-        .target_fetch_subresource_interception_snapshot_for_owner(
+    let auth_pause_sessions = ctx.with_fixture(|conn| {
+        conn.target_fetch_subresource_interception_snapshot_for_owner(
             &crate::conn::CommandOwnerScope::for_session("SID-1"),
         )
         .expect("active target fetch snapshot")
-        .matching_auth_required_pause_sessions(Some("SID-1"), &protected_parsed_url);
+        .matching_auth_required_pause_sessions(Some("SID-1"), &protected_parsed_url)
+    });
     assert_eq!(
         auth_pause_sessions
             .iter()
@@ -1962,11 +2021,10 @@ async fn run_cdp_fetch_then_bidi_network_auth_required_terminal_credentials_comp
         continue_renderer_output_predecessor,
     ) = match terminal_command {
         MixedAuthTerminalCredentialsCommand::ContinueWithAuth => ctx
-            .conn
-            .execute_devtools_command(DevToolsCommand::ContinueWithAuth(
+            .execute_owned_automation_command_for_test(AutomationCommand::ContinueWithAuth(
                 DevToolsContinueWithAuthCommand {
-                    context: DevToolsCommandContext {
-                        protocol: DevToolsProtocol::WebDriverBidi,
+                    context: AutomationContext {
+                        protocol: FrontendProtocol::WebDriverBidi,
                         session_id: Some(DevToolsSessionId::from("BIDI-SID")),
                         target_id: Some(DevToolsTargetId::from("TID-1")),
                         browser_context_id: None,
@@ -1980,33 +2038,33 @@ async fn run_cdp_fetch_then_bidi_network_auth_required_terminal_credentials_comp
             .await
             .into_complete_parts(),
         MixedAuthTerminalCredentialsCommand::ContinueResponseAuthCredentials => ctx
-            .conn
-            .execute_devtools_command(DevToolsCommand::ContinueInterceptedResponse(
-                DevToolsContinueInterceptedResponseCommand {
-                    context: DevToolsCommandContext {
-                        protocol: DevToolsProtocol::WebDriverBidi,
-                        session_id: Some(DevToolsSessionId::from("BIDI-SID")),
-                        target_id: Some(DevToolsTargetId::from("TID-1")),
-                        browser_context_id: None,
+            .execute_owned_automation_command_for_test(
+                AutomationCommand::ContinueInterceptedResponse(
+                    DevToolsContinueInterceptedResponseCommand {
+                        context: AutomationContext {
+                            protocol: FrontendProtocol::WebDriverBidi,
+                            session_id: Some(DevToolsSessionId::from("BIDI-SID")),
+                            target_id: Some(DevToolsTargetId::from("TID-1")),
+                            browser_context_id: None,
+                        },
+                        request_id: DevToolsRequestId::from(bidi_auth_request_id.as_str()),
+                        response_code: None,
+                        response_headers: None,
+                        response_phrase: None,
+                        auth_credentials: Some(DevToolsAuthCredentials {
+                            username: "user".to_owned(),
+                            password: "pass".to_owned(),
+                        }),
                     },
-                    request_id: DevToolsRequestId::from(bidi_auth_request_id.as_str()),
-                    response_code: None,
-                    response_headers: None,
-                    response_phrase: None,
-                    auth_credentials: Some(DevToolsAuthCredentials {
-                        username: "user".to_owned(),
-                        password: "pass".to_owned(),
-                    }),
-                },
-            ))
+                ),
+            )
             .await
             .into_complete_parts(),
         MixedAuthTerminalCredentialsCommand::ContinueWithAuthCancel => ctx
-            .conn
-            .execute_devtools_command(DevToolsCommand::ContinueWithAuth(
+            .execute_owned_automation_command_for_test(AutomationCommand::ContinueWithAuth(
                 DevToolsContinueWithAuthCommand {
-                    context: DevToolsCommandContext {
-                        protocol: DevToolsProtocol::WebDriverBidi,
+                    context: AutomationContext {
+                        protocol: FrontendProtocol::WebDriverBidi,
                         session_id: Some(DevToolsSessionId::from("BIDI-SID")),
                         target_id: Some(DevToolsTargetId::from("TID-1")),
                         browser_context_id: None,
@@ -2026,16 +2084,17 @@ async fn run_cdp_fetch_then_bidi_network_auth_required_terminal_credentials_comp
     }
     assert_eq!(
         continue_result.expect("BiDi auth terminal action should succeed"),
-        DevToolsCommandResult::Empty
+        AutomationResult::Empty
     );
     let mut continue_output = continue_protocol_events
         .into_iter()
-        .map(|event| event.into_protocol_message())
+        .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
         .collect::<Vec<_>>();
-    drain_scheduler_events_like_scheduler(
-        &mut ctx.conn,
+    collect_ready_scheduler_output(
+        &ctx.handle(),
         &mut continue_output,
         continue_scheduler_events,
+        crate::conn::BackgroundProtocolEvent::into_protocol_message,
     )
     .await;
     ctx.sent.extend(continue_output);
@@ -2431,10 +2490,11 @@ async fn runtime_fetch_subresource_proxy_digest_auth_then_continue_with_auth_res
 
     let page_url = "http://example.test/page";
     let protected_url = "http://example.test/protected";
-    let mut ctx = TestContext::new();
-    ctx.conn
-        .set_http_proxy_override_async(Some(format!("http://{proxy_addr}")))
+    let mut conn = crate::testing::real_layout_test_connection();
+    conn.set_root_target_discovery_enabled(true);
+    conn.set_http_proxy_override_async(Some(format!("http://{proxy_addr}")))
         .await;
+    let mut ctx = TestContext::from_conn(conn);
     with_loaded_http_document(&mut ctx, page_url, "SID-1", "TID-1").await;
     ctx.sent.clear();
 
@@ -2766,7 +2826,7 @@ async fn runtime_fetch_subresource_handles_multi_round_basic_auth() {
         .cloned()
         .expect("network request event");
     assert_eq!(request["params"]["requestId"], json!(network_id));
-    assert_chromium_successful_http_extra_info(&ctx, &network_id, &addr.to_string());
+    assert_chromium_successful_http_extra_info(&mut ctx, &network_id, &addr.to_string()).await;
 
     ctx.process_async(json!({
         "id": 702,
@@ -2995,7 +3055,7 @@ async fn runtime_fetch_subresource_handles_multi_round_digest_auth() {
         .cloned()
         .expect("network request event");
     assert_eq!(request["params"]["requestId"], json!(network_id));
-    assert_chromium_successful_http_extra_info(&ctx, &network_id, &addr.to_string());
+    assert_chromium_successful_http_extra_info(&mut ctx, &network_id, &addr.to_string()).await;
 
     ctx.process_async(json!({
         "id": 719,
@@ -3151,6 +3211,16 @@ async fn runtime_xhr_subresource_auth_required_default_aborts_request() {
     .await;
     ctx.expect_result(447, json!({}), Some("SID-1"));
 
+    wait_until_message(
+        &mut ctx,
+        "SID-1",
+        "native XHR failure notification",
+        |message| {
+            message["method"] == "Network.loadingFailed"
+                && message["params"]["requestId"] == network_id
+        },
+    )
+    .await;
     let failed = ctx
         .sent
         .iter()
@@ -3819,10 +3889,11 @@ async fn runtime_xhr_subresource_proxy_digest_auth_then_continue_with_auth_resol
         }
     });
 
-    let mut ctx = TestContext::new();
-    ctx.conn
-        .set_http_proxy_override_async(Some(format!("http://{proxy_addr}")))
+    let mut conn = crate::testing::real_layout_test_connection();
+    conn.set_root_target_discovery_enabled(true);
+    conn.set_http_proxy_override_async(Some(format!("http://{proxy_addr}")))
         .await;
+    let mut ctx = TestContext::from_conn(conn);
     with_loaded_http_document(&mut ctx, "http://example.test/page", "SID-1", "TID-1").await;
     ctx.sent.clear();
 
@@ -4120,18 +4191,14 @@ async fn runtime_fetch_subresource_continue_response_can_override_status_and_hea
     .await;
     let _ = take_response_by_id(&mut ctx, 414);
 
-    let request_paused = ctx
-        .sent
-        .iter()
-        .find(|message| message["method"] == json!("Fetch.requestPaused"))
-        .cloned()
-        .expect("request-stage pause");
+    let request_paused = ctx.take_first_matching("request-stage pause", |message| {
+        message["method"] == json!("Fetch.requestPaused")
+    });
     let request_id = request_paused["params"]["requestId"]
         .as_str()
         .expect("request id")
         .to_owned();
     assert_eq!(request_paused["params"]["request"]["url"], api_url);
-    ctx.sent.clear();
 
     ctx.process_async(json!({
         "id": 415,
@@ -4534,21 +4601,29 @@ async fn runtime_xhr_subresource_take_response_body_as_stream_at_response_stage(
         None,
     );
 
-    ctx.process_async(json!({
-        "id": 459,
-        "method": "IO.read",
-        "params": { "handle": "BID-1:TID-1:STREAM-2" }
-    }))
-    .await;
-    ctx.expect_result(
-        459,
-        json!({
-            "base64Encoded": false,
-            "data": "-xhr-response",
-            "eof": true
-        }),
-        None,
-    );
+    // A live pipe can return its last data before reporting EOF on the next
+    // read. Keep the byte and terminal assertions without assuming that they
+    // share a packet (the previous buffered-only fixture did).
+    let mut suffix = String::new();
+    loop {
+        ctx.process_async(json!({
+            "id": 459,
+            "method": "IO.read",
+            "params": { "handle": "BID-1:TID-1:STREAM-2" }
+        }))
+        .await;
+        let response = take_response_by_id(&mut ctx, 459);
+        let result = &response["result"];
+        assert_eq!(result["base64Encoded"], false, "{response}");
+        let chunk = result["data"].as_str().expect("stream bytes");
+        suffix.push_str(chunk);
+        assert!(suffix.len() <= "-xhr-response".len(), "{response}");
+        if result["eof"] == true {
+            break;
+        }
+        assert!(!chunk.is_empty(), "a nonterminal read must make progress");
+    }
+    assert_eq!(suffix, "-xhr-response");
 
     ctx.process_async(json!({
         "id": 460,
@@ -4566,14 +4641,15 @@ async fn runtime_xhr_subresource_take_response_body_as_stream_at_response_stage(
     .await;
     ctx.expect_result(460, json!({}), Some("SID-1"));
 
-    ctx.process_async(json!({
-        "id": 461,
-        "method": "Runtime.evaluate",
-        "sessionId": "SID-1",
-        "params": { "expression": "globalThis.__lm_xhr_streamed" }
-    }))
+    let resolved = evaluate_until_value_async(
+        &mut ctx,
+        "SID-1",
+        461,
+        "globalThis.__lm_xhr_streamed",
+        &json!("streamed-xhr-response"),
+        "XHR callback after fulfilling the intercepted stream",
+    )
     .await;
-    let resolved = take_response_by_id(&mut ctx, 461);
     assert_eq!(
         resolved["result"]["result"]["value"],
         "streamed-xhr-response"
@@ -4885,6 +4961,16 @@ async fn runtime_xhr_subresource_fail_request_at_response_stage_fires_error_and_
     .await;
     ctx.expect_result(433, json!({}), Some("SID-1"));
 
+    wait_until_message(
+        &mut ctx,
+        "SID-1",
+        "native XHR failure notification",
+        |message| {
+            message["method"] == "Network.loadingFailed"
+                && message["params"]["requestId"] == request_paused["params"]["networkId"]
+        },
+    )
+    .await;
     let failed = ctx
         .sent
         .iter()
@@ -5021,14 +5107,11 @@ async fn stop_loading_aborts_paused_response_stage_runtime_xhr_subresource() {
     ctx.expect_result(791, json!({}), Some("SID-1"));
 
     let failed = ctx
-        .sent
-        .iter()
-        .find(|message| {
+        .wait_for_scheduler_message("stopped response-stage XHR loadingFailed", |message| {
             message["method"] == json!("Network.loadingFailed")
                 && message["params"]["requestId"] == network_id
         })
-        .cloned()
-        .expect("network loadingFailed event");
+        .await;
     assert_eq!(failed["params"]["type"], "XHR");
     assert_eq!(failed["params"]["errorText"], "net::ERR_ABORTED");
     assert_eq!(failed["params"]["canceled"], true);
@@ -5042,14 +5125,15 @@ async fn stop_loading_aborts_paused_response_stage_runtime_xhr_subresource() {
     .await;
     ctx.expect_error(792, -32000, "RequestNotFound");
 
-    ctx.process_async(json!({
-        "id": 793,
-        "method": "Runtime.evaluate",
-        "sessionId": "SID-1",
-        "params": { "expression": "globalThis.__lm_xhr_result" }
-    }))
+    let resolved = evaluate_until_value_async(
+        &mut ctx,
+        "SID-1",
+        793,
+        "globalThis.__lm_xhr_result",
+        &json!("failed"),
+        "stopped response-stage XHR error callback",
+    )
     .await;
-    let resolved = take_response_by_id(&mut ctx, 793);
     assert_eq!(resolved["result"]["result"]["value"], "failed");
 
     server.abort();
@@ -5188,14 +5272,18 @@ async fn close_aborts_paused_response_stage_runtime_xhr_subresource() {
     let xhr_url = format!("http://{addr}/xhr");
     let mut ctx = TestContext::new();
     with_loaded_http_document(&mut ctx, &page_url, "SID-1", "TID-1").await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .active_page_target_mut()
-        .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
-        .runtime_session_state
-        .inspector_enabled = true;
+    {
+        let fixture_value = true;
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .unwrap()
+                .active_page_target_mut()
+                .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
+                .runtime_session_state
+                .inspector_enabled = fixture_value;
+        });
+    }
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -5264,12 +5352,26 @@ async fn close_aborts_paused_response_stage_runtime_xhr_subresource() {
     assert_eq!(response_paused["params"]["request"]["url"], xhr_url);
     ctx.sent.clear();
 
-    ctx.process_async(json!({
-        "id": 898,
-        "method": "Page.close",
-        "sessionId": "SID-1"
-    }))
+    let response_flush = ctx
+        .process_command_holding_response_flush_for_test(json!({
+            "id": 898,
+            "method": "Page.close",
+            "sessionId": "SID-1"
+        }))
+        .await;
+    ctx.finish_held_command_response_flush_for_test(response_flush)
+        .await;
+    crate::testing::wait_until_scheduler_message(
+        &mut ctx,
+        "target retirement after its command response",
+        |message| message["method"] == "Target.detachedFromTarget",
+    )
     .await;
+    ctx.wait_until_scheduler_state("original session retirement", |conn| {
+        !conn.has_attached_devtools_session("SID-1")
+    })
+    .await;
+
     ctx.expect_result(898, json!({}), Some("SID-1"));
 
     let failed = ctx
@@ -5438,14 +5540,11 @@ async fn stop_loading_aborts_paused_runtime_xhr_auth_subresource() {
     ctx.expect_result(7936, json!({}), Some("SID-1"));
 
     let failed = ctx
-        .sent
-        .iter()
-        .find(|message| {
+        .wait_for_scheduler_message("stopped auth-stage XHR loadingFailed", |message| {
             message["method"] == json!("Network.loadingFailed")
                 && message["params"]["requestId"] == network_id
         })
-        .cloned()
-        .expect("network loadingFailed event");
+        .await;
     assert_eq!(failed["params"]["type"], "XHR");
     assert_eq!(failed["params"]["errorText"], "net::ERR_ABORTED");
     assert_eq!(failed["params"]["canceled"], true);
@@ -5466,14 +5565,15 @@ async fn stop_loading_aborts_paused_runtime_xhr_auth_subresource() {
     .await;
     ctx.expect_error(7937, -32000, "RequestNotFound");
 
-    ctx.process_async(json!({
-        "id": 7938,
-        "method": "Runtime.evaluate",
-        "sessionId": "SID-1",
-        "params": { "expression": "globalThis.__lm_xhr_stop_auth_result" }
-    }))
+    let resolved = evaluate_until_value_async(
+        &mut ctx,
+        "SID-1",
+        7938,
+        "globalThis.__lm_xhr_stop_auth_result",
+        &json!("failed"),
+        "stopped authentication-stage XHR error callback",
+    )
     .await;
-    let resolved = take_response_by_id(&mut ctx, 7938);
     assert_eq!(resolved["result"]["result"]["value"], "failed");
 
     server.abort();
@@ -5526,14 +5626,18 @@ async fn close_aborts_paused_runtime_xhr_auth_subresource() {
     let protected_url = format!("http://{addr}/protected");
     let mut ctx = TestContext::new();
     with_loaded_http_document(&mut ctx, &page_url, "SID-1", "TID-1").await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .active_page_target_mut()
-        .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
-        .runtime_session_state
-        .inspector_enabled = true;
+    {
+        let fixture_value = true;
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .unwrap()
+                .active_page_target_mut()
+                .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
+                .runtime_session_state
+                .inspector_enabled = fixture_value;
+        });
+    }
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -5610,12 +5714,26 @@ async fn close_aborts_paused_runtime_xhr_auth_subresource() {
     assert_eq!(auth_required["params"]["resourceType"], "XHR");
     ctx.sent.clear();
 
-    ctx.process_async(json!({
-        "id": 7944,
-        "method": "Page.close",
-        "sessionId": "SID-1"
-    }))
+    let response_flush = ctx
+        .process_command_holding_response_flush_for_test(json!({
+            "id": 7944,
+            "method": "Page.close",
+            "sessionId": "SID-1"
+        }))
+        .await;
+    ctx.finish_held_command_response_flush_for_test(response_flush)
+        .await;
+    crate::testing::wait_until_scheduler_message(
+        &mut ctx,
+        "target retirement after its command response",
+        |message| message["method"] == "Target.detachedFromTarget",
+    )
     .await;
+    ctx.wait_until_scheduler_state("original session retirement", |conn| {
+        !conn.has_attached_devtools_session("SID-1")
+    })
+    .await;
+
     ctx.expect_result(7944, json!({}), Some("SID-1"));
 
     let failed = ctx
@@ -5773,14 +5891,16 @@ async fn crash_aborts_paused_runtime_fetch_subresource() {
     .await;
     ctx.expect_error(905, -32000, "RequestNotFound");
 
-    let bc = ctx.conn.browser_context.as_ref().expect("browser context");
-    assert!(
-        bc.active_page_target()
-            .owner_state
-            .target_crash_state
-            .is_crashed()
-    );
-    assert!(!bc.has_loaded_page());
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().expect("browser context");
+        assert!(
+            bc.active_page_target()
+                .owner_state
+                .target_crash_state
+                .is_crashed()
+        );
+        assert!(!bc.has_loaded_page());
+    });
 
     server.abort();
 }
@@ -5922,14 +6042,16 @@ async fn crash_aborts_paused_response_stage_runtime_xhr_subresource() {
     .await;
     ctx.expect_error(912, -32000, "RequestNotFound");
 
-    let bc = ctx.conn.browser_context.as_ref().expect("browser context");
-    assert!(
-        bc.active_page_target()
-            .owner_state
-            .target_crash_state
-            .is_crashed()
-    );
-    assert!(!bc.has_loaded_page());
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().expect("browser context");
+        assert!(
+            bc.active_page_target()
+                .owner_state
+                .target_crash_state
+                .is_crashed()
+        );
+        assert!(!bc.has_loaded_page());
+    });
 
     server.abort();
 }
@@ -6104,14 +6226,16 @@ async fn crash_aborts_paused_runtime_xhr_auth_subresource() {
     .await;
     ctx.expect_error(919, -32000, "RequestNotFound");
 
-    let bc = ctx.conn.browser_context.as_ref().expect("browser context");
-    assert!(
-        bc.active_page_target()
-            .owner_state
-            .target_crash_state
-            .is_crashed()
-    );
-    assert!(!bc.has_loaded_page());
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().expect("browser context");
+        assert!(
+            bc.active_page_target()
+                .owner_state
+                .target_crash_state
+                .is_crashed()
+        );
+        assert!(!bc.has_loaded_page());
+    });
 
     server.abort();
 }

@@ -1,4 +1,4 @@
-use crate::devtools_runtime::{
+use crate::automation::{
     AutomationEvent, DevToolsFrameId, DevToolsLoaderId, DevToolsNetworkResourceType,
     DevToolsRequestId, DevToolsTargetId, NetworkRedirectResponseEvent, NetworkRequestEvent,
 };
@@ -6,6 +6,7 @@ use moli_cookie_jar::{StoredCookieQueryReport, StoredCookieSetReport};
 use moli_core::page::{
     SubresourceRequestInitiatorType, WebSocketFrameDirection, WebSocketFrameOpcode,
 };
+use moli_protocol_cdp_defs::LocalCdpEvent;
 use serde_json::Value;
 use url::Url;
 
@@ -130,7 +131,7 @@ impl CdpNetworkAutomationEventSink for MainDocumentProgressOutputTarget<'_> {
 
     fn push_network_automation_event(
         &mut self,
-        method: &str,
+        method: LocalCdpEvent,
         params: serde_json::Value,
         session_id: Option<&str>,
         event: AutomationEvent,
@@ -155,7 +156,7 @@ pub(super) fn emit_main_document_request_will_be_sent(
         &Url,
         u16,
         Option<&str>,
-        &[(String, String)],
+        &[(String, Vec<u8>)],
         bool,
         Option<moli_fetch::NegotiatedHttpVersion>,
     )>,
@@ -252,7 +253,7 @@ pub(super) fn emit_response_received_extra_info(
     output: &mut MainDocumentProgressOutputTarget<'_>,
     session_id: Option<&str>,
     request_id: &str,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     status: u16,
     cookie_set_reports: &[StoredCookieSetReport],
 ) {
@@ -278,10 +279,10 @@ pub(super) fn emit_main_document_response_received(
     timestamp: f64,
     final_url: &Url,
     status: u16,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     cookie_set_reports: &[StoredCookieSetReport],
     extra_info_status: u16,
-    extra_info_headers: &[(String, String)],
+    extra_info_headers: &[(String, Vec<u8>)],
     _network_extra_info_available: bool,
     emit_extra_info: bool,
     encoded_data_length: usize,

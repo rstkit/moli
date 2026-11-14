@@ -8,6 +8,10 @@ use crate::RendererOutputFence;
 use crate::renderer::{RendererPageCommand, RendererPageReply};
 
 impl Page {
+    pub fn start_stop_document_lifecycle(&self) -> Result<PendingPageCommand> {
+        self.start_page_command(RendererPageCommand::StopDocumentLifecycle)
+    }
+
     pub fn take_pending_modal_javascript_dialogs(&self) -> Vec<RendererPendingJavaScriptDialog> {
         self.handle.take_pending_modal_javascript_dialogs()
     }
@@ -29,8 +33,8 @@ impl Page {
         internal_id: u64,
         url: Option<Url>,
         method: Option<String>,
-        body: Option<Option<String>>,
-        headers: Option<Vec<(String, String)>>,
+        body: Option<Option<bytes::Bytes>>,
+        headers: Option<moli_fetch::RequestHeaderOverride>,
         intercept_response: bool,
         handle_auth_requests: bool,
     ) -> Result<PendingSubresourceContinueOutcome> {
@@ -51,8 +55,8 @@ impl Page {
         internal_id: u64,
         url: Option<Url>,
         method: Option<String>,
-        body: Option<Option<String>>,
-        headers: Option<Vec<(String, String)>>,
+        body: Option<Option<bytes::Bytes>>,
+        headers: Option<moli_fetch::RequestHeaderOverride>,
         intercept_response: bool,
         handle_auth_requests: bool,
     ) -> Result<PendingPageCommand> {
@@ -212,7 +216,7 @@ impl Page {
         &mut self,
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> Result<()> {
         let pending = self.start_fulfill_pending_subresource_fetch(
@@ -228,7 +232,7 @@ impl Page {
         &self,
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> Result<PendingPageCommand> {
         self.start_page_command(RendererPageCommand::FulfillPendingSubresourceFetch {
@@ -256,7 +260,7 @@ impl Page {
         &mut self,
         internal_id: u64,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> Result<()> {
         let pending = self.start_continue_pending_subresource_response(
             internal_id,
@@ -270,7 +274,7 @@ impl Page {
         &self,
         internal_id: u64,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> Result<PendingPageCommand> {
         self.start_page_command(RendererPageCommand::ContinuePendingSubresourceResponse {
             internal_id,
@@ -332,7 +336,7 @@ impl Page {
         &mut self,
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> Result<()> {
         let pending = self.start_fulfill_pending_subresource_response(
@@ -348,7 +352,7 @@ impl Page {
         &self,
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> Result<PendingPageCommand> {
         self.start_page_command(RendererPageCommand::FulfillPendingSubresourceResponse {

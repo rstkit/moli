@@ -1,4 +1,6 @@
+use super::{WorkerGlobalKind, WorkerGlobalState, WorkerScriptResource, WorkerToParentMessage};
 use moli_fetch::RedirectInfo;
+use std::{cell::RefCell, rc::Rc};
 use url::Url;
 
 pub(crate) fn ensure_worker_script_redirect_chain_same_origin(
@@ -31,6 +33,28 @@ pub(crate) fn ensure_worker_script_redirect_chain_same_origin(
     Ok(())
 }
 
+pub(super) fn report_service_worker_script_resource(
+    state: &Rc<RefCell<WorkerGlobalState>>,
+    resource: WorkerScriptResource,
+) {
+    let state = state.borrow();
+    let WorkerGlobalKind::Service {
+        registration_id,
+        version_id,
+        ..
+    } = &state.global_kind
+    else {
+        return;
+    };
+    let _ = state
+        .parent_tx
+        .send(WorkerToParentMessage::ServiceWorkerImportedScriptLoaded {
+            registration_id: *registration_id,
+            version_id: *version_id,
+            resource,
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,12 +65,14 @@ mod tests {
 
     fn redirect(from_url: &Url, to_url: &Url) -> RedirectInfo {
         RedirectInfo {
+            source: moli_fetch::RedirectSource::Network,
             from_url: from_url.clone(),
             to_url: to_url.clone(),
             status: 302,
             headers: Vec::new(),
             network_extra_info_available: true,
             request_extra_info: None,
+            dispatched_request: None,
             response_extra_info: None,
             redirect_has_extra_info: true,
             request_cookie_report: None,

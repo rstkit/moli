@@ -16,12 +16,16 @@ use attribute::{normalized_option_text_content, split_class_names};
 use html5ever::{LocalName, Namespace, Prefix};
 use indexmap::IndexSet;
 use rare_data::ElementRareData;
+use selectors::attr::CaseSensitivity;
 use thin_vec::ThinVec;
 
 use super::NativeDom;
 use super::node::{NativeNodeId, Node};
 use crate::custom_elements::is_valid_custom_element_name;
-use crate::forms::{InputType, is_valid_number_input_value, sanitize_input_value_for_type};
+use crate::forms::{
+    ButtonTypeState, InputType, InputValueSanitizationContext, is_valid_number_input_value,
+    sanitize_input_value_for_type_with_context,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CustomElementState {
@@ -54,6 +58,23 @@ fn initial_custom_element_state_for_identity(
     } else {
         CustomElementState::Uncustomized
     }
+}
+
+fn is_element_reference_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "commandfor"
+            | "interestfor"
+            | "popovertarget"
+            | "aria-activedescendant"
+            | "aria-controls"
+            | "aria-describedby"
+            | "aria-details"
+            | "aria-errormessage"
+            | "aria-flowto"
+            | "aria-labelledby"
+            | "aria-owns"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +111,8 @@ impl Element {
         )
     }
 
+    /// Record parser provenance (including script preparation semantics).
+    /// Child construction is started separately by `ParserConstruction`.
     pub fn new_parser_created(
         local_name: String,
         namespace: String,
@@ -129,12 +152,6 @@ impl Element {
         {
             rare_data.control_state_mut().note_parser_created_script();
         }
-        if creation_source == ElementCreationSource::Parser
-            && local_name == "link"
-            && namespace == "http://www.w3.org/1999/xhtml"
-        {
-            rare_data.control_state_mut().note_parser_created_link();
-        }
         Self {
             local_name: LocalName::from(local_name),
             namespace: Namespace::from(namespace),
@@ -162,6 +179,25 @@ impl Element {
 
     pub fn prefix(&self) -> Option<&str> {
         self.prefix.as_ref().map(AsRef::as_ref)
+    }
+
+    pub fn explicit_element_references(&self, attribute: &str) -> Option<&[NativeNodeId]> {
+        self.control_state().explicit_element_references(attribute)
+    }
+
+    pub fn set_explicit_element_references(
+        &mut self,
+        attribute: &str,
+        references: Vec<NativeNodeId>,
+    ) {
+        self.control_state_mut()
+            .set_explicit_element_references(attribute, references);
+    }
+
+    fn synchronize_element_reference_attribute(&mut self, namespace: &str, local_name: &str) {
+        if namespace.is_empty() && is_element_reference_attribute(local_name) {
+            self.rare_data.clear_explicit_element_references(local_name);
+        }
     }
 
     pub fn set_prefix(&mut self, prefix: Option<String>) -> bool {
@@ -429,6 +465,14 @@ impl Element {
     }
 
     pub fn matches_class_names(&self, class_name: &str) -> bool {
+        self.matches_class_names_with_case_sensitivity(class_name, CaseSensitivity::CaseSensitive)
+    }
+
+    pub fn matches_class_names_with_case_sensitivity(
+        &self,
+        class_name: &str,
+        case_sensitivity: CaseSensitivity,
+    ) -> bool {
         let expected_classes = split_class_names(class_name);
         if expected_classes.is_empty() {
             return false;
@@ -438,9 +482,12 @@ impl Element {
             return false;
         };
         let actual_classes = split_class_names(actual);
-        expected_classes
-            .iter()
-            .all(|expected| actual_classes.iter().any(|actual| actual == expected))
+        expected_classes.iter().all(|expected| {
+            actual_classes.iter().any(|actual| match case_sensitivity {
+                CaseSensitivity::CaseSensitive => actual == expected,
+                CaseSensitivity::AsciiCaseInsensitive => actual.eq_ignore_ascii_case(expected),
+            })
+        })
     }
 
     pub fn matches_name(&self, name: &str) -> bool {
@@ -449,6 +496,10 @@ impl Element {
 
     pub fn input_type(&self) -> InputType {
         InputType::from_attribute_value(self.attribute("type"))
+    }
+
+    pub fn button_type_state(&self) -> ButtonTypeState {
+        ButtonTypeState::from_attribute_value(self.attribute("type"))
     }
 
     pub fn input_value(&self) -> String {
@@ -542,6 +593,30 @@ impl Element {
         self.is_html_element("link") && self.control_state().link_created_by_parser()
     }
 
+    fn sanitized_input_value(&self, value: &str) -> String {
+        sanitize_input_value_for_type_with_context(
+            self.input_type(),
+            value,
+            InputValueSanitizationContext {
+                multiple: self.has_attribute("multiple"),
+                min: self.attribute("min"),
+                max: self.attribute("max"),
+                step: self.attribute("step"),
+                value_attribute: self.attribute("value"),
+            },
+        )
+    }
+
+    pub(crate) fn resanitize_input_value_after_parser_attributes(&mut self) -> bool {
+        if !self.is_html_input() || self.input_value_dirty() {
+            return false;
+        }
+        let source = self.attribute("value").unwrap_or_default().to_owned();
+        let value = self.sanitized_input_value(&source);
+        self.control_state_mut()
+            .set_input_value_with_dirty(&value, false)
+    }
+
     pub fn set_input_value(&mut self, value: &str) -> bool {
         if !self.is_html_input() && !self.is_html_textarea() {
             return false;
@@ -553,7 +628,7 @@ impl Element {
             return self.set_selected_files(Vec::new());
         }
         let value = if self.is_html_input() {
-            sanitize_input_value_for_type(self.input_type(), value)
+            self.sanitized_input_value(value)
         } else {
             value.to_owned()
         };
@@ -571,7 +646,7 @@ impl Element {
             return self.set_selected_files(Vec::new());
         }
         let value = if self.is_html_input() {
-            sanitize_input_value_for_type(self.input_type(), value)
+            self.sanitized_input_value(value)
         } else {
             value.to_owned()
         };
@@ -601,7 +676,7 @@ impl Element {
             let value = if bad_input {
                 String::new()
             } else {
-                sanitize_input_value_for_type(input_type, value)
+                self.sanitized_input_value(value)
             };
             (value, bad_input)
         } else {
@@ -747,11 +822,34 @@ impl Element {
             .finish_parsing_script_children(source)
     }
 
+    pub(in crate::native) fn begin_parsing_children(&mut self) -> bool {
+        if self.is_inline_style_element() {
+            self.control_state_mut().begin_parsing_style_children();
+            true
+        } else if self.is_html_element("link") {
+            self.control_state_mut().begin_parsing_link_children();
+            true
+        } else {
+            self.is_script_element()
+        }
+    }
+
     pub fn finish_parsing_link_children(&mut self) -> bool {
         if !self.is_html_element("link") {
             return false;
         }
         self.control_state_mut().finish_parsing_link_children()
+    }
+
+    pub fn style_children_parsing(&self) -> bool {
+        self.control_state().style_children_parsing()
+    }
+
+    pub fn finish_parsing_style_children(&mut self) -> bool {
+        if !self.style_children_parsing() {
+            return false;
+        }
+        self.control_state_mut().finish_parsing_style_children()
     }
 
     pub fn parser_associated_form_owner(&self) -> Option<NativeNodeId> {
@@ -827,6 +925,14 @@ impl Element {
         self.control_state().media_paused().unwrap_or(true)
     }
 
+    pub fn media_audio_source_created(&self) -> bool {
+        self.control_state().media_audio_source_created()
+    }
+
+    pub fn mark_media_audio_source_created(&mut self) {
+        self.control_state_mut().mark_media_audio_source_created();
+    }
+
     pub fn set_media_paused(&mut self, paused: bool) -> bool {
         if !self.is_html_media() {
             return false;
@@ -846,7 +952,11 @@ impl Element {
     }
 
     pub fn media_muted(&self) -> bool {
-        self.control_state().media_muted().unwrap_or(false)
+        self.is_html_media()
+            && self
+                .control_state()
+                .media_muted()
+                .unwrap_or_else(|| self.has_attribute_ns("", "muted"))
     }
 
     pub fn set_media_muted(&mut self, muted: bool) -> bool {
@@ -984,8 +1094,24 @@ impl Element {
         self.control_state().popover_open()
     }
 
+    pub fn web_mcp_form_active(&self) -> bool {
+        self.control_state().web_mcp_form_active()
+    }
+
+    pub fn web_mcp_submit_active(&self) -> bool {
+        self.control_state().web_mcp_submit_active()
+    }
+
+    pub fn set_web_mcp_activity(&mut self, form: bool, submit: bool) -> bool {
+        self.control_state_mut().set_web_mcp_activity(form, submit)
+    }
+
     pub fn dialog_modal(&self) -> bool {
         self.control_state().dialog_modal()
+    }
+
+    pub fn dialog_modal_generation(&self) -> u64 {
+        self.control_state().dialog_modal_generation()
     }
 
     pub fn dialog_return_value(&self) -> &str {
@@ -1110,10 +1236,27 @@ impl Element {
         } else {
             self.input_type()
         };
+        let input_multiple = self.is_html_input() && self.has_attribute("multiple");
+        let range_attribute = |name| {
+            (input_type == InputType::Range)
+                .then(|| self.attribute(name).map(str::to_owned))
+                .flatten()
+        };
+        let input_min = range_attribute("min");
+        let input_max = range_attribute("max");
+        let input_step = range_attribute("step");
+        let input_value = range_attribute("value");
         self.rare_data.sync_control_state_from_attribute(
             self.namespace.as_ref(),
             self.local_name.as_ref(),
             input_type,
+            InputValueSanitizationContext {
+                multiple: input_multiple,
+                min: input_min.as_deref(),
+                max: input_max.as_deref(),
+                step: input_step.as_deref(),
+                value_attribute: input_value.as_deref(),
+            },
             attribute_name,
             attribute_value,
         );
@@ -1126,6 +1269,7 @@ impl Element {
         prefix: Option<String>,
         value: String,
     ) -> bool {
+        self.synchronize_element_reference_attribute(&namespace, &local_name);
         let next_value = value.clone();
         if let Some(index) = self
             .attributes
@@ -1166,6 +1310,7 @@ impl Element {
         prefix: Option<String>,
         value: String,
     ) -> bool {
+        self.synchronize_element_reference_attribute(&namespace, &local_name);
         let next_value = value.clone();
         if let Some(index) = self.attributes.iter().position(|attribute| {
             attribute.local_name() == local_name && attribute.namespace() == namespace
@@ -1189,7 +1334,20 @@ impl Element {
         true
     }
 
+    fn invalidate_dialog_modal_opening_for_removed_attribute(&mut self, attribute: &Attribute) {
+        if self.is_html_element("dialog")
+            && self.dialog_modal()
+            && attribute.namespace().is_empty()
+            && attribute.local_name() == "open"
+        {
+            // Removing open ends the close request without running the node's
+            // removing steps or changing its modal/top-layer registration.
+            self.control_state_mut().invalidate_dialog_modal_opening();
+        }
+    }
+
     pub fn remove_attribute(&mut self, name: &str) -> bool {
+        self.synchronize_element_reference_attribute("", name);
         let Some(index) = self
             .attributes
             .iter()
@@ -1197,19 +1355,22 @@ impl Element {
         else {
             return false;
         };
-        let local_name = self.attributes.remove(index).local_name;
-        self.sync_control_state_from_attribute(local_name.as_ref(), None);
+        let attribute = self.attributes.remove(index);
+        self.invalidate_dialog_modal_opening_for_removed_attribute(&attribute);
+        self.sync_control_state_from_attribute(attribute.local_name.as_ref(), None);
         true
     }
 
     pub fn remove_attribute_ns(&mut self, namespace: &str, local_name: &str) -> bool {
+        self.synchronize_element_reference_attribute(namespace, local_name);
         let Some(index) = self.attributes.iter().position(|attribute| {
             attribute.namespace() == namespace && attribute.local_name() == local_name
         }) else {
             return false;
         };
-        let local_name = self.attributes.remove(index).local_name;
-        self.sync_control_state_from_attribute(local_name.as_ref(), None);
+        let attribute = self.attributes.remove(index);
+        self.invalidate_dialog_modal_opening_for_removed_attribute(&attribute);
+        self.sync_control_state_from_attribute(attribute.local_name.as_ref(), None);
         true
     }
 

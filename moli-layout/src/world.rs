@@ -1,7 +1,7 @@
-use std::{collections::HashMap, fmt::Debug, hash::Hash, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, hash::Hash, num::NonZeroU32, sync::Arc};
 
 use style::Atom;
-use taffy::{Cache, Layout, Point, Style};
+use taffy::{Cache, DetailedLayoutInfo, Layout, Point, Style};
 
 use crate::{
     LayoutCssImageReference, LayoutElementSemantics, LayoutError, LayoutPoint, LayoutPseudo,
@@ -263,23 +263,14 @@ pub struct LayoutBox<N> {
     pub(crate) replaced_context: Option<ReplacedContext>,
     pub(crate) replaced_image: Option<crate::LayoutImageResource>,
     pub(crate) css_images: crate::source::LayoutCssImageResources,
-    /// Winning collapsed-table edges owned by the table wrapper for this pass.
-    ///
-    /// The record contains only resolved numeric/color/style data. It is
-    /// produced before Taffy sizing, completed with grid-line geometry after
-    /// sizing, and consumed once by immutable paint projection.
-    pub(crate) collapsed_table_borders: Option<crate::table::CollapsedTableBorders>,
     /// Suppresses ordinary per-box border paint for parts participating in a
     /// collapsed table. Their authored borders have already entered the table
     /// owner's conflict-resolution grid.
     pub(crate) collapsed_table_border_part: bool,
     pub(crate) inline_formatting_context: bool,
-    /// Used Grid tracks produced by the numeric layout pass.
-    ///
-    /// This is browser-owned canonical geometry rather than a retained Taffy
-    /// object. It is frozen with the rest of the layout tree for CSSOM reads.
-    pub(crate) resolved_grid_tracks: Option<LayoutResolvedGridTracks>,
-    pub(crate) cache: Cache,
+    /// One-based index into the owning world's compact numeric cache storage.
+    cache_slot: Option<NonZeroU32>,
+    pub(crate) table_measure_cache: Option<Box<crate::table::TableMeasureCache>>,
     pub(crate) unrounded_layout: Layout,
     pub(crate) final_layout: Layout,
 }
@@ -316,26 +307,35 @@ pub(crate) enum ViewportDefiningBox {
 pub(crate) struct ViewportScrollPolicy {
     pub(crate) defining_box: ViewportDefiningBox,
     pub(crate) effective_overflow: [LayoutOverflowMode; 2],
-    scrollbar_width: LayoutScrollbarWidth,
-    scrollbar_gutter: LayoutScrollbarGutter,
-    scrollbar_colors: Option<LayoutScrollbarColors>,
-    horizontal_writing_mode: bool,
+    scrollbar_style: ViewportScrollbarStyle,
+    embedder_allows_user_scroll: bool,
+    embedder_allows_scrollbar_controls: bool,
     revealed_scrollbar_x: bool,
     revealed_scrollbar_y: bool,
 }
 
+/// Authored scrollbar geometry remains available even when the embedder
+/// suppresses the viewport controls. Stable gutters use this hypothetical
+/// thickness independently of the actual control state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ViewportScrollbarStyle {
+    width: LayoutScrollbarWidth,
+    gutter: LayoutScrollbarGutter,
+    colors: Option<LayoutScrollbarColors>,
+    horizontal_writing_mode: bool,
+}
+
 impl Default for ViewportScrollPolicy {
     fn default() -> Self {
-        Self {
-            defining_box: ViewportDefiningBox::Root,
-            effective_overflow: [LayoutOverflowMode::Auto; 2],
-            scrollbar_width: LayoutScrollbarWidth::Auto,
-            scrollbar_gutter: LayoutScrollbarGutter::Auto,
-            scrollbar_colors: None,
-            horizontal_writing_mode: true,
-            revealed_scrollbar_x: false,
-            revealed_scrollbar_y: false,
-        }
+        Self::new(
+            ViewportDefiningBox::Root,
+            [LayoutOverflowMode::Auto; 2],
+            LayoutScrollbarWidth::Auto,
+            LayoutScrollbarGutter::Auto,
+            None,
+            true,
+            false,
+        )
     }
 }
 
@@ -347,14 +347,19 @@ impl ViewportScrollPolicy {
         scrollbar_gutter: LayoutScrollbarGutter,
         scrollbar_colors: Option<LayoutScrollbarColors>,
         horizontal_writing_mode: bool,
+        user_scrolling_disabled: bool,
     ) -> Self {
         Self {
             defining_box,
             effective_overflow,
-            scrollbar_width,
-            scrollbar_gutter,
-            scrollbar_colors,
-            horizontal_writing_mode,
+            scrollbar_style: ViewportScrollbarStyle {
+                width: scrollbar_width,
+                gutter: scrollbar_gutter,
+                colors: scrollbar_colors,
+                horizontal_writing_mode,
+            },
+            embedder_allows_user_scroll: !user_scrolling_disabled,
+            embedder_allows_scrollbar_controls: !user_scrolling_disabled,
             revealed_scrollbar_x: false,
             revealed_scrollbar_y: false,
         }
@@ -367,9 +372,12 @@ impl ViewportScrollPolicy {
         }
     }
 
-    pub(crate) fn prepare_scrollbar_layout(&mut self) {
-        self.revealed_scrollbar_x = self.effective_overflow[0] == LayoutOverflowMode::Scroll;
-        self.revealed_scrollbar_y = self.effective_overflow[1] == LayoutOverflowMode::Scroll;
+    pub(crate) fn prepare_scrollbar_layout(&mut self, scrollbars_hidden: bool) {
+        let allowed = !scrollbars_hidden && self.allows_scrollbar_controls();
+        self.revealed_scrollbar_x =
+            allowed && self.effective_overflow[0] == LayoutOverflowMode::Scroll;
+        self.revealed_scrollbar_y =
+            allowed && self.effective_overflow[1] == LayoutOverflowMode::Scroll;
     }
 
     pub(crate) fn reveal_auto_scrollbar(
@@ -378,7 +386,7 @@ impl ViewportScrollPolicy {
         overflowing: bool,
     ) -> bool {
         if !overflowing
-            || self.scrollbar_width == LayoutScrollbarWidth::None
+            || !self.allows_scrollbar_controls()
             || self.overflow_mode(axis) != LayoutOverflowMode::Auto
         {
             return false;
@@ -408,7 +416,7 @@ impl ViewportScrollPolicy {
     }
 
     pub(crate) fn allows_user_scroll(self, axis: LayoutScrollbarAxis) -> bool {
-        self.overflow_mode(axis).allows_user_scroll()
+        self.embedder_allows_user_scroll && self.overflow_mode(axis).allows_user_scroll()
     }
 
     pub(crate) fn clips_overflow(self) -> bool {
@@ -418,7 +426,7 @@ impl ViewportScrollPolicy {
     }
 
     pub(crate) fn has_scrollbar(self, axis: LayoutScrollbarAxis, overflowing: bool) -> bool {
-        if self.scrollbar_width == LayoutScrollbarWidth::None {
+        if !self.allows_scrollbar_controls() {
             return false;
         }
         match self.overflow_mode(axis) {
@@ -431,11 +439,20 @@ impl ViewportScrollPolicy {
     }
 
     pub(crate) const fn scrollbar_control_thickness(self) -> f32 {
-        self.scrollbar_width.thickness()
+        if self.allows_scrollbar_controls() {
+            self.scrollbar_style.width.thickness()
+        } else {
+            0.0
+        }
     }
 
     pub(crate) const fn scrollbar_colors(self) -> Option<LayoutScrollbarColors> {
-        self.scrollbar_colors
+        self.scrollbar_style.colors
+    }
+
+    const fn allows_scrollbar_controls(self) -> bool {
+        self.embedder_allows_scrollbar_controls
+            && !matches!(self.scrollbar_style.width, LayoutScrollbarWidth::None)
     }
 
     pub(crate) fn scrollbar_gutter_thickness(self, axis: LayoutScrollbarAxis) -> f32 {
@@ -455,35 +472,56 @@ impl ViewportScrollPolicy {
     }
 
     pub(crate) fn scrollbar_layout_insets(self) -> taffy::Rect<f32> {
-        if self.scrollbar_width == LayoutScrollbarWidth::None {
-            return taffy::Rect::ZERO;
+        let actual = self.actual_scrollbar_insets();
+        let reserved = self.stable_gutter_insets();
+        taffy::Rect {
+            left: actual.left.max(reserved.left),
+            right: actual.right.max(reserved.right),
+            top: actual.top.max(reserved.top),
+            bottom: actual.bottom.max(reserved.bottom),
         }
-        let thickness = self.scrollbar_width.thickness();
+    }
+
+    fn actual_scrollbar_insets(self) -> taffy::Rect<f32> {
+        let thickness = self.scrollbar_control_thickness();
+        taffy::Rect {
+            left: 0.0,
+            // Chromium keeps the viewport's vertical control on the physical
+            // right, including RTL and vertical writing modes.
+            right: if self.revealed_scrollbar_y {
+                thickness
+            } else {
+                0.0
+            },
+            top: 0.0,
+            bottom: if self.revealed_scrollbar_x {
+                thickness
+            } else {
+                0.0
+            },
+        }
+    }
+
+    fn stable_gutter_insets(self) -> taffy::Rect<f32> {
         let mut insets = taffy::Rect::ZERO;
-
-        if self.revealed_scrollbar_x {
-            insets.bottom = thickness;
+        if self.scrollbar_style.gutter == LayoutScrollbarGutter::Auto {
+            return insets;
         }
-        // Chromium keeps the viewport's vertical scrollbar on the physical
-        // right, including RTL and vertical writing modes.
-        if self.revealed_scrollbar_y {
+        let thickness = self.scrollbar_style.width.thickness();
+        let both_edges = self.scrollbar_style.gutter == LayoutScrollbarGutter::StableBothEdges;
+        if self.scrollbar_style.horizontal_writing_mode
+            && self.effective_overflow[1].creates_scroll_container()
+        {
             insets.right = thickness;
-        }
-
-        if self.scrollbar_gutter != LayoutScrollbarGutter::Auto {
-            if self.horizontal_writing_mode && self.effective_overflow[1].creates_scroll_container()
-            {
-                insets.right = thickness;
-                if self.scrollbar_gutter == LayoutScrollbarGutter::StableBothEdges {
-                    insets.left = thickness;
-                }
-            } else if !self.horizontal_writing_mode
-                && self.effective_overflow[0].creates_scroll_container()
-            {
-                insets.bottom = thickness;
-                if self.scrollbar_gutter == LayoutScrollbarGutter::StableBothEdges {
-                    insets.top = thickness;
-                }
+            if both_edges {
+                insets.left = thickness;
+            }
+        } else if !self.scrollbar_style.horizontal_writing_mode
+            && self.effective_overflow[0].creates_scroll_container()
+        {
+            insets.bottom = thickness;
+            if both_edges {
+                insets.top = thickness;
             }
         }
         insets
@@ -592,15 +630,32 @@ where
     N: Copy + Debug + Eq + Hash,
 {
     pub(crate) boxes: Vec<LayoutBox<N>>,
+    /// Pass-local numeric caches, created only for boxes with actual stores.
+    /// Flattened text boxes need no empty Taffy measurement arrays.
+    pub(crate) box_caches: Vec<Cache>,
+    /// Winning collapsed-table edges, computed and consumed in this pass.
+    /// Empty slots are not embedded in boxes that do not own a table.
+    pub(crate) collapsed_table_borders: HashMap<LayoutBoxId, crate::table::CollapsedTableBorders>,
+    /// Used Grid tracks for actual owners. Their canonical result is frozen
+    /// for CSSOM before this pass-local map is released.
+    pub(crate) resolved_grid_tracks: HashMap<LayoutBoxId, LayoutResolvedGridTracks>,
+    /// Native track positions and names read by Taffy's out-of-flow pass.
+    pub(crate) native_grid_details: HashMap<LayoutBoxId, DetailedLayoutInfo<Atom>>,
     pub(crate) source_mapping: HashMap<N, LayoutBoxId>,
     pub(crate) display_contents_mapping: HashMap<N, Vec<LayoutBoxId>>,
     pub(crate) root: LayoutBoxId,
     /// The root is the document element only for a complete document source.
     /// Subtree and synthetic sources still use the same internal root slot.
     pub(crate) root_is_document_element: bool,
+    pub(crate) quirks_mode: style::context::QuirksMode,
+    pub(crate) environment: crate::LayoutEnvironment,
     pub(crate) viewport_scroll_policy: ViewportScrollPolicy,
     pub(crate) viewport_layout: ViewportLayoutState,
     pub(crate) css_image_references: Vec<LayoutCssImageReference<N>>,
+    /// Full numeric measurement retains baselines without publishing layouts.
+    pub(crate) measure_baselines: bool,
+    /// The active table cell's used height need not be a percentage guarantee.
+    pub(crate) table_cell_percentage_height: Option<(LayoutBoxId, bool)>,
     numeric_layout_tracking: bool,
     numeric_layout_touched: Vec<LayoutBoxId>,
     numeric_layout_touched_marks: Vec<bool>,
@@ -613,17 +668,61 @@ where
     pub(crate) fn new(root: LayoutBox<N>, root_is_document_element: bool) -> Self {
         Self {
             boxes: vec![root],
+            box_caches: Vec::new(),
+            collapsed_table_borders: HashMap::new(),
+            resolved_grid_tracks: HashMap::new(),
+            native_grid_details: HashMap::new(),
             source_mapping: HashMap::new(),
             display_contents_mapping: HashMap::new(),
             root: LayoutBoxId::from_index(0),
             root_is_document_element,
+            quirks_mode: style::context::QuirksMode::NoQuirks,
+            environment: crate::LayoutEnvironment::default(),
             viewport_scroll_policy: ViewportScrollPolicy::default(),
             viewport_layout: ViewportLayoutState::default(),
             css_image_references: Vec::new(),
+            measure_baselines: false,
+            table_cell_percentage_height: None,
             numeric_layout_tracking: false,
             numeric_layout_touched: Vec::new(),
             numeric_layout_touched_marks: vec![false],
         }
+    }
+
+    pub(crate) fn clear_layout_caches(&mut self, id: LayoutBoxId) {
+        let layout_box = &mut self.boxes[id.index()];
+        if let Some(slot) = layout_box.cache_slot {
+            self.box_caches[(slot.get() - 1) as usize].clear();
+        }
+        if let Some(cache) = &mut layout_box.table_measure_cache {
+            cache.clear();
+        }
+    }
+
+    pub(crate) fn numeric_cache(&mut self, id: LayoutBoxId) -> Option<&mut Cache> {
+        let slot = self.boxes.get(id.index())?.cache_slot?;
+        self.box_caches.get_mut((slot.get() - 1) as usize)
+    }
+
+    pub(crate) fn numeric_cache_mut(&mut self, id: LayoutBoxId) -> &mut Cache {
+        let slot = if let Some(slot) = self.boxes[id.index()].cache_slot {
+            slot
+        } else {
+            if self.box_caches.is_empty() {
+                // Bound the first allocation without scanning construction
+                // boxes or reserving caches for boxes that may never store.
+                self.box_caches.reserve_exact(self.boxes.len().min(4));
+            }
+            let slot = u32::try_from(self.box_caches.len())
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .and_then(NonZeroU32::new)
+                .expect("one layout pass exceeded the u32 cache limit");
+            self.box_caches.push(Cache::new());
+            self.boxes[id.index()].cache_slot = Some(slot);
+            slot
+        };
+        &mut self.box_caches[(slot.get() - 1) as usize]
     }
 
     pub fn root(&self) -> LayoutBoxId {
@@ -853,6 +952,15 @@ where
             stack.extend(self.boxes[id.index()].children.iter().copied());
         }
 
+        // Most trees do not discard any construction boxes. Their IDs already
+        // form the final dense mapping; keep the pass-local allocation instead
+        // of moving every box and rebuilding every child vector unchanged.
+        if reachable.iter().all(|is_reachable| *is_reachable) {
+            self.display_contents_mapping
+                .retain(|_, ids| !ids.is_empty());
+            return;
+        }
+
         let mut remap = vec![None; self.boxes.len()];
         let mut next_index = 0;
         for (index, is_reachable) in reachable.iter().copied().enumerate() {
@@ -1044,7 +1152,7 @@ where
             Some(TableInvariantRole::Root) => layout_box.children.iter().all(|child| {
                 self.box_by_id(*child)
                     .and_then(|child| table_role(child.style.display()))
-                    .is_some_and(TableInvariantRole::is_direct_root_child)
+                    .is_some_and(TableInvariantRole::is_direct_table_child)
             }),
             Some(TableInvariantRole::RowGroup) => layout_box.children.iter().all(|child| {
                 self.box_by_id(*child).is_some_and(|child| {
@@ -1128,74 +1236,20 @@ where
             replaced_context: None,
             replaced_image: None,
             css_images: crate::source::LayoutCssImageResources::default(),
-            collapsed_table_borders: None,
             collapsed_table_border_part: false,
             inline_formatting_context: false,
-            resolved_grid_tracks: None,
-            cache: Cache::new(),
+            cache_slot: None,
+            table_measure_cache: None,
             unrounded_layout: Layout::with_order(0),
             final_layout: Layout::with_order(0),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TableInvariantRole {
-    Root,
-    Caption,
-    RowGroup,
-    ColumnGroup,
-    Column,
-    Row,
-    Cell,
-}
-
-impl TableInvariantRole {
-    const fn is_direct_root_child(self) -> bool {
-        matches!(
-            self,
-            Self::Caption | Self::RowGroup | Self::ColumnGroup | Self::Column
-        )
-    }
-
-    const fn debug_name(self) -> &'static str {
-        match self {
-            Self::Root => "table-root",
-            Self::Caption => "table-caption",
-            Self::RowGroup => "table-row-group",
-            Self::ColumnGroup => "table-column-group",
-            Self::Column => "table-column",
-            Self::Row => "table-row",
-            Self::Cell => "table-cell",
-        }
-    }
-}
+use crate::table_role::TableRole as TableInvariantRole;
 
 const fn table_role(display: crate::LayoutDisplay) -> Option<TableInvariantRole> {
-    use crate::LayoutDisplay as Display;
-    match display {
-        Display::Table | Display::InlineTable => Some(TableInvariantRole::Root),
-        Display::TableCaption => Some(TableInvariantRole::Caption),
-        Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
-            Some(TableInvariantRole::RowGroup)
-        }
-        Display::TableColumnGroup => Some(TableInvariantRole::ColumnGroup),
-        Display::TableColumn => Some(TableInvariantRole::Column),
-        Display::TableRow => Some(TableInvariantRole::Row),
-        Display::TableCell => Some(TableInvariantRole::Cell),
-        Display::None
-        | Display::Contents
-        | Display::Block
-        | Display::FlowRoot
-        | Display::Inline
-        | Display::InlineBlock
-        | Display::Flex
-        | Display::InlineFlex
-        | Display::Grid
-        | Display::InlineGrid
-        | Display::BlockListItem
-        | Display::InlineListItem => None,
-    }
+    TableInvariantRole::from_display(display)
 }
 
 fn default_capability_diagnostics(

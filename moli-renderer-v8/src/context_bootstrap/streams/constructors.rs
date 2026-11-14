@@ -1,9 +1,11 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::{
     util::{get_private_value, set_private_value},
     webidl,
 };
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
+use webidl::WebIdlDictionarySerialize;
 
 const COUNT_QUEUING_STRATEGY_SIZE_FUNCTION_SLOT: &str = "__moliCountQueuingStrategySizeFunction";
 const BYTE_LENGTH_QUEUING_STRATEGY_SIZE_FUNCTION_SLOT: &str =
@@ -13,39 +15,29 @@ const BYTE_LENGTH_QUEUING_STRATEGY_HIGH_WATER_MARK_SLOT: &str =
     "__moliByteLengthQueuingStrategyHighWaterMark";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextEncoderStream")]
+#[webapi(interface = web_api_interfaces::TextEncoderStream)]
 struct TextEncoderStreamObjectDeclaration {
     #[webapi(data_property)]
     encoding: &'static str,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextDecoderStream")]
+#[webapi(interface = web_api_interfaces::TextDecoderStream)]
 struct TextDecoderStreamObjectDeclaration {
     #[webapi(data_property)]
     encoding: String,
-    #[webapi(data_property)]
-    fatal: bool,
-    #[webapi(data_property = "ignoreBOM")]
-    ignore_bom: bool,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CountQueuingStrategy")]
-struct CountQueuingStrategyObjectDeclaration {
-    #[webapi(slot = COUNT_QUEUING_STRATEGY_HIGH_WATER_MARK_SLOT)]
-    high_water_mark: f64,
-}
+#[webapi(interface = web_api_interfaces::CountQueuingStrategy)]
+struct CountQueuingStrategyObjectDeclaration {}
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ByteLengthQueuingStrategy")]
-struct ByteLengthQueuingStrategyObjectDeclaration {
-    #[webapi(slot = BYTE_LENGTH_QUEUING_STRATEGY_HIGH_WATER_MARK_SLOT)]
-    high_water_mark: f64,
-}
+#[webapi(interface = web_api_interfaces::ByteLengthQueuingStrategy)]
+struct ByteLengthQueuingStrategyObjectDeclaration {}
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CountQueuingStrategy", enumerable)]
+#[webapi(interface = web_api_interfaces::CountQueuingStrategy, enumerable)]
 struct CountQueuingStrategyPrototypeDeclaration {
     #[webapi(accessor_property, getter = count_queuing_strategy_high_water_mark_getter)]
     high_water_mark: (),
@@ -54,7 +46,7 @@ struct CountQueuingStrategyPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ByteLengthQueuingStrategy", enumerable)]
+#[webapi(interface = web_api_interfaces::ByteLengthQueuingStrategy, enumerable)]
 struct ByteLengthQueuingStrategyPrototypeDeclaration {
     #[webapi(accessor_property, getter = byte_length_queuing_strategy_high_water_mark_getter)]
     high_water_mark: (),
@@ -67,8 +59,8 @@ struct ByteLengthQueuingStrategyPrototypeDeclaration {
 struct ReadableStreamConstructorArgs<'s> {
     #[webidl(index = 0)]
     source: Option<v8::Local<'s, v8::Object>>,
-    #[webidl(index = 1, with = parse_readable_stream_strategy_arg)]
-    strategy: StreamQueuingStrategy,
+    #[webidl(index = 1, dictionary)]
+    strategy: QueuingStrategyMembers,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -76,8 +68,8 @@ struct ReadableStreamConstructorArgs<'s> {
 struct WritableStreamConstructorArgs<'s> {
     #[webidl(index = 0)]
     sink: Option<v8::Local<'s, v8::Object>>,
-    #[webidl(index = 1, with = parse_writable_stream_strategy_arg)]
-    strategy: StreamQueuingStrategy,
+    #[webidl(index = 1, dictionary)]
+    strategy: QueuingStrategyMembers,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -85,10 +77,17 @@ struct WritableStreamConstructorArgs<'s> {
 struct TransformStreamConstructorArgs<'s> {
     #[webidl(index = 0)]
     transformer: Option<v8::Local<'s, v8::Object>>,
-    #[webidl(index = 1, with = parse_transform_stream_writable_strategy_arg)]
-    writable_strategy: StreamQueuingStrategy,
-    #[webidl(index = 2, with = parse_transform_stream_readable_strategy_arg)]
-    readable_strategy: StreamQueuingStrategy,
+    #[webidl(index = 1, dictionary)]
+    writable_strategy: QueuingStrategyMembers,
+}
+
+// Writable strategy conversion and validation must finish before reading the
+// readable strategy. Keep this second conversion stage ahead of transformer reads.
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "TransformStream")]
+struct TransformStreamReadableStrategyArgs {
+    #[webidl(index = 2, dictionary)]
+    readable_strategy: QueuingStrategyMembers,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -96,30 +95,40 @@ struct TransformStreamConstructorArgs<'s> {
 struct TextDecoderStreamConstructorArgs {
     #[webidl(default = "utf-8")]
     label: String,
-    #[webidl(index = 1, with = parse_text_decoder_stream_options_arg)]
+    #[webidl(index = 1, dictionary)]
     options: TextDecoderStreamOptions,
 }
 
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "CountQueuingStrategy")]
 struct CountQueuingStrategyConstructorArgs {
-    #[webidl(required, with = parse_queuing_strategy_init_arg)]
-    init: StreamQueuingStrategy,
+    #[webidl(required, dictionary)]
+    init: QueuingStrategyInit<true>,
 }
 
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "ByteLengthQueuingStrategy")]
 struct ByteLengthQueuingStrategyConstructorArgs {
-    #[webidl(required, with = parse_queuing_strategy_init_arg)]
-    init: StreamQueuingStrategy,
+    #[webidl(required, dictionary)]
+    init: QueuingStrategyInit<false>,
+}
+
+#[derive(webidl::WebIdlDictionary)]
+#[webidl(prefix = "QueuingStrategyInit", snapshot)]
+struct QueuingStrategyInit<const COUNT: bool> {
+    #[webidl(required, converter = "unrestricted_double")]
+    #[webidl(snapshot_slot = if COUNT { COUNT_QUEUING_STRATEGY_HIGH_WATER_MARK_SLOT } else { BYTE_LENGTH_QUEUING_STRATEGY_HIGH_WATER_MARK_SLOT })]
+    high_water_mark: f64,
 }
 
 #[derive(Default, webidl::WebIdlDictionary)]
-#[webidl(prefix = "TextDecoderOptions")]
+#[webidl(prefix = "TextDecoderOptions", snapshot)]
 struct TextDecoderStreamOptions {
     #[webidl(default = false)]
+    #[webidl(snapshot_attributes = v8::PropertyAttribute::DONT_ENUM)]
     fatal: bool,
     #[webidl(name = "ignoreBOM", default = false)]
+    #[webidl(snapshot_attributes = v8::PropertyAttribute::DONT_ENUM)]
     ignore_bom: bool,
 }
 
@@ -138,6 +147,17 @@ pub(in crate::context_bootstrap) fn readable_stream_constructor_callback<'s>(
     let Some(parsed) = webidl::parse_args::<ReadableStreamConstructorArgs<'s>>(scope, &args) else {
         return;
     };
+    let strategy =
+        match parsed
+            .strategy
+            .resolve(scope, webidl::Context::argument("ReadableStream", 2), 1.0)
+        {
+            Ok(strategy) => strategy,
+            Err(error) => {
+                webidl::throw_error(scope, &error);
+                return;
+            }
+        };
     let source = match parsed
         .source
         .map(|source| parse_readable_stream_source_object(scope, source))
@@ -150,7 +170,7 @@ pub(in crate::context_bootstrap) fn readable_stream_constructor_callback<'s>(
         }
     };
     let byte_stream = source.as_ref().is_some_and(|source| source.byte_stream);
-    if byte_stream && parsed.strategy.size.is_some() {
+    if byte_stream && strategy.size.is_some() {
         throw_range_error(
             scope,
             "A byte ReadableStream cannot use a queuing strategy size function",
@@ -166,10 +186,10 @@ pub(in crate::context_bootstrap) fn readable_stream_constructor_callback<'s>(
         throw_type_error(scope, "autoAllocateChunkSize must be greater than zero");
         return;
     }
-    let high_water_mark = if byte_stream && !parsed.strategy.high_water_mark_provided {
+    let high_water_mark = if byte_stream && !strategy.high_water_mark_provided {
         0.0
     } else {
-        parsed.strategy.high_water_mark
+        strategy.high_water_mark
     };
     initialize_webidl_readable_stream_object(
         scope,
@@ -177,7 +197,7 @@ pub(in crate::context_bootstrap) fn readable_stream_constructor_callback<'s>(
         source,
         byte_stream,
         high_water_mark,
-        parsed.strategy.size,
+        strategy.size,
     );
     rv.set(args.this().into());
 }
@@ -197,6 +217,17 @@ pub(in crate::context_bootstrap) fn writable_stream_constructor_callback<'s>(
     let Some(parsed) = webidl::parse_args::<WritableStreamConstructorArgs<'s>>(scope, &args) else {
         return;
     };
+    let strategy =
+        match parsed
+            .strategy
+            .resolve(scope, webidl::Context::argument("WritableStream", 2), 1.0)
+        {
+            Ok(strategy) => strategy,
+            Err(error) => {
+                webidl::throw_error(scope, &error);
+                return;
+            }
+        };
     let sink = match parsed
         .sink
         .map(|sink| parse_writable_stream_sink_object(scope, sink))
@@ -212,8 +243,8 @@ pub(in crate::context_bootstrap) fn writable_stream_constructor_callback<'s>(
         scope,
         args.this(),
         sink,
-        parsed.strategy.high_water_mark,
-        parsed.strategy.size,
+        strategy.high_water_mark,
+        strategy.size,
     );
     rv.set(args.this().into());
 }
@@ -234,6 +265,32 @@ pub(in crate::context_bootstrap) fn transform_stream_constructor_callback<'s>(
     else {
         return;
     };
+    let writable_strategy = match parsed.writable_strategy.resolve(
+        scope,
+        webidl::Context::argument("TransformStream", 2),
+        1.0,
+    ) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            webidl::throw_error(scope, &error);
+            return;
+        }
+    };
+    let Some(readable) = webidl::parse_args::<TransformStreamReadableStrategyArgs>(scope, &args)
+    else {
+        return;
+    };
+    let readable_strategy = match readable.readable_strategy.resolve(
+        scope,
+        webidl::Context::argument("TransformStream", 3),
+        0.0,
+    ) {
+        Ok(strategy) => strategy,
+        Err(error) => {
+            webidl::throw_error(scope, &error);
+            return;
+        }
+    };
     let transformer = match parsed
         .transformer
         .map(|transformer| parse_transform_stream_transformer_object(scope, transformer))
@@ -250,10 +307,10 @@ pub(in crate::context_bootstrap) fn transform_stream_constructor_callback<'s>(
         args.this(),
         transformer,
         None,
-        parsed.writable_strategy.high_water_mark,
-        parsed.writable_strategy.size,
-        parsed.readable_strategy.high_water_mark,
-        parsed.readable_strategy.size,
+        writable_strategy.high_water_mark,
+        writable_strategy.size,
+        readable_strategy.high_water_mark,
+        readable_strategy.size,
     );
     rv.set(args.this().into());
 }
@@ -302,7 +359,7 @@ pub(in crate::context_bootstrap) fn text_decoder_stream_constructor_callback<'s>
     let Some(parsed) = webidl::parse_args::<TextDecoderStreamConstructorArgs>(scope, &args) else {
         return;
     };
-    let label = parsed.label.trim().to_ascii_lowercase();
+    let label = parsed.label;
     let Some(encoding) = super::super::text_decoder_encoding_for_label(&label) else {
         throw_range_error(
             scope,
@@ -328,16 +385,16 @@ pub(in crate::context_bootstrap) fn text_decoder_stream_constructor_callback<'s>
         0.0,
         None,
     );
-    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
-        && let Some(writable) = object_property_as_object(scope, args.this(), "writable")
-    {
-        unsafe { &mut *host_ptr }
-            .text_codecs_mut()
-            .init_decoder(scope, writable, encoding, fatal, ignore_bom);
-    }
-    TextDecoderStreamObjectDeclaration::new(encoding_name, fatal, ignore_bom)
+    let writable = stream_slot_object(scope, args.this(), TRANSFORM_STREAM_WRITABLE_SLOT)
+        .expect("a new text decoder stream owns its writable endpoint");
+    init_text_decoder_state(scope, writable, encoding, fatal, ignore_bom);
+    TextDecoderStreamObjectDeclaration::new(encoding_name)
         .initialize(scope, args.this())
         .expect("TextDecoderStream declaration should initialize object");
+    parsed
+        .options
+        .initialize_snapshot(scope, args.this())
+        .expect("TextDecoderStream options");
     rv.set(args.this().into());
 }
 
@@ -357,7 +414,11 @@ pub(in crate::context_bootstrap) fn count_queuing_strategy_constructor_callback<
     else {
         return;
     };
-    CountQueuingStrategyObjectDeclaration::new(parsed.init.high_water_mark)
+    parsed
+        .init
+        .initialize_snapshot(scope, args.this())
+        .expect("queuing strategy state");
+    CountQueuingStrategyObjectDeclaration::new()
         .initialize(scope, args.this())
         .expect("CountQueuingStrategy declaration should initialize object");
     rv.set(args.this().into());
@@ -379,7 +440,11 @@ pub(in crate::context_bootstrap) fn byte_length_queuing_strategy_constructor_cal
     else {
         return;
     };
-    ByteLengthQueuingStrategyObjectDeclaration::new(parsed.init.high_water_mark)
+    parsed
+        .init
+        .initialize_snapshot(scope, args.this())
+        .expect("queuing strategy state");
+    ByteLengthQueuingStrategyObjectDeclaration::new()
         .initialize(scope, args.this())
         .expect("ByteLengthQueuingStrategy declaration should initialize object");
     rv.set(args.this().into());
@@ -565,70 +630,4 @@ fn byte_length_queuing_strategy_size_callback<'s>(
         return;
     };
     rv.set(byte_length);
-}
-
-fn parse_readable_stream_strategy_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<StreamQueuingStrategy, webidl::WebIdlError> {
-    parse_stream_strategy_arg(scope, args, index, "ReadableStream", 1.0)
-}
-
-fn parse_writable_stream_strategy_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<StreamQueuingStrategy, webidl::WebIdlError> {
-    parse_stream_strategy_arg(scope, args, index, "WritableStream", 1.0)
-}
-
-fn parse_transform_stream_writable_strategy_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<StreamQueuingStrategy, webidl::WebIdlError> {
-    parse_stream_strategy_arg(scope, args, index, "TransformStream", 1.0)
-}
-
-fn parse_transform_stream_readable_strategy_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<StreamQueuingStrategy, webidl::WebIdlError> {
-    parse_stream_strategy_arg(scope, args, index, "TransformStream", 0.0)
-}
-
-fn parse_queuing_strategy_init_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<StreamQueuingStrategy, webidl::WebIdlError> {
-    let context = webidl::Context::argument("QueuingStrategyInit", (index + 1) as usize);
-    let object = webidl::dictionary_arg(args, index, context)?
-        .ok_or_else(|| webidl::WebIdlError::missing_required(context))?;
-    let high_water_mark = object
-        .get(scope, v8str(scope, "highWaterMark").into())
-        .ok_or_else(|| webidl::WebIdlError::pending_exception(context))?;
-    if high_water_mark.is_undefined() {
-        return Err(webidl::WebIdlError::custom_message(
-            "QueuingStrategyInit.highWaterMark is required",
-        ));
-    }
-    let high_water_mark = high_water_mark.number_value(scope).ok_or_else(|| {
-        webidl::WebIdlError::custom_message("QueuingStrategyInit.highWaterMark must be a number")
-    })?;
-    Ok(StreamQueuingStrategy::without_size(high_water_mark))
-}
-
-fn parse_text_decoder_stream_options_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<TextDecoderStreamOptions, webidl::WebIdlError> {
-    let context = webidl::Context::argument("TextDecoderStream", (index + 1) as usize);
-    webidl::dictionary_arg(args, index, context)?
-        .map(|object| webidl::parse_dictionary_object(scope, object))
-        .transpose()
-        .map(|options| options.unwrap_or_default())
 }

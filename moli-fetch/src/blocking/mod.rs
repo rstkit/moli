@@ -3,7 +3,7 @@ mod collectors;
 
 use std::{
     ffi::{c_char, c_long},
-    net::{IpAddr, ToSocketAddrs},
+    net::IpAddr,
     str,
     time::Duration,
 };
@@ -14,12 +14,11 @@ use moli_cookie_jar::{
     NetworkCookieRequestContext, SharedBrowserCookieStore, StoredCookieQueryReport,
     StoredCookieSetReport, same_site_urls,
 };
-use moli_url::{
-    is_potentially_trustworthy_url, origin_ascii_serialization, same_origin, tuple_origin_url,
-};
+use moli_curl::{HostResolveOverrides, ProxyScheme};
+use moli_url::{is_potentially_trustworthy_url, same_origin};
 use moli_url_policy::ensure_http_network_transport_url;
 use tracing::debug;
-use url::Url;
+use url::{Host, Url};
 
 pub(crate) use self::cache::{
     CachedStreamingResponseLookup, cached_streaming_response_body_exceeds_response_limit,
@@ -39,8 +38,8 @@ pub(crate) use self::collectors::{
 };
 
 use crate::{
-    BrowserRequestMetadata, FetchConfig, NegotiatedHttpVersion, NetworkRequestExtraInfo,
-    RedirectInfo, Request, RequestAuthScheme, RequestAuthTarget, ResponseHead,
+    CookieHeaderPolicy, FetchConfig, NegotiatedHttpVersion, NetworkRequestExtraInfo, RedirectInfo,
+    Request, RequestAuthScheme, RequestAuthTarget, ResponseHead, proxy::HttpProxyRoute,
 };
 
 const MAX_REDIRECTS: usize = 10;
@@ -66,12 +65,14 @@ pub(crate) enum RequestHttpVersion {
 pub struct StreamingHtmlResponseStart {
     pub final_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirected: bool,
     pub redirect_chain: Vec<RedirectInfo>,
     pub from_cache: bool,
+    pub cache_state: crate::ResponseCacheState,
     pub negotiated_http_version: Option<NegotiatedHttpVersion>,
     pub network_request_extra_info: Option<NetworkRequestExtraInfo>,
 }
@@ -81,12 +82,14 @@ impl StreamingHtmlResponseStart {
         ResponseHead {
             final_url: self.final_url,
             status: self.status,
+            status_text: self.status_text,
             headers: self.headers,
             request_cookie_report: self.request_cookie_report,
             cookie_set_reports: self.cookie_set_reports,
             redirected: self.redirected,
             redirect_chain: self.redirect_chain,
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         }
     }
@@ -109,7 +112,7 @@ pub(crate) fn cookie_access_report_for_request(
     request_url: &Url,
     request_context: NetworkCookieRequestContext,
 ) -> Result<Option<StoredCookieQueryReport>> {
-    let mut cookie_store = cookie_store.lock();
+    let mut cookie_store = cookie_store.lock()?;
     let report = cookie_store.cookie_access_report_for_request(request_url, request_context);
     Ok(
         (!report.included_cookies.is_empty() || !report.excluded_cookies.is_empty())
@@ -122,7 +125,7 @@ pub fn observe_cookie_access_report_for_request(
     request_url: &Url,
     request_context: NetworkCookieRequestContext,
 ) -> Result<Option<StoredCookieQueryReport>> {
-    let mut cookie_store = cookie_store.lock();
+    let mut cookie_store = cookie_store.lock()?;
     let report =
         cookie_store.observe_cookie_access_report_for_request(request_url, request_context);
     Ok(
@@ -154,51 +157,146 @@ pub fn outgoing_request_headers(
     request: &Request,
     cookie_header: Option<&str>,
 ) -> Vec<(String, String)> {
-    outgoing_request_headers_for_url(config, request, &request.url, &[], cookie_header)
+    outgoing_request_headers_for_url(config, request, &request.url, cookie_header)
 }
 
+// String views used by observation and cache metadata are isomorphic byte
+// projections. The transport itself keeps the encoded representation below.
 pub(crate) fn outgoing_request_headers_for_url(
     config: &FetchConfig,
     request: &Request,
     request_url: &Url,
-    redirect_chain: &[RedirectInfo],
     cookie_header: Option<&str>,
 ) -> Vec<(String, String)> {
-    let mut outgoing = Vec::new();
-
-    if let Some(proxy_bearer_token) = config.proxy_bearer_token() {
-        outgoing.push((
-            "Proxy-Authorization".to_owned(),
-            format!("Bearer {proxy_bearer_token}"),
-        ));
+    // Cache/diagnostic previews can precede admission. Reuse its preparation
+    // contract; admitted requests keep the borrowed, allocation-free path.
+    let mut prepared = std::borrow::Cow::Borrowed(request);
+    if !header_present(&request.request_headers, "accept") {
+        prepared.to_mut().prepare_accept_header(config);
     }
+    outgoing_request_header_bytes_for_url(config, &prepared, request_url, cookie_header)
+        .to_byte_strings()
+}
+
+// Header emission and cache eligibility must select the same literal data,
+// including host scope, credentials, empty values and explicit-header overrides.
+fn literal_cookie_header_for_request<'a>(
+    config: &'a FetchConfig,
+    request: &'a Request,
+    request_url: &Url,
+) -> Option<&'a str> {
+    request
+        .additional_cookies()
+        .or_else(|| config.additional_cookies_for_request(request, request_url))
+        .filter(|value| !value.is_empty())
+        .filter(|_| request.allows_credentials_for_url(request_url))
+        .filter(|_| {
+            !request
+                .request_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                && !config
+                    .default_request_headers()
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        })
+}
+
+fn outgoing_request_header_bytes_for_url(
+    config: &FetchConfig,
+    request: &Request,
+    request_url: &Url,
+    cookie_header: Option<&str>,
+) -> crate::RequestHeaders {
+    let mut outgoing = crate::RequestHeaders::default();
+
+    let additional = literal_cookie_header_for_request(config, request, request_url);
+    let cookie_header = match (cookie_header, additional) {
+        (Some(stored), Some(literal)) => {
+            Some(std::borrow::Cow::Owned(format!("{stored}; {literal}")))
+        }
+        (Some(value), None) | (None, Some(value)) => Some(std::borrow::Cow::Borrowed(value)),
+        (None, None) => None,
+    };
+    let cookie_header = cookie_header.as_deref();
 
     if let Some(cookie_header) = cookie_header {
-        outgoing.push(("Cookie".to_owned(), cookie_header.to_owned()));
+        outgoing.push(("Cookie".to_owned(), cookie_header.as_bytes().to_vec()));
     }
+
+    // Scope custom credentials to the transfer's initial origin. Preserve the
+    // configured headers so returning to that origin can restore them.
+    let send_authorization = same_origin(request.initial_url(), request_url);
+    let send_explicit_cookies = match request.cookie_header_policy() {
+        CookieHeaderPolicy::PreferStore => cookie_header.is_none(),
+        CookieHeaderPolicy::PreserveExplicit => send_authorization,
+    };
 
     for (name, value) in config.default_request_headers() {
-        if cookie_header.is_some() && name.eq_ignore_ascii_case("cookie") {
+        if (!send_explicit_cookies && name.eq_ignore_ascii_case("cookie"))
+            || (!send_authorization && name.eq_ignore_ascii_case("authorization"))
+            || (name.eq_ignore_ascii_case("accept")
+                && header_present(&request.request_headers, "accept"))
+        {
+            continue;
+        }
+        outgoing.push((name.clone(), value.as_bytes().to_vec()));
+    }
+
+    for (name, value) in request.request_headers.iter() {
+        if (!send_explicit_cookies && name.eq_ignore_ascii_case("cookie"))
+            || (!send_authorization && name.eq_ignore_ascii_case("authorization"))
+        {
             continue;
         }
         outgoing.push((name.clone(), value.clone()));
     }
 
-    for (name, value) in &request.request_headers {
-        if cookie_header.is_some() && name.eq_ignore_ascii_case("cookie") {
-            continue;
+    // Cache modes affect intermediary caches as well as our local lookup.
+    // Explicit request fields retain precedence, including empty values.
+    match request.effective_cache_mode() {
+        crate::RequestCacheMode::Validate => {
+            if !header_present(&outgoing, "cache-control") {
+                outgoing.push(("Cache-Control".to_owned(), b"max-age=0".to_vec()));
+            }
         }
-        outgoing.push((name.clone(), value.clone()));
+        crate::RequestCacheMode::Bypass | crate::RequestCacheMode::NoStore => {
+            if !header_present(&outgoing, "pragma") {
+                outgoing.push(("Pragma".to_owned(), b"no-cache".to_vec()));
+            }
+            if !header_present(&outgoing, "cache-control") {
+                outgoing.push(("Cache-Control".to_owned(), b"no-cache".to_vec()));
+            }
+        }
+        _ => {}
     }
 
-    append_browser_navigation_headers(&mut outgoing, config, request, request_url, redirect_chain);
-    append_browser_subresource_headers(&mut outgoing, config, request, request_url, redirect_chain);
+    // Fetch selects identity whenever Range is present, even with an invalid
+    // value. Explicit embedder encoding preferences still take precedence.
+    if header_present(&outgoing, "range") {
+        append_encoded_header_if_missing(&mut outgoing, "Accept-Encoding", "identity".to_owned());
+    }
+
+    if request.has_browser_identity_override() {
+        append_encoded_header_if_missing(
+            &mut outgoing,
+            "User-Agent",
+            request.browser_identity(config).user_agent().to_owned(),
+        );
+    }
+
+    append_browser_navigation_headers(&mut outgoing, config, request, request_url);
+    append_browser_subresource_headers(&mut outgoing, config, request, request_url);
     append_browser_storage_access_header(&mut outgoing, request, request_url);
 
+    if let Some(origin) = request_origin_header_value(request, request_url) {
+        append_encoded_header_if_missing(&mut outgoing, "Origin", origin);
+    }
+
     if !header_present(&outgoing, "referer")
-        && let Some(referer) = referrer_header_value_for_request(request, request_url)
+        && let Some(referer) = request.referrer_header_value(request_url)
     {
-        outgoing.push(("Referer".to_owned(), referer));
+        outgoing.push(("Referer".to_owned(), referer.into_bytes()));
     }
 
     if !header_present(&outgoing, "authorization")
@@ -210,34 +308,7 @@ pub(crate) fn outgoing_request_headers_for_url(
         // 401 retry body while Digest/NTLM/Negotiate stay on the buffered path.
         outgoing.push((
             "Authorization".to_owned(),
-            format!("Basic {}", encode_basic_auth(username, password)),
-        ));
-    }
-
-    if let Some(auth) = request.auth()
-        && auth.target == RequestAuthTarget::Server
-        && auth.scheme == RequestAuthScheme::Basic
-        && !header_present(&outgoing, "authorization")
-    {
-        outgoing.push((
-            "Authorization".to_owned(),
-            format!(
-                "Basic {}",
-                encode_basic_auth(&auth.username, &auth.password)
-            ),
-        ));
-    }
-
-    if let Some(auth) = request.auth()
-        && auth.target == RequestAuthTarget::ProxyHeader
-        && !header_present(&outgoing, "proxy-authorization")
-    {
-        outgoing.push((
-            "Proxy-Authorization".to_owned(),
-            format!(
-                "Basic {}",
-                encode_basic_auth(&auth.username, &auth.password)
-            ),
+            format!("Basic {}", encode_basic_auth(username, password)).into_bytes(),
         ));
     }
 
@@ -246,89 +317,91 @@ pub(crate) fn outgoing_request_headers_for_url(
 
 pub(crate) fn network_request_extra_info_from_headers(
     config: &FetchConfig,
+    request: &Request,
     outgoing_headers: &[(String, String)],
     cookie_report: Option<&StoredCookieQueryReport>,
 ) -> NetworkRequestExtraInfo {
     let mut headers = outgoing_headers.to_vec();
-    append_header_if_missing(&mut headers, "User-Agent", config.user_agent().to_owned());
+    append_header_if_missing(
+        &mut headers,
+        "User-Agent",
+        request.browser_identity(config).user_agent().to_owned(),
+    );
     NetworkRequestExtraInfo {
         headers,
         cookie_report: cookie_report.cloned().unwrap_or_default(),
     }
 }
 
-fn header_present(headers: &[(String, String)], name: &str) -> bool {
+fn header_present<V>(headers: &[(String, V)], name: &str) -> bool {
     headers
         .iter()
         .any(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
 }
 
+fn header_utf8_byte_string(value: &str) -> String {
+    crate::headers::decode_http_header_bytes(value.as_bytes()).into_owned()
+}
+
 fn append_header_if_missing(headers: &mut Vec<(String, String)>, name: &str, value: String) {
     if !header_present(headers, name) {
-        headers.push((name.to_owned(), value));
+        headers.push((name.to_owned(), header_utf8_byte_string(&value)));
+    }
+}
+
+fn append_encoded_header_if_missing(
+    headers: &mut crate::RequestHeaders,
+    name: &str,
+    value: String,
+) {
+    if !header_present(headers, name) {
+        headers.push((name.to_owned(), value.into_bytes()));
     }
 }
 
 fn append_browser_navigation_headers(
-    outgoing: &mut Vec<(String, String)>,
+    outgoing: &mut crate::RequestHeaders,
     config: &FetchConfig,
     request: &Request,
     request_url: &Url,
-    redirect_chain: &[RedirectInfo],
 ) {
     if !request.is_navigation_request() || !matches!(request_url.scheme(), "http" | "https") {
         return;
     }
 
-    append_header_if_missing(
-        outgoing,
-        "Accept",
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".to_owned(),
-    );
-    append_header_if_missing(
+    append_encoded_header_if_missing(
         outgoing,
         "Accept-Language",
-        config.browser_identity().accept_language().to_owned(),
+        request
+            .browser_identity(config)
+            .accept_language()
+            .to_owned(),
     );
-    append_header_if_missing(outgoing, "Upgrade-Insecure-Requests", "1".to_owned());
-    append_header_if_missing(outgoing, "Sec-Fetch-Mode", "navigate".to_owned());
-    append_header_if_missing(
+    append_encoded_header_if_missing(outgoing, "Upgrade-Insecure-Requests", "1".to_owned());
+    append_fetch_metadata_headers(
         outgoing,
-        "Sec-Fetch-Dest",
+        request,
+        request_url,
+        "navigate",
         if request.is_subframe_navigation_request() {
             "iframe"
         } else {
             "document"
-        }
-        .to_owned(),
+        },
     );
-    append_header_if_missing(
-        outgoing,
-        "Sec-Fetch-Site",
-        request_sec_fetch_site(request, request_url),
-    );
-
-    if request.is_top_level_navigation_request() && request.cookie_context.initiator_url.is_none() {
-        append_header_if_missing(outgoing, "Sec-Fetch-User", "?1".to_owned());
-    }
 
     if request.browser_navigation_kind() == crate::BrowserNavigationRequestKind::Reload {
-        append_header_if_missing(outgoing, "Cache-Control", "max-age=0".to_owned());
+        append_encoded_header_if_missing(outgoing, "Cache-Control", "max-age=0".to_owned());
     }
 
-    if let Some(origin) = request_origin_header_value(request, request_url, redirect_chain) {
-        append_header_if_missing(outgoing, "Origin", origin);
-    }
-
-    append_browser_client_hints(outgoing, config);
+    append_browser_client_hints(outgoing, request.browser_identity(config));
 }
 
 fn append_browser_subresource_headers(
-    outgoing: &mut Vec<(String, String)>,
+    outgoing: &mut crate::RequestHeaders,
     config: &FetchConfig,
     request: &Request,
     request_url: &Url,
-    redirect_chain: &[RedirectInfo],
 ) {
     let Some(metadata) = request.browser_request_metadata() else {
         return;
@@ -337,165 +410,82 @@ fn append_browser_subresource_headers(
         return;
     }
 
-    match metadata {
-        BrowserRequestMetadata::Audio
-        | BrowserRequestMetadata::AudioWorklet
-        | BrowserRequestMetadata::Beacon
-        | BrowserRequestMetadata::EventSource
-        | BrowserRequestMetadata::Fetch
-        | BrowserRequestMetadata::Font
-        | BrowserRequestMetadata::Image
-        | BrowserRequestMetadata::JsonModule
-        | BrowserRequestMetadata::Manifest
-        | BrowserRequestMetadata::Ping
-        | BrowserRequestMetadata::Style
-        | BrowserRequestMetadata::StyleModule
-        | BrowserRequestMetadata::TextTrack
-        | BrowserRequestMetadata::Video
-        | BrowserRequestMetadata::Xhr => {
-            let accept = match metadata {
-                BrowserRequestMetadata::Image => {
-                    "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
-                }
-                BrowserRequestMetadata::EventSource => "text/event-stream",
-                BrowserRequestMetadata::Manifest => "*/*",
-                BrowserRequestMetadata::TextTrack => "text/vtt,*/*;q=0.1",
-                _ => "*/*",
-            };
-            append_header_if_missing(outgoing, "Accept", accept.to_owned());
-            append_header_if_missing(
-                outgoing,
-                "Accept-Language",
-                config.browser_identity().accept_language().to_owned(),
-            );
-            append_header_if_missing(
-                outgoing,
-                "Sec-Fetch-Site",
-                request_sec_fetch_site(request, request_url),
-            );
-            append_header_if_missing(
-                outgoing,
-                "Sec-Fetch-Mode",
-                request.request_mode.as_ref().to_owned(),
-            );
-            let destination = match metadata {
-                BrowserRequestMetadata::Audio => "audio",
-                BrowserRequestMetadata::AudioWorklet => "audioworklet",
-                BrowserRequestMetadata::Font => "font",
-                BrowserRequestMetadata::Image => "image",
-                BrowserRequestMetadata::JsonModule => "json",
-                BrowserRequestMetadata::Manifest => "manifest",
-                BrowserRequestMetadata::Style | BrowserRequestMetadata::StyleModule => "style",
-                BrowserRequestMetadata::TextTrack => "track",
-                BrowserRequestMetadata::Video => "video",
-                BrowserRequestMetadata::Beacon
-                | BrowserRequestMetadata::EventSource
-                | BrowserRequestMetadata::Fetch
-                | BrowserRequestMetadata::Ping
-                | BrowserRequestMetadata::Xhr => "empty",
-            };
-            append_header_if_missing(outgoing, "Sec-Fetch-Dest", destination.to_owned());
-            let origin = if matches!(metadata, BrowserRequestMetadata::Style)
-                && !matches!(request.request_mode, crate::RequestMode::Cors)
-            {
-                None
-            } else {
-                request_origin_header_value(request, request_url, redirect_chain)
-            };
-            if let Some(origin) = origin {
-                append_header_if_missing(outgoing, "Origin", origin);
-            }
-            append_browser_client_hints(outgoing, config);
-        }
+    append_encoded_header_if_missing(
+        outgoing,
+        "Accept-Language",
+        request
+            .browser_identity(config)
+            .accept_language()
+            .to_owned(),
+    );
+    let destination = metadata.fetch_destination();
+    append_fetch_metadata_headers(
+        outgoing,
+        request,
+        request_url,
+        request.request_mode.as_ref(),
+        destination,
+    );
+    append_browser_client_hints(outgoing, request.browser_identity(config));
+}
+
+// Fetch Metadata uses the current URL, including on every redirect hop.
+// Loopback and localhost HTTP destinations are potentially trustworthy too.
+fn append_fetch_metadata_headers(
+    outgoing: &mut crate::RequestHeaders,
+    request: &Request,
+    request_url: &Url,
+    mode: &str,
+    destination: &str,
+) {
+    if !is_potentially_trustworthy_url(request_url) {
+        return;
+    }
+    append_encoded_header_if_missing(outgoing, "Sec-Fetch-Mode", mode.to_owned());
+    append_encoded_header_if_missing(outgoing, "Sec-Fetch-Dest", destination.to_owned());
+    append_encoded_header_if_missing(
+        outgoing,
+        "Sec-Fetch-Site",
+        request_sec_fetch_site(request, request_url),
+    );
+    if request.is_navigation_request()
+        && request.is_top_level_navigation_request()
+        && request.cookie_context.initiator_url.is_none()
+    {
+        append_encoded_header_if_missing(outgoing, "Sec-Fetch-User", "?1".to_owned());
     }
 }
 
-fn request_origin_header_value(
-    request: &Request,
-    request_url: &Url,
-    redirect_chain: &[RedirectInfo],
-) -> Option<String> {
-    if !request_needs_origin_header(request, request_url, redirect_chain) {
+fn request_origin_header_value(request: &Request, request_url: &Url) -> Option<String> {
+    request.request_origin()?;
+    if !matches!(request_url.scheme(), "http" | "https") {
         return None;
     }
-    let Some(initiator_url) = request.cookie_context.initiator_url.as_ref() else {
-        return Some("null".to_owned());
-    };
-    let Some(initiator_origin_url) = tuple_origin_url(initiator_url) else {
-        return Some("null".to_owned());
-    };
-    Some(
-        if request_has_redirect_tainted_origin(
-            initiator_origin_url.as_ref(),
-            &request.url,
-            redirect_chain,
-        ) {
-            "null".to_owned()
-        } else {
-            origin_ascii_serialization(initiator_origin_url.as_ref())
-        },
-    )
+    let safe_method =
+        request.method.eq_ignore_ascii_case("GET") || request.method.eq_ignore_ascii_case("HEAD");
+    if safe_method
+        && (request.request_mode != crate::RequestMode::Cors
+            || !request.has_cross_origin_url(request_url))
+    {
+        return None;
+    }
+    Some(request.serialized_origin())
 }
 
-fn request_needs_origin_header(
-    request: &Request,
-    request_url: &Url,
-    redirect_chain: &[RedirectInfo],
-) -> bool {
-    if !matches!(request_url.scheme(), "http" | "https") {
-        return false;
-    }
-    if !request.method.eq_ignore_ascii_case("GET") && !request.method.eq_ignore_ascii_case("HEAD") {
-        return true;
-    }
-    if !matches!(request.request_mode, crate::RequestMode::Cors) {
-        return false;
-    }
-
-    let Some(initiator_url) = request.cookie_context.initiator_url.as_ref() else {
-        return true;
-    };
-    let Some(initiator_origin_url) = tuple_origin_url(initiator_url) else {
-        return true;
-    };
-    !same_origin(initiator_origin_url.as_ref(), request_url)
-        || request_has_redirect_tainted_origin(
-            initiator_origin_url.as_ref(),
-            &request.url,
-            redirect_chain,
-        )
-}
-
-fn request_has_redirect_tainted_origin(
-    request_origin_url: &Url,
-    original_request_url: &Url,
-    redirect_chain: &[RedirectInfo],
-) -> bool {
-    let mut last_url = original_request_url;
-
-    for redirect in redirect_chain {
-        let next_url = &redirect.to_url;
-        if !same_origin(next_url, last_url) && !same_origin(request_origin_url, last_url) {
-            return true;
-        }
-        last_url = next_url;
-    }
-
-    false
-}
-
-fn append_browser_client_hints(outgoing: &mut Vec<(String, String)>, config: &FetchConfig) {
-    let identity = config.browser_identity();
+fn append_browser_client_hints(
+    outgoing: &mut crate::RequestHeaders,
+    identity: &moli_browser_profile::BrowserIdentityProfile,
+) {
     let Some(sec_ch_ua) = identity.sec_ch_ua_value() else {
         return;
     };
-    append_header_if_missing(outgoing, "Sec-CH-UA", sec_ch_ua);
-    append_header_if_missing(
+    append_encoded_header_if_missing(outgoing, "Sec-CH-UA", sec_ch_ua);
+    append_encoded_header_if_missing(
         outgoing,
         "Sec-CH-UA-Mobile",
         if identity.mobile() { "?1" } else { "?0" }.to_owned(),
     );
-    append_header_if_missing(
+    append_encoded_header_if_missing(
         outgoing,
         "Sec-CH-UA-Platform",
         format!("\"{}\"", identity.platform()),
@@ -503,7 +493,7 @@ fn append_browser_client_hints(outgoing: &mut Vec<(String, String)>, config: &Fe
 }
 
 fn append_browser_storage_access_header(
-    outgoing: &mut Vec<(String, String)>,
+    outgoing: &mut crate::RequestHeaders,
     request: &Request,
     request_url: &Url,
 ) {
@@ -527,53 +517,36 @@ fn append_browser_storage_access_header(
     // Moli does not currently expose a third-party-cookie blocking mode,
     // so its network cookie policy has the same effective state. If such a
     // blocker is added, this value must be derived from that policy instead.
-    append_header_if_missing(outgoing, "Sec-Fetch-Storage-Access", "active".to_owned());
+    append_encoded_header_if_missing(outgoing, "Sec-Fetch-Storage-Access", "active".to_owned());
 }
 
 fn request_sec_fetch_site(request: &Request, request_url: &Url) -> String {
-    let Some(initiator_url) = request.cookie_context.initiator_url.as_ref() else {
+    if request.is_navigation_request() && request.cookie_context.initiator_url.is_none() {
+        return "none".to_owned();
+    }
+    let Some(origin) = request.request_origin() else {
         return "none".to_owned();
     };
-    let initiator_url =
-        tuple_origin_url(initiator_url).unwrap_or(std::borrow::Cow::Borrowed(initiator_url));
-    if same_origin(initiator_url.as_ref(), request_url) {
+    let Ok(initiator_url) = Url::parse(origin.ascii_serialization()) else {
+        return "cross-site".to_owned();
+    };
+    let urls = request.url_list(request_url);
+    if !urls.has_cross_origin_url(origin) {
         "same-origin".to_owned()
-    } else if same_site_urls(initiator_url.as_ref(), request_url, true) {
-        "same-site".to_owned()
-    } else {
+    } else if urls.has_cross_site_url(&initiator_url) {
         "cross-site".to_owned()
+    } else {
+        "same-site".to_owned()
     }
-}
-
-fn referrer_header_value_for_request(request: &Request, request_url: &Url) -> Option<String> {
-    if !request.infers_referrer_from_initiator() {
-        return None;
-    }
-    let referrer_url = request.cookie_context.initiator_url.as_ref()?;
-    let (referrer_policy, document_referrer_policy) = request
-        .subresource_request_metadata()
-        .map(|metadata| {
-            (
-                metadata.referrer_policy.as_deref(),
-                metadata.document_referrer_policy.as_deref(),
-            )
-        })
-        .unwrap_or((None, None));
-    crate::referrer_header_value(
-        referrer_url,
-        request_url,
-        referrer_policy,
-        document_referrer_policy,
-    )
 }
 
 pub(crate) fn store_response_cookies(
     cookie_store: &SharedBrowserCookieStore,
     response_url: &Url,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     request_context: &NetworkCookieRequestContext,
 ) -> Result<Vec<StoredCookieSetReport>> {
-    let mut cookie_store = cookie_store.lock();
+    let mut cookie_store = cookie_store.lock()?;
     Ok(cookie_store.store_response_headers_with_context_reports(
         response_url,
         headers,
@@ -581,18 +554,23 @@ pub(crate) fn store_response_cookies(
     ))
 }
 
-pub(crate) fn configure_easy<H: Handler>(
-    easy: &mut Easy2<H>,
+pub(crate) fn configure_easy(
+    easy: &mut Easy2<crate::runtime::FetchTransferHandler>,
     config: &FetchConfig,
+    proxy_route: &HttpProxyRoute,
     request: &Request,
     request_url: &Url,
-    redirect_chain: &[RedirectInfo],
     cookie_header: Option<&str>,
     http_version: RequestHttpVersion,
-    validation_headers: Option<Vec<(String, String)>>,
+    validation_headers: Option<Vec<(String, Vec<u8>)>>,
 ) -> Result<Vec<(String, String)>> {
     ensure_http_network_transport_url(request_url)?;
-    enforce_request_target_policy(config, request_url)?;
+    if crate::should_request_be_blocked_due_to_bad_port(request_url) {
+        bail!("blocked bad port for `{request_url}`");
+    }
+    if matches!(proxy_route, HttpProxyRoute::Direct) {
+        enforce_request_target_address_policy(config, request_url)?;
+    }
     configure_curl_http_protocol_allowlist(easy)?;
 
     // Keep proxy CONNECT handshake headers out of the response callbacks so
@@ -635,9 +613,6 @@ pub(crate) fn configure_easy<H: Handler>(
     if let Err(error) = easy.tcp_keepalive(true) {
         debug!(url = %request_url, "failed to enable TCP keepalive: {error}");
     }
-    if let Err(error) = easy.dns_cache_timeout(Duration::from_secs(60)) {
-        debug!(url = %request_url, "failed to configure curl DNS cache timeout: {error}");
-    }
     if let Some(max_connects) = config
         .http_max_total_connections()
         .or_else(|| config.effective_http_max_host_connections().map(u16::from))
@@ -652,58 +627,13 @@ pub(crate) fn configure_easy<H: Handler>(
     easy.accept_encoding("")
         .context("failed to enable curl response decompression")?;
 
-    easy.ssl_verify_peer(config.tls_verify_host())
-        .context("failed to configure curl TLS peer verification")?;
-    easy.ssl_verify_host(config.tls_verify_host())
-        .context("failed to configure curl TLS host verification")?;
-    if let Some(ca_cert) = config.ca_cert() {
-        easy.cainfo(ca_cert).with_context(|| {
-            format!(
-                "failed to configure curl CA certificate `{}`",
-                ca_cert.display()
-            )
-        })?;
-    }
     // TLS client identities are Fetch credentials. Check each redirect target;
     // curl also uses the client certificate configuration to match reusable
     // connections, keeping authenticated and anonymous requests separate.
-    if request.allows_credentials_for_url(request_url) {
-        if let Some(client_cert) = config.client_cert() {
-            easy.ssl_cert(client_cert).with_context(|| {
-                format!(
-                    "failed to configure curl client certificate `{}`",
-                    client_cert.display()
-                )
-            })?;
-            let cert_type = match client_cert
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-            {
-                Some("p12" | "pfx") => "P12",
-                Some("cer" | "der") => "DER",
-                _ => "PEM",
-            };
-            easy.ssl_cert_type(cert_type)
-                .context("failed to configure curl client certificate type")?;
-        }
-        if let Some(client_key) = config.client_key() {
-            easy.ssl_key(client_key).with_context(|| {
-                format!(
-                    "failed to configure curl client private key `{}`",
-                    client_key.display()
-                )
-            })?;
-            easy.ssl_key_type("PEM")
-                .context("failed to configure curl client private key type")?;
-        }
-        if let Some(password) = config.client_cert_password() {
-            easy.key_password(password)
-                .context("failed to configure curl client certificate password")?;
-        }
-    }
-    easy.useragent(config.user_agent())
+    config
+        .tls_config()
+        .configure(easy, request.allows_credentials_for_url(request_url))?;
+    easy.useragent(request.browser_identity(config).user_agent())
         .context("failed to set curl user-agent")?;
     easy.url(request_url.as_str())
         .with_context(|| anyhow!("failed to set curl request url to {}", request_url))?;
@@ -723,21 +653,31 @@ pub(crate) fn configure_easy<H: Handler>(
         method => {
             easy.custom_request(method)
                 .with_context(|| anyhow!("failed to configure {method} request"))?;
-            if let Some(ref body) = request.body {
-                easy.post_fields_copy(body)
+            // Fetch requires Content-Length: 0 for a bodyless PUT, just as for POST.
+            if request.body.is_some() || method == "PUT" {
+                easy.post_fields_copy(request.body.as_deref().unwrap_or(&[]))
                     .context("failed to set custom request body")?;
             }
         }
     }
 
-    if let Some(proxy) = config.http_proxy() {
-        easy.proxy(proxy)
-            .with_context(|| anyhow!("failed to configure HTTP proxy `{proxy}`"))?;
+    match proxy_route {
+        HttpProxyRoute::Direct => easy
+            .proxy("")
+            .context("failed to disable the HTTP proxy for a direct request")?,
+        HttpProxyRoute::Proxy(proxy) => {
+            easy.proxy(proxy.curl_url())
+                .with_context(|| anyhow!("failed to configure HTTP proxy `{}`", proxy.url()))?;
+            if proxy.scheme() == ProxyScheme::Https {
+                config.tls_config().configure_https_proxy(easy)?;
+            }
+            configure_proxy_headers(easy, config, request, proxy.scheme().uses_http_headers())?;
+        }
     }
-    if let Some(no_proxy) = config.http_no_proxy() {
-        easy.noproxy(no_proxy)
-            .with_context(|| anyhow!("failed to configure HTTP no_proxy `{no_proxy}`"))?;
-    }
+    // Proxy bypass has already been resolved into `proxy_route`. Keep curl
+    // from re-evaluating environment `no_proxy` after that security decision.
+    easy.noproxy("")
+        .context("failed to disable curl HTTP no_proxy evaluation")?;
     if !config.http_host_resolve().is_empty() {
         let mut resolve = List::new();
         for entry in normalized_http_host_resolve_entries(config.http_host_resolve())? {
@@ -750,58 +690,49 @@ pub(crate) fn configure_easy<H: Handler>(
     }
 
     let mut headers = List::new();
-    let mut outgoing_headers = outgoing_request_headers_for_url(
-        config,
-        request,
-        request_url,
-        redirect_chain,
-        cookie_header,
-    );
-    if let Some(web_bot_auth) = config.web_bot_auth() {
-        web_bot_auth
-            .append_request_headers(&mut outgoing_headers, &request.method, request_url)
-            .with_context(|| anyhow!("failed to sign web bot auth request for {request_url}"))?;
+    let mut outgoing_headers =
+        outgoing_request_header_bytes_for_url(config, request, request_url, cookie_header);
+    // A 407 can come from a transparent proxy even when no explicit proxy
+    // route is configured. In that case the connected endpoint receives the
+    // challenge response as a normal request header. Explicit proxies use the
+    // separate CURLOPT_PROXYHEADER path configured above.
+    if matches!(proxy_route, HttpProxyRoute::Direct)
+        && let Some(authorization) = proxy_header_authorization(request)
+        && !header_present(&outgoing_headers, "proxy-authorization")
+    {
+        outgoing_headers.push(("Proxy-Authorization".to_owned(), authorization.into_bytes()));
     }
-    let mut has_headers = false;
+    if let Some(web_bot_auth) = config.web_bot_auth() {
+        let mut signed_headers = outgoing_headers.to_byte_strings();
+        web_bot_auth
+            .append_request_headers(&mut signed_headers, &request.method, request_url)
+            .with_context(|| anyhow!("failed to sign web bot auth request for {request_url}"))?;
+        outgoing_headers = crate::RequestHeaders::from_byte_strings(&signed_headers)?;
+    }
 
     let mut has_content_type_header = false;
-    for (name, value) in &outgoing_headers {
+    for (name, value) in outgoing_headers.iter() {
         has_content_type_header |= name.eq_ignore_ascii_case("content-type");
-        let header_line = if value.is_empty() {
-            format!("{name}:")
-        } else {
-            format!("{name}: {value}")
-        };
-        headers
-            .append(&header_line)
+        append_curl_request_header(&mut headers, name, value)
             .context("failed to build request header")?;
-        has_headers = true;
     }
     if let Some(validation_headers) = validation_headers {
-        for (name, value) in validation_headers {
+        // Preserve cached response validator bytes in the conditional request.
+        let validation_headers = crate::RequestHeaders::from_bytes(validation_headers);
+        for (name, value) in validation_headers.iter() {
             has_content_type_header |= name.eq_ignore_ascii_case("content-type");
-            headers
-                .append(&format!("{name}: {value}"))
+            append_curl_request_header(&mut headers, name, value)
                 .context("failed to build cache validation request header")?;
-            has_headers = true;
         }
     }
-    if request.method.eq_ignore_ascii_case("POST") && !has_content_type_header {
-        // libcurl otherwise synthesizes `Content-Type: application/x-www-form-urlencoded`
-        // for POST bodies. Browser fetch/sendBeacon only send Content-Type when
-        // BodyInit or caller headers produce one, so suppress curl's transport default.
-        headers
-            .append("Content-Type:")
-            .context("failed to suppress curl default POST content-type")?;
-        has_headers = true;
+    if !has_content_type_header {
+        // BodyInit and caller headers determine whether Content-Type is present.
+        // Suppress libcurl's upload default when neither supplies one.
+        suppress_curl_generated_header(&mut headers, "Content-Type")
+            .context("failed to suppress curl default content-type")?;
     }
 
-    if has_headers {
-        easy.http_headers(headers)
-            .context("failed to attach curl request headers")?;
-    }
-
-    if let Some(auth) = request.auth()
+    if let Some(auth) = request.auth_for_url(request_url)
         && request.auth_requires_buffered_transport()
     {
         let mut methods = Auth::new();
@@ -840,294 +771,114 @@ pub(crate) fn configure_easy<H: Handler>(
         }
     }
 
-    Ok(outgoing_headers)
+    easy.http_headers(headers)
+        .context("failed to attach curl request headers")?;
+    Ok(outgoing_headers.to_byte_strings())
 }
 
-fn enforce_request_target_policy(config: &FetchConfig, request_url: &Url) -> Result<()> {
-    if crate::should_request_be_blocked_due_to_bad_port(request_url) {
-        bail!("blocked bad port for `{request_url}`");
+fn append_curl_request_header(headers: &mut List, name: &str, value: &[u8]) -> Result<()> {
+    let mut line = name.as_bytes().to_vec();
+    if value.is_empty() {
+        // CURLOPT_HTTPHEADER interprets `Name:` as header removal.
+        // `Name;` is libcurl's syntax for sending an explicit empty value.
+        line.push(b';');
+    } else {
+        line.extend_from_slice(b": ");
+        line.extend_from_slice(value);
+    }
+    headers.append_bytes(&line)?;
+    Ok(())
+}
+
+fn suppress_curl_generated_header(headers: &mut List, name: &str) -> Result<()> {
+    headers.append(&format!("{name}:"))?;
+    Ok(())
+}
+
+fn configure_proxy_headers<H: Handler>(
+    easy: &mut Easy2<H>,
+    config: &FetchConfig,
+    request: &Request,
+    proxy_uses_http_headers: bool,
+) -> Result<()> {
+    let explicit_proxy_header_auth = proxy_header_authorization(request);
+    if !proxy_uses_http_headers {
+        if config.proxy_bearer_token().is_some() || explicit_proxy_header_auth.is_some() {
+            bail!("Proxy-Authorization headers require an HTTP(S) proxy");
+        }
+        return Ok(());
     }
 
+    easy.separate_proxy_headers(true)
+        .context("failed to separate proxy headers from origin request headers")?;
+    let authorization = config
+        .proxy_bearer_token()
+        .map(|token| format!("Bearer {token}"))
+        .or(explicit_proxy_header_auth);
+    if let Some(authorization) = authorization {
+        let mut headers = List::new();
+        headers
+            .append(&format!("Proxy-Authorization: {authorization}"))
+            .context("failed to build proxy authorization header")?;
+        easy.proxy_headers(headers)
+            .context("failed to configure HTTP proxy headers")?;
+    }
+    Ok(())
+}
+
+fn proxy_header_authorization(request: &Request) -> Option<String> {
+    request
+        .auth()
+        .filter(|auth| auth.target == RequestAuthTarget::ProxyHeader)
+        .map(|auth| {
+            format!(
+                "Basic {}",
+                encode_basic_auth(&auth.username, &auth.password)
+            )
+        })
+}
+
+fn enforce_request_target_address_policy(config: &FetchConfig, request_url: &Url) -> Result<()> {
     if !config.block_private_networks() && config.block_cidrs().is_empty() {
         return Ok(());
     }
 
-    let Some(host) = request_url.host_str() else {
+    let Some(host) = request_url.host() else {
         return Ok(());
     };
+    let host_text = request_url
+        .host_str()
+        .expect("a parsed URL host must have text");
     let port = request_url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("could not determine port for request url `{request_url}`"))?;
 
-    let resolved_ips = resolve_target_ips(config, host, port)
-        .with_context(|| anyhow!("failed to resolve request host `{host}` for `{request_url}`"))?;
-    for ip in resolved_ips {
-        if config.block_private_networks() && is_private_or_internal_ip(ip) {
-            bail!("blocked private network address `{ip}` for `{request_url}`");
-        }
-        if let Some(cidr) = config.block_cidrs().iter().find(|cidr| cidr.contains(&ip)) {
-            bail!("blocked address `{ip}` for `{request_url}` because it matches `{cidr}`");
-        }
-    }
-
-    Ok(())
-}
-
-fn resolve_target_ips(config: &FetchConfig, host: &str, port: u16) -> Result<Vec<IpAddr>> {
-    if let Some(resolved_ips) =
-        resolve_host_resolve_override_ips(config.http_host_resolve(), host, port)?
+    let policy = config.network_address_policy();
+    if let Some(addresses) =
+        resolve_host_resolve_override_ips(config.http_host_resolve(), host_text, port)?
     {
-        return Ok(resolved_ips);
+        return policy.check_addresses(&addresses, request_url.as_str());
     }
 
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(vec![ip]);
+    match host {
+        Host::Ipv4(address) => policy.check_address(IpAddr::V4(address), request_url.as_str()),
+        Host::Ipv6(address) => policy.check_address(IpAddr::V6(address), request_url.as_str()),
+        Host::Domain(_) => Ok(()),
     }
-
-    resolve_system_target_ips(host, port)
 }
 
-fn resolve_host_resolve_override_ips(
+pub(crate) fn resolve_host_resolve_override_ips(
     entries: &[String],
     host: &str,
     port: u16,
 ) -> Result<Option<Vec<IpAddr>>> {
-    let mut exact_match: Option<Vec<IpAddr>> = None;
-    let mut wildcard_match: Option<Vec<IpAddr>> = None;
-    for entry in entries {
-        match parse_http_host_resolve_entry(entry)? {
-            HttpHostResolveEntry::Add {
-                host: entry_host,
-                port: entry_port,
-                addresses,
-                ..
-            } if entry_port == port => {
-                if entry_host == "*" {
-                    wildcard_match = Some(addresses);
-                } else if entry_host.eq_ignore_ascii_case(host) {
-                    exact_match = Some(addresses);
-                }
-            }
-            HttpHostResolveEntry::Remove {
-                host: entry_host,
-                port: entry_port,
-            } if entry_port == port => {
-                if entry_host == "*" {
-                    wildcard_match = None;
-                } else if entry_host.eq_ignore_ascii_case(host) {
-                    exact_match = None;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(exact_match.or(wildcard_match))
+    Ok(HostResolveOverrides::parse(entries)?
+        .addresses_for(host, port)
+        .map(<[IpAddr]>::to_vec))
 }
 
-fn resolve_system_target_ips(host: &str, port: u16) -> Result<Vec<IpAddr>> {
-    let mut resolved = Vec::new();
-    for addr in (host, port).to_socket_addrs()? {
-        let ip = addr.ip();
-        if !resolved.contains(&ip) {
-            resolved.push(ip);
-        }
-    }
-    if resolved.is_empty() {
-        bail!("no addresses resolved");
-    }
-    Ok(resolved)
-}
-
-enum HttpHostResolveEntry {
-    Add {
-        plus_prefix: bool,
-        host: String,
-        port: u16,
-        addresses: Vec<IpAddr>,
-    },
-    Remove {
-        host: String,
-        port: u16,
-    },
-}
-
-impl HttpHostResolveEntry {
-    fn curl_entry(&self) -> String {
-        match self {
-            Self::Add {
-                plus_prefix,
-                host,
-                port,
-                addresses,
-            } => {
-                let prefix = if *plus_prefix { "+" } else { "" };
-                let addresses = addresses
-                    .iter()
-                    .map(format_http_host_resolve_ip)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!(
-                    "{prefix}{}:{port}:{addresses}",
-                    format_http_host_resolve_host(host)
-                )
-            }
-            Self::Remove { host, port } => {
-                format!("-{}:{port}", format_http_host_resolve_host(host))
-            }
-        }
-    }
-}
-
-fn normalized_http_host_resolve_entries(entries: &[String]) -> Result<Vec<String>> {
-    entries
-        .iter()
-        .map(|entry| parse_http_host_resolve_entry(entry).map(|entry| entry.curl_entry()))
-        .collect()
-}
-
-fn parse_http_host_resolve_entry(entry: &str) -> Result<HttpHostResolveEntry> {
-    let entry = entry.trim();
-    if let Some(entry) = entry.strip_prefix('-') {
-        let (host, port) = split_http_host_resolve_remove_entry(entry)?;
-        return Ok(HttpHostResolveEntry::Remove {
-            host: normalize_http_host_resolve_host(host),
-            port: parse_http_host_resolve_port(port, entry)?,
-        });
-    }
-
-    let (plus_prefix, entry) = if let Some(entry) = entry.strip_prefix('+') {
-        (true, entry)
-    } else {
-        (false, entry)
-    };
-    let (host, port, address) = split_http_host_resolve_add_entry(entry)?;
-    let port = parse_http_host_resolve_port(port, entry)?;
-    let mut addresses = Vec::new();
-    for address in address.split(',').map(str::trim) {
-        if address.is_empty() {
-            bail!("--http-host-resolve entries must not contain empty addresses");
-        }
-        let address = address.trim_matches(['[', ']']);
-        let address = address
-            .parse::<IpAddr>()
-            .with_context(|| format!("invalid --http-host-resolve address in `{entry}`"))?;
-        if !addresses.contains(&address) {
-            addresses.push(address);
-        }
-    }
-
-    Ok(HttpHostResolveEntry::Add {
-        plus_prefix,
-        host: normalize_http_host_resolve_host(host),
-        port,
-        addresses,
-    })
-}
-
-fn split_http_host_resolve_add_entry(entry: &str) -> Result<(&str, &str, &str)> {
-    if let Some(entry) = entry.strip_prefix('[') {
-        let Some(host_end) = entry.find(']') else {
-            bail!("--http-host-resolve must be in HOST:PORT:ADDR form");
-        };
-        let host = &entry[..host_end];
-        let remainder = &entry[host_end + 1..];
-        let Some(remainder) = remainder.strip_prefix(':') else {
-            bail!("--http-host-resolve must be in HOST:PORT:ADDR form");
-        };
-        let Some((port, address)) = remainder.split_once(':') else {
-            bail!("--http-host-resolve must be in HOST:PORT:ADDR form");
-        };
-        if host.trim().is_empty() || port.trim().is_empty() || address.trim().is_empty() {
-            bail!("--http-host-resolve must be in HOST:PORT:ADDR form");
-        }
-        return Ok((host.trim(), port.trim(), address.trim()));
-    }
-
-    let mut parts = entry.splitn(3, ':');
-    let host = parts.next().unwrap_or_default().trim();
-    let port = parts.next().unwrap_or_default().trim();
-    let address = parts.next().unwrap_or_default().trim();
-
-    if host.is_empty() || port.is_empty() || address.is_empty() {
-        bail!("--http-host-resolve must be in HOST:PORT:ADDR form");
-    }
-
-    Ok((host, port, address))
-}
-
-fn split_http_host_resolve_remove_entry(entry: &str) -> Result<(&str, &str)> {
-    if let Some(entry) = entry.strip_prefix('[') {
-        let Some(host_end) = entry.find(']') else {
-            bail!("--http-host-resolve removal must be in HOST:PORT form");
-        };
-        let host = &entry[..host_end];
-        let remainder = &entry[host_end + 1..];
-        let Some(port) = remainder.strip_prefix(':') else {
-            bail!("--http-host-resolve removal must be in HOST:PORT form");
-        };
-        if host.trim().is_empty() || port.trim().is_empty() {
-            bail!("--http-host-resolve removal must be in HOST:PORT form");
-        }
-        return Ok((host.trim(), port.trim()));
-    }
-
-    let Some((host, port)) = entry.split_once(':') else {
-        bail!("--http-host-resolve removal must be in HOST:PORT form");
-    };
-    if host.trim().is_empty() || port.trim().is_empty() {
-        bail!("--http-host-resolve removal must be in HOST:PORT form");
-    }
-    Ok((host.trim(), port.trim()))
-}
-
-fn parse_http_host_resolve_port(port: &str, entry: &str) -> Result<u16> {
-    port.parse::<u16>()
-        .with_context(|| format!("invalid --http-host-resolve port in `{entry}`"))
-}
-
-fn normalize_http_host_resolve_host(host: &str) -> String {
-    host.trim_matches(['[', ']']).to_owned()
-}
-
-fn format_http_host_resolve_host(host: &str) -> String {
-    if host != "*" && host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_owned()
-    }
-}
-
-fn format_http_host_resolve_ip(ip: &IpAddr) -> String {
-    match ip {
-        IpAddr::V4(ip) => ip.to_string(),
-        IpAddr::V6(ip) => format!("[{ip}]"),
-    }
-}
-
-fn is_private_or_internal_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => {
-            ipv4.is_private()
-                || ipv4.is_loopback()
-                || ipv4.is_link_local()
-                || ipv4.is_broadcast()
-                || ipv4.is_documentation()
-                || ipv4.is_unspecified()
-                || ipv4.is_multicast()
-                || matches!(ipv4.octets(), [100, second, ..] if (64..=127).contains(&second))
-                || matches!(ipv4.octets(), [198, 18 | 19, ..])
-                || matches!(ipv4.octets(), [240..=255, ..])
-        }
-        IpAddr::V6(ipv6) => {
-            ipv6.is_loopback()
-                || ipv6.is_unspecified()
-                || ipv6.is_multicast()
-                || ipv6.is_unicast_link_local()
-                || ipv6.is_unique_local()
-                || (ipv6.segments()[0] == 0x2001 && ipv6.segments()[1] == 0x0db8)
-        }
-    }
+pub(crate) fn normalized_http_host_resolve_entries(entries: &[String]) -> Result<Vec<String>> {
+    Ok(HostResolveOverrides::parse(entries)?.normalized_entries())
 }
 
 fn configure_curl_http_protocol_allowlist<H: Handler>(easy: &mut Easy2<H>) -> Result<()> {
@@ -1189,7 +940,7 @@ fn effective_connect_timeout(config: &FetchConfig, request: &Request) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RequestMode;
+    use crate::{BrowserRequestMetadata, RequestMode};
 
     fn url(value: &str) -> Url {
         Url::parse(value).expect("valid URL")
@@ -1222,18 +973,151 @@ mod tests {
 
     fn redirect(from_url: &Url, to_url: &Url) -> RedirectInfo {
         RedirectInfo {
+            source: crate::RedirectSource::Network,
             from_url: from_url.clone(),
             to_url: to_url.clone(),
             status: 302,
             headers: Vec::new(),
             network_extra_info_available: true,
             request_extra_info: None,
+            dispatched_request: None,
             response_extra_info: None,
             redirect_has_extra_info: true,
             request_cookie_report: None,
             cookie_set_reports: Vec::new(),
             from_cache: false,
             negotiated_http_version: None,
+        }
+    }
+
+    #[test]
+    fn curl_explicit_cookie_headers_are_scoped_to_the_initial_origin() {
+        let initial_url = url("https://example.test/start");
+        let mut config = FetchConfig::default();
+        config.push_default_request_header("cOoKiE", "config=secret");
+        config.push_default_request_header("X-Config", "retained");
+        let original = Request::new(
+            "GET",
+            initial_url.as_str(),
+            None,
+            vec![
+                ("Cookie".to_owned(), "request=secret".to_owned()),
+                ("COOKIE".to_owned(), "duplicate=secret".to_owned()),
+                ("X-Request".to_owned(), "retained".to_owned()),
+            ],
+        )
+        .unwrap()
+        .with_cookie_header_policy(CookieHeaderPolicy::PreserveExplicit);
+
+        for (target, allowed) in [
+            ("https://EXAMPLE.test:443/final", true),
+            ("https://other.test/final", false),
+            ("https://sub.example.test/final", false),
+            ("https://example.test:444/final", false),
+            ("http://example.test:443/final", false),
+            ("http://example.test/final", false),
+        ] {
+            let target_url = url(target);
+            let mut followed = original.clone();
+            followed
+                .follow_redirect(redirect(&initial_url, &target_url))
+                .unwrap();
+            // The runtime retains request.url, while caller-owned redirect
+            // loops update it. Both must scope headers to the initial URL.
+            for request in [&original, &followed] {
+                let headers = outgoing_request_headers_for_url(
+                    &config,
+                    request,
+                    &target_url,
+                    Some("target=stored"),
+                );
+                let cookies = headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    cookies,
+                    if allowed {
+                        vec![
+                            "target=stored",
+                            "config=secret",
+                            "request=secret",
+                            "duplicate=secret",
+                        ]
+                    } else {
+                        vec!["target=stored"]
+                    },
+                    "{target}"
+                );
+                assert_eq!(
+                    header_value(&headers, "x-config").as_deref(),
+                    Some("retained")
+                );
+                assert_eq!(
+                    header_value(&headers, "x-request").as_deref(),
+                    Some("retained")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn curl_cookie_headers_restore_only_when_returning_to_the_initial_origin() {
+        let mut request = Request::new(
+            "GET",
+            "https://initial.test/start",
+            None,
+            vec![("Cookie".to_owned(), "intercepted=once".to_owned())],
+        )
+        .unwrap()
+        .with_cookie_header_policy(CookieHeaderPolicy::PreserveExplicit)
+        .with_redirect_headers(Some(
+            vec![("Cookie".to_owned(), "manual=secret".to_owned())].into(),
+        ))
+        .with_additional_cookies(Some("literal=suppressed".to_owned()));
+        let config = FetchConfig::default();
+        for (target, expected) in [
+            ("https://other.test/middle", None),
+            ("https://other.test/final", None),
+            ("https://initial.test/returned", Some("manual=secret")),
+        ] {
+            request
+                .follow_redirect(redirect(&request.url, &url(target)))
+                .unwrap();
+            let headers = outgoing_request_headers_for_url(&config, &request, &request.url, None);
+            assert_eq!(
+                header_value(&headers, "cookie").as_deref(),
+                expected,
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn curl_literal_and_store_cookies_remain_independent_of_header_redirect_scope() {
+        let target_url = url("http://other.test/final");
+        for literal_in_config in [false, true] {
+            let mut config = FetchConfig::default();
+            let mut request = Request::get("https://initial.test/start")
+                .unwrap()
+                .with_cookie_header_policy(CookieHeaderPolicy::PreserveExplicit);
+            if literal_in_config {
+                config.set_additional_cookies(Some("literal=retained".to_owned()));
+                config.bind_additional_cookie_scope(&request);
+            } else {
+                request = request.with_additional_cookies(Some("literal=retained".to_owned()));
+            }
+            let headers = outgoing_request_headers_for_url(
+                &config,
+                &request,
+                &target_url,
+                Some("target=stored"),
+            );
+            assert_eq!(
+                header_value(&headers, "cookie").as_deref(),
+                Some("target=stored; literal=retained")
+            );
         }
     }
 
@@ -1360,19 +1244,16 @@ mod tests {
             let request_url = url(case.request_url);
             let mut request = Request::new(case.method, case.request_url, None, Vec::new())
                 .unwrap()
+                .with_request_origin(moli_url::WebOrigin::Opaque)
                 .with_request_mode(case.mode)
                 .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
             if let Some(initiator) = case.initiator {
-                request = request.with_initiator_url(&url(initiator));
+                request = request
+                    .with_initiator_url(&url(initiator))
+                    .with_request_origin(moli_url::WebOrigin::from_url(&url(initiator)));
             }
 
-            let headers = outgoing_request_headers_for_url(
-                &config,
-                &request,
-                &request_url,
-                &Vec::new(),
-                None,
-            );
+            let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
             assert_eq!(
                 header_value(&headers, "origin").as_deref(),
                 case.expected,
@@ -1394,10 +1275,10 @@ mod tests {
         )
         .unwrap()
         .with_initiator_url(&url("https://app.test/page"))
+        .with_request_origin(moli_url::WebOrigin::from_url(&url("https://app.test/page")))
         .with_browser_request_metadata(BrowserRequestMetadata::Xhr);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
         assert_eq!(
             headers
                 .iter()
@@ -1409,46 +1290,79 @@ mod tests {
     }
 
     #[test]
+    fn opaque_request_origin_is_cross_origin_without_hiding_referrer_url() {
+        let config = FetchConfig::default();
+        let request_url = url("https://app.test/data");
+        let request = Request::new("GET", request_url.as_str(), None, Vec::new())
+            .unwrap()
+            .with_initiator_url(&url("https://app.test/sandboxed-frame"))
+            .with_request_origin(moli_url::WebOrigin::Opaque)
+            .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
+
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
+
+        assert_eq!(header_value(&headers, "origin").as_deref(), Some("null"));
+        assert_eq!(
+            header_value(&headers, "sec-fetch-site").as_deref(),
+            Some("cross-site")
+        );
+        assert_eq!(
+            header_value(&headers, "referer").as_deref(),
+            Some("https://app.test/sandboxed-frame")
+        );
+    }
+
+    #[test]
     fn post_navigation_without_an_initiator_serializes_opaque_origin() {
         let config = FetchConfig::default();
         let request_url = url("https://app.test/submit");
         let request = Request::new("POST", request_url.as_str(), None, Vec::new())
             .unwrap()
+            .with_request_origin(moli_url::WebOrigin::Opaque)
             .with_top_level_navigation_cookie_context();
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
         assert_eq!(header_value(&headers, "origin").as_deref(), Some("null"));
+        assert_eq!(
+            header_value(&headers, "sec-fetch-site").as_deref(),
+            Some("none")
+        );
     }
 
     #[test]
     fn browser_subresource_origin_uses_redirect_target_url() {
-        let config = FetchConfig::default();
-        let initiator_url = url("http://app.test/page");
-        let original_url = url("http://app.test/redirect");
-        let redirected_url = url("http://api.test/data");
-        let request = Request::new("GET", original_url.as_str(), None, Vec::new())
-            .unwrap()
-            .with_initiator_url(&initiator_url)
-            .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
-        let redirect_chain = vec![redirect(&original_url, &redirected_url)];
+        for scheme in ["http", "https"] {
+            let config = FetchConfig::default();
+            let initiator_url = url(&format!("{scheme}://app.test/page"));
+            let original_url = url(&format!("{scheme}://app.test/redirect"));
+            let redirected_url = url(&format!("{scheme}://api.test/data"));
+            let request = Request::new("GET", original_url.as_str(), None, Vec::new())
+                .unwrap()
+                .with_initiator_url(&initiator_url)
+                .with_request_origin(moli_url::WebOrigin::from_url(&initiator_url))
+                .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
+            let redirect_chain = vec![redirect(&original_url, &redirected_url)];
+            let request = request.with_redirect_chain(redirect_chain);
 
-        let headers = outgoing_request_headers_for_url(
-            &config,
-            &request,
-            &redirected_url,
-            &redirect_chain,
-            None,
-        );
+            let headers =
+                outgoing_request_headers_for_url(&config, &request, &redirected_url, None);
 
-        assert_eq!(
-            header_value(&headers, "origin"),
-            Some("http://app.test".to_owned())
-        );
-        assert_eq!(
-            header_value(&headers, "sec-fetch-site"),
-            Some("cross-site".to_owned())
-        );
+            assert_eq!(
+                header_value(&headers, "origin"),
+                Some(format!("{scheme}://app.test"))
+            );
+            assert_eq!(
+                header_value(&headers, "sec-fetch-site"),
+                (scheme == "https").then(|| "cross-site".to_owned())
+            );
+            if scheme == "http" {
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(name, _)| { !name.to_ascii_lowercase().starts_with("sec-fetch-") })
+                );
+            }
+        }
     }
 
     #[test]
@@ -1464,10 +1378,10 @@ mod tests {
         )
         .unwrap()
         .with_initiator_url(&initiator_url)
+        .with_request_origin(moli_url::WebOrigin::from_url(&initiator_url))
         .with_browser_request_metadata(BrowserRequestMetadata::Xhr);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
 
         assert_eq!(
             header_value(&headers, "origin"),
@@ -1481,109 +1395,191 @@ mod tests {
 
     #[test]
     fn browser_subresource_origin_serializes_null_after_cross_site_redirect() {
-        let config = FetchConfig::default();
-        let initiator_url = url("http://app.test/page");
-        let original_url = url("http://api.test/redirect");
-        let redirected_url = url("http://app.test/data");
-        let request = Request::new("GET", original_url.as_str(), None, Vec::new())
-            .unwrap()
-            .with_initiator_url(&initiator_url)
-            .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
-        let redirect_chain = vec![redirect(&original_url, &redirected_url)];
+        for scheme in ["http", "https"] {
+            let config = FetchConfig::default();
+            let initiator_url = url(&format!("{scheme}://app.test/page"));
+            let original_url = url(&format!("{scheme}://api.test/redirect"));
+            let redirected_url = url(&format!("{scheme}://app.test/data"));
+            let request = Request::new("GET", original_url.as_str(), None, Vec::new())
+                .unwrap()
+                .with_initiator_url(&initiator_url)
+                .with_request_origin(moli_url::WebOrigin::from_url(&initiator_url))
+                .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
+            let redirect_chain = vec![redirect(&original_url, &redirected_url)];
+            let request = request.with_redirect_chain(redirect_chain);
 
-        let headers = outgoing_request_headers_for_url(
-            &config,
-            &request,
-            &redirected_url,
-            &redirect_chain,
-            None,
-        );
+            let headers =
+                outgoing_request_headers_for_url(&config, &request, &redirected_url, None);
 
-        assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
-        assert_eq!(
-            header_value(&headers, "sec-fetch-site"),
-            Some("same-origin".to_owned())
-        );
+            assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
+            assert_eq!(
+                header_value(&headers, "sec-fetch-site"),
+                (scheme == "https").then(|| "cross-site".to_owned())
+            );
+            if scheme == "http" {
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(name, _)| { !name.to_ascii_lowercase().starts_with("sec-fetch-") })
+                );
+            }
+        }
     }
 
     #[test]
     fn browser_subresource_origin_serializes_null_after_same_site_redirect_chain() {
-        let config = FetchConfig::default();
-        let initiator_url = url("http://app.test:8000/page");
-        let original_url = url("http://app.test:8000/redirect");
-        let intermediate_url = url("http://app.test:8001/redirect");
-        let final_url = url("http://app.test:8000/data");
-        let request = Request::new("GET", original_url.as_str(), None, Vec::new())
-            .unwrap()
-            .with_initiator_url(&initiator_url)
-            .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
-        let redirect_chain = vec![
-            redirect(&original_url, &intermediate_url),
-            redirect(&intermediate_url, &final_url),
-        ];
+        for scheme in ["http", "https"] {
+            let config = FetchConfig::default();
+            let initiator_url = url(&format!("{scheme}://app.test:8000/page"));
+            let original_url = url(&format!("{scheme}://app.test:8000/redirect"));
+            let intermediate_url = url(&format!("{scheme}://app.test:8001/redirect"));
+            let final_url = url(&format!("{scheme}://app.test:8000/data"));
+            let request = Request::new("GET", original_url.as_str(), None, Vec::new())
+                .unwrap()
+                .with_initiator_url(&initiator_url)
+                .with_request_origin(moli_url::WebOrigin::from_url(&initiator_url))
+                .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
+            let redirect_chain = vec![
+                redirect(&original_url, &intermediate_url),
+                redirect(&intermediate_url, &final_url),
+            ];
+            let request = request.with_redirect_chain(redirect_chain);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &final_url, &redirect_chain, None);
+            let headers = outgoing_request_headers_for_url(&config, &request, &final_url, None);
 
-        assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
-        assert_eq!(
-            header_value(&headers, "sec-fetch-site"),
-            Some("same-origin".to_owned())
-        );
+            assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
+            assert_eq!(
+                header_value(&headers, "sec-fetch-site"),
+                (scheme == "https").then(|| "same-site".to_owned())
+            );
+            if scheme == "http" {
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(name, _)| { !name.to_ascii_lowercase().starts_with("sec-fetch-") })
+                );
+            }
+        }
     }
 
     #[test]
     fn browser_subresource_origin_serializes_null_after_cross_site_redirect_chain_returns_to_origin()
      {
-        let config = FetchConfig::default();
-        let initiator_url = url("http://app.test/page");
-        let original_url = url("http://app.test/redirect");
-        let cross_site_url = url("http://cross.test/redirect");
-        let final_url = url("http://app.test/data");
-        let request = Request::new("GET", original_url.as_str(), None, Vec::new())
-            .unwrap()
-            .with_initiator_url(&initiator_url)
-            .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
-        let redirect_chain = vec![
-            redirect(&original_url, &cross_site_url),
-            redirect(&cross_site_url, &final_url),
-        ];
+        for scheme in ["http", "https"] {
+            let config = FetchConfig::default();
+            let initiator_url = url(&format!("{scheme}://app.test/page"));
+            let original_url = url(&format!("{scheme}://app.test/redirect"));
+            let cross_site_url = url(&format!("{scheme}://cross.test/redirect"));
+            let final_url = url(&format!("{scheme}://app.test/data"));
+            let request = Request::new("GET", original_url.as_str(), None, Vec::new())
+                .unwrap()
+                .with_initiator_url(&initiator_url)
+                .with_request_origin(moli_url::WebOrigin::from_url(&initiator_url))
+                .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
+            let redirect_chain = vec![
+                redirect(&original_url, &cross_site_url),
+                redirect(&cross_site_url, &final_url),
+            ];
+            let request = request.with_redirect_chain(redirect_chain);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &final_url, &redirect_chain, None);
+            let headers = outgoing_request_headers_for_url(&config, &request, &final_url, None);
 
-        assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
-        assert_eq!(
-            header_value(&headers, "sec-fetch-site"),
-            Some("same-origin".to_owned())
-        );
+            assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
+            assert_eq!(
+                header_value(&headers, "sec-fetch-site"),
+                (scheme == "https").then(|| "cross-site".to_owned())
+            );
+            if scheme == "http" {
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(name, _)| { !name.to_ascii_lowercase().starts_with("sec-fetch-") })
+                );
+            }
+        }
     }
 
     #[test]
     fn browser_subresource_origin_serializes_null_after_cross_site_redirect_chain_stays_cross_site()
     {
+        for scheme in ["http", "https"] {
+            let config = FetchConfig::default();
+            let initiator_url = url(&format!("{scheme}://app.test/page"));
+            let original_url = url(&format!("{scheme}://app.test/redirect"));
+            let cross_site_redirect_url = url(&format!("{scheme}://cross.test/redirect"));
+            let final_url = url(&format!("{scheme}://api.test/data"));
+            let request = Request::new("GET", original_url.as_str(), None, Vec::new())
+                .unwrap()
+                .with_initiator_url(&initiator_url)
+                .with_request_origin(moli_url::WebOrigin::from_url(&initiator_url))
+                .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
+            let redirect_chain = vec![
+                redirect(&original_url, &cross_site_redirect_url),
+                redirect(&cross_site_redirect_url, &final_url),
+            ];
+            let request = request.with_redirect_chain(redirect_chain);
+
+            let headers = outgoing_request_headers_for_url(&config, &request, &final_url, None);
+
+            assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
+            assert_eq!(
+                header_value(&headers, "sec-fetch-site"),
+                (scheme == "https").then(|| "cross-site".to_owned())
+            );
+            if scheme == "http" {
+                assert!(
+                    headers
+                        .iter()
+                        .all(|(name, _)| { !name.to_ascii_lowercase().starts_with("sec-fetch-") })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn origin_header_does_not_require_browser_metadata() {
         let config = FetchConfig::default();
-        let initiator_url = url("http://app.test/page");
-        let original_url = url("http://app.test/redirect");
-        let cross_site_redirect_url = url("http://cross.test/redirect");
-        let final_url = url("http://api.test/data");
-        let request = Request::new("GET", original_url.as_str(), None, Vec::new())
-            .unwrap()
-            .with_initiator_url(&initiator_url)
-            .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
-        let redirect_chain = vec![
-            redirect(&original_url, &cross_site_redirect_url),
-            redirect(&cross_site_redirect_url, &final_url),
-        ];
-
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &final_url, &redirect_chain, None);
-
-        assert_eq!(header_value(&headers, "origin"), Some("null".to_owned()));
-        assert_eq!(
-            header_value(&headers, "sec-fetch-site"),
-            Some("cross-site".to_owned())
-        );
+        let initiator = url("https://app.test/page");
+        for (method, target, mode, expected) in [
+            (
+                "GET",
+                "https://cdn.test/script.js",
+                RequestMode::Cors,
+                Some("https://app.test"),
+            ),
+            (
+                "HEAD",
+                "https://cdn.test/script.js",
+                RequestMode::Cors,
+                Some("https://app.test"),
+            ),
+            ("GET", "https://app.test/script.js", RequestMode::Cors, None),
+            (
+                "GET",
+                "https://cdn.test/script.js",
+                RequestMode::NoCors,
+                None,
+            ),
+            (
+                "POST",
+                "https://app.test/data",
+                RequestMode::NoCors,
+                Some("https://app.test"),
+            ),
+        ] {
+            let request = Request::new(method, target, None, Vec::new())
+                .unwrap()
+                .with_initiator_url(&initiator)
+                .with_request_origin(moli_url::WebOrigin::from_url(&initiator))
+                .with_request_mode(mode);
+            assert_eq!(request.browser_request_metadata(), None);
+            let headers = outgoing_request_headers_for_url(&config, &request, &request.url, None);
+            assert_eq!(
+                header_value(&headers, "origin").as_deref(),
+                expected,
+                "{method} {target} {mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -1594,10 +1590,10 @@ mod tests {
             .unwrap()
             .with_request_mode(RequestMode::NoCors)
             .with_initiator_url(&url("https://app.test/page"))
+            .with_request_origin(moli_url::WebOrigin::from_url(&url("https://app.test/page")))
             .with_browser_request_metadata(BrowserRequestMetadata::Fetch);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
 
         assert_eq!(
             header_value(&headers, "sec-fetch-mode"),
@@ -1612,10 +1608,10 @@ mod tests {
         let request = Request::new("GET", request_url.as_str(), None, Vec::new())
             .unwrap()
             .with_initiator_url(&url("https://page.test/"))
+            .with_request_origin(moli_url::WebOrigin::from_url(&url("https://page.test/")))
             .with_subframe_navigation_cookie_context();
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
 
         assert_eq!(
             header_value(&headers, "sec-fetch-mode").as_deref(),
@@ -1642,7 +1638,7 @@ mod tests {
     fn http_host_resolve_entries_are_normalized_before_curl_configuration() {
         let entries = normalized_http_host_resolve_entries(&[
             " localhost:80: 1.1.1.1 , [2001:db8::1] ".to_owned(),
-            " - localhost:80 ".to_owned(),
+            " [2001:db8::2]:443: 192.0.2.1 ".to_owned(),
         ])
         .unwrap();
 
@@ -1650,9 +1646,40 @@ mod tests {
             entries,
             vec![
                 "localhost:80:1.1.1.1,[2001:db8::1]".to_owned(),
-                "-localhost:80".to_owned()
+                "[2001:db8::2]:443:192.0.2.1".to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn http_host_resolve_rejects_curl_prefix_syntax() {
+        for entry in [
+            "+example.test:443:93.184.216.34",
+            "-example.test:443",
+            "-example.test:443:93.184.216.34",
+        ] {
+            let error = normalized_http_host_resolve_entries(&[entry.to_owned()]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not support `+` or `-` prefixes"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_proxy_bearer_token_is_not_an_origin_header() {
+        let mut config = FetchConfig::default();
+        config.set_proxy_options(
+            Some("http://proxy.test:8080".to_owned()),
+            Some("secret".to_owned()),
+        );
+        let request = Request::get("http://example.test/").unwrap();
+
+        let headers = outgoing_request_headers_for_url(&config, &request, &request.url, None);
+
+        assert!(!header_present(&headers, "proxy-authorization"));
     }
 
     #[test]
@@ -1662,13 +1689,15 @@ mod tests {
         let request = Request::new("POST", request_url.as_str(), None, Vec::new())
             .unwrap()
             .with_initiator_url(&url("https://frame.test/challenge"))
+            .with_request_origin(moli_url::WebOrigin::from_url(&url(
+                "https://frame.test/challenge",
+            )))
             .with_site_for_cookies_url(&url("https://page.test/"))
             .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
             .with_credentials_mode(crate::RequestCredentialsMode::Include)
             .with_request_mode(crate::RequestMode::Cors);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
 
         assert_eq!(
             header_value(&headers, "sec-fetch-site").as_deref(),
@@ -1687,13 +1716,15 @@ mod tests {
         let request = Request::new("POST", request_url.as_str(), None, Vec::new())
             .unwrap()
             .with_initiator_url(&url("https://frame.test/challenge"))
+            .with_request_origin(moli_url::WebOrigin::from_url(&url(
+                "https://frame.test/challenge",
+            )))
             .with_site_for_cookies_url(&url("https://page.test/"))
             .with_browser_request_metadata(BrowserRequestMetadata::Xhr)
             .with_credentials_mode(crate::RequestCredentialsMode::SameOrigin)
             .with_request_mode(crate::RequestMode::Cors);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
 
         assert_eq!(
             header_value(&headers, "sec-fetch-site").as_deref(),
@@ -1709,12 +1740,14 @@ mod tests {
         let request = Request::new("POST", request_url.as_str(), None, Vec::new())
             .unwrap()
             .with_initiator_url(&url("http://frame.test/challenge"))
+            .with_request_origin(moli_url::WebOrigin::from_url(&url(
+                "http://frame.test/challenge",
+            )))
             .with_site_for_cookies_url(&url("http://page.test/"))
             .with_browser_request_metadata(BrowserRequestMetadata::Xhr)
             .with_credentials_mode(crate::RequestCredentialsMode::Include);
 
-        let headers =
-            outgoing_request_headers_for_url(&config, &request, &request_url, &Vec::new(), None);
+        let headers = outgoing_request_headers_for_url(&config, &request, &request_url, None);
 
         assert_eq!(header_value(&headers, "sec-fetch-storage-access"), None);
     }

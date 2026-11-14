@@ -1,6 +1,7 @@
+use anyhow::{Context as _, Result};
+
 use std::{
     collections::{HashMap, hash_map::Entry},
-    fmt,
     num::NonZeroI32,
 };
 
@@ -21,6 +22,7 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RendererCommandDescriptor {
+    abandoned_object_group: Option<String>,
     replacement: CdpRendererCommandReplacement,
     replay: RendererCommandReplay,
     response_delivery: RendererInspectorResponseDelivery,
@@ -35,6 +37,11 @@ pub(crate) enum RendererCommandReplay {
 }
 
 impl RendererCommandDescriptor {
+    pub(crate) fn with_abandoned_object_group_cleanup(mut self, group: Option<String>) -> Self {
+        self.abandoned_object_group = group;
+        self
+    }
+
     /// Builds a replay descriptor from the policy already derived at typed CDP
     /// ingress. Production frontend commands must use this constructor.
     pub(crate) fn from_frontend_policy(
@@ -43,6 +50,7 @@ impl RendererCommandDescriptor {
         response_delivery: RendererInspectorResponseDelivery,
     ) -> Self {
         Self {
+            abandoned_object_group: None,
             replacement: policy.replacement(),
             replay: RendererCommandReplay::Inspector(policy.replay_dispatch()),
             response_delivery,
@@ -56,6 +64,7 @@ impl RendererCommandDescriptor {
         response_delivery: RendererInspectorResponseDelivery,
     ) -> Self {
         Self {
+            abandoned_object_group: None,
             replacement: policy.replacement(),
             replay: RendererCommandReplay::PerformanceGetMetrics,
             response_delivery,
@@ -70,6 +79,7 @@ impl RendererCommandDescriptor {
         response_delivery: RendererInspectorResponseDelivery,
     ) -> Self {
         Self {
+            abandoned_object_group: None,
             replacement: policy.replacement(),
             replay: RendererCommandReplay::SetScriptExecutionDisabled { disabled },
             response_delivery,
@@ -82,16 +92,32 @@ impl RendererCommandDescriptor {
     ///
     /// This is deliberately named as a fallback: a frontend command reaching
     /// this constructor would reintroduce method-policy reconstruction.
-    pub(crate) fn from_synthesized_payload(frontend_payload: String) -> Result<Self, String> {
+    #[cfg(test)]
+    pub(crate) fn from_synthesized_payload(frontend_payload: String) -> Result<Self> {
         let command = ParsedCdpCommand::parse_str(&frontend_payload)
-            .map_err(|error| format!("invalid renderer Inspector command JSON: {error}"))?;
+            .context("invalid renderer Inspector command JSON")?;
         let policy = command.renderer_policy();
         Ok(Self {
+            abandoned_object_group: None,
             replacement: policy.replacement(),
             replay: RendererCommandReplay::Inspector(policy.replay_dispatch()),
             // Internal Classic/BiDi adapters own their reply channel. A
             // method being eligible for frontend session output must never
             // redirect a synthesized adapter command implicitly.
+            response_delivery: RendererInspectorResponseDelivery::AdapterReply,
+            frontend_payload,
+        })
+    }
+
+    /// Internal work tied to an exact Document must not replay an object or
+    /// context operation in a replacement runtime.
+    pub(crate) fn for_document_helper(frontend_payload: String) -> Result<Self> {
+        let command = ParsedCdpCommand::parse_str(&frontend_payload)
+            .context("invalid internal renderer Inspector command")?;
+        Ok(Self {
+            abandoned_object_group: None,
+            replacement: CdpRendererCommandReplacement::Terminate,
+            replay: RendererCommandReplay::Inspector(command.renderer_policy().replay_dispatch()),
             response_delivery: RendererInspectorResponseDelivery::AdapterReply,
             frontend_payload,
         })
@@ -114,7 +140,8 @@ impl RendererCommandDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("Duplicate `id` in protocol request")]
 pub(crate) struct DuplicatePendingRendererCommand {
     frontend_command_id: FrontendCommandId,
 }
@@ -125,14 +152,6 @@ impl DuplicatePendingRendererCommand {
         self.frontend_command_id
     }
 }
-
-impl fmt::Display for DuplicatePendingRendererCommand {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Duplicate `id` in protocol request")
-    }
-}
-
-impl std::error::Error for DuplicatePendingRendererCommand {}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct PendingRendererCommandKey {
@@ -149,33 +168,17 @@ impl PendingRendererCommandKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("renderer Inspector call-id space exhausted")]
 pub(crate) struct RendererCallIdExhausted;
 
-impl fmt::Display for RendererCallIdExhausted {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("renderer Inspector call-id space exhausted")
-    }
-}
-
-impl std::error::Error for RendererCallIdExhausted {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum RegisterRendererCallError {
-    Duplicate(DuplicatePendingRendererCommand),
-    Exhausted(RendererCallIdExhausted),
+    #[error(transparent)]
+    Duplicate(#[from] DuplicatePendingRendererCommand),
+    #[error(transparent)]
+    Exhausted(#[from] RendererCallIdExhausted),
 }
-
-impl fmt::Display for RegisterRendererCallError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Duplicate(error) => error.fmt(formatter),
-            Self::Exhausted(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for RegisterRendererCallError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RendererCommandCorrelation {
@@ -368,8 +371,9 @@ impl<T> PendingRendererCommandRegistry<T> {
         let response_delivery = descriptor.response_delivery();
         let (response_channel, response_receiver) =
             RendererRuntimeInspectorResponseChannel::new_for_delivery(response_delivery);
-        let response_sender =
-            response_channel.activate_sender(renderer_call_id.get(), dispatched_attachment_id);
+        let response_sender = response_channel
+            .activate_sender(renderer_call_id.get(), dispatched_attachment_id)
+            .with_abandoned_object_group_cleanup(descriptor.abandoned_object_group.clone());
         let previous_renderer_call = self.renderer_calls_by_frontend.insert(
             frontend_command_id,
             RegisteredRendererCall {
@@ -619,17 +623,6 @@ impl<T> PendingRendererCommandRegistry<T> {
             renderer_call_id: registered_call.renderer_call_id,
             dispatched_attachment_id: registered_call.dispatched_attachment_id,
         })
-    }
-
-    pub(crate) fn renderer_command_descriptor_for_renderer_if_attachment_matches(
-        &self,
-        renderer_call_id: RendererCallId,
-        dispatched_attachment_id: Option<RendererAgentAttachmentId>,
-    ) -> Option<RendererCommandDescriptor> {
-        let frontend_command_id = self.frontend_commands_by_renderer.get(&renderer_call_id)?;
-        let registered_call = self.renderer_calls_by_frontend.get(frontend_command_id)?;
-        (registered_call.dispatched_attachment_id == dispatched_attachment_id)
-            .then(|| registered_call.descriptor.clone())
     }
 
     #[cfg(test)]

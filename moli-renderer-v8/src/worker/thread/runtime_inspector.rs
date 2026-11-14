@@ -1,6 +1,10 @@
+use crate::runtime::WorkerInspectorError;
+use anyhow::Result;
+use moli_inspector_json::InspectorJson;
+use moli_protocol_cdp_defs::LocalCdpEvent;
 use std::{
-    cell::{Cell, RefCell, UnsafeCell},
-    collections::{HashMap, HashSet, VecDeque},
+    cell::{Cell, OnceCell, RefCell, UnsafeCell},
+    collections::{HashMap, VecDeque},
     rc::{Rc, Weak},
 };
 
@@ -12,7 +16,7 @@ use crate::runtime::{RendererRuntimeInspectorMessage, RendererRuntimeInspectorRe
 use crate::worker::{
     handle::{WorkerRuntimeInspectorMessageBatch, WorkerToParentMessage},
     inspector_task_runner::{
-        WorkerInspectorInterruptExecutor, WorkerInspectorTask, WorkerInspectorTaskMode,
+        WorkerInspectorInterruptExecutor, WorkerInspectorSessionLifetime, WorkerInspectorTask,
         WorkerInspectorTaskRunner, register_worker_inspector_executor,
         unregister_worker_inspector_executor,
     },
@@ -24,6 +28,9 @@ use super::dispatch::perform_worker_microtask_checkpoint_and_report_pending_prom
 
 const WORKER_INSPECTOR_CONTEXT_GROUP_ID: i32 = 1;
 const DEFAULT_WORKER_INSPECTOR_SESSION_KEY: &str = "";
+
+#[cfg(test)]
+mod pause_detach_tests;
 
 #[derive(Default)]
 struct WorkerInspectorOutboundState {
@@ -120,7 +127,7 @@ impl WorkerInspectorOutbound {
         let view = message.string();
         let message_units = view.len();
         let message_width = if view.is_8bit() { 8 } else { 16 };
-        match moli_v8_util::decode_inspector_protocol_message(view) {
+        match moli_v8_util::inspector_protocol_json(view) {
             Ok(value) => self.push_value(session_key, value),
             Err(error) => {
                 let raw = moli_v8_util::inspector_protocol_message_text(view);
@@ -136,7 +143,7 @@ impl WorkerInspectorOutbound {
         }
     }
 
-    fn push_value(&self, session_key: &str, value: Value) {
+    fn push_value(&self, session_key: &str, value: impl Into<InspectorJson>) {
         let message = RendererRuntimeInspectorMessage::from_v8_inspector_message(value);
         let mut guard = self.0.borrow_mut();
         if let Some(scope) = guard
@@ -167,23 +174,38 @@ impl WorkerInspectorOutbound {
         let view = message.string();
         let message_units = view.len();
         let message_width = if view.is_8bit() { 8 } else { 16 };
-        match moli_v8_util::decode_inspector_protocol_message(view) {
-            Ok(value) => self.push_response_value(session_key, call_id, value),
+        match moli_v8_util::inspector_protocol_json(view) {
+            Ok(value) if value.id_i64() == Some(i64::from(call_id)) => self.push_response_value(session_key, call_id, value),
+            Ok(_) => self.push_response_value(session_key, call_id, json!({"id":call_id,"error":{"code":-32603,"message":"Worker Inspector response ID mismatch"}})),
             Err(error) => {
                 let raw = moli_v8_util::inspector_protocol_message_text(view);
                 tracing::warn!(
                     target: "moli::cdp::worker_inspector",
                     %error,
                     %raw,
+                    call_id,
                     message_units,
                     message_width,
-                    "failed to decode worker inspector protocol response; dropping"
+                    "failed to decode worker inspector protocol response; returning protocol error"
                 );
+                self.push_response_value(session_key, call_id, json!({
+                    "id": call_id,
+                    "error": {
+                        "code": -32603,
+                        "message": format!("Failed to decode Worker Inspector response: {error}"),
+                    },
+                }));
             }
         }
     }
 
-    fn push_response_value(&self, session_key: &str, call_id: i32, value: Value) {
+    fn push_response_value(
+        &self,
+        session_key: &str,
+        call_id: i32,
+        value: impl Into<InspectorJson>,
+    ) {
+        let value = value.into();
         let mut guard = self.0.borrow_mut();
         if let Some(scope) = guard.active_dispatch_scopes.last_mut().filter(|scope| {
             scope.session_key == session_key && scope.internal_call_id == Some(call_id)
@@ -300,17 +322,24 @@ impl WorkerInspectorOutbound {
 }
 
 struct WorkerInspectorChannel {
+    lifetime: WorkerInspectorSessionLifetime,
     outbound: WorkerInspectorOutbound,
     session_key: String,
 }
 
 impl v8::inspector::ChannelImpl for WorkerInspectorChannel {
     fn send_response(&self, call_id: i32, message: v8::UniquePtr<v8::inspector::StringBuffer>) {
+        if !self.lifetime.is_active() {
+            return;
+        }
         self.outbound
             .push_response_message(&self.session_key, call_id, message);
     }
 
     fn send_notification(&self, message: v8::UniquePtr<v8::inspector::StringBuffer>) {
+        if !self.lifetime.is_active() {
+            return;
+        }
         self.outbound.push_message(&self.session_key, message);
     }
 
@@ -362,9 +391,33 @@ impl v8::inspector::V8InspectorClientImpl for WorkerInspectorClient {
     }
 }
 
+struct WorkerInspectorSession {
+    // Field order is deliberate: complete native retirement (separate from
+    // frontend stop acknowledgement) after releasing all Inspector roots.
+    native: v8::inspector::V8InspectorSession,
+    retirement: WorkerInspectorSessionRetirement,
+}
+
+struct WorkerInspectorSessionRetirement(WorkerInspectorSessionLifetime);
+
+impl Drop for WorkerInspectorSessionRetirement {
+    fn drop(&mut self) {
+        self.0.complete_retirement(Ok(()));
+    }
+}
+
+impl std::ops::Deref for WorkerInspectorSession {
+    type Target = v8::inspector::V8InspectorSession;
+    fn deref(&self) -> &Self::Target {
+        &self.native
+    }
+}
+
 pub(super) struct WorkerRuntimeInspector {
-    sessions: RefCell<HashMap<String, Rc<v8::inspector::V8InspectorSession>>>,
-    detached_sessions: RefCell<HashSet<String>>,
+    debugger_enabled: bool,
+    sessions: RefCell<HashMap<String, Rc<WorkerInspectorSession>>>,
+    navigator_emulation: Rc<RefCell<moli_page_types::NavigatorEmulationSessions>>,
+    identity: OnceCell<WorkerIdentity>,
     inspector: v8::inspector::V8Inspector,
     outbound: WorkerInspectorOutbound,
     default_context: Rc<RefCell<Option<v8::Global<v8::Context>>>>,
@@ -372,6 +425,11 @@ pub(super) struct WorkerRuntimeInspector {
     task_runner: WorkerInspectorTaskRunner,
     parent_tx: mpsc::UnboundedSender<WorkerToParentMessage>,
     shared_worker: bool,
+}
+
+struct WorkerIdentity {
+    client: crate::network::ResourceRequestClient,
+    inherited: Option<std::sync::Arc<moli_browser_profile::BrowserIdentityProfile>>,
 }
 
 struct WorkerInspectorExecutor {
@@ -407,10 +465,7 @@ impl WorkerInspectorExecutor {
 impl WorkerInspectorInterruptExecutor for WorkerInspectorExecutor {
     fn dispatch_interrupt(&self, isolate: v8::UnsafeRawIsolatePtr) {
         self.task_runner.interrupt_callback_started();
-        let Some(task) = self
-            .task_runner
-            .claim_task(WorkerInspectorTaskMode::Interrupt)
-        else {
+        let Some(task) = self.task_runner.claim_interrupt_task() else {
             self.task_runner.request_interrupt_if_needed();
             return;
         };
@@ -429,9 +484,14 @@ impl WorkerRuntimeInspector {
         task_runner: WorkerInspectorTaskRunner,
         parent_tx: mpsc::UnboundedSender<WorkerToParentMessage>,
         shared_worker: bool,
+        debugger_enabled: bool,
     ) -> Rc<Self> {
         let isolate_ptr = unsafe { isolate.as_raw_isolate_ptr() };
         let default_context = Rc::new(RefCell::new(None));
+        let navigator_emulation = Rc::new(RefCell::new(
+            moli_page_types::NavigatorEmulationSessions::default(),
+        ));
+        isolate.set_slot(navigator_emulation.clone());
         Rc::new_cyclic(|weak_inspector| {
             let executor = Rc::new(WorkerInspectorExecutor {
                 isolate: UnsafeCell::new(isolate_ptr),
@@ -447,9 +507,11 @@ impl WorkerRuntimeInspector {
                     executor.clone(),
                 )));
             Self {
+                debugger_enabled,
                 inspector: v8::inspector::V8Inspector::create(isolate, inspector_client),
                 sessions: RefCell::new(HashMap::new()),
-                detached_sessions: RefCell::new(HashSet::new()),
+                navigator_emulation,
+                identity: OnceCell::new(),
                 outbound: WorkerInspectorOutbound::default(),
                 default_context,
                 default_execution_context_id: Cell::new(None),
@@ -462,12 +524,17 @@ impl WorkerRuntimeInspector {
 
     #[cfg(test)]
     fn new_for_test(isolate: &mut v8::Isolate) -> Rc<Self> {
+        Self::new_for_test_with_debugger(isolate, false)
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_debugger(isolate: &mut v8::Isolate, debugger_enabled: bool) -> Rc<Self> {
         let (wake_tx, _wake_rx) = mpsc::unbounded_channel();
         let (parent_tx, _parent_rx) = mpsc::unbounded_channel();
         let isolate_handle =
             std::sync::Arc::new(parking_lot::Mutex::new(Some(isolate.thread_safe_handle())));
         let task_runner = WorkerInspectorTaskRunner::new(wake_tx, isolate_handle);
-        Self::new(isolate, task_runner, parent_tx, false)
+        Self::new(isolate, task_runner, parent_tx, false, debugger_enabled)
     }
 
     pub(super) fn attach_context<'s>(
@@ -493,16 +560,95 @@ impl WorkerRuntimeInspector {
         self.inspector.context_destroyed(context);
     }
 
-    pub(super) fn detach_session(&self, inspector_session_id: Option<&str>) {
-        let session_key = worker_inspector_session_key(inspector_session_id);
-        self.sessions.borrow_mut().remove(&session_key);
-        self.detached_sessions.borrow_mut().insert(session_key);
+    pub(super) fn bind_request_client(&self, client: crate::network::ResourceRequestClient) {
+        let inherited = client.page_network_policy().browser_identity_override();
+        assert!(
+            self.identity
+                .set(WorkerIdentity { client, inherited })
+                .is_ok(),
+            "Worker identity must be bound once"
+        );
     }
 
+    fn update_user_agent_override(&self) {
+        let Some(worker) = self.identity.get() else {
+            return;
+        };
+        let client = &worker.client;
+        let base = worker
+            .inherited
+            .as_deref()
+            .unwrap_or_else(|| client.browser_identity());
+        let identity = self
+            .navigator_emulation
+            .borrow()
+            .effective_user_agent_override()
+            .map(|value| {
+                std::sync::Arc::new(
+                    moli_browser_profile::BrowserIdentityProfile::from_devtools_override(
+                        base,
+                        value.user_agent,
+                        value.accept_language,
+                        None,
+                        value.user_agent_metadata,
+                    ),
+                )
+            });
+        client
+            .page_network_policy()
+            .set_browser_identity_override(identity.or_else(|| worker.inherited.clone()));
+    }
+
+    #[cfg(test)]
+    pub(super) fn detach_session(&self, inspector_session_id: Option<&str>) {
+        let lifetime = self.task_runner.retire_lifetime(inspector_session_id);
+        self.detach_session_incarnation(inspector_session_id, &lifetime);
+    }
+
+    fn detach_session_incarnation(
+        &self,
+        id: Option<&str>,
+        lifetime: &WorkerInspectorSessionLifetime,
+    ) {
+        let key = worker_inspector_session_key(id);
+        let mut sessions = self.sessions.borrow_mut();
+        if sessions
+            .get(&key)
+            .is_some_and(|session| session.retirement.0.matches(lifetime))
+        {
+            let session = sessions.remove(&key).expect("matching native session");
+            drop(sessions);
+            // Stop only this session's debugger. V8 exits the pause loop if
+            // no remaining agent accepts it, preserving other frontends'
+            // pause ownership. Never resume/terminate the whole Worker here.
+            session.stop();
+            self.outbound
+                .0
+                .borrow_mut()
+                .pending_response_callbacks
+                .retain(|(session, _), _| session != &key);
+            self.navigator_emulation.borrow_mut().remove(
+                &id.map(|id| moli_page_types::DevToolsSessionKey::Attached(id.to_owned()))
+                    .unwrap_or(moli_page_types::DevToolsSessionKey::Primary),
+            );
+            self.update_user_agent_override();
+            // A suspended synchronous dispatch may still own an Rc until a
+            // peer resumes execution. Its destructor remains responsible for
+            // final Inspector roots; frontend detachment must not wait on it.
+            drop(session);
+        } else if !lifetime.native_was_created() {
+            lifetime.complete_retirement(Ok(()));
+        }
+        lifetime.complete_detachment(Ok(()));
+    }
+
+    #[cfg(test)]
     pub(super) fn attach_session(&self, inspector_session_id: Option<&str>) {
-        let session_key = worker_inspector_session_key(inspector_session_id);
-        self.detached_sessions.borrow_mut().remove(&session_key);
-        let _ = self.ensure_session(&session_key);
+        let lifetime = self.task_runner.attach_lifetime(inspector_session_id);
+        self.ensure_session(
+            &worker_inspector_session_key(inspector_session_id),
+            &lifetime,
+        );
     }
 
     #[cfg(test)]
@@ -511,7 +657,7 @@ impl WorkerRuntimeInspector {
         scope: &mut v8::PinScope<'_, '_>,
         inspector_session_id: Option<&str>,
         raw_json: &str,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         self.dispatch_protocol_message_with_optional_deferred_response(
             scope,
             inspector_session_id,
@@ -527,7 +673,7 @@ impl WorkerRuntimeInspector {
         inspector_session_id: Option<&str>,
         raw_json: &str,
         deferred_response: Option<RendererRuntimeInspectorResponseSender>,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         let messages = with_scoped_inspector_microtasks(scope, || {
             self.dispatch_protocol_message_scoped(inspector_session_id, raw_json, deferred_response)
         })?;
@@ -535,38 +681,133 @@ impl WorkerRuntimeInspector {
         Ok(messages)
     }
 
+    #[cfg(test)]
     fn dispatch_protocol_message_scoped(
         &self,
         inspector_session_id: Option<&str>,
         raw_json: &str,
         deferred_response: Option<RendererRuntimeInspectorResponseSender>,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
+        let lifetime = self.task_runner.session_lifetime(inspector_session_id);
+        self.dispatch_protocol_message_for_incarnation(
+            inspector_session_id,
+            raw_json,
+            deferred_response,
+            &lifetime,
+        )
+    }
+
+    fn dispatch_protocol_message_for_incarnation(
+        &self,
+        inspector_session_id: Option<&str>,
+        raw_json: &str,
+        deferred_response: Option<RendererRuntimeInspectorResponseSender>,
+        lifetime: &WorkerInspectorSessionLifetime,
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         let session_key = worker_inspector_session_key(inspector_session_id);
-        if self.detached_sessions.borrow().contains(&session_key) {
-            return Err("Worker Inspector session has been detached".to_owned());
-        }
+        anyhow::ensure!(lifetime.is_active(), WorkerInspectorError::Detached);
+        let dispatch_scope = self.outbound.push_dispatch_scope(&session_key, None);
+        let session = self.ensure_session(&session_key, lifetime);
         if let Some(callback) = deferred_response {
             self.outbound
                 .register_response_callback(&session_key, callback);
         }
-        let dispatch_scope = self.outbound.push_dispatch_scope(&session_key, None);
-        let session = self.ensure_session(&session_key);
-        dispatch_with_runtime_defaults(
-            &session,
-            raw_json,
-            &WorkerInspectorSessionOutput {
-                outbound: &self.outbound,
-                session_key: &session_key,
-            },
-        )?;
+        if let Some(response) = self.dispatch_emulation(inspector_session_id, raw_json) {
+            if let Some(call_id) = response["id"]
+                .as_i64()
+                .and_then(|id| i32::try_from(id).ok())
+            {
+                self.outbound
+                    .push_response_value(&session_key, call_id, response);
+            }
+        } else {
+            dispatch_with_runtime_defaults(
+                &session,
+                raw_json,
+                &WorkerInspectorSessionOutput {
+                    outbound: &self.outbound,
+                    session_key: &session_key,
+                },
+            )?;
+        }
         let messages = dispatch_scope.finish();
         self.record_execution_context_state(&messages);
         Ok(messages)
     }
 
+    fn dispatch_emulation(&self, session_id: Option<&str>, raw_json: &str) -> Option<Value> {
+        let command: Value = serde_json::from_str(raw_json).ok()?;
+        let key = session_id
+            .map(|id| moli_page_types::DevToolsSessionKey::Attached(id.to_owned()))
+            .unwrap_or(moli_page_types::DevToolsSessionKey::Primary);
+        let invalid =
+            |message| Some(json!({"id":command["id"],"error":{"code":-32602,"message":message}}));
+        match command["method"].as_str()? {
+            "Emulation.setUserAgentOverride" | "Network.setUserAgentOverride" => {
+                let Ok(value) = serde_json::from_value::<moli_browser_profile::UserAgentOverride>(
+                    command["params"].clone(),
+                ) else {
+                    return invalid("InvalidParams");
+                };
+                if let Err(message) = value.validate() {
+                    return invalid(message);
+                }
+                self.navigator_emulation
+                    .borrow_mut()
+                    .set_user_agent_override(&key, value);
+                self.update_user_agent_override();
+            }
+            "Emulation.setHardwareConcurrencyOverride" => {
+                let value = command["params"]["hardwareConcurrency"]
+                    .as_u64()
+                    .filter(|value| *value <= i32::MAX as u64)
+                    .and_then(|value| std::num::NonZeroU32::new(value as u32));
+                let Some(value) = value else {
+                    return invalid("HardwareConcurrency must be a positive int32");
+                };
+                self.navigator_emulation
+                    .borrow_mut()
+                    .session_mut(&key)
+                    .hardware_concurrency = Some(value);
+            }
+            "Emulation.setAutomationOverride" => {
+                let Some(enabled) = command["params"]["enabled"].as_bool() else {
+                    return invalid("InvalidParams");
+                };
+                self.navigator_emulation
+                    .borrow_mut()
+                    .set_automation(&key, enabled);
+            }
+            "Emulation.setDataSaverOverride" => {
+                let value = &command["params"]["dataSaverEnabled"];
+                if !value.is_null() && !value.is_boolean() {
+                    return invalid("InvalidParams");
+                }
+                self.navigator_emulation
+                    .borrow_mut()
+                    .session_mut(&key)
+                    .data_saver = value.as_bool();
+            }
+            _ => return None,
+        }
+        Some(json!({"id":command["id"],"result":{}}))
+    }
+
     pub(super) fn execute_task(&self, isolate: &mut v8::Isolate, task: WorkerInspectorTask) {
+        // Owner messages for the two Inspector modes use separate queues. An
+        // already-published notification must also precede DontInterrupt work
+        // if that wake is selected before the environment fallback message.
+        if !matches!(task, WorkerInspectorTask::EnvironmentInvalidation(_))
+            && let Some(invalidation) = self.task_runner.claim_environment_invalidation()
+        {
+            invalidation.notify_isolate(isolate);
+        }
         match task {
+            WorkerInspectorTask::EnvironmentInvalidation(invalidation) => {
+                invalidation.notify_isolate(isolate)
+            }
             WorkerInspectorTask::DispatchProtocolMessage {
+                lifetime,
                 inspector_session_id,
                 raw_json,
                 deferred_response,
@@ -583,10 +824,11 @@ impl WorkerRuntimeInspector {
                     }
                 });
                 let result = with_scoped_inspector_microtasks(isolate, || {
-                    self.dispatch_protocol_message_scoped(
+                    self.dispatch_protocol_message_for_incarnation(
                         inspector_session_id.as_deref(),
                         &raw_json,
                         deferred_response,
+                        &lifetime,
                     )
                 });
                 if result.is_ok()
@@ -598,10 +840,21 @@ impl WorkerRuntimeInspector {
             }
             WorkerInspectorTask::AttachSession {
                 inspector_session_id,
-            } => self.attach_session(inspector_session_id.as_deref()),
+                lifetime,
+            } => {
+                if lifetime.is_active() {
+                    self.ensure_session(
+                        &worker_inspector_session_key(inspector_session_id.as_deref()),
+                        &lifetime,
+                    );
+                }
+            }
             WorkerInspectorTask::DetachSession {
                 inspector_session_id,
-            } => self.detach_session(inspector_session_id.as_deref()),
+                lifetime,
+            } => {
+                self.detach_session_incarnation(inspector_session_id.as_deref(), &lifetime);
+            }
             WorkerInspectorTask::RunIfWaitingForDebugger => {
                 self.task_runner.request_resume();
             }
@@ -630,7 +883,7 @@ impl WorkerRuntimeInspector {
                 inspector_session_id: worker_inspector_session_id_from_key(session_key),
                 messages: vec![RendererRuntimeInspectorMessage::from_v8_inspector_message(
                     json!({
-                        "method": "Inspector.workerScriptLoaded",
+                        "method": LocalCdpEvent::InspectorWorkerScriptLoaded.method(),
                         "params": {}
                     }),
                 )],
@@ -638,22 +891,44 @@ impl WorkerRuntimeInspector {
             .collect()
     }
 
-    fn ensure_session(&self, session_key: &str) -> Rc<v8::inspector::V8InspectorSession> {
+    fn ensure_session(
+        &self,
+        session_key: &str,
+        lifetime: &WorkerInspectorSessionLifetime,
+    ) -> Rc<WorkerInspectorSession> {
+        let existing = self.sessions.borrow().get(session_key).cloned();
+        if let Some(session) = existing {
+            if session.retirement.0.matches(lifetime) {
+                return session;
+            }
+            // Attach can overtake a queued detach after ingress was revoked.
+            // Stop the old incarnation before installing the new callback or
+            // session; its paused dispatch may still own a native Rc.
+            self.detach_session_incarnation(
+                worker_inspector_session_id_from_key(session_key).as_deref(),
+                &session.retirement.0,
+            );
+        }
+        let session = self.inspector.connect(
+            WORKER_INSPECTOR_CONTEXT_GROUP_ID,
+            v8::inspector::Channel::new(Box::new(WorkerInspectorChannel {
+                outbound: self.outbound.clone(),
+                session_key: session_key.to_owned(),
+                lifetime: lifetime.clone(),
+            })),
+            v8::inspector::StringView::from(&b"{}"[..]),
+            v8::inspector::V8InspectorClientTrustLevel::FullyTrusted,
+        );
+        session.set_skip_all_pauses(!self.debugger_enabled);
+        lifetime.mark_native_created();
+        let session = Rc::new(WorkerInspectorSession {
+            native: session,
+            retirement: WorkerInspectorSessionRetirement(lifetime.clone()),
+        });
         self.sessions
             .borrow_mut()
-            .entry(session_key.to_owned())
-            .or_insert_with(|| {
-                Rc::new(self.inspector.connect(
-                    WORKER_INSPECTOR_CONTEXT_GROUP_ID,
-                    v8::inspector::Channel::new(Box::new(WorkerInspectorChannel {
-                        outbound: self.outbound.clone(),
-                        session_key: session_key.to_owned(),
-                    })),
-                    v8::inspector::StringView::from(&b"{}"[..]),
-                    v8::inspector::V8InspectorClientTrustLevel::FullyTrusted,
-                ))
-            })
-            .clone()
+            .insert(session_key.to_owned(), session.clone());
+        session
     }
 
     fn record_execution_context_state(&self, messages: &[RendererRuntimeInspectorMessage]) {
@@ -768,6 +1043,7 @@ fn worker_runtime_inspector_message_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::inspector_task_runner::WorkerInspectorTaskMode;
     use serde_json::{Value, json};
     use std::pin::pin;
 
@@ -780,7 +1056,7 @@ mod tests {
             .iter()
             .find_map(|message| match message {
                 RendererRuntimeInspectorMessage::Protocol(message)
-                    if message.value().get("id").and_then(Value::as_i64) == Some(call_id) =>
+                    if message.payload().id_i64() == Some(call_id) =>
                 {
                     Some(message.value().clone())
                 }
@@ -799,6 +1075,89 @@ mod tests {
         scope.memory_pressure_notification(v8::MemoryPressureLevel::Critical);
         scope.low_memory_notification();
         rv.set(v8::Boolean::new(scope, inspector_policy_is_scoped).into());
+    }
+
+    #[tokio::test]
+    async fn worker_environment_notifications_precede_inspector_work_without_an_owner_loop_turn() {
+        crate::ensure_v8_for_test();
+        let mut isolate = v8::Isolate::new(Default::default());
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+        let (wake_tx, _wake_rx) = mpsc::unbounded_channel();
+        let (parent_tx, _parent_rx) = mpsc::unbounded_channel();
+        let task_runner = WorkerInspectorTaskRunner::new(
+            wake_tx,
+            std::sync::Arc::new(parking_lot::Mutex::new(Some(isolate.thread_safe_handle()))),
+        );
+        let inspector =
+            WorkerRuntimeInspector::new(&mut isolate, task_runner.clone(), parent_tx, false, false);
+        let registration = moli_v8_platform::V8PlatformIsolateRegistration::register(
+            &mut isolate,
+            moli_v8_platform::V8ForegroundTaskWake::queued(|_| {}),
+            task_runner.environment_notifier(),
+        );
+        {
+            let scope = pin!(v8::HandleScope::new(&mut isolate));
+            let scope = &mut scope.init();
+            let context = v8::Context::new(scope, Default::default());
+            inspector.attach_context(
+                context,
+                v8::Global::new(scope, context),
+                "https://worker-environment.test/worker.js",
+            );
+        }
+        let read_defaults = |isolate: &mut v8::Isolate, pump_interrupts: bool| {
+            let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+            assert!(task_runner.append_protocol_message(
+                None,
+                json!({
+                        "id": 1,
+                        "method": "Runtime.callFunctionOn",
+                        "params": {
+                            "functionDeclaration": "function() { return [new Intl.NumberFormat().resolvedOptions().locale, new Intl.DateTimeFormat().resolvedOptions().timeZone, new Date('2024-01-01T00:00:00Z').getTimezoneOffset()]; }",
+                            "executionContextId": inspector.default_execution_context_id.get().unwrap(),
+                            "returnByValue": true,
+                        },
+                }).to_string(),
+                None,
+                response_tx,
+            ));
+            // Pump explicit owner notifications before the non-interrupting
+            // evaluation. No global-version check or normal Worker entry is
+            // involved, and a nested pause can consume these same notifications.
+            if pump_interrupts {
+                while let Some(task) = task_runner.claim_interrupt_task() {
+                    inspector.execute_task(isolate, task);
+                }
+            }
+            let task = task_runner
+                .claim_task(WorkerInspectorTaskMode::DontInterrupt)
+                .unwrap();
+            inspector.execute_task(isolate, task);
+            let messages = response_rx.try_recv().unwrap().unwrap();
+            let response = protocol_response(&messages, 1);
+            assert!(response.get("error").is_none(), "{response:#?}");
+            response["result"]["result"]["value"].clone()
+        };
+        let baseline = read_defaults(&mut isolate, true);
+        let owner = moli_v8_platform::ProcessEnvironmentOwner::default();
+        owner.set_locale(Some("fr_FR")).unwrap();
+        owner.set_timezone(Some("Europe/Paris")).unwrap();
+        assert_eq!(
+            read_defaults(&mut isolate, true),
+            json!(["fr-FR", "Europe/Paris", -60])
+        );
+        owner.set_locale(Some("de_DE")).unwrap();
+        owner.set_timezone(Some("Asia/Shanghai")).unwrap();
+        // Deliberately choose the non-interrupting command ahead of the
+        // mailbox's fallback wake. It still observes both committed changes.
+        assert_eq!(
+            read_defaults(&mut isolate, false),
+            json!(["de-DE", "Asia/Shanghai", -480])
+        );
+        owner.release();
+        assert_eq!(read_defaults(&mut isolate, false), baseline);
+        registration.unregister();
+        task_runner.dispose(WorkerInspectorError::Closed);
     }
 
     #[test]
@@ -928,6 +1287,64 @@ mod tests {
             outbound.take_all().is_empty(),
             "stale worker late response must not contaminate pending notifications"
         );
+    }
+
+    #[test]
+    fn worker_debugger_initializes_each_session_with_startup_setting() {
+        crate::ensure_v8_for_test();
+        for debugger_enabled in [false, true] {
+            let mut isolate = v8::Isolate::new(Default::default());
+            let inspector =
+                WorkerRuntimeInspector::new_for_test_with_debugger(&mut isolate, debugger_enabled);
+            let scope = pin!(v8::HandleScope::new(&mut isolate));
+            let scope = &mut scope.init();
+            let context = v8::Context::new(scope, Default::default());
+            inspector.attach_context(
+                context,
+                v8::Global::new(scope, context),
+                "https://worker-debugger.test/worker.js",
+            );
+            for key in ["", "peer"] {
+                let state = v8::crdtp::cbor_to_json(
+                    &inspector
+                        .ensure_session(key, &inspector.task_runner.session_lifetime(Some(key)))
+                        .state(),
+                )
+                .expect("worker session state");
+                let state: Value = serde_json::from_slice(&state).expect("worker session JSON");
+                assert_eq!(state["Debugger"]["skipAllPauses"], !debugger_enabled);
+            }
+            assert!(inspector.take_pending_messages().is_empty());
+            let scope = &mut v8::ContextScope::new(scope, context);
+            if !debugger_enabled {
+                crate::inspector_session::tests::assert_debugger_defaults(|request| {
+                    inspector
+                        .dispatch_protocol_message(scope, None, request)
+                        .expect("worker Inspector dispatch")
+                        .into_iter()
+                        .map(RendererRuntimeInspectorMessage::into_v8_inspector_message)
+                        .collect()
+                });
+            }
+            inspector
+                .dispatch_protocol_message(
+                    scope,
+                    None,
+                    r#"{"id":10,"method":"Debugger.setSkipAllPauses","params":{"skip":false}}"#,
+                )
+                .expect("explicit worker pause override");
+            inspector
+                .dispatch_protocol_message(scope, None, r#"{"id":11,"method":"Debugger.enable"}"#)
+                .expect("worker Debugger.enable");
+            let state = v8::crdtp::cbor_to_json(
+                &inspector
+                    .ensure_session("", &inspector.task_runner.session_lifetime(None))
+                    .state(),
+            )
+            .expect("worker state");
+            let state: Value = serde_json::from_slice(&state).expect("worker state JSON");
+            assert_eq!(state["Debugger"]["skipAllPauses"], false);
+        }
     }
 
     #[test]
@@ -1181,6 +1598,93 @@ mod tests {
     }
 
     #[test]
+    fn worker_inspector_outbound_raw_utf16_and_id_validation_preserve_session_authority() {
+        let outbound = WorkerInspectorOutbound::default();
+        let (peer_tx, mut peer_rx) = tokio::sync::oneshot::channel();
+        outbound.register_response_callback(
+            "peer",
+            RendererRuntimeInspectorResponseSender::new(7, peer_tx),
+        );
+        for (call_id, raw) in [
+            (7, r#"{"id":7,"result":{"value":"\ud800"}}"#),
+            (8, r#"{"id":9,"result":{"value":"\udfff"}}"#),
+        ] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            outbound.register_response_callback(
+                "owner",
+                RendererRuntimeInspectorResponseSender::new(call_id, tx),
+            );
+            outbound.push_response_message(
+                "owner",
+                call_id,
+                v8::inspector::StringBuffer::create(v8::inspector::StringView::from(
+                    raw.as_bytes(),
+                )),
+            );
+            let completion = rx.try_recv().expect("the owning call completes");
+            let response = completion
+                .output
+                .protocol_response_payload(call_id)
+                .unwrap();
+            if call_id == 7 {
+                assert!(!response.is_materialized());
+                assert!(response.to_string().contains(r"\ud800"));
+            } else {
+                assert_eq!(response.value()["error"]["code"], -32603);
+                assert_eq!(response.id_i64(), Some(8));
+            }
+            assert!(matches!(
+                peer_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn worker_inspector_outbound_decode_error_settles_only_the_matching_session() {
+        let outbound = WorkerInspectorOutbound::default();
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        outbound.register_response_callback(
+            "SID-1",
+            RendererRuntimeInspectorResponseSender::new(7, first_tx),
+        );
+        outbound.register_response_callback(
+            "SID-2",
+            RendererRuntimeInspectorResponseSender::new(7, second_tx),
+        );
+
+        let raw = br#"{"id":7,"result":]}"#;
+        let message =
+            v8::inspector::StringBuffer::create(v8::inspector::StringView::from(&raw[..]));
+        outbound.push_response_message("SID-1", 7, message);
+        let completion = first_rx
+            .try_recv()
+            .expect("a malformed response must settle its callback");
+        assert_eq!(
+            completion.output.protocol_response(7).unwrap()["error"]["code"],
+            -32603
+        );
+        assert!(matches!(
+            second_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        let raw = br#"{"id":7,"result":{"value":42}}"#;
+        let message =
+            v8::inspector::StringBuffer::create(v8::inspector::StringView::from(&raw[..]));
+        outbound.push_response_message("SID-2", 7, message);
+        let completion = second_rx
+            .try_recv()
+            .expect("the peer session must remain usable");
+        assert_eq!(
+            completion.output.protocol_response(7).unwrap()["result"]["value"],
+            42
+        );
+        assert!(outbound.take_all().is_empty());
+    }
+
+    #[test]
     fn worker_inspector_outbound_tags_peer_session_pending_messages() {
         let outbound = WorkerInspectorOutbound::default();
 
@@ -1230,6 +1734,32 @@ mod tests {
     }
 
     #[test]
+    fn worker_native_inspector_owns_object_namespaces_and_groups() {
+        crate::ensure_v8_for_test();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let inspector = WorkerRuntimeInspector::new_for_test(&mut isolate);
+        let scope = pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        inspector.attach_context(
+            context,
+            v8::Global::new(scope, context),
+            "https://worker-native-objects.test/worker.js",
+        );
+        let scope = &mut v8::ContextScope::new(scope, context);
+        crate::inspector_session::tests::object_lifecycle::assert_object_namespaces_and_groups(
+            |session, request| {
+                inspector
+                    .dispatch_protocol_message(scope, Some(session), request)
+                    .expect("Worker native Inspector dispatch")
+                    .into_iter()
+                    .map(RendererRuntimeInspectorMessage::into_v8_inspector_message)
+                    .collect()
+            },
+        );
+    }
+
+    #[test]
     fn detached_worker_inspector_session_is_not_lazily_recreated() {
         crate::ensure_v8_for_test();
         let mut isolate = v8::Isolate::new(Default::default());
@@ -1244,8 +1774,101 @@ mod tests {
                     &json!({"id": 1, "method": "Runtime.enable"}).to_string(),
                     None,
                 )
-                .expect_err("detached session must reject a queued late command"),
-            "Worker Inspector session has been detached"
+                .expect_err("detached session must reject a queued late command")
+                .downcast::<crate::runtime::WorkerInspectorError>()
+                .unwrap(),
+            crate::runtime::WorkerInspectorError::Detached
         );
+    }
+    #[test]
+    fn worker_native_retirement_receipt_follows_last_owner_and_frees_inspector_roots() {
+        crate::ensure_v8_for_test();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let inspector = WorkerRuntimeInspector::new_for_test(&mut isolate);
+        let (id, weak) = {
+            let scope = pin!(v8::HandleScope::new(&mut isolate));
+            let scope = &mut scope.init();
+            let context = v8::Context::new(scope, Default::default());
+            inspector.attach_context(
+                context,
+                v8::Global::new(scope, context),
+                "https://worker-roots.test/worker.js",
+            );
+            let scope = &mut v8::ContextScope::new(scope, context);
+            let response = inspector.dispatch_protocol_message(scope, Some("A"), r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"({tag:'only-inspector'})","objectGroup":"same"}}"#).unwrap();
+            let id = protocol_response(&response, 1)["result"]["result"]["objectId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let session = inspector.sessions.borrow()["A"].clone();
+            let (value, _, _) = session
+                .unwrap_object(scope, v8::inspector::StringView::from(id.as_bytes()))
+                .unwrap();
+            (
+                id,
+                v8::Weak::new(scope, value.try_cast::<v8::Object>().unwrap()),
+            )
+        };
+        let held = inspector.sessions.borrow()["A"].clone();
+        let lifetime = inspector.task_runner.retire_lifetime(Some("A"));
+        let mut receipt = lifetime.retirement();
+        inspector.detach_session_incarnation(Some("A"), &lifetime);
+        isolate.clear_kept_objects();
+        isolate.low_memory_notification();
+        assert!(!weak.is_empty());
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        drop(held);
+        receipt
+            .try_recv()
+            .expect("the native destructor settles the receipt")
+            .unwrap();
+        isolate.clear_kept_objects();
+        isolate.low_memory_notification();
+        assert!(weak.is_empty(), "the native session released {id}");
+    }
+
+    #[test]
+    fn retired_worker_channel_cannot_settle_a_reused_wire_call_id() {
+        crate::ensure_v8_for_test();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let inspector = WorkerRuntimeInspector::new_for_test(&mut isolate);
+        let scope = pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        inspector.attach_context(
+            context,
+            v8::Global::new(scope, context),
+            "https://worker-channel.test/worker.js",
+        );
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let (tx, mut old_reply) = tokio::sync::oneshot::channel();
+        inspector.dispatch_protocol_message_with_optional_deferred_response(scope, Some("A"), r#"{"id":99,"method":"Runtime.evaluate","params":{"expression":"new Promise(resolve => globalThis.resolveOld = resolve)","awaitPromise":true}}"#, Some(RendererRuntimeInspectorResponseSender::new(99, tx))).unwrap();
+        let old_session = inspector.sessions.borrow()["A"].clone();
+        inspector.detach_session(Some("A"));
+        assert!(matches!(
+            old_reply.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        inspector.attach_session(Some("A"));
+        let (tx, mut new_reply) = tokio::sync::oneshot::channel();
+        inspector.dispatch_protocol_message_with_optional_deferred_response(scope, Some("A"), r#"{"id":99,"method":"Runtime.evaluate","params":{"expression":"new Promise(resolve => globalThis.resolveNew = resolve)","awaitPromise":true,"returnByValue":true}}"#, Some(RendererRuntimeInspectorResponseSender::new(99, tx))).unwrap();
+        inspector.dispatch_protocol_message(scope, Some("B"), r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"resolveOld('old')"}}"#).unwrap();
+        assert!(
+            matches!(
+                new_reply.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "a retired channel must not claim the successor's response slot"
+        );
+        inspector.dispatch_protocol_message(scope, Some("B"), r#"{"id":2,"method":"Runtime.evaluate","params":{"expression":"resolveNew('new')"}}"#).unwrap();
+        let completion = new_reply.try_recv().unwrap();
+        assert_eq!(
+            completion.output.protocol_response(99).unwrap()["result"]["result"]["value"],
+            "new"
+        );
+        drop(old_session);
     }
 }

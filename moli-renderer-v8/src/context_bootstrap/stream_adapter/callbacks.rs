@@ -10,16 +10,11 @@
 //! these types. They remain ordinary V8 functions in the existing controller
 //! state and are selected by `invoke_stored_stream_algorithm`.
 
-use moli_webidl_callback::invoke_webidl_callback_function;
-
 use super::{call_function_result, *};
 use crate::{
-    util::context_host_ptr_from_global_bridge,
     v8_traced_webidl_callback::V8TracedWebIdlCallbackFunction,
     webidl,
-    window_webidl_callback::{
-        PreparedWindowWebIdlCallbackFunctionOutcome, V8TracedWindowWebIdlCallbackFunction,
-    },
+    webidl_callback_execution::{PreparedWebIdlCallbackExecution, WebIdlCallbackExecutionOutcome},
 };
 
 #[derive(Clone, Copy, webidl::WebIdlEnum)]
@@ -89,7 +84,7 @@ struct TransformerMembers<'s> {
 /// `highWaterMark` before `size`.
 #[derive(Default, webidl::WebIdlDictionary)]
 #[webidl(prefix = "QueuingStrategy")]
-struct QueuingStrategyMembers {
+pub(in crate::context_bootstrap) struct QueuingStrategyMembers {
     #[webidl(name = "highWaterMark", converter = "unrestricted_double")]
     high_water_mark: Option<f64>,
     #[webidl(converter = "callback_function")]
@@ -125,16 +120,6 @@ pub(in crate::context_bootstrap) struct StreamQueuingStrategy {
     pub(in crate::context_bootstrap) high_water_mark: f64,
     pub(in crate::context_bootstrap) high_water_mark_provided: bool,
     pub(in crate::context_bootstrap) size: Option<webidl::WebIdlCallbackFunction>,
-}
-
-impl StreamQueuingStrategy {
-    pub(in crate::context_bootstrap) const fn without_size(high_water_mark: f64) -> Self {
-        Self {
-            high_water_mark,
-            high_water_mark_provided: true,
-            size: None,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -238,35 +223,27 @@ pub(in crate::context_bootstrap) fn parse_transform_stream_transformer_object<'s
     })
 }
 
-pub(in crate::context_bootstrap) fn parse_stream_strategy_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-    prefix: &'static str,
-    default_high_water_mark: f64,
-) -> Result<StreamQueuingStrategy, webidl::WebIdlError> {
-    let context = webidl::Context::argument(prefix, (index + 1) as usize);
-    let Some(object) = webidl::dictionary_arg(args, index, context)? else {
-        return Ok(StreamQueuingStrategy {
-            high_water_mark: default_high_water_mark,
-            high_water_mark_provided: false,
-            size: None,
-        });
-    };
-    let members = webidl::parse_dictionary_object::<QueuingStrategyMembers>(scope, object)?;
-    let high_water_mark = members.high_water_mark.unwrap_or(default_high_water_mark);
-    if moli_streams::numeric::validate_high_water_mark(high_water_mark).is_err() {
-        crate::util::throw_range_error(
-            scope,
-            "A queuing strategy's highWaterMark must be a nonnegative, non-NaN number",
-        );
-        return Err(webidl::WebIdlError::pending_exception(context));
+impl QueuingStrategyMembers {
+    pub(in crate::context_bootstrap) fn resolve(
+        self,
+        scope: &mut v8::PinScope<'_, '_>,
+        context: webidl::Context,
+        default_high_water_mark: f64,
+    ) -> Result<StreamQueuingStrategy, webidl::WebIdlError> {
+        let high_water_mark = self.high_water_mark.unwrap_or(default_high_water_mark);
+        if moli_streams::numeric::validate_high_water_mark(high_water_mark).is_err() {
+            crate::util::throw_range_error(
+                scope,
+                "A queuing strategy's highWaterMark must be a nonnegative, non-NaN number",
+            );
+            return Err(webidl::WebIdlError::pending_exception(context));
+        }
+        Ok(StreamQueuingStrategy {
+            high_water_mark,
+            high_water_mark_provided: self.high_water_mark.is_some(),
+            size: self.size,
+        })
     }
-    Ok(StreamQueuingStrategy {
-        high_water_mark,
-        high_water_mark_provided: members.high_water_mark.is_some(),
-        size: members.size,
-    })
 }
 
 /// Invokes one page-supplied callback through Web IDL while leaving exception,
@@ -292,24 +269,17 @@ fn invoke_stream_webidl_callback_with<'s, R>(
         &[v8::Local<'s, v8::Value>],
     ) -> Result<R, v8::Local<'s, v8::Value>>,
 ) -> Result<R, v8::Local<'s, v8::Value>> {
-    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
-        let host = unsafe { &*host_ptr };
-        let callback =
-            V8TracedWindowWebIdlCallbackFunction::from_object(callback.object).prepare(scope, host);
-        return match callback.invoke(scope, host, receiver, arguments, invoke_function) {
-            PreparedWindowWebIdlCallbackFunctionOutcome::Returned(result) => Ok(result),
-            PreparedWindowWebIdlCallbackFunctionOutcome::Failed(error) => Err(error),
-            PreparedWindowWebIdlCallbackFunctionOutcome::Retired => {
-                Err(stream_callback_no_longer_runnable(scope))
-            }
-        };
-    }
-
-    if crate::worker::get_worker_state(scope).is_none() {
+    let Some(callback) = PreparedWebIdlCallbackExecution::from_traced(scope, callback.object)
+    else {
         return Err(stream_callback_no_longer_runnable(scope));
+    };
+    match callback.invoke_with(scope, receiver, arguments, invoke_function) {
+        WebIdlCallbackExecutionOutcome::Returned(result) => Ok(result),
+        WebIdlCallbackExecutionOutcome::Failed(error) => Err(error),
+        WebIdlCallbackExecutionOutcome::Unavailable => {
+            Err(stream_callback_no_longer_runnable(scope))
+        }
     }
-    let callback = V8TracedWebIdlCallbackFunction::from_object(callback.object).prepare(scope);
-    invoke_webidl_callback_function(scope, &callback, receiver, arguments, invoke_function)
 }
 
 /// Dispatches either a page-supplied typed callback carrier or a
@@ -376,9 +346,9 @@ pub(in crate::context_bootstrap) fn invoke_stored_stream_promise_algorithm<'s>(
                     return Err(error);
                 }
             };
-            if let Ok(promise) = v8::Local::<v8::Promise>::try_from(result) {
-                return Ok(Some(promise.into()));
-            }
+            // Web IDL Promise<T> conversion creates a new capability even
+            // when the callback returned a Promise. Resolving it observes
+            // thenables and preserves the adoption boundary in this Realm.
             let Some(resolver) = v8::PromiseResolver::new(scope) else {
                 return Err(v8::undefined(scope).into());
             };

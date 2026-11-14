@@ -1,9 +1,10 @@
 use crate::document_runtime::DomHandle;
 use crate::native_bridge::collections;
 use crate::util::v8str;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
-use super::super::super::super::JsContextHost;
+use super::super::super::super::PageScriptHost;
 use super::super::super::define_collection_value_property;
 use super::callbacks::{
     document_all_call_callback, document_all_item_callback, document_all_named_collection_getter,
@@ -12,14 +13,14 @@ use super::callbacks::{
 use super::items::{document_all_items_array, document_all_named_lookup};
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct DocumentAllCollectionDataDeclaration<'scope> {
     items: v8::Local<'scope, v8::Array>,
     named: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "HTMLAllCollection")]
+#[webapi(interface = web_api_interfaces::HTMLAllCollection)]
 struct DocumentAllCollectionSurfaceDeclaration<'scope> {
     /// Declaration-only input shared by `item` and `namedItem`.
     ///
@@ -44,7 +45,7 @@ struct DocumentAllCollectionSurfaceDeclaration<'scope> {
 
 pub(super) fn build_document_all_collection<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document_handle: DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let items = document_all_items_array(scope, runtime_ptr, document_handle)?;
@@ -52,18 +53,18 @@ pub(super) fn build_document_all_collection<'s>(
     let data = DocumentAllCollectionDataDeclaration::new(items, named)
         .bind(scope)
         .ok()?;
-    let global = scope.get_current_context().global(scope);
-    let html_all_ctor = global.get(scope, v8str(scope, "HTMLAllCollection").into())?;
-    let html_all_ctor = v8::Local::<v8::Function>::try_from(html_all_ctor).ok()?;
-    let prototype = html_all_ctor.get(scope, v8str(scope, "prototype").into())?;
-    let prototype = v8::Local::<v8::Object>::try_from(prototype).ok()?;
+    let prototype =
+        crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "HTMLAllCollection")
+            .ok()?;
 
     let object_template = v8::ObjectTemplate::new(scope);
     object_template.mark_as_undetectable();
     object_template
         .set_call_as_function_handler_with_data(document_all_call_callback, Some(data.into()));
     let collection = object_template.new_instance(scope)?;
-    let _ = collection.set_prototype(scope, prototype.into());
+    collection
+        .set_prototype(scope, prototype.into())?
+        .then_some(())?;
     let _ = data.set(scope, v8str(scope, "self").into(), collection.into());
 
     for index in 0..items.length() {
@@ -99,13 +100,15 @@ pub(super) fn build_document_all_collection<'s>(
             continue;
         }
         if collections::is_document_all_named_collection_value(scope, value) {
-            let _ = collection.set_native_data_property_with_configuration(
-                scope,
-                key_name,
-                v8::NativeDataPropertyConfiguration::new(document_all_named_collection_getter)
-                    .data(value)
-                    .property_attribute(v8::PropertyAttribute::DONT_ENUM),
-            );
+            collection
+                .set_native_data_property_with_configuration(
+                    scope,
+                    key_name,
+                    v8::NativeDataPropertyConfiguration::new(document_all_named_collection_getter)
+                        .data(value)
+                        .property_attribute(v8::PropertyAttribute::DONT_ENUM),
+                )?
+                .then_some(())?;
             continue;
         }
         define_collection_value_property(

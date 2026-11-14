@@ -1,5 +1,5 @@
 use super::core::{
-    node_can_contain_children, node_move_before_shadow_including_contains, node_type_is_insertable,
+    node_can_contain_children, node_is_host_including_inclusive_ancestor, node_type_is_insertable,
     pre_insert_validation_handles,
 };
 use super::fragment::{
@@ -123,7 +123,7 @@ pub(in crate::native_bridge) fn node_prepend_callback<'s>(
 
 fn parent_node_insertion_handles(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document_handle: Option<DomHandle>,
     args: &v8::FunctionCallbackArguments<'_>,
 ) -> Option<Vec<DomHandle>> {
@@ -138,7 +138,7 @@ fn parent_node_insertion_handles(
 
 fn validate_parent_node_insertion(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     parent: DomHandle,
     reference_child: Option<DomHandle>,
     inserted: &[DomHandle],
@@ -148,7 +148,7 @@ fn validate_parent_node_insertion(
         return false;
     }
     for child in inserted {
-        if node_move_before_shadow_including_contains(runtime, *child, parent) {
+        if node_is_host_including_inclusive_ancestor(runtime, *child, parent) {
             throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
             return false;
         }
@@ -272,7 +272,7 @@ pub(in crate::native_bridge) fn node_replace_children_callback<'s>(
 
 fn validate_parent_node_replace_children(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     parent: DomHandle,
     inserted: &[DomHandle],
 ) -> bool {
@@ -281,7 +281,7 @@ fn validate_parent_node_replace_children(
         return false;
     }
     for child in inserted {
-        if node_move_before_shadow_including_contains(runtime, *child, parent) {
+        if node_is_host_including_inclusive_ancestor(runtime, *child, parent) {
             throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
             return false;
         }

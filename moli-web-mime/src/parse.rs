@@ -1,7 +1,5 @@
-use moli_content_type::parse_mime_type;
-
 pub use moli_content_type::{
-    mime_charset, mime_essence, mime_parameter, normalize_web_api_mime_type,
+    mime_charset, mime_essence, mime_parameter, normalize_web_api_mime_type, parse_mime_type,
 };
 
 pub fn parse_mime(input: &str) -> Option<mime::Mime> {
@@ -9,8 +7,8 @@ pub fn parse_mime(input: &str) -> Option<mime::Mime> {
 }
 
 pub fn request_header_content_type_essence(input: &str) -> Option<String> {
-    if input.contains(',') {
-        return None;
-    }
+    // Fetch parses one MIME type here, rather than extracting a type from a
+    // comma-separated response header. Commas invalidate the type/subtype,
+    // but are allowed in parameters.
     mime_essence(input)
 }

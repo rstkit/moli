@@ -1,49 +1,62 @@
-//! Protocol-neutral DevTools owner and dispatch layer for Moli.
+//! Protocol-neutral automation owner and dispatch layer for Moli.
 //!
 //! This crate is being split away from the Chrome DevTools Protocol wire shape.
 //! It still contains transitional CDP-named owner types, but protocol-specific
 //! parsing and Chrome protocol metadata belong in
 //! `moli-protocol-cdp`.
 
+pub mod automation;
 mod cdp_projection;
 pub mod conn;
-pub mod devtools_runtime;
 pub mod domains;
+
+pub mod frame_index;
 #[cfg(feature = "test-support")]
 pub mod test_support;
+
+pub use domains::command_output::client_window_info_json;
+
+pub use domains::storage::cdp_cookie_same_site_wire_name;
+
 #[cfg(test)]
 pub mod testing;
 pub mod version;
 
-pub use devtools_runtime::*;
+pub use automation::*;
 
 pub use conn::{
-    BackgroundCommandResponsePayload, BackgroundProtocolEvent, CdpCommandTaskStep, CdpConnection,
-    CdpInitialStoragePartition, CdpRendererCommandAccess, CdpRendererCommandReplacement,
-    CdpRendererCommandReplayDispatch, CdpRendererOwnerTurnOutcome, CdpSchedulerEvent,
-    CdpTargetHostLifecycleDelta, CdpTargetHostLifecycleObserver, CdpTurnOutcome,
+    AutomationCommandDispatchOutcome, BackgroundCommandResponsePayload, BackgroundProtocolEvent,
+    CdpCommandTaskStep, CdpConnection, CdpInitialStoragePartition, CdpRendererCommandAccess,
+    CdpRendererCommandReplacement, CdpRendererCommandReplayDispatch, CdpRendererOwnerTurnOutcome,
+    CdpSchedulerEvent, CdpTargetHostLifecycleDelta, CdpTargetHostLifecycleObserver, CdpTurnOutcome,
     CommandDispatchContext, CommandResponseFlushContext, CommandResponseFlushPermit,
-    CompletedCdpCommandDispatch, CompletedDeferredMainDocumentLoadCompletion,
-    CompletedRuntimeProtocolMessageDispatch, DEFAULT_CDP_PAGE_TARGET_ID, DEFAULT_CDP_TAB_TARGET_ID,
+    CommandResponseFlushState, CommandWaitLifetime, CompletedCdpCommandDispatch,
+    CompletedProtocolSchedulerWork, CompletedRuntimeProtocolMessageDispatch,
+    DEFAULT_CDP_PAGE_TARGET_ID, DEFAULT_CDP_TAB_TARGET_ID,
     DeferredMainDocumentLoadCompletionOutputAction,
     DeferredMainDocumentLoadCompletionOutputInterest, DeferredMainDocumentLoadObservationId,
-    DeferredMainDocumentLoadPredecessorCandidate, DevToolsCommandDispatchOutcome,
-    DevToolsDocumentLifecycleWaitKey, DevToolsDocumentLifecycleWaitState,
-    DevToolsDocumentNavigationState, DevToolsPageResidenceIdentity, ParsedCdpCommand,
-    PendingCdpCommandDispatch, PendingDeferredMainDocumentLoadCompletion,
-    PendingRuntimeProtocolMessageDispatch,
+    DeferredMainDocumentLoadPredecessorCandidate, DevToolsDocumentLifecycleWaitKey,
+    DevToolsDocumentLifecycleWaitState, DevToolsDocumentNavigationState,
+    DevToolsDocumentResidenceIdentity, DevToolsPageResidenceIdentity, OwnedProtocolWaitFailure,
+    OwnedProtocolWaitTask, ParsedCdpCommand, PendingCdpCommandDispatch,
+    PendingProtocolSchedulerWork, PendingRuntimeProtocolMessageDispatch, ProtocolOwnerClosed,
+    ProtocolStateHandle, ProtocolStateOwner, ProtocolWorkflowState, RendererOutputDependencies,
+    WebDriverNodeReference, spawn_owned_protocol_wait,
+};
+pub use conn::{
+    AutomationCommandTaskStep, CompletedAutomationCommandDispatch, PendingAutomationCommandDispatch,
 };
 pub use domains::activity::{
-    ProtocolSchedulerWork, ProtocolSchedulerWorkKind, ProtocolWorkPublishSequence,
+    ProtocolNavigationDependency, ProtocolSchedulerWork, ProtocolSchedulerWorkKind,
+    ProtocolWorkPublishSequence, RendererFencedProtocolOutput,
     RuntimeCommandOutputBarrierCompletion, RuntimeCommandOutputBarrierPermit,
     RuntimeCommandOutputBarrierTerminal, RuntimeCommandOutputBarriers,
 };
 pub use domains::page::{
     BackgroundNavigationCompletion, CompletedPageScreencastCapture,
     PageScreencastCaptureCompletion, PageScreencastCaptureStart, PageScreencastRegistration,
-    PageScreencastSubscriptionStatus, PendingPageScreencastCapture, build_default_raster_pdf,
+    PageScreencastSubscriptionStatus, PendingPageScreencastCapture,
 };
-pub use domains::runtime::{
-    CompletedDevToolsRuntimeCommandDispatch, DevToolsRuntimeCommandTaskStep,
-    PendingDevToolsRuntimeCommandDispatch,
-};
+
+#[cfg(feature = "ace-protocol")]
+pub use conn::ace_page_task;

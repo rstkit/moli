@@ -1,9 +1,10 @@
 use super::*;
+use crate::web_api_interfaces;
 use moli_url::search_params::{SearchParamPair, SearchParams, serialize_search_params_pairs};
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "URLSearchParams")]
+#[webapi(interface = web_api_interfaces::URLSearchParams)]
 struct UrlSearchParamsObjectDeclaration<'s> {
     #[webapi(slot = URL_SEARCH_PARAMS_OWNER_SLOT)]
     owner: v8::Local<'s, v8::Value>,
@@ -17,15 +18,7 @@ pub(in crate::context_bootstrap) fn new_url_search_params_object<'s>(
     initial_pairs: Option<Vec<SearchParamPair>>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let pairs = initial_pairs.as_deref().unwrap_or(&[]);
-    let global = scope.get_current_context().global(scope);
-    if let Some(object) = global
-        .get(scope, v8str(scope, "URLSearchParams").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-        .and_then(|ctor| ctor.new_instance(scope, &[]))
-    {
-        initialize_url_search_params_object(scope, object, owner, pairs);
-        return Some(object);
-    }
+    // Platform-created queries use the declaration's intrinsic realm prototype.
     UrlSearchParamsObjectDeclaration::new(
         owner
             .map(Into::into)
@@ -102,9 +95,7 @@ pub(super) fn url_search_params_is_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> bool {
-    // The internal slot is the WebIDL brand. A constructed subclass has this
-    // slot even though its direct prototype is not URLSearchParams.prototype.
-    url_search_params_pairs_array(scope, object).is_some()
+    web_api_interfaces::URLSearchParams::is_instance(scope, object)
 }
 
 pub(crate) fn url_search_params_request_body<'s>(

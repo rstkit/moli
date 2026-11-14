@@ -3,6 +3,7 @@ use crate::util::{
     call_global_bridge_method, context_host_ptr_from_global_bridge, get_private_value,
     set_private_value, v8str,
 };
+use crate::web_api_interfaces;
 use crate::{
     context_bootstrap::ensure_intrinsic_interface_prototype,
     custom_elements,
@@ -11,9 +12,9 @@ use crate::{
         install_detached_anchor_instance_properties,
         install_detached_form_associated_instance_properties,
         install_detached_form_control_instance_properties,
-        install_detached_form_instance_properties, install_detached_iframe_instance_properties,
-        install_detached_image_instance_properties, install_detached_label_instance_properties,
-        install_detached_option_instance_properties, install_detached_select_instance_properties,
+        install_detached_iframe_instance_properties, install_detached_image_instance_properties,
+        install_detached_label_instance_properties, install_detached_option_instance_properties,
+        install_detached_select_instance_properties,
         install_detached_text_replacement_instance_properties,
     },
 };
@@ -22,7 +23,7 @@ use moli_webapi_declare::WebApiObject;
 const DETACHED_ELEMENT_BRIDGE_PROTOTYPE_SLOT: &str = "__moliDetachedElementBridgePrototype";
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct GenericHtmlElementProxyHandlerDeclaration {
     #[webapi(method, length = 3, callback = generic_html_element_proxy_get_callback)]
     get: (),
@@ -33,7 +34,7 @@ struct GenericHtmlElementProxyHandlerDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct SelectHtmlElementProxyHandlerDeclaration {
     #[webapi(method, length = 3, callback = select_html_element_proxy_get_callback)]
     get: (),
@@ -44,7 +45,7 @@ struct SelectHtmlElementProxyHandlerDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", scope_lifetime = 'scope)]
+#[webapi(plain, scope_lifetime = 'scope)]
 struct DetachedElementObjectDeclaration<'scope, 'tag> {
     #[webapi(prototype)]
     prototype: v8::Local<'scope, v8::Object>,
@@ -99,6 +100,15 @@ pub(in crate::native_bridge::document) fn generic_html_element_proxy<'s>(
         .bind(scope)
         .ok()?;
     let proxy = v8::Proxy::new(scope, target, handler)?;
+    moli_webapi_declare::register_web_api_proxy(scope, proxy).ok()?;
+    // This factory publishes the canonical wrapper. Native aliases register
+    // their brand separately and do not replace this identity association.
+    set_private_value(
+        scope,
+        target,
+        crate::dom_parser::DOM_PARSER_FOREIGN_NODE_SLOT,
+        proxy.into(),
+    );
     let proxy: v8::Local<'s, v8::Value> = proxy.into();
     v8::Local::<v8::Object>::try_from(proxy).ok()
 }
@@ -115,6 +125,13 @@ pub(in crate::native_bridge::document) fn select_html_element_proxy<'s>(
     .bind(scope)
     .ok()?;
     let proxy = v8::Proxy::new(scope, target, handler)?;
+    moli_webapi_declare::register_web_api_proxy(scope, proxy).ok()?;
+    set_private_value(
+        scope,
+        target,
+        crate::dom_parser::DOM_PARSER_FOREIGN_NODE_SLOT,
+        proxy.into(),
+    );
     let proxy: v8::Local<'s, v8::Value> = proxy.into();
     v8::Local::<v8::Object>::try_from(proxy).ok()
 }
@@ -371,26 +388,13 @@ fn select_html_element_proxy_set_callback<'s>(
     );
 }
 
-pub(in crate::native_bridge::document) fn mirror_detached_private_slots<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    source: v8::Local<'s, v8::Object>,
-    target: v8::Local<'s, v8::Object>,
-) {
-    for slot in [
-        DETACHED_STATE_SLOT,
-        DETACHED_LIVE_DELEGATE_SLOT,
-        DETACHED_NATIVE_HANDLE_SLOT,
-    ] {
-        if let Some(value) = get_private_value(scope, source, slot) {
-            set_private_value(scope, target, slot, value);
-        }
-    }
-}
-
 pub(in crate::native_bridge::document) fn copy_detached_element_bridge_members<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) {
+    let Some(target) = crate::native_bridge::node::node_backing_object(scope, target) else {
+        return;
+    };
     let Some(parent) = target.get_prototype(scope) else {
         return;
     };
@@ -450,7 +454,7 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
     };
     let namespace_uri = normalize_namespace(namespace_uri);
     let html_like = document_kind == "html" && namespace_uri.as_deref() == Some(XHTML_NS);
-    let local_name = if html_like {
+    let local_name = if html_like && !split_qualified_name {
         local_name_raw.to_ascii_lowercase()
     } else {
         local_name_raw
@@ -459,6 +463,8 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
         && html_element_constructor_name(&local_name).is_some();
     let svg_interface_like = namespace_uri.as_deref() == Some(SVG_NS)
         && svg_element_constructor_name(&local_name).is_some();
+    let mathml_interface_like =
+        namespace_uri.as_deref() == Some(crate::native_bridge::document::MATHML_NS);
     let node_name = if html_like {
         qualified.to_ascii_uppercase()
     } else {
@@ -468,6 +474,8 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
         Some(html_element_to_string_tag(&local_name))
     } else if namespace_uri.as_deref() == Some(SVG_NS) {
         Some(svg_element_to_string_tag(&local_name))
+    } else if mathml_interface_like {
+        Some("MathMLElement")
     } else {
         Some("Element")
     };
@@ -478,18 +486,33 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
         html_element_constructor_name(&local_name)
     } else if svg_interface_like {
         svg_element_constructor_name(&local_name)
+    } else if mathml_interface_like {
+        Some("MathMLElement")
     } else {
         None
     };
     let mut object = if let Some(proto) =
         element_interface_prototype(scope, owner_document, prototype_name, html_interface_like)
     {
-        DetachedElementObjectDeclaration::new(proto, to_string_tag)
-            .bind(scope)
-            .ok()?
+        let declaration = DetachedElementObjectDeclaration::new(proto, to_string_tag);
+        if html_interface_like && local_name == "form" {
+            // Reuse the native interface template, including its property handlers.
+            // The detached identity is attached below; the reflector slot stays empty.
+            let runtime_ptr = context_host_ptr_from_global_bridge(scope)?;
+            let object = unsafe { &mut *runtime_ptr }
+                .native_bridge_mut()
+                .node_wrapper_template("HTMLFormElement")?
+                .new_instance(scope)?;
+            declaration.bind_into(scope, object).ok()?;
+            object
+        } else {
+            declaration.bind(scope).ok()?
+        }
     } else {
         new_detached_object_with_prototype(scope, "__detachedElementPrototype", to_string_tag)?
     };
+    let interface = to_string_tag.unwrap_or("Element");
+    web_api_interfaces::initialize(scope, object, interface).ok()?;
     let state = new_detached_state_object(scope, "element", 1, &node_name)?;
     let _ = state.set(
         scope,
@@ -522,9 +545,6 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
         v8_string(scope, document_kind)?.into(),
     );
     let attributes = new_map_object(scope);
-    if let Some(is_name) = is_name {
-        detached_map_set(scope, attributes, "is", is_name);
-    }
     let _ = state.set(scope, v8str(scope, "attributes").into(), attributes.into());
     let namespace_attributes = new_map_object(scope);
     let _ = state.set(
@@ -551,10 +571,13 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
         );
         if let Some(is_name) = is_name {
             let runtime = unsafe { &mut *runtime_ptr };
-            let _ = runtime.dom_host_mut().set_attribute(handle, "is", is_name);
-            if runtime
+            let _ = runtime
                 .dom_host_mut()
-                .set_custom_element_state(handle, CustomElementState::Undefined)
+                .set_custom_element_is_name(handle, Some(is_name.to_owned()));
+            if namespace_uri.as_deref() == Some(XHTML_NS)
+                && runtime
+                    .dom_host_mut()
+                    .set_custom_element_state(handle, CustomElementState::Undefined)
             {
                 runtime.note_style_subtree_context_change(handle);
             }
@@ -568,9 +591,11 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
         define_detached_native_handle(scope, object, handle);
         native_handle = Some((runtime_ptr, handle));
     }
-    install_detached_element_instance_properties(scope, object);
+    if !(html_interface_like && local_name == "form") {
+        install_detached_element_instance_properties(scope, object);
+        remove_detached_element_instance_selector_matching_methods(scope, object);
+    }
     copy_detached_element_bridge_members(scope, object);
-    remove_detached_element_instance_selector_matching_methods(scope, object);
     if html_interface_like && matches!(local_name.as_str(), "a" | "area") {
         install_detached_anchor_instance_properties(scope, object);
     }
@@ -597,9 +622,6 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
     if html_like && local_name == "iframe" {
         install_detached_iframe_instance_properties(scope, object);
     }
-    if html_like && local_name == "form" {
-        install_detached_form_instance_properties(scope, object);
-    }
     if html_like
         && matches!(
             local_name.as_str(),
@@ -611,32 +633,16 @@ pub(in crate::native_bridge::document) fn build_detached_element_object<'s>(
     if html_like && local_name == "select" {
         install_detached_select_instance_properties(scope, object);
         if let Some(proxy) = select_html_element_proxy(scope, object) {
-            mirror_detached_private_slots(scope, object, proxy);
             if let Some((_, handle)) = native_handle {
-                define_detached_native_handle(scope, proxy, handle);
+                pair_detached_native_handle_with_wrapper(scope, proxy, handle);
             }
             object = proxy;
         }
     }
 
-    // HTMLTemplateElement spec: a template's `content` is a DocumentFragment
-    // owned by the template's *template contents owner document*, not by the
-    // surrounding document. The standard `HTMLTemplateElement.prototype.content`
-    // getter reads this native handle for both live and detached wrappers.
-    if html_like
-        && local_name == "template"
-        && let Some((runtime_ptr, template_handle)) = native_handle
-        && let Some(contents_owner) =
-            build_detached_document_object(scope, "plain", None, None, None)
-        && let Some(fragment) = build_detached_document_fragment_object(scope, contents_owner)
-        && let Some(fragment_handle) = detached_native_handle(scope, fragment)
-        && let Some(element) = unsafe { &mut *runtime_ptr }
-            .dom_host_mut()
-            .node_mut(template_handle)
-            .and_then(|node| node.data_mut().as_element_mut())
-    {
-        element.set_template_contents(Some(fragment_handle));
-    }
+    // Native allocation already establishes template contents and their inert
+    // owner document. Keep that fragment so its document kind and host survive;
+    // the standard content getter wraps the native handle.
 
     // Run custom-element upgrade only after the detached wrapper has its own
     // DOM surface installed. The HTML constructor returns this object from the

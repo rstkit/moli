@@ -13,7 +13,16 @@ from typing import Any, Awaitable, Callable, Iterable
 from .config import WebDriverTarget, clear_current_process_proxy_env, reserve_port
 from .fixture import FixtureServer
 from .groups.bidi import run_bidi_group
+from .groups.bidi_network import run_bidi_network_group
+from .groups.bidi_progress import (
+    run_bidi_progress_group,
+    run_bidi_input_layout_group,
+    run_bidi_auth_progress_group,
+    run_bidi_layout_freshness_group,
+)
+from .groups.bidi_storage import run_bidi_storage_group
 from .groups.classic import run_classic_group
+from .groups.classic_alert_progress import run_classic_alert_progress_group
 from .groups.navigation_errors import run_navigation_errors_group
 from .groups.script_interrupt import (
     run_chromedriver_script_timeout_group,
@@ -78,6 +87,16 @@ async def _run_bidi_group(
 
 MOLI_GROUPS: tuple[SmokeGroup, ...] = (
     SmokeGroup(
+        "classic-alert-progress",
+        "Classic alert interruption, pageLoad deadlines and recovery during held navigation.",
+        run_classic_alert_progress_group,
+    ),
+    SmokeGroup(
+        "bidi-progress",
+        "Pipelined navigation, script and input waits; shared top-level device state; independent dialog and renderer output.",
+        run_bidi_progress_group,
+    ),
+    SmokeGroup(
         "classic",
         "Raw WebDriver Classic HTTP session, navigation, element, script, alert, shadow, cookie, and window state flows.",
         _run_classic_group,
@@ -86,6 +105,16 @@ MOLI_GROUPS: tuple[SmokeGroup, ...] = (
         "bidi",
         "Raw WebDriver BiDi WebSocket session, browsingContext lifecycle, input actions, element origins, file uploads, network data, user contexts, emulation, explicit screenshot unsupported errors, and storage.",
         _run_bidi_group,
+    ),
+    SmokeGroup(
+        "bidi-network",
+        "Cross-engine background iframe Network/lifecycle events, response bodies, and collector isolation.",
+        run_bidi_network_group,
+    ),
+    SmokeGroup(
+        "bidi-storage",
+        "Cross-engine BiDi cookie deletion filters, CHIPS partition identities, and user context isolation.",
+        run_bidi_storage_group,
     ),
     SmokeGroup(
         "selenium",
@@ -123,7 +152,28 @@ CHROMEDRIVER_ORACLE_GROUPS: tuple[SmokeGroup, ...] = (
 )
 
 DEFAULT_GROUPS: tuple[SmokeGroup, ...] = MOLI_GROUPS
-ALL_GROUPS: tuple[SmokeGroup, ...] = DEFAULT_GROUPS + CHROMEDRIVER_ORACLE_GROUPS
+LAYOUT_GROUPS: tuple[SmokeGroup, ...] = (
+    SmokeGroup(
+        "bidi-input-layout",
+        "Cross-frame viewport pointer input; requires a layout-enabled endpoint.",
+        run_bidi_input_layout_group,
+    ),
+)
+DIAGNOSTIC_GROUPS: tuple[SmokeGroup, ...] = (
+    SmokeGroup(
+        "bidi-layout-freshness",
+        "Diagnostic: style mutation reaches a real layout frame without pending input; needs a layout endpoint.",
+        run_bidi_layout_freshness_group,
+    ),
+    SmokeGroup(
+        "bidi-auth-progress",
+        "Diagnostic: concurrent auth navigation and exact Native Fetch context routing.",
+        run_bidi_auth_progress_group,
+    ),
+)
+ALL_GROUPS: tuple[SmokeGroup, ...] = (
+    DEFAULT_GROUPS + CHROMEDRIVER_ORACLE_GROUPS + LAYOUT_GROUPS + DIAGNOSTIC_GROUPS
+)
 DEFAULT_GROUP_NAMES: tuple[str, ...] = tuple(group.name for group in DEFAULT_GROUPS)
 DEFAULT_GROUP_NAME_SET = frozenset(DEFAULT_GROUP_NAMES)
 GROUPS_BY_NAME: dict[str, SmokeGroup] = {group.name: group for group in ALL_GROUPS}

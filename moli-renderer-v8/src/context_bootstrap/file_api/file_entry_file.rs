@@ -8,14 +8,8 @@
 //! the selected Page-task dispatcher owns checkpoint and runtime follow-up.
 
 use crate::{
-    host::report_event_callback_exception,
-    native_bridge::JsContextHost,
-    util::context_host_ptr_from_global_bridge,
-    webidl,
-    window_webidl_callback::{
-        WindowWebIdlCallbackFunction, WindowWebIdlCallbackFunctionOutcome,
-        invoke_window_webidl_callback_function,
-    },
+    native_bridge::PageScriptHost, util::context_host_ptr_from_global_bridge, webidl,
+    window_webidl_callback::WindowWebIdlCallbackFunction,
 };
 use moli_webidl_callback::WebIdlCallbackFunction;
 
@@ -51,7 +45,7 @@ pub(crate) struct FileEntryFileCallbackTask {
 impl FileEntryFileCallbackTask {
     pub(crate) fn new(
         scope: &mut v8::PinScope<'_, '_>,
-        host: &JsContextHost,
+        host: &PageScriptHost,
         callback: WebIdlCallbackFunction,
         file: v8::Local<'_, v8::Object>,
     ) -> Self {
@@ -64,39 +58,23 @@ impl FileEntryFileCallbackTask {
     pub(crate) fn invoke(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> FileEntryFileCallbackTaskEffect {
-        let callback = self.callback.prepare(scope);
-        let relevant_identity = callback.relevant_identity();
+        let Some(callback) = self.callback.prepare_execution(scope, host_ptr, None) else {
+            return FileEntryFileCallbackTaskEffect::CallbackNotInvoked;
+        };
         let file = v8::Local::new(scope, &self.file);
         let receiver = v8::undefined(scope);
-        match invoke_window_webidl_callback_function(
+        if callback.invoke_and_report(
             scope,
-            host_ptr,
-            "FileCallback",
-            "FileSystemFileEntry.file callback threw",
+            "filesystemfileentry",
             "FileSystemFileEntry.file callback",
-            &callback,
             receiver.into(),
             &[file.into()],
         ) {
-            WindowWebIdlCallbackFunctionOutcome::Returned => {
-                FileEntryFileCallbackTaskEffect::CallbackInvoked
-            }
-            WindowWebIdlCallbackFunctionOutcome::Threw(report) => {
-                report_event_callback_exception(
-                    scope,
-                    host_ptr,
-                    "filesystemfileentry",
-                    relevant_identity,
-                    None,
-                    &report,
-                );
-                FileEntryFileCallbackTaskEffect::CallbackInvoked
-            }
-            WindowWebIdlCallbackFunctionOutcome::Retired => {
-                FileEntryFileCallbackTaskEffect::CallbackNotInvoked
-            }
+            FileEntryFileCallbackTaskEffect::CallbackInvoked
+        } else {
+            FileEntryFileCallbackTaskEffect::CallbackNotInvoked
         }
     }
 }

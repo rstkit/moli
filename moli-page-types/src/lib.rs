@@ -4,29 +4,33 @@
 //! responses, script execution reports, subresource records, and frame
 //! snapshots that are shared by the facade, renderer, and CDP crates.
 
+mod document_activity;
+mod document_settings;
 mod inspector_identity;
 mod inspector_state;
 mod layout;
 mod navigation_history;
 mod navigator_overrides;
 mod renderer_transport_memory;
+mod session_history;
+mod web_mcp;
+
+pub use session_history::{SessionHistoryCommit, SessionHistorySeed, SessionHistoryUpdate};
+pub use web_mcp::{
+    RendererWebMcpAnnotations, RendererWebMcpCommand, RendererWebMcpError, RendererWebMcpEvent,
+    RendererWebMcpNavigation, RendererWebMcpObservation, RendererWebMcpResult, RendererWebMcpTool,
+    RendererWebMcpToolId,
+};
 
 use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, Write},
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+    io::{self, Write},
+    sync::Arc,
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-
+use moli_disk_pool::{DiskData, DiskPool};
+use moli_parkable_image::ParkableImage;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,18 +43,22 @@ use moli_fetch::{
     NegotiatedHttpVersion, NetworkRequestExtraInfo, NetworkResponseExtraInfo, RedirectInfo,
     RequestAuth, RequestAuthScheme, RequestAuthTarget, Response, ResponseBody, ResponseHead,
 };
-use moli_web_mime::is_json_module_mime;
+use moli_web_mime::{extract_response_mime_essence, is_json_mime};
 
 const SUBRESOURCE_RESPONSE_BODY_MEMORY_LIMIT: usize = 1024 * 1024;
-static NEXT_SUBRESOURCE_RESPONSE_BODY_SPOOL_ID: AtomicU64 = AtomicU64::new(1);
 
+pub use document_activity::DocumentActivity;
+pub use document_settings::DocumentSettings;
 pub use inspector_identity::{
     DevToolsSessionKey, FrontendCommandId, RendererAgentAttachmentId, RendererCallId,
     RendererCallIdOutOfRange, RendererDevToolsAgentToken, RendererDevToolsCommandId,
     RendererInspectorResponseDelivery,
 };
-pub use layout::LayoutPolicy;
-pub use navigator_overrides::{GeolocationPositionOverride, NavigatorOverrides};
+pub use layout::{LayoutConfiguration, LayoutPolicy};
+pub use navigator_overrides::{
+    GeolocationPositionOverride, NavigatorEmulationSessions, NavigatorOverrides,
+    NavigatorQueryOverrides,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentNodeAttributeSnapshot {
@@ -189,10 +197,9 @@ pub use inspector_state::{
     renderer_inspector_protocol_configuration_command_from_method,
 };
 pub use navigation_history::{
-    NavigationActivationSeed, NavigationHistoryDocumentId, NavigationHistoryEntryId,
-    NavigationHistoryEntryKey, NavigationHistoryEntrySeed, NavigationHistoryMutation,
-    NavigationHistorySerializedEntry, NavigationTraversalSeedCandidate, SameDocumentHistoryUpdate,
-    apply_child_browsing_context_javascript_url_navigation_to_entry_seed,
+    NavigationActivationSeed, NavigationHistoryEntryId, NavigationHistoryEntrySeed,
+    NavigationHistoryMutation, NavigationHistorySerializedEntry, NavigationTraversalSeedCandidate,
+    SessionHistoryUpdateKind, apply_child_browsing_context_javascript_url_navigation_to_entry_seed,
     apply_child_browsing_context_navigation_to_entry_seed,
     child_browsing_context_single_entry_seed, cross_document_navigation_seed,
     initial_navigation_history_seed, reload_navigation_seed,
@@ -252,12 +259,14 @@ impl DomScrollIntoViewRect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavigationRedirect {
+    pub source: moli_fetch::RedirectSource,
     pub from_url: Url,
     pub to_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub network_extra_info_available: bool,
     pub request_extra_info: Option<NetworkRequestExtraInfo>,
+    pub dispatched_request: Option<std::sync::Arc<moli_fetch::DispatchedRequest>>,
     pub response_extra_info: Option<NetworkResponseExtraInfo>,
     pub redirect_has_extra_info: bool,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
@@ -269,12 +278,14 @@ pub struct NavigationRedirect {
 impl From<RedirectInfo> for NavigationRedirect {
     fn from(value: RedirectInfo) -> Self {
         Self {
+            source: value.source,
             from_url: value.from_url,
             to_url: value.to_url,
             status: value.status,
             headers: value.headers,
             network_extra_info_available: value.network_extra_info_available,
             request_extra_info: value.request_extra_info,
+            dispatched_request: value.dispatched_request,
             response_extra_info: value.response_extra_info,
             redirect_has_extra_info: value.redirect_has_extra_info,
             request_cookie_report: value.request_cookie_report,
@@ -288,12 +299,14 @@ impl From<RedirectInfo> for NavigationRedirect {
 impl From<NavigationRedirect> for RedirectInfo {
     fn from(value: NavigationRedirect) -> Self {
         Self {
+            source: value.source,
             from_url: value.from_url,
             to_url: value.to_url,
             status: value.status,
             headers: value.headers,
             network_extra_info_available: value.network_extra_info_available,
             request_extra_info: value.request_extra_info,
+            dispatched_request: value.dispatched_request,
             response_extra_info: value.response_extra_info,
             redirect_has_extra_info: value.redirect_has_extra_info,
             request_cookie_report: value.request_cookie_report,
@@ -308,13 +321,15 @@ impl From<NavigationRedirect> for RedirectInfo {
 pub struct NavigationResponse {
     pub final_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     body: ResponseBody,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirected: bool,
     pub redirect_chain: Vec<NavigationRedirect>,
     pub from_cache: bool,
+    pub cache_state: moli_fetch::ResponseCacheState,
     pub negotiated_http_version: Option<NegotiatedHttpVersion>,
     network_request_headers: Option<Vec<(String, String)>>,
 }
@@ -324,6 +339,7 @@ impl Clone for NavigationResponse {
         Self {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             body: self
                 .body
@@ -334,6 +350,7 @@ impl Clone for NavigationResponse {
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.clone(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
             network_request_headers: self.network_request_headers.clone(),
         }
@@ -359,6 +376,20 @@ impl NavigationResponse {
         self.body_bytes().to_vec()
     }
 
+    /// Moves the complete materialized payload out of this response.
+    ///
+    /// The response head remains usable and the response body becomes empty.
+    /// This is intended for handing large payloads to an owning backing store
+    /// without briefly retaining both the response buffer and a clone.
+    pub fn take_body_bytes(&mut self) -> Vec<u8> {
+        std::mem::replace(
+            &mut self.body,
+            ResponseBody::materialized_text(String::new(), Vec::new()),
+        )
+        .try_into_materialized_bytes()
+        .expect("NavigationResponse body should remain materialized")
+    }
+
     pub fn materialized_body(&self) -> ResponseBody {
         self.body
             .clone_materialized()
@@ -369,6 +400,7 @@ impl NavigationResponse {
         ResponseHead {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             request_cookie_report: self.request_cookie_report.clone(),
             cookie_set_reports: self.cookie_set_reports.clone(),
@@ -380,6 +412,7 @@ impl NavigationResponse {
                 .map(Into::into)
                 .collect(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         }
     }
@@ -413,6 +446,7 @@ impl NavigationResponse {
         Self {
             final_url: head.final_url,
             status: head.status,
+            status_text: head.status_text,
             headers: head.headers,
             body,
             request_cookie_report: head.request_cookie_report,
@@ -420,6 +454,7 @@ impl NavigationResponse {
             redirected: head.redirected,
             redirect_chain: head.redirect_chain.into_iter().map(Into::into).collect(),
             from_cache: head.from_cache,
+            cache_state: head.cache_state,
             negotiated_http_version: head.negotiated_http_version,
             network_request_headers: None,
         }
@@ -432,11 +467,12 @@ impl NavigationResponse {
     pub fn from_text_body(
         final_url: Url,
         status: u16,
-        headers: Vec<(String, String)>,
+        headers: Vec<(String, Vec<u8>)>,
         body: String,
     ) -> Self {
         Self::from_head_and_text_body(
             ResponseHead {
+                status_text: None,
                 final_url,
                 status,
                 headers,
@@ -445,6 +481,7 @@ impl NavigationResponse {
                 redirected: false,
                 redirect_chain: Vec::new(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             body,
@@ -454,9 +491,12 @@ impl NavigationResponse {
     pub fn with_status_headers_from(
         source: &Self,
         status: u16,
-        headers: Vec<(String, String)>,
+        headers: Vec<(String, Vec<u8>)>,
     ) -> Self {
         let mut head = source.head();
+        if head.status != status {
+            head.status_text = None;
+        }
         head.status = status;
         head.headers = headers;
         Self::from_head_and_materialized_body(head, source.materialized_body())
@@ -467,12 +507,14 @@ impl NavigationResponse {
         let head = ResponseHead {
             final_url: self.final_url,
             status: self.status,
+            status_text: self.status_text,
             headers: self.headers,
             request_cookie_report: self.request_cookie_report,
             cookie_set_reports: self.cookie_set_reports,
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.into_iter().map(Into::into).collect(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         };
         let (body, body_bytes) = self
@@ -489,16 +531,28 @@ impl NavigationResponse {
         (head, body)
     }
 
+    /// Consumes a materialized response and transfers its exact byte payload
+    /// without retaining the text view or copying UTF-8 text storage.
+    pub fn into_byte_parts(self) -> (ResponseHead, Vec<u8>) {
+        let (head, body) = self.into_body();
+        let bytes = body
+            .try_into_materialized_bytes()
+            .expect("NavigationResponse body should remain materialized");
+        (head, bytes)
+    }
+
     pub fn into_body(self) -> (ResponseHead, ResponseBody) {
         let head = ResponseHead {
             final_url: self.final_url,
             status: self.status,
+            status_text: self.status_text,
             headers: self.headers,
             request_cookie_report: self.request_cookie_report,
             cookie_set_reports: self.cookie_set_reports,
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.into_iter().map(Into::into).collect(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         };
         (head, self.body)
@@ -1048,9 +1102,9 @@ struct SubresourceNetworkRecordInner {
     request_handle: Option<SubresourceNetworkRequestHandle>,
     websocket_socket_id: Option<u64>,
     method: String,
-    request_headers: Vec<(String, String)>,
+    request_headers: moli_fetch::RequestHeaders,
     request_body: Option<String>,
-    request_body_bytes: Option<Vec<u8>>,
+    request_body_bytes: Option<bytes::Bytes>,
     resource_type: SubresourceResourceType,
     request_initiator_type: SubresourceRequestInitiatorType,
     request_cookie_report: Option<StoredCookieQueryReport>,
@@ -1081,9 +1135,9 @@ pub struct SubresourceRequestStarted {
     document_url: Url,
     url: Url,
     method: String,
-    request_headers: Vec<(String, String)>,
+    request_headers: moli_fetch::RequestHeaders,
     request_body: Option<String>,
-    request_body_bytes: Option<Vec<u8>>,
+    request_body_bytes: Option<bytes::Bytes>,
     keepalive: bool,
     resource_type: SubresourceResourceType,
     request_initiator_type: SubresourceRequestInitiatorType,
@@ -1097,7 +1151,7 @@ pub struct SubresourceResponseStarted {
     final_url: Url,
     status: u16,
     status_text: Option<String>,
-    response_headers: Vec<(String, String)>,
+    response_headers: Vec<(String, Vec<u8>)>,
     cookie_set_reports: Vec<StoredCookieSetReport>,
     from_cache: bool,
     network_request_headers: Option<Vec<(String, String)>>,
@@ -1169,7 +1223,7 @@ impl SubresourceRequestStarted {
         document_url: Url,
         url: Url,
         method: String,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         request_body: Option<String>,
         resource_type: SubresourceResourceType,
         request_initiator_type: SubresourceRequestInitiatorType,
@@ -1196,7 +1250,7 @@ impl SubresourceRequestStarted {
         self.handle
     }
 
-    pub fn with_request_body_bytes(mut self, request_body_bytes: Option<Vec<u8>>) -> Self {
+    pub fn with_request_body_bytes(mut self, request_body_bytes: Option<bytes::Bytes>) -> Self {
         self.request_body_bytes =
             request_body_bytes.or_else(|| request_body_text_bytes(&self.request_body));
         self
@@ -1223,7 +1277,7 @@ impl SubresourceRequestStarted {
         &self.method
     }
 
-    pub fn request_headers(&self) -> &[(String, String)] {
+    pub fn request_headers(&self) -> &moli_fetch::RequestHeaders {
         &self.request_headers
     }
 
@@ -1231,8 +1285,8 @@ impl SubresourceRequestStarted {
         self.request_body.as_deref()
     }
 
-    pub fn request_body_bytes(&self) -> Option<&[u8]> {
-        self.request_body_bytes.as_deref()
+    pub fn request_body_bytes(&self) -> Option<&bytes::Bytes> {
+        self.request_body_bytes.as_ref()
     }
 
     pub fn keepalive(&self) -> bool {
@@ -1258,7 +1312,7 @@ impl SubresourceResponseStarted {
         redirect_chain: Vec<NavigationRedirect>,
         final_url: Url,
         status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         cookie_set_reports: Vec<StoredCookieSetReport>,
     ) -> Self {
         Self {
@@ -1321,7 +1375,7 @@ impl SubresourceResponseStarted {
         self.status_text.as_deref()
     }
 
-    pub fn response_headers(&self) -> &[(String, String)] {
+    pub fn response_headers(&self) -> &[(String, Vec<u8>)] {
         &self.response_headers
     }
 
@@ -1459,43 +1513,109 @@ impl SubresourceBodyFinished {
 #[derive(Debug, Clone)]
 pub struct SubresourceResponseBody {
     inner: Arc<SubresourceResponseBodyInner>,
+    prefix_len: Option<usize>,
 }
 
 #[derive(Debug)]
 enum SubresourceResponseBodyInner {
     Memory(Vec<u8>),
-    File { path: PathBuf, len: usize },
+    Disk {
+        storage: PooledSubresourceResponseBody,
+    },
+    ParkableImage(ParkableImage),
 }
 
-impl SubresourceResponseBodyInner {
-    fn in_memory_bytes(&self) -> Option<&[u8]> {
-        match self {
-            Self::Memory(bytes) => Some(bytes),
-            Self::File { .. } => None,
+#[derive(Debug)]
+struct PooledSubresourceResponseBody {
+    chunks: Vec<DiskData>,
+    trailing_bytes: Box<[u8]>,
+    len: usize,
+}
+
+impl PooledSubresourceResponseBody {
+    fn read_range(&self, offset: usize, max_len: usize) -> io::Result<Vec<u8>> {
+        if offset >= self.len || max_len == 0 {
+            return Ok(Vec::new());
+        }
+        let len = max_len.min(self.len - offset);
+        let mut bytes = vec![0; len];
+        self.read_exact_at(offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn read_exact_at(&self, offset: usize, buffer: &mut [u8]) -> io::Result<()> {
+        Self::read_chunks_at(&self.chunks, &self.trailing_bytes, offset, buffer)
+    }
+
+    fn read_chunks_at(
+        chunks: &[DiskData],
+        trailing_bytes: &[u8],
+        mut offset: usize,
+        mut buffer: &mut [u8],
+    ) -> io::Result<()> {
+        for chunk in chunks {
+            if buffer.is_empty() {
+                break;
+            }
+            if offset >= chunk.len() {
+                offset -= chunk.len();
+                continue;
+            }
+            let len = buffer.len().min(chunk.len() - offset);
+            chunk.read_exact_at(offset, &mut buffer[..len])?;
+            buffer = &mut buffer[len..];
+            offset = 0;
+        }
+
+        if !buffer.is_empty() {
+            let trailing = trailing_bytes.get(offset..).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pooled resource body ended before its recorded length",
+                )
+            })?;
+            let len = buffer.len().min(trailing.len());
+            buffer[..len].copy_from_slice(&trailing[..len]);
+            buffer = &mut buffer[len..];
+        }
+
+        if buffer.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pooled resource body ended before its recorded length",
+            ))
         }
     }
-}
 
-impl Drop for SubresourceResponseBodyInner {
-    fn drop(&mut self) {
-        if let Self::File { path, .. } = self {
-            let _ = fs::remove_file(path);
+    fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        for chunk in &self.chunks {
+            chunk.write_to(writer)?;
         }
+        writer.write_all(&self.trailing_bytes)
     }
 }
 
 impl PartialEq for SubresourceResponseBody {
     fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
         if Arc::ptr_eq(&self.inner, &other.inner) {
             return true;
         }
-        let Some(left_bytes) = self.inner.in_memory_bytes() else {
-            return false;
-        };
-        let Some(right_bytes) = other.inner.in_memory_bytes() else {
-            return false;
-        };
-        left_bytes == right_bytes
+        match (self.inner.as_ref(), other.inner.as_ref()) {
+            (
+                SubresourceResponseBodyInner::Memory(left),
+                SubresourceResponseBodyInner::Memory(right),
+            ) => left[..self.len()] == right[..other.len()],
+            (
+                SubresourceResponseBodyInner::ParkableImage(left),
+                SubresourceResponseBodyInner::ParkableImage(right),
+            ) => left.shares_storage_with(right),
+            _ => false,
+        }
     }
 }
 
@@ -1506,9 +1626,9 @@ pub struct SubresourceResponseBodyWriter {
     memory_limit: usize,
     len: usize,
     memory: Vec<u8>,
-    file: Option<File>,
-    path: Option<PathBuf>,
-    spool_failed: bool,
+    disk_pool: Option<DiskPool>,
+    disk_chunks: Vec<DiskData>,
+    disk_write_failed: bool,
 }
 
 impl Default for SubresourceResponseBodyWriter {
@@ -1518,121 +1638,127 @@ impl Default for SubresourceResponseBodyWriter {
 }
 
 impl SubresourceResponseBodyWriter {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Read bytes already captured without finishing or duplicating the body.
+    /// Pending Fetch response streams use the same disk backing as final bodies.
+    pub fn read_chunk(&self, offset: usize, max_len: usize) -> io::Result<Vec<u8>> {
+        let len = max_len.min(self.len.saturating_sub(offset));
+        let mut bytes = vec![0; len];
+        PooledSubresourceResponseBody::read_chunks_at(
+            &self.disk_chunks,
+            &self.memory,
+            offset,
+            &mut bytes,
+        )?;
+        Ok(bytes)
+    }
+
     pub fn new(memory_limit: usize) -> Self {
+        Self::with_memory_limit_and_disk_pool(memory_limit, None)
+    }
+
+    /// Creates a writer using the default in-memory threshold and a shared
+    /// browser resource disk pool when one is available.
+    pub fn with_disk_pool(disk_pool: Option<DiskPool>) -> Self {
+        Self::with_memory_limit_and_disk_pool(SUBRESOURCE_RESPONSE_BODY_MEMORY_LIMIT, disk_pool)
+    }
+
+    pub fn with_memory_limit_and_disk_pool(
+        memory_limit: usize,
+        disk_pool: Option<DiskPool>,
+    ) -> Self {
         Self {
             memory_limit,
             len: 0,
             memory: Vec::new(),
-            file: None,
-            path: None,
-            spool_failed: false,
+            disk_pool,
+            disk_chunks: Vec::new(),
+            disk_write_failed: false,
         }
     }
 
-    pub fn append(&mut self, bytes: &[u8]) {
+    pub fn append(&mut self, mut bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        if self.file.is_some() {
-            if let Some(file) = self.file.as_mut()
-                && file.write_all(bytes).is_ok()
-            {
-                self.len = self.len.saturating_add(bytes.len());
+        self.len = self.len.saturating_add(bytes.len());
+        if self.disk_write_failed || self.disk_pool.is_none() {
+            self.memory.extend_from_slice(bytes);
+            return;
+        }
+
+        if self.disk_chunks.is_empty()
+            && self.memory.len().saturating_add(bytes.len()) <= self.memory_limit
+        {
+            self.memory.extend_from_slice(bytes);
+            return;
+        }
+
+        let chunk_size = self.memory_limit.max(1);
+        while !bytes.is_empty() {
+            if self.memory.len() == chunk_size && !self.flush_memory_to_disk() {
+                self.disk_write_failed = true;
+                self.memory.extend_from_slice(bytes);
                 return;
             }
-            self.abandon_file_to_memory();
-            self.spool_failed = true;
+            let available = chunk_size - self.memory.len();
+            let consumed = available.min(bytes.len());
+            self.memory.extend_from_slice(&bytes[..consumed]);
+            bytes = &bytes[consumed..];
+            if self.memory.len() == chunk_size && !self.flush_memory_to_disk() {
+                self.disk_write_failed = true;
+                self.memory.extend_from_slice(bytes);
+                return;
+            }
         }
-        if self.spool_failed || self.len.saturating_add(bytes.len()) <= self.memory_limit {
-            self.memory.extend_from_slice(bytes);
-            self.len = self.len.saturating_add(bytes.len());
-            return;
-        }
-        if self.ensure_file().is_ok()
-            && let Some(file) = self.file.as_mut()
-            && file.write_all(bytes).is_ok()
-        {
-            self.len = self.len.saturating_add(bytes.len());
-            return;
-        }
-        // Spooling is an optimization for CDP bookkeeping. If private temp-file
-        // creation fails, keep the protocol-correct body in memory rather than
-        // dropping captured bytes.
-        self.spool_failed = true;
-        self.abandon_file_to_memory();
-        self.memory.extend_from_slice(bytes);
-        self.len = self.len.saturating_add(bytes.len());
     }
 
     pub fn finish(mut self) -> SubresourceResponseBody {
-        if let Some(mut file) = self.file.take() {
-            if file.flush().is_ok() {
-                let path = self
-                    .path
-                    .take()
-                    .expect("subresource body spool path should be set");
-                return SubresourceResponseBody {
-                    inner: Arc::new(SubresourceResponseBodyInner::File {
-                        path,
-                        len: self.len,
-                    }),
-                };
+        if !self.disk_chunks.is_empty() {
+            if !self.memory.is_empty() && !self.disk_write_failed {
+                let _ = self.flush_memory_to_disk();
             }
-            self.file = Some(file);
-            self.abandon_file_to_memory();
-        }
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
+            let stored_len = self
+                .disk_chunks
+                .iter()
+                .map(DiskData::len)
+                .sum::<usize>()
+                .saturating_add(self.memory.len());
+            debug_assert_eq!(stored_len, self.len);
+            return SubresourceResponseBody {
+                prefix_len: None,
+                inner: Arc::new(SubresourceResponseBodyInner::Disk {
+                    storage: PooledSubresourceResponseBody {
+                        chunks: std::mem::take(&mut self.disk_chunks),
+                        trailing_bytes: std::mem::take(&mut self.memory).into_boxed_slice(),
+                        len: self.len,
+                    },
+                }),
+            };
         }
         SubresourceResponseBody::from_bytes(std::mem::take(&mut self.memory))
     }
 
-    fn ensure_file(&mut self) -> io::Result<()> {
-        if self.file.is_some() {
-            return Ok(());
+    fn flush_memory_to_disk(&mut self) -> bool {
+        if self.memory.is_empty() {
+            return true;
         }
-        let path = unique_subresource_response_body_spool_path()?;
-        let mut options = OpenOptions::new();
-        options.create_new(true).read(true).write(true);
-        configure_secure_subresource_response_body_spool_file_options(&mut options);
-        let mut file = options.open(&path)?;
-        if !self.memory.is_empty() {
-            if let Err(error) = file.write_all(&self.memory) {
-                drop(file);
-                let _ = fs::remove_file(&path);
-                return Err(error);
-            }
-            self.memory.clear();
-        }
-        self.path = Some(path);
-        self.file = Some(file);
-        Ok(())
-    }
-
-    fn abandon_file_to_memory(&mut self) {
-        let _ = self.file.take();
-        if let Some(path) = self.path.take() {
-            if let Ok(mut bytes) = fs::read(&path) {
-                bytes.extend_from_slice(&self.memory);
-                self.memory = bytes;
-            }
-            let _ = fs::remove_file(path);
-        }
-        self.len = self.memory.len();
-    }
-
-    #[cfg(feature = "test-support")]
-    pub fn replace_spool_path_for_test(&mut self, replacement: PathBuf) -> Option<PathBuf> {
-        self.path.replace(replacement)
-    }
-}
-
-impl Drop for SubresourceResponseBodyWriter {
-    fn drop(&mut self) {
-        let _ = self.file.take();
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
-        }
+        let Some(pool) = self.disk_pool.as_ref() else {
+            return false;
+        };
+        let Ok(Some(chunk)) = pool.store(&self.memory) else {
+            return false;
+        };
+        self.disk_chunks.push(chunk);
+        self.memory.clear();
+        true
     }
 }
 
@@ -1640,6 +1766,26 @@ impl SubresourceResponseBody {
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
         Self {
             inner: Arc::new(SubresourceResponseBodyInner::Memory(bytes)),
+            prefix_len: None,
+        }
+    }
+
+    /// Builds a response body that shares the encoded image backing.
+    /// Cloning this body does not clone bytes.
+    pub fn from_parkable_image(image: ParkableImage) -> Self {
+        Self {
+            inner: Arc::new(SubresourceResponseBodyInner::ParkableImage(image)),
+            prefix_len: None,
+        }
+    }
+
+    /// A bounded readable view of the same capture, without copying or
+    /// re-spooling. The entire backing remains alive; bounded caches must
+    /// charge `retained_size_bytes()`, not this view's `len()`.
+    pub fn prefix(&self, len: usize) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            prefix_len: Some(len.min(self.len())),
         }
     }
 
@@ -1667,8 +1813,11 @@ impl SubresourceResponseBody {
 
     pub fn try_bytes(&self) -> io::Result<Cow<'_, [u8]>> {
         match self.inner.as_ref() {
-            SubresourceResponseBodyInner::Memory(bytes) => Ok(Cow::Borrowed(bytes)),
-            SubresourceResponseBodyInner::File { .. } => self.materialize_bytes().map(Cow::Owned),
+            SubresourceResponseBodyInner::Memory(bytes) => Ok(Cow::Borrowed(&bytes[..self.len()])),
+            SubresourceResponseBodyInner::Disk { .. } => self.materialize_bytes().map(Cow::Owned),
+            SubresourceResponseBodyInner::ParkableImage(image) => image
+                .snapshot()
+                .map(|snapshot| Cow::Owned(snapshot[..self.len()].to_vec())),
         }
     }
 
@@ -1713,24 +1862,11 @@ impl SubresourceResponseBody {
     }
 
     pub fn materialize_bytes_from(&self, offset: usize) -> io::Result<Vec<u8>> {
-        match self.inner.as_ref() {
-            SubresourceResponseBodyInner::Memory(bytes) => {
-                Ok(bytes.get(offset..).map(<[u8]>::to_vec).unwrap_or_default())
-            }
-            SubresourceResponseBodyInner::File { path, len, .. } => {
-                if offset >= *len {
-                    return Ok(Vec::new());
-                }
-                let mut file = File::open(path)?;
-                file.seek(io::SeekFrom::Start(offset as u64))?;
-                let mut bytes = Vec::with_capacity(len.saturating_sub(offset));
-                file.read_to_end(&mut bytes)?;
-                Ok(bytes)
-            }
-        }
+        self.read_chunk(offset, self.len().saturating_sub(offset))
     }
 
     pub fn read_chunk(&self, offset: usize, max_len: usize) -> io::Result<Vec<u8>> {
+        let max_len = max_len.min(self.len().saturating_sub(offset));
         if max_len == 0 {
             return Ok(Vec::new());
         }
@@ -1742,42 +1878,49 @@ impl SubresourceResponseBody {
                 let len = remaining.len().min(max_len);
                 Ok(remaining[..len].to_vec())
             }
-            SubresourceResponseBodyInner::File { path, len, .. } => {
-                if offset >= *len {
-                    return Ok(Vec::new());
-                }
-                let mut file = File::open(path)?;
-                file.seek(io::SeekFrom::Start(offset as u64))?;
-                let mut chunk = vec![0; max_len.min(len.saturating_sub(offset))];
-                let read = file.read(&mut chunk)?;
-                chunk.truncate(read);
-                Ok(chunk)
+            SubresourceResponseBodyInner::Disk { storage, .. } => {
+                storage.read_range(offset, max_len)
             }
+            SubresourceResponseBodyInner::ParkableImage(image) => image.read_range(offset, max_len),
         }
     }
 
     pub fn write_bytes_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        if self.prefix_len.is_some() {
+            let mut offset = 0;
+            while offset < self.len() {
+                let bytes = self.read_chunk(offset, 64 * 1024)?;
+                writer.write_all(&bytes)?;
+                offset += bytes.len();
+            }
+            return Ok(());
+        }
         match self.inner.as_ref() {
             SubresourceResponseBodyInner::Memory(bytes) => writer.write_all(bytes),
-            SubresourceResponseBodyInner::File { path, .. } => {
-                let mut file = File::open(path)?;
-                let mut buffer = [0; 64 * 1024];
-                loop {
-                    let read = file.read(&mut buffer)?;
-                    if read == 0 {
-                        break;
-                    }
-                    writer.write_all(&buffer[..read])?;
-                }
-                Ok(())
+            SubresourceResponseBodyInner::Disk { storage, .. } => storage.write_to(writer),
+            SubresourceResponseBodyInner::ParkableImage(image) => {
+                writer.write_all(&image.snapshot()?)
             }
         }
     }
 
     pub fn len(&self) -> usize {
-        match self.inner.as_ref() {
+        let len = match self.inner.as_ref() {
             SubresourceResponseBodyInner::Memory(bytes) => bytes.len(),
-            SubresourceResponseBodyInner::File { len, .. } => *len,
+            SubresourceResponseBodyInner::Disk { storage, .. } => storage.len,
+            SubresourceResponseBodyInner::ParkableImage(image) => image.len(),
+        };
+        self.prefix_len.map_or(len, |prefix| prefix.min(len))
+    }
+
+    /// Storage byte charge for the whole backing retained by this view.
+    /// Shared backings are conservatively charged in full for each entry.
+    /// This does not read or materialize the body, and excludes object metadata.
+    pub fn retained_size_bytes(&self) -> usize {
+        match self.inner.as_ref() {
+            SubresourceResponseBodyInner::Memory(bytes) => bytes.capacity(),
+            SubresourceResponseBodyInner::Disk { storage } => storage.len,
+            SubresourceResponseBodyInner::ParkableImage(image) => image.len(),
         }
     }
 
@@ -1785,42 +1928,6 @@ impl SubresourceResponseBody {
         self.len() == 0
     }
 }
-
-fn unique_subresource_response_body_spool_path() -> io::Result<PathBuf> {
-    let root = std::env::temp_dir().join("moli-subresource-body-spool");
-    create_secure_subresource_response_body_spool_root(&root)?;
-    let id = NEXT_SUBRESOURCE_RESPONSE_BODY_SPOOL_ID.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    Ok(root.join(format!(
-        "subresource-body-{}-{id}-{nanos}.bin",
-        std::process::id()
-    )))
-}
-
-#[cfg(unix)]
-fn create_secure_subresource_response_body_spool_root(root: &Path) -> io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder.create(root)?;
-    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn create_secure_subresource_response_body_spool_root(root: &Path) -> io::Result<()> {
-    fs::create_dir_all(root)
-}
-
-#[cfg(unix)]
-fn configure_secure_subresource_response_body_spool_file_options(options: &mut OpenOptions) {
-    options.mode(0o600);
-}
-
-#[cfg(not(unix))]
-fn configure_secure_subresource_response_body_spool_file_options(_options: &mut OpenOptions) {}
 
 #[derive(Debug, Clone, Default)]
 pub struct SubresourceResponseWaitCriteria {
@@ -1949,7 +2056,7 @@ pub struct SubresourceJsonPathRegex {
 }
 
 fn json_path_equals(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     body: &str,
     expectation: &SubresourceJsonPathEquals,
 ) -> bool {
@@ -1959,7 +2066,7 @@ fn json_path_equals(
 }
 
 fn json_path_matches_regex(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     body: &str,
     expectation: &SubresourceJsonPathRegex,
 ) -> bool {
@@ -1969,15 +2076,15 @@ fn json_path_matches_regex(
 }
 
 fn json_path_satisfies(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     body: &str,
     path: &[String],
     predicate: impl FnOnce(&Value) -> bool,
 ) -> bool {
-    let Some(content_type) = header_value(headers, "content-type") else {
+    let Some(content_type) = extract_response_mime_essence(headers) else {
         return false;
     };
-    if !is_json_module_mime(content_type) {
+    if !is_json_mime(&content_type) {
         return false;
     }
 
@@ -2019,13 +2126,6 @@ fn json_value_matches_regex(value: &Value, regex: &Regex) -> bool {
         Value::Null => regex.is_match("null"),
         Value::Array(_) | Value::Object(_) => false,
     }
-}
-
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
 }
 
 impl SubresourceNetworkRecord {
@@ -2108,14 +2208,14 @@ impl SubresourceNetworkRecord {
         document_url: Url,
         url: Url,
         method: String,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         request_body: Option<String>,
         resource_type: SubresourceResourceType,
         request_cookie_report: Option<StoredCookieQueryReport>,
         redirect_chain: Vec<NavigationRedirect>,
         final_url: Url,
         status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: String,
         cookie_set_reports: Vec<StoredCookieSetReport>,
     ) -> Self {
@@ -2142,14 +2242,14 @@ impl SubresourceNetworkRecord {
         document_url: Url,
         url: Url,
         method: String,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         request_body: Option<String>,
         resource_type: SubresourceResourceType,
         request_cookie_report: Option<StoredCookieQueryReport>,
         redirect_chain: Vec<NavigationRedirect>,
         final_url: Url,
         status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: SubresourceResponseBody,
         cookie_set_reports: Vec<StoredCookieSetReport>,
     ) -> Self {
@@ -2189,7 +2289,7 @@ impl SubresourceNetworkRecord {
         document_url: Url,
         url: Url,
         method: String,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         request_body: Option<String>,
         resource_type: SubresourceResourceType,
         error_text: String,
@@ -2228,7 +2328,7 @@ impl SubresourceNetworkRecord {
         self
     }
 
-    pub fn with_request_body_bytes(mut self, request_body_bytes: Option<Vec<u8>>) -> Self {
+    pub fn with_request_body_bytes(mut self, request_body_bytes: Option<bytes::Bytes>) -> Self {
         let inner = Arc::make_mut(&mut self.inner);
         inner.request_body_bytes =
             request_body_bytes.or_else(|| request_body_text_bytes(&inner.request_body));
@@ -2240,6 +2340,27 @@ impl SubresourceNetworkRecord {
         request_initiator_type: SubresourceRequestInitiatorType,
     ) -> Self {
         Arc::make_mut(&mut self.inner).request_initiator_type = request_initiator_type;
+        self
+    }
+
+    /// Projects a terminal after redirects were already reported separately.
+    /// The diagnostic record can keep its original complete redirect chain.
+    pub fn with_redirect_chain(mut self, redirects: Vec<NavigationRedirect>) -> Self {
+        if let SubresourceNetworkOutcome::Success { redirect_chain, .. } =
+            &mut Arc::make_mut(&mut self.inner).outcome
+        {
+            *redirect_chain = redirects;
+        }
+        self
+    }
+
+    /// Keeps a consumer's detailed diagnostic without rebuilding the terminal.
+    pub fn with_error_text(mut self, error: impl Into<String>) -> Self {
+        if let SubresourceNetworkOutcome::Failure { error_text } =
+            &mut Arc::make_mut(&mut self.inner).outcome
+        {
+            *error_text = error.into();
+        }
         self
     }
 
@@ -2299,7 +2420,7 @@ impl SubresourceNetworkRecord {
         &self.inner.method
     }
 
-    pub fn request_headers(&self) -> &[(String, String)] {
+    pub fn request_headers(&self) -> &moli_fetch::RequestHeaders {
         &self.inner.request_headers
     }
 
@@ -2307,8 +2428,8 @@ impl SubresourceNetworkRecord {
         self.inner.request_body.as_deref()
     }
 
-    pub fn request_body_bytes(&self) -> Option<&[u8]> {
-        self.inner.request_body_bytes.as_deref()
+    pub fn request_body_bytes(&self) -> Option<&bytes::Bytes> {
+        self.inner.request_body_bytes.as_ref()
     }
 
     pub fn resource_type(&self) -> SubresourceResourceType {
@@ -2364,8 +2485,10 @@ impl SubresourceNetworkRecord {
     }
 }
 
-fn request_body_text_bytes(request_body: &Option<String>) -> Option<Vec<u8>> {
-    request_body.as_ref().map(|body| body.as_bytes().to_vec())
+fn request_body_text_bytes(request_body: &Option<String>) -> Option<bytes::Bytes> {
+    request_body
+        .as_ref()
+        .map(|body| bytes::Bytes::copy_from_slice(body.as_bytes()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2377,11 +2500,18 @@ pub struct PendingSubresourceFetchInfo {
     pub url: Url,
     pub websocket_socket_id: Option<u64>,
     pub method: String,
-    pub request_headers: Vec<(String, String)>,
+    pub request_headers: moli_fetch::RequestHeaders,
     pub request_body: Option<String>,
-    pub request_body_bytes: Option<Vec<u8>>,
+    pub request_body_bytes: Option<bytes::Bytes>,
     pub resource_type: SubresourceResourceType,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
+}
+
+/// The navigation identity and previous response for one child Document hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildDocumentFetchRequest {
+    pub loader_id: String,
+    pub redirect: Option<NavigationRedirect>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2390,17 +2520,18 @@ pub struct PendingSubresourceResponseInfo {
     pub url: Url,
     pub final_url: Url,
     pub method: String,
-    pub request_headers: Vec<(String, String)>,
+    pub request_headers: moli_fetch::RequestHeaders,
     pub request_body: Option<String>,
     pub resource_type: SubresourceResourceType,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub network_request_headers: Option<Vec<(String, String)>>,
     pub response_status: u16,
-    pub response_headers: Vec<(String, String)>,
-    /// Exact response bytes plus the lossy compatibility text view needed while
-    /// a response-stage Fetch pause is held.
+    pub response_headers: Vec<(String, Vec<u8>)>,
+    /// Captured body for renderer-owned continuations. Native network pauses
+    /// carry their pending body capability separately; this is empty there.
     pub response_body: SubresourceResponseBody,
     pub from_cache: bool,
+    pub cache_state: moli_fetch::ResponseCacheState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2408,7 +2539,7 @@ pub struct PendingSubresourceAuthInfo {
     pub internal_id: u64,
     pub url: Url,
     pub method: String,
-    pub request_headers: Vec<(String, String)>,
+    pub request_headers: moli_fetch::RequestHeaders,
     pub request_body: Option<String>,
     pub resource_type: SubresourceResourceType,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
@@ -2417,9 +2548,12 @@ pub struct PendingSubresourceAuthInfo {
     pub intercept_response: bool,
     pub response_final_url: Url,
     pub response_status: u16,
-    pub response_headers: Vec<(String, String)>,
+    pub response_headers: Vec<(String, Vec<u8>)>,
+    /// Captured compatibility body; native network pauses retain the pending
+    /// transfer in their native decision port instead of waiting for EOF.
     pub response_body: SubresourceResponseBody,
     pub response_from_cache: bool,
+    pub response_cache_state: moli_fetch::ResponseCacheState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2453,19 +2587,19 @@ pub struct SubresourceAuthCredentials {
 }
 
 pub fn extract_subresource_auth_challenge(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> Option<SubresourceAuthChallenge> {
     let mut first_challenge = None;
     for (source, value) in headers.iter().filter_map(|(name, value)| {
         if name.eq_ignore_ascii_case("www-authenticate") {
-            Some(("Server", value.as_str()))
+            Some(("Server", moli_fetch::decode_header_value(value)))
         } else if name.eq_ignore_ascii_case("proxy-authenticate") {
-            Some(("Proxy", value.as_str()))
+            Some(("Proxy", moli_fetch::decode_header_value(value)))
         } else {
             None
         }
     }) {
-        for candidate in parse_auth_challenge_candidates(value) {
+        for candidate in parse_auth_challenge_candidates(&value) {
             let challenge = SubresourceAuthChallenge {
                 source: source.to_owned(),
                 scheme: candidate.scheme,
@@ -2572,6 +2706,9 @@ pub enum PendingSubresourceContinueEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubresourceResourceType {
+    /// A child frame's navigation request. Only CDP Fetch interception uses
+    /// this type; the request itself is issued by the child navigation.
+    Document,
     Script,
     Stylesheet,
     Image,
@@ -2624,7 +2761,8 @@ impl OptionalResourceFetchMask {
             SubresourceResourceType::Video => Some(Self::VIDEO),
             SubresourceResourceType::Media => Some(Self::MEDIA),
             SubresourceResourceType::TextTrack => Some(Self::TEXT_TRACK),
-            SubresourceResourceType::Script
+            SubresourceResourceType::Document
+            | SubresourceResourceType::Script
             | SubresourceResourceType::Stylesheet
             | SubresourceResourceType::Fetch
             | SubresourceResourceType::EventSource
@@ -2674,6 +2812,7 @@ impl SubresourceRequestInitiatorType {
 impl SubresourceResourceType {
     pub fn as_cdp_type(self) -> &'static str {
         match self {
+            Self::Document => "Document",
             Self::Script => "Script",
             Self::Stylesheet => "Stylesheet",
             Self::Image => "Image",
@@ -2695,17 +2834,92 @@ impl SubresourceResourceType {
     /// Returns the resource type exposed by the CDP Fetch interception domain.
     ///
     /// Chromium's loader interception receives Fetch, EventSource, and XHR as
-    /// Blink's shared `kXhr` resource type. The Network domain still reports
-    /// their higher-level types through `as_cdp_type`.
+    /// Blink's shared `kXhr` resource type, and text tracks as `kMedia`. The
+    /// Network domain still reports their higher-level types through `as_cdp_type`.
     pub fn as_cdp_fetch_interception_type(self) -> &'static str {
         match self {
             Self::Fetch | Self::EventSource | Self::Xhr => "XHR",
+            Self::TextTrack => "Media",
             _ => self.as_cdp_type(),
         }
     }
 
     pub fn has_same_cdp_fetch_interception_type(self, other: Self) -> bool {
         self.as_cdp_fetch_interception_type() == other.as_cdp_fetch_interception_type()
+    }
+}
+
+bitflags::bitflags! {
+    /// The set of CDP Fetch interception classes that the renderer routes
+    /// through the protocol.
+    ///
+    /// Interception classes mirror the distinct tokens of
+    /// [`SubresourceResourceType::as_cdp_fetch_interception_type`]: Chromium's
+    /// loader collapses Blink's Fetch, EventSource, and XHR into the shared
+    /// "XHR" class and text tracks into "Media", so several resource types
+    /// share one class bit. Fetch.enable patterns with heterogeneous resource
+    /// types used to collapse the renderer channel to "intercept every
+    /// class"; a class set keeps them scoped to exactly the classes the
+    /// patterns name. An empty set routes nothing through the protocol, while
+    /// [`Self::ALL`] routes every class and preserves type-less pattern,
+    /// auth, and response-stage admission.
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+    pub struct SubresourceInterceptionClasses: u16 {
+        const NONE = 0;
+        const DOCUMENT = 1 << 0;
+        const SCRIPT = 1 << 1;
+        const STYLESHEET = 1 << 2;
+        const IMAGE = 1 << 3;
+        const FONT = 1 << 4;
+        const MEDIA = 1 << 5;
+        const FETCH_LIKE = 1 << 6;
+        const PING = 1 << 7;
+        const CSP_VIOLATION_REPORT = 1 << 8;
+        const MANIFEST = 1 << 9;
+        const WEBSOCKET = 1 << 10;
+        const OTHER = 1 << 11;
+        const ALL = Self::DOCUMENT.bits()
+            | Self::SCRIPT.bits()
+            | Self::STYLESHEET.bits()
+            | Self::IMAGE.bits()
+            | Self::FONT.bits()
+            | Self::MEDIA.bits()
+            | Self::FETCH_LIKE.bits()
+            | Self::PING.bits()
+            | Self::CSP_VIOLATION_REPORT.bits()
+            | Self::MANIFEST.bits()
+            | Self::WEBSOCKET.bits()
+            | Self::OTHER.bits();
+    }
+}
+
+impl SubresourceInterceptionClasses {
+    /// The set holding only `resource_type`'s CDP Fetch interception class.
+    pub const fn for_resource_type(resource_type: SubresourceResourceType) -> Self {
+        match resource_type {
+            SubresourceResourceType::Document => Self::DOCUMENT,
+            SubresourceResourceType::Script => Self::SCRIPT,
+            SubresourceResourceType::Stylesheet => Self::STYLESHEET,
+            SubresourceResourceType::Image => Self::IMAGE,
+            SubresourceResourceType::Font => Self::FONT,
+            SubresourceResourceType::Audio
+            | SubresourceResourceType::Video
+            | SubresourceResourceType::Media
+            | SubresourceResourceType::TextTrack => Self::MEDIA,
+            SubresourceResourceType::Fetch
+            | SubresourceResourceType::EventSource
+            | SubresourceResourceType::Xhr => Self::FETCH_LIKE,
+            SubresourceResourceType::Ping => Self::PING,
+            SubresourceResourceType::CspReport => Self::CSP_VIOLATION_REPORT,
+            SubresourceResourceType::Dictionary => Self::OTHER,
+            SubresourceResourceType::Manifest => Self::MANIFEST,
+            SubresourceResourceType::WebSocket => Self::WEBSOCKET,
+        }
+    }
+
+    /// Whether the set admits `resource_type`'s interception class.
+    pub const fn intercepts(self, resource_type: SubresourceResourceType) -> bool {
+        self.intersects(Self::for_resource_type(resource_type))
     }
 }
 
@@ -2716,7 +2930,7 @@ pub enum SubresourceNetworkOutcome {
         final_url: Url,
         status: u16,
         status_text: Option<String>,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: SubresourceResponseBody,
     },
     Failure {
@@ -3094,6 +3308,7 @@ pub struct EmulatedMediaOverrides {
     pub media: Option<String>,
     pub color_scheme: Option<String>,
     pub reduced_motion: Option<String>,
+    pub reduced_transparency: Option<String>,
     pub forced_colors: Option<String>,
     pub contrast: Option<String>,
 }
@@ -3115,6 +3330,76 @@ pub struct ViewportSurface {
     pub screen_height: u32,
     pub screen_avail_width: u32,
     pub screen_avail_height: u32,
+    pub window_x: i32,
+    pub window_y: i32,
+    pub screen_orientation: ScreenOrientation,
+    /// Presentation of the native widget, independent of the CSS layout size.
+    pub emulated_view: Option<EmulatedView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmulatedView {
+    pub width: u32,
+    pub height: u32,
+    pub scale: f64,
+    /// The compositor keeps its native DPR even when CSS reports an override.
+    pub native_device_pixel_ratio: f64,
+    pub viewport: Option<EmulatedViewport>,
+}
+
+/// Page-coordinate origin and scale of a forced compositor viewport. Its
+/// requested extent is already accounted for in the native widget dimensions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EmulatedViewport {
+    pub x: f64,
+    pub y: f64,
+    pub scale: f64,
+}
+
+impl ViewportSurface {
+    pub fn visible_size(self) -> (u32, u32) {
+        self.emulated_view
+            .map_or((self.inner_width, self.inner_height), |view| {
+                (view.width, view.height)
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenOrientation {
+    pub kind: &'static str,
+    pub angle: u16,
+}
+
+impl Default for ScreenOrientation {
+    fn default() -> Self {
+        let profile = moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE;
+        Self {
+            kind: profile.orientation_type,
+            angle: profile.orientation_angle as u16,
+        }
+    }
+}
+
+impl Default for ViewportSurface {
+    fn default() -> Self {
+        let profile = moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE;
+        Self {
+            inner_width: profile.inner_width as u32,
+            inner_height: profile.inner_height as u32,
+            outer_width: profile.inner_width as u32,
+            outer_height: profile.inner_height as u32,
+            device_pixel_ratio: profile.device_pixel_ratio,
+            screen_width: profile.screen_width as u32,
+            screen_height: profile.screen_height as u32,
+            screen_avail_width: profile.screen_avail_width as u32,
+            screen_avail_height: profile.screen_avail_height as u32,
+            window_x: 0,
+            window_y: 0,
+            screen_orientation: Default::default(),
+            emulated_view: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -3197,7 +3482,7 @@ pub struct ChildFrameDocumentNetworkSnapshot {
     pub final_url: String,
     pub status: u16,
     #[serde(default)]
-    pub response_headers: Vec<(String, String)>,
+    pub response_headers: Vec<(String, Vec<u8>)>,
     #[serde(default)]
     pub encoded_data_length: usize,
     /// Exact in-process response body source for protocol consumers.
@@ -3209,6 +3494,8 @@ pub struct ChildFrameDocumentNetworkSnapshot {
     pub response_body: Option<SubresourceResponseBody>,
     #[serde(default)]
     pub from_cache: bool,
+    #[serde(default)]
+    pub cache_state: moli_fetch::ResponseCacheState,
 }
 
 /// A completed child main-resource request whose Network facts remain
@@ -3408,12 +3695,89 @@ pub enum ScriptSkipReason {
     UnsupportedType(String),
 }
 
+pub use inspector_identity::allocate_nonzero_u64;
+
+pub use renderer_transport_memory::transport_headers_charge_bytes;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn test_url(path: &str) -> Url {
         Url::parse(&format!("https://example.test{path}")).expect("test URL should parse")
+    }
+
+    fn pooled_body_writer(memory_limit: usize, pool: &DiskPool) -> SubresourceResponseBodyWriter {
+        SubresourceResponseBodyWriter::with_memory_limit_and_disk_pool(
+            memory_limit,
+            Some(pool.clone()),
+        )
+    }
+
+    #[test]
+    fn response_body_prefix_reads_survive_spilling_and_later_appends() {
+        let pool = DiskPool::new(None).unwrap();
+        let mut body = pooled_body_writer(4, &pool);
+        body.append(b"abc");
+        assert_eq!(body.read_chunk(1, 100).unwrap(), b"bc");
+        body.append(b"defghi");
+        assert_eq!(body.len(), 9);
+        assert_eq!(body.read_chunk(2, 6).unwrap(), b"cdefgh");
+        body.append(b"jkl");
+        assert_eq!(body.read_chunk(7, 20).unwrap(), b"hijkl");
+        assert!(body.read_chunk(20, 1).unwrap().is_empty());
+        let finished = body.finish();
+        assert_eq!(finished.materialize_bytes().unwrap(), b"abcdefghijkl");
+    }
+
+    #[test]
+    fn navigation_status_message_survives_conversion_and_header_overrides() {
+        for status_text in [None, Some("Original message"), Some("")] {
+            let mut response = NavigationResponse::from_text_body(
+                test_url("/response"),
+                200,
+                Vec::new(),
+                "body".to_owned(),
+            );
+            response.status_text = status_text.map(str::to_owned);
+            let headers = vec![("x-overridden".to_owned(), b"true".to_vec())];
+            let overridden =
+                NavigationResponse::with_status_headers_from(&response, 200, headers.clone());
+            assert_eq!(overridden.headers, headers);
+            assert_eq!(overridden.status_text, response.status_text);
+            assert_eq!(
+                overridden.clone().into_parts().0.status_text,
+                response.status_text
+            );
+            let text = Response::from(overridden);
+            assert_eq!(text.head().status_text, response.status_text);
+            let round_trip = NavigationResponse::from(text);
+            assert_eq!(round_trip.into_body().0.status_text, response.status_text);
+
+            let changed = NavigationResponse::with_status_headers_from(&response, 201, Vec::new());
+            assert_eq!(changed.head().status_text(), "Created");
+            assert_eq!(changed.body_text(), "body");
+        }
+    }
+
+    #[test]
+    fn navigation_response_byte_parts_transfer_exact_storage() {
+        let template =
+            NavigationResponse::from_text_body(test_url("/module"), 200, Vec::new(), String::new());
+        for bytes in [b"module source".to_vec(), vec![b'a', 0xff, b'b']] {
+            let expected = bytes.clone();
+            let storage = bytes.as_ptr();
+            let response = NavigationResponse::from_head_and_materialized_body(
+                template.head(),
+                ResponseBody::lossy_text_from_bytes(bytes),
+            );
+
+            let (head, bytes) = response.into_byte_parts();
+
+            assert_eq!(head.final_url, template.final_url);
+            assert_eq!(bytes, expected);
+            assert_eq!(bytes.as_ptr(), storage, "exact bytes must be transferred");
+        }
     }
 
     #[test]
@@ -3464,7 +3828,7 @@ mod tests {
             test_url("/"),
             test_url("/asset.js"),
             "GET".to_owned(),
-            vec![("accept".to_owned(), "*/*".to_owned())],
+            vec![("accept".to_owned(), "*/*".to_owned())].into(),
             None,
             SubresourceResourceType::Script,
             "network failed".to_owned(),
@@ -3595,6 +3959,119 @@ mod tests {
     }
 
     #[test]
+    fn cdp_fetch_interception_groups_audio_video_and_text_tracks() {
+        let media = [
+            SubresourceResourceType::Audio,
+            SubresourceResourceType::Video,
+            SubresourceResourceType::Media,
+            SubresourceResourceType::TextTrack,
+        ];
+        for resource_type in media {
+            assert_eq!(resource_type.as_cdp_fetch_interception_type(), "Media");
+            for other in media {
+                assert!(resource_type.has_same_cdp_fetch_interception_type(other));
+            }
+            assert!(
+                !resource_type.has_same_cdp_fetch_interception_type(SubresourceResourceType::Font)
+            );
+        }
+        assert_eq!(
+            SubresourceResourceType::TextTrack.as_cdp_type(),
+            "TextTrack"
+        );
+    }
+
+    #[test]
+    fn interception_classes_share_bits_with_cdp_fetch_interception_groups() {
+        let grouped: &[(&[SubresourceResourceType], SubresourceInterceptionClasses)] = &[
+            (
+                &[SubresourceResourceType::Document],
+                SubresourceInterceptionClasses::DOCUMENT,
+            ),
+            (
+                &[SubresourceResourceType::Script],
+                SubresourceInterceptionClasses::SCRIPT,
+            ),
+            (
+                &[SubresourceResourceType::Stylesheet],
+                SubresourceInterceptionClasses::STYLESHEET,
+            ),
+            (
+                &[SubresourceResourceType::Image],
+                SubresourceInterceptionClasses::IMAGE,
+            ),
+            (
+                &[SubresourceResourceType::Font],
+                SubresourceInterceptionClasses::FONT,
+            ),
+            (
+                &[
+                    SubresourceResourceType::Audio,
+                    SubresourceResourceType::Video,
+                    SubresourceResourceType::Media,
+                    SubresourceResourceType::TextTrack,
+                ],
+                SubresourceInterceptionClasses::MEDIA,
+            ),
+            (
+                &[
+                    SubresourceResourceType::Fetch,
+                    SubresourceResourceType::EventSource,
+                    SubresourceResourceType::Xhr,
+                ],
+                SubresourceInterceptionClasses::FETCH_LIKE,
+            ),
+            (
+                &[SubresourceResourceType::Ping],
+                SubresourceInterceptionClasses::PING,
+            ),
+            (
+                &[SubresourceResourceType::CspReport],
+                SubresourceInterceptionClasses::CSP_VIOLATION_REPORT,
+            ),
+            (
+                &[SubresourceResourceType::Dictionary],
+                SubresourceInterceptionClasses::OTHER,
+            ),
+            (
+                &[SubresourceResourceType::Manifest],
+                SubresourceInterceptionClasses::MANIFEST,
+            ),
+            (
+                &[SubresourceResourceType::WebSocket],
+                SubresourceInterceptionClasses::WEBSOCKET,
+            ),
+        ];
+
+        let all: Vec<SubresourceResourceType> = grouped
+            .iter()
+            .flat_map(|(types, _)| types.iter().copied())
+            .collect();
+        assert_eq!(all.len(), 17);
+        for (types, class) in grouped {
+            for resource_type in *types {
+                assert_eq!(
+                    SubresourceInterceptionClasses::for_resource_type(*resource_type),
+                    *class
+                );
+                assert!(class.intercepts(*resource_type));
+                assert!(SubresourceInterceptionClasses::ALL.intercepts(*resource_type));
+                let others = SubresourceInterceptionClasses::ALL.difference(*class);
+                assert!(!others.intercepts(*resource_type));
+            }
+        }
+        let union = grouped
+            .iter()
+            .fold(SubresourceInterceptionClasses::NONE, |set, (_, class)| {
+                set.union(*class)
+            });
+        assert_eq!(union, SubresourceInterceptionClasses::ALL);
+        assert!(
+            !SubresourceInterceptionClasses::NONE.intersects(SubresourceInterceptionClasses::ALL)
+        );
+    }
+
+    #[test]
     fn optional_resource_fetch_mask_round_trips_valid_bits_and_rejects_unknown_bits() {
         for bits in 0..=OptionalResourceFetchMask::ALL.bits() {
             assert_eq!(
@@ -3694,7 +4171,7 @@ mod tests {
             document_url.clone(),
             test_url("/api"),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             "network failed".to_owned(),
@@ -3743,7 +4220,7 @@ mod tests {
             document_url,
             test_url("/image.png"),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Image,
             SubresourceRequestInitiatorType::Parser,
@@ -3754,7 +4231,7 @@ mod tests {
             Vec::new(),
             test_url("/image.png"),
             200,
-            vec![("content-type".to_owned(), "image/png".to_owned())],
+            vec![("content-type".to_owned(), b"image/png".to_vec())],
             Vec::new(),
         );
         let body = SubresourceBodyFinished::ready(
@@ -3801,7 +4278,7 @@ mod tests {
             document_url.clone(),
             test_url("/api"),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             "network failed".to_owned(),
@@ -3866,6 +4343,7 @@ mod tests {
     fn subresource_response_body_stores_only_exact_response_bytes() {
         let response = Response::from_head_and_body(
             ResponseHead {
+                status_text: None,
                 final_url: test_url("/utf8.txt"),
                 status: 200,
                 headers: Vec::new(),
@@ -3874,6 +4352,7 @@ mod tests {
                 redirected: false,
                 redirect_chain: Vec::new(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             "hello".to_owned(),
@@ -3892,6 +4371,7 @@ mod tests {
     fn subresource_response_body_preserves_non_utf8_response_bytes() {
         let response = Response::from_head_and_body(
             ResponseHead {
+                status_text: None,
                 final_url: test_url("/legacy.txt"),
                 status: 200,
                 headers: Vec::new(),
@@ -3900,6 +4380,7 @@ mod tests {
                 redirected: false,
                 redirect_chain: Vec::new(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             "é".to_owned(),
@@ -3913,7 +4394,8 @@ mod tests {
 
     #[test]
     fn subresource_response_body_writer_keeps_small_body_in_memory() {
-        let mut writer = SubresourceResponseBodyWriter::new(16);
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer = pooled_body_writer(16, &pool);
         writer.append(b"hello");
         writer.append(b" world");
         let body = writer.finish();
@@ -3921,53 +4403,239 @@ mod tests {
         assert_eq!(body.len(), 11);
         assert_eq!(body.try_bytes().unwrap().as_ref(), b"hello world");
         assert_eq!(body.clone_body_bytes(), b"hello world");
+        assert_eq!(pool.diagnostics().disk_footprint_bytes, 0);
     }
 
     #[test]
-    fn subresource_response_body_writer_spools_large_body_and_materializes_on_demand() {
-        let mut writer = SubresourceResponseBodyWriter::new(4);
+    fn navigation_response_body_can_move_into_an_external_backing_without_cloning() {
+        let mut response = NavigationResponse::from_head_and_body(
+            ResponseHead {
+                final_url: test_url("/image.png"),
+                status: 200,
+                status_text: None,
+                headers: vec![("Content-Type".to_owned(), b"image/png".to_vec())],
+                request_cookie_report: None,
+                cookie_set_reports: Vec::new(),
+                redirected: false,
+                redirect_chain: Vec::new(),
+                from_cache: false,
+                cache_state: Default::default(),
+                negotiated_http_version: None,
+            },
+            String::new(),
+            b"encoded-image".to_vec(),
+        );
+
+        assert_eq!(response.take_body_bytes(), b"encoded-image");
+        assert!(response.body_bytes().is_empty());
+        assert_eq!(response.status, 200);
+        assert_eq!(response.final_url, test_url("/image.png"));
+    }
+
+    #[test]
+    fn subresource_response_body_writer_pools_large_body_and_materializes_on_demand() {
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer = pooled_body_writer(4, &pool);
         writer.append(b"hello");
         writer.append(b" world");
         let body = writer.finish();
 
         assert_eq!(body.len(), 11);
+        assert_eq!(pool.diagnostics().disk_footprint_bytes, 11);
         assert_eq!(body.try_bytes().unwrap().as_ref(), b"hello world");
 
         let mut copied = Vec::new();
         body.write_bytes_to(&mut copied)
-            .expect("spooled body should stream-copy into writer");
+            .expect("pooled body should stream-copy into writer");
         assert_eq!(copied, b"hello world");
     }
 
     #[test]
-    fn subresource_response_body_reads_memory_and_spooled_chunks_by_offset() {
+    fn response_body_prefix_shares_storage_and_bounds_all_read_paths() {
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer = pooled_body_writer(4, &pool);
+        writer.append(b"hello world");
+        let pooled = writer.finish();
+        for body in [
+            SubresourceResponseBody::from_bytes(b"hello world".to_vec()),
+            pooled,
+        ] {
+            let prefix = body.prefix(5);
+            assert!(Arc::ptr_eq(&body.inner, &prefix.inner));
+            assert_eq!(prefix.len(), 5);
+            assert_ne!(body, prefix);
+            assert_eq!(prefix.try_bytes().unwrap().as_ref(), b"hello");
+            assert_eq!(prefix.materialize_bytes_from(3).unwrap(), b"lo");
+            assert_eq!(prefix.read_chunk(3, usize::MAX).unwrap(), b"lo");
+            assert!(prefix.read_chunk(5, usize::MAX).unwrap().is_empty());
+            let mut copied = Vec::new();
+            prefix.write_bytes_to(&mut copied).unwrap();
+            assert_eq!(copied, b"hello");
+            assert_eq!(prefix.prefix(usize::MAX), prefix);
+            assert!(prefix.prefix(0).is_empty());
+            assert_eq!(body.materialize_bytes().unwrap(), b"hello world");
+        }
+        assert_eq!(pool.diagnostics().disk_footprint_bytes, 11);
+    }
+
+    #[test]
+    fn response_body_prefix_retains_full_memory_allocation_after_other_owners_drop() {
+        for visible in [0, 2] {
+            let mut bytes = Vec::with_capacity(64);
+            bytes.extend_from_slice(b"abcdef");
+            let capacity = bytes.capacity();
+            let full = SubresourceResponseBody::from_bytes(bytes);
+            let backing = Arc::downgrade(&full.inner);
+            let reader = full.clone();
+            let prefix = full.prefix(visible);
+            drop(full);
+            drop(reader);
+
+            assert_eq!(backing.strong_count(), 1);
+            assert_eq!(prefix.len(), visible);
+            assert_eq!(prefix.retained_size_bytes(), capacity);
+            assert_eq!(prefix.materialize_bytes().unwrap(), &b"abcdef"[..visible]);
+            drop(prefix);
+            assert!(backing.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn response_body_prefix_retains_full_disk_capture_until_last_owner_drops() {
+        let pool = DiskPool::new(None).unwrap();
+        for visible in [0, 2] {
+            let mut writer = pooled_body_writer(4, &pool);
+            writer.append(b"abcdefghijkl");
+            let full = writer.finish();
+            let reader = full.clone();
+            let prefix = full.prefix(visible);
+            drop(full);
+            drop(reader);
+
+            let retained = pool.diagnostics();
+            assert_eq!(
+                retained.disk_footprint_bytes - retained.free_bytes as u64,
+                12
+            );
+            assert_eq!(prefix.len(), visible);
+            assert_eq!(prefix.retained_size_bytes(), 12);
+            assert_eq!(
+                prefix.materialize_bytes().unwrap(),
+                &b"abcdefghijkl"[..visible]
+            );
+            drop(prefix);
+            let released = pool.diagnostics();
+            assert_eq!(released.disk_footprint_bytes, released.free_bytes as u64);
+        }
+    }
+
+    #[test]
+    fn pooled_response_body_releases_the_empty_staging_allocation() {
+        let memory_limit = 1024 * 1024;
+        let bytes = vec![7; memory_limit + 1];
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer = pooled_body_writer(memory_limit, &pool);
+        writer.append(&bytes);
+        let body = writer.finish();
+
+        assert_eq!(body.len(), bytes.len());
+        assert_eq!(body.materialize_bytes().unwrap(), bytes);
+        assert!(
+            body.renderer_transport_retained_memory_bytes() < memory_limit,
+            "a disk-backed body must not retain its full staging allocation"
+        );
+    }
+
+    #[test]
+    fn subresource_response_body_reads_memory_and_pooled_chunks_by_offset() {
         let memory = SubresourceResponseBody::from_bytes(b"hello world".to_vec());
         assert_eq!(memory.read_chunk(6, 3).unwrap(), b"wor");
         assert_eq!(memory.materialize_bytes_from(6).unwrap(), b"world");
         assert_eq!(memory.diagnostic_clone_body_bytes_from(6), b"world");
 
-        let mut writer = SubresourceResponseBodyWriter::new(4);
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer = pooled_body_writer(4, &pool);
         writer.append(b"hello");
         writer.append(b" world");
-        let spooled = writer.finish();
-        assert_eq!(spooled.read_chunk(6, 3).unwrap(), b"wor");
-        assert_eq!(spooled.materialize_bytes_from(6).unwrap(), b"world");
-        assert_eq!(spooled.diagnostic_clone_body_bytes_from(6), b"world");
+        let pooled = writer.finish();
+        assert_eq!(pooled.read_chunk(3, 5).unwrap(), b"lo wo");
+        assert_eq!(pooled.read_chunk(6, 3).unwrap(), b"wor");
+        assert_eq!(pooled.materialize_bytes_from(6).unwrap(), b"world");
+        assert_eq!(pooled.diagnostic_clone_body_bytes_from(6), b"world");
     }
 
     #[test]
-    fn subresource_response_body_fallible_materialize_reports_missing_spool_file() {
-        let missing_path = std::env::temp_dir().join(format!(
-            "moli-missing-subresource-body-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&missing_path);
-        let body = SubresourceResponseBody {
-            inner: Arc::new(SubresourceResponseBodyInner::File {
-                path: missing_path,
-                len: 5,
-            }),
-        };
+    fn subresource_response_bodies_share_pool_and_release_extents_on_last_drop() {
+        let pool = DiskPool::new(None).unwrap();
+        let mut first_writer = pooled_body_writer(4, &pool);
+        first_writer.append(b"abcdefgh");
+        let first = first_writer.finish();
+        let mut second_writer = pooled_body_writer(4, &pool);
+        second_writer.append(b"ijklmnop");
+        let second = second_writer.finish();
+
+        assert_eq!(pool.diagnostics().disk_footprint_bytes, 16);
+        assert_eq!(pool.diagnostics().free_bytes, 0);
+        let first_clone = first.clone();
+        drop(first);
+        assert_eq!(
+            pool.diagnostics().free_bytes,
+            0,
+            "the body Arc should own its pooled extents"
+        );
+        drop(first_clone);
+        assert_eq!(pool.diagnostics().free_bytes, 8);
+        drop(second);
+        assert_eq!(pool.diagnostics().free_bytes, 16);
+        assert_eq!(pool.diagnostics().free_chunk_count, 1);
+    }
+
+    #[test]
+    fn parkable_image_body_shares_one_extent_and_unparks_on_demand() {
+        let pool = DiskPool::new(None).unwrap();
+        let manager = moli_parkable_image::ParkableImageManager::new(
+            Some(pool.clone()),
+            moli_parkable_image::ParkableImagePolicy {
+                min_size_to_park: 1,
+                parking_delay: std::time::Duration::ZERO,
+                reader_release_delay: std::time::Duration::ZERO,
+            },
+        );
+        let encoded = manager.from_frozen_bytes(b"encoded image".to_vec());
+        let body = SubresourceResponseBody::from_parkable_image(encoded.clone());
+
+        manager.force_park_images();
+        assert_eq!(manager.diagnostics().parked_count, 1);
+        assert_eq!(pool.diagnostics().disk_footprint_bytes, 13);
+        assert_eq!(body.read_chunk(8, 5).unwrap(), b"image");
+        assert_eq!(body.materialize_bytes().unwrap(), b"encoded image");
+        assert_eq!(pool.diagnostics().disk_footprint_bytes, 13);
+
+        drop(encoded);
+        assert_eq!(pool.diagnostics().free_bytes, 0);
+        drop(body);
+        assert_eq!(pool.diagnostics().free_bytes, 13);
+    }
+
+    #[test]
+    fn subresource_response_body_keeps_order_when_pool_reaches_capacity() {
+        let pool = DiskPool::new(Some(4)).unwrap();
+        let mut writer = pooled_body_writer(4, &pool);
+        writer.append(b"hello world");
+        let body = writer.finish();
+
+        assert_eq!(pool.diagnostics().disk_footprint_bytes, 4);
+        assert_eq!(body.materialize_bytes().unwrap(), b"hello world");
+        assert_eq!(body.read_chunk(3, 6).unwrap(), b"lo wor");
+    }
+
+    #[test]
+    fn subresource_response_body_fallible_materialize_reports_pool_corruption() {
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer = pooled_body_writer(2, &pool);
+        writer.append(b"hello");
+        let body = writer.finish();
+        pool.truncate_file_for_test(0).unwrap();
 
         assert!(body.materialize_bytes().is_err());
         assert!(body.materialize_bytes_from(2).is_err());
@@ -3980,14 +4648,14 @@ mod tests {
             Url::parse("https://example.test/page").unwrap(),
             Url::parse("https://example.test/api").unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             None,
             Vec::new(),
             Url::parse("https://example.test/api").unwrap(),
             200,
-            vec![("content-type".to_owned(), "text/plain".to_owned())],
+            vec![("content-type".to_owned(), b"text/plain".to_vec())],
             body,
             Vec::new(),
         );
@@ -4012,7 +4680,7 @@ mod tests {
             Url::parse("https://example.test/page").unwrap(),
             Url::parse("https://api.example.test/v1/orders/42").unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             None,
@@ -4050,14 +4718,14 @@ mod tests {
             Url::parse("https://example.test/page").unwrap(),
             Url::parse("https://example.test/api").unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             None,
             Vec::new(),
             Url::parse("https://example.test/api").unwrap(),
             200,
-            vec![("content-type".to_owned(), "text/plain".to_owned())],
+            vec![("content-type".to_owned(), b"text/plain".to_vec())],
             SubresourceResponseBody::from_bytes(b"order #42 ready".to_vec()),
             Vec::new(),
         );
@@ -4104,7 +4772,7 @@ mod tests {
         assert!(json_path_equals(
             &[(
                 "content-type".to_owned(),
-                "application/manifest+json;charset=utf-8".to_owned(),
+                b"application/manifest+json;charset=utf-8".to_vec(),
             )],
             r#"{"ok":true}"#,
             &expectation,
@@ -4112,16 +4780,37 @@ mod tests {
         assert!(json_path_equals(
             &[(
                 "content-type".to_owned(),
-                "application/json; charset = utf-8".to_owned(),
+                b"application/json; charset = utf-8".to_vec(),
             )],
             r#"{"ok":true}"#,
             &expectation,
         ));
-        assert!(!json_path_equals(
-            &[("content-type".to_owned(), "text/json".to_owned())],
+        assert!(json_path_equals(
+            &[("content-type".to_owned(), b"text/json".to_vec())],
             r#"{"ok":true}"#,
             &expectation,
         ));
+        assert!(!json_path_equals(
+            &[("content-type".to_owned(), b"text/plain".to_vec())],
+            r#"{"ok":true}"#,
+            &expectation,
+        ));
+        for (values, matches) in [
+            (vec!["text/plain", "text/json"], true),
+            (vec!["text/plain, text/json"], true),
+            (vec!["text/json", "invalid", "*/*"], true),
+            (vec!["text/json", "text/plain"], false),
+        ] {
+            let headers: Vec<_> = values
+                .iter()
+                .map(|value| ("Content-Type".to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            assert_eq!(
+                json_path_equals(&headers, r#"{"ok":true}"#, &expectation),
+                matches,
+                "{values:?}"
+            );
+        }
 
         let regex_expectation = SubresourceJsonPathRegex {
             path: vec!["data".to_owned(), "url".to_owned()],
@@ -4130,13 +4819,21 @@ mod tests {
         assert!(json_path_matches_regex(
             &[(
                 "content-type".to_owned(),
-                "application/json; charset=utf-8".to_owned(),
+                b"application/json; charset=utf-8".to_vec(),
+            )],
+            r#"{"data":{"url":"/item/42"}}"#,
+            &regex_expectation,
+        ));
+        assert!(json_path_matches_regex(
+            &[(
+                "content-type".to_owned(),
+                b"Text/JSON; charset=utf-8".to_vec(),
             )],
             r#"{"data":{"url":"/item/42"}}"#,
             &regex_expectation,
         ));
         assert!(!json_path_matches_regex(
-            &[("content-type".to_owned(), "application/json".to_owned())],
+            &[("content-type".to_owned(), b"application/json".to_vec())],
             r#"{"data":{"url":"/orders/42"}}"#,
             &regex_expectation,
         ));
@@ -4144,28 +4841,14 @@ mod tests {
 
     #[test]
     fn subresource_response_body_partial_eq_does_not_treat_unreadable_sources_as_empty() {
-        let missing_path_a = std::env::temp_dir().join(format!(
-            "moli-missing-subresource-body-eq-a-{}",
-            std::process::id()
-        ));
-        let missing_path_b = std::env::temp_dir().join(format!(
-            "moli-missing-subresource-body-eq-b-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&missing_path_a);
-        let _ = fs::remove_file(&missing_path_b);
-        let body_a = SubresourceResponseBody {
-            inner: Arc::new(SubresourceResponseBodyInner::File {
-                path: missing_path_a,
-                len: 5,
-            }),
-        };
-        let body_b = SubresourceResponseBody {
-            inner: Arc::new(SubresourceResponseBodyInner::File {
-                path: missing_path_b,
-                len: 5,
-            }),
-        };
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer_a = pooled_body_writer(2, &pool);
+        writer_a.append(b"first");
+        let body_a = writer_a.finish();
+        let mut writer_b = pooled_body_writer(2, &pool);
+        writer_b.append(b"other");
+        let body_b = writer_b.finish();
+        pool.truncate_file_for_test(0).unwrap();
 
         assert_eq!(body_a, body_a.clone());
         assert_ne!(body_a, body_b);
@@ -4173,33 +4856,35 @@ mod tests {
     }
 
     #[test]
-    fn subresource_response_body_partial_eq_keeps_file_backed_equality_io_free() {
-        let mut left_writer = SubresourceResponseBodyWriter::new(2);
+    fn subresource_response_body_partial_eq_keeps_disk_backed_equality_io_free() {
+        let pool = DiskPool::new(None).unwrap();
+        let mut left_writer = pooled_body_writer(2, &pool);
         left_writer.append(b"same");
         let left = left_writer.finish();
 
-        let mut right_writer = SubresourceResponseBodyWriter::new(2);
+        let mut right_writer = pooled_body_writer(2, &pool);
         right_writer.append(b"same");
         let right = right_writer.finish();
 
         assert_ne!(
             left, right,
-            "ordinary equality should not read separate file-backed sources"
+            "ordinary equality should not read separate disk-backed sources"
         );
         assert!(
             left.try_byte_eq(&right)
-                .expect("explicit byte equality should read spooled bodies"),
+                .expect("explicit byte equality should read pooled bodies"),
             "callers that need content equality must opt in to source I/O"
         );
     }
 
     #[test]
     fn subresource_network_record_response_body_byte_equality_is_explicit() {
-        let mut left_writer = SubresourceResponseBodyWriter::new(2);
+        let pool = DiskPool::new(None).unwrap();
+        let mut left_writer = pooled_body_writer(2, &pool);
         left_writer.append(b"same");
         let left_body = left_writer.finish();
 
-        let mut right_writer = SubresourceResponseBodyWriter::new(2);
+        let mut right_writer = pooled_body_writer(2, &pool);
         right_writer.append(b"same");
         let right_body = right_writer.finish();
 
@@ -4208,7 +4893,7 @@ mod tests {
             Url::parse("https://example.test/page").unwrap(),
             Url::parse("https://example.test/api").unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             None,
@@ -4224,7 +4909,7 @@ mod tests {
             Url::parse("https://example.test/page").unwrap(),
             Url::parse("https://example.test/api").unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             None,
@@ -4243,14 +4928,15 @@ mod tests {
         assert!(
             left_record
                 .try_response_body_byte_eq(&right_record)
-                .expect("explicit record body equality should read spooled bodies"),
+                .expect("explicit record body equality should read pooled bodies"),
             "callers that need record body content equality must opt in"
         );
     }
 
     #[test]
-    fn subresource_response_body_preserves_invalid_bytes_when_spooled() {
-        let mut writer = SubresourceResponseBodyWriter::new(2);
+    fn subresource_response_body_preserves_invalid_bytes_when_pooled() {
+        let pool = DiskPool::new(None).unwrap();
+        let mut writer = pooled_body_writer(2, &pool);
         writer.append(b"hi ");
         writer.append(&[0xff, b'!']);
         let body = writer.finish();
@@ -4266,11 +4952,11 @@ mod tests {
         let challenge = extract_subresource_auth_challenge(&[
             (
                 "www-authenticate".to_owned(),
-                "Bearer realm=\"token-area\"".to_owned(),
+                b"Bearer realm=\"token-area\"".to_vec(),
             ),
             (
                 "www-authenticate".to_owned(),
-                "Basic realm=\"basic-area\"".to_owned(),
+                b"Basic realm=\"basic-area\"".to_vec(),
             ),
         ])
         .expect("auth challenge");
@@ -4284,7 +4970,7 @@ mod tests {
     fn auth_challenge_parser_prefers_supported_scheme_from_combined_header() {
         let challenge = extract_subresource_auth_challenge(&[(
             "www-authenticate".to_owned(),
-            "Bearer realm=\"token-area\", Basic realm=\"basic-area\"".to_owned(),
+            b"Bearer realm=\"token-area\", Basic realm=\"basic-area\"".to_vec(),
         )])
         .expect("auth challenge");
 
@@ -4297,7 +4983,7 @@ mod tests {
     fn auth_challenge_parser_preserves_quoted_commas_and_escaped_quotes() {
         let challenge = extract_subresource_auth_challenge(&[(
             "www-authenticate".to_owned(),
-            r#"Digest realm="area, with \"quote\"", nonce="deadbeef", qop="auth""#.to_owned(),
+            br#"Digest realm="area, with \"quote\"", nonce="deadbeef", qop="auth""#.to_vec(),
         )])
         .expect("auth challenge");
 
@@ -4310,7 +4996,7 @@ mod tests {
     fn auth_challenge_parser_recognizes_proxy_and_falls_back_to_unsupported() {
         let challenge = extract_subresource_auth_challenge(&[(
             "proxy-authenticate".to_owned(),
-            "Bearer realm=\"proxy-token\"".to_owned(),
+            b"Bearer realm=\"proxy-token\"".to_vec(),
         )])
         .expect("proxy auth challenge");
 

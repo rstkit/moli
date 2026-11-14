@@ -1,6 +1,6 @@
-use crate::devtools_runtime::DevToolsNetworkResourceType;
+use crate::automation::DevToolsNetworkResourceType;
 use moli_cookie_jar::new_shared_browser_cookie_store;
-use moli_core::page::{SameDocumentHistoryUpdate, SubresourceResourceType};
+use moli_core::page::{SessionHistoryUpdateKind, SubresourceInterceptionClasses};
 
 use super::super::fetch_support::{
     FetchAuthChallenge, PendingFetchAuthNavigation, PendingFetchNavigation,
@@ -25,6 +25,12 @@ use url::Url;
 
 fn test_navigation_dispatch_state(fetch_request_id: &str) -> NavigationDispatchState {
     NavigationDispatchState {
+        web_mcp_invocation: None,
+        navigation_initiator: None,
+        initial_document_environment: None,
+        auxiliary_document_response: None,
+        redirect_chain: Vec::new(),
+        redirect_headers: None,
         navigate_id: Some(1),
         owner: crate::conn::CommandOwnerScope::for_session("SID-1"),
         result_projection: NavigationResultProjection::Cdp(
@@ -35,11 +41,12 @@ fn test_navigation_dispatch_state(fetch_request_id: &str) -> NavigationDispatchS
         request_id: Some(format!("NETWORK-{fetch_request_id}")),
         loader_id: "LID-0000000001".to_owned(),
         request_announced: false,
+        announced_redirects: 0,
         requested_url: Url::parse("https://example.test/").unwrap(),
         request_method: "GET".to_owned(),
         request_body: None,
         request_body_bytes: None,
-        request_headers: Vec::new(),
+        request_headers: Vec::new().into(),
         request_load_policy: crate::conn::NavigationRequestLoadPolicy::DocumentInitiated,
         timestamp: 0.0,
         source_document_security: Default::default(),
@@ -108,16 +115,25 @@ fn page_domain_subscription_generation_tracks_distinct_enable_lifetimes() {
 
 #[test]
 fn input_event_ignore_state_survives_document_context_replacement() {
-    let mut state = TargetPageSessionState {
-        input_events_ignored: true,
-        ..Default::default()
-    };
+    let mut target = PageTargetHost::empty("TID-input".to_owned());
+    target.devtools_sessions[moli_page_types::DevToolsSessionKey::Primary].page_session_state =
+        TargetPageSessionState {
+            input_events_ignored: true,
+            input_intercept_drags_enabled: true,
+            ..Default::default()
+        };
 
-    state.clear_loaded_document_context_state();
+    target.clear_loaded_document_context_state();
+    let state =
+        &target.devtools_sessions[moli_page_types::DevToolsSessionKey::Primary].page_session_state;
 
     assert!(
         state.input_events_ignored,
         "Chromium retains each Inspector session's input ignore handle across renderer navigation"
+    );
+    assert!(
+        state.input_intercept_drags_enabled,
+        "drag interception belongs to the DevTools session, not the replaced Document"
     );
 }
 
@@ -150,8 +166,8 @@ fn target_fetch_owner_projects_config_without_exposing_slots() {
     let snapshot = owner.subresource_interception_snapshot();
     assert_eq!(
         owner.subresource_interception_config(),
-        (true, None),
-        "Fetch + WebSocket filters require broad subresource interception"
+        SubresourceInterceptionClasses::ALL,
+        "handleAuthRequests routes every class through the protocol"
     );
     assert_eq!(
         snapshot.event_session_id(None),
@@ -193,14 +209,14 @@ fn target_fetch_owner_projects_config_without_exposing_slots() {
     );
     assert_eq!(
         owner.subresource_interception_config(),
-        (true, None),
-        "aggregate subresource config still includes the FETCH-SID WebSocket pattern"
+        SubresourceInterceptionClasses::ALL,
+        "aggregate subresource config keeps handleAuthRequests broad admission"
     );
     let root_config = owner.config_snapshot_for_session(None);
     assert_eq!(root_config.session_id(), None);
     assert_eq!(
         root_config.subresource_interception_config(),
-        (true, Some(SubresourceResourceType::Fetch))
+        SubresourceInterceptionClasses::FETCH_LIKE
     );
 
     owner.configure(
@@ -223,7 +239,10 @@ fn target_fetch_owner_projects_config_without_exposing_slots() {
 
     owner.reset_config();
     assert!(!owner.is_enabled());
-    assert_eq!(owner.subresource_interception_config(), (false, None));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::NONE
+    );
     assert_eq!(
         owner.matching_document_request_stage(&Url::parse("https://example.test/doc").unwrap()),
         None
@@ -292,7 +311,10 @@ fn target_fetch_owner_aggregates_network_intercepts_by_id() {
     assert!(!owner.remove_network_intercept("missing-intercept"));
     assert!(owner.remove_network_intercept("intercept-response"));
     assert!(!owner.is_enabled());
-    assert_eq!(owner.subresource_interception_config(), (false, None));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::NONE
+    );
 }
 
 #[test]
@@ -323,7 +345,8 @@ fn target_fetch_owner_keeps_fetch_enable_configs_per_session() {
     assert!(aggregate.handle_auth_requests());
     assert_eq!(
         owner.subresource_interception_config(),
-        (true, Some(SubresourceResourceType::Fetch))
+        SubresourceInterceptionClasses::ALL,
+        "aggregate handleAuthRequests broadens the renderer class set"
     );
 
     let primary = owner.config_snapshot_for_session(Some("SID-primary"));
@@ -336,7 +359,8 @@ fn target_fetch_owner_keeps_fetch_enable_configs_per_session() {
     );
     assert_eq!(
         primary.subresource_interception_config(),
-        (true, Some(SubresourceResourceType::Fetch))
+        SubresourceInterceptionClasses::ALL,
+        "session handleAuthRequests broadens the renderer class set"
     );
 
     let aux = owner.config_snapshot_for_session(Some("SID-attached"));
@@ -346,7 +370,7 @@ fn target_fetch_owner_keeps_fetch_enable_configs_per_session() {
     assert_eq!(aux.patterns()[0].url_pattern, "https://example.test/aux");
     assert_eq!(
         aux.subresource_interception_config(),
-        (true, Some(SubresourceResourceType::Xhr))
+        SubresourceInterceptionClasses::FETCH_LIKE
     );
 
     assert!(owner.remove_fetch_session(Some("SID-primary")));
@@ -611,7 +635,10 @@ fn target_fetch_owner_keeps_dormant_network_intercept_removable() {
     );
 
     assert!(!owner.is_enabled());
-    assert_eq!(owner.subresource_interception_config(), (false, None));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::NONE
+    );
     assert_eq!(owner.config_snapshot().patterns(), &[]);
     assert!(
         owner
@@ -753,7 +780,10 @@ fn target_fetch_owner_reports_matching_auth_required_network_intercepts() {
     let matching_url = Url::parse("https://example.test/protected/basic").unwrap();
     let other_url = Url::parse("https://other.test/protected/basic").unwrap();
     let config = owner.config_snapshot();
-    assert_eq!(owner.subresource_interception_config(), (true, None));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::ALL
+    );
     assert!(config.matches_auth_required(&matching_url));
     assert!(config.matches_auth_required(&other_url));
     assert_eq!(
@@ -798,9 +828,153 @@ fn target_fetch_owner_reports_matching_auth_required_network_intercepts() {
 }
 
 #[test]
+fn cdp_auth_is_independent_of_network_intercept_registration() {
+    let mut owner = TargetFetchOwner::default();
+    let image_patterns = vec![FetchInterceptionPattern {
+        url_pattern: "*".to_owned(),
+        resource_type_filter: Some(FetchResourceTypeFilter::Image),
+        request_stage: FetchRequestStage::Request,
+    }];
+    owner.configure(Some("SID-fetch".to_owned()), true, image_patterns.clone());
+    owner.configure(Some("SID-other".to_owned()), true, image_patterns.clone());
+    owner.add_network_intercept(
+        "intercept-no-auth".to_owned(),
+        Some("BIDI-SID".to_owned()),
+        false,
+        vec!["*".to_owned()],
+        image_patterns.clone(),
+    );
+
+    let any_url = Url::parse("https://example.test/protected/basic").unwrap();
+    let config = owner.config_snapshot();
+    assert!(owner.handle_auth_requests());
+    assert!(config.matches_auth_required(&any_url));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::ALL
+    );
+    assert!(owner.remove_network_intercept("intercept-no-auth"));
+    assert!(owner.config_snapshot().matches_auth_required(&any_url));
+    owner.add_network_intercept(
+        "intercept-no-auth".to_owned(),
+        Some("BIDI-SID".to_owned()),
+        false,
+        Vec::new(),
+        image_patterns.clone(),
+    );
+
+    // A scoped network auth rule adds an owner only for its own URL. It
+    // cannot remove either CDP handler's authority over other challenges.
+    owner.add_network_intercept(
+        "intercept-auth".to_owned(),
+        Some("BIDI-SID".to_owned()),
+        true,
+        vec!["https://other.test/protected*".to_owned()],
+        Vec::new(),
+    );
+    let config = owner.config_snapshot();
+    let snapshot = config.subresource_interception_snapshot();
+    assert!(config.matches_auth_required(&any_url));
+    assert!(snapshot.matches_auth_required(&any_url));
+    assert!(
+        snapshot
+            .matching_auth_required_network_intercepts(&any_url)
+            .is_empty()
+    );
+    assert_eq!(
+        snapshot.auth_required_owner_kind(&any_url),
+        Some(PendingSubresourceFetchOwnerKind::Fetch)
+    );
+    assert_eq!(
+        snapshot
+            .matching_auth_required_pause_sessions(None, &any_url)
+            .len(),
+        2
+    );
+    assert!(owner.remove_fetch_session(Some("SID-fetch")));
+    assert!(owner.config_snapshot().matches_auth_required(&any_url));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::ALL
+    );
+
+    owner.configure(Some("SID-other".to_owned()), false, image_patterns);
+    let config = owner.config_snapshot();
+    let snapshot = config.subresource_interception_snapshot();
+    let other_url = Url::parse("https://other.test/protected/basic").unwrap();
+    assert!(!config.matches_auth_required(&any_url));
+    assert!(!snapshot.matches_auth_required(&any_url));
+    assert!(
+        snapshot
+            .matching_auth_required_pause_sessions(None, &any_url)
+            .is_empty()
+    );
+    assert!(config.matches_auth_required(&other_url));
+    assert!(snapshot.matches_auth_required(&other_url));
+    assert_eq!(
+        snapshot.auth_required_owner_kind(&other_url),
+        Some(PendingSubresourceFetchOwnerKind::NetworkOrBidi)
+    );
+    // A real auth rule still requires all resource classes even though it
+    // no longer authorizes unrelated URLs after the last CDP handler stops.
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::ALL
+    );
+    assert!(owner.remove_network_intercept("intercept-auth"));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::IMAGE
+    );
+    assert!(!owner.config_snapshot().matches_auth_required(&other_url));
+    assert!(owner.remove_fetch_session(Some("SID-other")));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::IMAGE
+    );
+    assert!(owner.remove_network_intercept("intercept-no-auth"));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::NONE
+    );
+}
+
+#[test]
+fn network_auth_without_url_patterns_does_not_broaden_or_authorize_requests() {
+    let mut owner = TargetFetchOwner::default();
+    owner.add_network_intercept(
+        "intercept-empty-auth".to_owned(),
+        Some("BIDI-SID".to_owned()),
+        true,
+        Vec::new(),
+        vec![FetchInterceptionPattern {
+            url_pattern: "*".to_owned(),
+            resource_type_filter: Some(FetchResourceTypeFilter::Image),
+            request_stage: FetchRequestStage::Request,
+        }],
+    );
+    let url = Url::parse("https://example.test/protected/basic").unwrap();
+    let config = owner.config_snapshot();
+    let snapshot = config.subresource_interception_snapshot();
+    assert!(owner.handle_auth_requests());
+    assert!(!config.matches_auth_required(&url));
+    assert!(!snapshot.matches_auth_required(&url));
+    assert_eq!(snapshot.auth_required_owner_kind(&url), None);
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::IMAGE
+    );
+}
+
+#[test]
 fn pending_navigation_rejects_generic_request_action_without_consuming_id() {
     let mut state = TargetFetchState::default();
     state.register_pending_fetch_navigation_request(PendingFetchNavigation {
+        reserved_service_worker_client: None,
+        interception: None,
+        remaining_request_stages: Vec::new(),
+        redirected_request_id: None,
+        auth_retry_budget: Default::default(),
         fetch_request_id: "FETCH-NAV".to_owned(),
         interception_session_id: Some("SID-fetch".to_owned()),
         document_navigation_token: None,
@@ -842,6 +1016,7 @@ fn pending_auth_navigation_rejects_generic_request_action_without_consuming_id()
     state.register_pending_fetch_auth_navigation(
         "FETCH-AUTH".to_owned(),
         PendingFetchAuthNavigation {
+            auth_retry_budget: Default::default(),
             owner_session_id: None,
             action_session_id: None,
             interception_session_id: None,
@@ -892,6 +1067,7 @@ fn unscoped_fetch_owned_auth_navigation_allows_routed_action_session() {
     state.register_pending_fetch_auth_navigation(
         "FETCH-AUTH".to_owned(),
         PendingFetchAuthNavigation {
+            auth_retry_budget: Default::default(),
             owner_session_id: None,
             action_session_id: None,
             interception_session_id: None,
@@ -926,6 +1102,7 @@ fn unscoped_fetch_owned_auth_navigation_allows_routed_action_session() {
     state.register_pending_fetch_auth_navigation(
         "NETWORK-AUTH".to_owned(),
         PendingFetchAuthNavigation {
+            auth_retry_budget: Default::default(),
             owner_session_id: None,
             action_session_id: None,
             interception_session_id: None,
@@ -1052,6 +1229,7 @@ fn navigation_history_seed_entry_preserves_pending_update() {
         title: "seed".to_owned(),
         transition_type: "typed".to_owned(),
         document_sequence_number: None,
+        browsing_context_group: None,
     });
 
     let reloaded_id = history.allocate_entry_id();
@@ -1062,6 +1240,7 @@ fn navigation_history_seed_entry_preserves_pending_update() {
         title: "reloaded".to_owned(),
         transition_type: "typed".to_owned(),
         document_sequence_number: None,
+        browsing_context_group: None,
     });
 
     let (current_index, entries) = history.snapshot();
@@ -1127,11 +1306,12 @@ fn navigation_history_prune_rejects_only_pending_existing_entry_traversal() {
         title: "initial".to_owned(),
         transition_type: "typed".to_owned(),
         document_sequence_number: None,
+        browsing_context_group: None,
     });
-    assert!(history.record_same_document_update(
+    assert!(history.record_session_history_update(
         "https://example.test/pushed".to_owned(),
         "pushed".to_owned(),
-        SameDocumentHistoryUpdate::Push,
+        SessionHistoryUpdateKind::Push,
     ));
     let pushed_id = history.snapshot().1[1].id;
 
@@ -1165,11 +1345,12 @@ fn navigation_history_traversal_reuses_same_document_entries() {
         title: "page".to_owned(),
         transition_type: "typed".to_owned(),
         document_sequence_number: None,
+        browsing_context_group: None,
     });
-    assert!(history.record_same_document_update(
+    assert!(history.record_session_history_update(
         "https://example.test/page?state=pushed".to_owned(),
         "page".to_owned(),
-        SameDocumentHistoryUpdate::Push,
+        SessionHistoryUpdateKind::Push,
     ));
 
     let (_, entries) = history.snapshot();
@@ -1181,10 +1362,10 @@ fn navigation_history_traversal_reuses_same_document_entries() {
     assert_eq!(entries[1].user_typed_url, "https://example.test/page");
     assert_eq!(entries[1].transition_type, "link");
 
-    assert!(history.record_same_document_update(
+    assert!(history.record_session_history_update(
         "https://example.test/page".to_owned(),
         "page".to_owned(),
-        SameDocumentHistoryUpdate::Traverse { delta: -1 },
+        SessionHistoryUpdateKind::Traverse { delta: -1 },
     ));
     let (current_index, entries) = history.snapshot();
     assert_eq!(current_index, 0);
@@ -1192,10 +1373,10 @@ fn navigation_history_traversal_reuses_same_document_entries() {
     assert_eq!(entries[0].id, initial_id);
     assert_eq!(entries[1].id, pushed_id);
 
-    assert!(history.record_same_document_update(
+    assert!(history.record_session_history_update(
         "https://example.test/page?state=pushed".to_owned(),
         "page".to_owned(),
-        SameDocumentHistoryUpdate::Traverse { delta: 1 },
+        SessionHistoryUpdateKind::Traverse { delta: 1 },
     ));
     let (current_index, entries) = history.snapshot();
     assert_eq!(current_index, 1);
@@ -1272,7 +1453,14 @@ fn committed_document_navigation_state_clears_document_local_runtime_state() {
             bidi_channel_handoffs: Vec::new(),
         },
     ));
-    owner_state.insert_attached_child_frame_id("FRAME-child".to_owned());
+    owner_state
+        .frame_index
+        .insert(crate::frame_index::FrameRecord::new(
+            "FRAME-child",
+            Some("TID-1".into()),
+            "TID-1",
+            Some("BID-1".into()),
+        ));
     owner_state
         .runtime_observable_state
         .mark_emitted_exception_entries(3);
@@ -1305,7 +1493,7 @@ fn committed_document_navigation_state_clears_document_local_runtime_state() {
 fn devtools_session_runtime_context_clear_resets_child_default_emission_cursor() {
     let mut state = DevToolsSessionState::default();
     state.mark_child_default_execution_context_id_emitted(99);
-    state.clear_runtime_remote_object_tracking();
+    state.clear_runtime_context_metadata();
 
     assert!(
         !state.has_emitted_child_default_execution_context_id(99),
@@ -1378,6 +1566,7 @@ fn stored_cookie(name: &str, value: &str) -> moli_cookie_jar::StoredCookie {
         source_scheme: moli_cookie_jar::StoredCookieSourceScheme::NonSecure,
         source_port: -1,
         creation_index: 0,
+        creation_time: None,
         last_access_index: 0,
     }
 }
@@ -1396,7 +1585,7 @@ fn seed_initial_cookies_keeps_store_available_after_lock_holder_panic() {
         vec![stored_cookie("sid", "seeded")],
     );
 
-    let cookies = cookie_store.lock().cookies();
+    let cookies = cookie_store.lock().unwrap().cookies();
     assert_eq!(cookies.len(), 1);
     assert_eq!(cookies[0].name, "sid");
 }
@@ -1417,18 +1606,18 @@ fn browser_context_clears_origin_site_data_through_partition_owner() {
 
     context.store_response_cookie_headers_for_test(
         &origin,
-        &[("set-cookie".to_owned(), "host=1; Path=/; Secure".to_owned())],
+        &[("set-cookie".to_owned(), b"host=1; Path=/; Secure".to_vec())],
     );
     context.store_response_cookie_headers_for_test(
         &Url::parse("https://cdn.example.com/page").unwrap(),
         &[(
             "set-cookie".to_owned(),
-            "sibling=1; Path=/; Secure".to_owned(),
+            b"sibling=1; Path=/; Secure".to_vec(),
         )],
     );
-    assert_eq!(context.snapshot_cookies().len(), 2);
+    assert_eq!(context.snapshot_cookies().unwrap().len(), 2);
     {
-        let mut store = context.web_storage_store_for_test().lock();
+        let store = context.web_storage_store_for_test();
         assert!(store.set_item(&storage_key, "local", "1"));
         assert!(store.set_item(&sibling_storage_key, "local", "2"));
     }
@@ -1446,10 +1635,10 @@ fn browser_context_clears_origin_site_data_through_partition_owner() {
         )
         .expect("site data clear should succeed");
 
-    let cookies = context.snapshot_cookies();
+    let cookies = context.snapshot_cookies().unwrap();
     assert_eq!(cookies.len(), 1);
     assert_eq!(cookies[0].name, "sibling");
-    let mut store = context.web_storage_store_for_test().lock();
+    let store = context.web_storage_store_for_test();
     assert_eq!(store.get_item(&storage_key, "local"), None);
     assert_eq!(
         store.get_item(&sibling_storage_key, "local"),
@@ -1602,7 +1791,8 @@ fn materialized_active_initial_empty_document_requires_loaded_page() {
             .assert_target_materialized_initial_empty_document_has_page(
                 "TID-initial-active-invariant"
             )
-            .expect_err("materialized active initial document must have a Page"),
+            .expect_err("materialized active initial document must have a Page")
+            .to_string(),
         "TargetInitialEmptyDocumentMissingPage: target TID-initial-active-invariant has materialized current initial empty document without loaded Page"
     );
 }
@@ -1703,7 +1893,8 @@ fn materialized_background_initial_empty_document_requires_loaded_page() {
     assert_eq!(
         context
             .assert_target_materialized_initial_empty_document_has_page("TID-initial-bg-invariant")
-            .expect_err("materialized background initial document must have a Page"),
+            .expect_err("materialized background initial document must have a Page")
+            .to_string(),
         "TargetInitialEmptyDocumentMissingPage: target TID-initial-bg-invariant has materialized current initial empty document without loaded Page"
     );
 }
@@ -1734,4 +1925,69 @@ fn committed_document_navigation_accepts_matching_late_body_only_until_next_navi
         "starting a newer navigation must make the previous body completion stale"
     );
     assert!(context.accepts_document_body_completion_event(&second));
+}
+
+#[test]
+fn interception_eligibility_includes_authentication_independent_of_resource_type() {
+    let mut owner = TargetFetchOwner::default();
+    let pattern = |url: &str, kind, stage| FetchInterceptionPattern {
+        url_pattern: url.to_owned(),
+        resource_type_filter: kind,
+        request_stage: stage,
+    };
+    owner.configure(
+        Some("CDP".to_owned()),
+        false,
+        vec![
+            pattern(
+                "*/image",
+                Some(FetchResourceTypeFilter::Image),
+                FetchRequestStage::Request,
+            ),
+            pattern(
+                "*/api-a",
+                Some(FetchResourceTypeFilter::Xhr),
+                FetchRequestStage::Request,
+            ),
+            pattern(
+                "*/api-b",
+                Some(FetchResourceTypeFilter::Xhr),
+                FetchRequestStage::Response,
+            ),
+        ],
+    );
+    owner.add_network_intercept(
+        "auth".to_owned(),
+        Some("BIDI".to_owned()),
+        true,
+        vec!["*/auth-only".to_owned()],
+        Vec::new(),
+    );
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::ALL
+    );
+    owner.configure(
+        Some("CDP".to_owned()),
+        true,
+        vec![pattern(
+            "*/image",
+            Some(FetchResourceTypeFilter::Image),
+            FetchRequestStage::Request,
+        )],
+    );
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::ALL
+    );
+    owner.remove_fetch_session(Some("CDP"));
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::ALL
+    );
+    owner.remove_network_intercept("auth");
+    assert_eq!(
+        owner.subresource_interception_config(),
+        SubresourceInterceptionClasses::NONE
+    );
 }

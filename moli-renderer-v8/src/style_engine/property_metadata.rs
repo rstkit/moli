@@ -3,10 +3,10 @@ use std::{cmp::Ordering, sync::LazyLock};
 use style::properties::{LonghandId, PropertyId, ShorthandId};
 use style::stylesheets::{CssRuleType, CssRuleTypes};
 
-use crate::css_style::mask_compat_property_name;
+use crate::css_style::{mask_compat_property_name, stylo_property_is_chromium_exposed};
 
 struct ComputedLonghandMetadata {
-    longhands: Box<[LonghandId]>,
+    longhands: Box<[&'static str]>,
     first_vendor_index: usize,
 }
 
@@ -17,9 +17,7 @@ impl ComputedLonghandMetadata {
         } else {
             0..self.first_vendor_index
         };
-        self.longhands[range]
-            .binary_search_by(|id| id.name().cmp(name))
-            .is_ok()
+        self.longhands[range].binary_search(&name).is_ok()
     }
 }
 
@@ -30,22 +28,32 @@ const COMPAT_COMPUTED_QUERY_PROPERTIES: &[&str] = &["animation-range", "mask"];
 static COMPUTED_LONGHAND_METADATA: LazyLock<ComputedLonghandMetadata> = LazyLock::new(|| {
     super::ensure_stylo_browser_compat_prefs();
 
-    // Match Servo's CSSStyleDeclaration metadata source. The `all` shorthand
-    // contains every enabled longhand except direction and unicode-bidi.
+    // Use Stylo's longhand metadata with the same public-property policy as the
+    // CSSStyleDeclaration accessors. The `all` shorthand contains every enabled
+    // longhand except direction and unicode-bidi.
     let mut longhands = ShorthandId::All
         .longhands()
-        .filter(|id| stylo_property_is_enabled_for_style_rule(id.name()))
+        .filter(|id| {
+            stylo_property_is_enabled_for_style_rule(id.name())
+                && stylo_property_is_chromium_exposed(id.name())
+        })
+        .map(|id| id.name())
         .collect::<Vec<_>>();
     for id in [LonghandId::Direction, LonghandId::UnicodeBidi] {
         if stylo_property_is_enabled_for_style_rule(id.name()) {
-            longhands.push(id);
+            longhands.push(id.name());
         }
     }
-    longhands.sort_unstable_by(|left, right| canonical_property_order(left.name(), right.name()));
-    longhands.dedup_by(|left, right| left.name() == right.name());
+    // CSS Masking exposes one mask-position longhand. Stylo represents it with
+    // private x/y longhands and a shorthand, so expose its public name here.
+    if stylo_property_is_enabled_for_style_rule("mask-position") {
+        longhands.push("mask-position");
+    }
+    longhands.sort_unstable_by(|left, right| canonical_property_order(left, right));
+    longhands.dedup();
     let first_vendor_index = longhands
         .iter()
-        .position(|property| property.name().starts_with('-'))
+        .position(|property| property.starts_with('-'))
         .unwrap_or(longhands.len());
     ComputedLonghandMetadata {
         longhands: longhands.into_boxed_slice(),
@@ -65,16 +73,8 @@ pub(crate) fn computed_longhand_count() -> usize {
     COMPUTED_LONGHAND_METADATA.longhands.len()
 }
 
-pub(crate) fn computed_longhand_first_vendor_index() -> usize {
-    COMPUTED_LONGHAND_METADATA.first_vendor_index
-}
-
 pub(crate) fn computed_longhand_name_at(index: usize) -> Option<&'static str> {
-    COMPUTED_LONGHAND_METADATA
-        .longhands
-        .get(index)
-        .copied()
-        .map(|id| id.name())
+    COMPUTED_LONGHAND_METADATA.longhands.get(index).copied()
 }
 
 pub(crate) fn computed_property_is_queryable(name: &str) -> bool {
@@ -98,8 +98,7 @@ mod tests {
     use style::properties::PropertyId;
 
     use super::{
-        computed_longhand_count, computed_longhand_first_vendor_index, computed_longhand_name_at,
-        computed_property_is_queryable,
+        computed_longhand_count, computed_longhand_name_at, computed_property_is_queryable,
     };
 
     #[test]
@@ -118,6 +117,7 @@ mod tests {
             "font-size",
             "grid-auto-columns",
             "inline-size",
+            "mask-position",
             "object-fit",
             "overflow-wrap",
             "pointer-events",
@@ -127,10 +127,21 @@ mod tests {
         ] {
             assert!(names.contains(&representative), "missing {representative}");
         }
-        for non_longhand in ["animation-range", "margin", "mask", "padding-block", "size"] {
+        for excluded in [
+            "animation-range",
+            "margin",
+            "mask",
+            "padding-block",
+            "size",
+            "mask-position-x",
+            "mask-position-y",
+            "-moz-default-appearance",
+            "-moz-min-font-size-ratio",
+            "-x-text-scale",
+        ] {
             assert!(
-                !names.contains(&non_longhand),
-                "enumerated non-element longhand {non_longhand}"
+                !names.contains(&excluded),
+                "enumerated non-public longhand {excluded}"
             );
         }
         assert_eq!(
@@ -144,7 +155,10 @@ mod tests {
             "every enumerated computed longhand must be queryable"
         );
 
-        let first_vendor = computed_longhand_first_vendor_index();
+        let first_vendor = names
+            .iter()
+            .position(|name| name.starts_with('-'))
+            .unwrap_or(names.len());
         assert!(
             first_vendor > 250,
             "ordinary longhands must precede the vendor tail: {first_vendor}"

@@ -16,8 +16,18 @@ pub enum PaintCaptureRegion {
     Viewport,
     /// The complete document content extent computed by this layout pass.
     FullDocument,
+    /// The complete document for vector printing, independent of the
+    /// full-document bitmap dimension limit.
+    PrintDocument,
     /// One explicit page-coordinate rectangle.
     PageClip { rect: LayoutRect, scale: f32 },
+    /// Present the existing viewport on a separate raster surface. Scroll
+    /// compensation is resolved after layout samples the current scroll offset.
+    TransformedViewport {
+        surface: PaintCaptureSurface,
+        transform: LayoutTransform2D,
+        scroll_scale: f64,
+    },
 }
 
 /// Output constraints for one short-lived screenshot or screencast capture.
@@ -82,6 +92,14 @@ impl PaintCaptureRequest {
         }
     }
 
+    /// Captures vector print content without imposing a full-page pixel buffer.
+    pub const fn print_document() -> Self {
+        Self {
+            region: PaintCaptureRegion::PrintDocument,
+            ..Self::full_document()
+        }
+    }
+
     /// Captures one document-coordinate rectangle at the requested clip scale.
     pub const fn page_clip(rect: LayoutRect, scale: f32) -> Self {
         Self {
@@ -129,9 +147,12 @@ impl PaintCaptureSurface {
 pub(crate) struct ResolvedPaintCapture {
     /// Captured rectangle in the projection's viewport coordinate system.
     pub(crate) viewport_rect: LayoutRect,
-    /// Translation applied after local-to-viewport transforms.
+    /// Transform applied after local-to-viewport transforms.
     pub(crate) viewport_to_surface: LayoutTransform2D,
     pub(crate) surface: PaintCaptureSurface,
+    /// Clip painted content to the transformed live viewport. The propagated
+    /// canvas color still clears the whole surface, matching the compositor.
+    pub(crate) clip_to_viewport: bool,
     pub(crate) include_backgrounds: bool,
     /// Viewport captures include the root viewport's native controls. Full
     /// document and page-clip captures paint page content only, matching
@@ -148,19 +169,22 @@ impl PaintCaptureRequest {
         content_size: LayoutSize,
     ) -> Result<ResolvedPaintCapture, LayoutError> {
         validate_viewport(viewport)?;
-        let paint_root_scrollbars = self.include_viewport_controls;
+        let viewport_bounds = LayoutRect::new(
+            0.0,
+            0.0,
+            viewport.css_width as f32,
+            viewport.css_height as f32,
+        );
         let (viewport_rect, capture_scale) = match self.region {
-            PaintCaptureRegion::Viewport => (
-                LayoutRect::new(
-                    0.0,
-                    0.0,
-                    viewport.css_width as f32,
-                    viewport.css_height as f32,
-                ),
-                1.0,
-            ),
-            PaintCaptureRegion::FullDocument => {
-                validate_full_document_extent(content_size.width, content_size.height)?;
+            PaintCaptureRegion::Viewport | PaintCaptureRegion::TransformedViewport { .. } => {
+                (viewport_bounds, 1.0)
+            }
+            PaintCaptureRegion::FullDocument | PaintCaptureRegion::PrintDocument => {
+                if self.region == PaintCaptureRegion::FullDocument {
+                    validate_full_document_extent(content_size.width, content_size.height)?;
+                } else {
+                    validate_extent("document content", content_size.width, content_size.height)?;
+                }
                 (
                     LayoutRect::new(
                         -viewport_scroll.x,
@@ -185,18 +209,42 @@ impl PaintCaptureRequest {
             }
         };
 
-        let mut device_scale = viewport.device_pixel_ratio * capture_scale;
+        let (mut surface, viewport_to_surface, clip_to_viewport) = match self.region {
+            PaintCaptureRegion::TransformedViewport {
+                surface,
+                mut transform,
+                scroll_scale,
+            } => {
+                transform.coefficients[4] += f64::from(viewport_scroll.x) * scroll_scale;
+                transform.coefficients[5] += f64::from(viewport_scroll.y) * scroll_scale;
+                if !transform.is_finite() || !scroll_scale.is_finite() {
+                    return Err(invalid_capture("viewport transform must be finite"));
+                }
+                (surface, transform, true)
+            }
+            _ => (
+                PaintCaptureSurface::new(
+                    viewport_rect.width,
+                    viewport_rect.height,
+                    viewport.device_pixel_ratio * capture_scale,
+                ),
+                LayoutTransform2D::translation(-viewport_rect.x, -viewport_rect.y),
+                false,
+            ),
+        };
+        validate_extent("capture surface", surface.css_width, surface.css_height)?;
+        let mut device_scale = surface.device_scale;
         if let Some(max_width) = self.max_width {
             if max_width == 0 {
                 return Err(invalid_capture("maximum width must be greater than zero"));
             }
-            device_scale = device_scale.min(max_width as f32 / viewport_rect.width);
+            device_scale = device_scale.min(max_width as f32 / surface.css_width);
         }
         if let Some(max_height) = self.max_height {
             if max_height == 0 {
                 return Err(invalid_capture("maximum height must be greater than zero"));
             }
-            device_scale = device_scale.min(max_height as f32 / viewport_rect.height);
+            device_scale = device_scale.min(max_height as f32 / surface.css_height);
         }
         if !device_scale.is_finite() || device_scale <= 0.0 {
             return Err(invalid_capture(
@@ -204,16 +252,14 @@ impl PaintCaptureRequest {
             ));
         }
 
+        surface.device_scale = device_scale;
         Ok(ResolvedPaintCapture {
             viewport_rect,
-            viewport_to_surface: LayoutTransform2D::translation(-viewport_rect.x, -viewport_rect.y),
-            surface: PaintCaptureSurface::new(
-                viewport_rect.width,
-                viewport_rect.height,
-                device_scale,
-            ),
+            viewport_to_surface,
+            surface,
+            clip_to_viewport,
             include_backgrounds: self.include_backgrounds,
-            paint_root_scrollbars,
+            paint_root_scrollbars: self.include_viewport_controls,
             base_background_color: self.base_background_color,
         })
     }
@@ -277,6 +323,22 @@ fn invalid_capture(detail: impl Into<String>) -> LayoutError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_print_capture_is_not_limited_by_full_page_bitmap_dimensions() {
+        let viewport = LayoutViewport::new(800, 600, 3.0);
+        let size = LayoutSize::new(800.0, 200_000.0);
+        assert!(
+            PaintCaptureRequest::full_document()
+                .resolve(viewport, LayoutPoint::ZERO, size)
+                .is_err()
+        );
+        let print = PaintCaptureRequest::print_document()
+            .resolve(viewport, LayoutPoint::ZERO, size)
+            .unwrap();
+        assert_eq!(print.surface.css_height, size.height);
+        assert!(!print.paint_root_scrollbars);
+    }
 
     #[test]
     fn full_document_capture_keeps_layout_viewport_and_offsets_scroll() {

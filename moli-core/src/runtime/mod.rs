@@ -40,14 +40,16 @@ pub use fetch_deadline::{FetchDeadline, FetchReadinessTimeout, FetchTimeoutPhase
 pub use moli_renderer_v8::{
     DetachedParserScriptFetchContinuation, RendererBrowserContextRuntime,
     RendererBrowserContextRuntimeOwner, RendererBrowserContextRuntimeOwnerAccess,
-    RendererLifecycleDecider, RendererLifecycleDecision, RendererLifecycleSnapshot,
-    RendererPageReservationToken, RendererReservedServiceWorkerClient,
-    RendererServiceWorkerMainResourceFetch, RendererSharedWorkerRuntimeDiagnostics,
+    RendererDocumentPreparationTarget, RendererLifecycleDecider, RendererLifecycleDecision,
+    RendererLifecycleSnapshot, RendererPageReplacementTarget, RendererPageReservationToken,
+    RendererReservedServiceWorkerClient, RendererServiceWorkerMainResourceFetch,
+    RendererSharedWorkerRuntimeDiagnostics,
 };
 pub use navigation_engine::{
-    BuiltDocumentPage, CommittedDocumentResourceSource, NavigationEngine,
-    NavigationPageStorageHandles, NavigationResourceStorageHandles, NavigationRuntimeConfig,
-    PendingBuiltDocumentPage, PreparedDocumentPage, PreparedDocumentPageCommitConfiguration,
+    BuiltDocumentPage, CommittedDocumentPageReplacement, CommittedDocumentResourceSource,
+    CompletedDocumentPageReplacement, NavigationEngine, NavigationPageStorageHandles,
+    NavigationResourceStorageHandles, NavigationRuntimeConfig, PendingBuiltDocumentPage,
+    PendingDocumentPageReplacement, PreparedDocumentPage, PreparedDocumentPageCommitConfiguration,
     PreparedDocumentPageCommitPermit,
 };
 
@@ -58,6 +60,13 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 pub enum RawDocumentFetchPolicy {
     /// Read the response body and return [`FetchedDocument::Raw`].
     Materialize,
+    /// Return response metadata with an empty body and cancel the download.
+    /// Callers can use the metadata to select an error without reading a body
+    /// that their output format cannot consume.
+    MetadataOnly,
+    /// Read the body only for statuses below the threshold. Otherwise return
+    /// response metadata with an empty body and cancel the download.
+    MaterializeBelowStatus(u16),
     /// Require a renderable Page, rejecting raw responses from their headers.
     RequirePage,
 }
@@ -74,10 +83,14 @@ impl fmt::Display for RawDocumentPageRequired {
 
 impl std::error::Error for RawDocumentPageRequired {}
 
-fn ensure_raw_document_materialization_allowed(policy: RawDocumentFetchPolicy) -> Result<()> {
-    match policy {
-        RawDocumentFetchPolicy::Materialize => Ok(()),
-        RawDocumentFetchPolicy::RequirePage => Err(anyhow::Error::new(RawDocumentPageRequired)),
+impl RawDocumentFetchPolicy {
+    fn should_materialize_body(self, status: u16) -> Result<bool> {
+        match self {
+            Self::Materialize => Ok(true),
+            Self::MetadataOnly => Ok(false),
+            Self::MaterializeBelowStatus(threshold) => Ok(status < threshold),
+            Self::RequirePage => Err(anyhow::Error::new(RawDocumentPageRequired)),
+        }
     }
 }
 
@@ -150,10 +163,10 @@ impl Drop for BrowserLifetimeOwner {
             drop(js_runtime);
         }
         self.browser_context_owner.shutdown_and_join();
-        if let Err(error) = self.partition.flush() {
+        if let Err(error) = self.partition.shutdown() {
             warn!(
                 error = %error,
-                "failed to flush browser storage partition"
+                "failed to close browser storage partition"
             );
         }
         debug!("browser renderer and resource owners joined");
@@ -210,7 +223,7 @@ impl RawDocument {
         self.response.status
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
+    pub fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.response.headers
     }
 
@@ -227,6 +240,19 @@ impl RawDocument {
 pub enum FetchedDocument {
     Page(Page),
     Raw(Box<RawDocument>),
+}
+
+// Browser's public page-loading API starts a new navigation without a caller
+// Document. An HTTP request supplied here enters browser semantics with that
+// opaque initiator; renderer subresources must already carry their environment.
+fn initial_navigation_request(request: Request) -> Request {
+    if request.request_origin().is_none() {
+        request
+            .with_request_origin(moli_url::WebOrigin::Opaque)
+            .with_request_mode(moli_fetch::RequestMode::Navigate)
+    } else {
+        request
+    }
 }
 
 impl Browser {
@@ -261,16 +287,17 @@ impl Browser {
             RendererBrowserContextRuntime::new_owned_with_service_worker_resource_store_and_browser_resource_runtime(
                 partition.service_worker_resource_store(),
                 resource_runtime,
+                config.debugger_enabled(),
             );
         let browser_context_access = browser_context_owner.owner_access();
         let resource_runtime = browser_context_access
             .current_browser_resource_runtime()
-            .map_err(|error| anyhow!("browser context resource owner unavailable: {error}"))?;
+            .context("browser context resource owner unavailable")?;
         let js_runtime =
             JsRuntime::initialize_with_browser_context_owner_access(&browser_context_access)?;
         js_runtime
             .renderer_owner_handle()
-            .configure_layout_policy(config.layout_policy())?;
+            .configure_layout_configuration(config.layout_configuration())?;
         let lifetime_owner = Rc::new(BrowserLifetimeOwner {
             js_runtime: Some(js_runtime.clone()),
             browser_context_owner,
@@ -484,6 +511,7 @@ impl Browser {
         lifecycle_decider: Option<RendererLifecycleDecider>,
         raw_document_policy: RawDocumentFetchPolicy,
     ) -> Result<FetchedDocument> {
+        let request = initial_navigation_request(request);
         let timeout = deadline.timeout();
         let stage = wait_until.base_stage();
 
@@ -548,9 +576,12 @@ impl Browser {
         if let Some(response) = response {
             navigation_loader.note_service_worker_response_ready()?;
             if response_headers_indicate_raw_document(&response.headers) {
-                ensure_raw_document_materialization_allowed(raw_document_policy)?;
-                let raw_response =
-                    RawResponse::from_head_and_body(response.head(), response.clone_body_bytes());
+                let body = if raw_document_policy.should_materialize_body(response.status)? {
+                    response.clone_body_bytes()
+                } else {
+                    Vec::new()
+                };
+                let raw_response = RawResponse::from_head_and_body(response.head(), body);
                 return Ok(FetchedDocument::Raw(Box::new(RawDocument::from_response(
                     raw_response,
                 ))));
@@ -594,7 +625,12 @@ impl Browser {
             )
             .await?;
         if response_headers_indicate_raw_document(&response.headers) {
-            ensure_raw_document_materialization_allowed(raw_document_policy)?;
+            if !raw_document_policy.should_materialize_body(response.status)? {
+                let raw_response = RawResponse::from_head_and_body(response.head(), Vec::new());
+                return Ok(FetchedDocument::Raw(Box::new(RawDocument::from_response(
+                    raw_response,
+                ))));
+            }
             // Binary/download-like main resources have no DOM lifecycle
             // milestones, but materializing a RawDocument still consumes the
             // caller-owned absolute fetch-readiness budget.
@@ -835,6 +871,7 @@ impl Browser {
     }
 
     async fn fetch_internal(&self, request: Request, stage: PageVmInitStage) -> Result<Page> {
+        let request = initial_navigation_request(request);
         let raw_url = request.url.as_str().to_owned();
         let requested_url = request.url.clone();
         if is_about_blank_url(&requested_url) {
@@ -904,6 +941,7 @@ impl Browser {
         request: Request,
         stage: PageVmInitStage,
     ) -> Result<Page> {
+        let request = initial_navigation_request(request);
         let raw_url = request.url.as_str().to_owned();
         let requested_url = request.url.clone();
         if is_about_blank_url(&requested_url) {
@@ -968,6 +1006,7 @@ impl Browser {
         stage: PageVmInitStage,
         reply_boundary: RendererReplyBoundary,
     ) -> Result<FetchedDocument> {
+        let request = initial_navigation_request(request);
         let raw_url = request.url.as_str().to_owned();
         let requested_url = request.url.clone();
         if is_about_blank_url(&requested_url) {
@@ -1146,15 +1185,17 @@ impl Browser {
             document_start_scripts,
             vec![],
             vec![],
-            vec![],
+            Default::default(),
             false,
             Vec::new(),
-            false,
-            None,
+            crate::page::SubresourceInterceptionClasses::NONE,
             stage,
         );
-        create_page_request.script_execution_disabled = self.config.script_execution_disabled();
+        create_page_request
+            .document_settings
+            .script_execution_disabled = self.config.script_execution_disabled();
         create_page_request.wpt_extensions_enabled = self.config.wpt_extensions_enabled();
+        create_page_request.document_settings.debugger_enabled = self.config.debugger_enabled();
         create_page_request.reply_boundary = reply_boundary;
         create_page_request.lifecycle_decider = lifecycle_decider;
         create_page_request.indexed_db_manager = Some(self.partition.weak_indexed_db_manager());
@@ -1266,7 +1307,7 @@ impl Browser {
             pending_download,
         ) = self
             .js_runtime
-            .create_streaming_raw_page_from_external_body_with_inspector_session_restores(
+            .create_streaming_raw_page_from_external_body(
                 requested_url,
                 final_url,
                 None,
@@ -1281,32 +1322,24 @@ impl Browser {
                     self.partition.session_storage_store(),
                 ),
                 raw_body,
-                Some(self.partition.weak_indexed_db_manager()),
-                Some(self.partition.storage_bucket_store()),
-                document_start_scripts,
-                vec![],
-                vec![],
-                None,
-                None,
-                self.config.script_execution_disabled(),
-                false,
-                1.0,
-                Default::default(),
-                None,
-                false,
-                Vec::new(),
-                false,
-                None,
-                Vec::new(),
                 self.config.wpt_extensions_enabled(),
                 stage,
                 reply_boundary,
                 moli_renderer_v8::RendererTopLevelNavigationDispatch::FollowInStandaloneAdapter,
                 moli_renderer_v8::RendererNavigationReplyPolicy::FollowBeforeReply,
-                None,
                 reserved_service_worker_client,
-                None,
                 lifecycle_decider,
+                moli_renderer_v8::RendererDocumentOptions {
+                    indexed_db_manager: Some(self.partition.weak_indexed_db_manager()),
+                    storage_bucket_store: Some(self.partition.storage_bucket_store()),
+                    document_start_scripts,
+                    document_settings: moli_page_types::DocumentSettings {
+                        script_execution_disabled: self.config.script_execution_disabled(),
+                        debugger_enabled: self.config.debugger_enabled(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
             )
             .await?;
         if pending_download.is_some() {
@@ -1424,11 +1457,23 @@ fn external_raw_document_body_from_streaming_response_with_observer_and_progress
     body_stream
 }
 
-fn streaming_raw_response_from_navigation_response(
-    response: NavigationResponse,
+pub fn streaming_raw_response_from_navigation_response(
+    mut response: NavigationResponse,
 ) -> Result<StreamingRawResponse> {
     let head = response.head();
-    let body = response.clone_body_bytes();
+    let body = response.take_body_bytes();
+    streaming_raw_response_from_raw_response(moli_fetch::RawResponse::from_head_and_body(
+        head, body,
+    ))
+}
+
+pub fn streaming_raw_response_from_raw_response(
+    response: moli_fetch::RawResponse,
+) -> Result<StreamingRawResponse> {
+    let (head, body) = response.into_body();
+    let body = body
+        .try_into_materialized_bytes()
+        .map_err(|_| anyhow!("navigation response body must be materialized"))?;
     let (body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel();
     if !body.is_empty() {
         body_tx

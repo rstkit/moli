@@ -17,12 +17,16 @@ pub mod storage;
 pub mod testing;
 
 pub use moli_page_types as protocol_types;
-pub use moli_page_types::{LayoutPolicy, OptionalResourceFetchMask};
+pub use moli_page_types::{LayoutConfiguration, LayoutPolicy, OptionalResourceFetchMask};
+pub use moli_renderer_v8::ProcessEnvironmentOwner;
 pub use moli_renderer_v8::renderer_output_transport_channel;
 pub use moli_renderer_v8::{
-    PageId, RendererBrowserContextRuntimeId, RendererDocumentLifecycleIdentity,
-    RendererDocumentTitleChanged, RendererOutputCursor, RendererOutputFence,
-    RendererOutputFenceLeaseId, RendererOutputItem, RendererOutputPublication,
+    PageId, RendererBrowserContextRuntimeId, RendererCdpCall, RendererDocumentLifecycleIdentity,
+    RendererDocumentTitleChanged, RendererNativeCommandReadyResponse,
+    RendererNativeCommandResponseGuard, RendererNativeCommandTerminal, RendererNativeOperation,
+    RendererNativeOperationStep, RendererNativeProtocolError, RendererNativeProtocolNotification,
+    RendererNativeProtocolResponse, RendererNativeProtocolStateUpdate, RendererOutputCursor,
+    RendererOutputFence, RendererOutputFenceLeaseId, RendererOutputItem, RendererOutputPublication,
     RendererOutputPublicationOrdering, RendererOutputRecord, RendererOutputResidenceIdentity,
     RendererOutputStreamCloseReason, RendererOutputStreamControl, RendererOutputStreamEpoch,
     RendererOutputStreamIdentity, RendererOutputTransportDiagnostics,
@@ -32,4 +36,10 @@ pub use moli_renderer_v8::{
     RendererOwnerRuntimeActivitySource, RendererProtocolObservation,
     RendererRuntimeCommandCausalIdentity, RendererRuntimeInspectorAsyncCompletion,
     RendererRuntimeInspectorResponseChannel, RendererRuntimeInspectorResponseSender,
+    RendererRuntimeRemoteObjectResolution,
 };
+pub use moli_renderer_v8::{RendererPageAccessError, RendererPageCommand, RendererPageReply};
+
+/// ACE page tasks executed on the renderer owner thread.
+#[cfg(feature = "ace-protocol")]
+pub use moli_renderer_v8::ace_page_task;

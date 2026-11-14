@@ -1,11 +1,12 @@
 use crate::conn::{CdpConnection, CommandOwnerScope};
+use crate::conn::{CommandWorkflowContext, ProtocolWorkflowDriver};
 use crate::domains::activity::{
     PreparedSubresourceContinueAction, ProtocolOutputPayloads, ProtocolOutputProjectionContext,
     ProtocolOutputSink, ProtocolOutputSlot,
-    flush_prepared_subresource_continue_actions_background_events_async,
     prepare_subresource_continue_action_for_renderer_record,
 };
 use crate::domains::fetch;
+use anyhow::Result;
 
 use super::TargetSubresourceFetchPauseOutput;
 use super::output_queue::TargetNetworkBacklogPreparedDelivery;
@@ -21,17 +22,10 @@ pub(crate) enum NetworkActivityOutput {
     SubresourceFetchInterception,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NetworkOutputProjectionStep {
-    PendingSubresourceContinueEvents,
-    RendererNetworkLive,
-    NetworkBacklog,
-    SubresourceFetchInterception,
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct NetworkPreparedOutputs {
     pending_subresource_continue_actions: Vec<PreparedSubresourceContinueAction>,
+    automatic_subresource_continuations: Vec<fetch::PreparedSubresourceAutoContinue>,
     renderer_live: TargetNetworkBacklogPreparedDelivery,
     backlog: TargetNetworkBacklogPreparedDelivery,
     subresource_fetch_pauses: Vec<TargetSubresourceFetchPauseOutput>,
@@ -42,11 +36,79 @@ pub(crate) struct NetworkPreparedOutputSlot {
     outputs: NetworkPreparedOutputs,
 }
 
+pub(crate) struct PreparedSubresourceProjection {
+    automatic: Vec<fetch::PreparedSubresourceAutoContinue>,
+    actions: std::vec::IntoIter<PreparedSubresourceContinueAction>,
+    pending: Option<Box<crate::domains::activity::PreparedSubresourceContinueWait>>,
+    owner: CommandOwnerScope,
+}
+
+impl PreparedSubresourceProjection {
+    pub(in crate::domains) fn take(
+        conn: &mut CdpConnection,
+        owner: &CommandOwnerScope,
+        payloads: &mut ProtocolOutputPayloads,
+        context: &mut CommandWorkflowContext,
+    ) -> Option<Self> {
+        let outputs = &mut payloads.network_mut()?.outputs;
+        let mut projection = Self {
+            automatic: std::mem::take(&mut outputs.automatic_subresource_continuations),
+            actions: std::mem::take(&mut outputs.pending_subresource_continue_actions).into_iter(),
+            pending: None,
+            owner: owner.clone(),
+        };
+        if !projection.automatic.is_empty() {
+            return Some(projection);
+        }
+        for action in projection.actions.by_ref() {
+            if let Some(pending) = crate::domains::activity::prepare_subresource_continue_action(
+                conn,
+                context.context_mut().protocol_events_mut(),
+                owner,
+                action,
+            ) {
+                projection.pending = Some(Box::new(pending));
+                return Some(projection);
+            }
+        }
+        None
+    }
+
+    pub(crate) async fn run(
+        self,
+        driver: &mut ProtocolWorkflowDriver,
+        context: &mut CommandWorkflowContext,
+    ) -> Result<()> {
+        for pending in self.automatic {
+            pending.run(driver).await?;
+        }
+        if let Some(pending) = self.pending {
+            let events = pending.run(driver).await?;
+            context.context_mut().protocol_events_mut().extend(events);
+        }
+        for action in self.actions {
+            let owner = self.owner.clone();
+            let (events, pending) = driver.with_state(move |state| {
+                state.prepare_subresource_continue_action(owner, action)
+            })?;
+            context.context_mut().protocol_events_mut().extend(events);
+            if let Some(pending) = pending {
+                context
+                    .context_mut()
+                    .protocol_events_mut()
+                    .extend(pending.run(driver).await?);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl NetworkPreparedOutputs {
     pub(crate) fn from_renderer_live_delivery(
         renderer_live: TargetNetworkBacklogPreparedDelivery,
     ) -> Self {
         Self {
+            automatic_subresource_continuations: Vec::new(),
             pending_subresource_continue_actions: Vec::new(),
             renderer_live,
             backlog: TargetNetworkBacklogPreparedDelivery::default(),
@@ -72,10 +134,21 @@ impl NetworkPreparedOutputs {
         subresource_fetch_pauses: Vec<TargetSubresourceFetchPauseOutput>,
     ) -> Self {
         Self {
+            automatic_subresource_continuations: Vec::new(),
             pending_subresource_continue_actions: Vec::new(),
             renderer_live: TargetNetworkBacklogPreparedDelivery::default(),
             backlog: TargetNetworkBacklogPreparedDelivery::default(),
             subresource_fetch_pauses,
+        }
+    }
+
+    pub(crate) fn from_subresource_fetch_pauses_and_continuations(
+        pauses: Vec<TargetSubresourceFetchPauseOutput>,
+        automatic_subresource_continuations: Vec<fetch::PreparedSubresourceAutoContinue>,
+    ) -> Self {
+        Self {
+            automatic_subresource_continuations,
+            ..Self::from_subresource_fetch_pauses(pauses)
         }
     }
 
@@ -84,14 +157,17 @@ impl NetworkPreparedOutputs {
         owner: &CommandOwnerScope,
         source_document: moli_core::RendererDocumentLifecycleIdentity,
         event: moli_core::page::PendingSubresourceContinueEvent,
+        network_pause: Option<moli_core::network::ResourceInterceptionPause>,
     ) -> Self {
         Self {
+            automatic_subresource_continuations: Vec::new(),
             pending_subresource_continue_actions:
                 prepare_subresource_continue_action_for_renderer_record(
                     conn,
                     owner,
                     source_document,
                     event,
+                    network_pause,
                 )
                 .into_iter()
                 .collect(),
@@ -102,6 +178,8 @@ impl NetworkPreparedOutputs {
     }
 
     pub(crate) fn extend(&mut self, other: Self) {
+        self.automatic_subresource_continuations
+            .extend(other.automatic_subresource_continuations);
         self.pending_subresource_continue_actions
             .extend(other.pending_subresource_continue_actions);
         self.renderer_live.extend(other.renderer_live);
@@ -111,7 +189,8 @@ impl NetworkPreparedOutputs {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.pending_subresource_continue_actions.is_empty()
+        self.automatic_subresource_continuations.is_empty()
+            && self.pending_subresource_continue_actions.is_empty()
             && !self.renderer_live.has_delivery_output()
             && !self.backlog.has_delivery_output()
             && self.subresource_fetch_pauses.is_empty()
@@ -119,7 +198,9 @@ impl NetworkPreparedOutputs {
 
     pub(crate) fn outputs(&self) -> Vec<NetworkActivityOutput> {
         let mut outputs = Vec::new();
-        if !self.pending_subresource_continue_actions.is_empty() {
+        if !self.pending_subresource_continue_actions.is_empty()
+            || !self.automatic_subresource_continuations.is_empty()
+        {
             outputs.push(NetworkActivityOutput::PendingSubresourceContinueEvents);
         }
         if self.renderer_live.has_delivery_output() {
@@ -159,13 +240,6 @@ impl NetworkPreparedOutputs {
         }
     }
 
-    pub(crate) fn take_pending_subresource_continue_actions(
-        &mut self,
-    ) -> Option<Vec<PreparedSubresourceContinueAction>> {
-        (!self.pending_subresource_continue_actions.is_empty())
-            .then(|| std::mem::take(&mut self.pending_subresource_continue_actions))
-    }
-
     pub(crate) fn take_subresource_fetch_pauses(
         &mut self,
     ) -> Option<Vec<TargetSubresourceFetchPauseOutput>> {
@@ -178,6 +252,7 @@ impl NetworkPreparedOutputs {
         actions: Vec<PreparedSubresourceContinueAction>,
     ) -> Self {
         Self {
+            automatic_subresource_continuations: Vec::new(),
             pending_subresource_continue_actions: actions,
             renderer_live: TargetNetworkBacklogPreparedDelivery::default(),
             backlog: TargetNetworkBacklogPreparedDelivery::default(),
@@ -202,14 +277,14 @@ impl NetworkPreparedOutputs {
             url: Url::parse("https://example.test/api").unwrap(),
             websocket_socket_id: None,
             method: "GET".to_owned(),
-            request_headers: Vec::new(),
+            request_headers: Vec::new().into(),
             request_body: None,
             request_body_bytes: None,
             resource_type: SubresourceResourceType::Fetch,
             request_cookie_report: None,
         };
         let pending = PendingSubresourceFetchRequest {
-            residence: crate::conn::PendingSubresourceFetchResidence::InstalledPage(page_owner),
+            residence: crate::conn::PendingSubresourceFetchResidence::Page(page_owner),
             owner_session_id: None,
             action_session_id: None,
             owner_kind: PendingSubresourceFetchOwnerKind::Fetch,
@@ -274,12 +349,6 @@ impl NetworkPreparedOutputSlot {
         self.outputs.extend(other.outputs);
     }
 
-    pub(crate) fn take_pending_subresource_continue_actions(
-        &mut self,
-    ) -> Option<Vec<PreparedSubresourceContinueAction>> {
-        self.outputs.take_pending_subresource_continue_actions()
-    }
-
     pub(crate) fn take_subresource_fetch_pauses(
         &mut self,
     ) -> Option<Vec<TargetSubresourceFetchPauseOutput>> {
@@ -300,20 +369,6 @@ impl NetworkPreparedOutputSlot {
             contextual_subresource_request_id,
             Some(&mut self.outputs),
         )
-    }
-
-    pub(crate) async fn emit_pending_subresource_continue_background_events(
-        &mut self,
-        conn: &mut CdpConnection,
-        out: &mut Vec<crate::conn::BackgroundProtocolEvent>,
-        owner: &CommandOwnerScope,
-    ) {
-        if let Some(actions) = self.take_pending_subresource_continue_actions() {
-            flush_prepared_subresource_continue_actions_background_events_async(
-                conn, out, owner, actions,
-            )
-            .await;
-        }
     }
 
     pub(crate) fn emit_backlog_activity_background_events(
@@ -361,105 +416,60 @@ pub(in crate::domains) const SLOT_NETWORK_BACKLOG: ProtocolOutputSlot =
 pub(in crate::domains) const SLOT_SUBRESOURCE_FETCH_INTERCEPTION: ProtocolOutputSlot =
     ProtocolOutputSlot::SubresourceFetchInterception;
 
-impl NetworkOutputProjectionStep {
-    async fn project_async(
-        self,
-        conn: &mut CdpConnection,
-        context: &mut ProtocolOutputProjectionContext<'_>,
-        prepared_outputs: Option<&mut ProtocolOutputPayloads>,
-    ) {
-        let owner = context.owner().clone();
-        match self {
-            NetworkOutputProjectionStep::PendingSubresourceContinueEvents => {
-                if let Some(slot) = prepared_outputs.and_then(ProtocolOutputPayloads::network_mut) {
-                    slot.emit_pending_subresource_continue_background_events(
-                        conn,
-                        context.command.protocol_events_mut(),
-                        &owner,
-                    )
-                    .await;
-                }
-            }
-            NetworkOutputProjectionStep::RendererNetworkLive => {
-                if let Some(slot) = prepared_outputs.and_then(ProtocolOutputPayloads::network_mut) {
-                    slot.emit_renderer_live_background_events(
-                        conn,
-                        context.command.protocol_events_mut(),
-                        &owner,
-                    );
-                }
-            }
-            NetworkOutputProjectionStep::NetworkBacklog => {
-                if let Some(slot) = prepared_outputs.and_then(ProtocolOutputPayloads::network_mut) {
-                    slot.emit_backlog_activity_background_events(
-                        conn,
-                        context.command.protocol_events_mut(),
-                        &owner,
-                        context.subresource_frame_id,
-                        context.subresource_timestamp,
-                        context.subresource_network_request_id,
-                    );
-                }
-            }
-            NetworkOutputProjectionStep::SubresourceFetchInterception => {
-                if let Some(pauses) = prepared_outputs
-                    .and_then(ProtocolOutputPayloads::network_mut)
-                    .and_then(NetworkPreparedOutputSlot::take_subresource_fetch_pauses)
-                {
-                    let mut events = Vec::new();
-                    let network_session_ids = conn.network_event_session_ids_for_owner(&owner);
-                    fetch::emit_subresource_fetch_pause_outputs(
-                        conn,
-                        &mut events,
-                        &owner,
-                        &network_session_ids,
-                        pauses,
-                    );
-                    context.command.protocol_events_mut().extend(events);
-                }
-            }
-        }
+pub(in crate::domains) fn project_network_backlog(
+    conn: &mut CdpConnection,
+    context: &mut ProtocolOutputProjectionContext<'_>,
+    prepared_outputs: &mut ProtocolOutputPayloads,
+) {
+    let owner = context.owner().clone();
+    if let Some(slot) = prepared_outputs.network_mut() {
+        slot.emit_backlog_activity_background_events(
+            conn,
+            context.command.protocol_events_mut(),
+            &owner,
+            context.subresource_frame_id,
+            context.subresource_timestamp,
+            context.subresource_network_request_id,
+        );
     }
 }
 
-pub(in crate::domains) async fn project_pending_subresource_continue_async(
+pub(in crate::domains) fn project_renderer_network_live(
     conn: &mut CdpConnection,
     context: &mut ProtocolOutputProjectionContext<'_>,
-    prepared_outputs: Option<&mut ProtocolOutputPayloads>,
+    prepared_outputs: &mut ProtocolOutputPayloads,
 ) {
-    NetworkOutputProjectionStep::PendingSubresourceContinueEvents
-        .project_async(conn, context, prepared_outputs)
-        .await;
+    let owner = context.owner().clone();
+    if let Some(slot) = prepared_outputs.network_mut() {
+        slot.emit_renderer_live_background_events(
+            conn,
+            context.command.protocol_events_mut(),
+            &owner,
+        );
+    }
 }
 
-pub(in crate::domains) async fn project_network_backlog_async(
+pub(in crate::domains) fn project_subresource_fetch_interception(
     conn: &mut CdpConnection,
     context: &mut ProtocolOutputProjectionContext<'_>,
-    prepared_outputs: Option<&mut ProtocolOutputPayloads>,
+    prepared_outputs: &mut ProtocolOutputPayloads,
 ) {
-    NetworkOutputProjectionStep::NetworkBacklog
-        .project_async(conn, context, prepared_outputs)
-        .await;
-}
-
-pub(in crate::domains) async fn project_renderer_network_live_async(
-    conn: &mut CdpConnection,
-    context: &mut ProtocolOutputProjectionContext<'_>,
-    prepared_outputs: Option<&mut ProtocolOutputPayloads>,
-) {
-    NetworkOutputProjectionStep::RendererNetworkLive
-        .project_async(conn, context, prepared_outputs)
-        .await;
-}
-
-pub(in crate::domains) async fn project_subresource_fetch_interception_async(
-    conn: &mut CdpConnection,
-    context: &mut ProtocolOutputProjectionContext<'_>,
-    prepared_outputs: Option<&mut ProtocolOutputPayloads>,
-) {
-    NetworkOutputProjectionStep::SubresourceFetchInterception
-        .project_async(conn, context, prepared_outputs)
-        .await;
+    let owner = context.owner().clone();
+    if let Some(pauses) = prepared_outputs
+        .network_mut()
+        .and_then(NetworkPreparedOutputSlot::take_subresource_fetch_pauses)
+    {
+        let mut events = Vec::new();
+        let network_session_ids = conn.network_event_session_ids_for_owner(&owner);
+        fetch::emit_subresource_fetch_pause_outputs(
+            conn,
+            &mut events,
+            &owner,
+            &network_session_ids,
+            pauses,
+        );
+        context.command.protocol_events_mut().extend(events);
+    }
 }
 
 pub(in crate::domains) fn network_backlog_prepared_outputs_for_owner(
@@ -477,6 +487,7 @@ pub(in crate::domains) fn network_backlog_prepared_outputs_for_owner(
         preferred_request_id,
     ) {
         outputs.extend(NetworkPreparedOutputs {
+            automatic_subresource_continuations: Vec::new(),
             pending_subresource_continue_actions: Vec::new(),
             renderer_live: TargetNetworkBacklogPreparedDelivery::default(),
             backlog,
@@ -519,7 +530,7 @@ mod tests {
         request_handle: SubresourceNetworkRequestHandle,
     ) -> PendingSubresourceFetchRequest {
         PendingSubresourceFetchRequest {
-            residence: crate::conn::PendingSubresourceFetchResidence::InstalledPage(page_owner),
+            residence: crate::conn::PendingSubresourceFetchResidence::Page(page_owner),
             owner_session_id: None,
             action_session_id: None,
             owner_kind: PendingSubresourceFetchOwnerKind::Fetch,
@@ -544,8 +555,9 @@ mod tests {
                     Message::Binary(bytes) => {
                         let _ = socket.send(Message::Binary(bytes)).await;
                     }
-                    Message::Close(frame) => {
-                        let _ = socket.send(Message::Close(frame)).await;
+                    Message::Close(_frame) => {
+                        // recv already queued the Close reply; flush before releasing TCP.
+                        let _ = futures_util::SinkExt::flush(&mut socket).await;
                         break;
                     }
                     Message::Ping(bytes) => {
@@ -580,19 +592,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_subresource_continue_drain_consumes_prepared_events_without_page_readback() {
-        let mut conn = CdpConnection::default();
+        let mut ctx = crate::testing::TestContext::from_conn(CdpConnection::default());
         let mut bc = BrowserContext::new("BID-1".into());
         bc.set_active_target_id("TID-1");
         bc.attach_active_session("SID-1");
         bc.active_page_target_mut()
             .runtime_slot
             .set_page_attachment_id_for_test(1);
-        conn.install_browser_context_fixture_for_test(bc);
-        let page_owner = conn
-            .target_page_residence_identity_for_session(Some("SID-1"))
-            .expect("test target should expose a Page residence identity");
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+        let page_owner = ctx.with_fixture(|conn| {
+            conn.target_page_residence_identity_for_session(Some("SID-1"))
+                .expect("test target should expose a Page residence identity")
+        });
         let pending = PendingSubresourceFetchRequest {
-            residence: crate::conn::PendingSubresourceFetchResidence::InstalledPage(page_owner),
+            residence: crate::conn::PendingSubresourceFetchResidence::Page(page_owner),
             owner_session_id: None,
             action_session_id: None,
             owner_kind: PendingSubresourceFetchOwnerKind::Fetch,
@@ -605,37 +618,43 @@ mod tests {
             websocket_socket_id: None,
             request_stage_chain: None,
         };
-        assert!(
-            conn.register_in_flight_subresource_fetch_request_for_owner(
-                &crate::conn::CommandOwnerScope::for_session("SID-1"),
-                Some("fetch-req-1".to_owned()),
-                pending,
-            ),
-            "test setup should register owner-local in-flight subresource fetch"
-        );
+        ctx.with_fixture(|conn| {
+            assert!(
+                conn.register_in_flight_subresource_fetch_request_for_owner(
+                    &crate::conn::CommandOwnerScope::for_session("SID-1"),
+                    Some("fetch-req-1".to_owned()),
+                    pending,
+                ),
+                "test setup should register owner-local in-flight subresource fetch"
+            )
+        });
         let event =
             PendingSubresourceContinueEvent::ResponsePaused(PendingSubresourceResponseInfo {
                 internal_id: 7,
                 url: Url::parse("https://example.test/api").unwrap(),
                 final_url: Url::parse("https://example.test/api").unwrap(),
                 method: "GET".to_owned(),
-                request_headers: Vec::new(),
+                request_headers: Vec::new().into(),
                 request_body: None,
                 resource_type: SubresourceResourceType::Fetch,
                 request_cookie_report: None,
                 network_request_headers: None,
                 response_status: 200,
-                response_headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                response_headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
                 response_body: SubresourceResponseBody::from_bytes(b"prepared".to_vec()),
                 from_cache: false,
+                cache_state: Default::default(),
             });
-        let action = crate::domains::activity::PreparedSubresourceContinueAction::capture_for_test(
-            &mut conn,
-            Some("SID-1"),
-            event,
-        )
-        .expect("test target should capture the prepared continue action");
-        let mut prepared =
+        let action = ctx
+            .with_fixture(|conn| {
+                crate::domains::activity::PreparedSubresourceContinueAction::capture_for_test(
+                    conn,
+                    Some("SID-1"),
+                    event,
+                )
+            })
+            .expect("test target should capture the prepared continue action");
+        let prepared =
             ProtocolOutputPayloads::from_slot(super::NetworkPreparedOutputSlot::from_outputs(
                 NetworkPreparedOutputs::from_prepared_subresource_continue_actions_for_test(vec![
                     action,
@@ -643,24 +662,27 @@ mod tests {
             ));
         let owner = CommandOwnerScope::for_session("SID-1");
         let mut command_context = CommandDispatchContext::default();
-        let mut context = ProtocolOutputProjectionContext::new(&owner, &mut command_context);
-
-        super::NetworkOutputProjectionStep::PendingSubresourceContinueEvents
-            .project_async(&mut conn, &mut context, Some(&mut prepared))
-            .await;
-
-        assert!(
-            conn.runtime_session_owner_slot(Some("SID-1"))
-                .expect("runtime owner slot should exist")
-                .loaded_page()
-                .is_none(),
-            "prepared pending subresource continue emission must not require a loaded page"
+        let projection = crate::domains::activity::PreparedProtocolOutputs::from_slots_for_test(
+            [crate::domains::activity::ProtocolOutputSlot::PendingSubresourceContinueEvents],
+            prepared,
         );
-        let out = context
-            .command
+        ctx.project_fixture_outputs(projection, owner, &mut command_context)
+            .await
+            .unwrap();
+
+        ctx.with_fixture(|conn| {
+            assert!(
+                conn.runtime_session_owner_slot(Some("SID-1"))
+                    .expect("runtime owner slot should exist")
+                    .loaded_page()
+                    .is_none(),
+                "prepared pending subresource continue emission must not require a loaded page"
+            )
+        });
+        let out = command_context
             .take_protocol_events()
             .into_iter()
-            .map(crate::conn::BackgroundProtocolEvent::into_protocol_message)
+            .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
             .collect::<Vec<_>>();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["method"], json!("Fetch.requestPaused"));
@@ -673,31 +695,34 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn prepared_subresource_continue_rejects_replacement_id_and_handle_collision() {
-        let mut conn = CdpConnection::default();
+        let mut ctx = crate::testing::TestContext::from_conn(CdpConnection::default());
         let mut bc = BrowserContext::new("BID-collision".into());
         bc.set_active_target_id("TID-collision");
         bc.attach_active_session("SID-collision");
         bc.active_page_target_mut()
             .runtime_slot
             .set_page_attachment_id_for_test(1);
-        conn.install_browser_context_fixture_for_test(bc);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-        let old_owner = conn
-            .target_page_residence_identity_for_session(Some("SID-collision"))
-            .expect("old Page residence should exist");
+        let old_owner = ctx.with_fixture(|conn| {
+            conn.target_page_residence_identity_for_session(Some("SID-collision"))
+                .expect("old Page residence should exist")
+        });
         let reused_handle = SubresourceNetworkRequestHandle::new(9);
-        assert!(conn.register_in_flight_subresource_fetch_request_for_owner(
-            &crate::conn::CommandOwnerScope::for_session("SID-collision"),
-            Some("FETCH-old".to_owned()),
-            pending_request_for_page(old_owner, 7, "NETWORK-old", reused_handle),
-        ));
+        ctx.with_fixture(|conn| {
+            assert!(conn.register_in_flight_subresource_fetch_request_for_owner(
+                &crate::conn::CommandOwnerScope::for_session("SID-collision"),
+                Some("FETCH-old".to_owned()),
+                pending_request_for_page(old_owner, 7, "NETWORK-old", reused_handle),
+            ))
+        });
         let event =
             PendingSubresourceContinueEvent::ResponsePaused(PendingSubresourceResponseInfo {
                 internal_id: 7,
                 url: Url::parse("https://example.test/old").unwrap(),
                 final_url: Url::parse("https://example.test/old").unwrap(),
                 method: "GET".to_owned(),
-                request_headers: Vec::new(),
+                request_headers: Vec::new().into(),
                 request_body: None,
                 resource_type: SubresourceResourceType::Fetch,
                 request_cookie_report: None,
@@ -706,34 +731,49 @@ mod tests {
                 response_headers: Vec::new(),
                 response_body: SubresourceResponseBody::from_bytes(b"old".to_vec()),
                 from_cache: false,
+                cache_state: Default::default(),
             });
-        let old_action =
-            crate::domains::activity::PreparedSubresourceContinueAction::capture_for_test(
-                &mut conn,
-                Some("SID-collision"),
-                event,
-            )
+        let old_action = ctx
+            .with_fixture(|conn| {
+                crate::domains::activity::PreparedSubresourceContinueAction::capture_for_test(
+                    conn,
+                    Some("SID-collision"),
+                    event,
+                )
+            })
             .expect("old continuation should capture its exact request state");
 
-        conn.runtime_session_owner_slot_mut(Some("SID-collision"))
-            .expect("runtime owner should remain addressable")
-            .replace_page_attachment_id_for_test();
-        let replacement_owner = conn
-            .target_page_residence_identity_for_session(Some("SID-collision"))
-            .expect("replacement Page residence should exist");
-        assert!(conn.register_in_flight_subresource_fetch_request_for_owner(
-            &crate::conn::CommandOwnerScope::for_session("SID-collision"),
-            Some("FETCH-new".to_owned()),
-            pending_request_for_page(replacement_owner, 7, "NETWORK-new", reused_handle),
-        ));
+        ctx.with_fixture(|conn| {
+            conn.runtime_session_owner_slot_mut(Some("SID-collision"))
+                .expect("runtime owner should remain addressable")
+                .replace_page_attachment_id_for_test()
+        });
+        let replacement_owner = ctx.with_fixture(|conn| {
+            conn.target_page_residence_identity_for_session(Some("SID-collision"))
+                .expect("replacement Page residence should exist")
+        });
+        ctx.with_fixture(|conn| {
+            assert!(conn.register_in_flight_subresource_fetch_request_for_owner(
+                &crate::conn::CommandOwnerScope::for_session("SID-collision"),
+                Some("FETCH-new".to_owned()),
+                pending_request_for_page(replacement_owner, 7, "NETWORK-new", reused_handle),
+            ))
+        });
 
         let mut out = Vec::new();
         let command_owner = CommandOwnerScope::for_session("SID-collision");
-        crate::domains::activity::flush_prepared_subresource_continue_actions_background_events_async(
-            &mut conn,
+        let mut prepared =
+            ProtocolOutputPayloads::from_slot(super::NetworkPreparedOutputSlot::from_outputs(
+                NetworkPreparedOutputs::from_prepared_subresource_continue_actions_for_test(vec![
+                    old_action,
+                ]),
+            ));
+        crate::domains::activity::project_frozen_slot_for_test(
+            &mut ctx,
+            crate::domains::activity::ProtocolOutputSlot::PendingSubresourceContinueEvents,
+            &mut prepared,
+            command_owner,
             &mut out,
-            &command_owner,
-            vec![old_action],
         )
         .await;
 
@@ -741,7 +781,7 @@ mod tests {
             out.is_empty(),
             "stale continuation must not project an event for the replacement request"
         );
-        assert_eq!(
+        ctx.with_fixture(|conn| { assert_eq!(
             conn.in_flight_subresource_fetch_request_id_for_owner(
                 &crate::conn::CommandOwnerScope::for_session("SID-collision"),
                 7,
@@ -749,12 +789,12 @@ mod tests {
             .as_deref(),
             Some("FETCH-new"),
             "stale apply must not claim the replacement request even when both renderer IDs collide"
-        );
+        ) });
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn subresource_fetch_interception_drain_consumes_prepared_pause_without_page_readback() {
-        let mut conn = CdpConnection::default();
+        let ctx = crate::testing::TestContext::from_conn(CdpConnection::default());
         let mut bc = BrowserContext::new("BID-1".into());
         bc.set_active_target_id("TID-1");
         bc.attach_active_session("SID-1");
@@ -762,11 +802,14 @@ mod tests {
         bc.active_page_target_mut()
             .runtime_slot
             .set_page_attachment_id_for_test(1);
-        conn.install_browser_context_fixture_for_test(bc);
-        assert!(conn.enable_network_listener_for_session_owner(Some("FETCH-SID")));
-        let page_owner = conn
-            .target_page_residence_identity_for_session(Some("SID-1"))
-            .expect("test target should expose a Page residence identity");
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+        ctx.with_fixture(|conn| {
+            assert!(conn.enable_network_listener_for_session_owner(Some("FETCH-SID")))
+        });
+        let page_owner = ctx.with_fixture(|conn| {
+            conn.target_page_residence_identity_for_session(Some("SID-1"))
+                .expect("test target should expose a Page residence identity")
+        });
         let mut prepared =
             ProtocolOutputPayloads::from_slot(super::NetworkPreparedOutputSlot::from_outputs(
                 NetworkPreparedOutputs::from_subresource_fetch_interception_for_test(page_owner),
@@ -775,22 +818,23 @@ mod tests {
         let mut command_context = CommandDispatchContext::default();
         let mut context = ProtocolOutputProjectionContext::new(&owner, &mut command_context);
 
-        super::NetworkOutputProjectionStep::SubresourceFetchInterception
-            .project_async(&mut conn, &mut context, Some(&mut prepared))
-            .await;
+        ctx.with_fixture(|conn| {
+            super::project_subresource_fetch_interception(conn, &mut context, &mut prepared)
+        });
 
-        assert!(
-            conn.runtime_session_owner_slot(Some("SID-1"))
-                .expect("runtime owner slot should exist")
-                .loaded_page()
-                .is_none(),
-            "prepared subresource fetch interception emission must not require a loaded page"
-        );
-        let out = context
-            .command
+        ctx.with_fixture(|conn| {
+            assert!(
+                conn.runtime_session_owner_slot(Some("SID-1"))
+                    .expect("runtime owner slot should exist")
+                    .loaded_page()
+                    .is_none(),
+                "prepared subresource fetch interception emission must not require a loaded page"
+            )
+        });
+        let out = command_context
             .take_protocol_events()
             .into_iter()
-            .map(crate::conn::BackgroundProtocolEvent::into_protocol_message)
+            .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
             .collect::<Vec<_>>();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["method"], json!("Network.requestWillBeSent"));
@@ -800,7 +844,7 @@ mod tests {
         assert_eq!(out[1]["sessionId"], json!("FETCH-SID"));
         assert_eq!(out[1]["params"]["requestId"], json!("FETCH-1"));
         assert_eq!(out[1]["params"]["networkId"], json!("REQ-1"));
-        assert!(
+        ctx.with_fixture(|conn| { assert!(
             conn.browser_context
                 .as_ref()
                 .unwrap()
@@ -808,12 +852,12 @@ mod tests {
                 .fetch_owner
                 .has_pending_subresource_fetch_for_test("FETCH-1"),
             "prepared emission should still register the paused request on the owner fetch state"
-        );
+        ) });
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn subresource_fetch_interception_omits_network_events_without_listener() {
-        let mut conn = CdpConnection::default();
+        let ctx = crate::testing::TestContext::from_conn(CdpConnection::default());
         let mut bc = BrowserContext::new("BID-1".into());
         bc.set_active_target_id("TID-1");
         bc.attach_active_session("SID-1");
@@ -821,10 +865,11 @@ mod tests {
         bc.active_page_target_mut()
             .runtime_slot
             .set_page_attachment_id_for_test(1);
-        conn.install_browser_context_fixture_for_test(bc);
-        let page_owner = conn
-            .target_page_residence_identity_for_session(Some("SID-1"))
-            .expect("test target should expose a Page residence identity");
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+        let page_owner = ctx.with_fixture(|conn| {
+            conn.target_page_residence_identity_for_session(Some("SID-1"))
+                .expect("test target should expose a Page residence identity")
+        });
         let mut prepared =
             ProtocolOutputPayloads::from_slot(super::NetworkPreparedOutputSlot::from_outputs(
                 NetworkPreparedOutputs::from_subresource_fetch_interception_for_test(page_owner),
@@ -833,15 +878,14 @@ mod tests {
         let mut command_context = CommandDispatchContext::default();
         let mut context = ProtocolOutputProjectionContext::new(&owner, &mut command_context);
 
-        super::NetworkOutputProjectionStep::SubresourceFetchInterception
-            .project_async(&mut conn, &mut context, Some(&mut prepared))
-            .await;
+        ctx.with_fixture(|conn| {
+            super::project_subresource_fetch_interception(conn, &mut context, &mut prepared)
+        });
 
-        let out = context
-            .command
+        let out = command_context
             .take_protocol_events()
             .into_iter()
-            .map(crate::conn::BackgroundProtocolEvent::into_protocol_message)
+            .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
             .collect::<Vec<_>>();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["method"], json!("Fetch.requestPaused"));
@@ -909,7 +953,7 @@ mod tests {
             Some("SID-background".to_owned()),
             page_url.clone(),
         ));
-        ctx.conn.install_browser_context_fixture_for_test(bc);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
         for (id, session_id) in [(1, "SID-active"), (2, "SID-background")] {
             ctx.process_async(serde_json::json!({
@@ -997,7 +1041,7 @@ mod tests {
         let mut bc = BrowserContext::new("BID-1".into());
         bc.set_active_target_id("TID-1");
         bc.attach_active_session("SID-1");
-        ctx.conn.install_browser_context_fixture_for_test(bc);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
         ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
             .await;
         ctx.process_async(serde_json::json!({

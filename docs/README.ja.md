@@ -1,9 +1,19 @@
 <p align="center">
-  <img
-    src="../assets/moli-browser-banner.jpg"
-    alt="Moli Browser — 構造を優先し、画素は必要なときだけ。AI エージェント向けのオープンソースブラウザ。"
-    width="1086"
-  />
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="../assets/moli-browser-banner-dark.jpg"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="../assets/moli-browser-banner.jpg"
+    />
+    <img
+      src="../assets/moli-browser-banner.jpg"
+      alt="Moli Browser — 構造を優先し、画素は必要なときだけ。AI エージェント向けのオープンソースブラウザ。"
+      width="1086"
+    />
+  </picture>
 </p>
 
 <h1 align="center">Moli</h1>
@@ -14,7 +24,32 @@
   <strong>日本語</strong> |
   <a href="README.de.md">Deutsch</a> |
   <a href="README.fr.md">Français</a> |
-  <a href="README.es.md">Español</a>
+  <a href="README.es.md">Español</a> |
+  <a href="README.ko.md">한국어</a>
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/4eXGtdWWnq">
+    <img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2" alt="Discord" />
+  </a>
+  <a href="../assets/moli-feedback-wechat-group.png">
+    <img src="https://img.shields.io/badge/WeChat-Join%20Community-07C160" alt="WeChat" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/lexmount-browser?launch=moli-by-lexmount" target="_blank" rel="noopener noreferrer">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=dark" />
+      <img src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=light" alt="Moli by Lexmount - #1 Product of the Day | Product Hunt" width="250" height="54" />
+    </picture>
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/daily" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/weekly?language=Rust" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
 </p>
 
 Moli は、AI エージェント向けのヘッドレスブラウザで、本番環境でも利用できます。必要なときだけレイアウトと描画を行うことで、ブラウザの実行環境を一通り備えながら、計算資源の使用量を抑えます。
@@ -89,7 +124,7 @@ Moli の標準の完了判定を使い、ページを Markdown 形式で出力�
 ```bash
 moli fetch \
   --dump markdown \
-  --wait-until done \
+  --wait done \
   https://example.com
 ```
 
@@ -192,7 +227,7 @@ Moli では、処理負荷の高い機能は明示的に有効にした場合だ
 | `--layout` | `LayoutPolicy::OnDemand` — 実際のレイアウト、位置・寸法、座標判定、座標入力、画面画像、連続画面配信を提供します。 |
 | `--resource` | 通常は省略する画像・音声などのデータをすべて取得します。 |
 | `--image`、`--font`、`--audio`、`--video`、`--media`、`--text-track` | 指定した種類のデータを取得します。 |
-| `--profile-dir`、`--http-cache-dir`、`--cookie-file` | 必要な保存機能だけを選んで有効にします。 |
+| `--profile-dir`、`--http-cache-dir`、`--cookie` | 必要な保存機能だけを選んで有効にします。 |
 
 レイアウト結果は常に更新される状態ではなく、要求を受けた時点の状態です。最初に位置・寸法を要求されたときは、現在の DOM とスタイルから一時的な作業用レイアウト木を構築し、その確定済みジオメトリを DOM から独立した不変の `FrozenLayoutTree` に凍結して、最新の木だけを保持します。その後はページが変化していても通常の位置・寸法取得で古い木を再利用する場合があります。一方、画面画像と連続画面配信は毎回再構築して凍結木を置き換え、古い描画結果を再利用しません。
 

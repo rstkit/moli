@@ -1,3 +1,5 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
 use std::time::Instant;
 
 use moli_crypto::sha256_hex;
@@ -54,7 +56,7 @@ pub(super) struct ServiceWorkerScriptResource {
     pub(super) final_url: Url,
     pub(super) kind: WorkerScriptResourceKind,
     pub(super) status: u16,
-    pub(super) headers: Vec<(String, String)>,
+    pub(super) headers: Vec<(String, Vec<u8>)>,
     pub(super) body_len: usize,
     pub(super) body_sha256: String,
     pub(super) response_time_ms: u64,
@@ -104,8 +106,8 @@ pub(super) struct LoadedServiceWorkerScript {
     pub(super) resource: ServiceWorkerScriptResource,
     pub(super) source: String,
     pub(super) response_referrer_policy: Option<String>,
-    pub(super) response_content_security_policies: Vec<String>,
-    pub(super) response_content_security_report_only_policies: Vec<String>,
+    pub(super) response_content_security_policies: Vec<ContentSecurityPolicy>,
+    pub(super) response_content_security_report_only_policies: Vec<ContentSecurityPolicy>,
     pub(super) response_content_security_reporting_endpoints:
         ContentSecurityPolicyReportingEndpoints,
 }
@@ -197,6 +199,7 @@ pub(super) fn load_service_worker_script_source_for_params(
         .with_cache_mode(params.cache_mode)
         .with_page_network_policy()
         .with_initiator_url(&params.document_url)
+        .with_request_origin(moli_url::WebOrigin::from_url(&params.document_url))
         .with_script_fetch_metadata(ScriptFetchRequestMetadata {
             ..ScriptFetchRequestMetadata::default()
         });
@@ -329,9 +332,15 @@ fn load_imported_script_resource_for_update_check(
         .with_cache_mode(cache_mode)
         .with_page_network_policy()
         .with_initiator_url(initiator_url)
+        .with_request_origin(moli_url::WebOrigin::from_url(initiator_url))
         .with_script_fetch_metadata(ScriptFetchRequestMetadata {
             ..ScriptFetchRequestMetadata::default()
         });
+    let request = if kind == WorkerScriptResourceKind::TextModule {
+        request.with_browser_request_metadata(moli_fetch::BrowserRequestMetadata::TextModule)
+    } else {
+        request
+    };
     let response_started_at = Instant::now();
     let response = request_client
         .fetch_text_for_worker_blocking_boundary_with_cancel(request, FetchCancelHandle::new())
@@ -357,7 +366,7 @@ fn load_imported_script_resource_for_update_check(
     moli_fetch::ensure_http_status_success(response.final_url.as_str(), response.status, false)
         .map_err(|error| error.to_string())?;
     ensure_imported_script_resource_mime(kind, &response)?;
-    let (head, _body, body_bytes) = response.into_parts();
+    let (head, body_bytes) = response.into_byte_parts();
     let mut resource = ServiceWorkerScriptResource::from_response_parts(
         request_url_without_fragment,
         &head,
@@ -389,9 +398,7 @@ fn ensure_imported_script_resource_mime(
         WorkerScriptResourceKind::JsonModule => {
             crate::worker::ensure_worker_json_module_mime(response)
         }
-        WorkerScriptResourceKind::TextModule => {
-            crate::worker::ensure_worker_text_module_mime(response)
-        }
+        WorkerScriptResourceKind::TextModule => Ok(()),
         WorkerScriptResourceKind::WebAssemblyModule => {
             crate::worker::ensure_worker_wasm_module_mime(response)
         }
@@ -424,14 +431,16 @@ mod tests {
     fn script_resource_records_response_metadata_and_body_hash() {
         let request_url = Url::parse("https://example.test/app/sw.js").unwrap();
         let head = ResponseHead {
+            status_text: None,
             final_url: Url::parse("https://example.test/app/sw.js?final").unwrap(),
             status: 200,
-            headers: vec![("Content-Type".to_owned(), "text/javascript".to_owned())],
+            headers: vec![("Content-Type".to_owned(), b"text/javascript".to_vec())],
             request_cookie_report: None,
             cookie_set_reports: Vec::new(),
             redirected: false,
             redirect_chain: Vec::new(),
             from_cache: false,
+            cache_state: Default::default(),
             negotiated_http_version: None,
         };
 
@@ -658,7 +667,7 @@ mod tests {
             (
                 "/app/dep.txt",
                 "HTTP/1.1 200 OK",
-                "text/plain; charset=utf-8",
+                "application/octet-stream; charset=utf-16",
                 "updated text".to_owned(),
             ),
         ]);
@@ -695,7 +704,12 @@ mod tests {
                 script_url: dep_url
             }
         );
-        server.join().expect("script response server should finish");
+        let requests = server.join().expect("script response server should finish");
+        assert!(
+            requests[1]
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("sec-fetch-dest: text"))
+        );
     }
 
     #[test]
@@ -812,14 +826,16 @@ mod tests {
         kind: WorkerScriptResourceKind,
     ) -> ServiceWorkerScriptResource {
         let head = ResponseHead {
+            status_text: None,
             final_url: script_url.clone(),
             status: 200,
-            headers: vec![("Content-Type".to_owned(), mime_type.to_owned())],
+            headers: vec![("Content-Type".to_owned(), mime_type.as_bytes().to_vec())],
             request_cookie_report: None,
             cookie_set_reports: Vec::new(),
             redirected: false,
             redirect_chain: Vec::new(),
             from_cache: false,
+            cache_state: Default::default(),
             negotiated_http_version: None,
         };
         let mut resource =
@@ -834,7 +850,7 @@ mod tests {
 
     fn spawn_script_response_server(
         responses: Vec<(&'static str, &'static str, &'static str, String)>,
-    ) -> (String, thread::JoinHandle<()>) {
+    ) -> (String, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind script response server");
         let addr = listener.local_addr().expect("script response server addr");
         let server = thread::spawn(move || {
@@ -847,6 +863,7 @@ mod tests {
                     )
                 })
                 .collect::<HashMap<_, _>>();
+            let mut requests = Vec::new();
             while !responses.is_empty() {
                 let (mut stream, _) = listener.accept().expect("accept script request");
                 let request = read_http_request_head(&mut stream);
@@ -858,6 +875,7 @@ mod tests {
                 let (status_line, content_type, body) = responses
                     .remove(path)
                     .unwrap_or_else(|| panic!("unexpected script path: {path}"));
+                requests.push(request);
                 let response = format!(
                     "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -867,6 +885,7 @@ mod tests {
                     .write_all(response.as_bytes())
                     .expect("write script response");
             }
+            requests
         });
         (format!("http://{addr}"), server)
     }

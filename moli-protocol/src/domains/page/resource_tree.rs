@@ -1,3 +1,517 @@
+use super::*;
+
+pub(crate) struct PreparedAutomationFrameTree {
+    result: DevToolsGetFrameTreeResult,
+    host: Option<crate::conn::ProtocolPageHostScope>,
+    query: Option<crate::conn::PreparedRuntimePageQuery<Vec<ChildFrameTreeSnapshot>>>,
+}
+
+impl PreparedAutomationFrameTree {
+    pub(crate) fn prepare(
+        conn: &mut CdpConnection,
+        command: DevToolsGetFrameTreeCommand,
+    ) -> Result<Self, DevToolsError> {
+        let target_info = command
+            .context
+            .target_id
+            .as_ref()
+            .and_then(|target| devtools_target_info_for_target_id(conn, target.as_str()));
+        if matches!(
+            target_info.as_ref().map(|info| info.kind),
+            Some(DevToolsTargetKind::ServiceWorker)
+        ) {
+            return devtools_service_worker_frame_tree_result(
+                target_info.expect("service worker info"),
+                command.max_depth,
+            )
+            .map(|result| Self {
+                result,
+                host: None,
+                query: None,
+            });
+        }
+        let owner = page_command_owner(conn, &command.context)?;
+        if command.context.session_id.is_none() && conn.browser_context.is_none() {
+            return Err(devtools_frame_tree_error(
+                PageFrameQueryError::BrowserContextNotLoaded,
+            ));
+        }
+        let (target, url, origin, secure) = conn
+            .target_session_owner_frame_tree_identity_for_owner(&owner)
+            .ok_or_else(|| devtools_frame_tree_error(PageFrameQueryError::TargetNotLoaded))?;
+        let unreachable = network_error_page_unreachable_url(conn, &owner, &url);
+        let loader = frame_tree_loader_id_for_current_owner(conn, &owner);
+        let host = crate::conn::ProtocolPageHostScope::capture(conn, &owner)
+            .map_err(devtools_frame_tree_error)?;
+        let mime = if conn.ensure_document_accessible_for_owner(&owner).is_ok() {
+            conn.loaded_page_mut_for_owner(&owner)
+                .map(|page| main_document_mime_type(page))
+        } else {
+            None
+        };
+        let query = if mime.is_some() {
+            Some(
+                crate::conn::PreparedRuntimePageQuery::prepare_resident(
+                    conn,
+                    &owner,
+                    "Failed to snapshot child frame tree",
+                    |page| page.start_child_frame_tree_snapshot(),
+                    Page::finish_child_frame_tree_snapshot,
+                )
+                .map_err(devtools_frame_tree_error)?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            result: DevToolsGetFrameTreeResult {
+                frame_tree: frame_tree_payload(
+                    target,
+                    loader,
+                    url,
+                    unreachable,
+                    origin,
+                    secure,
+                    mime.unwrap_or_else(default_document_mime_type),
+                    Vec::new(),
+                ),
+                target_info,
+                max_depth: command.max_depth,
+            },
+            host: Some(host),
+            query,
+        })
+    }
+
+    pub(crate) async fn run(
+        self,
+        driver: &mut crate::conn::ProtocolWorkflowDriver,
+    ) -> Result<DevToolsGetFrameTreeResult, DevToolsError> {
+        let Self {
+            mut result,
+            host,
+            query,
+        } = self;
+        // Global frame inventories cannot merge unrelated Native stream tails.
+        let children = match query {
+            Some(query) => Some(query.run(driver, &mut None).await),
+            None => None,
+        };
+        if let Some(host) = host {
+            let current = driver
+                .with_state(move |state| state.page_query_host_is_current(&host))
+                .map_err(devtools_frame_tree_error)?;
+            if !current {
+                return Err(DevToolsError::new(
+                    DevToolsErrorKind::NoSuchTarget,
+                    crate::conn::NoDocumentLoaded,
+                ));
+            }
+        }
+        let children = match children {
+            Some(Ok(children)) => children,
+            Some(Err(error)) if error.is::<crate::conn::NoDocumentLoaded>() => Vec::new(),
+            Some(Err(error)) => return Err(devtools_frame_tree_error(error)),
+            None => Vec::new(),
+        };
+        if !children.is_empty() {
+            let frame = &result.frame_tree["frame"];
+            let target = frame["id"].as_str().expect("frozen Page frame id");
+            let origin = frame["securityOrigin"]
+                .as_str()
+                .expect("frozen Page security origin");
+            let secure = frame["secureContextType"]
+                .as_str()
+                .expect("frozen Page secure context type");
+            let children = children
+                .iter()
+                .map(|child| build_child_frame_tree_payload(child, target, origin, secure))
+                .collect();
+            result.frame_tree["childFrames"] = Value::Array(children);
+        }
+        Ok(result)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PageFrameQueryError {
+    #[error("BrowserContextNotLoaded")]
+    BrowserContextNotLoaded,
+    #[error("TargetNotLoaded")]
+    TargetNotLoaded,
+}
+
+pub(super) fn get_frame_tree_command_output_plan(
+    output_kind: FrameTreeCommandOutputKind,
+    target_id: String,
+    target_loader_id: String,
+    target_url: String,
+    target_unreachable_url: Option<String>,
+    target_security_origin: String,
+    target_secure_context_type: String,
+    target_mime_type: String,
+    child_frame_snapshots: Vec<ChildFrameTreeSnapshot>,
+    resource_records: &[moli_core::page::SubresourceNetworkRecord],
+) -> CommandOutputPlan {
+    let frame_tree = frame_tree_payload(
+        target_id,
+        target_loader_id,
+        target_url,
+        target_unreachable_url,
+        target_security_origin,
+        target_secure_context_type,
+        target_mime_type,
+        child_frame_snapshots,
+    );
+    let frame_tree = match output_kind {
+        FrameTreeCommandOutputKind::FrameTree => frame_tree,
+        FrameTreeCommandOutputKind::ResourceTree => {
+            resource_tree::attach_frame_resources(frame_tree, resource_records)
+        }
+    };
+    CommandOutputPlan::result(json!({
+        "frameTree": frame_tree
+    }))
+}
+
+fn frame_tree_payload(
+    target_id: String,
+    target_loader_id: String,
+    target_url: String,
+    target_unreachable_url: Option<String>,
+    target_security_origin: String,
+    target_secure_context_type: String,
+    target_mime_type: String,
+    child_frame_snapshots: Vec<ChildFrameTreeSnapshot>,
+) -> Value {
+    let mut frame_tree = json!({
+        "frame": {
+            "id": target_id,
+            "loaderId": target_loader_id,
+            "url": target_url,
+            "domainAndRegistry": "",
+            "securityOrigin": target_security_origin,
+            "mimeType": target_mime_type,
+            "adFrameStatus": { "adFrameType": "none" },
+            "secureContextType": target_secure_context_type,
+            "crossOriginIsolatedContextType": "NotIsolated",
+            "gatedAPIFeatures": [],
+        }
+    });
+    if let Some(unreachable_url) = target_unreachable_url {
+        frame_tree["frame"]["unreachableUrl"] = json!(unreachable_url);
+    }
+    let child_frames = child_frame_snapshots
+        .into_iter()
+        .map(|frame| {
+            build_child_frame_tree_payload(
+                &frame,
+                &target_id,
+                &target_security_origin,
+                &target_secure_context_type,
+            )
+        })
+        .collect::<Vec<_>>();
+    if !child_frames.is_empty() {
+        frame_tree["childFrames"] = Value::Array(child_frames);
+    }
+    frame_tree
+}
+
+pub(super) fn build_child_frame_tree_payload(
+    frame: &moli_core::page::ChildFrameTreeSnapshot,
+    parent_frame_id: &str,
+    inherited_security_origin: &str,
+    inherited_secure_context_type: &str,
+) -> Value {
+    let (security_origin, secure_context_type) = child_frame_security_identity(
+        &frame.url,
+        frame.security_origin_inherited,
+        frame.security_origin_opaque,
+        inherited_security_origin,
+        inherited_secure_context_type,
+    );
+    let name = frame
+        .name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .or(frame.owner_element_id.as_deref())
+        .unwrap_or("");
+    let frame_payload = json!({
+        "id": frame.frame_id,
+        "parentId": parent_frame_id,
+        "loaderId": if frame.loader_id.is_empty() { LOADER_ID } else { &frame.loader_id },
+        "name": name,
+        "url": frame.url,
+        "domainAndRegistry": "",
+        "securityOrigin": security_origin.clone(),
+        "mimeType": "text/html",
+        "adFrameStatus": { "adFrameType": "none" },
+        "secureContextType": secure_context_type.clone(),
+        "crossOriginIsolatedContextType": "NotIsolated",
+        "gatedAPIFeatures": [],
+    });
+    let mut payload = json!({ "frame": frame_payload });
+    if !frame.child_frames.is_empty() {
+        payload["childFrames"] = Value::Array(
+            frame
+                .child_frames
+                .iter()
+                .map(|child| {
+                    build_child_frame_tree_payload(
+                        child,
+                        &frame.frame_id,
+                        &security_origin,
+                        &secure_context_type,
+                    )
+                })
+                .collect(),
+        );
+    }
+    payload
+}
+
+pub(crate) fn child_frame_security_identity(
+    url: &str,
+    security_origin_inherited: bool,
+    _security_origin_opaque: bool,
+    _inherited_security_origin: &str,
+    inherited_secure_context_type: &str,
+) -> (String, String) {
+    let parsed_url = Url::parse(url).ok();
+    // Blink's Page.Frame projection constructs this field from the
+    // DocumentLoader URL, not from the document's live SecurityOrigin.
+    let security_origin = parsed_url
+        .as_ref()
+        .map(|url| {
+            if url.scheme() == "about" {
+                "://".to_owned()
+            } else {
+                moli_url::origin_ascii_serialization(url)
+            }
+        })
+        .unwrap_or_else(|| "null".to_owned());
+    let inherited_secure_context =
+        security_origin_inherited || parsed_url.as_ref().is_some_and(moli_url::is_about_blank);
+    let secure_context_type = if inherited_secure_context {
+        inherited_secure_context_type.to_owned()
+    } else if parsed_url
+        .as_ref()
+        .is_some_and(moli_url::is_potentially_trustworthy_url)
+    {
+        "Secure".to_owned()
+    } else {
+        "InsecureScheme".to_owned()
+    };
+    (security_origin, secure_context_type)
+}
+
+pub(super) fn devtools_browsing_context_target_infos(
+    conn: &CdpConnection,
+) -> Vec<DevToolsTargetInfo> {
+    conn.browser_contexts()
+        .flat_map(|browser_context| browser_context.devtools_target_infos())
+        .filter(|info| {
+            matches!(
+                info.kind,
+                DevToolsTargetKind::Page
+                    | DevToolsTargetKind::Frame
+                    | DevToolsTargetKind::ServiceWorker
+            )
+        })
+        .collect()
+}
+
+pub(super) fn devtools_service_worker_frame_tree_result(
+    target_info: DevToolsTargetInfo,
+    max_depth: Option<u32>,
+) -> Result<DevToolsGetFrameTreeResult, DevToolsError> {
+    let Some(target_id) = target_info.target_id.as_ref() else {
+        return Err(DevToolsError::new(
+            DevToolsErrorKind::Internal,
+            "MissingServiceWorkerTargetId",
+        ));
+    };
+    Ok(DevToolsGetFrameTreeResult {
+        frame_tree: json!({
+            "frame": {
+                "id": target_id.as_str(),
+                "url": target_info.url.as_str(),
+            }
+        }),
+        target_info: Some(target_info),
+        max_depth,
+    })
+}
+
+pub(super) fn default_document_mime_type() -> String {
+    "text/html".to_owned()
+}
+
+pub(super) fn network_error_page_unreachable_url(
+    conn: &CdpConnection,
+    owner: &CommandOwnerScope,
+    document_url: &str,
+) -> Option<String> {
+    (document_url == NETWORK_ERROR_PAGE_URL)
+        .then(|| conn.runtime_session_owner_target_url_for_owner(owner))
+        .flatten()
+}
+
+pub(super) fn main_document_mime_type(page: &Page) -> String {
+    moli_web_mime::effective_response_mime_essence(page.headers(), None)
+        .unwrap_or_else(default_document_mime_type)
+}
+
+pub(super) fn devtools_frame_tree_error(message: impl std::fmt::Display) -> DevToolsError {
+    DevToolsError::new(DevToolsErrorKind::Internal, message)
+}
+
+/// Returns the current committed DocumentLoader identity for CDP serialization.
+///
+/// Blink's `BuildObjectForFrame()` permits the rare state where a `LocalFrame`
+/// has no `DocumentLoader`; `IdentifiersFactory::LoaderId(nullptr)` serializes
+/// that absence as an empty string. Reusing a well-known loader ID here would
+/// instead claim that the frame belongs to an unrelated document/navigation.
+pub(super) fn frame_tree_loader_id_for_current_owner(
+    conn: &CdpConnection,
+    owner: &CommandOwnerScope,
+) -> String {
+    conn.target_session_owner_frame_tree_loader_id_for_owner(owner)
+        .unwrap_or_default()
+}
+
+pub(super) fn devtools_target_info_for_target_id(
+    conn: &CdpConnection,
+    target_id: &str,
+) -> Option<DevToolsTargetInfo> {
+    conn.browser_contexts()
+        .find_map(|browser_context| browser_context.devtools_target_info(target_id))
+}
+
+pub(super) fn try_start_page_get_frame_tree_command(
+    conn: &mut CdpConnection,
+    cmd: &Cmd<'_>,
+) -> PageCommandTaskStep {
+    let command = build_cdp_get_frame_tree_command(conn, cmd);
+    start_devtools_get_frame_tree_command(
+        conn,
+        cmd.id,
+        command,
+        FrameTreeCommandOutputKind::FrameTree,
+    )
+}
+
+pub(super) fn try_start_page_get_resource_tree_command(
+    conn: &mut CdpConnection,
+    cmd: &Cmd<'_>,
+) -> PageCommandTaskStep {
+    let command = build_cdp_get_frame_tree_command(conn, cmd);
+    start_devtools_get_frame_tree_command(
+        conn,
+        cmd.id,
+        command,
+        FrameTreeCommandOutputKind::ResourceTree,
+    )
+}
+
+pub(super) fn build_cdp_get_frame_tree_command(
+    conn: &CdpConnection,
+    cmd: &Cmd<'_>,
+) -> DevToolsGetFrameTreeCommand {
+    let (browser_context_id, target_id) = conn
+        .target_owner_identity_for_session(cmd.session_id)
+        .map(|(browser_context_id, target_id)| (Some(browser_context_id), target_id))
+        .unwrap_or((None, None));
+    DevToolsGetFrameTreeCommand {
+        context: cmd.automation_context(target_id.as_deref(), browser_context_id.as_deref()),
+        max_depth: None,
+    }
+}
+
+pub(super) fn start_devtools_get_frame_tree_command(
+    conn: &mut CdpConnection,
+    command_id: Option<u64>,
+    command: DevToolsGetFrameTreeCommand,
+    output_kind: FrameTreeCommandOutputKind,
+) -> PageCommandTaskStep {
+    let command_session_id = command.context.session_id.as_ref().map(|id| id.as_str());
+    if command_session_id.is_none() && conn.browser_context.is_none() {
+        return PageCommandTaskStep::Complete(CommandOutputPlan::error(
+            -31998,
+            "BrowserContextNotLoaded",
+        ));
+    };
+    let owner = CommandOwnerScope::capture(conn, command_session_id);
+    let (target_id, target_url, target_security_origin, target_secure_context_type) =
+        match conn.target_session_owner_frame_tree_identity_for_owner(&owner) {
+            Some(identity) => identity,
+            None => {
+                return PageCommandTaskStep::Complete(CommandOutputPlan::error(
+                    -31998,
+                    "TargetNotLoaded",
+                ));
+            }
+        };
+    let target_unreachable_url = network_error_page_unreachable_url(conn, &owner, &target_url);
+    let target_url = if pending_initial_document_url(conn, &owner).is_some() {
+        ":".to_owned()
+    } else {
+        target_url
+    };
+    let target_loader_id = frame_tree_loader_id_for_current_owner(conn, &owner);
+    if conn.ensure_document_accessible_for_owner(&owner).is_err() {
+        return PageCommandTaskStep::Complete(get_frame_tree_command_output_plan(
+            output_kind,
+            target_id,
+            target_loader_id,
+            target_url,
+            target_unreachable_url,
+            target_security_origin,
+            target_secure_context_type,
+            default_document_mime_type(),
+            Vec::new(),
+            &[],
+        ));
+    }
+    let Some(page) = conn.loaded_page_mut_for_owner(&owner) else {
+        return PageCommandTaskStep::Complete(get_frame_tree_command_output_plan(
+            output_kind,
+            target_id,
+            target_loader_id,
+            target_url,
+            target_unreachable_url,
+            target_security_origin,
+            target_secure_context_type,
+            default_document_mime_type(),
+            Vec::new(),
+            &[],
+        ));
+    };
+    let target_mime_type = main_document_mime_type(page);
+    match page.start_child_frame_tree_snapshot() {
+        Ok(pending) => PageCommandTaskStep::Pending(PendingPageCommandDispatch {
+            command_id,
+            owner_scope: CommandOwnerScope::capture(conn, command_session_id),
+            kind: Box::new(PendingPageCommandKind::GetFrameTree {
+                output_kind,
+                target_id,
+                target_loader_id,
+                target_url,
+                target_unreachable_url,
+                target_security_origin,
+                target_secure_context_type,
+                target_mime_type,
+                pending,
+            }),
+        }),
+        Err(error) => PageCommandTaskStep::Complete(CommandOutputPlan::error(
+            -32000,
+            format!("Failed to snapshot child frame tree: {error}"),
+        )),
+    }
+}
+
 use std::collections::HashMap;
 
 use moli_core::page::{
@@ -128,6 +642,80 @@ fn attach_resources_to_frame(
     }
 }
 
+/// Blink initializes a DocumentLoader with an empty URL, while the initial
+/// DOM document exposes about:blank. InspectorPageAgent serializes that empty
+/// loader URL as ":". Moli materializes both using the initial document URL,
+/// so retain the lifecycle distinction until the target's first navigation
+/// replaces it. An ordinary ready about:blank target needs no replacement.
+/// This is independent of debugger suspension and response delivery mode.
+fn pending_initial_document_url(conn: &CdpConnection, owner: &CommandOwnerScope) -> Option<String> {
+    conn.runtime_session_owner_initial_empty_document_has_replacement_url_for_owner(owner)
+        .then(|| conn.runtime_session_owner_record_initial_empty_document_url_for_owner(owner))
+        .flatten()
+}
+
+/// Resolve both children and resource records before publishing the terminal.
+/// Browser identity is fixed at admission; URL, MIME and resource content come
+/// from the renderer's immutable state for the completed command turn.
+pub(super) fn prepare_native_tree(
+    conn: &CdpConnection,
+    cmd: &Cmd<'_>,
+    resources: bool,
+) -> Result<moli_core::RendererNativeOperation, CommandOutputPlan> {
+    use moli_core::{
+        RendererNativeOperation as Operation, RendererNativeProtocolResponse as Response,
+        RendererPageCommand as Command, RendererPageReply as Reply,
+    };
+    let owner = CommandOwnerScope::capture(conn, cmd.session_id);
+    let (target_id, target_url, security_origin, secure_context_type) = conn
+        .target_session_owner_frame_tree_identity_for_owner(&owner)
+        .ok_or_else(|| CommandOutputPlan::error(-31998, "TargetNotLoaded"))?;
+    let unreachable_url = network_error_page_unreachable_url(conn, &owner, &target_url);
+    let loader_id = frame_tree_loader_id_for_current_owner(conn, &owner);
+    let initial_document_url = pending_initial_document_url(conn, &owner);
+    Ok(Operation::with_page_state(
+        Command::ChildFrameTreeSnapshot,
+        move |reply, state| match reply {
+            Ok(Reply::ChildFrameTreeSnapshots(children)) => {
+                // A preceding renderer command may already have changed the
+                // document URL before its Browser adapter applies the state.
+                // Only project the initial loader while that document is current.
+                let document_url =
+                    if initial_document_url.as_deref() == Some(state.final_url.as_str()) {
+                        ":".to_owned()
+                    } else {
+                        state.final_url.to_string()
+                    };
+                let tree = frame_tree_payload(
+                    target_id,
+                    loader_id,
+                    document_url,
+                    unreachable_url,
+                    security_origin,
+                    secure_context_type,
+                    moli_web_mime::effective_response_mime_essence(&state.headers, None)
+                        .unwrap_or_else(default_document_mime_type),
+                    children,
+                );
+                let tree = if resources {
+                    attach_frame_resources(
+                        tree,
+                        state.script_execution.subresource_network_records(),
+                    )
+                } else {
+                    tree
+                };
+                Response::success(json!({"frameTree": tree}))
+            }
+            Err(error) => Response::error(
+                -32000,
+                format!("Failed to snapshot child frame tree: {error}"),
+            ),
+            _ => unreachable!("Page frame tree reply"),
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,14 +733,14 @@ mod tests {
             Url::parse("https://example.test/document").unwrap(),
             Url::parse(requested_url).unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             resource_type,
             None,
             Vec::new(),
             Url::parse(final_url).unwrap(),
             200,
-            vec![("Content-Type".to_owned(), content_type.to_owned())],
+            vec![("Content-Type".to_owned(), content_type.as_bytes().to_vec())],
             body.to_owned(),
             Vec::new(),
         )
@@ -241,7 +829,7 @@ mod tests {
             Url::parse("https://example.test/document").unwrap(),
             Url::parse("https://example.test/app.js#fragment").unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Script,
             "connection reset".to_owned(),

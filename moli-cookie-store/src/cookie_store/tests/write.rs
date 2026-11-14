@@ -83,7 +83,7 @@ fn set_response_cookie_str_with_access_result_reports_sanitized_attribute_warnin
     );
     assert_eq!(
         result.effective_same_site,
-        Some(CookieEffectiveSameSite::NoRestriction)
+        Some(CookieEffectiveSameSite::LaxAllowUnsafe)
     );
 
     let cookie = store
@@ -110,7 +110,7 @@ fn set_with_access_result_warns_when_secure_cookie_is_granted_on_localhost_http(
     );
     assert_eq!(
         result.effective_same_site,
-        Some(CookieEffectiveSameSite::NoRestriction)
+        Some(CookieEffectiveSameSite::LaxAllowUnsafe)
     );
 }
 
@@ -366,6 +366,7 @@ fn canonical_partitioned_cookie_with_explicit_key_is_stored() {
             priority: Some(CookiePriority::Medium),
             source_scheme: CookieSourceScheme::Secure,
             source_port: 443,
+            creation_time: None,
         },
         &request_url,
     )
@@ -407,6 +408,7 @@ fn set_canonical_cookie_with_context_round_trips_metadata() {
             priority: Some(CookiePriority::High),
             source_scheme: CookieSourceScheme::Secure,
             source_port: 443,
+            creation_time: None,
         },
         &InsertContext::http(&request_url),
     );
@@ -440,6 +442,7 @@ fn canonical_host_only_input_preserves_explicit_domain() {
             priority: Some(CookiePriority::Medium),
             source_scheme: CookieSourceScheme::Secure,
             source_port: 443,
+            creation_time: None,
         },
         &request_url,
     )
@@ -474,6 +477,7 @@ fn set_canonical_cookie_with_context_accepts_partitioned_cookie() {
             priority: Some(CookiePriority::Medium),
             source_scheme: CookieSourceScheme::Secure,
             source_port: 443,
+            creation_time: None,
         },
         &InsertContext::http(&request_url),
     );
@@ -541,9 +545,10 @@ fn partitioned_cookies_coexist_and_query_by_exact_partition_key() {
         store.delete_matching(&CookieDeleteFilter {
             name: Some("sid"),
             domain: Some("cdn.example"),
+            serialized_domain: None,
             path: Some("/foo"),
             url_host: None,
-            partition_key: Some(&key_a),
+            partition: CookiePartitionMatch::Exact(&key_a),
         }),
         1
     );
@@ -554,6 +559,22 @@ fn partitioned_cookies_coexist_and_query_by_exact_partition_key() {
         .get_with_partition_key("cdn.example", "/foo", "sid", Some(&key_b))
         .is_some());
     assert!(store.get("cdn.example", "/foo", "sid").is_some());
+
+    assert_eq!(
+        store.delete_matching(&CookieDeleteFilter {
+            name: Some("sid"),
+            partition: CookiePartitionMatch::Unpartitioned,
+            ..Default::default()
+        }),
+        1
+    );
+    assert!(store.get("cdn.example", "/foo", "sid").is_none());
+    assert!(store
+        .get_with_partition_key("cdn.example", "/foo", "sid", Some(&key_b))
+        .is_some());
+
+    assert_eq!(store.delete_matching(&CookieDeleteFilter::default()), 1);
+    assert_eq!(store.iter_unexpired().count(), 0);
 }
 
 #[test]
@@ -1174,6 +1195,107 @@ fn global_eviction_applies_when_total_cookie_limit_is_hit() {
         ))),
         vec![("d".to_owned(), "1".to_owned())]
     );
+}
+
+#[test]
+fn partitioned_cookies_do_not_use_global_cookie_quota() {
+    let mut store = CookieStore::default().with_limits(CookieStoreLimits::new(2, 1));
+    let login_url = test_utils::url("https://login.example/");
+    inserted!(store.insert_response_cookie_str("A2=login; Path=/; HttpOnly", &login_url));
+
+    let key = CookiePartitionKey::site("https://top.example".into(), true);
+    for host in ["one.example", "two.example"] {
+        let url = test_utils::url(&format!("https://{host}/"));
+        let mut context = InsertContext::http(&url);
+        context.browser_context.cookie_partition_key = Some(key.clone());
+        inserted!(store.insert_response_cookie_str_with_context(
+            "chip=1; Path=/; Secure; Partitioned",
+            &context,
+        ));
+    }
+
+    assert!(store.contains("login.example", "/", "A2"));
+    assert_eq!(store.iter_unexpired().count(), 3);
+}
+
+#[test]
+fn unpartitioned_global_eviction_does_not_remove_partitioned_cookies() {
+    let mut store = CookieStore::default().with_limits(CookieStoreLimits::new(1, 1));
+    let key = CookiePartitionKey::site("https://top.example".into(), true);
+    let url = test_utils::url("https://cdn.example/");
+    let mut context = InsertContext::http(&url);
+    context.browser_context.cookie_partition_key = Some(key.clone());
+    inserted!(store
+        .insert_response_cookie_str_with_context("chip=1; Path=/; Secure; Partitioned", &context,));
+
+    for host in ["one.example", "two.example"] {
+        inserted!(store.insert_response_cookie_str(
+            "sid=1; Path=/; Secure",
+            &test_utils::url(&format!("https://{host}/")),
+        ));
+    }
+
+    assert!(store
+        .get_with_partition_key("cdn.example", "/", "chip", Some(&key))
+        .is_some());
+    assert!(!store.contains("one.example", "/", "sid"));
+    assert!(store.contains("two.example", "/", "sid"));
+    assert_eq!(store.iter_unexpired().count(), 2);
+}
+
+#[test]
+fn per_domain_cookie_eviction_is_partition_scoped() {
+    let mut store = CookieStore::default().with_limits(CookieStoreLimits::new(1, 100));
+    let url = test_utils::url("https://cdn.example/");
+    let keys = [
+        None,
+        Some(CookiePartitionKey::site(
+            "https://top-a.example".into(),
+            false,
+        )),
+        Some(CookiePartitionKey::site(
+            "https://top-a.example".into(),
+            true,
+        )),
+        Some(CookiePartitionKey::site(
+            "https://top-b.example".into(),
+            true,
+        )),
+        Some(CookiePartitionKey::opaque(1, true)),
+        Some(CookiePartitionKey::opaque(2, true)),
+    ];
+    for key in &keys {
+        let mut context = InsertContext::http(&url);
+        context.browser_context.cookie_partition_key = key.clone();
+        let partitioned = if key.is_some() { "; Partitioned" } else { "" };
+        inserted!(store.insert_response_cookie_str_with_context(
+            &format!("sid=old; Path=/; Secure{partitioned}"),
+            &context,
+        ));
+    }
+    assert_eq!(store.iter_unexpired().count(), keys.len());
+
+    for key in &keys {
+        let mut context = InsertContext::http(&url);
+        context.browser_context.cookie_partition_key = key.clone();
+        let partitioned = if key.is_some() { "; Partitioned" } else { "" };
+        updated!(store.insert_response_cookie_str_with_context(
+            &format!("sid=updated; Path=/; Secure{partitioned}"),
+            &context,
+        ));
+        assert_eq!(store.iter_unexpired().count(), keys.len());
+        inserted!(store.insert_response_cookie_str_with_context(
+            &format!("next=1; Path=/; Secure{partitioned}"),
+            &context,
+        ));
+        assert!(store
+            .get_with_partition_key("cdn.example", "/", "sid", key.as_ref())
+            .is_none());
+        assert!(store
+            .get_with_partition_key("cdn.example", "/", "next", key.as_ref())
+            .is_some());
+        assert_eq!(store.iter_unexpired().count(), keys.len());
+    }
 }
 
 #[test]

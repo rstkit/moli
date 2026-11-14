@@ -16,10 +16,8 @@ use std::{
 enum DirectCallOwner {
     /// Shared renderer adapter for a typed Web IDL callback.
     TypedWebIdlAdapter,
-    /// Callback accepted by a Chromium-specific API outside Web IDL.
-    VendorApiCallback,
-    /// HTML event-handler or reaction policy owned by the renderer.
-    EventHandlerOrReaction,
+    /// Shared renderer entry point that owns native JavaScript nesting.
+    JavaScriptEntryPoint,
     /// Promise capability or browser-created algorithm function.
     BrowserAlgorithm,
     /// Captured native intrinsic, DOM forwarding method, or compiled script.
@@ -34,16 +32,22 @@ struct AllowedDirectCallFile {
 }
 
 const RAW_GLOBAL_FUNCTION_ALLOWLIST: &[(&str, usize)] = &[
+    // WebMCP retains native registration/invocation abort algorithms here.
+    // Page-supplied execute functions use WindowWebIdlCallbackFunction instead.
+    ("context_bootstrap/web_mcp/state.rs", 1),
     ("custom_elements/construction.rs", 1),
     ("custom_elements/definition.rs", 10),
     ("custom_elements/definition_callbacks.rs", 1),
     ("host/timers.rs", 1),
-    ("native_bridge/abort.rs", 3),
+    // AbortSignal listeners and onabort now use the shared typed EventTarget
+    // registry. These remaining roots own browser-created abort algorithms.
+    // Native abort algorithms reside in the store or its extracted dispatch
+    // batch. Dispatch moves the roots; it does not add a Web IDL callback store.
+    ("native_bridge/abort.rs", 2),
     ("native_bridge/abort/event.rs", 1),
     ("native_bridge/history_queue.rs", 3),
     ("script_vm/frame_script_jobs.rs", 3),
-    ("worker/abort.rs", 3),
-    ("worker/abort/event_listener.rs", 1),
+    ("worker/abort.rs", 2),
     ("worker/timer_callback.rs", 1),
 ];
 
@@ -70,21 +74,22 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
         1,
         DirectCallOwner::TypedWebIdlAdapter,
     ),
+    // The shared callback executor checks exact Realm currentness and
+    // enters the Web IDL relevant/incumbent contexts before normalizing the
+    // Promise-returning execute callback. It owns no raw author-function root.
     allowed(
-        "context_bootstrap/chrome_runtime.rs",
+        "context_bootstrap/web_mcp/execution.rs",
         1,
-        DirectCallOwner::VendorApiCallback,
+        DirectCallOwner::TypedWebIdlAdapter,
     ),
-    // Event-handler/reaction policy. These are HTML-owned callbacks rather
-    // than values accepted through a Web IDL callback parameter.
+    // Ordinary calls, including HTML-owned callbacks and script wrappers,
+    // enter through the common JavaScript execution boundary.
     allowed(
-        "exception_reporting.rs",
+        "script_execution.rs",
         1,
-        DirectCallOwner::EventHandlerOrReaction,
+        DirectCallOwner::JavaScriptEntryPoint,
     ),
-    allowed("util.rs", 2, DirectCallOwner::EventHandlerOrReaction),
     // Browser-created functions, Promise capabilities, and algorithm steps.
-    allowed("blob.rs", 1, DirectCallOwner::BrowserAlgorithm),
     allowed(
         "context_bootstrap/animation_runtime.rs",
         1,
@@ -92,22 +97,22 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
     ),
     allowed(
         "context_bootstrap/history_runtime/traversal.rs",
-        2,
-        DirectCallOwner::BrowserAlgorithm,
-    ),
-    allowed(
-        "context_bootstrap/location_navigation.rs",
+        // Post-commit settlement invokes the intercepted result's then method.
+        // Precommit adoption now uses PromiseResolver in the shared coordinator.
         1,
         DirectCallOwner::BrowserAlgorithm,
     ),
     allowed(
         "context_bootstrap/navigation_callbacks/navigation.rs",
-        11,
+        // Three settlement calls now go through the existing shared helpers.
+        8,
         DirectCallOwner::BrowserAlgorithm,
     ),
     allowed(
         "context_bootstrap/navigation_lifecycle.rs",
-        6,
+        // Committed and deferred fulfillment share one realm-aware settlement
+        // helper. The other two calls reject browser-owned Promise capabilities.
+        3,
         DirectCallOwner::BrowserAlgorithm,
     ),
     allowed(
@@ -122,7 +127,9 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
     ),
     allowed(
         "context_bootstrap/stream_adapter/utils.rs",
-        9,
+        // Pending promise settlement and cancellation continuations use the
+        // native Promise API; the remaining calls run stream algorithms.
+        4,
         DirectCallOwner::BrowserAlgorithm,
     ),
     allowed(
@@ -131,18 +138,13 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
         DirectCallOwner::BrowserAlgorithm,
     ),
     allowed(
-        "context_bootstrap/websocket/stream.rs",
-        2,
-        DirectCallOwner::BrowserAlgorithm,
-    ),
-    allowed(
-        "native_bridge/abort/statics.rs",
-        2,
-        DirectCallOwner::BrowserAlgorithm,
-    ),
-    allowed(
         "network_host/body_source.rs",
-        3,
+        1,
+        DirectCallOwner::BrowserAlgorithm,
+    ),
+    allowed(
+        "network_host/body_source/stream_consumer.rs",
+        1,
         DirectCallOwner::BrowserAlgorithm,
     ),
     allowed(
@@ -152,10 +154,9 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
     ),
     allowed(
         "network_host/fetch_surface.rs",
-        2,
+        1,
         DirectCallOwner::BrowserAlgorithm,
     ),
-    allowed("worker/abort.rs", 2, DirectCallOwner::BrowserAlgorithm),
     allowed(
         "worker/timer_callback.rs",
         1,
@@ -180,11 +181,6 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
     allowed(
         "context_bootstrap/css_runtime/highlights.rs",
         1,
-        DirectCallOwner::NativeForwardingOrScript,
-    ),
-    allowed(
-        "context_bootstrap/runtime_state.rs",
-        2,
         DirectCallOwner::NativeForwardingOrScript,
     ),
     allowed(
@@ -218,16 +214,6 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
         DirectCallOwner::NativeForwardingOrScript,
     ),
     allowed(
-        "native_bridge/context_host/host_loads.rs",
-        1,
-        DirectCallOwner::NativeForwardingOrScript,
-    ),
-    allowed(
-        "native_bridge/context_host/popups.rs",
-        2,
-        DirectCallOwner::NativeForwardingOrScript,
-    ),
-    allowed(
         "native_bridge/document/attributes/named_node_map/handlers.rs",
         1,
         DirectCallOwner::NativeForwardingOrScript,
@@ -239,7 +225,9 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
     ),
     allowed(
         "native_bridge/element/activation/default_action.rs",
-        3,
+        // Drag data now uses private native readers, without forwarding to
+        // an author-replaceable DataTransfer.getData method.
+        2,
         DirectCallOwner::NativeForwardingOrScript,
     ),
     allowed(
@@ -249,11 +237,6 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
     ),
     allowed(
         "native_bridge/element/forms/submission.rs",
-        1,
-        DirectCallOwner::NativeForwardingOrScript,
-    ),
-    allowed(
-        "network_host/headers/store/init.rs",
         1,
         DirectCallOwner::NativeForwardingOrScript,
     ),
@@ -268,7 +251,7 @@ const DIRECT_V8_CALL_ALLOWLIST: &[AllowedDirectCallFile] = &[
         DirectCallOwner::NativeForwardingOrScript,
     ),
     allowed(
-        "worker/global_scope/mod.rs",
+        "worker/global_scope/console.rs",
         1,
         DirectCallOwner::NativeForwardingOrScript,
     ),
@@ -321,6 +304,56 @@ fn direct_v8_call_inventory_is_frozen() {
             .map(|entry| (entry.path, entry.matches, entry.owner))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn script_and_module_execution_use_the_shared_entry_points() {
+    let expected = BTreeMap::from([("script_execution.rs".to_owned(), 1)]);
+    assert_eq!(
+        renderer_source_inventory(count_script_runs),
+        expected,
+        "execute compiled scripts through script_execution::execute_compiled_script"
+    );
+    assert_eq!(
+        renderer_source_inventory(count_module_evaluations),
+        expected,
+        "evaluate modules through script_execution::evaluate_module"
+    );
+    assert!(
+        renderer_source_inventory(count_microtask_scopes).is_empty(),
+        "renderer execution must use moli_v8_util::with_microtasks_scope"
+    );
+    assert_eq!(
+        renderer_source_inventory(count_shared_microtask_boundaries),
+        expected,
+        "the shared script entry point must own the renderer microtask boundary"
+    );
+}
+
+fn count_script_runs(source: &str) -> usize {
+    let source = compact_source(source);
+    source.matches(concat!(".run(", "scope")).count()
+        + source.matches(concat!(".run(&", "scope")).count()
+        + source.matches(concat!(".run(&mut", "scope")).count()
+}
+
+fn count_module_evaluations(source: &str) -> usize {
+    let source = compact_source(source);
+    source.matches(concat!(".evaluate(", "scope")).count()
+        + source.matches(concat!(".evaluate(&", "scope")).count()
+        + source.matches(concat!(".evaluate(&mut", "scope")).count()
+}
+
+fn count_microtask_scopes(source: &str) -> usize {
+    compact_source(source)
+        .matches(concat!("v8::MicrotasksScope::", "new("))
+        .count()
+}
+
+fn count_shared_microtask_boundaries(source: &str) -> usize {
+    compact_source(source)
+        .matches(concat!("moli_v8_util::", "with_microtasks_scope("))
+        .count()
 }
 
 fn renderer_source_inventory(count: fn(&str) -> usize) -> BTreeMap<String, usize> {

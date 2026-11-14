@@ -1,4 +1,7 @@
-use crate::native_bridge::collections::{STATIC_COLLECTION_LENGTH_SLOT, mark_collection_kind};
+pub(in crate::native_bridge::document) use self::detached_document_all_item_callback as detached_document_all_call_callback;
+use crate::native_bridge::collections::{
+    STATIC_COLLECTION_LENGTH_SLOT, initialize_collection_identity,
+};
 use crate::native_bridge::document::DETACHED_NATIVE_NODE_LIST_HANDLES_SLOT;
 use crate::native_bridge::identity::CollectionKind;
 use crate::native_bridge::named_access::{
@@ -8,20 +11,21 @@ use crate::util::{
     context_host_ptr_from_global_bridge, get_private_value, serialize_v8_iter_array,
     set_private_value,
 };
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::{ObjectLiteralDeclaration, WebApiObject};
 
 use super::*;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct DetachedCollectionItemsAndNamedDataDeclaration<'scope> {
     items: v8::Local<'scope, v8::Value>,
     named: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "HTMLAllCollection")]
+#[webapi(interface = web_api_interfaces::HTMLAllCollection)]
 struct DetachedDocumentAllCollectionDeclaration<'scope> {
     /// Declaration-only input shared by `item` and `namedItem`.
     ///
@@ -44,7 +48,7 @@ struct DetachedDocumentAllCollectionDeclaration<'scope> {
 /// All fixed members come from the shared `NodeList` prototype. The wrapper
 /// only carries its indexed values and private collection brand/length state.
 #[derive(WebApiObject)]
-#[webapi(interface = "NodeList", require_prototype, allow_empty)]
+#[webapi(interface = web_api_interfaces::NodeList, require_prototype)]
 struct DetachedNodeListDeclaration {}
 
 /// Declares the detached `HTMLCollection` wrapper surface.
@@ -53,7 +57,7 @@ struct DetachedNodeListDeclaration {}
 /// reusable interface template. Only indexed/named snapshot entries remain
 /// own properties.
 #[derive(WebApiObject)]
-#[webapi(interface = "HTMLCollection", require_prototype, allow_empty)]
+#[webapi(interface = web_api_interfaces::HTMLCollection, require_prototype)]
 struct DetachedHtmlCollectionDeclaration {}
 
 #[derive(webidl::WebIdlArgs)]
@@ -400,7 +404,7 @@ fn install_detached_collection_state<'s>(
     kind: CollectionKind,
     length: usize,
 ) {
-    mark_collection_kind(scope, wrapper, kind);
+    initialize_collection_identity(scope, wrapper, kind);
     set_private_value(
         scope,
         wrapper,
@@ -434,33 +438,6 @@ fn collect_detached_document_all_values<'s>(
     }
 }
 
-pub(in crate::native_bridge::document) fn detached_document_all_call_callback<'a>(
-    scope: &mut v8::PinScope<'a, '_>,
-    args: v8::FunctionCallbackArguments<'a>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Ok(data) = v8::Local::<v8::Object>::try_from(args.data()) else {
-        rv.set_null();
-        return;
-    };
-    let Some(items) = object_property_as_object(scope, data, "items") else {
-        rv.set_null();
-        return;
-    };
-    let Some(named) = object_property_as_object(scope, data, "named") else {
-        rv.set_null();
-        return;
-    };
-    let Some(name_or_index) = detached_document_all_name_or_index(scope, &args) else {
-        rv.set_null();
-        return;
-    };
-    match resolve_detached_document_all_value(scope, items, named, name_or_index) {
-        Some(value) => rv.set(value),
-        None => rv.set_null(),
-    }
-}
-
 pub(in crate::native_bridge::document) fn build_detached_document_all<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     document: v8::Local<'s, v8::Object>,
@@ -470,11 +447,9 @@ pub(in crate::native_bridge::document) fn build_detached_document_all<'s>(
         collect_detached_document_all_values(scope, root, &mut values);
     }
 
-    let global = scope.get_current_context().global(scope);
-    let html_all_ctor = global.get(scope, v8str(scope, "HTMLAllCollection").into())?;
-    let html_all_ctor = v8::Local::<v8::Function>::try_from(html_all_ctor).ok()?;
-    let prototype = html_all_ctor.get(scope, v8str(scope, "prototype").into())?;
-    let prototype = v8::Local::<v8::Object>::try_from(prototype).ok()?;
+    let prototype =
+        crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "HTMLAllCollection")
+            .ok()?;
 
     let items = build_object_array(scope, &values);
     let named =
@@ -490,7 +465,9 @@ pub(in crate::native_bridge::document) fn build_detached_document_all<'s>(
         Some(data.into()),
     );
     let collection = object_template.new_instance(scope)?;
-    let _ = collection.set_prototype(scope, prototype.into());
+    collection
+        .set_prototype(scope, prototype.into())?
+        .then_some(())?;
     DetachedDocumentAllCollectionDeclaration::new(data, values.len() as f64)
         .initialize(scope, collection)
         .ok()?;

@@ -68,6 +68,8 @@ impl ScriptVm {
             | FrameLocalWindowOwnerTransition::Preserved { .. } => None,
         };
         if let Some(retired_owner) = transition.retired_owner() {
+            let prepared_context_transition =
+                self.prepare_document_context_transition(transition.context_transition());
             let execution_context_owner = crate::native_bridge::WindowExecutionContextOwner::Frame(
                 retired_owner.local_window_id,
             );
@@ -77,12 +79,30 @@ impl ScriptVm {
                     .is_none_or(|local_window_id| local_window_id == retired_owner.local_window_id),
                 "committed LocalWindow retirement must identify the retired document owner"
             );
-            if execution_context_retired
-                && let Some(execution_context_id) = self
+            if execution_context_retired {
+                self.cancel_history_traversals_for_retiring_window(execution_context_owner);
+            }
+            if execution_context_retired {
+                if let Some(execution_context_id) = self
                     .child_frame_realm_store
                     .context_id_for_local_window_id(retired_owner.local_window_id)
-            {
-                self.destroy_child_default_context(execution_context_id);
+                {
+                    self.destroy_child_default_context(execution_context_id);
+                } else {
+                    // A synchronous contentDocument/contentWindow getter can
+                    // expose a realm before its owner task promotes it. Move
+                    // wrappers into that realm's traced graph before retiring
+                    // the execution binding below discards strong cache entries.
+                    let pending_context = self
+                        .prebootstrapped_child_default_contexts
+                        .borrow()
+                        .values()
+                        .find(|context| context.local_window_id == retired_owner.local_window_id)
+                        .map(|context| context.context.clone());
+                    if let Some(context) = pending_context {
+                        self.clear_context_wrapper_cache_for_context_ptr(&context, false);
+                    }
+                }
             }
             let retired_timer_count = if execution_context_retired {
                 self.document_runtime
@@ -208,22 +228,7 @@ impl ScriptVm {
                 0
             };
             let (retired_isolated_world_count, rebound_isolated_world_count) =
-                if execution_context_retired {
-                    (
-                        self.retire_isolated_worlds_for_document_owner(retired_owner),
-                        0,
-                    )
-                } else if let Some(current_owner) = transition.current_owner() {
-                    (
-                        0,
-                        self.rebind_isolated_worlds_for_document_owner_transition(
-                            retired_owner,
-                            current_owner,
-                        ),
-                    )
-                } else {
-                    (0, 0)
-                };
+                self.finish_document_context_transition(prepared_context_transition);
             let retired_modulator_count = if execution_context_retired {
                 self.child_document_modulator_store
                     .remove_execution_context(retired_owner.local_window_id)
@@ -278,6 +283,28 @@ impl ScriptVm {
                     "skipping realm projection for a superseded child owner transition"
                 );
                 return;
+            }
+            let needs_isolated_proxy_restore = self
+                ._context_host
+                .borrow()
+                .child_has_isolated_window_proxies(child_handle);
+            if needs_isolated_proxy_restore {
+                let restored = self.with_default_context_scope(|scope, host_ptr| {
+                    crate::native_bridge::PageScriptHost::restore_child_isolated_window_proxies(
+                        scope,
+                        host_ptr,
+                        child_handle,
+                        current_owner,
+                    )
+                });
+                if let Err(error) = restored {
+                    tracing::warn!(
+                        %error,
+                        ?child_handle,
+                        ?current_owner,
+                        "failed to restore isolated WindowProxies for the committed child Document"
+                    );
+                }
             }
             let should_materialize_default_realm = {
                 let host = self._context_host.borrow();
@@ -490,7 +517,11 @@ impl ScriptVm {
                 snapshot.local_window_id == document_owner.local_window_id
                     && snapshot.document_id == document_owner.document_id
             })
-            .map(|snapshot| snapshot.document_base_url)
+            .map(|snapshot| {
+                snapshot
+                    .settings
+                    .request_initiator_url(&snapshot.document_base_url)
+            })
             .unwrap_or_else(|| fallback_url.clone())
     }
 
@@ -589,7 +620,7 @@ impl ScriptVm {
         root_entry: ModuleEntryId,
     ) -> bool {
         self.child_document_modulator_store
-            .mark_parser_module_graph_evaluated(owner.document_owner(), realm_id, root_entry)
+            .mark_module_graph_evaluated(owner.document_owner(), realm_id, root_entry)
     }
 
     pub(super) fn take_child_parser_module_tree_job(
@@ -626,6 +657,14 @@ impl ScriptVm {
         result: FrameDocumentModuleFetchTerminalResult,
     ) -> FrameDocumentModuleTerminalQueueFollowup {
         let owner = task.owner().document_owner();
+        let is_current = self
+            ._context_host
+            .borrow()
+            .current_child_module_route_task_owner(owner, realm_id)
+            .is_some();
+        if is_current {
+            self.dispatch_module_fetch_csp_violations(task.fetch_request().csp_context());
+        }
         let tasks = self
             .child_document_modulator_store
             .finish_parser_module_dependency_fetch(owner, realm_id, task, result);

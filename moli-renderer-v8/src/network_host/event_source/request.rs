@@ -1,13 +1,14 @@
 use super::*;
-use crate::native_bridge::{JsContextHost, throw_dom_exception};
+use crate::native_bridge::{PageScriptHost, throw_dom_exception};
 use crate::network_host::{
     BLOCKED_BY_CLIENT_ERROR_TEXT, active_subresource_network_partition_key,
-    effective_subresource_policy_context, local_url_response, merge_subresource_request_headers,
+    effective_subresource_policy_context, effective_subresource_referrer_policy,
+    local_url_response, merge_subresource_request_headers,
     observe_subresource_request_cookie_report, resolve_context_url, spawn_async_subresource_fetch,
-    subresource_request_scope_for_owner,
 };
 use crate::service_worker_runtime::{
-    ServiceWorkerFetchDispatch, ServiceWorkerFetchRequestMetadata, ServiceWorkerRequestDestination,
+    ServiceWorkerFetchDispatch, ServiceWorkerRequestDestination,
+    service_worker_fetch_request_metadata,
 };
 use crate::types::{
     PendingSubresourceFetchInfo, SubresourceNetworkRecord, SubresourceResourceType,
@@ -45,8 +46,11 @@ struct PreparedEventSourceRequest {
     owner: crate::native_bridge::OwnerDispatchScope,
     resource_loader: crate::network::context::DocumentResourceLoader,
     document_url: url::Url,
+    referrer_source: Option<url::Url>,
+    document_referrer_policy: Option<String>,
+    request_origin: moli_url::WebOrigin,
     resolved_url: url::Url,
-    request_headers: Vec<(String, String)>,
+    request_headers: moli_fetch::RequestHeaders,
     cors_preflight_request_headers: Vec<(String, String)>,
     credentials_mode: RequestCredentialsMode,
     request_cookie_report: Option<moli_cookie_jar::StoredCookieQueryReport>,
@@ -90,14 +94,17 @@ pub(crate) fn event_source_constructor_callback<'s>(
         return;
     };
     let owner = execution_context.dispatch_scope();
-    let Some((_, document_url)) = subresource_request_scope_for_owner(scope, host, owner) else {
+    let Some(environment) = host
+        .document_resource_loader_for_dispatch_scope(owner)
+        .and_then(|loader| host.subresource_request_environment(&loader, owner))
+    else {
         throw_type_error(
             scope,
             "Failed to construct 'EventSource': Window execution context owner is retired.",
         );
         return;
     };
-    let resolved_url = match resolve_context_url(&document_url, &parsed.url, None) {
+    let resolved_url = match resolve_context_url(&environment.base_url, &parsed.url, None) {
         Ok(url) => url,
         Err(_) => {
             throw_dom_exception(
@@ -255,7 +262,7 @@ pub(crate) fn start_event_source_request<'s>(
                 skip_fetch_security_validation: false,
                 response_filter: None,
                 network_error_text: None,
-                result: Ok(response.into()),
+                result: Ok(response.into()).into(),
             },
         );
         return;
@@ -295,6 +302,7 @@ pub(crate) fn start_event_source_request<'s>(
         registered.internal_id,
         crate::types::AsyncSubresourceNetworkContext {
             frame_id: prepared.frame_id,
+            request_origin: prepared.request_origin.clone(),
             document_url: prepared.document_url,
             resource_type: SubresourceResourceType::EventSource,
             policy_context: prepared.policy_context,
@@ -308,7 +316,7 @@ pub(crate) fn start_event_source_request<'s>(
 
 fn prepare_event_source_request<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     event_source: v8::Local<'s, v8::Object>,
 ) -> Result<PreparedEventSourceRequest, String> {
     let execution_context = host
@@ -318,8 +326,15 @@ fn prepare_event_source_request<'s>(
     let resource_loader = host
         .document_resource_loader_for_dispatch_scope(owner)
         .ok_or_else(|| "EventSource: Document resource authority is unavailable".to_owned())?;
-    let (frame_id, document_url) = subresource_request_scope_for_owner(scope, host, owner)
+    let environment = host
+        .subresource_request_environment(&resource_loader, owner)
         .ok_or_else(|| "EventSource: Window execution context owner is retired".to_owned())?;
+    let crate::network::context::SubresourceRequestEnvironment {
+        document_url,
+        request_origin,
+        frame_id,
+        ..
+    } = environment;
     let resolved_url = event_source_connection_url(scope, event_source)
         .ok_or_else(|| "EventSource: URL state is unavailable".to_owned())
         .and_then(|value| url::Url::parse(&value).map_err(|error| error.to_string()))?;
@@ -341,6 +356,7 @@ fn prepare_event_source_request<'s>(
     let request_cookie_report = observe_subresource_request_cookie_report(
         resource_loader.request_client(),
         &document_url,
+        &request_origin,
         &resolved_url,
         "GET",
         credentials_mode,
@@ -351,9 +367,12 @@ fn prepare_event_source_request<'s>(
         owner,
         resource_loader,
         document_url,
+        referrer_source: host.document_referrer_source_url_for_dispatch_scope(owner),
+        document_referrer_policy: effective_subresource_referrer_policy(host, owner),
+        request_origin,
         resolved_url,
         request_headers,
-        cors_preflight_request_headers: host.extra_http_headers().to_vec(),
+        cors_preflight_request_headers: host.extra_http_headers().to_byte_strings(),
         credentials_mode,
         request_cookie_report,
         network_partition_key: active_subresource_network_partition_key(host, owner),
@@ -363,7 +382,7 @@ fn prepare_event_source_request<'s>(
 
 fn dispatch_service_worker_event_source<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     event_source: v8::Local<'s, v8::Object>,
     prepared: &PreparedEventSourceRequest,
 ) -> Option<u64> {
@@ -376,6 +395,7 @@ fn dispatch_service_worker_event_source<'s>(
         &prepared.document_url,
         &prepared.resolved_url,
     )?;
+    let native_request = build_event_source_request(prepared).ok()?;
 
     let cancel_handle = FetchCancelHandle::new();
     let registered = register_event_source_request(
@@ -397,19 +417,16 @@ fn dispatch_service_worker_event_source<'s>(
         prepared.credentials_mode,
         RequestRedirectMode::Follow,
         None,
-        ServiceWorkerFetchRequestMetadata {
-            cache: "no-store".to_owned(),
-            ..ServiceWorkerFetchRequestMetadata::default()
-        },
+        service_worker_fetch_request_metadata(&native_request),
     );
     let dispatch = ServiceWorkerFetchDispatch {
         internal_id: registered.internal_id,
         request,
-        request_body_text: None,
         cors_preflight_request_headers: prepared.cors_preflight_request_headers.clone(),
         request_cookie_report: prepared.request_cookie_report.clone(),
         network_context: crate::types::AsyncSubresourceNetworkContext {
             frame_id: prepared.frame_id.clone(),
+            request_origin: prepared.request_origin.clone(),
             document_url: prepared.document_url.clone(),
             resource_type: SubresourceResourceType::EventSource,
             policy_context: prepared.policy_context,
@@ -432,7 +449,7 @@ fn dispatch_service_worker_event_source<'s>(
                 skip_fetch_security_validation: false,
                 response_filter: None,
                 network_error_text: None,
-                result: Err("service worker EventSource dispatch failed".to_owned()),
+                result: Err("service worker EventSource dispatch failed".to_owned()).into(),
             },
         );
     }
@@ -440,25 +457,35 @@ fn dispatch_service_worker_event_source<'s>(
 }
 
 fn build_event_source_request(prepared: &PreparedEventSourceRequest) -> Result<Request, String> {
-    Request::new(
+    let request = Request::new(
         "GET",
         prepared.resolved_url.as_str(),
         None,
         prepared.request_headers.clone(),
     )
-    .map_err(|error| error.to_string())
-    .map(|request| {
-        request
-            .with_initiator_url(&prepared.document_url)
-            .with_request_mode(RequestMode::Cors)
-            .with_credentials_mode(prepared.credentials_mode)
-            .with_network_partition_key(prepared.network_partition_key.clone())
-            .with_redirect_mode(RequestRedirectMode::Follow)
-            .with_cache_mode(RequestCacheMode::NoStore)
-            .with_browser_request_metadata(BrowserRequestMetadata::EventSource)
-            .with_subframe_context(prepared.frame_id.is_some())
-            .without_request_timeout()
-    })
+    .map_err(|error| error.to_string())?
+    .with_fetch_referrer(
+        prepared
+            .referrer_source
+            .as_ref()
+            .map_or("", url::Url::as_str),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(request
+        .with_initiator_url(&prepared.document_url)
+        .with_subresource_request_metadata(moli_fetch::SubresourceRequestMetadata {
+            document_referrer_policy: prepared.document_referrer_policy.clone(),
+            ..Default::default()
+        })
+        .with_request_origin(prepared.request_origin.clone())
+        .with_request_mode(RequestMode::Cors)
+        .with_credentials_mode(prepared.credentials_mode)
+        .with_network_partition_key(prepared.network_partition_key.clone())
+        .with_redirect_mode(RequestRedirectMode::Follow)
+        .with_cache_mode(RequestCacheMode::NoStore)
+        .with_browser_request_metadata(BrowserRequestMetadata::EventSource)
+        .with_subframe_context(prepared.frame_id.is_some())
+        .without_request_timeout())
 }
 
 struct RegisteredEventSourceRequest {
@@ -468,7 +495,7 @@ struct RegisteredEventSourceRequest {
 
 fn register_event_source_request<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     event_source: v8::Local<'s, v8::Object>,
     prepared: &PreparedEventSourceRequest,
     cancel_handle: Option<FetchCancelHandle>,
@@ -502,7 +529,7 @@ fn register_event_source_request<'s>(
 }
 
 fn record_event_source_preflight_failure<'s>(
-    _host: &mut JsContextHost,
+    _host: &mut PageScriptHost,
     event_source: v8::Local<'s, v8::Object>,
     scope: &mut v8::PinScope<'s, '_>,
     _error: String,
@@ -511,7 +538,7 @@ fn record_event_source_preflight_failure<'s>(
 }
 
 fn record_prepared_event_source_failure<'s>(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     prepared: &PreparedEventSourceRequest,
     error: String,
     scope: &mut v8::PinScope<'s, '_>,

@@ -1,6 +1,8 @@
 use super::*;
 use crate::content_security_policy::TrustedTypesForScriptRequirements;
+use crate::dom::native::DomStringValue;
 use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiObject;
 
@@ -8,13 +10,12 @@ mod policy_callbacks;
 mod realm_state;
 
 use policy_callbacks::{
-    TrustedTypePolicyCallbackOutcome, invoke_policy_callback, parse_policy_callback_carriers,
+    TrustedTypePolicyCallbackOutcome, invoke_policy_callback, parse_policy_callbacks,
 };
 
 #[cfg(test)]
 pub(crate) use realm_state::trusted_types_lazy_state_materialized;
 
-const TRUSTED_TYPE_KIND_SLOT: &str = "__moliTrustedTypeKind";
 const TRUSTED_TYPE_VALUE_SLOT: &str = "__moliTrustedTypeValue";
 const TRUSTED_SCRIPT_CODE_LIKE_CONSTRUCTOR_SLOT: &str = "__moliTrustedScriptCodeLikeConstructor";
 const TRUSTED_TYPE_HTML_PROTOTYPE_SLOT: &str = "__moliTrustedHTMLPrototype";
@@ -29,7 +30,7 @@ const TRUSTED_TYPES_CREATE_SCRIPT_SLOT: &str = "__moliTrustedTypesCreateScript";
 const TRUSTED_TYPES_CREATE_SCRIPT_URL_SLOT: &str = "__moliTrustedTypesCreateScriptURL";
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::TrustedTypePolicyFactory)]
 struct TrustedTypesFactoryDeclaration {
     #[webapi(method, callback = trusted_types_create_policy_callback, length = 2)]
     create_policy: (),
@@ -42,16 +43,14 @@ struct TrustedTypesFactoryDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct TrustedTypeObjectDeclaration<'scope> {
-    #[webapi(slot = TRUSTED_TYPE_KIND_SLOT)]
-    kind: v8::Local<'scope, v8::String>,
     #[webapi(slot = TRUSTED_TYPE_VALUE_SLOT)]
     value: v8::Local<'scope, v8::String>,
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct TrustedTypePrototypeDeclaration {
     #[webapi(method = "toString", callback = trusted_type_to_string_callback, length = 0)]
     to_string: (),
@@ -62,12 +61,10 @@ struct TrustedTypePrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::TrustedTypePolicy)]
 struct TrustedTypePolicyDeclaration<'scope> {
     #[webapi(data_property)]
     name: v8::Local<'scope, v8::String>,
-    #[webapi(slot = TRUSTED_TYPES_CREATE_HTML_SLOT)]
-    create_html_callback: Option<v8::Local<'scope, v8::Object>>,
     #[webapi(
         method = "createHTML",
         callback = trusted_type_policy_create_callback,
@@ -75,8 +72,6 @@ struct TrustedTypePolicyDeclaration<'scope> {
         length = 1
     )]
     create_html: (),
-    #[webapi(slot = TRUSTED_TYPES_CREATE_SCRIPT_SLOT)]
-    create_script_callback: Option<v8::Local<'scope, v8::Object>>,
     #[webapi(
         method,
         callback = trusted_type_policy_create_callback,
@@ -84,8 +79,6 @@ struct TrustedTypePolicyDeclaration<'scope> {
         length = 1
     )]
     create_script: (),
-    #[webapi(slot = TRUSTED_TYPES_CREATE_SCRIPT_URL_SLOT)]
-    create_script_url_callback: Option<v8::Local<'scope, v8::Object>>,
     #[webapi(
         method = "createScriptURL",
         callback = trusted_type_policy_create_callback,
@@ -103,12 +96,16 @@ enum TrustedTypeKind {
 }
 
 impl TrustedTypeKind {
-    fn constructor_name(self) -> &'static str {
+    fn interface(self) -> moli_webapi_declare::WebApiInterfaceDescriptor {
         match self {
-            Self::Html => "TrustedHTML",
-            Self::Script => "TrustedScript",
-            Self::ScriptUrl => "TrustedScriptURL",
+            Self::Html => web_api_interfaces::TrustedHTML::DESCRIPTOR,
+            Self::Script => web_api_interfaces::TrustedScript::DESCRIPTOR,
+            Self::ScriptUrl => web_api_interfaces::TrustedScriptURL::DESCRIPTOR,
         }
+    }
+
+    fn constructor_name(self) -> &'static str {
+        self.interface().name()
     }
 
     fn create_method_name(self) -> &'static str {
@@ -140,14 +137,6 @@ impl TrustedTypeKind {
             Self::Html => TRUSTED_TYPE_HTML_CONSTRUCTOR_SLOT,
             Self::Script => TRUSTED_TYPE_SCRIPT_CONSTRUCTOR_SLOT,
             Self::ScriptUrl => TRUSTED_TYPE_SCRIPT_URL_CONSTRUCTOR_SLOT,
-        }
-    }
-
-    fn as_slot_value(self) -> &'static str {
-        match self {
-            Self::Html => "html",
-            Self::Script => "script",
-            Self::ScriptUrl => "script-url",
         }
     }
 
@@ -301,10 +290,10 @@ pub(crate) fn check_javascript_url_trusted_types(
     };
     match outcome {
         DefaultTrustedTypePolicyOutcome::Value(value)
-            if url::Url::parse(&format!("javascript:{value}")).is_ok() =>
+            if url::Url::parse(&format!("javascript:{}", value.as_str_lossy())).is_ok() =>
         {
             JavascriptUrlTrustedTypesCheck {
-                source: Some(value),
+                source: Some(value.as_str_lossy().to_owned()),
                 violated: false,
             }
         }
@@ -324,36 +313,11 @@ pub(crate) enum TrustedTypesCodeGenerationCheck {
     Block,
 }
 
-pub(crate) fn trusted_types_code_generation_check_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    source: v8::Local<'s, v8::Value>,
-    is_code_like: bool,
-) -> v8::ModifyCodeGenerationFromStringsResult<'s> {
-    if trusted_types_eval_is_allowed(scope) && source.is_string() {
-        return v8::ModifyCodeGenerationFromStringsResult {
-            codegen_allowed: true,
-            modified_source: None,
-        };
-    }
-    let (codegen_allowed, modified_source) =
-        match trusted_types_code_generation_check(scope, source, is_code_like) {
-            TrustedTypesCodeGenerationCheck::AllowOriginal => (true, None),
-            TrustedTypesCodeGenerationCheck::AllowModified(source) => {
-                let source = v8_string(scope, &source);
-                (source.is_some(), source)
-            }
-            TrustedTypesCodeGenerationCheck::Block => (false, None),
-        };
-    v8::ModifyCodeGenerationFromStringsResult {
-        codegen_allowed,
-        modified_source,
-    }
-}
-
 pub(crate) fn trusted_types_code_generation_check<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     source: v8::Local<'s, v8::Value>,
     is_code_like: bool,
+    requirements: TrustedTypesForScriptRequirements,
 ) -> TrustedTypesCodeGenerationCheck {
     if let Some(value) = trusted_type_string(scope, source, TrustedTypeKind::Script) {
         return TrustedTypesCodeGenerationCheck::AllowModified(value);
@@ -369,7 +333,10 @@ pub(crate) fn trusted_types_code_generation_check<'s>(
     let Some(original) = js_value_to_string(scope, source) else {
         return TrustedTypesCodeGenerationCheck::Block;
     };
-    trusted_script_string_for_code_generation(scope, &original)
+    if !requirements.requires_conversion() {
+        return TrustedTypesCodeGenerationCheck::AllowModified(original);
+    }
+    trusted_script_string_for_code_generation(scope, &original, requirements)
         .map(TrustedTypesCodeGenerationCheck::AllowModified)
         .unwrap_or(TrustedTypesCodeGenerationCheck::Block)
 }
@@ -377,44 +344,20 @@ pub(crate) fn trusted_types_code_generation_check<'s>(
 fn trusted_script_string_for_code_generation(
     scope: &mut v8::PinScope<'_, '_>,
     original: &str,
+    requirements: TrustedTypesForScriptRequirements,
 ) -> Option<String> {
     let Some(function_source) = function_constructor_code_generation_source(original) else {
-        return trusted_script_string_for_eval_source(scope, original);
+        return trusted_script_string_for_eval_source(scope, original, requirements);
     };
-    if let Some(default_value) = apply_default_trusted_type_policy(
+    trusted_script_string_for_code_generation_sink(
         scope,
+        original,
         function_source.default_policy_input,
-        TrustedTypeKind::Script,
-        "Function",
-        TrustedTypeErrorKind::Eval,
-    ) {
-        if default_value == function_source.default_policy_input {
-            return Some(original.to_owned());
-        }
-        dispatch_trusted_types_sink_violation_event(
-            scope,
-            "Function",
-            function_source.violation_sample,
-        );
-        throw_eval_error(
-            scope,
-            "Trusted Types default policy must not transform strings passed to Function.",
-        );
-        return None;
-    }
-    dispatch_trusted_types_sink_violation_event(
-        scope,
         "Function",
         function_source.violation_sample,
-    );
-    throw_trusted_type_error(
-        scope,
-        TrustedTypeErrorKind::Eval,
-        "Function",
-        TrustedTypeKind::Script,
-        "Function",
-    );
-    None
+        requirements,
+        "Trusted Types default policy must not transform strings passed to Function.",
+    )
 }
 
 struct FunctionConstructorCodeGenerationSource<'a> {
@@ -445,33 +388,71 @@ fn function_constructor_code_generation_source(
 fn trusted_script_string_for_eval_source(
     scope: &mut v8::PinScope<'_, '_>,
     original: &str,
+    requirements: TrustedTypesForScriptRequirements,
 ) -> Option<String> {
-    if let Some(default_value) = apply_default_trusted_type_policy(
+    trusted_script_string_for_code_generation_sink(
         scope,
         original,
-        TrustedTypeKind::Script,
+        original,
         "eval",
-        TrustedTypeErrorKind::Eval,
-    ) {
-        if default_value == original {
-            return Some(default_value);
-        }
-        dispatch_trusted_types_sink_violation_event(scope, "eval", original);
-        throw_eval_error(
-            scope,
-            "Trusted Types default policy must not transform strings passed to eval.",
-        );
-        return None;
-    }
-    dispatch_trusted_types_sink_violation_event(scope, "eval", original);
-    throw_trusted_type_error(
+        original,
+        requirements,
+        "Trusted Types default policy must not transform strings passed to eval.",
+    )
+}
+
+fn trusted_script_string_for_code_generation_sink(
+    scope: &mut v8::PinScope<'_, '_>,
+    original: &str,
+    default_policy_input: &str,
+    sink: &'static str,
+    violation_sample: &str,
+    requirements: TrustedTypesForScriptRequirements,
+    transformed_value_error: &'static str,
+) -> Option<String> {
+    let outcome = apply_default_trusted_type_policy_outcome(
         scope,
-        TrustedTypeErrorKind::Eval,
-        "eval",
+        default_policy_input,
         TrustedTypeKind::Script,
-        "eval",
+        sink,
     );
-    None
+    match outcome {
+        DefaultTrustedTypePolicyOutcome::Value(value)
+            if value.as_str() == Some(default_policy_input) =>
+        {
+            Some(original.to_owned())
+        }
+        DefaultTrustedTypePolicyOutcome::Value(_) => {
+            // TrustedScript was supplied; rejecting transformed source is a compilation error.
+            throw_eval_error(scope, transformed_value_error);
+            None
+        }
+        DefaultTrustedTypePolicyOutcome::Exception => None,
+        outcome @ (DefaultTrustedTypePolicyOutcome::Unavailable
+        | DefaultTrustedTypePolicyOutcome::Rejected) => {
+            dispatch_trusted_types_sink_violation_event(scope, sink, violation_sample);
+            if requirements.is_enforced() {
+                if matches!(outcome, DefaultTrustedTypePolicyOutcome::Rejected) {
+                    throw_trusted_type_policy_result_error(
+                        scope,
+                        TrustedTypeErrorKind::Eval,
+                        TrustedTypeKind::Script,
+                    );
+                } else {
+                    throw_trusted_type_error(
+                        scope,
+                        TrustedTypeErrorKind::Eval,
+                        sink,
+                        TrustedTypeKind::Script,
+                        sink,
+                    );
+                }
+                None
+            } else {
+                Some(original.to_owned())
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -483,7 +464,7 @@ enum TrustedTypeErrorKind {
 
 enum DefaultTrustedTypePolicyOutcome {
     Unavailable,
-    Value(String),
+    Value(DomStringValue),
     Rejected,
     Exception,
 }
@@ -506,7 +487,9 @@ fn trusted_type_string_or_throw<'s>(
     let original = js_value_to_string(scope, value)?;
     let default_policy = apply_default_trusted_type_policy_outcome(scope, &original, kind, sink);
     let default_policy_rejected = match default_policy {
-        DefaultTrustedTypePolicyOutcome::Value(value) => return Some(value),
+        DefaultTrustedTypePolicyOutcome::Value(value) => {
+            return Some(value.as_str_lossy().to_owned());
+        }
         DefaultTrustedTypePolicyOutcome::Exception => return None,
         DefaultTrustedTypePolicyOutcome::Unavailable => false,
         DefaultTrustedTypePolicyOutcome::Rejected => true,
@@ -532,7 +515,7 @@ fn apply_default_trusted_type_policy<'s>(
     error_kind: TrustedTypeErrorKind,
 ) -> Option<String> {
     match apply_default_trusted_type_policy_outcome(scope, input, kind, sink) {
-        DefaultTrustedTypePolicyOutcome::Value(value) => Some(value),
+        DefaultTrustedTypePolicyOutcome::Value(value) => Some(value.as_str_lossy().to_owned()),
         DefaultTrustedTypePolicyOutcome::Rejected => {
             throw_trusted_type_policy_result_error(scope, error_kind, kind);
             None
@@ -578,9 +561,7 @@ fn trusted_type_string<'s>(
     kind: TrustedTypeKind,
 ) -> Option<String> {
     let object = v8::Local::<v8::Object>::try_from(value).ok()?;
-    let kind_value = get_private_value(scope, object, TRUSTED_TYPE_KIND_SLOT)?;
-    let kind_string = kind_value.to_string(scope)?.to_rust_string_lossy(scope);
-    if kind_string != kind.as_slot_value() {
+    if !kind.interface().is_instance(scope, object) {
         return None;
     }
     let value = get_private_value(scope, object, TRUSTED_TYPE_VALUE_SLOT)?;
@@ -659,12 +640,12 @@ fn install_trusted_script_code_like_constructor<'s>(
 fn build_trusted_type_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     kind: TrustedTypeKind,
-    value: String,
+    value: DomStringValue,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let global = scope.get_current_context().global(scope);
     let prototype = get_private_value(scope, global, kind.prototype_slot())
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let value = v8_string(scope, &value)?;
+    let value = crate::util::v8_string_from_utf16_units(scope, &value.utf16_units())?;
     let object = if kind == TrustedTypeKind::Script {
         get_private_value(scope, global, TRUSTED_SCRIPT_CODE_LIKE_CONSTRUCTOR_SLOT)
             .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?
@@ -672,10 +653,13 @@ fn build_trusted_type_object<'s>(
     } else {
         v8::Object::new(scope)
     };
-    TrustedTypeObjectDeclaration::new(v8str(scope, kind.as_slot_value()), value)
+    TrustedTypeObjectDeclaration::new(value)
         .initialize(scope, object)
         .expect("TrustedType object declaration should initialize");
-    let _ = object.set_prototype(scope, prototype.into());
+    kind.interface().initialize(scope, object).ok()?;
+    object
+        .set_prototype(scope, prototype.into())?
+        .then_some(())?;
     Some(object)
 }
 
@@ -722,7 +706,7 @@ fn trusted_types_create_policy_callback<'s>(
         return;
     };
     let name: String = name.into();
-    let Some(callbacks) = parse_policy_callback_carriers(scope, args.get(1)) else {
+    let Some(callbacks) = parse_policy_callbacks(scope, args.get(1)) else {
         return;
     };
 
@@ -735,14 +719,11 @@ fn trusted_types_create_policy_callback<'s>(
     }
 
     let policy_name = v8_string(scope, &name).unwrap_or_else(|| v8::String::empty(scope));
-    let policy = TrustedTypePolicyDeclaration::new(
-        policy_name,
-        callbacks.create_html,
-        callbacks.create_script,
-        callbacks.create_script_url,
-    )
-    .bind(scope)
-    .expect("TrustedTypePolicy declaration should bind");
+    let policy = TrustedTypePolicyDeclaration::new(policy_name)
+        .bind(scope)
+        .expect("TrustedTypePolicy declaration should bind");
+    webidl::WebIdlDictionarySerialize::initialize_snapshot(&callbacks, scope, policy)
+        .expect("TrustedTypePolicy callbacks should initialize");
 
     if name == "default" {
         let global = scope.get_current_context().global(scope);
@@ -785,7 +766,7 @@ fn trusted_type_policy_create_callback<'s>(
         return;
     };
     let policy = args.this();
-    let Some(input) = webidl::required_argument::<webidl::DomString>(
+    let Some(input) = webidl::required_argument::<webidl::DomString16>(
         scope,
         &args,
         0,
@@ -794,14 +775,10 @@ fn trusted_type_policy_create_callback<'s>(
     ) else {
         return;
     };
-    let Some(input) = v8_string(scope, &String::from(input)) else {
+    let Some(input) = crate::util::v8_string_from_utf16_units(scope, &input.0) else {
         return;
     };
-    let mut callback_arguments = Vec::with_capacity(args.length().max(1) as usize);
-    callback_arguments.push(input.into());
-    for index in 1..args.length() {
-        callback_arguments.push(args.get(index));
-    }
+    let callback_arguments = moli_v8_util::callback_arguments_with_first(&args, input.into());
     let value = match invoke_policy_callback(scope, policy, kind, &callback_arguments) {
         TrustedTypePolicyCallbackOutcome::Missing => {
             throw_type_error(
@@ -916,13 +893,18 @@ fn install_function_constructor_wrappers<'s>(
             .build(scope)
             .ok_or_else(|| anyhow!("failed to build {} Trusted Types wrapper", kind.name()))?;
         constructor.set_name(v8str(scope, kind.name()));
-        if let Some(prototype) = eval_object(scope, kind.prototype_expression()) {
-            let _ = prototype.define_own_property(
+        if let Some(prototype) = eval_object(scope, kind.prototype_expression())
+            && prototype.define_own_property(
                 scope,
                 v8str(scope, "constructor").into(),
                 constructor.into(),
                 v8::PropertyAttribute::DONT_ENUM,
-            );
+            ) != Some(true)
+        {
+            return Err(anyhow!(
+                "failed to install {} Trusted Types wrapper",
+                kind.name()
+            ));
         }
         if kind == TrustedFunctionConstructorKind::Function {
             define_global_value(scope, global, "Function", constructor.into())?;
@@ -937,7 +919,7 @@ fn eval_object<'s>(
 ) -> Option<v8::Local<'s, v8::Object>> {
     let source = v8str(scope, source);
     v8::Script::compile(scope, source, None)
-        .and_then(|script| script.run(scope))
+        .and_then(|script| crate::script_execution::execute_compiled_script(scope, script))
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
 }
 
@@ -964,7 +946,7 @@ fn trusted_types_function_constructor_callback<'s>(
     let Some(script) = v8::Script::compile(scope, source, None) else {
         return;
     };
-    if let Some(function) = script.run(scope) {
+    if let Some(function) = crate::script_execution::execute_compiled_script(scope, script) {
         rv.set(function);
     }
 }
@@ -1019,7 +1001,7 @@ fn trusted_script_string_for_function_constructor<'s>(
         if default_value == default_policy_source {
             return Some(original);
         }
-        dispatch_trusted_types_sink_violation_event(scope, "Function", &violation_sample);
+        // The policy supplied TrustedScript, so this is not a sink mismatch.
         throw_eval_error(
             scope,
             "Trusted Types default policy must not transform strings passed to Function.",

@@ -2,7 +2,7 @@ use super::init::read_event_init;
 use super::*;
 use crate::context_bootstrap::{current_performance_time_origin, dom_time_since_origin_millis};
 use crate::util::{get_private_value, set_private_value};
-use crate::webidl;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
 pub(crate) const EVENT_DISPATCHING_SLOT: &str = "__lmDispatching";
@@ -14,9 +14,18 @@ const EVENT_INITIALIZED_SLOT: &str = "__moliEventInitialized";
 const EVENT_TRUSTED_PRIVATE_SLOT: &str = "__moliEventTrusted";
 const EVENT_TIMESTAMP_PRIVATE_SLOT: &str = "__moliEventTimeStamp";
 const EVENT_IS_TRUSTED_GETTER_FUNCTION_SLOT: &str = "__moliEventIsTrustedGetterFunction";
+pub(super) const EVENT_BACKING_SLOT: &str = "__moliEventBacking";
+
+pub(crate) fn event_backing<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    event: v8::Local<'_, v8::Object>,
+) -> v8::Local<'s, v8::Object> {
+    let event = v8::Local::new(scope, event);
+    crate::util::get_private_object(scope, event, EVENT_BACKING_SLOT).unwrap_or(event)
+}
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct InitializedEventHeaderDeclaration<'scope> {
     #[webapi(data_property = "type")]
     event_type: v8::Local<'scope, v8::String>,
@@ -31,7 +40,7 @@ struct InitializedEventHeaderDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(prototype = "Object", interface = web_api_interfaces::Event, data_properties, enumerable)]
 struct InitializedEventStateDeclaration {
     bubbles: bool,
     cancelable: bool,
@@ -48,7 +57,7 @@ struct InitializedEventStateDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct InitializedEventIsTrustedAccessorDeclaration {
     #[webapi(
         accessor_property,
@@ -60,7 +69,7 @@ struct InitializedEventIsTrustedAccessorDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct InitializedEventTailDeclaration {
     #[webapi(init = false)]
     composed: (),
@@ -78,7 +87,7 @@ pub(in crate::context_bootstrap) fn event_type_argument<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     constructor_name: &'static str,
-) -> Option<String> {
+) -> Option<v8::Local<'s, v8::String>> {
     if args.length() == 0 {
         throw_type_error(
             scope,
@@ -86,28 +95,16 @@ pub(in crate::context_bootstrap) fn event_type_argument<'s>(
         );
         return None;
     }
-    webidl::argument::<webidl::DomString>(
-        scope,
-        args,
-        0,
-        webidl::Context::argument(constructor_name, 1),
-    )
-    .map(Into::into)
-    .map_or_else(
-        |error| {
-            webidl::throw_error(scope, &error);
-            None
-        },
-        Some,
-    )
+    args.get(0).to_string(scope)
 }
 
-pub(in crate::context_bootstrap) fn define_event_property(
+pub(crate) fn define_event_property(
     scope: &mut v8::PinScope<'_, '_>,
     event: v8::Local<'_, v8::Object>,
     key: &'static str,
     value: v8::Local<'_, v8::Value>,
 ) {
+    let event = event_backing(scope, event);
     let _ = event.set(scope, v8str(scope, key).into(), value);
 }
 
@@ -130,6 +127,7 @@ pub(crate) fn event_initialized<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event: v8::Local<'s, v8::Object>,
 ) -> Option<bool> {
+    let event = event_backing(scope, event);
     get_private_value(scope, event, EVENT_INITIALIZED_SLOT).map(|value| value.boolean_value(scope))
 }
 
@@ -138,6 +136,7 @@ pub(in crate::context_bootstrap) fn set_event_initialized(
     event: v8::Local<'_, v8::Object>,
     initialized: bool,
 ) {
+    let event = event_backing(scope, event);
     set_private_value(
         scope,
         event,
@@ -151,6 +150,7 @@ pub(in crate::context_bootstrap) fn set_event_dispatch_fields<'s>(
     target: v8::Local<'s, v8::Object>,
     event: v8::Local<'s, v8::Object>,
 ) {
+    let event = event_backing(scope, event);
     let _ = event.set(scope, v8str(scope, "target").into(), target.into());
     let _ = event.set(scope, v8str(scope, "srcElement").into(), target.into());
     let _ = event.set(scope, v8str(scope, "currentTarget").into(), target.into());
@@ -166,6 +166,7 @@ pub(in crate::context_bootstrap) fn clear_event_dispatch_fields(
     scope: &mut v8::PinScope<'_, '_>,
     event: v8::Local<'_, v8::Object>,
 ) {
+    let event = event_backing(scope, event);
     let _ = event.set(
         scope,
         v8str(scope, "currentTarget").into(),
@@ -184,6 +185,7 @@ pub(crate) fn event_internal_bool_flag<'s>(
     event: v8::Local<'s, v8::Object>,
     key: &'static str,
 ) -> bool {
+    let event = event_backing(scope, event);
     get_private_value(scope, event, key).is_some_and(|value| value.is_true())
 }
 
@@ -193,6 +195,7 @@ pub(crate) fn set_event_internal_flag(
     key: &'static str,
     value: bool,
 ) {
+    let event = event_backing(scope, event);
     set_private_value(scope, event, key, v8::Boolean::new(scope, value).into());
 }
 
@@ -200,8 +203,29 @@ pub(crate) fn event_composed_path_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event: v8::Local<'s, v8::Object>,
 ) -> v8::Local<'s, v8::Value> {
-    get_private_value(scope, event, EVENT_COMPOSED_PATH_SLOT)
-        .unwrap_or_else(|| v8::Array::new(scope, 0).into())
+    let backing = event_backing(scope, event);
+    let path = get_private_value(scope, backing, EVENT_COMPOSED_PATH_SLOT)
+        .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok());
+    let context = event.get_creation_context(scope);
+    let mut values = Vec::new();
+    if let Some(path) = path {
+        for index in 0..path.length() {
+            if let Some(value) = path.get_index(scope, index) {
+                let value = if let (Ok(target), Some(context)) =
+                    (v8::Local::<v8::Object>::try_from(value), context)
+                {
+                    crate::context_bootstrap::shared_event_targets::target_in_realm(
+                        scope, target, context,
+                    )
+                    .into()
+                } else {
+                    value
+                };
+                values.push(value);
+            }
+        }
+    }
+    v8::Array::new_with_elements(scope, &values).into()
 }
 
 pub(crate) fn set_event_composed_path<'s>(
@@ -209,6 +233,7 @@ pub(crate) fn set_event_composed_path<'s>(
     event: v8::Local<'s, v8::Object>,
     path: v8::Local<'s, v8::Array>,
 ) {
+    let event = event_backing(scope, event);
     set_private_value(scope, event, EVENT_COMPOSED_PATH_SLOT, path.into());
 }
 
@@ -233,10 +258,11 @@ fn event_is_trusted_getter_function<'s>(
     rv.set(v8::Boolean::new(scope, trusted).into());
 }
 
-pub(super) fn event_trusted<'s>(
+pub(crate) fn event_trusted<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event: v8::Local<'s, v8::Object>,
 ) -> bool {
+    let event = event_backing(scope, event);
     get_private_value(scope, event, EVENT_TRUSTED_PRIVATE_SLOT)
         .map(|value| value.boolean_value(scope))
         .unwrap_or(false)
@@ -254,6 +280,7 @@ pub(crate) fn set_event_trusted(
     event: v8::Local<'_, v8::Object>,
     trusted: bool,
 ) {
+    let event = event_backing(scope, event);
     set_private_value(
         scope,
         event,
@@ -270,6 +297,7 @@ pub(super) fn event_time_stamp<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event: v8::Local<'s, v8::Object>,
 ) -> f64 {
+    let event = event_backing(scope, event);
     get_private_value(scope, event, EVENT_TIMESTAMP_PRIVATE_SLOT)
         .and_then(|value| value.number_value(scope))
         .or_else(|| {
@@ -289,31 +317,19 @@ pub(crate) fn initialize_event_object<'s>(
     bubbles: bool,
     cancelable: bool,
 ) {
-    initialize_event_declaration(scope, event, event_type, bubbles, cancelable);
+    let event_type = v8_string(scope, event_type).expect("event type value");
+    initialize_event_object_with_type(scope, event, event_type, bubbles, cancelable);
 }
 
-fn initialize_event_declaration<'s>(
+pub(crate) fn initialize_event_object_with_type<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event: v8::Local<'s, v8::Object>,
-    event_type: &str,
+    event_type: v8::Local<'s, v8::String>,
     bubbles: bool,
     cancelable: bool,
 ) {
-    initialized_event_header_declaration(scope, event_type)
-        .initialize(scope, event)
-        .expect("initialized event header declaration should initialize");
-    initialize_event_after_header(scope, event, bubbles, cancelable);
-}
-
-fn initialize_event_after_header<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    event: v8::Local<'s, v8::Object>,
-    bubbles: bool,
-    cancelable: bool,
-) {
-    InitializedEventStateDeclaration::new(bubbles, cancelable)
-        .initialize(scope, event)
-        .expect("initialized event state declaration should initialize");
+    let event = event_backing(scope, event);
+    initialize_event_attributes(scope, event, event_type, bubbles, cancelable);
     if !event_has_own_property(scope, event, "isTrusted") {
         define_event_is_trusted_accessor(scope, event);
     }
@@ -322,7 +338,42 @@ fn initialize_event_after_header<'s>(
         .expect("initialized event tail declaration should initialize");
 }
 
-fn define_event_is_trusted_accessor<'s>(
+pub(crate) fn reinitialize_event_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    event: v8::Local<'s, v8::Object>,
+    event_type: &[u16],
+    bubbles: bool,
+    cancelable: bool,
+) -> bool {
+    let event = event_backing(scope, event);
+    // WebIDL arguments have already been converted before this method step.
+    if event_is_dispatching(scope, event) {
+        return false;
+    }
+    let Some(event_type) = v8_string_from_utf16_units(scope, event_type) else {
+        return false;
+    };
+    // Creation-only state (including composed and timeStamp) is retained.
+    initialize_event_attributes(scope, event, event_type, bubbles, cancelable);
+    true
+}
+
+fn initialize_event_attributes<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    event: v8::Local<'s, v8::Object>,
+    event_type: v8::Local<'s, v8::String>,
+    bubbles: bool,
+    cancelable: bool,
+) {
+    InitializedEventHeaderDeclaration::new(event_type)
+        .initialize(scope, event)
+        .expect("initialized event header declaration should initialize");
+    InitializedEventStateDeclaration::new(bubbles, cancelable)
+        .initialize(scope, event)
+        .expect("initialized event state declaration should initialize");
+}
+
+pub(super) fn define_event_is_trusted_accessor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event: v8::Local<'s, v8::Object>,
 ) {
@@ -378,13 +429,9 @@ fn event_core_attribute_getter<'s>(
         return;
     }
 
-    let key = v8str(scope, key);
-    let value = receiver
-        .get_own_property_descriptor(scope, key.into())
-        .and_then(|descriptor| v8::Local::<v8::Object>::try_from(descriptor).ok())
-        .and_then(|descriptor| descriptor.get(scope, v8str(scope, "value").into()))
-        .unwrap_or_else(|| v8::undefined(scope).into());
-    rv.set(value);
+    if let Some(value) = super::wrappers::event_attribute_in_wrapper(scope, receiver, key) {
+        rv.set(value);
+    }
 }
 
 macro_rules! define_event_core_attribute_getter {
@@ -409,14 +456,6 @@ define_event_core_attribute_getter!(event_default_prevented_getter_function, "de
 define_event_core_attribute_getter!(event_composed_getter_function, "composed");
 define_event_core_attribute_getter!(event_src_element_getter_function, "srcElement");
 
-fn initialized_event_header_declaration<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    event_type: &str,
-) -> InitializedEventHeaderDeclaration<'s> {
-    let type_value = v8_string(scope, event_type).expect("event type value");
-    InitializedEventHeaderDeclaration::new(type_value)
-}
-
 fn initialized_event_tail_declaration(
     scope: &mut v8::PinScope<'_, '_>,
 ) -> InitializedEventTailDeclaration {
@@ -437,13 +476,16 @@ pub(in crate::context_bootstrap) fn event_constructor_callback<'s>(
         return;
     }
 
-    let event = args.this();
+    let wrapper = args.this();
     let Some(event_type) = event_type_argument(scope, &args, "Event") else {
         return;
     };
 
-    let (bubbles, cancelable, composed) = read_event_init(scope, &args);
-    initialize_event_object(scope, event, &event_type, bubbles, cancelable);
+    let Some((bubbles, cancelable, composed)) = read_event_init(scope, &args) else {
+        return;
+    };
+    let event = new_event_state(scope);
+    initialize_event_object_with_type(scope, event, event_type, bubbles, cancelable);
     define_event_property(
         scope,
         event,
@@ -451,5 +493,7 @@ pub(in crate::context_bootstrap) fn event_constructor_callback<'s>(
         v8::Boolean::new(scope, composed).into(),
     );
 
-    rv.set(event.into());
+    if initialize_event_wrapper(scope, wrapper, event).is_some() {
+        rv.set(wrapper.into());
+    }
 }

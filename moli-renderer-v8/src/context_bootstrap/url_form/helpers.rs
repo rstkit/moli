@@ -1,17 +1,6 @@
 use super::*;
 use crate::util::{get_private_value, set_private_value};
-
-pub(crate) fn object_prototype_matches(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<'_, v8::Object>,
-    ctor_name: &str,
-) -> bool {
-    global_constructor_prototype(scope, ctor_name).is_some_and(|prototype| {
-        object
-            .get_prototype(scope)
-            .is_some_and(|candidate| candidate.strict_equals(prototype.into()))
-    })
-}
+use crate::web_api_interfaces;
 
 pub(in crate::context_bootstrap) fn callback_value_string(
     scope: &mut v8::PinScope<'_, '_>,
@@ -22,40 +11,20 @@ pub(in crate::context_bootstrap) fn callback_value_string(
         .map(|value| value.to_rust_string_lossy(scope))
 }
 
-pub(in crate::context_bootstrap) fn callback_arg_url_like_string<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Option<String> {
-    if value.is_null_or_undefined() {
-        return None;
-    }
-    if let Ok(object) = v8::Local::<v8::Object>::try_from(value)
-        && let Some(href) = url_href_slot(scope, object)
-    {
-        return Some(href);
-    }
-    callback_value_string(scope, value)
-}
-
 pub(super) fn resolve_url_constructor_input(
     input: &str,
     base: Option<&str>,
 ) -> std::result::Result<url::Url, url::ParseError> {
-    if let Ok(url) = url::Url::parse(input) {
-        return Ok(url);
+    // A supplied base must be validated even for an absolute input. It also
+    // participates in parsing same-scheme inputs such as `https:child`.
+    match base {
+        Some(base) => url::Url::parse(base)?.join(input),
+        None => url::Url::parse(input),
     }
-    let Some(base) = base else {
-        return Err(url::ParseError::RelativeUrlWithoutBase);
-    };
-    let base = url::Url::parse(base)?;
-    base.join(input)
 }
 
 pub(super) fn can_parse_url_input(input: &str, base: Option<&str>) -> bool {
-    match base {
-        Some(base) => url::Url::parse(base).is_ok_and(|base| base.join(input).is_ok()),
-        None => url::Url::parse(input).is_ok(),
-    }
+    resolve_url_constructor_input(input, base).is_ok()
 }
 
 pub(in crate::context_bootstrap) fn url_href_slot<'s>(
@@ -71,7 +40,7 @@ pub(in crate::context_bootstrap) fn require_url_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    if get_private_value(scope, object, URL_HREF_SLOT).is_some() {
+    if web_api_interfaces::URL::is_instance(scope, object) {
         return Some(object);
     }
     throw_type_error(scope, "Illegal invocation");

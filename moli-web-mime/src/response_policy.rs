@@ -1,31 +1,38 @@
 use crate::classification::{
     is_audio_mime_essence, is_css_mime, is_font_mime_essence, is_image_mime_essence,
-    is_javascript_mime, is_video_mime_essence,
+    is_javascript_mime, is_json_mime_essence, is_office_document_mime_essence,
+    is_video_mime_essence,
 };
 use crate::destination::FetchDestination;
-use crate::headers::response_header_value;
-use crate::parse::{mime_charset, mime_essence};
+use crate::headers::{extract_response_mime_essence, extract_response_mime_type};
+use crate::parse::mime_charset;
 use crate::sniffing::{MimeSniffingContext, computed_mime_type, sniff_image_mime_type};
 
-pub fn determine_nosniff(headers: &[(String, String)]) -> bool {
+pub fn determine_nosniff(headers: &[(String, Vec<u8>)]) -> bool {
     headers
         .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("x-content-type-options"))
-        .flat_map(|(_, value)| value.split(','))
-        .map(str::trim)
-        .next()
-        .is_some_and(|value| value.eq_ignore_ascii_case("nosniff"))
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-content-type-options"))
+        .is_some_and(|(_, value)| {
+            moli_header_field::decode_header_value(value)
+                .split(',')
+                .next()
+                .is_some_and(|value| {
+                    value
+                        .trim_matches(['\t', ' '])
+                        .eq_ignore_ascii_case("nosniff")
+                })
+        })
 }
 
 pub fn should_response_be_blocked_due_to_nosniff(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     destination: FetchDestination,
 ) -> bool {
     if !determine_nosniff(headers) {
         return false;
     }
 
-    let content_type = response_header_value(headers, "content-type");
+    let content_type = extract_response_mime_essence(headers);
     if destination.is_script_like() {
         return content_type
             .as_deref()
@@ -39,24 +46,11 @@ pub fn should_response_be_blocked_due_to_nosniff(
     false
 }
 
-pub fn should_opaque_response_be_blocked_by_orb(headers: &[(String, String)]) -> bool {
-    let content_type = response_header_value(headers, "content-type");
-    if determine_nosniff(headers)
-        && content_type
-            .as_deref()
-            .is_none_or(|content_type| content_type.trim().is_empty())
-    {
-        return true;
-    }
-
-    let Some(content_type) = content_type else {
-        return false;
-    };
-    let Some(essence) = mime_essence(&content_type) else {
+pub fn should_opaque_response_be_blocked_by_orb(headers: &[(String, Vec<u8>)]) -> bool {
+    let Some(essence) = extract_response_mime_essence(headers) else {
         return determine_nosniff(headers);
     };
-    if is_javascript_mime(&content_type) || is_css_mime(&content_type) || essence == "image/svg+xml"
-    {
+    if is_javascript_mime(&essence) || is_css_mime(&essence) || essence == "image/svg+xml" {
         return false;
     }
 
@@ -65,9 +59,7 @@ pub fn should_opaque_response_be_blocked_by_orb(headers: &[(String, String)]) ->
         || essence == "text/xml"
         || essence == "application/xml"
         || essence == "application/xhtml+xml"
-        || essence == "application/json"
-        || essence == "text/json"
-        || essence.ends_with("+json")
+        || is_json_mime_essence(&essence)
         || essence == "application/dash+xml"
         || essence == "application/gzip"
         || essence == "application/x-gzip"
@@ -82,39 +74,18 @@ pub fn should_opaque_response_be_blocked_by_orb(headers: &[(String, String)]) ->
         || essence == "text/csv"
         || essence == "text/vtt"
         || is_font_mime_essence(&essence)
+        || is_office_document_mime_essence(&essence)
         || matches!(
             essence.as_str(),
-            "application/msexcel"
-                | "application/mspowerpoint"
-                | "application/msword"
-                | "application/msword-template"
-                | "application/vnd.apple.mpegurl"
+            "application/vnd.apple.mpegurl"
                 | "application/vnd.ces-quickpoint"
                 | "application/vnd.ces-quicksheet"
                 | "application/vnd.ces-quickword"
-                | "application/vnd.ms-excel"
-                | "application/vnd.ms-excel.sheet.macroenabled.12"
-                | "application/vnd.ms-powerpoint"
-                | "application/vnd.ms-powerpoint.presentation.macroenabled.12"
-                | "application/vnd.ms-word"
-                | "application/vnd.ms-word.document.12"
-                | "application/vnd.ms-word.document.macroenabled.12"
-                | "application/vnd.msword"
-                | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                | "application/vnd.openxmlformats-officedocument.presentationml.template"
-                | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                | "application/vnd.openxmlformats-officedocument.spreadsheetml.template"
-                | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
-                | "application/vnd.presentation-openxml"
-                | "application/vnd.presentation-openxmlm"
-                | "application/vnd.spreadsheet-openxml"
-                | "application/vnd.wordprocessing-openxml"
         )
 }
 
 pub fn should_opaque_response_be_blocked_by_orb_with_body(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     body: &[u8],
 ) -> bool {
     if !should_opaque_response_be_blocked_by_orb(headers) {
@@ -125,27 +96,20 @@ pub fn should_opaque_response_be_blocked_by_orb_with_body(
         return false;
     }
 
-    let Some(content_type) = response_header_value(headers, "content-type") else {
+    let Some(mime) = extract_response_mime_type(headers) else {
         return true;
     };
-    let Some(essence) = mime_essence(&content_type) else {
-        return true;
-    };
-    if is_json_like_mime_essence(&essence)
-        && response_body_looks_like_orb_allowed_javascript(&content_type, body)
-    {
-        return false;
-    }
-
-    true
+    let essence = mime.essence();
+    !(is_json_mime_essence(&essence)
+        && response_body_looks_like_orb_allowed_javascript(&mime.to_string(), body))
 }
 
 pub fn computed_response_mime_type(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     context: MimeSniffingContext,
     body: &[u8],
 ) -> String {
-    let content_type = response_header_value(headers, "content-type");
+    let content_type = extract_response_mime_type(headers).map(|mime| mime.to_string());
     computed_mime_type(
         content_type.as_deref(),
         determine_nosniff(headers),
@@ -161,7 +125,7 @@ pub enum ScriptResponseMimeError {
 }
 
 pub fn check_script_response_mime(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     body: &[u8],
     destination: FetchDestination,
     require_javascript_mime: bool,
@@ -170,37 +134,34 @@ pub fn check_script_response_mime(
         return Err(ScriptResponseMimeError::Nosniff);
     }
 
-    let computed_mime_type =
-        computed_response_mime_type(headers, MimeSniffingContext::Script, body);
     if require_javascript_mime {
-        return is_javascript_mime(&computed_mime_type)
+        // A script-context sniffing default cannot satisfy an explicit
+        // JavaScript MIME requirement, including when Content-Type is absent
+        // or cannot be parsed.
+        let supplied_mime_type = extract_response_mime_essence(headers).unwrap_or_default();
+        return is_javascript_mime(&supplied_mime_type)
             .then_some(())
-            .ok_or(ScriptResponseMimeError::Unsupported(computed_mime_type));
+            .ok_or(ScriptResponseMimeError::Unsupported(supplied_mime_type));
     }
 
     if should_script_like_response_be_blocked_due_to_mime_type(headers) {
+        let computed_mime_type =
+            computed_response_mime_type(headers, MimeSniffingContext::Script, body);
         return Err(ScriptResponseMimeError::Unsupported(computed_mime_type));
     }
     Ok(())
 }
 
 pub fn should_script_like_response_be_blocked_due_to_mime_type(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> bool {
-    let Some(content_type) = response_header_value(headers, "content-type") else {
-        return false;
-    };
-    let Some(essence) = mime_essence(&content_type) else {
+    let Some(essence) = extract_response_mime_essence(headers) else {
         return false;
     };
     is_audio_mime_essence(&essence)
         || is_image_mime_essence(&essence)
         || is_video_mime_essence(&essence)
         || essence == "text/csv"
-}
-
-fn is_json_like_mime_essence(essence: &str) -> bool {
-    essence == "application/json" || essence == "text/json" || essence.ends_with("+json")
 }
 
 fn response_body_looks_like_orb_allowed_javascript(content_type: &str, body: &[u8]) -> bool {
@@ -250,7 +211,7 @@ fn decode_orb_script_candidate(content_type: &str, body: &[u8]) -> String {
 }
 
 fn decode_utf16_body(body: &[u8], little_endian: bool) -> String {
-    let units = body.chunks_exact(2).map(|chunk| {
+    let units = body.as_chunks::<2>().0.iter().map(|chunk| {
         if little_endian {
             u16::from_le_bytes([chunk[0], chunk[1]])
         } else {

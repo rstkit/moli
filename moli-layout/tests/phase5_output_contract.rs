@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use moli_layout::{
     DocumentLayoutServices, LayoutControlSurfaceHit, LayoutDisplay, LayoutElementCategory,
-    LayoutElementSemantics, LayoutError, LayoutFlushReason, LayoutFragmentKind, LayoutNamespace,
-    LayoutPaintedSurfaceHit, LayoutPassRequest, LayoutPassResult, LayoutPoint, LayoutPosition,
-    LayoutQuery, LayoutQueryAnswer, LayoutQueryBatch, LayoutRect, LayoutScrollbarColors,
-    LayoutScrollbarGutter, LayoutScrollbarPart, LayoutScrollbarWidth, LayoutSource,
-    LayoutSourceKind, LayoutStyleResolver, LayoutTransform2D, LayoutViewport, PaintBrush,
-    PaintCaptureRequest, PaintColor, PaintFragment, PaintShape, ResolvedLayoutElementStyles,
-    ResolvedLayoutStyle, build_layout_pass,
+    LayoutElementSemantics, LayoutEnvironment, LayoutError, LayoutFlushReason, LayoutFragmentKind,
+    LayoutNamespace, LayoutPaintedSurfaceHit, LayoutPassRequest, LayoutPassResult, LayoutPoint,
+    LayoutPosition, LayoutQuery, LayoutQueryAnswer, LayoutQueryBatch, LayoutRect,
+    LayoutScrollbarColors, LayoutScrollbarGutter, LayoutScrollbarPart, LayoutScrollbarWidth,
+    LayoutSource, LayoutSourceKind, LayoutStyleResolver, LayoutTransform2D, LayoutViewport,
+    PaintBrush, PaintCaptureRequest, PaintColor, PaintFragment, PaintShape,
+    ResolvedLayoutElementStyles, ResolvedLayoutStyle, build_layout_pass,
 };
 use style::Atom;
 use taffy::{
@@ -104,6 +104,13 @@ impl LayoutSource for Source {
         self.0[node].label.to_owned()
     }
 
+    fn hyperlink(&self, node: usize) -> Option<moli_layout::LayoutHyperlink<usize>> {
+        (self.0[node].local_name == "a").then(|| moli_layout::LayoutHyperlink {
+            url: self.0[node].label.into(),
+            destination: None,
+        })
+    }
+
     fn scroll_offset(&self, node: Self::NodeId) -> LayoutPoint {
         self.0[node].scroll
     }
@@ -150,12 +157,91 @@ fn build(source: &Source, styles: &mut Styles) -> LayoutPassResult<usize> {
     )
 }
 
+#[test]
+fn owned_links_are_collected_only_for_printing_and_do_not_change_paint() {
+    let (raster, print) = {
+        let source = Source(vec![
+            Node::element("root", vec![1]),
+            Node::html_element("https://example.com/link", "a", vec![2]),
+            Node::element("child", vec![]),
+        ]);
+        let mut styles = Styles(HashMap::from([
+            (0, fixed_size(LayoutDisplay::Block, 320.0, 240.0)),
+            (1, fixed_size(LayoutDisplay::Block, 100.0, 40.0)),
+            (2, fixed_size(LayoutDisplay::Block, 30.0, 20.0)),
+        ]));
+        let viewport = LayoutViewport::new(320, 240, 1.0);
+        let raster = build_with_request(
+            &source,
+            &mut styles,
+            LayoutPassRequest::with_paint(viewport, LayoutFlushReason::Test),
+        )
+        .into_paint_snapshot()
+        .unwrap();
+        let print = build_with_request(
+            &source,
+            &mut styles,
+            LayoutPassRequest::with_paint(viewport, LayoutFlushReason::Print),
+        )
+        .into_paint_snapshot()
+        .unwrap();
+        (raster, print)
+    };
+    assert!(raster.links.is_empty());
+    assert_eq!(raster.fragments, print.fragments);
+    assert_eq!(print.links.len(), 2, "anchor and inherited child regions");
+    assert!(
+        print
+            .links
+            .iter()
+            .all(|link| link.target.url.as_ref() == "https://example.com/link")
+    );
+    assert_eq!(print.links[0].rect.width, 100.0);
+}
+
 fn build_with_request(
     source: &Source,
     styles: &mut Styles,
     request: LayoutPassRequest,
 ) -> LayoutPassResult<usize> {
     build_layout_pass(source, styles, &mut DocumentLayoutServices::new(), request).unwrap()
+}
+
+fn assert_fragment_batches_match_direct_queries(
+    output: &LayoutPassResult<usize>,
+    sources: std::ops::Range<usize>,
+) {
+    let queries = LayoutQueryBatch::new(
+        sources
+            .flat_map(|source| {
+                [
+                    LayoutQuery::BoxModel { source },
+                    LayoutQuery::ClientRects { source },
+                    LayoutQuery::ContentQuads { source },
+                    LayoutQuery::TextRangeRects {
+                        source,
+                        utf16_range: 0..2,
+                    },
+                    LayoutQuery::TextRangeRects {
+                        source,
+                        utf16_range: 1..1,
+                    },
+                    LayoutQuery::TextRangeRects {
+                        source,
+                        utf16_range: 2..usize::MAX,
+                    },
+                ]
+            })
+            .collect(),
+    );
+    let expected = queries
+        .queries
+        .iter()
+        .map(|query| output.answer_query(query))
+        .collect::<Vec<_>>();
+    let answers = output.answer_queries(&queries);
+    assert_eq!(answers.answers, expected);
+    assert_eq!(answers.metrics, output.metrics);
 }
 
 fn assert_close(actual: f32, expected: f32) {
@@ -767,11 +853,124 @@ fn auto_scrollbar_feedback_reveals_the_perpendicular_axis() {
 }
 
 #[test]
+fn hidden_scrollbar_environment_skips_feedback_and_preserves_scroll_ranges() {
+    let mut source = Source(vec![
+        Node::element("root", vec![1]),
+        Node::element("scroller", vec![2]),
+        Node::element("content", Vec::new()),
+    ]);
+    source.0[1].scroll = LayoutPoint::new(0.0, 60.0);
+    let mut styles = Styles::default();
+    styles
+        .0
+        .insert(0, fixed_size(LayoutDisplay::Block, 320.0, 240.0));
+    styles.0.insert(
+        1,
+        resolved(
+            LayoutDisplay::Block,
+            Style {
+                size: Size {
+                    width: length(200.0),
+                    height: length(100.0),
+                },
+                overflow: Point {
+                    x: Overflow::Scroll,
+                    y: Overflow::Scroll,
+                },
+                ..Style::default()
+            },
+        ),
+    );
+    styles
+        .0
+        .insert(2, fixed_size(LayoutDisplay::Block, 200.0, 200.0));
+
+    // The same authored styles need three iterations with classic controls:
+    // vertical overflow reveals a gutter, which then causes horizontal overflow.
+    let classic = build(&source, &mut styles);
+    assert_eq!(classic.metrics.numeric_layout_pass_count, 3);
+    assert_eq!(
+        classic.element_metrics_for_source(1).unwrap().client_size,
+        moli_layout::LayoutSize::new(185.0, 85.0)
+    );
+
+    let hidden = build_with_request(
+        &source,
+        &mut styles,
+        LayoutPassRequest::with_paint(LayoutViewport::new(320, 240, 1.0), LayoutFlushReason::Test)
+            .with_environment(LayoutEnvironment {
+                scrollbars_hidden: true,
+            }),
+    );
+    assert_eq!(hidden.metrics.numeric_layout_pass_count, 1);
+    assert_eq!(hidden.metrics.numeric_feedback_invalidated_node_count, 0);
+    assert_eq!(
+        hidden
+            .metrics
+            .numeric_feedback_overflow_recomputed_node_count,
+        0
+    );
+    let metrics = hidden.element_metrics_for_source(1).unwrap();
+    assert_eq!(
+        metrics.client_size,
+        moli_layout::LayoutSize::new(200.0, 100.0)
+    );
+    assert_eq!(
+        metrics.scroll_size,
+        moli_layout::LayoutSize::new(200.0, 200.0)
+    );
+    let box_id = hidden.source_output(1).unwrap().principal_box.unwrap();
+    let extent = hidden.scroll_extent(box_id).unwrap();
+    assert_eq!(extent.applied_offset, LayoutPoint::new(0.0, 60.0));
+    assert_eq!(extent.maximum_offset, LayoutPoint::new(0.0, 100.0));
+    assert!(extent.allows_user_scroll_y);
+    assert!(extent.horizontal_scrollbar.is_none());
+    assert!(extent.vertical_scrollbar.is_none());
+    assert!(extent.scrollbar_corner.is_none());
+}
+
+fn fixed_inline_font() -> (ResolvedLayoutStyle, DocumentLayoutServices) {
+    use style::values::computed::font::{
+        FamilyName, FontFamily, FontFamilyList, FontFamilyNameSyntax, SingleFontFamily,
+    };
+    let mut font = style::properties::style_structs::Font::initial_values();
+    font.set_font_family(FontFamily {
+        families: FontFamilyList {
+            list: style::ArcSlice::from_iter(std::iter::once(SingleFontFamily::FamilyName(
+                FamilyName {
+                    name: Atom::from("Moli Ahem"),
+                    syntax: FontFamilyNameSyntax::Quoted,
+                },
+            ))),
+        },
+        is_system_font: false,
+        is_initial: false,
+    });
+    let style = ResolvedLayoutStyle::from_stylo(
+        style::properties::ComputedValues::initial_values_with_font_override(font),
+    );
+    let mut services =
+        DocumentLayoutServices::with_system_font_policy(moli_layout::SystemFontPolicy::Disabled);
+    services
+        .register_web_font(moli_layout::WebFontRegistration::new(
+            "fixed",
+            moli_layout::WebFontFace::new("Moli Ahem"),
+            include_bytes!("fixtures/moli-ahem.ttf").to_vec(),
+        ))
+        .unwrap();
+    (style, services)
+}
+
+#[test]
 fn scrollbar_feedback_rebreaks_the_reused_inline_layout_at_its_final_width() {
-    const TEXT: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+    const TEXT: &str = concat!(
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa ",
+        "supercalifragilisticexpialidocious",
+    );
     let source = Source(vec![
         Node::element("root", vec![1]),
         Node::element("scroller", vec![2]),
+        Node::element("fixed-font", vec![3]),
         Node::text("text", TEXT),
     ]);
     let mut styles = Styles::default();
@@ -788,7 +987,10 @@ fn scrollbar_feedback_rebreaks_the_reused_inline_layout_at_its_final_width() {
                     height: length(40.0),
                 },
                 overflow: Point {
-                    x: Overflow::Scroll,
+                    // Only the vertical scrollbar narrows the text. Keep the
+                    // long word's horizontal overflow without showing a
+                    // horizontal scrollbar.
+                    x: Overflow::Hidden,
                     y: Overflow::Scroll,
                 },
                 ..Style::default()
@@ -796,13 +998,32 @@ fn scrollbar_feedback_rebreaks_the_reused_inline_layout_at_its_final_width() {
         ),
     );
 
-    let feedback = build(&source, &mut styles);
+    // The old system-font fixture happened to fit on macOS but exposed
+    // hanging-space overflow on Linux. Bind shaping to the same test face.
+    let (font_style, mut fixed_services) = fixed_inline_font();
+    styles.0.insert(2, font_style);
+    let feedback = build_layout_pass(
+        &source,
+        &mut styles,
+        &mut fixed_services,
+        LayoutPassRequest::new(LayoutViewport::new(320, 240, 1.0), LayoutFlushReason::Test),
+    )
+    .unwrap();
     assert_eq!(feedback.metrics.numeric_layout_pass_count, 2);
     assert_eq!(
         feedback.element_metrics_for_source(1).unwrap().client_size,
-        moli_layout::LayoutSize::new(85.0, 25.0),
+        moli_layout::LayoutSize::new(85.0, 40.0),
     );
-    let feedback_text = feedback.client_rects_for_source(2);
+    let scroller_box = feedback.source_output(1).unwrap().principal_box.unwrap();
+    let extent = feedback.scroll_extent(scroller_box).unwrap();
+    assert!(extent.vertical_scrollbar.is_some());
+    assert!(extent.horizontal_scrollbar.is_none());
+    assert!(!extent.allows_user_scroll_x);
+    let feedback_text = feedback.text_range_rects(3, 0..TEXT.encode_utf16().count());
+    assert!(
+        !feedback_text.is_empty(),
+        "compare real text fragments, not element-only client rects"
+    );
 
     // Lay out the same paragraph directly at the converged 85px content
     // width. Its line fragments must match the scrollbar-corrected result;
@@ -820,8 +1041,23 @@ fn scrollbar_feedback_rebreaks_the_reused_inline_layout_at_its_final_width() {
             },
         ),
     );
-    let direct = build(&source, &mut styles);
-    assert_eq!(feedback_text, direct.client_rects_for_source(2));
+    let direct = build_layout_pass(
+        &source,
+        &mut styles,
+        &mut fixed_services,
+        LayoutPassRequest::new(LayoutViewport::new(320, 240, 1.0), LayoutFlushReason::Test),
+    )
+    .unwrap();
+    assert_eq!(
+        feedback_text,
+        direct.text_range_rects(3, 0..TEXT.encode_utf16().count())
+    );
+    assert!(
+        feedback_text
+            .iter()
+            .any(|quad| quad.points.iter().any(|point| point.x > 85.0)),
+        "the unbreakable final word should retain horizontal overflow"
+    );
 }
 
 #[test]
@@ -1051,6 +1287,86 @@ fn thin_and_hidden_scrollbars_match_chromium_client_geometry() {
 }
 
 #[test]
+fn hidden_scrollbar_policy_preserves_explicit_stable_gutters_without_controls() {
+    let source = Source(vec![
+        Node::element("root", vec![1]),
+        Node::element("scroller", vec![2]),
+        Node::element("content", Vec::new()),
+    ]);
+    // Chromium --hide-scrollbars removes automatic gutters, but stable gutters
+    // still use the authored auto/thin width even though no UI is painted.
+    for (width, thickness) in [
+        (LayoutScrollbarWidth::Auto, 15.0),
+        (LayoutScrollbarWidth::Thin, 10.0),
+        (LayoutScrollbarWidth::None, 0.0),
+    ] {
+        for (gutter, edges) in [
+            (LayoutScrollbarGutter::Auto, 0.0),
+            (LayoutScrollbarGutter::Stable, 1.0),
+            (LayoutScrollbarGutter::StableBothEdges, 2.0),
+        ] {
+            let mut styles = Styles::default();
+            styles
+                .0
+                .insert(0, fixed_size(LayoutDisplay::Block, 320.0, 240.0));
+            let mut scroller = resolved(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(200.0),
+                        height: length(100.0),
+                    },
+                    overflow: Point {
+                        x: Overflow::Scroll,
+                        y: Overflow::Scroll,
+                    },
+                    ..Style::default()
+                },
+            );
+            scroller.set_scrollbar_style(width, gutter, None);
+            styles.0.insert(1, scroller);
+            styles
+                .0
+                .insert(2, fixed_size(LayoutDisplay::Block, 400.0, 300.0));
+            let output = build_with_request(
+                &source,
+                &mut styles,
+                LayoutPassRequest::with_paint(
+                    LayoutViewport::new(320, 240, 1.0),
+                    LayoutFlushReason::Test,
+                )
+                .with_environment(LayoutEnvironment {
+                    scrollbars_hidden: true,
+                }),
+            );
+            let metrics = output.element_metrics_for_source(1).unwrap();
+            assert_eq!(
+                metrics.client_size,
+                moli_layout::LayoutSize::new(200.0 - edges * thickness, 100.0)
+            );
+            assert_eq!(
+                metrics.client_border.x,
+                if edges == 2.0 { thickness } else { 0.0 }
+            );
+            assert_eq!(
+                metrics.scroll_size,
+                moli_layout::LayoutSize::new(400.0, 300.0)
+            );
+            let box_id = output.source_output(1).unwrap().principal_box.unwrap();
+            let extent = output.scroll_extent(box_id).unwrap();
+            assert!(extent.horizontal_scrollbar.is_none());
+            assert!(extent.vertical_scrollbar.is_none());
+            assert!(extent.scrollbar_corner.is_none());
+            assert!(
+                output
+                    .scrollbar_hit_test(LayoutPoint::new(190.0, 30.0))
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
 fn stable_both_edges_reserves_and_offsets_both_chromium_gutters() {
     let source = Source(vec![
         Node::element("root", vec![1]),
@@ -1154,7 +1470,7 @@ fn stable_both_edges_reserves_horizontal_space_during_numeric_layout() {
                     },
                     min_size: Size {
                         width: length(400.0),
-                        height: Dimension::auto(),
+                        height: Dimension::auto().into(),
                     },
                     ..Style::default()
                 },
@@ -1417,6 +1733,88 @@ fn scrollbar_hit_test_honors_the_same_ancestor_clip_as_paint() {
         None,
         "a control clipped out of paint must not intercept input"
     );
+}
+
+#[test]
+fn fractional_overflow_clip_matches_its_background_paint_edges() {
+    for display in [LayoutDisplay::Block, LayoutDisplay::Grid] {
+        let source = Source(vec![
+            Node::element("root", vec![1]),
+            Node::element("clipper", vec![2]),
+            Node::element("content", Vec::new()),
+        ]);
+        let mut styles = Styles::default();
+        styles
+            .0
+            .insert(0, fixed_size(LayoutDisplay::Block, 320.0, 240.0));
+        let background = PaintColor::new(0.0, 1.0, 1.0, 1.0);
+        styles.0.insert(
+            1,
+            ResolvedLayoutStyle::synthetic(
+                display,
+                Style {
+                    size: Size {
+                        width: length(200.4),
+                        height: length(100.4),
+                    },
+                    margin: Rect {
+                        top: length(0.25),
+                        left: length(0.25),
+                        ..Rect::zero()
+                    },
+                    overflow: Point {
+                        x: Overflow::Hidden,
+                        y: Overflow::Hidden,
+                    },
+                    ..Style::default()
+                },
+                background,
+            ),
+        );
+        styles.0.insert(
+            2,
+            ResolvedLayoutStyle::synthetic(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(300.0),
+                        height: length(200.0),
+                    },
+                    ..Style::default()
+                },
+                PaintColor::new(1.0, 0.0, 0.0, 1.0),
+            ),
+        );
+        let output = build_with_request(
+            &source,
+            &mut styles,
+            LayoutPassRequest::with_paint(
+                LayoutViewport::new(320, 240, 1.0),
+                LayoutFlushReason::Test,
+            ),
+        );
+        let snapshot = output.paint_snapshot().unwrap();
+        let (background_rect, _, background_transform) = snapshot
+            .fragments
+            .iter()
+            .filter_map(PaintFragment::solid_fill)
+            .find(|(_, color, _)| *color == background)
+            .unwrap();
+        let clips = snapshot
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                PaintFragment::PushClip { shape, transform } if shape.bounds().width < 320.0 => {
+                    Some((shape.bounds(), *transform))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!clips.is_empty());
+        assert!(clips.iter().all(|(rect, transform)| {
+            *rect == background_rect && *transform == background_transform
+        }));
+    }
 }
 
 #[test]
@@ -2089,13 +2487,25 @@ fn pass_result_owns_complete_box_models_and_answers_a_batch_from_one_pass() {
         model.margin.bounding_rect(),
         LayoutRect::new(0.0, 0.0, 120.0, 80.0),
     );
+    let quads = output.content_quads_for_source(0);
+    assert_eq!(quads.len(), 1);
+    assert_rect(
+        quads[0].bounding_rect(),
+        LayoutRect::new(3.0, 3.0, 114.0, 74.0),
+    );
 
-    let answers = output.answer_queries(&LayoutQueryBatch::new(vec![
+    let queries = LayoutQueryBatch::new(vec![
         LayoutQuery::DocumentMetrics,
         LayoutQuery::BoxModel { source: 0 },
         LayoutQuery::ClientRects { source: 0 },
-    ]));
-    assert_eq!(answers.answers.len(), 3);
+        LayoutQuery::ElementMetrics { source: 0 },
+        LayoutQuery::ElementMetrics { source: usize::MAX },
+    ]);
+    let answers = output.answer_queries(&queries);
+    assert_eq!(answers.answers.len(), 5);
+    for (query, answer) in queries.queries.iter().zip(&answers.answers) {
+        assert_eq!(&output.tree.answer_query(query), answer);
+    }
     assert_eq!(answers.metrics.reason, LayoutFlushReason::Test);
     assert_eq!(answers.metrics.box_count, output.boxes.len());
     assert!(matches!(
@@ -2110,6 +2520,11 @@ fn pass_result_owns_complete_box_models_and_answers_a_batch_from_one_pass() {
         &answers.answers[2],
         LayoutQueryAnswer::ClientRects(rects) if rects.len() == 1
     ));
+    assert!(matches!(
+        answers.answers[3],
+        LayoutQueryAnswer::ElementMetrics(Some(_))
+    ));
+    assert_eq!(answers.answers[4], LayoutQueryAnswer::ElementMetrics(None));
 }
 
 #[test]
@@ -2496,6 +2911,7 @@ fn display_contents_has_no_css_box_but_can_scroll_its_rendered_contents_into_vie
         .insert(2, resolved(LayoutDisplay::Inline, Style::default()));
 
     let output = build(&source, &mut styles);
+    assert_fragment_batches_match_direct_queries(&output, 0..5);
     let contents = output.source_output(1).expect("display: contents source");
     assert!(contents.principal_box.is_none());
     assert!(contents.fragments.is_empty());
@@ -2646,6 +3062,7 @@ fn split_inline_continuations_remain_mapped_to_the_originating_element() {
         .insert(4, resolved(LayoutDisplay::Inline, Style::default()));
 
     let output = build(&source, &mut styles);
+    assert_fragment_batches_match_direct_queries(&output, 0..7);
     let rects = output.client_rects_for_source(1);
     assert_eq!(rects.len(), 2, "{rects:?}");
     let first = rects[0].bounding_rect();
@@ -2684,6 +3101,211 @@ fn block_in_inline_offset_parent_uses_the_structural_inline_ancestor() {
         .element_metrics_for_source(2)
         .expect("promoted block metrics");
     assert_eq!(metrics.offset_parent, Some(1));
+}
+
+#[test]
+fn sticky_tracks_viewport_scroll_and_stops_at_its_containing_block() {
+    let mut source = Source(vec![
+        Node::html_element("root", "html", vec![1]),
+        Node::html_element("body", "body", vec![2, 5]),
+        Node::element("wrapper", vec![3]),
+        Node::element("sticky", vec![4]),
+        Node::element("sticky-child", vec![]),
+        Node::element("tail", vec![]),
+    ]);
+    let red = PaintColor::new(1.0, 0.0, 0.0, 1.0);
+    let mut styles = Styles(HashMap::from([
+        (0, resolved(LayoutDisplay::Block, Style::default())),
+        (
+            1,
+            resolved(
+                LayoutDisplay::Block,
+                Style {
+                    overflow: Point {
+                        x: Overflow::Hidden,
+                        y: Overflow::Scroll,
+                    },
+                    ..Style::default()
+                },
+            ),
+        ),
+        (
+            2,
+            resolved(
+                LayoutDisplay::Flex,
+                Style {
+                    size: Size {
+                        width: length(320.0),
+                        height: length(600.0),
+                    },
+                    ..Style::default()
+                },
+            ),
+        ),
+        (
+            3,
+            ResolvedLayoutStyle::synthetic(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(50.0),
+                        height: length(40.0),
+                    },
+                    margin: Rect {
+                        top: length(84.0),
+                        ..Rect::zero()
+                    },
+                    inset: Rect {
+                        top: length(60.0),
+                        ..Rect::auto()
+                    },
+                    ..Style::default()
+                },
+                red,
+            )
+            .with_position(LayoutPosition::Sticky),
+        ),
+        (4, fixed_size(LayoutDisplay::Block, 10.0, 10.0)),
+        (5, fixed_size(LayoutDisplay::Block, 320.0, 600.0)),
+    ]));
+    for (requested, applied, expected_y) in [
+        (0.0, 0.0, 84.0),
+        (100.0, 100.0, 60.0),
+        (550.0, 550.0, 10.0),
+        (10_000.0, 960.0, -400.0),
+        (0.0, 0.0, 84.0),
+    ] {
+        source.0[0].scroll.y = requested;
+        let output = build_with_request(
+            &source,
+            &mut styles,
+            LayoutPassRequest::with_paint(
+                LayoutViewport::new(320, 240, 1.0),
+                LayoutFlushReason::Test,
+            )
+            .with_environment(LayoutEnvironment {
+                scrollbars_hidden: true,
+            }),
+        );
+        assert_close(output.viewport_scroll.y, applied);
+        for node in [3, 4] {
+            assert_close(
+                output.client_rects_for_source(node)[0].bounding_rect().y,
+                expected_y,
+            );
+        }
+        assert_close(
+            output
+                .element_metrics_for_source(3)
+                .unwrap()
+                .offset_position
+                .y,
+            applied + expected_y,
+        );
+        let fragments = &output.paint_snapshot().unwrap().fragments;
+        if expected_y >= 0.0 {
+            assert_eq!(
+                output
+                    .hit_test(LayoutPoint::new(20.0, expected_y + 5.0), false)
+                    .unwrap()
+                    .source,
+                3
+            );
+            let (rect, _, transform) = fragments[solid_fill_index(fragments, red)]
+                .solid_fill()
+                .unwrap();
+            assert_close(transform.map_rect(rect).bounding_rect().y, expected_y);
+        } else {
+            assert!(!fragments.iter().any(|fragment| {
+                fragment
+                    .solid_fill()
+                    .is_some_and(|(_, color, _)| color == red)
+            }));
+        }
+    }
+}
+
+#[test]
+fn sticky_uses_the_nearest_scrollers_applied_offset() {
+    let mut source = Source(vec![
+        Node::element("root", vec![1, 2, 6]),
+        Node::element("spacer", vec![]),
+        Node::element("scroller", vec![3]),
+        Node::element("content", vec![4, 5]),
+        Node::element("sticky", vec![]),
+        Node::element("filler", vec![]),
+        Node::element("tail", vec![]),
+    ]);
+    source.0[0].scroll.y = 50.0;
+    let mut styles = Styles(HashMap::from([
+        (0, fixed_size(LayoutDisplay::Block, 320.0, 1000.0)),
+        (1, fixed_size(LayoutDisplay::Block, 200.0, 80.0)),
+        (
+            2,
+            resolved(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(200.0),
+                        height: length(120.0),
+                    },
+                    overflow: Point {
+                        x: Overflow::Hidden,
+                        y: Overflow::Hidden,
+                    },
+                    ..Style::default()
+                },
+            ),
+        ),
+        (3, fixed_size(LayoutDisplay::Block, 200.0, 600.0)),
+        (
+            4,
+            resolved(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(50.0),
+                        height: length(30.0),
+                    },
+                    inset: Rect {
+                        top: length(10.0),
+                        ..Rect::auto()
+                    },
+                    ..Style::default()
+                },
+            )
+            .with_position(LayoutPosition::Sticky),
+        ),
+        (5, fixed_size(LayoutDisplay::Block, 200.0, 570.0)),
+        (6, fixed_size(LayoutDisplay::Block, 200.0, 800.0)),
+    ]));
+    for direct_child in [false, true] {
+        if direct_child {
+            source.0[2].children = vec![4, 5];
+            source.0[3].children.clear();
+        }
+        for (requested, applied) in [(0.0, 0.0), (120.0, 120.0), (10_000.0, 480.0)] {
+            source.0[2].scroll.y = requested;
+            let output = build(&source, &mut styles);
+            assert_close(
+                output
+                    .element_metrics_for_source(2)
+                    .unwrap()
+                    .scroll_offset
+                    .y,
+                applied,
+            );
+            assert_close(output.client_rects_for_source(4)[0].bounding_rect().y, 40.0);
+            assert_close(
+                output
+                    .element_metrics_for_source(4)
+                    .unwrap()
+                    .offset_position
+                    .y,
+                90.0 + applied,
+            );
+        }
+    }
 }
 
 #[test]
@@ -2769,6 +3391,605 @@ fn scroll_is_sampled_per_pass_and_updates_geometry_clip_and_hit_testing() {
             .x,
         -10.0,
     );
+}
+
+#[test]
+fn positioned_auto_descendants_paint_after_ordinary_siblings() {
+    let source = Source(vec![
+        Node::element("root", vec![1]),
+        Node::element("positioned-row", vec![2]),
+        Node::element("view", vec![3, 4]),
+        Node::element("overlay", Vec::new()),
+        Node::element("label", Vec::new()),
+    ]);
+    let red = PaintColor::new(1.0, 0.0, 0.0, 1.0);
+    let blue = PaintColor::new(0.0, 0.0, 1.0, 1.0);
+    for row_z_index in [None, Some(0)] {
+        for opacity in [0.0, 0.5, 1.0] {
+            for label_position in [LayoutPosition::Static, LayoutPosition::Relative] {
+                let mut styles = Styles::default();
+                styles
+                    .0
+                    .insert(0, fixed_size(LayoutDisplay::Block, 100.0, 80.0));
+                let mut row = fixed_size(LayoutDisplay::Block, 80.0, 40.0)
+                    .with_position(LayoutPosition::Relative);
+                if let Some(z_index) = row_z_index {
+                    row = row.with_z_index(z_index);
+                }
+                styles.0.insert(1, row);
+                styles
+                    .0
+                    .insert(2, fixed_size(LayoutDisplay::Block, 80.0, 40.0));
+                styles.0.insert(
+                    3,
+                    ResolvedLayoutStyle::synthetic(
+                        LayoutDisplay::Block,
+                        Style {
+                            position: Position::Absolute,
+                            inset: Rect {
+                                left: length(0.0),
+                                top: length(0.0),
+                                right: LengthPercentageAuto::auto(),
+                                bottom: LengthPercentageAuto::auto(),
+                            },
+                            size: Size {
+                                width: length(40.0),
+                                height: length(40.0),
+                            },
+                            ..Style::default()
+                        },
+                        red,
+                    )
+                    .with_position(LayoutPosition::Absolute)
+                    .with_opacity(opacity),
+                );
+                styles.0.insert(
+                    4,
+                    ResolvedLayoutStyle::synthetic(
+                        LayoutDisplay::Block,
+                        Style {
+                            size: Size {
+                                width: length(80.0),
+                                height: length(40.0),
+                            },
+                            ..Style::default()
+                        },
+                        blue,
+                    )
+                    .with_position(label_position),
+                );
+                for paint in [false, true] {
+                    let viewport = LayoutViewport::new(100, 80, 1.0);
+                    let request = if paint {
+                        LayoutPassRequest::with_paint(viewport, LayoutFlushReason::Test)
+                    } else {
+                        LayoutPassRequest::new(viewport, LayoutFlushReason::Test)
+                    };
+                    let output = build_with_request(&source, &mut styles, request);
+                    let overlay_on_top = label_position == LayoutPosition::Static;
+                    assert_eq!(
+                        output
+                            .hit_test(LayoutPoint::new(20.0, 20.0), false)
+                            .unwrap()
+                            .source,
+                        if overlay_on_top { 3 } else { 4 },
+                        "row z-index={row_z_index:?}, opacity={opacity}, label={label_position:?}, paint={paint}"
+                    );
+                    if let Some(snapshot) = output.paint_snapshot() {
+                        let fills = snapshot
+                            .fragments
+                            .iter()
+                            .filter_map(|fragment| fragment.solid_fill().map(|(_, color, _)| color))
+                            .filter(|color| *color == red || *color == blue)
+                            .collect::<Vec<_>>();
+                        let expected = if overlay_on_top {
+                            vec![blue, red]
+                        } else {
+                            vec![red, blue]
+                        };
+                        assert_eq!(fills, expected);
+                        // Paint commands remain inside an opacity-zero layer;
+                        // the compositor suppresses pixels, not hit geometry.
+                        if opacity < 1.0 {
+                            assert!(snapshot.fragments.iter().any(|fragment| matches!(
+                                fragment,
+                                PaintFragment::PushLayer { opacity: layer_opacity, .. }
+                                    if *layer_opacity == opacity
+                            )));
+                        }
+                        assert_balanced_paint_stack(&snapshot.fragments);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_atomic_inlines_share_paint_and_hit_order_with_their_block_descendants() {
+    let red = PaintColor::new(1.0, 0.0, 0.0, 1.0);
+    let blue = PaintColor::new(0.0, 0.0, 1.0, 1.0);
+    let green = PaintColor::new(0.0, 1.0, 0.0, 1.0);
+    let source = Source(vec![
+        Node::element("root", vec![1]),
+        Node::html_element("label", "label", vec![2]),
+        Node::html_element("atomic", "span", vec![3]),
+        Node::html_element("block-child", "span", vec![]),
+    ]);
+    for display in [
+        LayoutDisplay::InlineBlock,
+        LayoutDisplay::InlineFlex,
+        LayoutDisplay::InlineGrid,
+    ] {
+        let mut styles = Styles(HashMap::from([
+            (0, fixed_size(LayoutDisplay::Block, 320.0, 240.0)),
+            (
+                1,
+                ResolvedLayoutStyle::synthetic(LayoutDisplay::Inline, Style::default(), red),
+            ),
+            (
+                2,
+                ResolvedLayoutStyle::synthetic(
+                    display,
+                    Style {
+                        size: Size {
+                            width: length(100.0),
+                            height: length(60.0),
+                        },
+                        ..Style::default()
+                    },
+                    blue,
+                ),
+            ),
+            (
+                3,
+                ResolvedLayoutStyle::synthetic(
+                    LayoutDisplay::Block,
+                    Style {
+                        size: Size {
+                            width: length(40.0),
+                            height: length(20.0),
+                        },
+                        ..Style::default()
+                    },
+                    green,
+                ),
+            ),
+        ]));
+        for paint in [false, true] {
+            let viewport = LayoutViewport::new(320, 240, 1.0);
+            let request = if paint {
+                LayoutPassRequest::with_paint(viewport, LayoutFlushReason::Test)
+            } else {
+                LayoutPassRequest::new(viewport, LayoutFlushReason::Test)
+            };
+            let output = build_with_request(&source, &mut styles, request);
+            let child = output
+                .box_model_for_source(3)
+                .unwrap()
+                .border
+                .bounding_rect();
+            let point = LayoutPoint::new(child.x + child.width / 2.0, child.y + child.height / 2.0);
+            assert_eq!(
+                output.hit_test(point, false).unwrap().source,
+                3,
+                "{display:?}, paint={paint}"
+            );
+            if let Some(snapshot) = output.paint_snapshot() {
+                let red = solid_fill_index(&snapshot.fragments, red);
+                let blue = solid_fill_index(&snapshot.fragments, blue);
+                let green = solid_fill_index(&snapshot.fragments, green);
+                assert!(
+                    red < blue && blue < green,
+                    "label, atomic background, then ordinary child: {display:?}"
+                );
+                assert_balanced_paint_stack(&snapshot.fragments);
+            }
+        }
+    }
+}
+
+#[test]
+fn ordinary_atomic_inline_keeps_ordinary_descendants_local_and_hoists_positioned_ones() {
+    let red = PaintColor::new(1.0, 0.0, 0.0, 1.0);
+    let blue = PaintColor::new(0.0, 0.0, 1.0, 1.0);
+    let green = PaintColor::new(0.0, 1.0, 0.0, 1.0);
+    for display in [
+        LayoutDisplay::InlineBlock,
+        LayoutDisplay::InlineFlex,
+        LayoutDisplay::InlineGrid,
+    ] {
+        for (position, z_index, floated, expected) in [
+            (LayoutPosition::Static, None, false, 4),
+            (LayoutPosition::Static, None, true, 4),
+            (LayoutPosition::Relative, None, false, 3),
+            (LayoutPosition::Absolute, None, false, 3),
+            (LayoutPosition::Relative, Some(-1), false, 4),
+            (LayoutPosition::Relative, Some(0), false, 3),
+            (LayoutPosition::Relative, Some(1), false, 3),
+        ] {
+            // Floats apply to block children, but not to flex/grid items.
+            if floated && display != LayoutDisplay::InlineBlock {
+                continue;
+            }
+            // Give the absolute child an explicit, non-stacking positioning
+            // ancestor with normal-flow content.
+            let absolute = position == LayoutPosition::Absolute;
+            let source = Source(vec![
+                Node::element("root", vec![1]),
+                Node::html_element("label", "label", vec![2, 4]),
+                Node::html_element("first-atomic", "span", vec![if absolute { 5 } else { 3 }]),
+                Node::html_element("descendant", "span", vec![]),
+                Node::html_element("overlapping-atomic", "span", vec![]),
+                Node::html_element(
+                    "positioning-anchor",
+                    "span",
+                    if absolute { vec![3, 6] } else { vec![] },
+                ),
+                Node::html_element("anchor-content", "span", vec![]),
+            ]);
+            let mut child = ResolvedLayoutStyle::synthetic(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(80.0),
+                        height: length(40.0),
+                    },
+                    inset: Rect {
+                        left: length(0.0),
+                        top: length(0.0),
+                        right: LengthPercentageAuto::auto(),
+                        bottom: LengthPercentageAuto::auto(),
+                    },
+                    ..Style::default()
+                },
+                green,
+            )
+            .with_position(position);
+            if let Some(z_index) = z_index {
+                child = child.with_z_index(z_index);
+            }
+            if floated {
+                child = child.with_float(taffy::Float::Left, taffy::Clear::None);
+            }
+            let mut styles = Styles(HashMap::from([
+                (
+                    0,
+                    fixed_size(LayoutDisplay::Block, 320.0, 240.0)
+                        .with_position(LayoutPosition::Relative),
+                ),
+                (1, resolved(LayoutDisplay::Inline, Style::default())),
+                (
+                    2,
+                    ResolvedLayoutStyle::synthetic(
+                        display,
+                        Style {
+                            size: Size {
+                                width: length(80.0),
+                                height: length(40.0),
+                            },
+                            ..Style::default()
+                        },
+                        blue,
+                    ),
+                ),
+                (3, child),
+                (
+                    5,
+                    fixed_size(LayoutDisplay::Block, 80.0, 40.0)
+                        .with_position(LayoutPosition::Relative),
+                ),
+                (6, fixed_size(LayoutDisplay::Block, 80.0, 40.0)),
+                (
+                    4,
+                    ResolvedLayoutStyle::synthetic(
+                        LayoutDisplay::InlineBlock,
+                        Style {
+                            size: Size {
+                                width: length(80.0),
+                                height: length(40.0),
+                            },
+                            margin: Rect {
+                                left: length(-80.0),
+                                ..Style::<Atom>::default().margin
+                            },
+                            ..Style::default()
+                        },
+                        red,
+                    ),
+                ),
+            ]));
+            for paint in [false, true] {
+                let viewport = LayoutViewport::new(320, 240, 1.0);
+                let request = if paint {
+                    LayoutPassRequest::with_paint(viewport, LayoutFlushReason::Test)
+                } else {
+                    LayoutPassRequest::new(viewport, LayoutFlushReason::Test)
+                };
+                let output = build_with_request(&source, &mut styles, request);
+                let first = output
+                    .box_model_for_source(2)
+                    .unwrap()
+                    .border
+                    .bounding_rect();
+                let over = output
+                    .box_model_for_source(4)
+                    .unwrap()
+                    .border
+                    .bounding_rect();
+                assert_rect(first, over);
+                let point = LayoutPoint::new(over.x + over.width / 2.0, over.y + over.height / 2.0);
+                let descendant = output
+                    .box_model_for_source(3)
+                    .unwrap()
+                    .border
+                    .bounding_rect();
+                assert!(
+                    descendant.contains(point),
+                    "{display:?}, {position:?}, z={z_index:?}, float={floated}: child={descendant:?}, atomic={over:?}, point={point:?}"
+                );
+                assert_eq!(
+                    output.hit_test(point, false).unwrap().source,
+                    expected,
+                    "{display:?}, {position:?}, z={z_index:?}, float={floated}, paint={paint}"
+                );
+                if let Some(snapshot) = output.paint_snapshot() {
+                    let top = snapshot
+                        .fragments
+                        .iter()
+                        .filter_map(PaintFragment::solid_fill)
+                        .map(|(_, color, _)| color)
+                        .rfind(|color| *color == red || *color == blue || *color == green);
+                    assert_eq!(
+                        top,
+                        Some(if expected == 3 { green } else { red }),
+                        "{display:?}, {position:?}, z={z_index:?}, float={floated}"
+                    );
+                    assert_balanced_paint_stack(&snapshot.fragments);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn atomic_inline_local_float_paints_above_later_block_background() {
+    let blue = PaintColor::new(0.0, 0.0, 1.0, 1.0);
+    let green = PaintColor::new(0.0, 1.0, 0.0, 1.0);
+    let source = Source(vec![
+        Node::element("root", vec![1]),
+        Node::element("atomic", vec![2, 3]),
+        Node::element("floating", vec![]),
+        Node::element("block", vec![]),
+    ]);
+    let mut styles = Styles(HashMap::from([
+        (0, fixed_size(LayoutDisplay::Block, 320.0, 240.0)),
+        (1, fixed_size(LayoutDisplay::InlineBlock, 120.0, 80.0)),
+        (
+            2,
+            ResolvedLayoutStyle::synthetic(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(80.0),
+                        height: length(40.0),
+                    },
+                    ..Style::default()
+                },
+                green,
+            )
+            .with_float(taffy::Float::Left, taffy::Clear::None),
+        ),
+        (
+            3,
+            ResolvedLayoutStyle::synthetic(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: Dimension::auto(),
+                        height: length(80.0),
+                    },
+                    ..Style::default()
+                },
+                blue,
+            ),
+        ),
+    ]));
+    for paint in [false, true] {
+        let viewport = LayoutViewport::new(320, 240, 1.0);
+        let request = if paint {
+            LayoutPassRequest::with_paint(viewport, LayoutFlushReason::Test)
+        } else {
+            LayoutPassRequest::new(viewport, LayoutFlushReason::Test)
+        };
+        let output = build_with_request(&source, &mut styles, request);
+        let floating = output
+            .box_model_for_source(2)
+            .unwrap()
+            .border
+            .bounding_rect();
+        let point = LayoutPoint::new(floating.x + 10.0, floating.y + 10.0);
+        assert!(
+            output
+                .box_model_for_source(3)
+                .unwrap()
+                .border
+                .bounding_rect()
+                .contains(point)
+        );
+        assert_eq!(
+            output.hit_test(point, false).unwrap().source,
+            2,
+            "paint={paint}"
+        );
+        if let Some(snapshot) = output.paint_snapshot() {
+            assert!(
+                solid_fill_index(&snapshot.fragments, blue)
+                    < solid_fill_index(&snapshot.fragments, green)
+            );
+            assert_balanced_paint_stack(&snapshot.fragments);
+        }
+    }
+}
+
+#[test]
+fn atomic_inline_interleaves_with_overlapping_inline_background_and_text() {
+    let blue = PaintColor::new(0.0, 0.0, 1.0, 1.0);
+    let green = PaintColor::new(0.0, 1.0, 0.0, 1.0);
+    for reverse in [false, true] {
+        let source = Source(vec![
+            Node::element("root", if reverse { vec![2, 1] } else { vec![1, 2] }),
+            Node::html_element("atomic", "span", vec![]),
+            Node::html_element("inline", "span", vec![3]),
+            Node::text("text", "XXXXX"),
+        ]);
+        let mut styles = Styles(HashMap::from([
+            (
+                0,
+                fixed_size(LayoutDisplay::Block, 320.0, 240.0).with_text_metrics(40.0, 40.0),
+            ),
+            (
+                1,
+                ResolvedLayoutStyle::synthetic(
+                    LayoutDisplay::InlineBlock,
+                    Style {
+                        size: Size {
+                            width: length(120.0),
+                            height: length(40.0),
+                        },
+                        margin: Rect {
+                            left: length(if reverse { -120.0 } else { 0.0 }),
+                            right: length(if reverse { 0.0 } else { -120.0 }),
+                            ..Style::<Atom>::default().margin
+                        },
+                        ..Style::default()
+                    },
+                    blue,
+                ),
+            ),
+            (
+                2,
+                ResolvedLayoutStyle::synthetic(LayoutDisplay::Inline, Style::default(), green)
+                    .with_text_metrics(40.0, 40.0),
+            ),
+        ]));
+        for paint in [false, true] {
+            let viewport = LayoutViewport::new(320, 240, 1.0);
+            let request = if paint {
+                LayoutPassRequest::with_paint(viewport, LayoutFlushReason::Test)
+            } else {
+                LayoutPassRequest::new(viewport, LayoutFlushReason::Test)
+            };
+            let output = build_with_request(&source, &mut styles, request);
+            let inline = output
+                .box_model_for_source(2)
+                .unwrap()
+                .border
+                .bounding_rect();
+            let atomic = output
+                .box_model_for_source(1)
+                .unwrap()
+                .border
+                .bounding_rect();
+            let point =
+                LayoutPoint::new(inline.x.max(atomic.x) + 10.0, inline.y.max(atomic.y) + 5.0);
+            assert!(
+                inline.contains(point) && atomic.contains(point),
+                "inline={inline:?}, atomic={atomic:?}"
+            );
+            let hit = output.hit_test(point, false).unwrap().source;
+            assert!(
+                if reverse {
+                    hit == 1
+                } else {
+                    hit == 2 || hit == 3
+                },
+                "reverse={reverse}, paint={paint}, hit={hit}"
+            );
+            if let Some(snapshot) = output.paint_snapshot() {
+                let blue = solid_fill_index(&snapshot.fragments, blue);
+                let green = solid_fill_index(&snapshot.fragments, green);
+                let glyphs = snapshot
+                    .fragments
+                    .iter()
+                    .position(|fragment| matches!(fragment, PaintFragment::GlyphRun(_)))
+                    .unwrap();
+                assert!(
+                    green < glyphs,
+                    "the inline background must precede its text"
+                );
+                assert_eq!(blue < green, !reverse);
+                assert_eq!(blue < glyphs, !reverse);
+                assert_balanced_paint_stack(&snapshot.fragments);
+            }
+        }
+    }
+}
+
+#[test]
+fn atomic_inline_interleaves_shaped_text_runs_from_the_same_parent() {
+    let blue = PaintColor::new(0.0, 0.0, 1.0, 1.0);
+    let source = Source(vec![
+        Node::element("root", vec![1, 2, 3]),
+        Node::text("before", "before"),
+        Node::element("atomic", vec![]),
+        Node::text("after", "after"),
+    ]);
+    for width in [120.0, 480.0] {
+        let mut styles = Styles(HashMap::from([
+            (
+                0,
+                fixed_size(LayoutDisplay::Block, width, 240.0).with_text_metrics(40.0, 40.0),
+            ),
+            (
+                2,
+                ResolvedLayoutStyle::synthetic(
+                    LayoutDisplay::InlineBlock,
+                    Style {
+                        size: Size {
+                            width: length(120.0),
+                            height: length(40.0),
+                        },
+                        margin: Rect {
+                            right: length(-120.0),
+                            ..Style::<Atom>::default().margin
+                        },
+                        ..Style::default()
+                    },
+                    blue,
+                ),
+            ),
+        ]));
+        let output = build_with_request(
+            &source,
+            &mut styles,
+            LayoutPassRequest::with_paint(
+                LayoutViewport::new(480, 240, 1.0),
+                LayoutFlushReason::Test,
+            ),
+        );
+        let snapshot = output.paint_snapshot().unwrap();
+        let blue = solid_fill_index(&snapshot.fragments, blue);
+        let mut glyphs = snapshot
+            .fragments
+            .iter()
+            .enumerate()
+            .filter(|(_, fragment)| matches!(fragment, PaintFragment::GlyphRun(_)))
+            .map(|(index, _)| index);
+        let first = glyphs.next().unwrap();
+        let last = glyphs.next_back().unwrap();
+        assert!(first < blue && blue < last, "width={width}");
+        for source in [1, 3] {
+            for id in &output.source_output(source).unwrap().fragments {
+                let fragment = output.fragment(*id).unwrap();
+                assert!(
+                    fragment.paint_order.is_some(),
+                    "every text hit fragment must be published"
+                );
+            }
+        }
+        assert_balanced_paint_stack(&snapshot.fragments);
+    }
 }
 
 #[test]
@@ -2864,6 +4085,162 @@ fn transforms_and_semantic_paint_order_share_the_hit_test_projection() {
 }
 
 #[test]
+fn atomic_inlines_paint_and_hit_test_above_their_wrapping_inline_box() {
+    let red = PaintColor::new(1.0, 0.0, 0.0, 1.0);
+    let blue = PaintColor::new(0.0, 0.0, 1.0, 1.0);
+    let source = Source(vec![
+        Node::element("root", vec![1]),
+        Node::element("inline", vec![2, 3, 4]),
+        Node::text("before", "before"),
+        Node::element("atomic", Vec::new()),
+        Node::text("after", "after"),
+    ]);
+    let mut styles = Styles::default();
+    styles
+        .0
+        .insert(0, fixed_size(LayoutDisplay::Block, 300.0, 100.0));
+    styles.0.insert(
+        1,
+        ResolvedLayoutStyle::synthetic(LayoutDisplay::Inline, Style::default(), red)
+            .with_text_metrics(20.0, 20.0),
+    );
+    styles.0.insert(
+        3,
+        ResolvedLayoutStyle::synthetic(
+            LayoutDisplay::InlineBlock,
+            Style {
+                size: Size {
+                    width: length(40.0),
+                    height: length(10.0),
+                },
+                ..Style::default()
+            },
+            blue,
+        ),
+    );
+
+    let output = build_with_request(
+        &source,
+        &mut styles,
+        LayoutPassRequest::with_paint(LayoutViewport::new(320, 240, 1.0), LayoutFlushReason::Test),
+    );
+    let fragments = &output.paint_snapshot().unwrap().fragments;
+    let (inline_index, atomic_index) = (
+        solid_fill_index(fragments, red),
+        solid_fill_index(fragments, blue),
+    );
+    let (inline_rect, _, _) = fragments[inline_index].solid_fill().unwrap();
+    let (atomic_rect, _, _) = fragments[atomic_index].solid_fill().unwrap();
+    let center_y = atomic_rect.y + atomic_rect.height / 2.0;
+    assert!(
+        (inline_rect.y..inline_rect.y + inline_rect.height).contains(&center_y),
+        "the atomic box must overlap the inline box: {inline_rect:?} {atomic_rect:?}"
+    );
+    assert!(
+        inline_index < atomic_index,
+        "the inline background must paint behind its atomic child"
+    );
+    assert!(
+        fragments
+            .iter()
+            .rposition(|fragment| matches!(fragment, PaintFragment::GlyphRun(..)))
+            .unwrap()
+            > atomic_index,
+        "the text of the line must paint over the atomic background"
+    );
+
+    let center = LayoutPoint::new(atomic_rect.x + atomic_rect.width / 2.0, center_y);
+    let hit = output.into_tree().hit_test(center, false).unwrap();
+    assert_eq!(hit.source, 3);
+}
+
+#[test]
+fn point_hits_select_paint_order_before_deduplicating_sources() {
+    let source = Source(vec![
+        Node::element("root", vec![2, 1, 3]),
+        Node::element("foremost", Vec::new()),
+        Node::element("back", Vec::new()),
+        Node::element("middle", Vec::new()),
+    ]);
+    let mut styles = Styles::default();
+    styles
+        .0
+        .insert(0, fixed_size(LayoutDisplay::Block, 200.0, 150.0));
+    for (source, z_index) in [(1, 3), (2, 1), (3, 2)] {
+        styles.0.insert(
+            source,
+            resolved(
+                LayoutDisplay::Block,
+                Style {
+                    position: Position::Absolute,
+                    inset: Rect {
+                        left: length(20.0),
+                        top: length(20.0),
+                        right: LengthPercentageAuto::auto(),
+                        bottom: LengthPercentageAuto::auto(),
+                    },
+                    size: Size {
+                        width: length(80.0),
+                        height: length(80.0),
+                    },
+                    ..Style::default()
+                },
+            )
+            .with_position(LayoutPosition::Absolute)
+            .with_z_index(z_index),
+        );
+    }
+    let mut output = build(&source, &mut styles);
+    let point = LayoutPoint::new(30.0, 30.0);
+    let hit = output.hit_test(point, false).unwrap();
+    assert_eq!(hit.source, 1, "the last stored box is not foremost");
+
+    // Generated boxes can retarget to the same DOM source. The lower box is
+    // stored first, but deduplication must retain the foremost fragment.
+    output
+        .tree
+        .boxes
+        .iter_mut()
+        .find(|layout_box| layout_box.hit_source == Some(2))
+        .unwrap()
+        .hit_source = Some(1);
+    let hits = output.hit_test_all(point, false);
+    assert_eq!(
+        hits.iter().map(|hit| hit.source).collect::<Vec<_>>(),
+        [1, 3, 0]
+    );
+    assert_eq!(hits[0].fragment, hit.fragment);
+    assert_eq!(output.hit_test(point, false), Some(hits[0]));
+    let surfaces = output.painted_surface_hits(point, false);
+    assert!(
+        surfaces
+            .windows(2)
+            .all(|pair| pair[0].paint_order() >= pair[1].paint_order())
+    );
+
+    for layout_box in &mut output.tree.boxes {
+        if layout_box.hit_source == Some(1) {
+            layout_box.geometry.pointer_events = false;
+        }
+    }
+    assert_eq!(output.hit_test(point, false).unwrap().source, 3);
+    assert_eq!(output.hit_test(point, true).unwrap().source, 1);
+    assert_eq!(
+        output
+            .hit_test_all(point, false)
+            .iter()
+            .map(|hit| hit.source)
+            .collect::<Vec<_>>(),
+        [3, 0]
+    );
+    assert!(
+        output
+            .hit_test(LayoutPoint::new(-1.0, -1.0), false)
+            .is_none()
+    );
+}
+
+#[test]
 fn transformed_hit_retains_exact_local_content_box_and_inverse_mapping() {
     let source = Source(vec![
         Node::element("root", vec![1]),
@@ -2924,9 +4301,11 @@ fn transformed_hit_retains_exact_local_content_box_and_inverse_mapping() {
         .local_content_box
         .expect("box hit should retain its unprojected content box");
     assert_rect(local_content, LayoutRect::new(7.0, 7.0, 100.0, 60.0));
-    let projected_content = hit
-        .box_model
-        .expect("box hit should retain its projected protocol model")
+    // Full CSSOM geometry is an explicit query, not part of every hit. It
+    // still comes from the same tree without another layout pass.
+    let projected_content = output
+        .box_model_for_source(hit.source)
+        .expect("the hit source should have a projected protocol model")
         .content
         .bounding_rect();
     assert_close(projected_content.width, 50.0);
@@ -3225,4 +4604,186 @@ fn transformed_fixed_containing_block_still_clips_its_fixed_descendant() {
         2,
         "the fixed containing block's overflow clip must still apply"
     );
+}
+
+#[test]
+fn wrapped_trailing_spaces_do_not_expand_scrollable_overflow() {
+    for (text, overflows) in [("aa aa aa aa", false), ("aaaaaa", true)] {
+        let source = Source(vec![
+            Node::element("root", vec![1]),
+            Node::element("scroller", vec![2]),
+            Node::html_element("fixed-font", "span", vec![3]),
+            Node::text("text", text),
+        ]);
+        let mut styles = Styles::default();
+        styles
+            .0
+            .insert(0, fixed_size(LayoutDisplay::Block, 320.0, 240.0));
+        styles
+            .0
+            .insert(1, fixed_size(LayoutDisplay::Block, 25.0, 120.0));
+        let (mut font_style, mut services) = fixed_inline_font();
+        font_style.force_layout_display(LayoutDisplay::Inline);
+        styles.0.insert(2, font_style);
+        let pass = build_layout_pass(
+            &source,
+            &mut styles,
+            &mut services,
+            LayoutPassRequest::new(LayoutViewport::new(320, 240, 1.0), LayoutFlushReason::Test),
+        )
+        .unwrap();
+        let metrics = pass.element_metrics_for_source(1).unwrap();
+        if overflows {
+            assert!(metrics.scroll_size.width > metrics.client_size.width);
+        } else {
+            assert_eq!(metrics.scroll_size.width, metrics.client_size.width);
+            assert!(
+                pass.client_rects_for_source(2)
+                    .iter()
+                    .any(|quad| quad.bounding_rect().width > metrics.client_size.width),
+                "hanging spaces must remain part of inline CSSOM geometry"
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_sticky_projection_roundtrips_clamps_and_preserves_frozen_queries() {
+    let mut source = Source(vec![
+        Node::element("root", vec![1]),
+        Node::element("scroller", vec![2]),
+        Node::element("content", vec![3, 5]),
+        Node::element("parent-sticky", vec![4]),
+        Node::element("child-sticky", vec![]),
+        Node::element("normal-sibling", vec![]),
+    ]);
+    let mut styles = Styles(HashMap::from([
+        (0, fixed_size(LayoutDisplay::Block, 320.0, 240.0)),
+        (
+            1,
+            resolved(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(200.0),
+                        height: length(120.0),
+                    },
+                    overflow: Point {
+                        x: Overflow::Hidden,
+                        y: Overflow::Scroll,
+                    },
+                    ..Style::default()
+                },
+            ),
+        ),
+        (
+            2,
+            resolved(
+                LayoutDisplay::Flex,
+                Style {
+                    size: Size {
+                        width: length(200.0),
+                        height: length(600.0),
+                    },
+                    flex_direction: taffy::FlexDirection::Column,
+                    ..Style::default()
+                },
+            ),
+        ),
+        (
+            3,
+            resolved(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(100.0),
+                        height: length(300.0),
+                    },
+                    margin: Rect {
+                        top: length(84.0),
+                        ..Rect::zero()
+                    },
+                    inset: Rect {
+                        top: length(10.0),
+                        ..Rect::auto()
+                    },
+                    ..Style::default()
+                },
+            )
+            .with_position(LayoutPosition::Sticky),
+        ),
+        (
+            4,
+            resolved(
+                LayoutDisplay::Block,
+                Style {
+                    size: Size {
+                        width: length(30.0),
+                        height: length(30.0),
+                    },
+                    inset: Rect {
+                        top: length(30.0),
+                        ..Rect::auto()
+                    },
+                    ..Style::default()
+                },
+            )
+            .with_position(LayoutPosition::Sticky),
+        ),
+        (5, fixed_size(LayoutDisplay::Block, 200.0, 100.0)),
+    ]));
+    let initial = build(&source, &mut styles);
+    let initial_parent = initial.client_rects_for_source(3);
+    let initial_child = initial.client_rects_for_source(4);
+    let sibling_offset = initial
+        .element_metrics_for_source(5)
+        .unwrap()
+        .offset_position;
+    let mut clamped = None;
+    for (requested, parent_y, child_y) in [
+        (0.0, 84.0, 84.0),
+        (100.0, 10.0, 30.0),
+        (10_000.0, -180.0, 30.0),
+        (480.0, -180.0, 30.0),
+        (100.0, 10.0, 30.0),
+        (0.0, 84.0, 84.0),
+    ] {
+        source.0[1].scroll.y = requested;
+        let output = build(&source, &mut styles);
+        assert_close(
+            output.client_rects_for_source(3)[0].bounding_rect().y,
+            parent_y,
+        );
+        assert_close(
+            output.client_rects_for_source(4)[0].bounding_rect().y,
+            child_y,
+        );
+        assert_eq!(
+            output
+                .element_metrics_for_source(5)
+                .unwrap()
+                .offset_position,
+            sibling_offset
+        );
+        assert!(
+            output.paint_snapshot().is_none(),
+            "query-only projection must stay paint-free"
+        );
+        let hit = output
+            .hit_test(LayoutPoint::new(5.0, child_y + 5.0), false)
+            .unwrap();
+        assert_eq!(hit.source, 4);
+        if requested == 10_000.0 {
+            clamped = Some(output.client_rects_for_source(4));
+        } else if requested == 480.0 {
+            assert_eq!(Some(output.client_rects_for_source(4)), clamped);
+        }
+        // Publishing a new pass cannot mutate an older retained tree.
+        assert_eq!(initial.client_rects_for_source(3), initial_parent);
+        assert_eq!(initial.client_rects_for_source(4), initial_child);
+        if requested == 0.0 {
+            assert_eq!(output.client_rects_for_source(3), initial_parent);
+            assert_eq!(output.client_rects_for_source(4), initial_child);
+        }
+    }
 }

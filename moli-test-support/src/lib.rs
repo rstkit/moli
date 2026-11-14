@@ -23,10 +23,20 @@ use tokio::{
     time::{Duration, sleep},
 };
 
+mod cdp;
+pub use cdp::discover_browser_websocket_url;
+
 #[derive(Clone, Default)]
 struct FixtureRuntimeState {
     dynamic_stylesheet_dcl: Arc<FixtureEvent>,
     dynamic_stylesheet_script_executed: Arc<FixtureEvent>,
+    runtime_inline_module_executed: Arc<FixtureEvent>,
+    runtime_stylesheet_snapshot_applied: Arc<FixtureEvent>,
+    alternate_stylesheet_probe_executed: Arc<FixtureEvent>,
+    runtime_owned_async_script_executed: Arc<FixtureEvent>,
+    parse_time_async_task_first_executed: Arc<FixtureEvent>,
+    parse_time_async_task_visibility_first_executed: Arc<FixtureEvent>,
+    dynamic_preparation_context_replaced: Arc<FixtureEvent>,
 }
 
 #[derive(Default)]
@@ -139,7 +149,7 @@ const BROWSER_SURFACE_COMPAT_HTML: &str = concat!(
     "document.body.setAttribute('data-location-after-replace', location.pathname + location.search);",
     "</script></body></html>"
 );
-const DATE_LOCALE_DETAILS_HTML: &str = "<!doctype html><html><body data-locale-string=\"\" data-locale-date=\"\" data-locale-time=\"\" data-invalid=\"\"><script>const d=new Date(Date.UTC(2024,2,24,16,5,6));document.body.setAttribute('data-locale-string', d.toLocaleString('en-US'));document.body.setAttribute('data-locale-date', d.toLocaleDateString('en-US'));document.body.setAttribute('data-locale-time', d.toLocaleTimeString('en-US'));document.body.setAttribute('data-invalid', new Date(NaN).toLocaleString('en-US'));</script></body></html>";
+const DATE_LOCALE_DETAILS_HTML: &str = "<!doctype html><html><body data-locale-string=\"\" data-locale-date=\"\" data-locale-time=\"\" data-invalid=\"\"><script>const d=new Date(Date.UTC(2024,2,24,16,5,6));const options={timeZone:'UTC'};document.body.setAttribute('data-locale-string', d.toLocaleString('en-US',options));document.body.setAttribute('data-locale-date', d.toLocaleDateString('en-US',options));document.body.setAttribute('data-locale-time', d.toLocaleTimeString('en-US',options));document.body.setAttribute('data-invalid', new Date(NaN).toLocaleString('en-US',options));</script></body></html>";
 const BROWSER_SURFACE_DETAILS_HTML: &str = "<!doctype html><html><body data-mime-tag=\"\" data-plugin-tag=\"\" data-storage-tag=\"\" data-mime-item-hit=\"\" data-mime-named-item-hit=\"\" data-plugin-item-hit=\"\" data-plugin-named-item-hit=\"\" data-mime-item-null=\"\" data-mime-named-item-null=\"\" data-plugin-item-null=\"\" data-plugin-named-item-null=\"\" data-plugin-refresh-undefined=\"\" data-storage-prototype=\"\" data-storage-roundtrip=\"\" data-storage-length-after-set=\"\" data-storage-key0=\"\" data-storage-length-after-remove=\"\" data-history-scroll-restoration=\"\"><script>document.body.setAttribute('data-mime-tag', Object.prototype.toString.call(navigator.mimeTypes));document.body.setAttribute('data-plugin-tag', Object.prototype.toString.call(navigator.plugins));document.body.setAttribute('data-storage-tag', Object.prototype.toString.call(localStorage));document.body.setAttribute('data-mime-item-hit', String(navigator.mimeTypes.item(0)?.type ?? 'null'));document.body.setAttribute('data-mime-named-item-hit', String(navigator.mimeTypes.namedItem('application/pdf')?.type ?? 'null'));document.body.setAttribute('data-plugin-item-hit', String(navigator.plugins.item(0)?.name ?? 'null'));document.body.setAttribute('data-plugin-named-item-hit', String(navigator.plugins.namedItem('PDF Viewer')?.name ?? 'null'));document.body.setAttribute('data-mime-item-null', String(navigator.mimeTypes.item(999)===null));document.body.setAttribute('data-mime-named-item-null', String(navigator.mimeTypes.namedItem('application/x-missing')===null));document.body.setAttribute('data-plugin-item-null', String(navigator.plugins.item(999)===null));document.body.setAttribute('data-plugin-named-item-null', String(navigator.plugins.namedItem('Missing Plugin')===null));document.body.setAttribute('data-plugin-refresh-undefined', String(navigator.plugins.refresh()===undefined));document.body.setAttribute('data-storage-prototype', String(Storage.prototype.isPrototypeOf(localStorage) && Storage.prototype.isPrototypeOf(sessionStorage)));localStorage.clear();localStorage.setItem('alpha','1');document.body.setAttribute('data-storage-roundtrip', String(localStorage.getItem('alpha')));document.body.setAttribute('data-storage-length-after-set', String(localStorage.length));document.body.setAttribute('data-storage-key0', String(localStorage.key(0)));localStorage.removeItem('alpha');document.body.setAttribute('data-storage-length-after-remove', String(localStorage.length));document.body.setAttribute('data-history-scroll-restoration', String(history.scrollRestoration));</script></body></html>";
 const HISTORY_RELATIVE_URL_UPDATE_HTML: &str =
     include_str!("../../moli-core/tests/fixtures/runtime/history_relative_url_update.html");
@@ -172,8 +182,8 @@ const HISTORY_BACK_SAME_TURN_TRAVERSES_ASYNCHRONOUSLY_HTML: &str = include_str!(
 const HISTORY_BACK_IGNORES_PAGE_TAMPERED_QUEUE_MICROTASK_HTML: &str = include_str!(
     "../../moli-core/tests/fixtures/runtime/history_back_ignores_page_tampered_queue_microtask.html"
 );
-const HISTORY_BACK_FORWARD_SAME_TURN_COALESCES_HTML: &str = include_str!(
-    "../../moli-core/tests/fixtures/runtime/history_back_forward_same_turn_coalesces.html"
+const HISTORY_BACK_FORWARD_SAME_TURN_TRAVERSES_IN_ORDER_HTML: &str = include_str!(
+    "../../moli-core/tests/fixtures/runtime/history_back_forward_same_turn_traverses_in_order.html"
 );
 const HISTORY_STATE_MUTATION_DOES_NOT_MUTATE_STORED_SNAPSHOT_HTML: &str = include_str!(
     "../../moli-core/tests/fixtures/runtime/history_state_mutation_does_not_mutate_stored_snapshot.html"
@@ -428,6 +438,9 @@ const CHROME_OVERFLOW_PROPERTY_HTML: &str =
     include_str!("../../moli-core/tests/fixtures/runtime/chrome_overflow_property.html");
 const CHROME_CSSSTYLESHEET_RULE_MUTATION_HTML: &str =
     include_str!("../../moli-core/tests/fixtures/runtime/chrome_cssstylesheet_rule_mutation.html");
+const CHROME_CSSSTYLESHEET_RULE_MUTATION_V2_HTML: &str = include_str!(
+    "../../moli-core/tests/fixtures/runtime/chrome_cssstylesheet_rule_mutation_v2.html"
+);
 const CHROME_DELETE_RULE_NO_CRASH_HTML: &str =
     include_str!("../../moli-core/tests/fixtures/runtime/chrome_delete_rule_no_crash.html");
 const CHROME_IMPORTANT_JS_OVERRIDE_HTML: &str =
@@ -645,6 +658,8 @@ const PARSE_TIME_ASYNC_CLASSIC_HTML: &str =
     include_str!("../../moli-core/tests/fixtures/runtime/parse_time_async_classic.html");
 const PARSE_TIME_ASYNC_CLASSIC_CHUNKED_HTML: &str =
     include_str!("../../moli-core/tests/fixtures/runtime/parse_time_async_classic_chunked.html");
+const PARSE_TIME_ASYNC_CLASSIC_CHUNKED_JS: &str =
+    include_str!("../../moli-core/tests/fixtures/runtime/parse_time_async_classic_chunked.js");
 const PARSE_TIME_ASYNC_CLASSIC_SLOW_CHUNKED_TAIL_HTML: &str = include_str!(
     "../../moli-core/tests/fixtures/runtime/parse_time_async_classic_slow_chunked_tail.html"
 );
@@ -1326,9 +1341,19 @@ const RUNTIME_OWNED_DEFAULT_ASYNC_MODULE_SIDE_EFFECT_MJS: &str = include_str!(
     "../../moli-core/tests/fixtures/runtime/runtime_owned_default_async_module_side_effect.mjs"
 );
 const PARSE_TIME_ASYNC_SLOW_JS: &str = "window.parseTimeAsyncSlowSawTail = !!document.getElementById('late'); window.parseTimeAsyncSlowSawDcl = window.parseTimeDclFired === true;";
-const PARSE_TIME_ASYNC_TASK_FIRST_JS: &str = "window.asyncTaskOrder.push('first-script'); Promise.resolve().then(() => window.asyncTaskOrder.push('first-microtask'));";
+const PARSE_TIME_ASYNC_TASK_FIRST_JS: &str = concat!(
+    "window.asyncTaskOrder.push('first-script');",
+    "Promise.resolve().then(() => window.asyncTaskOrder.push('first-microtask'));",
+    "fetch('/assets/parse_time_async_task_first_executed');",
+);
 const PARSE_TIME_ASYNC_TASK_SECOND_JS: &str = "window.asyncTaskOrder.push('second-script'); window.asyncTaskOrderResult = window.asyncTaskOrder.join(',');";
-const PARSE_TIME_ASYNC_TASK_VISIBILITY_FIRST_JS: &str = "window.asyncTaskVisibilityOrder.push('first-script'); window.asyncTaskVisibilityFirstSawTail = !!document.getElementById('late'); window.asyncTaskVisibilityFirstSawDcl = window.parseTimeVisibilityDclFired === true; Promise.resolve().then(() => window.asyncTaskVisibilityOrder.push('first-microtask'));";
+const PARSE_TIME_ASYNC_TASK_VISIBILITY_FIRST_JS: &str = concat!(
+    "window.asyncTaskVisibilityOrder.push('first-script');",
+    "window.asyncTaskVisibilityFirstSawTail = !!document.getElementById('late');",
+    "window.asyncTaskVisibilityFirstSawDcl = window.parseTimeVisibilityDclFired === true;",
+    "Promise.resolve().then(() => window.asyncTaskVisibilityOrder.push('first-microtask'));",
+    "fetch('/assets/parse_time_async_task_visibility_first_executed');",
+);
 const PARSE_TIME_ASYNC_TASK_VISIBILITY_SECOND_JS: &str = "window.asyncTaskVisibilityOrder.push('second-script'); window.asyncTaskVisibilityOrderResult = window.asyncTaskVisibilityOrder.join(',');";
 const PARSE_TIME_ASYNC_POST_PARSE_FIRST_JS: &str = "window.postParseAsyncTaskOrder.push('first-script'); Promise.resolve().then(() => window.postParseAsyncTaskOrder.push('first-microtask'));";
 const PARSE_TIME_ASYNC_POST_PARSE_SECOND_JS: &str = "window.postParseAsyncTaskOrder.push('second-script'); window.postParseAsyncTaskOrder.push(window.postParseDclSeen ? 'second-after-dcl' : 'second-before-dcl');";
@@ -1336,7 +1361,12 @@ const PARSE_TIME_ASYNC_POST_PARSE_SLOW_FIRST_JS: &str = "window.postParseSlowTas
 const PARSE_TIME_ASYNC_POST_PARSE_SLOW_SECOND_JS: &str = "window.postParseSlowTaskOrder.push('second-script'); window.postParseSlowTaskOrder.push(window.postParseSlowDclSeen ? 'second-after-dcl' : 'second-before-dcl'); window.postParseSlowFinalOrder = window.postParseSlowTaskOrder.join(',');";
 const PARSE_TIME_ASYNC_SLOW_CHUNKED_FIRST_JS: &str = "window.slowChunkOrder.push('slow-async'); window.slowChunkFinalOrder = window.slowChunkOrder.join(',');";
 const PARSE_TIME_ASYNC_SLOW_CHUNKED_DEFER_JS: &str = "window.slowChunkOrder.push('defer');";
-const PARSE_TIME_DEFER_LEFT_JS: &str = "window.deferLikeOrder.push('defer-left'); Promise.resolve().then(() => window.deferLikeOrder.push('defer-left-microtask'));";
+const PARSE_TIME_DEFER_LEFT_JS: &str = concat!(
+    "if (window.sharedBlockingDeferOrder) {",
+    "window.sharedBlockingDeferSawStylesheet = getComputedStyle(document.body).color === 'rgb(1, 2, 3)';",
+    "}",
+    "window.deferLikeOrder.push('defer-left'); Promise.resolve().then(() => window.deferLikeOrder.push('defer-left-microtask'));",
+);
 const PARSE_TIME_DEFER_RIGHT_JS: &str = "window.deferLikeOrder.push('defer-right'); Promise.resolve().then(() => window.deferLikeOrder.push('defer-right-microtask'));";
 const PARSE_TIME_FINAL_CLASSIC_TERMINAL_JS: &str = "window.finalClassicTerminalOrder.push('script-body'); Promise.resolve().then(() => window.finalClassicTerminalOrder.push('script-body-microtask'));";
 const PARSE_TIME_FINAL_MODULE_TERMINAL_JS: &str = "window.finalModuleTerminalOrder.push('module-body'); Promise.resolve().then(() => window.finalModuleTerminalOrder.push('module-body-microtask'));";
@@ -1359,11 +1389,11 @@ const DOCUMENT_WRITE_NESTED_EXTERNAL_OUTER_AFTER_JS: &str =
 const DOCUMENT_WRITE_EXTERNAL_SPLIT_SESSION_PARENT_JS: &str = r#"window.documentWriteExternalSplitSessionOrder.push("parent");document.write('<script>window.documentWriteExternalSplitSessionOrder.push("written-inline");window.documentWriteExternalSplitSessionSawTail=!!document.getElementById("tail")');document.write(';window.documentWriteExternalSplitSessionOrder.push(window.documentWriteExternalSplitSessionSawTail?"tail-visible":"tail-hidden")<\/script>');window.documentWriteExternalSplitSessionOrder.push("parent-after-write");"#;
 const DOCUMENT_WRITE_INSERTED_CHUNKED_EXTERNAL_JS: &str =
     r#"window.documentWriteInsertedChunkedOrder.push("inserted-external");"#;
-const BLOCKING_STYLESHEET_PARSER_BLOCKING_JS: &str = "window.blockingStylesheetParserElapsed = Date.now() - window.blockingStylesheetStart; window.blockingStylesheetParserBlockedEnough = window.blockingStylesheetParserElapsed >= 50; window.blockingStylesheetParserSawLate = !!document.getElementById('late'); window.blockingStylesheetParserSawDcl = window.blockingStylesheetDclSeen === true; window.blockingStylesheetOrder.push('parser');";
-const BLOCKING_STYLESHEET_PARSER_BLOCKING_DOCUMENT_WRITE_JS: &str = "window.blockingStylesheetParserWriteRan = true; window.blockingStylesheetParserWriteElapsed = Date.now() - window.blockingStylesheetStart; window.blockingStylesheetParserWriteBlockedEnough = window.blockingStylesheetParserWriteElapsed >= 50; window.blockingStylesheetParserWriteSawLate = !!document.getElementById('late'); document.write('<span id=\"written-before-late\">written</span>'); window.blockingStylesheetParserWriteSawWrittenDuringScript = !!document.getElementById('written-before-late'); window.blockingStylesheetOrder.push('parser-write');";
-const BLOCKING_STYLESHEET_DEFER_JS: &str = "window.blockingStylesheetDeferElapsed = Date.now() - window.blockingStylesheetStart; window.blockingStylesheetDeferBlockedEnough = window.blockingStylesheetDeferElapsed >= 50; window.blockingStylesheetDeferSawLate = !!document.getElementById('late'); window.blockingStylesheetDeferSawDcl = window.blockingStylesheetDeferOrder.includes('dcl'); window.blockingStylesheetDeferOrder.push('defer');";
+const BLOCKING_STYLESHEET_PARSER_BLOCKING_JS: &str = "window.blockingStylesheetParserSawStylesheet = getComputedStyle(document.documentElement).color === 'rgb(1, 2, 3)'; window.blockingStylesheetParserSawLate = !!document.getElementById('late'); window.blockingStylesheetParserSawDcl = window.blockingStylesheetDclSeen === true; window.blockingStylesheetOrder.push('parser');";
+const BLOCKING_STYLESHEET_PARSER_BLOCKING_DOCUMENT_WRITE_JS: &str = "window.blockingStylesheetParserWriteRan = true; window.blockingStylesheetParserWriteSawStylesheet = getComputedStyle(document.documentElement).color === 'rgb(1, 2, 3)'; window.blockingStylesheetParserWriteSawLate = !!document.getElementById('late'); document.write('<span id=\"written-before-late\">written</span>'); window.blockingStylesheetParserWriteSawWrittenDuringScript = !!document.getElementById('written-before-late'); window.blockingStylesheetOrder.push('parser-write');";
+const BLOCKING_STYLESHEET_DEFER_JS: &str = "window.blockingStylesheetDeferSawStylesheet = getComputedStyle(document.documentElement).color === 'rgb(1, 2, 3)'; window.blockingStylesheetDeferSawLate = !!document.getElementById('late'); window.blockingStylesheetDeferSawDcl = window.blockingStylesheetDeferOrder.includes('dcl'); window.blockingStylesheetDeferOrder.push('defer');";
 const PHASE_TWO_UPGRADE_RUNTIME_STYLE_DEFER_JS: &str = "window.phaseTwoUpgradeDeferSawLoaded = window.phaseTwoUpgradeStyleLoaded === true; window.phaseTwoUpgradeDeferSawLate = !!document.getElementById('late'); window.phaseTwoUpgradeStyleOrder.push('defer'); Promise.resolve().then(() => { window.phaseTwoUpgradeStyleOrder.push('defer-microtask'); window.phaseTwoUpgradeStyleFinalOrder = window.phaseTwoUpgradeStyleOrder.join(','); }); window.phaseTwoUpgradeStyleFinalOrder = window.phaseTwoUpgradeStyleOrder.join(',');";
-const BLOCKING_STYLESHEET_ALTERNATE_PROBE_JS: &str = "window.blockingStylesheetAlternateElapsed = Date.now() - window.blockingStylesheetAlternateStart; window.blockingStylesheetAlternateBlocked = window.blockingStylesheetAlternateElapsed >= 50; window.blockingStylesheetAlternateSawLate = !!document.getElementById('late'); window.blockingStylesheetAlternateSawDcl = window.blockingStylesheetAlternateDclSeen === true;";
+const BLOCKING_STYLESHEET_ALTERNATE_PROBE_JS: &str = "window.blockingStylesheetAlternateBlocked = window.blockingStylesheetAlternateLoaded === true; window.blockingStylesheetAlternateSawLate = !!document.getElementById('late'); window.blockingStylesheetAlternateSawDcl = window.blockingStylesheetAlternateDclSeen === true; fetch('/assets/blocking_stylesheet_alternate_probe_executed', { cache: 'no-store' });";
 const DYNAMIC_BLOCKING_STYLESHEET_RUNTIME_JS: &str = "window.dynamicBlockingStylesheetSawStyleLoaded = window.dynamicBlockingStylesheetStyleLoaded === true; window.dynamicBlockingStylesheetSawLate = !!document.getElementById('late'); window.dynamicBlockingStylesheetSawDcl = window.dynamicBlockingStylesheetOrder.includes('dcl'); window.dynamicBlockingStylesheetSawLoad = window.dynamicBlockingStylesheetOrder.includes('load'); window.dynamicBlockingStylesheetOrder.push('dynamic'); window.dynamicBlockingStylesheetFinalOrder = window.dynamicBlockingStylesheetOrder.join(','); fetch('/assets/dynamic_blocking_stylesheet_script_executed', { cache: 'no-store' });";
 const RUNTIME_CONNECTED_MODULEPRELOAD_SLOW_MJS: &str = "export const slow = 'modulepreload-ok';";
 const MODULEPRELOAD_SHARED_ROOT_MJS: &str = r#"import { seenLeafOrder, value } from "./modulepreload_shared_mid.mjs";
@@ -1418,7 +1448,7 @@ const DYNAMIC_TAXONOMY_ASYNC_FAST_JS: &str = "window.dynamicScriptTaxonomyOrder.
 const DYNAMIC_TAXONOMY_IN_ORDER_SLOW_JS: &str = "if (window.dynamicScriptTaxonomyOrder) { window.dynamicScriptTaxonomyOrder.push('in-order-slow'); window.dynamicScriptTaxonomyOrderResult = window.dynamicScriptTaxonomyOrder.join(','); } if (window.dynamicInOrderScriptOrder) { window.dynamicInOrderScriptOrder.push('in-order-slow'); window.dynamicInOrderScriptOrderResult = window.dynamicInOrderScriptOrder.join(','); }";
 const DYNAMIC_TAXONOMY_IN_ORDER_FAST_JS: &str = "window.dynamicInOrderScriptOrder.push('in-order-fast'); window.dynamicInOrderScriptOrderResult = window.dynamicInOrderScriptOrder.join(',');";
 const DYNAMIC_PREPARATION_CONTEXT_STALE_JS: &str = "window.staleDynamicRan = true; window.dynamicPreparationContextOrder = window.dynamicPreparationContextOrder || []; window.dynamicPreparationContextOrder.push('stale'); window.dynamicPreparationContextResult = window.dynamicPreparationContextOrder.join(',');";
-const DYNAMIC_PREPARATION_CONTEXT_OPEN_JS: &str = r#"document.open(); document.write(`<!doctype html><html><body><script>window.documentOpenAsyncRan = true; window.dynamicPreparationContextOrder = ['replacement']; window.dynamicPreparationContextResult = 'pending'; setTimeout(() => { window.dynamicPreparationContextResult = window.staleDynamicRan ? 'stale-ran' : 'replacement-only'; }, 0);</script></body></html>`); document.close();"#;
+const DYNAMIC_PREPARATION_CONTEXT_OPEN_JS: &str = r#"document.open(); document.write(`<!doctype html><html><body><script>window.documentOpenAsyncRan = true; fetch('/assets/dynamic_preparation_context_replaced'); window.dynamicPreparationContextOrder = ['replacement']; window.dynamicPreparationContextResult = 'pending'; setTimeout(() => { window.dynamicPreparationContextResult = window.staleDynamicRan ? 'stale-ran' : 'replacement-only'; }, 0);</script></body></html>`); document.close();"#;
 const DOCUMENT_WRITE_IMPLICIT_REPLACE_ASYNC_JS: &str = r#"window.documentWriteImplicitOrder.push('dynamic'); document.write(`<!doctype html><html><body><main id="new">new</main><script>window.documentWriteImplicitOrder.push('replacement'); window.documentWriteImplicitReplaceRan = true; window.documentWriteImplicitResult = 'pending'; window.documentWriteImplicitOrderResult = window.documentWriteImplicitOrder.join(','); setTimeout(() => { window.documentWriteImplicitResult = window.documentWriteImplicitStaleDeferRan ? 'stale-ran' : 'replacement-only'; window.documentWriteImplicitOrderResult = window.documentWriteImplicitOrder.join(','); }, 0);</script></body></html>`);"#;
 const DOCUMENT_WRITE_IMPLICIT_REPLACE_ASYNC_MODULE_JS: &str = r#"window.documentWriteImplicitModuleOrder.push('dynamic'); document.write(`<!doctype html><html><body><main id="new">new</main><script>window.documentWriteImplicitModuleOrder.push('replacement'); window.documentWriteImplicitModuleReplaceRan = true; window.documentWriteImplicitModuleResult = 'pending'; window.documentWriteImplicitModuleOrderResult = window.documentWriteImplicitModuleOrder.join(','); setTimeout(() => { window.documentWriteImplicitModuleResult = window.documentWriteImplicitStaleModuleRan ? 'stale-ran' : 'replacement-only'; window.documentWriteImplicitModuleOrderResult = window.documentWriteImplicitModuleOrder.join(','); }, 0);</script></body></html>`);"#;
 const DOCUMENT_WRITE_IMPLICIT_REPLACE_STALE_DEFER_JS: &str = "window.documentWriteImplicitOrder.push('stale-defer'); window.documentWriteImplicitStaleDeferRan = true; window.documentWriteImplicitOrderResult = window.documentWriteImplicitOrder.join(',');";
@@ -1440,7 +1470,8 @@ const DOCUMENT_OPEN_AFTER_LOAD_EXTERNAL_2_JS: &str = "window.documentOpenAfterLo
 const DOCUMENT_WRITE_IMPORTMAP_WRITTEN_MODULE_MJS: &str = include_str!(
     "../../moli-core/tests/fixtures/runtime/document_write_importmap_written_module.mjs"
 );
-const BLOCKING_STYLESHEET_SLOW_CSS: &str = "body { color: rgb(1, 2, 3); }";
+// Probe readiness before <body> exists as well as in defer/module scripts.
+const BLOCKING_STYLESHEET_SLOW_CSS: &str = "html, body { color: rgb(1, 2, 3); }";
 const URL_BINDING_HTML: &str =
     include_str!("../../moli-core/tests/fixtures/runtime/url_binding.html");
 const CHROME_STYLESHEETLIST_1_CSS: &str = "#e1 { color: red; }";

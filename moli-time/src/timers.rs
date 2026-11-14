@@ -17,23 +17,10 @@ impl TimerId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TimerReadyAllowance {
-    pub max_delay_ms: u32,
-    pub allowance: Duration,
-}
-
-impl TimerReadyAllowance {
-    pub const NONE: Self = Self {
-        max_delay_ms: 0,
-        allowance: Duration::ZERO,
-    };
-}
-
 #[derive(Debug)]
 pub struct ReadyTimer<T> {
     pub id: TimerId,
-    pub delay_ms: u32,
+    pub delay_ms: u64,
     pub payload: T,
 }
 
@@ -42,8 +29,14 @@ struct ScheduledTimer<T> {
     id: TimerId,
     sequence: u64,
     run_at: Instant,
-    delay_ms: u32,
+    delay_ms: u64,
     payload: T,
+}
+
+impl<T> ScheduledTimer<T> {
+    fn is_ready_at(&self, now: Instant) -> bool {
+        self.run_at <= now
+    }
 }
 
 impl<T> Ord for ScheduledTimer<T> {
@@ -69,6 +62,7 @@ impl<T> PartialEq for ScheduledTimer<T> {
     }
 }
 
+/// Timers become runnable only at or after their stored monotonic deadline.
 #[derive(Debug)]
 pub struct TimerScheduler<T> {
     pending: BinaryHeap<ScheduledTimer<T>>,
@@ -93,7 +87,9 @@ impl<T> Default for TimerScheduler<T> {
 }
 
 impl<T> TimerScheduler<T> {
-    pub fn schedule_after(&mut self, payload: T, delay_ms: u32, now: Instant) -> TimerId {
+    // Internal timeouts such as AbortSignal.timeout accept 64-bit delays.
+    // HTML timers apply their own argument conversion before scheduling.
+    pub fn schedule_after(&mut self, payload: T, delay_ms: u64, now: Instant) -> TimerId {
         let id = self.allocate_id();
         self.schedule_existing_after(id, payload, delay_ms, now);
         id
@@ -135,18 +131,14 @@ impl<T> TimerScheduler<T> {
             .flatten()
     }
 
-    pub fn take_next_ready(
-        &mut self,
-        now: Instant,
-        allowance: TimerReadyAllowance,
-    ) -> Option<ReadyTimer<T>> {
+    pub fn take_next_ready(&mut self, now: Instant) -> Option<ReadyTimer<T>> {
         loop {
             let timer = self.pending.peek()?;
             if !self.active.contains(&timer.id) {
                 let _ = self.pending.pop();
                 continue;
             }
-            if !timer_ready(timer.run_at, timer.delay_ms, now, allowance) {
+            if !timer.is_ready_at(now) {
                 return None;
             }
 
@@ -166,13 +158,12 @@ impl<T> TimerScheduler<T> {
     pub fn take_next_ready_matching<F>(
         &mut self,
         now: Instant,
-        allowance: TimerReadyAllowance,
         predicate: F,
     ) -> Option<ReadyTimer<T>>
     where
         F: FnMut(&T) -> bool,
     {
-        let selected = self.next_ready_matching_timer(now, allowance, predicate)?;
+        let selected = self.next_ready_matching_timer(now, predicate)?;
         let selected_id = selected.id;
         let selected_sequence = selected.sequence;
 
@@ -201,19 +192,12 @@ impl<T> TimerScheduler<T> {
         })
     }
 
-    pub fn has_ready_matching<F>(
-        &self,
-        now: Instant,
-        allowance: TimerReadyAllowance,
-        mut predicate: F,
-    ) -> bool
+    pub fn has_ready_matching<F>(&self, now: Instant, mut predicate: F) -> bool
     where
         F: FnMut(&T) -> bool,
     {
         self.pending.iter().any(|timer| {
-            self.active.contains(&timer.id)
-                && timer_ready(timer.run_at, timer.delay_ms, now, allowance)
-                && predicate(&timer.payload)
+            self.active.contains(&timer.id) && timer.is_ready_at(now) && predicate(&timer.payload)
         })
     }
 
@@ -226,7 +210,7 @@ impl<T> TimerScheduler<T> {
         &mut self,
         id: TimerId,
         payload: T,
-        delay_ms: u32,
+        delay_ms: u64,
         now: Instant,
     ) -> bool {
         self.running.remove(&id);
@@ -237,23 +221,17 @@ impl<T> TimerScheduler<T> {
         true
     }
 
-    pub fn has_ready_timer(&self, now: Instant, allowance: TimerReadyAllowance) -> bool {
-        self.pending.iter().any(|timer| {
-            self.active.contains(&timer.id)
-                && timer_ready(timer.run_at, timer.delay_ms, now, allowance)
-        })
+    pub fn has_ready_timer(&self, now: Instant) -> bool {
+        self.pending
+            .iter()
+            .any(|timer| self.active.contains(&timer.id) && timer.is_ready_at(now))
     }
 
-    pub fn next_ready_deadline_matching<F>(
-        &self,
-        now: Instant,
-        allowance: TimerReadyAllowance,
-        predicate: F,
-    ) -> Option<Instant>
+    pub fn next_ready_deadline_matching<F>(&self, now: Instant, predicate: F) -> Option<Instant>
     where
         F: FnMut(&T) -> bool,
     {
-        self.next_ready_matching_timer(now, allowance, predicate)
+        self.next_ready_matching_timer(now, predicate)
             .map(|timer| timer.run_at)
     }
 
@@ -281,14 +259,14 @@ impl<T> TimerScheduler<T> {
         self.active.len()
     }
 
-    fn schedule_existing_after(&mut self, id: TimerId, payload: T, delay_ms: u32, now: Instant) {
+    fn schedule_existing_after(&mut self, id: TimerId, payload: T, delay_ms: u64, now: Instant) {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         self.active.insert(id);
         self.pending.push(ScheduledTimer {
             id,
             sequence,
-            run_at: now + Duration::from_millis(u64::from(delay_ms)),
+            run_at: now + Duration::from_millis(delay_ms),
             delay_ms,
             payload,
         });
@@ -307,22 +285,17 @@ impl<T> TimerScheduler<T> {
     fn next_ready_matching_timer<F>(
         &self,
         now: Instant,
-        allowance: TimerReadyAllowance,
         mut predicate: F,
     ) -> Option<&ScheduledTimer<T>>
     where
         F: FnMut(&T) -> bool,
     {
-        let mut first_non_ready = None;
         let mut selected = None;
         for timer in &self.pending {
             if !self.active.contains(&timer.id) {
                 continue;
             }
-            if !timer_ready(timer.run_at, timer.delay_ms, now, allowance) {
-                if first_non_ready.is_none_or(|current| timer_precedes(timer, current)) {
-                    first_non_ready = Some(timer);
-                }
+            if !timer.is_ready_at(now) {
                 continue;
             }
             if predicate(&timer.payload)
@@ -332,11 +305,7 @@ impl<T> TimerScheduler<T> {
             }
         }
 
-        let selected = selected?;
-        if first_non_ready.is_some_and(|barrier| timer_precedes(barrier, selected)) {
-            return None;
-        }
-        Some(selected)
+        selected
     }
 }
 
@@ -348,20 +317,57 @@ fn timer_precedes<T>(left: &ScheduledTimer<T>, right: &ScheduledTimer<T>) -> boo
     }
 }
 
-fn timer_ready(
-    run_at: Instant,
-    delay_ms: u32,
-    now: Instant,
-    allowance: TimerReadyAllowance,
-) -> bool {
-    run_at <= now
-        || (delay_ms <= allowance.max_delay_ms
-            && run_at.duration_since(now).le(&allowance.allowance))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timers_wait_until_their_deadline_in_every_ready_query() {
+        let now = Instant::now();
+        for delay_ms in [1, 2, 100] {
+            for consume_matching in [false, true] {
+                let mut scheduler = TimerScheduler::default();
+                let id = scheduler.schedule_after("timer", delay_ms, now);
+                let deadline = now + Duration::from_millis(delay_ms);
+
+                for before_deadline in [now, deadline - Duration::from_nanos(1)] {
+                    assert!(!scheduler.has_ready_timer(before_deadline));
+                    assert!(!scheduler.has_ready_matching(before_deadline, |_| true));
+                    assert_eq!(
+                        scheduler.next_ready_deadline_matching(before_deadline, |_| true),
+                        None
+                    );
+                    assert!(scheduler.take_next_ready(before_deadline).is_none());
+                    assert!(
+                        scheduler
+                            .take_next_ready_matching(before_deadline, |_| true)
+                            .is_none()
+                    );
+                    assert_eq!(scheduler.next_deadline(), Some(deadline));
+                    assert!(scheduler.ms_to_next(before_deadline).unwrap() > 0);
+                    assert_eq!(scheduler.pending_count(), 1);
+                }
+
+                assert!(scheduler.has_ready_timer(deadline));
+                assert!(scheduler.has_ready_matching(deadline, |_| true));
+                assert_eq!(
+                    scheduler.next_ready_deadline_matching(deadline, |_| true),
+                    Some(deadline)
+                );
+                assert_eq!(scheduler.ms_to_next(deadline), Some(0));
+                let ready = if consume_matching {
+                    scheduler.take_next_ready_matching(deadline, |_| true)
+                } else {
+                    scheduler.take_next_ready(deadline)
+                }
+                .unwrap();
+                assert_eq!(ready.id, id);
+                assert_eq!(ready.payload, "timer");
+                scheduler.finish_running(id);
+                assert_eq!(scheduler.pending_count(), 0);
+            }
+        }
+    }
 
     #[test]
     fn ready_timers_fire_by_deadline_then_sequence() {
@@ -372,14 +378,14 @@ mod tests {
         let second = scheduler.schedule_after("second", 10, now);
 
         let ready = scheduler
-            .take_next_ready(now + Duration::from_millis(10), TimerReadyAllowance::NONE)
+            .take_next_ready(now + Duration::from_millis(10))
             .expect("first timer should be ready");
         assert_eq!(ready.id, first);
         assert_eq!(ready.payload, "first");
         scheduler.finish_running(ready.id);
 
         let ready = scheduler
-            .take_next_ready(now + Duration::from_millis(10), TimerReadyAllowance::NONE)
+            .take_next_ready(now + Duration::from_millis(10))
             .expect("second timer should be ready");
         assert_eq!(ready.id, second);
         assert_eq!(ready.payload, "second");
@@ -387,16 +393,42 @@ mod tests {
 
         assert!(
             scheduler
-                .take_next_ready(now + Duration::from_millis(10), TimerReadyAllowance::NONE)
+                .take_next_ready(now + Duration::from_millis(10))
                 .is_none()
         );
 
         let ready = scheduler
-            .take_next_ready(now + Duration::from_millis(20), TimerReadyAllowance::NONE)
+            .take_next_ready(now + Duration::from_millis(20))
             .expect("slow timer should be ready");
         assert_eq!(ready.id, slow);
         assert_eq!(ready.payload, "slow");
         scheduler.finish_running(ready.id);
+    }
+
+    #[test]
+    fn long_timeouts_preserve_their_full_deadline() {
+        let now = Instant::now();
+        for delay_ms in [u64::from(u32::MAX) + 1, 9_007_199_254_740_991] {
+            let mut scheduler = TimerScheduler::default();
+            let id = scheduler.schedule_after("long", delay_ms, now);
+            let deadline = now + Duration::from_millis(delay_ms);
+            assert_eq!(scheduler.next_deadline(), Some(deadline));
+            assert!(
+                scheduler
+                    .take_next_ready(deadline - Duration::from_millis(1))
+                    .is_none()
+            );
+            let ready = scheduler.take_next_ready(deadline).unwrap();
+            assert_eq!(ready.id, id);
+            assert_eq!(ready.delay_ms, delay_ms);
+            assert!(scheduler.reschedule_running_after(id, ready.payload, delay_ms, deadline));
+            assert_eq!(
+                scheduler.next_deadline(),
+                Some(deadline + Duration::from_millis(delay_ms))
+            );
+            assert!(scheduler.cancel(id));
+            assert_eq!(scheduler.pending_count(), 0);
+        }
     }
 
     #[test]
@@ -409,16 +441,12 @@ mod tests {
         scheduler.cancel(cancelled);
 
         let ready = scheduler
-            .take_next_ready(now, TimerReadyAllowance::NONE)
+            .take_next_ready(now)
             .expect("kept timer should be ready");
         assert_eq!(ready.id, kept);
         assert_eq!(ready.payload, "kept");
         scheduler.finish_running(ready.id);
-        assert!(
-            scheduler
-                .take_next_ready(now, TimerReadyAllowance::NONE)
-                .is_none()
-        );
+        assert!(scheduler.take_next_ready(now).is_none());
     }
 
     #[test]
@@ -428,7 +456,7 @@ mod tests {
         let interval = scheduler.schedule_after("tick", 0, now);
 
         let ready = scheduler
-            .take_next_ready(now, TimerReadyAllowance::NONE)
+            .take_next_ready(now)
             .expect("interval should be ready");
         scheduler.cancel(interval);
         assert!(!scheduler.reschedule_running_after(
@@ -460,7 +488,7 @@ mod tests {
         assert_eq!(scheduler.pending_count(), 1);
 
         let ready = scheduler
-            .take_next_ready(now + Duration::from_millis(12), TimerReadyAllowance::NONE)
+            .take_next_ready(now + Duration::from_millis(12))
             .expect("kept timer should become ready");
         assert_eq!(ready.id, kept);
         scheduler.finish_running(ready.id);
@@ -476,40 +504,40 @@ mod tests {
         scheduler.cancel(cancelled);
 
         assert_eq!(
-            scheduler
-                .next_ready_deadline_matching(now, TimerReadyAllowance::NONE, |payload| *payload
-                    == "selected",),
+            scheduler.next_ready_deadline_matching(now, |payload| *payload == "selected",),
             None
         );
         assert_eq!(
-            scheduler.next_ready_deadline_matching(
-                now + Duration::from_millis(1),
-                TimerReadyAllowance::NONE,
-                |payload| *payload == "selected",
-            ),
+            scheduler
+                .next_ready_deadline_matching(now + Duration::from_millis(1), |payload| *payload
+                    == "selected",),
             Some(now + Duration::from_millis(1))
         );
     }
 
     #[test]
-    fn matching_ready_deadline_respects_an_earlier_non_ready_barrier() {
+    fn matching_ready_deadline_does_not_admit_a_future_timer() {
         let now = Instant::now();
         let mut scheduler = TimerScheduler::default();
-        scheduler.schedule_after("barrier", 2, now);
+        scheduler.schedule_after("earlier", 2, now);
         scheduler.schedule_after("selected", 1, now + Duration::from_micros(1_500));
-        let allowance = TimerReadyAllowance {
-            max_delay_ms: 1,
-            allowance: Duration::from_millis(1),
-        };
-
+        let before_selected = now + Duration::from_micros(2_499);
+        assert!(scheduler.has_ready_timer(before_selected));
         assert_eq!(
-            scheduler.next_ready_deadline_matching(
-                now + Duration::from_micros(1_500),
-                allowance,
-                |payload| *payload == "selected",
-            ),
-            None,
-            "a later timer admitted by early allowance must not overtake the heap head"
+            scheduler
+                .next_ready_deadline_matching(before_selected, |payload| *payload == "selected"),
+            None
+        );
+        assert!(
+            scheduler
+                .take_next_ready_matching(before_selected, |payload| *payload == "selected")
+                .is_none()
+        );
+        assert_eq!(
+            scheduler.next_ready_deadline_matching(now + Duration::from_micros(2_500), |payload| {
+                *payload == "selected"
+            },),
+            Some(now + Duration::from_micros(2_500))
         );
     }
 
@@ -531,25 +559,25 @@ mod tests {
     }
 
     #[test]
-    fn early_allowance_only_applies_to_short_delays() {
+    fn rescheduled_short_timer_waits_for_its_new_deadline() {
         let now = Instant::now();
         let mut scheduler = TimerScheduler::default();
-        let short = scheduler.schedule_after("short", 1, now);
-        scheduler.schedule_after("long", 2, now);
+        let id = scheduler.schedule_after("tick", 1, now);
+        let first_deadline = now + Duration::from_millis(1);
+        let ready = scheduler.take_next_ready(first_deadline).unwrap();
+        assert!(scheduler.reschedule_running_after(id, ready.payload, 1, first_deadline));
 
-        let allowance = TimerReadyAllowance {
-            max_delay_ms: 1,
-            allowance: Duration::from_millis(1),
-        };
-        let just_before = now + Duration::from_micros(500);
-        assert!(scheduler.has_ready_timer(just_before, allowance));
-        let ready = scheduler
-            .take_next_ready(just_before, allowance)
-            .expect("short timer should be ready within allowance");
-        assert_eq!(ready.id, short);
-        scheduler.finish_running(ready.id);
-
-        assert!(!scheduler.has_ready_timer(just_before, allowance));
+        let next_deadline = first_deadline + Duration::from_millis(1);
+        for before_deadline in [first_deadline, next_deadline - Duration::from_nanos(1)] {
+            assert!(!scheduler.has_ready_timer(before_deadline));
+            assert!(scheduler.take_next_ready(before_deadline).is_none());
+            assert_eq!(scheduler.next_deadline(), Some(next_deadline));
+        }
+        let ready = scheduler.take_next_ready(next_deadline).unwrap();
+        assert_eq!(ready.id, id);
+        assert_eq!(ready.payload, "tick");
+        scheduler.finish_running(id);
+        assert_eq!(scheduler.pending_count(), 0);
     }
 
     #[test]
@@ -560,29 +588,23 @@ mod tests {
         let selected = scheduler.schedule_after("selected", 0, now);
         let second = scheduler.schedule_after("second", 0, now);
 
-        assert!(
-            scheduler.has_ready_matching(now, TimerReadyAllowance::NONE, |payload| {
-                *payload == "selected"
-            })
-        );
+        assert!(scheduler.has_ready_matching(now, |payload| { *payload == "selected" }));
         let ready = scheduler
-            .take_next_ready_matching(now, TimerReadyAllowance::NONE, |payload| {
-                *payload == "selected"
-            })
+            .take_next_ready_matching(now, |payload| *payload == "selected")
             .expect("selected timer should be ready");
         assert_eq!(ready.id, selected);
         assert_eq!(ready.payload, "selected");
         scheduler.finish_running(ready.id);
 
         let ready = scheduler
-            .take_next_ready(now, TimerReadyAllowance::NONE)
+            .take_next_ready(now)
             .expect("first timer should remain pending");
         assert_eq!(ready.id, first);
         assert_eq!(ready.payload, "first");
         scheduler.finish_running(ready.id);
 
         let ready = scheduler
-            .take_next_ready(now, TimerReadyAllowance::NONE)
+            .take_next_ready(now)
             .expect("second timer should remain pending");
         assert_eq!(ready.id, second);
         assert_eq!(ready.payload, "second");
@@ -600,16 +622,14 @@ mod tests {
         let selected = scheduler.schedule_after("selected", 0, now);
 
         let ready = scheduler
-            .take_next_ready_matching(now, TimerReadyAllowance::NONE, |payload| {
-                *payload == "selected"
-            })
+            .take_next_ready_matching(now, |payload| *payload == "selected")
             .expect("selected timer should be ready after skipped timers");
         assert_eq!(ready.id, selected);
         assert_eq!(ready.payload, "selected");
         scheduler.finish_running(ready.id);
 
         let ready = scheduler
-            .take_next_ready(now, TimerReadyAllowance::NONE)
+            .take_next_ready(now)
             .expect("first timer should remain first after matching drain");
         assert_eq!(ready.id, first);
         assert_eq!(ready.payload, "first");
@@ -617,7 +637,7 @@ mod tests {
 
         for skipped_id in skipped {
             let ready = scheduler
-                .take_next_ready(now, TimerReadyAllowance::NONE)
+                .take_next_ready(now)
                 .expect("skipped timer should remain pending");
             assert_eq!(ready.id, skipped_id);
             assert_eq!(ready.payload, "skipped");

@@ -52,7 +52,10 @@ pub(crate) enum RendererOwnerWake {
     /// The browser-side commit response has crossed its release boundary.
     /// Parser work parked at DocumentCommit may now resume without racing
     /// ahead of target installation, old-Page retirement, or the response.
-    CommittedDocumentParserUnblocked { token: RendererPageToken },
+    CommittedDocumentParserUnblocked {
+        token: RendererPageToken,
+        vm_creation_id: u64,
+    },
     /// A concrete late Inspector response that became ready inside a Page
     /// owner turn. It is committed only after that turn has published all
     /// protocol-visible output, and never schedules or executes Page work.
@@ -88,8 +91,14 @@ impl RendererOwnerWake {
         Self::PostResponseDocumentLifecycle { token, document }
     }
 
-    pub(crate) fn committed_document_parser_unblocked(token: RendererPageToken) -> Self {
-        Self::CommittedDocumentParserUnblocked { token }
+    pub(crate) fn committed_document_parser_unblocked(
+        token: RendererPageToken,
+        vm_creation_id: u64,
+    ) -> Self {
+        Self::CommittedDocumentParserUnblocked {
+            token,
+            vm_creation_id,
+        }
     }
 
     pub(crate) fn runtime_inspector_response_publication(
@@ -121,7 +130,7 @@ impl RendererOwnerWake {
         match self {
             Self::Page { token, .. }
             | Self::PostResponseDocumentLifecycle { token, .. }
-            | Self::CommittedDocumentParserUnblocked { token }
+            | Self::CommittedDocumentParserUnblocked { token, .. }
             | Self::RuntimeInspectorResponsePublication { token, .. }
             | Self::TopLevelNavigationHandoff { token, .. }
             | Self::ReplacementDocumentViewSettled { token, .. } => token.page_id(),
@@ -713,6 +722,8 @@ impl RendererResourceCompletionTestHarness {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use moli_module_script_tree as module_tree;
     use url::Url;
 
@@ -829,13 +840,13 @@ mod tests {
             internal_id,
             request_url: Url::parse("https://example.test/api").unwrap(),
             request_method: "GET".to_owned(),
-            request_headers: Vec::new(),
+            request_headers: Vec::new().into(),
             request_body: None,
             response_status_text: None,
             skip_fetch_security_validation: false,
             response_filter: None,
             network_error_text: None,
-            result: Err("test".to_owned()),
+            result: Err("test".to_owned()).into(),
         }
     }
 
@@ -860,6 +871,7 @@ mod tests {
                 source_result: Ok(format!("window.defer{parser_position} = true")),
                 source_bytes: None,
                 network_result: None,
+                network_request_handle: None,
             },
         )
     }
@@ -902,7 +914,6 @@ mod tests {
             target,
             Ok(ModuleGraphFetchedSource::new(
                 request_url.clone(),
-                false,
                 ModuleSource::text("export default 1;".to_owned()),
             )),
             None,
@@ -937,7 +948,6 @@ mod tests {
             target,
             Ok(ModuleGraphFetchedSource::new(
                 request_url.clone(),
-                false,
                 ModuleSource::text("export default 1;".to_owned()),
             )),
             None,
@@ -967,7 +977,6 @@ mod tests {
             target,
             Ok(ModuleGraphFetchedSource::new(
                 request_url.clone(),
-                false,
                 ModuleSource::text("export default 1;".to_owned()),
             )),
             None,
@@ -997,7 +1006,6 @@ mod tests {
             target,
             Ok(ModuleGraphFetchedSource::new(
                 request_url.clone(),
-                false,
                 ModuleSource::text("export default 1;".to_owned()),
             )),
             None,
@@ -1021,12 +1029,18 @@ mod tests {
         owner: FrameDocumentTaskOwner,
     ) -> ChildBlockingStylesheetLoadCompletion {
         ChildBlockingStylesheetLoadCompletion {
+            csp_violations: Vec::new(),
+            graph: Arc::new(
+                crate::stylesheet_blocking::StylesheetImportGraphFetchResult::new(true, Vec::new()),
+            ),
+            load_delay_token: crate::frame_owner_model::DocumentLoadDelayTokenId(1),
             child_handle,
             owner,
             signature: crate::DocumentBlockingStylesheetSignature::ParserCreatedStyleImport {
                 urls: Vec::new(),
             },
-            network_results: Vec::new(),
+            frame_id: None,
+            document_url: Url::parse("https://example.test/document").unwrap(),
         }
     }
 

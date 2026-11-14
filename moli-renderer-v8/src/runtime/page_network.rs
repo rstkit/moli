@@ -129,15 +129,15 @@ impl PageVm {
 
     pub(crate) fn set_fetch_subresource_interception(
         &mut self,
-        enabled: bool,
-        resource_type: Option<crate::SubresourceResourceType>,
+        classes: crate::SubresourceInterceptionClasses,
     ) {
-        self.vm_mut()
-            .set_fetch_subresource_interception(enabled, resource_type);
+        self.request_client
+            .page_network_policy()
+            .set_subresource_interception(classes);
     }
 
-    pub(crate) fn set_extra_http_headers(&mut self, headers: &[(String, String)]) {
-        self.extra_http_headers = headers.to_vec();
+    pub(crate) fn set_extra_http_headers(&mut self, headers: &moli_fetch::RequestHeaders) {
+        self.extra_http_headers = headers.clone();
         self.vm_mut().set_extra_http_headers(headers);
     }
 
@@ -147,65 +147,6 @@ impl PageVm {
     ) {
         self.permission_overrides = overrides.to_vec();
         self.vm_mut().set_permission_overrides(overrides);
-    }
-
-    pub(crate) fn set_locale_override(&mut self, locale: Option<&str>) -> Result<()> {
-        self.vm_mut().set_locale_override_and_sync_surface(locale)
-    }
-
-    pub(crate) fn set_timezone_override(&mut self, timezone: Option<&str>) -> Result<()> {
-        self.vm_mut()
-            .set_timezone_override_and_sync_surface(timezone)
-    }
-
-    pub(crate) fn set_script_execution_disabled(&mut self, disabled: bool) {
-        self.vm_mut().set_script_execution_disabled(disabled);
-    }
-
-    pub(crate) fn set_bypass_content_security_policy(&mut self, bypass: bool) {
-        self.bypass_content_security_policy = bypass;
-        self.vm_mut().set_bypass_content_security_policy(bypass);
-    }
-
-    pub(crate) fn set_cpu_throttling_rate(&mut self, rate: f64) {
-        self.cpu_throttling_rate = rate;
-    }
-
-    pub(crate) fn set_emulated_media(
-        &mut self,
-        overrides: &crate::protocol_types::EmulatedMediaOverrides,
-    ) {
-        self.emulated_media = overrides.clone();
-        self.vm_mut().set_emulated_media(overrides);
-    }
-
-    pub(crate) fn set_idle_override(
-        &mut self,
-        idle_override: Option<crate::protocol_types::EmulatedIdleOverride>,
-    ) -> anyhow::Result<()> {
-        self.vm_mut()
-            .set_idle_override_and_sync_surface(idle_override)?;
-        self.idle_override = idle_override;
-        Ok(())
-    }
-
-    pub(crate) fn set_viewport_surface(
-        &mut self,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-    ) -> anyhow::Result<()> {
-        self.vm_mut().set_viewport_surface(viewport_surface)?;
-        self.viewport_surface = viewport_surface;
-        Ok(())
-    }
-
-    pub(crate) fn set_navigator_overrides(
-        &mut self,
-        overrides: &moli_page_types::NavigatorOverrides,
-    ) -> anyhow::Result<()> {
-        self.vm_mut()
-            .set_navigator_overrides_and_sync_surface(overrides)?;
-        self.navigator_overrides = overrides.clone();
-        Ok(())
     }
 
     pub(crate) fn set_network_offline(&mut self, offline: bool) {
@@ -289,8 +230,8 @@ impl PageVm {
         internal_id: u64,
         url: Option<Url>,
         method: Option<String>,
-        body: Option<Option<String>>,
-        headers: Option<Vec<(String, String)>>,
+        body: Option<Option<bytes::Bytes>>,
+        headers: Option<moli_fetch::RequestHeaderOverride>,
         intercept_response: bool,
         handle_auth_requests: bool,
     ) -> Result<crate::PendingSubresourceContinueOutcome> {
@@ -350,7 +291,7 @@ impl PageVm {
         &mut self,
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> Result<()> {
         let execution = self.vm_mut().fulfill_pending_subresource_fetch_body(
@@ -366,7 +307,7 @@ impl PageVm {
         &mut self,
         internal_id: u64,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> Result<()> {
         let execution = self.vm_mut().continue_pending_subresource_response_body(
             internal_id,
@@ -391,7 +332,7 @@ impl PageVm {
         &mut self,
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> Result<()> {
         let execution = self.vm_mut().fulfill_pending_subresource_response_body(

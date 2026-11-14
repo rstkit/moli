@@ -31,10 +31,10 @@ pub(crate) fn storage_cookie_to_json(cookie: &StoredCookie) -> Value {
         "session": cookie.expires.is_none(),
         "sourceScheme": cookie.source_scheme.as_str(),
         "sourcePort": cookie.source_port,
+        // CDP `Network.Cookie.priority` is required. A cookie set without a
+        // `Priority` attribute reports Chromium's default, `Medium`.
+        "priority": cookie.effective_priority().as_str(),
     });
-    if let Some(priority) = cookie.priority {
-        value["priority"] = json!(priority.as_str());
-    }
     match cookie.same_site {
         StoredCookieSameSite::Unspecified => {}
         StoredCookieSameSite::None => value["sameSite"] = json!("None"),
@@ -302,6 +302,9 @@ fn cookie_exclusion_reason_to_str(reason: &StoredCookieExclusionReason) -> &'sta
         StoredCookieExclusionReason::SchemeMismatch => "SchemeMismatch",
         StoredCookieExclusionReason::SameSiteStrict => "SameSiteStrict",
         StoredCookieExclusionReason::SameSiteLax => "SameSiteLax",
+        StoredCookieExclusionReason::SameSiteUnspecifiedTreatedAsLax => {
+            "SameSiteUnspecifiedTreatedAsLax"
+        }
         StoredCookieExclusionReason::PartitionKeyMismatch => "PartitionKeyMismatch",
     }
 }
@@ -323,6 +326,9 @@ fn cdp_cookie_blocked_reason_to_str(reason: &StoredCookieExclusionReason) -> &'s
         StoredCookieExclusionReason::SchemeMismatch => "SchemeMismatch",
         StoredCookieExclusionReason::SameSiteStrict => "SameSiteStrict",
         StoredCookieExclusionReason::SameSiteLax => "SameSiteLax",
+        StoredCookieExclusionReason::SameSiteUnspecifiedTreatedAsLax => {
+            "SameSiteUnspecifiedTreatedAsLax"
+        }
         StoredCookieExclusionReason::PartitionKeyMismatch => "UnknownError",
     }
 }
@@ -389,6 +395,11 @@ fn cookie_set_rejection_reason_to_str(reason: StoredCookieSetRejectionReason) ->
         StoredCookieSetRejectionReason::NonRelativeScheme => "NonRelativeScheme",
         StoredCookieSetRejectionReason::DomainMismatch => "DomainMismatch",
         StoredCookieSetRejectionReason::SameSiteNoneRequiresSecure => "SameSiteNoneRequiresSecure",
+        StoredCookieSetRejectionReason::SameSiteStrict => "SameSiteStrict",
+        StoredCookieSetRejectionReason::SameSiteLax => "SameSiteLax",
+        StoredCookieSetRejectionReason::SameSiteUnspecifiedTreatedAsLax => {
+            "SameSiteUnspecifiedTreatedAsLax"
+        }
         StoredCookieSetRejectionReason::PrefixViolation => "PrefixViolation",
         StoredCookieSetRejectionReason::SecureOverlay => "SecureOverlay",
         StoredCookieSetRejectionReason::NameValueTooLarge => "NameValueTooLarge",
@@ -409,6 +420,7 @@ fn cookie_effective_same_site_to_str(same_site: StoredCookieEffectiveSameSite) -
     match same_site {
         StoredCookieEffectiveSameSite::NoRestriction => "NoRestriction",
         StoredCookieEffectiveSameSite::Lax => "Lax",
+        StoredCookieEffectiveSameSite::LaxAllowUnsafe => "LaxAllowUnsafe",
         StoredCookieEffectiveSameSite::Strict => "Strict",
     }
 }

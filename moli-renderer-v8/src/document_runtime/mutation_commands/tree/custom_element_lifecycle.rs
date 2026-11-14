@@ -2,7 +2,7 @@ use crate::{
     custom_elements,
     document_runtime::{DocumentRuntime, DomHandle},
     dom::native::Node,
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
 };
 
 impl DocumentRuntime {
@@ -14,7 +14,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_disconnected_callbacks_in_subtrees(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
     ) -> bool {
         let mut enqueued = false;
@@ -34,7 +34,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_adoption_disconnected_callbacks_in_subtrees_unless_pending(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
     ) -> bool {
         let mut enqueued = false;
@@ -55,7 +55,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_disconnected_callbacks_for_moved_roots_if_needed(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
         was_connected: bool,
     ) {
@@ -81,18 +81,19 @@ impl DocumentRuntime {
                     scope, host_ptr, handle,
                 );
             }
-            unsafe { &mut *host_ptr }
-                .drop_child_browsing_context_subtree_with_window_realm(scope, root);
+            PageScriptHost::drop_child_browsing_context_subtree_with_window_realm(
+                scope, host_ptr, root,
+            );
         }
     }
 
     pub(super) fn enqueue_custom_element_connected_callbacks(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
         was_connected: bool,
-        sync_upgrade_subtrees: bool,
+        upgrade_subtrees: bool,
     ) {
         if was_connected
             || !roots
@@ -105,33 +106,40 @@ impl DocumentRuntime {
         // been defined and none have been upgraded yet — the typical state for
         // pages that don't use the Custom Elements API. See
         // CustomElementStore::is_subtree_lifecycle_quiescent.
-        let host = unsafe { &*host_ptr };
-        if host.custom_elements_subtree_lifecycle_quiescent() {
+        if unsafe { &*host_ptr }.custom_elements_subtree_lifecycle_quiescent() {
             return;
         }
-        if sync_upgrade_subtrees {
-            for &root in roots {
-                if custom_elements::is_shadow_including_rooted_in_browsing_context_document(
-                    host, root,
-                ) {
-                    let _ = custom_elements::upgrade_subtree_if_defined(scope, host_ptr, root);
+        for &root in roots {
+            if !self.is_custom_element_lifecycle_connected(root) {
+                continue;
+            }
+            let can_upgrade = upgrade_subtrees
+                && custom_elements::is_shadow_including_rooted_in_browsing_context_document(
+                    unsafe { &*host_ptr },
+                    root,
+                );
+            let mut handles = Vec::new();
+            self.collect_subtree_handles_preorder(root, &mut handles);
+            for handle in handles {
+                // Insertion queues either a connection for an existing custom
+                // element or an upgrade. The upgrade owns its initial connection
+                // callback, and both kinds of reaction retain subtree order.
+                let is_custom = unsafe { &*host_ptr }
+                    .custom_elements_for_node_handle(handle)
+                    .is_some_and(|store| store.is_upgraded_handle(handle));
+                if is_custom {
+                    custom_elements::enqueue_connected_callback(scope, host_ptr, handle);
+                } else if can_upgrade {
+                    custom_elements::enqueue_upgrade_reaction_if_defined(scope, host_ptr, handle);
                 }
             }
-        }
-        for &root in roots {
-            self.enqueue_custom_element_lifecycle_in_subtree(
-                scope,
-                host_ptr,
-                root,
-                "connectedCallback",
-            );
         }
     }
 
     pub(super) fn enqueue_custom_element_form_association_callbacks_in_subtrees(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
     ) -> bool {
         let mut enqueued = false;
@@ -148,7 +156,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_form_association_callbacks_in_subtree(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         root: DomHandle,
     ) -> bool {
         let mut handles = Vec::new();
@@ -166,7 +174,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_form_association_callbacks_for_form_owner_subtrees(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
     ) -> bool {
         if roots.is_empty() || unsafe { &*host_ptr }.custom_elements_subtree_lifecycle_quiescent() {
@@ -192,7 +200,7 @@ impl DocumentRuntime {
 
     pub(super) fn parser_insertion_root_has_form_associated_custom_element(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         root: DomHandle,
     ) -> bool {
         let mut handles = Vec::new();
@@ -205,7 +213,7 @@ impl DocumentRuntime {
 
     pub(super) fn tree_mutation_may_change_detached_fieldset_disabled_state(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         roots: &[DomHandle],
     ) -> bool {
@@ -241,7 +249,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_form_disabled_callbacks_in_subtrees(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
     ) -> bool {
         let mut enqueued = false;
@@ -257,7 +265,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_form_disabled_callbacks_in_subtree(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         root: DomHandle,
     ) -> bool {
         custom_elements::enqueue_form_disabled_callbacks_in_subtree(scope, host_ptr, root)
@@ -266,7 +274,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_lifecycle_in_subtree(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         root: DomHandle,
         callback_name: &str,
     ) -> bool {
@@ -317,7 +325,7 @@ impl DocumentRuntime {
     pub(super) fn enqueue_custom_element_atomic_move_callbacks(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
     ) {
         let host = unsafe { &*host_ptr };

@@ -18,6 +18,13 @@ use moli_stylesheet_blocking::{
 };
 
 impl StylesheetBlockingReadView for ParserStreamDocumentSnapshot {
+    fn media_query_matches(&self, media: &str) -> bool {
+        moli_stylesheet_blocking::default_screen_media_query_matches(
+            media,
+            self.document_is_quirks_mode(),
+        )
+    }
+
     fn stylesheet_element(&self, node_id: NativeNodeId) -> Option<StylesheetElementRead> {
         self.node(node_id)
             .and_then(StylesheetElementRead::from_node)
@@ -43,6 +50,12 @@ impl StylesheetBlockingReadView for ParserStreamDocumentSnapshot {
         self.document_node_id()
     }
 
+    fn document_is_quirks_mode(&self) -> bool {
+        self.node(self.document_node_id())
+            .and_then(moli_dom::native::Node::as_document)
+            .is_some_and(|document| document.is_quirks_mode())
+    }
+
     fn document_order_stylesheet_candidate_ids_before(
         &self,
         target_node_id: Option<NodeId>,
@@ -64,6 +77,34 @@ mod tests {
     };
     use crate::{HtmlParser, ParserPumpStep};
     use moli_dom::native::Node;
+
+    #[test]
+    fn nonmatching_style_imports_are_loads_only_when_the_style_type_is_css() {
+        for (type_attribute, loads) in [
+            ("", true),
+            ("text/css", true),
+            (" text/css ", false),
+            ("application/json", false),
+        ] {
+            let stream = HtmlParser::SCRIPTING_ENABLED
+                .start_document(url::Url::parse("https://example.test/").unwrap());
+            let html = format!(
+                "<!doctype html><style type='{type_attribute}' media='print'>@import url('/print.css');</style><script>0</script>"
+            );
+            let outcome = stream.pump_parser_step(&html);
+            assert_eq!(
+                outcome.discovered_stylesheet_inputs.len(),
+                usize::from(loads),
+                "type={type_attribute:?}"
+            );
+            assert!(
+                outcome
+                    .discovered_stylesheet_inputs
+                    .iter()
+                    .all(|input| !input.blocks_scripts())
+            );
+        }
+    }
 
     #[test]
     fn document_owned_blocking_candidates_include_parser_created_style_imports() {
@@ -95,14 +136,14 @@ mod tests {
     #[test]
     fn parser_created_link_blocker_is_captured_before_link_processing_state_is_consumed() {
         let parser = HtmlParser::SCRIPTING_ENABLED;
-        let mut stream = parser.start_document(url::Url::parse("https://example.com/").unwrap());
+        let stream = parser.start_document(url::Url::parse("https://example.com/").unwrap());
         stream.append_to_end(
             "<!doctype html><html><head><link rel=stylesheet href='/slow.css'><script>window.x = 1;</script></head></html>".to_owned(),
         );
         let mut captured_blockers = Vec::new();
         while stream.has_pending_input() {
             let outcome = stream.pump_next_parser_step(0);
-            captured_blockers.extend(outcome.discovered_blocking_stylesheet_inputs);
+            captured_blockers.extend(outcome.discovered_stylesheet_inputs);
             if matches!(outcome.result, ParserPumpStep::InputDrained) && !stream.has_pending_input()
             {
                 break;
@@ -158,6 +199,34 @@ mod tests {
             disposition.url().as_str(),
             "https://example.com/assets/app.css"
         );
+        assert!(!disposition.options().quirks_mode_mime_compatibility());
+    }
+
+    #[test]
+    fn stylesheet_link_captures_quirks_mode_mime_compatibility() {
+        let parser = HtmlParser::SCRIPTING_ENABLED;
+        let document = parser.parse(
+            url::Url::parse("https://example.com/page.html").unwrap(),
+            "<html><head><link rel=stylesheet href=app.css></head></html>".to_owned(),
+        );
+        let link = document
+            .document_head_handle()
+            .and_then(|head| document.child_nodes(head))
+            .and_then(|children| {
+                children.into_iter().find(|handle| {
+                    document
+                        .node(*handle)
+                        .and_then(Node::as_element)
+                        .is_some_and(|element| element.is_html_element("link"))
+                })
+            })
+            .expect("stylesheet link");
+
+        let disposition =
+            stylesheet_link_disposition(&document, moli_dom::NodeId::new(link.index()))
+                .expect("stylesheet disposition");
+
+        assert!(disposition.options().quirks_mode_mime_compatibility());
     }
 
     #[test]

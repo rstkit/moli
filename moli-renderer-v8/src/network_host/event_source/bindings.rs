@@ -1,13 +1,11 @@
 use super::*;
 use crate::context_bootstrap::mark_event_trusted;
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 #[derive(WebApiObject)]
-#[webapi(interface = "EventSource")]
+#[webapi(interface = web_api_interfaces::EventSource)]
 struct EventSourceObjectDeclaration<'scope> {
-    #[webapi(slot = EVENT_SOURCE_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = EVENT_SOURCE_URL_SLOT)]
     url: v8::Local<'scope, v8::String>,
 
@@ -41,15 +39,12 @@ struct EventSourceObjectDeclaration<'scope> {
     #[webapi(slot = EVENT_SOURCE_ONERROR_SLOT, init = "null")]
     onerror: (),
 
-    #[webapi(slot = SIMPLE_EVENT_TARGET_SLOT, value = EVENT_SOURCE_LISTENERS_SLOT)]
-    event_target_slot: (),
-
-    #[webapi(slot = SIMPLE_EVENT_TARGET_ORDERED_HANDLERS_SLOT, init = true)]
-    ordered_handlers: (),
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "EventSource", enumerable)]
+#[webapi(interface = web_api_interfaces::EventSource, enumerable)]
 struct EventSourceTemplateDeclaration {
     #[webapi(constant = "CONNECTING", value = EVENT_SOURCE_CONNECTING)]
     connecting: (),
@@ -65,7 +60,7 @@ struct EventSourceTemplateDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "EventSource")]
+#[webapi(interface = web_api_interfaces::EventSource)]
 struct EventSourceAccessorsDeclaration {
     #[webapi(accessor_property, getter = event_source_url_getter, enumerable)]
     url: (),
@@ -110,14 +105,6 @@ struct EventSourceAccessorsDeclaration {
         enumerable
     )]
     onerror: (),
-}
-
-#[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
-struct EventSourceMessageEventInitDeclaration<'scope> {
-    data: v8::Local<'scope, v8::String>,
-    origin: v8::Local<'scope, v8::String>,
-    last_event_id: v8::Local<'scope, v8::String>,
 }
 
 #[derive(Clone, Copy)]
@@ -332,13 +319,6 @@ pub(crate) fn dispatch_event_source_message<'s>(
     event_source: v8::Local<'s, v8::Object>,
     message: &EventSourceMessage,
 ) {
-    let global = scope.get_current_context().global(scope);
-    let Some(constructor) = global
-        .get(scope, v8str(scope, "MessageEvent").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-    else {
-        return;
-    };
     let origin = event_source_response_url(scope, event_source)
         .parse::<url::Url>()
         .ok()
@@ -347,31 +327,22 @@ pub(crate) fn dispatch_event_source_message<'s>(
     let Some(data) = v8_string(scope, &message.data) else {
         return;
     };
-    let Some(origin) = v8_string(scope, &origin) else {
-        return;
-    };
-    let Some(last_event_id) = v8_string(scope, &message.event_id) else {
-        return;
-    };
-    let Ok(init) =
-        EventSourceMessageEventInitDeclaration::new(data, origin, last_event_id).bind(scope)
-    else {
-        return;
-    };
-    let Some(event_type) = v8_string(scope, &message.event_name) else {
-        return;
-    };
-    let Some(event) = constructor.new_instance(scope, &[event_type.into(), init.into()]) else {
+    let last_event_id = message.event_id.encode_utf16().collect::<Vec<_>>();
+    let source = v8::null(scope).into();
+    let ports = v8::Array::new(scope, 0);
+    let Some(event) = crate::context_bootstrap::construct_original_message_event(
+        scope,
+        &message.event_name,
+        data.into(),
+        &origin,
+        &last_event_id,
+        source,
+        ports,
+    ) else {
         return;
     };
     mark_event_trusted(scope, event);
-    let _ = dispatch_simple_event_target_event(
-        scope,
-        event_source,
-        EVENT_SOURCE_LISTENERS_SLOT,
-        &message.event_name,
-        event,
-    );
+    let _ = dispatch_simple_event_target_event(scope, event_source, &message.event_name, event);
 }
 
 pub(crate) fn schedule_event_source_connect<'s>(
@@ -395,7 +366,7 @@ pub(crate) fn schedule_event_source_connect<'s>(
     let timer_id = unsafe { &mut *host_ptr }.queue_timeout(
         scope,
         callback,
-        delay_ms.min(u32::MAX as u64) as u32,
+        delay_ms.min(u64::from(u32::MAX)),
         crate::host::HostTimerOwner::Window,
         Vec::new(),
     );
@@ -561,20 +532,12 @@ fn event_source_event_handler_setter<'s>(
     ) else {
         return;
     };
-    let value = args.get(0);
-    let stored = if value.is_function() {
-        value
-    } else {
-        v8::null(scope).into()
-    };
-    set_private_value(scope, args.this(), handler.slot_name, stored);
-    simple_object_event_set_ordered_handler(
+    simple_object_event_set_handler(
         scope,
         args.this(),
-        EVENT_SOURCE_LISTENERS_SLOT,
         handler.event_type,
         handler.slot_name,
-        stored.is_function(),
+        args.get(0),
     );
 }
 
@@ -597,21 +560,14 @@ fn dispatch_event_source_named_event<'s>(
         return;
     };
     mark_event_trusted(scope, event);
-    let _ = dispatch_simple_event_target_event(
-        scope,
-        event_source,
-        EVENT_SOURCE_LISTENERS_SLOT,
-        event_type,
-        event,
-    );
+    let _ = dispatch_simple_event_target_event(scope, event_source, event_type, event);
 }
 
 fn event_source_is_branded<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event_source: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, event_source, EVENT_SOURCE_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
+    web_api_interfaces::EventSource::is_instance(scope, event_source)
 }
 
 fn event_source_string_slot<'s>(

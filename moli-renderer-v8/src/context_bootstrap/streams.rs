@@ -1,15 +1,16 @@
 use super::specs::{ConstructorKind, ConstructorSpec};
 use super::stream_adapter::{
-    StreamQueuingStrategy, cancel_readable_stream, close_stream, enqueue_chunk,
-    initialize_transform_stream_object, initialize_webidl_readable_stream_object,
-    initialize_webidl_transform_stream_object, initialize_webidl_writable_stream_object,
-    parse_readable_stream_source_object, parse_stream_strategy_arg,
+    EnqueueChunkError, QueuingStrategyMembers, call_function_result, cancel_readable_stream,
+    close_stream, enqueue_chunk, initialize_transform_stream_object,
+    initialize_webidl_readable_stream_object, initialize_webidl_transform_stream_object,
+    initialize_webidl_writable_stream_object, new_readable_stream_object,
+    new_transform_stream_shell_object, parse_readable_stream_source_object,
     parse_transform_stream_transformer_object, parse_writable_stream_sink_object,
     readable_stream_byob_request_respond_callback,
     readable_stream_byob_request_respond_with_new_view_callback,
     readable_stream_byob_request_view_getter, readable_stream_is_byte_stream,
-    readable_stream_locked, rejected_promise_value, set_resolved_promise, stream_slot_array,
-    stream_slot_object, writable_stream_close_internal, writable_stream_locked,
+    readable_stream_locked, rejected_promise_value, set_resolved_promise, stream_slot_object,
+    suppress_promise_unhandled_rejection, writable_stream_close_internal, writable_stream_locked,
     writable_stream_snapshot,
 };
 use super::stream_objects::{
@@ -23,13 +24,38 @@ use super::stream_objects::{
     writable_stream_writer_release_lock_callback, writable_stream_writer_write_callback,
 };
 use super::*;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiFunctionTemplate;
 
 mod compression;
 mod constructors;
+mod from;
 mod readable;
 mod transferable;
 mod writable;
+
+pub(crate) fn tee_fetch_body_stream<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Array>> {
+    super::stream_adapter::tee_readable_stream_with_cloned_branch(scope, stream).ok()
+}
+
+pub(crate) fn proxy_fetch_body_stream<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let transform = new_transform_stream_shell_object(scope);
+    initialize_transform_stream_object(scope, transform, None, None, 1.0, None, 0.0, None);
+    let readable = stream_slot_object(scope, transform, TRANSFORM_STREAM_READABLE_SLOT)?;
+    let writable = stream_slot_object(scope, transform, TRANSFORM_STREAM_WRITABLE_SLOT)?;
+    // A proxy disturbs its input immediately, even when backpressure delays
+    // the first source read.
+    super::stream_adapter::disturb_readable_stream(scope, stream);
+    let pipe = readable::start_internal_readable_stream_pipe_to(scope, stream, writable)?;
+    suppress_promise_unhandled_rejection(scope, pipe);
+    Some(readable)
+}
 
 #[derive(Clone, Copy)]
 enum StreamPrototypeInstaller {
@@ -59,141 +85,135 @@ struct StreamInterfaceSpec {
 const STREAM_INTERFACE_SPECS: &[StreamInterfaceSpec] = &[
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "ReadableStream",
-            parent: None,
+            interface: web_api_interfaces::ReadableStream::DESCRIPTOR,
             kind: ConstructorKind::ReadableStream,
         },
         prototype_installer: StreamPrototypeInstaller::ReadableStream,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "ReadableStreamDefaultReader",
-            parent: None,
+            interface: web_api_interfaces::ReadableStreamDefaultReader::DESCRIPTOR,
             kind: ConstructorKind::ReadableStreamDefaultReader,
         },
         prototype_installer: StreamPrototypeInstaller::DefaultReader,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "ReadableStreamDefaultController",
-            parent: None,
+            interface: web_api_interfaces::ReadableStreamDefaultController::DESCRIPTOR,
             kind: ConstructorKind::ReadableStreamDefaultController,
         },
         prototype_installer: StreamPrototypeInstaller::Controller,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "WritableStream",
-            parent: None,
+            interface: web_api_interfaces::WritableStream::DESCRIPTOR,
             kind: ConstructorKind::WritableStream,
         },
         prototype_installer: StreamPrototypeInstaller::WritableStream,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "WritableStreamDefaultWriter",
-            parent: None,
+            interface: web_api_interfaces::WritableStreamDefaultWriter::DESCRIPTOR,
             kind: ConstructorKind::WritableStreamDefaultWriter,
         },
         prototype_installer: StreamPrototypeInstaller::DefaultWriter,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "WritableStreamDefaultController",
-            parent: None,
+            interface: web_api_interfaces::WritableStreamDefaultController::DESCRIPTOR,
             kind: ConstructorKind::WritableStreamDefaultController,
         },
         prototype_installer: StreamPrototypeInstaller::Controller,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "TransformStream",
-            parent: None,
+            interface: web_api_interfaces::TransformStream::DESCRIPTOR,
             kind: ConstructorKind::TransformStream,
         },
         prototype_installer: StreamPrototypeInstaller::TransformFamily,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "TransformStreamDefaultController",
-            parent: None,
+            interface: web_api_interfaces::TransformStreamDefaultController::DESCRIPTOR,
             kind: ConstructorKind::TransformStreamDefaultController,
         },
         prototype_installer: StreamPrototypeInstaller::Controller,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "TextEncoderStream",
-            parent: None,
+            interface: web_api_interfaces::TextEncoderStream::DESCRIPTOR,
             kind: ConstructorKind::TextEncoderStream,
         },
         prototype_installer: StreamPrototypeInstaller::TransformFamily,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "TextDecoderStream",
-            parent: None,
+            interface: web_api_interfaces::TextDecoderStream::DESCRIPTOR,
             kind: ConstructorKind::TextDecoderStream,
         },
         prototype_installer: StreamPrototypeInstaller::TransformFamily,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "ByteLengthQueuingStrategy",
-            parent: None,
+            interface: web_api_interfaces::ByteLengthQueuingStrategy::DESCRIPTOR,
             kind: ConstructorKind::ByteLengthQueuingStrategy,
         },
         prototype_installer: StreamPrototypeInstaller::QueuingStrategy,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "CountQueuingStrategy",
-            parent: None,
+            interface: web_api_interfaces::CountQueuingStrategy::DESCRIPTOR,
             kind: ConstructorKind::CountQueuingStrategy,
         },
         prototype_installer: StreamPrototypeInstaller::QueuingStrategy,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "CompressionStream",
-            parent: None,
+            interface: web_api_interfaces::CompressionStream::DESCRIPTOR,
             kind: ConstructorKind::CompressionStream,
         },
         prototype_installer: StreamPrototypeInstaller::Compression,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "DecompressionStream",
-            parent: None,
+            interface: web_api_interfaces::DecompressionStream::DESCRIPTOR,
             kind: ConstructorKind::DecompressionStream,
         },
         prototype_installer: StreamPrototypeInstaller::Compression,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "ReadableStreamBYOBReader",
-            parent: None,
+            interface: web_api_interfaces::ReadableStreamBYOBReader::DESCRIPTOR,
             kind: ConstructorKind::ReadableStreamByobReader,
         },
         prototype_installer: StreamPrototypeInstaller::ByobReader,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "ReadableStreamBYOBRequest",
-            parent: None,
+            interface: web_api_interfaces::ReadableStreamBYOBRequest::DESCRIPTOR,
             kind: ConstructorKind::Illegal,
         },
         prototype_installer: StreamPrototypeInstaller::ByobRequest,
     },
     StreamInterfaceSpec {
         constructor: ConstructorSpec {
-            name: "ReadableByteStreamController",
-            parent: None,
+            interface: web_api_interfaces::ReadableByteStreamController::DESCRIPTOR,
             kind: ConstructorKind::Illegal,
         },
         prototype_installer: StreamPrototypeInstaller::Controller,
     },
 ];
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(name = "ReadableStream", enumerable)]
+struct ReadableStreamConstructorDeclaration {
+    #[webapi(
+        static_method = "from",
+        length = 1,
+        callback = from::readable_stream_from_callback
+    )]
+    from: (),
+}
 
 pub(in crate::context_bootstrap) fn stream_constructor_specs()
 -> impl Iterator<Item = ConstructorSpec> {
@@ -204,7 +224,7 @@ pub(in crate::context_bootstrap) fn stream_constructor_specs()
 pub(in crate::context_bootstrap) fn stream_interface_names() -> impl Iterator<Item = &'static str> {
     STREAM_INTERFACE_SPECS
         .iter()
-        .map(|spec| spec.constructor.name)
+        .map(|spec| spec.constructor.interface.name())
 }
 
 pub(in crate::context_bootstrap) fn is_worker_exposed_stream_interface(name: &str) -> bool {
@@ -214,11 +234,11 @@ pub(in crate::context_bootstrap) fn is_worker_exposed_stream_interface(name: &st
 fn stream_interface_spec(name: &str) -> Option<&'static StreamInterfaceSpec> {
     STREAM_INTERFACE_SPECS
         .iter()
-        .find(|spec| spec.constructor.name == name)
+        .find(|spec| spec.constructor.interface.name() == name)
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ReadableStream", enumerable)]
+#[webapi(interface = web_api_interfaces::ReadableStream, enumerable)]
 struct ReadableStreamPrototypeDeclaration {
     #[webapi(method, length = 0, callback = readable_stream_get_reader_callback)]
     get_reader: (),
@@ -239,20 +259,20 @@ struct ReadableStreamPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "WritableStream", enumerable)]
+#[webapi(interface = web_api_interfaces::WritableStream, enumerable, receiver)]
 struct WritableStreamPrototypeDeclaration {
     #[webapi(method, length = 0, callback = writable_stream_get_writer_callback)]
     get_writer: (),
-    #[webapi(method, length = 0, callback = writable_stream_abort_callback)]
+    #[webapi(method, returns_promise, length = 0, callback = writable_stream_abort_callback)]
     abort: (),
-    #[webapi(method, length = 0, callback = writable_stream_close_callback)]
+    #[webapi(method, returns_promise, length = 0, callback = writable_stream_close_callback)]
     close: (),
     #[webapi(accessor_property, getter = writable_stream_locked_getter)]
     locked: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ReadableStreamDefaultReader", enumerable)]
+#[webapi(interface = web_api_interfaces::ReadableStreamDefaultReader, enumerable)]
 struct ReadableStreamDefaultReaderPrototypeDeclaration {
     #[webapi(method, length = 0, callback = readable_stream_reader_read_callback)]
     read: (),
@@ -265,7 +285,7 @@ struct ReadableStreamDefaultReaderPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ReadableStreamBYOBReader", enumerable)]
+#[webapi(interface = web_api_interfaces::ReadableStreamBYOBReader, enumerable)]
 struct ReadableStreamByobReaderPrototypeDeclaration {
     #[webapi(method, length = 1, callback = readable_stream_byob_reader_read_callback)]
     read: (),
@@ -278,7 +298,7 @@ struct ReadableStreamByobReaderPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ReadableStreamBYOBRequest", enumerable)]
+#[webapi(interface = web_api_interfaces::ReadableStreamBYOBRequest, enumerable)]
 struct ReadableStreamByobRequestPrototypeDeclaration {
     #[webapi(accessor_property, getter = readable_stream_byob_request_view_getter)]
     view: (),
@@ -293,7 +313,7 @@ struct ReadableStreamByobRequestPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "WritableStreamDefaultWriter", enumerable)]
+#[webapi(interface = web_api_interfaces::WritableStreamDefaultWriter, enumerable)]
 struct WritableStreamDefaultWriterPrototypeDeclaration {
     #[webapi(method, length = 0, callback = writable_stream_writer_write_callback)]
     write: (),
@@ -350,17 +370,7 @@ pub(crate) fn is_writable_stream_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> bool {
-    stream_slot_array(scope, object, WRITABLE_STREAM_STRATEGY_SLOT).is_some()
-}
-
-pub(crate) fn is_transform_stream_object<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-) -> bool {
-    stream_slot_object(scope, object, TRANSFORM_STREAM_READABLE_SLOT)
-        .is_some_and(|readable| is_readable_stream_object(scope, readable))
-        && stream_slot_object(scope, object, TRANSFORM_STREAM_WRITABLE_SLOT)
-            .is_some_and(|writable| is_writable_stream_object(scope, writable))
+    web_api_interfaces::WritableStream::is_instance(scope, object)
 }
 
 pub(super) fn install_stream_template_bindings<'s>(
@@ -374,6 +384,7 @@ pub(super) fn install_stream_template_bindings<'s>(
     let prototype = template.prototype_template(scope);
     match spec.prototype_installer {
         StreamPrototypeInstaller::ReadableStream => {
+            ReadableStreamConstructorDeclaration::initialize_template(scope, template);
             ReadableStreamPrototypeDeclaration::initialize_prototype_template(scope, prototype);
         }
         StreamPrototypeInstaller::WritableStream => {
@@ -441,8 +452,8 @@ mod catalog_tests {
 
         let registered_stream_names = crate::context_bootstrap::specs::constructor_specs()
             .into_iter()
-            .filter(|spec| is_worker_exposed_stream_interface(spec.name))
-            .map(|spec| spec.name)
+            .filter(|spec| is_worker_exposed_stream_interface(spec.interface.name()))
+            .map(|spec| spec.interface.name())
             .collect::<Vec<_>>();
         assert_eq!(registered_stream_names, catalog_names);
     }

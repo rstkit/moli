@@ -1,3 +1,4 @@
+use crate::web_api_interfaces;
 use std::{collections::HashMap, ffi::c_void};
 
 use anyhow::{Result, anyhow};
@@ -7,7 +8,7 @@ use super::super::context_bootstrap::bridge_descriptor::{
     WrapperKind, node_bridge_descriptor, node_bridge_descriptors,
 };
 use super::{
-    BridgeHandle, JsContextHost, ReflectorId, collections, document, element, traversal, window,
+    BridgeHandle, PageScriptHost, ReflectorId, collections, document, element, traversal, window,
 };
 
 mod native_template;
@@ -17,38 +18,81 @@ use native_template::build_native_bridge_template;
 use node_template::build_node_wrapper_template;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NativeBridgeGlobalDeclaration<'scope> {
     #[webapi(data_property = "__moliNativeBridge")]
     bridge: v8::Local<'scope, v8::Object>,
 }
 
-#[cfg(test)]
-thread_local! {
-    static WRAPPER_OWNER_REALM_CUSTOM_ELEMENT_CHECKS: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_wrapper_owner_realm_custom_element_checks_for_test() {
-    WRAPPER_OWNER_REALM_CUSTOM_ELEMENT_CHECKS.set(0);
-}
-
-#[cfg(test)]
-pub(crate) fn wrapper_owner_realm_custom_element_checks_for_test() -> u64 {
-    WRAPPER_OWNER_REALM_CUSTOM_ELEMENT_CHECKS.get()
-}
-
-#[cfg(test)]
-fn record_wrapper_owner_realm_custom_element_check_for_test() {
-    WRAPPER_OWNER_REALM_CUSTOM_ELEMENT_CHECKS.set(
-        WRAPPER_OWNER_REALM_CUSTOM_ELEMENT_CHECKS
-            .get()
-            .saturating_add(1),
-    );
-}
-
+/// Native Page ownership does not require V8 wrapper templates. The first
+/// Window bootstrap initializes these while its isolate is entered.
 pub(crate) struct NativeBridgeBindings {
+    isolate_ptr: v8::UnsafeRawIsolatePtr,
+    templates: Option<NativeBridgeTemplates>,
+}
+
+impl NativeBridgeBindings {
+    pub(crate) fn deferred(isolate_ptr: v8::UnsafeRawIsolatePtr) -> Self {
+        Self {
+            isolate_ptr,
+            templates: None,
+        }
+    }
+
+    pub(crate) fn build(
+        scope: &mut v8::PinScope<'_, '_, ()>,
+        isolate_ptr: v8::UnsafeRawIsolatePtr,
+        global: v8::Local<'_, v8::ObjectTemplate>,
+        cross_origin: v8::Local<'_, v8::ObjectTemplate>,
+    ) -> Self {
+        Self {
+            isolate_ptr,
+            templates: Some(NativeBridgeTemplates::build(
+                scope,
+                isolate_ptr,
+                global,
+                cross_origin,
+            )),
+        }
+    }
+
+    pub(crate) fn initialize_if_needed(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_, ()>,
+        global: v8::Local<'_, v8::ObjectTemplate>,
+        cross_origin: v8::Local<'_, v8::ObjectTemplate>,
+    ) {
+        if self.templates.is_none() {
+            *self = Self::build(scope, self.isolate_ptr, global, cross_origin);
+        }
+    }
+
+    pub(crate) fn build_peer_in_scope(&self, scope: &mut v8::PinScope<'_, '_>) -> Self {
+        Self {
+            isolate_ptr: self.isolate_ptr,
+            templates: Some(std::ops::Deref::deref(self).build_peer_in_scope(scope)),
+        }
+    }
+}
+
+impl std::ops::Deref for NativeBridgeBindings {
+    type Target = NativeBridgeTemplates;
+    fn deref(&self) -> &Self::Target {
+        self.templates
+            .as_ref()
+            .expect("Window bindings must be initialized before creating JS wrappers")
+    }
+}
+
+impl std::ops::DerefMut for NativeBridgeBindings {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.templates
+            .as_mut()
+            .expect("Window bindings must be initialized before creating JS wrappers")
+    }
+}
+
+pub(crate) struct NativeBridgeTemplates {
     isolate_ptr: v8::UnsafeRawIsolatePtr,
     window_global_template: v8::Global<v8::ObjectTemplate>,
     cross_origin_window_global_template: v8::Global<v8::ObjectTemplate>,
@@ -71,7 +115,7 @@ fn open_object_template<'a>(
     template: &'a v8::Global<v8::ObjectTemplate>,
 ) -> &'a v8::ObjectTemplate {
     let isolate = unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(isolate_ptr) };
-    // SAFETY: every template in NativeBridgeBindings belongs to this isolate,
+    // SAFETY: every template in NativeBridgeTemplates belongs to this isolate,
     // and these references are only exposed while its renderer thread owns and
     // has entered the isolate. The returned reference cannot outlive `template`.
     unsafe { template.open(isolate) }
@@ -88,7 +132,7 @@ fn wrapper_kind_for_handle(handle: &BridgeHandle) -> WrapperKind {
     }
 }
 
-fn prototype_name_for_handle(host_ptr: *mut JsContextHost, handle: &BridgeHandle) -> &'static str {
+fn prototype_name_for_handle(host_ptr: *mut PageScriptHost, handle: &BridgeHandle) -> &'static str {
     match handle {
         BridgeHandle::Window => "Window",
         BridgeHandle::ClassList(_, _) => "DOMTokenList",
@@ -104,11 +148,7 @@ fn prototype_name_for_handle(host_ptr: *mut JsContextHost, handle: &BridgeHandle
                     .node(*node_handle)
                     .map(|node| match node.data() {
                         crate::dom::native::NodeData::Document(document) => {
-                            if document.is_html_document() {
-                                "HTMLDocument"
-                            } else {
-                                "XMLDocument"
-                            }
+                            document.interface_name()
                         }
                         _ if node
                             .local_name()
@@ -129,7 +169,19 @@ fn prototype_name_for_handle(host_ptr: *mut JsContextHost, handle: &BridgeHandle
     }
 }
 
-impl NativeBridgeBindings {
+impl NativeBridgeTemplates {
+    pub(crate) fn build_peer_in_scope(&self, scope: &mut v8::PinScope<'_, '_>) -> Self {
+        let window_template = v8::Local::new(scope, &self.window_global_template);
+        let cross_origin_template =
+            v8::Local::new(scope, &self.cross_origin_window_global_template);
+        Self::build(
+            scope,
+            self.isolate_ptr,
+            window_template,
+            cross_origin_template,
+        )
+    }
+
     pub(crate) fn build(
         scope: &mut v8::PinScope<'_, '_, ()>,
         isolate_ptr: v8::UnsafeRawIsolatePtr,
@@ -139,8 +191,10 @@ impl NativeBridgeBindings {
         let mut node_wrapper_templates = HashMap::new();
         for descriptor in node_bridge_descriptors() {
             let template = build_node_wrapper_template(scope, descriptor);
-            node_wrapper_templates
-                .insert(descriptor.prototype_name, v8::Global::new(scope, template));
+            node_wrapper_templates.insert(
+                descriptor.interface.name(),
+                v8::Global::new(scope, template),
+            );
         }
 
         let bridge_template = build_native_bridge_template(scope);
@@ -203,13 +257,13 @@ impl NativeBridgeBindings {
     }
 
     /// Install the native bridge global object with two internal fields:
-    /// - field 0: `*mut JsContextHost` (for `runtime_ptr_from_object` compatibility)
-    /// - field 1: `*const RefCell<JsContextHost>` from the per-context bridge-ref token
+    /// - field 0: `*mut PageScriptHost` (for `runtime_ptr_from_object` compatibility)
+    /// - field 1: `*const RefCell<PageScriptHost>` from the per-context bridge-ref token
     pub(super) fn install_global<'s>(
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
         global: v8::Local<'s, v8::Object>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         rc_ptr: *mut c_void,
     ) -> Result<()> {
         let template = self.bridge_template();
@@ -230,7 +284,7 @@ impl NativeBridgeBindings {
     pub(super) fn instantiate_wrapper<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: BridgeHandle,
         reflector_id: ReflectorId,
     ) -> v8::Local<'s, v8::Object> {
@@ -277,8 +331,18 @@ impl NativeBridgeBindings {
                 "`{prototype_name}` wrapper must expose its reflector identity field"
             );
         }
+        web_api_interfaces::initialize(scope, wrapper, prototype_name)
+            .expect("native wrapper identity should initialize");
         set_named_constructor_prototype(scope, wrapper, prototype_name);
-        self.sync_wrapper_owner_realm_prototype(scope, host_ptr, &handle, wrapper);
+        if matches!(prototype_name, "Document" | "HTMLDocument" | "XMLDocument") {
+            crate::context_bootstrap::install_constructed_document_location_runtime_state(
+                scope, wrapper,
+            )
+            .expect("Document.location should initialize on its native wrapper");
+        }
+        if matches!(wrapper_kind, WrapperKind::Window) {
+            window::sync_window_wrapper_function_identity(scope, wrapper);
+        }
         if matches!(wrapper_kind, WrapperKind::Node) {
             let descriptor = node_bridge_descriptor(prototype_name).unwrap_or_else(|| {
                 panic!("missing native bridge descriptor for `{prototype_name}`")
@@ -292,55 +356,10 @@ impl NativeBridgeBindings {
         wrapper
     }
 
-    pub(super) fn sync_wrapper_owner_realm_prototype(
-        &mut self,
-        scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
-        handle: &BridgeHandle,
-        wrapper: v8::Local<'_, v8::Object>,
-    ) {
-        if matches!(handle, BridgeHandle::Window) {
-            window::sync_window_wrapper_function_identity(scope, wrapper);
-            return;
-        }
-        let BridgeHandle::Node(node_handle) = handle else {
-            return;
-        };
-        let child_handle = {
-            let host = unsafe { &*host_ptr };
-            let Some(document_handle) = host.dom_host().owner_document_handle(*node_handle) else {
-                return;
-            };
-            let Some(child_handle) =
-                host.child_browsing_context_host_for_document_handle(document_handle)
-            else {
-                return;
-            };
-            child_handle
-        };
-        #[cfg(test)]
-        record_wrapper_owner_realm_custom_element_check_for_test();
-        if unsafe { &*host_ptr }.custom_element_handle_is_upgraded(*node_handle) {
-            return;
-        }
-        let prototype_name = prototype_name_for_handle(host_ptr, handle);
-        if let Some(prototype) = unsafe { &mut *host_ptr }
-            .child_browsing_context_constructor_prototype(scope, child_handle, prototype_name)
-        {
-            let updated = wrapper.set_prototype(scope, prototype).unwrap_or_else(|| {
-                panic!("failed to set child-realm `{prototype_name}` wrapper prototype")
-            });
-            assert!(
-                updated,
-                "V8 rejected the child-realm `{prototype_name}` wrapper prototype"
-            );
-        }
-    }
-
     pub(super) fn instantiate_window_shell<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> v8::Local<'s, v8::Object> {
         let wrapper = self
             .window_wrapper_template()
@@ -355,6 +374,9 @@ impl NativeBridgeBindings {
             wrapper.set_internal_field(1, v8::Number::new(scope, 0.0).into()),
             "synthetic Window wrapper must expose its shell marker"
         );
+        web_api_interfaces::Window::DESCRIPTOR
+            .initialize(scope, wrapper)
+            .expect("synthetic Window identity should initialize");
         set_named_constructor_prototype(scope, wrapper, "Window");
         wrapper
     }
@@ -368,7 +390,6 @@ impl NativeBridgeBindings {
         // properties, especially non-configurable Window.location, before
         // its cross-origin accessors are installed.
         let global_template = v8::Local::new(scope, &self.cross_origin_window_global_template);
-        let parent_security_token = scope.get_current_context().get_security_token(scope);
         let context = v8::Context::new(
             scope,
             v8::ContextOptions {
@@ -376,7 +397,8 @@ impl NativeBridgeBindings {
                 ..Default::default()
             },
         );
-        context.set_security_token(parent_security_token);
+        // A facade has no LocalWindow identity. Its unique default token must
+        // force every external access through the cross-origin handlers.
         let global = context.global(scope);
         (global, v8::Global::new(scope, context))
     }
@@ -431,7 +453,7 @@ impl NativeBridgeBindings {
         open_object_template(&mut self.isolate_ptr, &self.bridge_template)
     }
 
-    fn node_wrapper_template(
+    pub(super) fn node_wrapper_template(
         &mut self,
         prototype_name: &'static str,
     ) -> Option<&v8::ObjectTemplate> {

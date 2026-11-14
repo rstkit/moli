@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    ops::{Deref, DerefMut},
+    ops::{ControlFlow, Deref, DerefMut},
     rc::Rc,
 };
 
@@ -15,7 +15,9 @@ use xml5ever::{
 };
 
 use super::{html_chunks, xml_tree_viewer::transform_document_to_xml_tree_view};
-use moli_dom::native::{Attribute as NativeAttribute, DomHost, NativeDom, NativeNodeId, Node};
+use moli_dom::native::{
+    Attribute as NativeAttribute, DomHost, NativeDom, NativeNodeId, Node, ParserConstruction,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct XmlParser;
@@ -57,6 +59,7 @@ impl DerefMut for XmlDomHost<'_> {
 }
 
 struct XmlLiveTreeSinkTarget<'a> {
+    construction: ParserConstruction,
     dom_host: XmlDomHost<'a>,
     document_handle: NativeNodeId,
 }
@@ -80,6 +83,9 @@ impl XmlParser {
         present_unstyled_xml: bool,
     ) -> NativeDom {
         let sink = XmlDocumentSink::new(XmlLiveTreeSinkTarget::new_owned(final_url));
+        if sink.note_lexical_errors(&xml).is_break() {
+            return sink.finish().finish_document();
+        }
         let mut parser = parse_xml_document(sink, XmlParseOpts::default());
         for chunk in html_chunks(&xml) {
             parser.process(XmlStrTendril::from(chunk));
@@ -105,6 +111,10 @@ impl XmlParser {
     ) -> Option<()> {
         let target = XmlLiveTreeSinkTarget::new_borrowed(dom_host, document_handle)?;
         let sink = XmlDocumentSink::new(target);
+        if sink.note_lexical_errors(xml).is_break() {
+            sink.finish().finish_live_tree();
+            return Some(());
+        }
         let mut parser = parse_xml_document(sink, XmlParseOpts::default());
         for chunk in html_chunks(xml) {
             parser.process(XmlStrTendril::from(chunk));
@@ -132,6 +142,27 @@ impl PartialEq for XmlParseHandle {
 impl Eq for XmlParseHandle {}
 
 impl<'a> XmlDocumentSink<'a> {
+    /// Keep partial trees for errors inside the document element, but stop
+    /// before tree construction when the prologue itself is malformed.
+    fn note_lexical_errors(&self, source: &str) -> ControlFlow<()> {
+        let mut saw_document_element = false;
+        for token in xmlparser::Tokenizer::from(source) {
+            match token {
+                Ok(xmlparser::Token::ElementStart { .. }) => saw_document_element = true,
+                Err(error) => {
+                    self.parse_error(Cow::Owned(error.to_string()));
+                    return if saw_document_element {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    };
+                }
+                Ok(_) => {}
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
     fn new(target: XmlLiveTreeSinkTarget<'a>) -> Self {
         Self {
             target: RefCell::new(target),
@@ -145,6 +176,7 @@ impl XmlLiveTreeSinkTarget<'static> {
         let dom_host = DomHost::from_dom(NativeDom::new_xml(final_url));
         let document_handle = dom_host.document_handle();
         Self {
+            construction: ParserConstruction::default(),
             dom_host: XmlDomHost::Owned(Box::new(dom_host)),
             document_handle,
         }
@@ -169,6 +201,7 @@ impl<'a> XmlLiveTreeSinkTarget<'a> {
             return None;
         }
         Some(Self {
+            construction: ParserConstruction::default(),
             dom_host: XmlDomHost::Borrowed(dom_host),
             document_handle,
         })
@@ -197,14 +230,13 @@ impl<'a> XmlLiveTreeSinkTarget<'a> {
                 )
             })
             .collect::<Vec<_>>();
-        let node_id = self
-            .dom_host
-            .create_parser_element_without_attributes_for_document(
-                self.document_handle,
-                name.local.to_string(),
-                name.ns.to_string(),
-                name.prefix.as_ref().map(|prefix| prefix.to_string()),
-            );
+        let node_id = self.construction.create_element(
+            &mut self.dom_host,
+            self.document_handle,
+            name.local.to_string(),
+            name.ns.to_string(),
+            name.prefix.as_ref().map(|prefix| prefix.to_string()),
+        );
         self.dom_host
             .add_attrs_if_missing_for_parser(node_id, attributes);
         XmlParseHandle::new(node_id, Some(element_name))
@@ -426,8 +458,8 @@ impl<'a> XmlLiveTreeSinkTarget<'a> {
 
         for attribute in attrs {
             let already_exists = element.attributes().iter().any(|existing| {
-                existing.namespace() == attribute.name.ns.as_ref()
-                    && existing.local_name() == attribute.name.local.as_ref()
+                existing.namespace() == AsRef::<str>::as_ref(&attribute.name.ns)
+                    && existing.local_name() == AsRef::<str>::as_ref(&attribute.name.local)
                     && existing.prefix()
                         == attribute.name.prefix.as_ref().map(|prefix| prefix.as_ref())
             });
@@ -467,7 +499,9 @@ impl<'host> XmlTreeSinkBase for XmlDocumentSink<'host> {
         Self: 'a;
 
     fn finish(self) -> Self::Output {
-        self.target.into_inner()
+        let target = self.target.into_inner();
+        target.construction.finish();
+        target
     }
 
     fn parse_error(&self, err: Cow<'static, str>) {
@@ -555,6 +589,13 @@ impl<'host> XmlTreeSinkBase for XmlDocumentSink<'host> {
         left == right
     }
 
+    fn pop(&self, node: &Self::Handle) {
+        let target = &mut *self.target.borrow_mut();
+        let _ = target
+            .construction
+            .finish_children(&mut target.dom_host, node.node_id);
+    }
+
     fn set_quirks_mode(&self, mode: XmlQuirksMode) {
         self.quirks_mode.set(mode);
     }
@@ -587,6 +628,170 @@ mod tests {
     use super::XmlParser;
     use moli_dom::native::{DomHost, NativeDom, NativeNodeId, Node, NodeType};
     use url::Url;
+
+    #[test]
+    fn xml_parser_discards_recovered_tree_after_doctype_error() {
+        let url = Url::parse("https://example.test/doctype.xml").unwrap();
+        let invalid = XmlParser.parse(
+            url.clone(),
+            concat!(
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\">",
+                "<html><div id=\"test\"/></html>"
+            )
+            .to_owned(),
+        );
+        assert!(!invalid.parse_errors().is_empty());
+        assert!(
+            invalid
+                .child_ids(invalid.document_node_id())
+                .all(|child| !invalid.node(child).is_some_and(Node::is_element))
+        );
+
+        let mut host = DomHost::from_dom(NativeDom::new_html(url.clone()));
+        let document = host.create_detached_xml_document();
+        XmlParser
+            .parse_inert_tree_into_document(
+                &mut host,
+                document,
+                "<!DOCTYPE html PUBLIC \"public\"><html><div/></html>",
+            )
+            .unwrap();
+        assert!(host.child_handles(document).next().is_none());
+        assert!(!host.snapshot_document().parse_errors().is_empty());
+
+        for system_id in ["", "x"] {
+            let valid = XmlParser.parse(
+                url.clone(),
+                format!(
+                    "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"{system_id}\"><html/>"
+                ),
+            );
+            assert!(
+                valid.parse_errors().is_empty(),
+                "system ID `{system_id}` should be accepted: {:?}",
+                valid.parse_errors()
+            );
+        }
+    }
+
+    #[test]
+    fn xml_parser_rejects_malformed_attributes_without_rejecting_distinct_namespaces() {
+        let prologue = "<html xmlns='http://www.w3.org/1999/xhtml' xml:lang='en' lang='en'><body>";
+        for fragment in [
+            "<span novalue/>",
+            "<span =\"noattr\"/>",
+            "<span xmlns:='urn:test'/>",
+            "<span data-test=testing/>",
+            "<8:test xmlns:8='urn:test'/>",
+            "<span xmlns:p1 xmlns:p2='urn:test'/>",
+        ] {
+            for source in [
+                fragment.to_owned(),
+                format!("{prologue}{fragment}</body></html>"),
+            ] {
+                let dom = XmlParser.parse(
+                    Url::parse("https://xml.test/malformed.xml").unwrap(),
+                    source.clone(),
+                );
+                assert!(
+                    !dom.parse_errors().is_empty(),
+                    "{source} must report malformed XML"
+                );
+            }
+        }
+        let valid = format!(
+            "{prologue}<span data-test='testing' xmlns:p='urn:test' p:attr='x'/></body></html>"
+        );
+        let dom = XmlParser.parse(Url::parse("https://xml.test/valid.xml").unwrap(), valid);
+        assert!(dom.parse_errors().is_empty(), "{:?}", dom.parse_errors());
+    }
+
+    #[test]
+    fn xml_numeric_references_follow_xml_chars_without_html_replacements() {
+        for unit in [
+            0x9, 0xa, 0xd, 0x20, 0x7f, 0x80, 0x85, 0x91, 0x9f, 0xd7ff, 0xe000, 0xfdd0, 0xfdef,
+            0xfffd, 0x10000, 0x1fffe, 0x1ffff, 0x10ffff,
+        ] {
+            let expected = char::from_u32(unit).unwrap().to_string();
+            for reference in [format!("&#{unit};"), format!("&#x{unit:X};")] {
+                for quote in ['\'', '"'] {
+                    let source = format!(
+                        "<root xmlns:p='urn:test' p:v={quote}{reference}{quote}>{reference}</root>"
+                    );
+                    let dom = XmlParser.parse(
+                        Url::parse("https://xml.test/character-reference.xml").unwrap(),
+                        source.clone(),
+                    );
+                    assert!(
+                        dom.parse_errors().is_empty(),
+                        "{source}: {:?}",
+                        dom.parse_errors()
+                    );
+                    let root = dom.document_element_node_id().unwrap();
+                    let element = dom.node(root).and_then(Node::as_element).unwrap();
+                    let attribute = element
+                        .attributes()
+                        .iter()
+                        .find(|attribute| attribute.namespace() == "urn:test")
+                        .unwrap();
+                    assert_eq!(attribute.value(), expected, "{source}");
+                    assert_eq!(
+                        dom.text_content(root).as_deref(),
+                        Some(expected.as_str()),
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn xml_numeric_references_reject_values_outside_xml_char() {
+        for value in [
+            "0",
+            "1",
+            "8",
+            "11",
+            "12",
+            "14",
+            "31",
+            "55296",
+            "57343",
+            "65534",
+            "65535",
+            "1114112",
+            "999999999999999999999999999999999999",
+        ] {
+            for source in [
+                format!("<root v='&#{value};'/>"),
+                format!("<root>&#{value};</root>"),
+            ] {
+                let dom = XmlParser.parse(
+                    Url::parse("https://xml.test/invalid-character-reference.xml").unwrap(),
+                    source.clone(),
+                );
+                assert!(!dom.parse_errors().is_empty(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn xml_style_children_finish_at_close() {
+        for namespace in ["http://www.w3.org/1999/xhtml", "http://www.w3.org/2000/svg"] {
+            let document = XmlParser.parse(
+                Url::parse("https://example.test/style.xml").unwrap(),
+                format!("<style xmlns='{namespace}'>p {{ color: blue; }}</style>"),
+            );
+            let root = document.document_element_node_id().unwrap();
+            assert!(
+                !document
+                    .node(root)
+                    .and_then(Node::as_element)
+                    .unwrap()
+                    .style_children_parsing()
+            );
+        }
+    }
 
     #[test]
     fn xml_parser_preserves_namespace_declarations_as_dom_attributes() {
@@ -647,6 +852,41 @@ mod tests {
         assert_eq!(child_attributes.len(), 1);
         assert_eq!(child_attributes[0].name(), "xmlns");
         assert_eq!(child_attributes[0].value(), "urn:nested");
+    }
+
+    #[test]
+    fn xml_parser_finishes_styles_in_owned_and_borrowed_documents() {
+        let url = Url::parse("https://example.test/style.xml").unwrap();
+        for namespace in ["http://www.w3.org/1999/xhtml", "http://www.w3.org/2000/svg"] {
+            for ending in [
+                "/>",
+                "><![CDATA[body { color: red; }]]></style>",
+                ">body { color: red; }",
+            ] {
+                let source = format!("<style xmlns='{namespace}'{ending}");
+                let parsed = XmlParser.parse(url.clone(), source.clone());
+                let style = document_element(&parsed);
+                assert!(
+                    !parsed
+                        .node(style)
+                        .and_then(Node::as_element)
+                        .unwrap()
+                        .style_children_parsing(),
+                    "owned XML parse must finish style children: {source}"
+                );
+
+                let mut host = DomHost::from_dom(NativeDom::new_html(url.clone()));
+                let document = host.create_detached_xml_document();
+                XmlParser
+                    .parse_inert_tree_into_document(&mut host, document, &source)
+                    .unwrap();
+                let style = host.child_handles(document).next().unwrap();
+                assert!(
+                    !host.is_style_element_parsing_children(style),
+                    "borrowed XML parse must finish style children: {source}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -751,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn xml_parser_existing_document_html_template_uses_the_target_document_url() {
+    fn xml_parser_existing_document_html_template_uses_an_independent_inert_owner() {
         let parser = XmlParser;
         let mut host = DomHost::from_dom(NativeDom::new_html(
             Url::parse("https://parent.example.test/").unwrap(),
@@ -794,11 +1034,33 @@ mod tests {
 
         assert_ne!(inert_document, host.document_handle());
         assert_ne!(inert_document, child_document);
+        let inert = host
+            .node(inert_document)
+            .and_then(Node::as_document)
+            .unwrap();
+        assert_eq!(inert.url().as_str(), "about:blank");
+        assert_eq!(inert.base_url().as_str(), "about:blank");
+        assert!(!inert.is_html_document());
         assert_eq!(
-            host.node(inert_document)
+            host.node(child_document)
                 .and_then(Node::as_document)
                 .map(|document| document.url()),
             Some(&child_url)
+        );
+        let peer = host.create_element_without_attributes_for_document(
+            child_document,
+            "template".into(),
+            "http://www.w3.org/1999/xhtml".into(),
+            None,
+        );
+        let peer_contents = host
+            .node(peer)
+            .and_then(Node::as_element)
+            .and_then(|element| element.template_contents())
+            .unwrap();
+        assert_eq!(
+            host.owner_document_handle(peer_contents),
+            Some(inert_document)
         );
     }
 

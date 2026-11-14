@@ -1,4 +1,4 @@
-use crate::devtools_runtime::DevToolsProtocol;
+use crate::automation::FrontendProtocol;
 use serde_json::Value;
 
 use crate::conn::Cmd;
@@ -26,11 +26,12 @@ fn cdp_create_target_builds_protocol_neutral_target_command() {
             for_tab: None,
             background: None,
             focus: None,
+            new_window: None,
         },
     )
     .expect("valid target disposition");
 
-    assert_eq!(command.context.protocol, DevToolsProtocol::Cdp);
+    assert_eq!(command.context.protocol, FrontendProtocol::Cdp);
     assert_eq!(
         command.context.session_id.as_ref().map(|id| id.as_str()),
         Some("SID-create")
@@ -70,7 +71,7 @@ fn cdp_close_target_builds_protocol_neutral_target_command() {
         },
     );
 
-    assert_eq!(command.context.protocol, DevToolsProtocol::Cdp);
+    assert_eq!(command.context.protocol, FrontendProtocol::Cdp);
     assert_eq!(
         command.context.session_id.as_ref().map(|id| id.as_str()),
         Some("SID-close")
@@ -101,7 +102,7 @@ fn cdp_activate_target_builds_protocol_neutral_target_command() {
         },
     );
 
-    assert_eq!(command.context.protocol, DevToolsProtocol::Cdp);
+    assert_eq!(command.context.protocol, FrontendProtocol::Cdp);
     assert_eq!(
         command.context.session_id.as_ref().map(|id| id.as_str()),
         Some("SID-activate")

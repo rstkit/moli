@@ -4,12 +4,13 @@ use std::sync::{
 };
 
 use anyhow::{Result, anyhow};
-use http::HeaderName;
-use indexmap::IndexMap;
 use moli_fetch::{Request, RequestCacheMode, url_pattern_matches};
 use parking_lot::Mutex;
 
-use crate::{protocol_types::OptionalResourceFetchMask, types::SubresourceResourceType};
+use crate::{
+    protocol_types::OptionalResourceFetchMask,
+    types::{SubresourceInterceptionClasses, SubresourceResourceType},
+};
 
 const BLOCKED_BY_CLIENT_ERROR_TEXT: &str = "net::ERR_BLOCKED_BY_CLIENT";
 static NEXT_MEMORY_CACHE_PARTITION_ID: AtomicU64 = AtomicU64::new(0);
@@ -21,7 +22,7 @@ fn next_memory_cache_partition_id() -> u64 {
         .expect("Page memory-cache partition id exhausted")
 }
 
-type SharedHeaderList = Arc<[(Box<str>, Box<str>)]>;
+type SharedHeaderList = Arc<[(Box<str>, Box<[u8]>)]>;
 type SharedPatternList = Arc<[Box<str>]>;
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,7 @@ struct PageNetworkPolicyState {
     revision: u64,
     memory_cache_partition_id: u64,
     extra_http_headers: SharedHeaderList,
+    browser_identity: Option<Arc<moli_browser_profile::BrowserIdentityProfile>>,
     blocked_url_patterns: SharedPatternList,
     optional_resource_fetch_mask: OptionalResourceFetchMask,
     subframe_loading_enabled: bool,
@@ -52,6 +54,7 @@ impl Default for PageNetworkPolicyState {
             revision: 0,
             memory_cache_partition_id: next_memory_cache_partition_id(),
             extra_http_headers: Arc::from([]),
+            browser_identity: None,
             blocked_url_patterns: Arc::from([]),
             optional_resource_fetch_mask: OptionalResourceFetchMask::NONE,
             subframe_loading_enabled: true,
@@ -92,6 +95,7 @@ impl PageNetworkConditionsState {
 pub struct PageNetworkPolicy {
     state: Arc<Mutex<PageNetworkPolicyState>>,
     network_conditions: Arc<Mutex<PageNetworkConditionsState>>,
+    subresource_interception: Arc<Mutex<SubresourceInterceptionClasses>>,
 }
 
 impl Default for PageNetworkPolicy {
@@ -99,6 +103,7 @@ impl Default for PageNetworkPolicy {
         Self {
             state: Arc::new(Mutex::new(PageNetworkPolicyState::default())),
             network_conditions: Arc::new(Mutex::new(PageNetworkConditionsState::default())),
+            subresource_interception: Arc::default(),
         }
     }
 }
@@ -118,12 +123,13 @@ impl PageNetworkPolicy {
         Self {
             state: Arc::new(Mutex::new(state)),
             network_conditions: Arc::new(Mutex::new(PageNetworkConditionsState::default())),
+            subresource_interception: Arc::default(),
         }
     }
 
-    /// Returns a policy with the same current values and independent mutable
-    /// state. This is the target-creation boundary; ordinary `clone()` keeps
-    /// sharing the original target policy.
+    /// Copies request configuration and network conditions into a new target.
+    /// Target-local protocol interception starts disabled; ordinary
+    /// `clone()` keeps sharing the original target policy.
     pub fn isolated_copy(&self) -> Self {
         Self::from_snapshot(self.snapshot())
     }
@@ -131,12 +137,15 @@ impl PageNetworkPolicy {
     /// Returns a Document-owned mutable view within the same Page target.
     ///
     /// Renderer Documents need independent request-policy state, but resource
-    /// reuse across top-level navigation remains owned by the stable Page.
+    /// reuse across top-level navigation and protocol interception remain
+    /// owned by the stable Page.
     pub fn isolated_same_page_copy(&self) -> Self {
-        Self::from_snapshot_with_memory_cache_partition(
+        let mut copy = Self::from_snapshot_with_memory_cache_partition(
             self.snapshot(),
             self.memory_cache_partition_id(),
-        )
+        );
+        copy.subresource_interception = Arc::clone(&self.subresource_interception);
+        copy
     }
 
     pub fn shares_memory_cache_partition_with(&self, other: &Self) -> bool {
@@ -156,6 +165,7 @@ impl PageNetworkPolicy {
                 revision: snapshot.configuration_revision,
                 memory_cache_partition_id,
                 extra_http_headers: snapshot.extra_http_headers,
+                browser_identity: snapshot.browser_identity,
                 blocked_url_patterns: snapshot.blocked_url_patterns,
                 optional_resource_fetch_mask: snapshot.optional_resource_fetch_mask,
                 subframe_loading_enabled: snapshot.subframe_loading_enabled,
@@ -167,23 +177,26 @@ impl PageNetworkPolicy {
                 revision: snapshot.network_conditions_revision,
                 offline: snapshot.network_offline,
             })),
+            subresource_interception: Arc::default(),
         }
     }
 
     /// Freezes request configuration while retaining the target's live
-    /// network-emulation conditions.
+    /// network-emulation conditions and interception rules.
     ///
     /// A resource lease uses this view to keep its original backend, headers
     /// and blocked-URL policy across re-entry. It deliberately continues to
     /// observe `Network.emulateNetworkConditions`, including while a DevTools
-    /// request-stage interception is paused.
+    /// request-stage interception is paused. Interception rules also stay live
+    /// so existing Documents and workers observe subsequent enable/disable calls.
     pub(crate) fn frozen_request_view(&self) -> Self {
         let snapshot = self.snapshot();
         Self {
             state: Arc::new(Mutex::new(PageNetworkPolicyState {
                 revision: snapshot.configuration_revision,
-                memory_cache_partition_id: self.memory_cache_partition_id(),
+                memory_cache_partition_id: snapshot.memory_cache_partition_id,
                 extra_http_headers: snapshot.extra_http_headers,
+                browser_identity: snapshot.browser_identity,
                 blocked_url_patterns: snapshot.blocked_url_patterns,
                 optional_resource_fetch_mask: snapshot.optional_resource_fetch_mask,
                 subframe_loading_enabled: snapshot.subframe_loading_enabled,
@@ -192,6 +205,7 @@ impl PageNetworkPolicy {
                 cache_disabled: snapshot.cache_disabled,
             })),
             network_conditions: Arc::clone(&self.network_conditions),
+            subresource_interception: Arc::clone(&self.subresource_interception),
         }
     }
 
@@ -202,11 +216,16 @@ impl PageNetworkPolicy {
     pub fn shares_state_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.state, &other.state)
             && Arc::ptr_eq(&self.network_conditions, &other.network_conditions)
+            && Arc::ptr_eq(
+                &self.subresource_interception,
+                &other.subresource_interception,
+            )
     }
 
     /// Captures the current request configuration and network conditions.
     ///
-    /// A normal request preparation retains this complete snapshot. A
+    /// Protocol interception stays with its target and is not copied into
+    /// snapshots. A normal request preparation retains this snapshot. A
     /// long-lived resource lease instead uses [`Self::frozen_request_view`] so
     /// that DevTools network conditions remain live while request
     /// configuration cannot drift across JavaScript/CDP re-entry.
@@ -214,9 +233,11 @@ impl PageNetworkPolicy {
         let state = self.state.lock();
         let network_conditions = self.network_conditions.lock();
         PageNetworkPolicySnapshot {
+            memory_cache_partition_id: state.memory_cache_partition_id,
             configuration_revision: state.revision,
             network_conditions_revision: network_conditions.revision,
             extra_http_headers: state.extra_http_headers.clone(),
+            browser_identity: state.browser_identity.clone(),
             network_offline: network_conditions.offline,
             blocked_url_patterns: state.blocked_url_patterns.clone(),
             optional_resource_fetch_mask: state.optional_resource_fetch_mask,
@@ -231,13 +252,13 @@ impl PageNetworkPolicy {
         self.snapshot().revision()
     }
 
-    pub fn set_extra_http_headers(&self, headers: &[(String, String)]) {
+    pub fn set_extra_http_headers(&self, headers: &moli_fetch::RequestHeaders) {
         let headers = headers
             .iter()
             .map(|(name, value)| {
                 (
                     name.clone().into_boxed_str(),
-                    value.clone().into_boxed_str(),
+                    value.clone().into_boxed_slice(),
                 )
             })
             .collect::<Vec<_>>();
@@ -248,6 +269,27 @@ impl PageNetworkPolicy {
         }
         state.extra_http_headers = headers;
         state.advance_revision();
+    }
+
+    pub(crate) fn set_browser_identity_override(
+        &self,
+        identity: Option<Arc<moli_browser_profile::BrowserIdentityProfile>>,
+    ) {
+        let mut state = self.state.lock();
+        if state.browser_identity == identity {
+            return;
+        }
+        state.browser_identity = identity;
+        // Worker imports must not reuse renderer-cache responses prepared for
+        // a different identity. The shared transport/cache budget is unchanged.
+        state.memory_cache_partition_id = next_memory_cache_partition_id();
+        state.advance_revision();
+    }
+
+    pub(crate) fn browser_identity_override(
+        &self,
+    ) -> Option<Arc<moli_browser_profile::BrowserIdentityProfile>> {
+        self.state.lock().browser_identity.clone()
     }
 
     pub fn set_network_offline(&self, offline: bool) {
@@ -271,6 +313,24 @@ impl PageNetworkPolicy {
         }
         state.blocked_url_patterns = patterns;
         state.advance_revision();
+    }
+
+    /// Live target eligibility only. Protocol rules and session ordering stay
+    /// with their canonical protocol owner, rather than being copied to XHR.
+    pub fn set_subresource_interception(&self, classes: SubresourceInterceptionClasses) {
+        *self.subresource_interception.lock() = classes;
+    }
+
+    pub(crate) fn subresource_interception_config(&self) -> SubresourceInterceptionClasses {
+        *self.subresource_interception.lock()
+    }
+
+    pub(crate) fn should_intercept_subresource(
+        &self,
+        resource_type: SubresourceResourceType,
+    ) -> bool {
+        self.subresource_interception_config()
+            .intercepts(resource_type)
     }
 
     pub fn set_optional_resource_fetch_mask(&self, mask: OptionalResourceFetchMask) {
@@ -359,9 +419,11 @@ impl PageNetworkPolicy {
 /// mutation cannot alter a request already being prepared.
 #[derive(Debug, Clone)]
 pub struct PageNetworkPolicySnapshot {
+    memory_cache_partition_id: u64,
     configuration_revision: u64,
     network_conditions_revision: u64,
     extra_http_headers: SharedHeaderList,
+    browser_identity: Option<Arc<moli_browser_profile::BrowserIdentityProfile>>,
     network_offline: bool,
     blocked_url_patterns: SharedPatternList,
     optional_resource_fetch_mask: OptionalResourceFetchMask,
@@ -407,7 +469,27 @@ impl PageNetworkPolicySnapshot {
             .any(|pattern| url_pattern_matches(pattern, url.as_str()))
     }
 
+    /// Merge headers without enforcing network availability or resource policy.
+    /// Existing request fields, including empty values, take precedence.
+    pub(crate) fn apply_request_headers(&self, request: &mut Request) {
+        if !self.extra_http_headers.is_empty() {
+            let headers = moli_fetch::RequestHeaders::from_bytes(
+                self.extra_http_headers
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_vec()))
+                    .collect(),
+            );
+            request.apply_default_headers(&headers);
+        }
+    }
+
     pub(crate) fn apply_to_request(&self, mut request: Request) -> Result<Request> {
+        // Worker fetch/XHR enforce their loading policy at the API boundary,
+        // but still inherit the identity captured by their resource lease.
+        if let Some(identity) = &self.browser_identity {
+            request = request.with_browser_identity(identity.clone());
+        }
+
         if !request.uses_page_network_policy() {
             return Ok(request);
         }
@@ -428,42 +510,13 @@ impl PageNetworkPolicySnapshot {
             return Err(anyhow!(BLOCKED_BY_CLIENT_ERROR_TEXT));
         }
 
-        if self.cache_disabled {
+        if self.cache_disabled && request.cache_mode() != RequestCacheMode::NoStore {
             request = request.with_cache_mode(RequestCacheMode::Bypass);
         }
 
-        if !self.extra_http_headers.is_empty() {
-            request.request_headers = merge_page_network_policy_headers(
-                &self.extra_http_headers,
-                &request.request_headers,
-            );
-        }
+        self.apply_request_headers(&mut request);
         Ok(request)
     }
-}
-
-fn merge_page_network_policy_headers(
-    context_headers: &[(Box<str>, Box<str>)],
-    request_headers: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut merged = IndexMap::<String, (String, String)>::new();
-    for (name, value) in context_headers {
-        merged
-            .entry(header_name_key(name))
-            .or_insert_with(|| (name.to_string(), value.to_string()));
-    }
-    for (name, value) in request_headers {
-        let key = header_name_key(name);
-        merged.shift_remove(&key);
-        merged.insert(key, (name.clone(), value.clone()));
-    }
-    merged.into_values().collect()
-}
-
-fn header_name_key(name: &str) -> String {
-    HeaderName::from_bytes(name.as_bytes())
-        .map(|name| name.as_str().to_owned())
-        .unwrap_or_else(|_| name.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -471,9 +524,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn interception_eligibility_follows_same_target_views_only() {
+        let page = PageNetworkPolicy::default();
+        let document = page.isolated_same_page_copy();
+        let worker = page.frozen_request_view();
+        page.set_subresource_interception(SubresourceInterceptionClasses::FETCH_LIKE);
+        let target = page.isolated_copy();
+        for view in [&page, &document, &worker] {
+            assert!(view.should_intercept_subresource(SubresourceResourceType::Xhr));
+            assert!(!view.should_intercept_subresource(SubresourceResourceType::Image));
+        }
+        assert!(!target.should_intercept_subresource(SubresourceResourceType::Xhr));
+        page.set_subresource_interception(SubresourceInterceptionClasses::NONE);
+        for view in [&page, &document, &worker] {
+            assert!(!view.should_intercept_subresource(SubresourceResourceType::Xhr));
+        }
+        assert!(!target.should_intercept_subresource(SubresourceResourceType::Xhr));
+    }
+
+    #[test]
     fn isolated_policy_copy_preserves_values_without_sharing_mutations() {
         let policy = PageNetworkPolicy::new(OptionalResourceFetchMask::IMAGE, false, true);
-        policy.set_extra_http_headers(&[("x-owner".to_owned(), "first".to_owned())]);
+        policy.set_extra_http_headers(&vec![("x-owner".to_owned(), "first".to_owned())].into());
         let isolated = policy.isolated_copy();
 
         assert!(!policy.shares_state_with(&isolated));
@@ -485,7 +557,7 @@ mod tests {
         assert!(isolated.author_styles_disabled());
 
         isolated.set_network_offline(true);
-        isolated.set_extra_http_headers(&[("x-owner".to_owned(), "second".to_owned())]);
+        isolated.set_extra_http_headers(&vec![("x-owner".to_owned(), "second".to_owned())].into());
 
         assert!(!policy.snapshot().network_offline());
         let original = policy
@@ -497,7 +569,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            original.request_headers,
+            original.request_headers.to_byte_strings(),
             vec![("x-owner".to_owned(), "first".to_owned())]
         );
     }
@@ -540,10 +612,14 @@ mod tests {
     #[test]
     fn request_snapshot_does_not_observe_later_policy_mutation() {
         let policy = PageNetworkPolicy::default();
-        policy.set_extra_http_headers(&[("x-policy-revision".to_owned(), "one".to_owned())]);
+        policy.set_extra_http_headers(
+            &vec![("x-policy-revision".to_owned(), "one".to_owned())].into(),
+        );
         let snapshot = policy.snapshot();
 
-        policy.set_extra_http_headers(&[("x-policy-revision".to_owned(), "two".to_owned())]);
+        policy.set_extra_http_headers(
+            &vec![("x-policy-revision".to_owned(), "two".to_owned())].into(),
+        );
         policy.set_network_offline(true);
 
         let request = snapshot
@@ -554,7 +630,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            request.request_headers,
+            request.request_headers.to_byte_strings(),
             vec![("x-policy-revision".to_owned(), "one".to_owned())]
         );
         assert!(policy.snapshot().network_offline());
@@ -562,21 +638,62 @@ mod tests {
     }
 
     #[test]
-    fn cache_disabled_forces_page_requests_to_bypass_cache() {
+    fn page_headers_survive_request_scoped_override_restoration_on_redirect() {
+        let policy = PageNetworkPolicy::default();
+        policy.set_extra_http_headers(&vec![("x-page".to_owned(), "page".to_owned())].into());
+        let mut request = policy
+            .snapshot()
+            .apply_to_request(
+                Request::new(
+                    "GET",
+                    "https://example.test/redirect",
+                    None,
+                    vec![("x-hop".to_owned(), "initial-only".to_owned())],
+                )
+                .unwrap()
+                .with_page_network_policy()
+                .with_redirect_headers(Some(Vec::new().into())),
+            )
+            .unwrap();
+        assert_eq!(
+            request.request_headers.to_byte_strings(),
+            vec![("x-hop".to_owned(), "initial-only".to_owned())],
+        );
+        request.apply_redirect_status(302);
+        assert_eq!(
+            request.request_headers.to_byte_strings(),
+            vec![("x-page".to_owned(), "page".to_owned())],
+        );
+    }
+
+    #[test]
+    fn cache_disabled_preserves_no_store_and_bypasses_other_modes() {
         let policy = PageNetworkPolicy::default();
         let before = policy.revision();
         policy.set_cache_disabled(true);
 
-        let request = policy
-            .snapshot()
-            .apply_to_request(
-                Request::get("https://example.test/cache")
-                    .unwrap()
-                    .with_page_network_policy(),
-            )
-            .unwrap();
-
-        assert_eq!(request.cache_mode(), RequestCacheMode::Bypass);
+        for mode in [
+            RequestCacheMode::Default,
+            RequestCacheMode::Validate,
+            RequestCacheMode::Bypass,
+            RequestCacheMode::NoStore,
+        ] {
+            let request = policy
+                .snapshot()
+                .apply_to_request(
+                    Request::get("https://example.test/cache")
+                        .unwrap()
+                        .with_cache_mode(mode)
+                        .with_page_network_policy(),
+                )
+                .unwrap();
+            let expected = if mode == RequestCacheMode::NoStore {
+                RequestCacheMode::NoStore
+            } else {
+                RequestCacheMode::Bypass
+            };
+            assert_eq!(request.cache_mode(), expected, "initial mode: {mode:?}");
+        }
         assert!(policy.cache_disabled());
         assert!(policy.revision() > before);
     }
@@ -584,10 +701,14 @@ mod tests {
     #[test]
     fn frozen_request_view_keeps_configuration_but_observes_live_network_conditions() {
         let policy = PageNetworkPolicy::default();
-        policy.set_extra_http_headers(&[("x-policy-revision".to_owned(), "one".to_owned())]);
+        policy.set_extra_http_headers(
+            &vec![("x-policy-revision".to_owned(), "one".to_owned())].into(),
+        );
         let request_view = policy.frozen_request_view();
 
-        policy.set_extra_http_headers(&[("x-policy-revision".to_owned(), "two".to_owned())]);
+        policy.set_extra_http_headers(
+            &vec![("x-policy-revision".to_owned(), "two".to_owned())].into(),
+        );
         let request = request_view
             .snapshot()
             .apply_to_request(
@@ -597,7 +718,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            request.request_headers,
+            request.request_headers.to_byte_strings(),
             vec![("x-policy-revision".to_owned(), "one".to_owned())],
             "request configuration must remain the one captured at registration"
         );
@@ -612,5 +733,47 @@ mod tests {
             !request_view.snapshot().network_offline(),
             "resuming online must update the same network-condition handle"
         );
+    }
+
+    #[test]
+    fn request_identity_is_frozen_before_later_worker_overrides() {
+        let policy = PageNetworkPolicy::default();
+        let config = moli_fetch::FetchConfig::default();
+        let identity = |ua: &str, language: &str| {
+            Arc::new(moli_browser_profile::BrowserIdentityProfile::new(
+                ua, language,
+            ))
+        };
+        policy.set_browser_identity_override(Some(identity("Worker/A", "fr-FR")));
+        let request_view = policy.frozen_request_view();
+        let partition = request_view.memory_cache_partition_id();
+        policy.set_browser_identity_override(Some(identity("Worker/B", "de-DE")));
+        assert_ne!(partition, policy.memory_cache_partition_id());
+        let request = || {
+            Request::get("https://example.test/worker-fetch")
+                .unwrap()
+                .with_browser_request_metadata(moli_fetch::BrowserRequestMetadata::Fetch)
+        };
+        let frozen = request_view.snapshot().apply_to_request(request()).unwrap();
+        let current = policy.snapshot().apply_to_request(request()).unwrap();
+        policy.set_browser_identity_override(None);
+        for (request, ua, language) in [
+            (frozen, "Worker/A", "fr-FR"),
+            (current, "Worker/B", "de-DE"),
+        ] {
+            let headers = moli_fetch::outgoing_request_headers(&config, &request, None);
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("user-agent") && value == ua)
+            );
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("accept-language")
+                        && value == language)
+            );
+        }
+        assert!(policy.browser_identity_override().is_none());
     }
 }

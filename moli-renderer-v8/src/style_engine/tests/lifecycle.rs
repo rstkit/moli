@@ -1,12 +1,109 @@
 use super::*;
 
 #[test]
+fn adopting_inert_template_styles_does_not_prepare_unused_sources() {
+    let mut host = test_host();
+    let template = host.create_element("template");
+    let contents = host.parser_template_contents_handle(template).unwrap();
+    let style = host.create_element("style");
+    assert!(host.set_text_content(style, "span { color: blue; }"));
+    assert!(host.append_child(contents, style));
+    let destination = host.create_detached_html_document();
+    let mut engine = MoliStyleEngine::new();
+    let (_, changes) = host
+        .adopt_node_with_stylesheet_owner_changes(destination, template)
+        .unwrap();
+    engine.apply_stylesheet_owner_changes_with_host(&host, &changes);
+    assert!(engine.owner_style_sheet_processing_source(style).is_none());
+
+    // Activating the same element later must still prepare its source.
+    let insertion = host.append_child_effects(destination, style);
+    engine.apply_stylesheet_owner_changes_with_host(&host, insertion.stylesheet_owners().changes());
+    assert_eq!(
+        engine
+            .owner_style_sheet_processing_source(style)
+            .unwrap()
+            .css_text(),
+        "span { color: blue; }"
+    );
+}
+
+#[test]
+fn style_element_initialization_waits_for_parser_and_preserves_prepared_sources() {
+    let mut host = test_host();
+    let document = host.document_handle();
+    let construction = moli_dom::native::ParserConstruction::default();
+    let owner = construction.create_element(
+        &mut host,
+        document,
+        "style".into(),
+        "http://www.w3.org/1999/xhtml".into(),
+        None,
+    );
+    assert!(host.set_text_content(owner, ".first { color: red; }"));
+    let insertion = host.append_child_effects(document, owner);
+    let mut engine = MoliStyleEngine::new();
+    engine.apply_stylesheet_owner_changes_with_host(&host, insertion.stylesheet_owners().changes());
+    engine.initialize_style_element_sources_with_host(&host, document);
+    assert!(engine.owner_style_sheet_processing_source(owner).is_none());
+
+    let completion = construction.finish_children(&mut host, owner);
+    construction.finish();
+    engine
+        .apply_stylesheet_owner_changes_with_host(&host, completion.stylesheet_owners().changes());
+    let first = engine.owner_style_sheet_processing_source(owner).unwrap();
+    assert_eq!(first.css_text(), ".first { color: red; }");
+    engine.initialize_style_element_sources_with_host(&host, document);
+    assert!(std::sync::Arc::ptr_eq(
+        &first,
+        &engine.owner_style_sheet_processing_source(owner).unwrap(),
+    ));
+
+    let change = host.set_text_content_effects(owner, ".second { color: blue; }");
+    engine.apply_stylesheet_owner_changes_with_host(&host, change.stylesheet_owners().changes());
+    let second = engine.owner_style_sheet_processing_source(owner).unwrap();
+    assert_eq!(second.css_text(), ".second { color: blue; }");
+    assert!(!std::sync::Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn styles_in_documents_without_browsing_context_follow_owner_lifecycle() {
+    let mut host = test_host();
+    let document = host.create_detached_html_document();
+    let style = host.create_element("style");
+    assert!(host.set_text_content(style, ".first { color: red; }"));
+    let mut engine = MoliStyleEngine::new();
+    let insertion = host.append_child_effects(document, style);
+    assert!(!host.is_connected(style));
+    engine.apply_stylesheet_owner_changes_with_host(&host, insertion.stylesheet_owners().changes());
+    assert_eq!(
+        engine
+            .owner_style_sheet_text_with_host(&host, style)
+            .as_deref(),
+        Some(".first { color: red; }"),
+    );
+
+    let change = host.set_text_content_effects(style, ".second { color: blue; }");
+    engine.apply_stylesheet_owner_changes_with_host(&host, change.stylesheet_owners().changes());
+    assert_eq!(
+        engine
+            .owner_style_sheet_text_with_host(&host, style)
+            .as_deref(),
+        Some(".second { color: blue; }"),
+    );
+    let removal = host.remove_child_effects(document, style);
+    engine.apply_stylesheet_owner_changes_with_host(&host, removal.stylesheet_owners().changes());
+    assert!(engine.owner_style_sheet_processing_source(style).is_none());
+}
+
+#[test]
 fn disabled_author_styles_use_stylo_author_origin_gate() {
     let mut host = test_host();
     host.reset_html_document_shell();
     let body = host.document_body_handle().expect("test body");
     let target = host.create_element("div");
     assert!(host.set_attribute(target, "class", "styled"));
+    assert!(host.set_attribute(target, "hidden", ""));
     assert!(host.set_attribute(target, "style", "color: rgb(1, 2, 3); display: none"));
     assert!(host.append_child(body, target));
 

@@ -6,19 +6,16 @@ use super::*;
 use crate::util::{
     callback_data_index_value, callback_data_item, get_private_value, set_private_value, v8str,
 };
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
-const OFFSCREEN_CANVAS_BRAND_SLOT: &str = "__moliOffscreenCanvasBrand";
 const OFFSCREEN_CANVAS_CONTEXT_SLOT: &str = "__moliOffscreenCanvasContext";
 const OFFSCREEN_CANVAS_CONTEXT_KIND_SLOT: &str = "__moliOffscreenCanvasContextKind";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "OffscreenCanvas")]
+#[webapi(interface = web_api_interfaces::OffscreenCanvas)]
 struct OffscreenCanvasObjectDeclaration {
-    #[webapi(slot = OFFSCREEN_CANVAS_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = OFFSCREEN_CANVAS_WIDTH_SLOT)]
     width: f64,
     #[webapi(slot = OFFSCREEN_CANVAS_HEIGHT_SLOT)]
@@ -26,7 +23,7 @@ struct OffscreenCanvasObjectDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "OffscreenCanvas")]
+#[webapi(interface = web_api_interfaces::OffscreenCanvas, receiver)]
 struct OffscreenCanvasPrototypeAccessorsDeclaration {
     #[webapi(
         accessor_property,
@@ -75,10 +72,6 @@ fn offscreen_canvas_attribute_getter_callback<'s>(
         rv.set_undefined();
         return;
     };
-    if !offscreen_canvas_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let value = get_private_value(scope, args.this(), slot)
         .and_then(|value| value.number_value(scope))
         .unwrap_or(0.0) as u32;
@@ -99,10 +92,6 @@ fn offscreen_canvas_attribute_setter_callback<'s>(
         rv.set_undefined();
         return;
     };
-    if !offscreen_canvas_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(name) = offscreen_canvas_attribute_name_for_slot(slot) else {
         rv.set_undefined();
         return;
@@ -142,10 +131,6 @@ pub(crate) fn offscreen_canvas_get_context_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !offscreen_canvas_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(kind) = webidl::try_parse_args::<OffscreenCanvasGetContextArgs>(scope, &args)
         .ok()
         .map(|parsed| parsed.kind)
@@ -194,13 +179,9 @@ pub(crate) fn offscreen_canvas_get_context_callback<'s>(
 
 pub(crate) fn offscreen_canvas_convert_to_blob_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
+    _args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !offscreen_canvas_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         rv.set(v8::undefined(scope).into());
         return;
@@ -226,12 +207,4 @@ pub(super) fn init_offscreen_canvas_object<'s>(
         .bind_into(scope, object)
         .expect("OffscreenCanvas declaration should initialize object");
     reset_canvas_like_backing_store(scope, object);
-}
-
-pub(super) fn offscreen_canvas_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, OFFSCREEN_CANVAS_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }

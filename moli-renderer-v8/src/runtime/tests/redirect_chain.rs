@@ -32,12 +32,14 @@ async fn assert_streaming_redirect_chain(reply_boundary: RendererReplyBoundary) 
             .map(|location| {
                 let to_url = requested_url.join(location).unwrap();
                 let redirect = NavigationRedirect {
+                    source: moli_fetch::RedirectSource::Network,
                     from_url: from_url.clone(),
                     to_url: to_url.clone(),
                     status: 302,
-                    headers: vec![("location".to_owned(), location.to_owned())],
+                    headers: vec![("location".to_owned(), location.as_bytes().to_vec())],
                     network_extra_info_available: false,
                     request_extra_info: None,
+                    dispatched_request: None,
                     response_extra_info: None,
                     redirect_has_extra_info: false,
                     request_cookie_report: None,
@@ -50,11 +52,12 @@ async fn assert_streaming_redirect_chain(reply_boundary: RendererReplyBoundary) 
             })
             .collect();
         let final_url = from_url;
-        let headers = vec![("content-type".to_owned(), content_type.to_owned())];
+        let headers: Vec<(String, Vec<u8>)> =
+            vec![("content-type".to_owned(), content_type.as_bytes().to_vec())];
         // DocumentCommit forces a pending phase-one installation, even when
         // the body is already buffered. No network timing or sleep is needed.
         let (mut page, initial, _, artifacts, download) = runtime
-            .create_streaming_raw_page_from_external_body_with_inspector_session_restores(
+            .create_streaming_raw_page_from_external_body(
                 requested_url.clone(),
                 final_url.clone(),
                 None,
@@ -66,23 +69,6 @@ async fn assert_streaming_redirect_chain(reply_boundary: RendererReplyBoundary) 
                 &loader,
                 crate::RendererWebStorageHandles::ephemeral(),
                 ExternalRawDocumentBodyStream::from_bytes(body.as_bytes().to_vec()),
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                None,
-                false,
-                false,
-                1.0,
-                Default::default(),
-                None,
-                false,
-                Vec::new(),
-                false,
-                None,
-                Vec::new(),
                 false,
                 PageVmInitStage::Load,
                 reply_boundary,
@@ -90,8 +76,9 @@ async fn assert_streaming_redirect_chain(reply_boundary: RendererReplyBoundary) 
                 RendererNavigationReplyPolicy::FollowBeforeReply,
                 None,
                 None,
-                None,
-                None,
+                crate::RendererDocumentOptions {
+                    ..Default::default()
+                },
             )
             .await
             .expect("redirected document should attach");

@@ -6,9 +6,17 @@ use crate::LayoutError;
 
 use super::model::{
     FrozenCoordinateSpace, LayoutBoxGeometry, LayoutClipNode, LayoutCoordinateSpaceId,
-    LayoutFragment, LayoutFragmentId, LayoutOutputBoxId, LayoutPoint, LayoutScrollExtent,
-    LayoutSize, LayoutViewport,
+    LayoutFragment, LayoutFragmentId, LayoutOutputBoxId, LayoutPoint, LayoutQuad,
+    LayoutScrollExtent, LayoutSize, LayoutViewport,
 };
+
+/// A source object without a CSS box, expressed in its owner's local space.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutObjectGeometry<N> {
+    pub source: N,
+    pub owner: LayoutOutputBoxId,
+    pub quad: LayoutQuad,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CssSizingBox {
@@ -108,10 +116,10 @@ where
     /// Source/box relationships for `display: contents` nodes, which own no
     /// principal box but can still nominate rendered descendants for scroll.
     pub scroll_proxy_links: Vec<(N, LayoutOutputBoxId)>,
+    pub object_geometry: Vec<LayoutObjectGeometry<N>>,
     viewport_coordinate_space: FrozenCoordinateSpace,
     pub clip_chain: Vec<LayoutClipNode>,
     embedded_frames: Vec<FrozenEmbeddedFrame<N>>,
-    embedded_frames_complete: bool,
 }
 
 impl<N> FrozenLayoutTree<N>
@@ -177,6 +185,9 @@ where
         let own_estimated_geometry_bytes = std::mem::size_of::<Self>()
             .saturating_add(allocation::<FrozenLayoutBox<N>>(self.boxes.capacity()))
             .saturating_add(allocation::<LayoutFragment>(self.fragments.capacity()))
+            .saturating_add(allocation::<LayoutObjectGeometry<N>>(
+                self.object_geometry.capacity(),
+            ))
             .saturating_add(allocation::<(N, LayoutOutputBoxId)>(
                 self.scroll_proxy_links.capacity(),
             ))
@@ -200,7 +211,11 @@ where
         );
         LayoutTreeRetentionMetrics {
             box_count: self.boxes.len().saturating_add(embedded.box_count),
-            fragment_count: self.fragments.len().saturating_add(embedded.fragment_count),
+            fragment_count: self
+                .fragments
+                .len()
+                .saturating_add(self.object_geometry.len())
+                .saturating_add(embedded.fragment_count),
             estimated_geometry_bytes: own_estimated_geometry_bytes
                 .saturating_add(embedded.estimated_geometry_bytes),
         }
@@ -246,13 +261,6 @@ where
             .map(|frame| frame.tree.as_ref())
     }
 
-    /// Whether every live child frame encountered by this pass was projected.
-    /// Hit-test demands require this bit before reusing a tree produced by a
-    /// geometry-only pass.
-    pub const fn embedded_frames_complete(&self) -> bool {
-        self.embedded_frames_complete
-    }
-
     pub fn embedded_frames(&self) -> impl ExactSizeIterator<Item = &FrozenEmbeddedFrame<N>> {
         self.embedded_frames.iter()
     }
@@ -271,10 +279,10 @@ where
         boxes: Vec<FrozenLayoutBox<N>>,
         fragments: Vec<LayoutFragment>,
         scroll_proxy_links: Vec<(N, LayoutOutputBoxId)>,
+        object_geometry: Vec<LayoutObjectGeometry<N>>,
         viewport_coordinate_space: FrozenCoordinateSpace,
         clip_chain: Vec<LayoutClipNode>,
         embedded_frames: Vec<FrozenEmbeddedFrame<N>>,
-        embedded_frames_complete: bool,
     ) -> Self {
         Self {
             source_root,
@@ -285,10 +293,10 @@ where
             boxes,
             fragments,
             scroll_proxy_links,
+            object_geometry,
             viewport_coordinate_space,
             clip_chain,
             embedded_frames,
-            embedded_frames_complete,
         }
     }
 }

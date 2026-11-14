@@ -1,4 +1,4 @@
-use super::{JsContextHost, OwnerDispatchScope, WindowTaskTarget};
+use super::{OwnerDispatchScope, PageScriptHost, WindowTaskTarget};
 use crate::{
     context_bootstrap::run_view_transition_update_callback,
     document_runtime::DomHandle,
@@ -30,7 +30,7 @@ impl Default for ViewTransitionUpdateState {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn queue_view_transition_update_callback(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
@@ -94,15 +94,11 @@ impl JsContextHost {
         let dispatch_scope = target.dispatch_scope();
         let previous_scope = dispatch_scope.enter(scope);
         let transition = v8::Local::new(scope, &pending.transition);
-        let callback = pending
-            .callback
-            .as_ref()
-            .map(|callback| callback.prepare(scope));
         run_view_transition_update_callback(
             scope,
-            self as *mut JsContextHost,
+            self as *mut PageScriptHost,
             transition,
-            callback.as_ref(),
+            pending.callback.as_ref(),
         );
         dispatch_scope.restore(scope, previous_scope);
         true

@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::web_api_interfaces;
 use crate::{
     document_runtime::DomHandle,
     host::HostTimerOwner,
@@ -12,11 +13,9 @@ use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 mod position;
 mod watches;
 
-const GEOLOCATION_BRAND_SLOT: &str = "__moliGeolocationBrand";
 const GEOLOCATION_SECURE_CONTEXT_SLOT: &str = "__moliGeolocationSecureContext";
 const GEOLOCATION_NEXT_WATCH_ID_SLOT: &str = "__moliGeolocationNextWatchId";
 const GEOLOCATION_CHILD_HANDLE_SLOT: &str = "__moliGeolocationChildHandle";
-const GEOLOCATION_POSITION_ERROR_BRAND_SLOT: &str = "__moliGeolocationPositionErrorBrand";
 const GEOLOCATION_POSITION_ERROR_CODE_SLOT: &str = "__moliGeolocationPositionErrorCode";
 const GEOLOCATION_POSITION_ERROR_MESSAGE_SLOT: &str = "__moliGeolocationPositionErrorMessage";
 
@@ -25,11 +24,8 @@ const POSITION_UNAVAILABLE: u16 = 2;
 const TIMEOUT: u16 = 3;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Geolocation")]
+#[webapi(interface = web_api_interfaces::Geolocation)]
 struct GeolocationObjectDeclaration {
-    #[webapi(slot = GEOLOCATION_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = GEOLOCATION_SECURE_CONTEXT_SLOT)]
     secure_context: bool,
 
@@ -38,7 +34,7 @@ struct GeolocationObjectDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "Geolocation", enumerable)]
+#[webapi(interface = web_api_interfaces::Geolocation, enumerable, receiver)]
 struct GeolocationPrototypeMethodsDeclaration {
     #[webapi(method, length = 1, callback = geolocation_get_current_position_callback)]
     get_current_position: (),
@@ -51,11 +47,8 @@ struct GeolocationPrototypeMethodsDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "GeolocationPositionError")]
+#[webapi(interface = web_api_interfaces::GeolocationPositionError)]
 struct GeolocationPositionErrorObjectDeclaration {
-    #[webapi(slot = GEOLOCATION_POSITION_ERROR_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = GEOLOCATION_POSITION_ERROR_CODE_SLOT)]
     code: u16,
 
@@ -64,7 +57,7 @@ struct GeolocationPositionErrorObjectDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "GeolocationPositionError", enumerable)]
+#[webapi(interface = web_api_interfaces::GeolocationPositionError, enumerable)]
 struct GeolocationPositionErrorPrototypeDeclaration {
     #[webapi(accessor_property, getter = geolocation_position_error_code_getter_callback)]
     code: (),
@@ -74,7 +67,7 @@ struct GeolocationPositionErrorPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "GeolocationPositionError", enumerable)]
+#[webapi(interface = web_api_interfaces::GeolocationPositionError, enumerable)]
 struct GeolocationPositionErrorConstantsDeclaration {
     #[webapi(constant = "PERMISSION_DENIED", value = 1u32)]
     permission_denied: (),
@@ -95,7 +88,7 @@ struct GetCurrentPositionArgs {
     #[webidl(nullable, converter = "callback_function")]
     error_callback: Option<webidl::WebIdlCallbackFunction>,
 
-    #[webidl(with = position_options_arg)]
+    #[webidl(dictionary)]
     options: PositionOptions,
 }
 
@@ -108,7 +101,7 @@ struct WatchPositionArgs {
     #[webidl(nullable, converter = "callback_function")]
     error_callback: Option<webidl::WebIdlCallbackFunction>,
 
-    #[webidl(with = position_options_arg)]
+    #[webidl(dictionary)]
     options: PositionOptions,
 }
 
@@ -185,10 +178,6 @@ fn geolocation_get_current_position_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !geolocation_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(parsed) = webidl::parse_args::<GetCurrentPositionArgs>(scope, &args) else {
         return;
     };
@@ -212,10 +201,6 @@ fn geolocation_watch_position_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !geolocation_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(parsed) = webidl::parse_args::<WatchPositionArgs>(scope, &args) else {
         return;
     };
@@ -240,10 +225,6 @@ fn geolocation_clear_watch_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !geolocation_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(parsed) = webidl::parse_args::<ClearWatchArgs>(scope, &args) else {
         return;
     };
@@ -253,30 +234,6 @@ fn geolocation_clear_watch_callback<'s>(
             unsafe { &mut *host_ptr }.cancel_geolocation_watch(scope, args.this(), parsed.watch_id);
     }
     rv.set_undefined();
-}
-
-fn position_options_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> std::result::Result<PositionOptions, webidl::WebIdlError> {
-    if args.length() <= index || args.get(index).is_undefined() {
-        return Ok(PositionOptions {
-            timeout: u32::MAX,
-            ..PositionOptions::default()
-        });
-    }
-    webidl::parse_dictionary::<PositionOptions>(
-        scope,
-        args.get(index),
-        webidl::Context::argument("Geolocation", (index + 1) as usize),
-    )
-    .map(|options| {
-        options.unwrap_or(PositionOptions {
-            timeout: u32::MAX,
-            ..PositionOptions::default()
-        })
-    })
 }
 
 fn clamped_unsigned_long_position_option<'s>(
@@ -302,14 +259,6 @@ fn clamp_unsigned_long(value: f64) -> u32 {
         return u32::MAX;
     }
     value.round_ties_even() as u32
-}
-
-fn geolocation_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, GEOLOCATION_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }
 
 fn take_next_watch_id<'s>(
@@ -447,9 +396,7 @@ fn geolocation_position_error_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    if get_private_value(scope, receiver, GEOLOCATION_POSITION_ERROR_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-    {
+    if web_api_interfaces::GeolocationPositionError::is_instance(scope, receiver) {
         Some(receiver)
     } else {
         throw_type_error(scope, "Illegal invocation");

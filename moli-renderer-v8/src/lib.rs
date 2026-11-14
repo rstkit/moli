@@ -4,8 +4,11 @@
 //! owner/page handles, the native bridge, script and module execution, Web API
 //! bootstrap, and the renderer-side `ResourceRequestClient` wrapper used by the facade crate.
 
+#![recursion_limit = "256"]
+
 #[path = "planning.rs"]
 mod script_planning;
+mod service_worker_api_values;
 mod stylesheet_blocking;
 mod subresource_integrity;
 
@@ -13,6 +16,7 @@ pub use moli_dom as dom;
 pub use moli_page_types as protocol_types;
 pub use moli_parser as parser;
 pub use moli_selector as selector;
+pub use moli_v8_platform::ProcessEnvironmentOwner;
 
 pub use app_manifest::{
     RendererAppManifest, RendererAppManifestDisplayMode, RendererAppManifestError,
@@ -24,12 +28,16 @@ pub use app_manifest::{
 };
 
 mod abort_signal_route;
+#[cfg(feature = "ace-protocol")]
+pub mod ace_page_task;
 mod app_manifest;
 mod blob;
 mod broadcast_channel_runtime;
 mod callback_invocation;
 #[cfg(test)]
 mod chromium_property_surface;
+mod common_runtime;
+mod console_forwarding;
 mod content_security_policy;
 mod context_bootstrap;
 mod cross_origin_isolation;
@@ -47,12 +55,16 @@ mod document_cookie_owner;
 mod document_language;
 mod document_last_modified;
 mod document_module_graph;
+mod document_response_decoder;
 mod document_runtime;
 mod document_script_scheduler;
 mod document_task_lane;
 mod dom_parser;
+mod dom_presentation;
 mod dynamic_script_owner;
+mod event_listener_args;
 mod exception_reporting;
+mod font_loading;
 mod frame_owner_model;
 mod host;
 mod host_bindings;
@@ -65,6 +77,7 @@ mod live_document_parser;
 mod live_stylesheet;
 pub(crate) mod local_executor;
 mod message_port_runtime;
+mod meta_refresh_scheduler;
 mod module_runtime;
 mod module_script_continuation;
 mod modulepreload;
@@ -79,6 +92,7 @@ mod page_resource_completion;
 mod page_task_queue;
 mod parser_module_evaluation;
 mod parser_module_pending;
+mod parser_mutation_effects;
 mod parser_script;
 mod permissions_policy;
 mod queue_microtask;
@@ -86,13 +100,16 @@ mod range_boundary;
 mod referrer_policy;
 mod render_runtime;
 mod renderer_resource_scheduler;
+mod resource_initiator;
 mod resource_owner;
 mod resource_ready;
 mod runtime;
 mod runtime_binding_data;
+mod script_execution;
 mod script_execution_control;
 mod script_provenance;
 mod script_vm;
+mod scroll_options;
 mod service_worker_runtime;
 mod shared_worker_runtime;
 mod structured_clone;
@@ -108,6 +125,7 @@ mod v8_traced_webidl_callback;
 mod wasm_module_support;
 mod web_storage_handles;
 pub(crate) mod webidl;
+mod webidl_callback_execution;
 #[cfg(test)]
 mod webidl_callback_source_boundary_tests;
 mod webidl_iterator;
@@ -148,15 +166,15 @@ pub(crate) fn parse_html_test_fixture_with_parser_outputs(
 ) -> (
     dom::native::NativeDom,
     Vec<parser::ParserScriptHandoff>,
-    Vec<DocumentOwnedBlockingStylesheetDiscoveryInput>,
+    Vec<DocumentOwnedStylesheetDiscoveryInput>,
 ) {
-    let mut stream = parser::HtmlParser::SCRIPTING_ENABLED.start_document(final_url);
+    let stream = parser::HtmlParser::SCRIPTING_ENABLED.start_document(final_url);
     stream.append_to_end(html);
     let mut scripts = Vec::new();
     let mut blocking_stylesheets = Vec::new();
     while stream.has_pending_input() {
         let outcome = stream.pump_next_parser_step(0);
-        blocking_stylesheets.extend(outcome.discovered_blocking_stylesheet_inputs);
+        blocking_stylesheets.extend(outcome.discovered_stylesheet_inputs);
         if let parser::ParserPumpStep::Yield(parser::ParserYield::Script(script)) = outcome.result {
             scripts.push(*script);
         }
@@ -171,7 +189,7 @@ pub(crate) use crate::script_planning::{
 };
 #[allow(unused_imports)]
 pub(crate) use crate::stylesheet_blocking::{
-    DocumentBlockingStylesheetSignature, DocumentOwnedBlockingStylesheetDiscoveryInput,
+    DocumentBlockingStylesheetSignature, DocumentOwnedStylesheetDiscoveryInput,
     StylesheetBlockingReadView, StylesheetElementRead,
     collect_document_owned_blocking_stylesheet_discovery_inputs_before_in_view,
     collect_document_owned_blocking_stylesheets_before_in_view,
@@ -179,10 +197,10 @@ pub(crate) use crate::stylesheet_blocking::{
 
 pub use context_bootstrap::{
     DEFAULT_ORIGIN_STORAGE_QUOTA_BYTES, IndexedDbKey, IndexedDbObjectStoreOptions,
-    IndexedDbOpenOptions, IndexedDbTransactionMode, SharedIndexedDbManager, WeakIndexedDbManager,
+    IndexedDbTransactionMode, SharedIndexedDbManager, WeakIndexedDbManager,
     clear_indexed_db_origin, clear_indexed_db_origins_with_prefix, downgrade_indexed_db_manager,
-    indexed_db_origin_usage_bytes, indexed_db_origins_with_prefix_usage_bytes,
-    new_indexed_db_manager,
+    indexed_db_origin_usage_bytes, new_indexed_db_manager, new_sqlite_indexed_db_manager,
+    new_sqlite_indexed_db_manager_with_runtime,
 };
 pub use context_bootstrap::{
     SharedStorageBucketStore, StorageBucketIdentity, new_shared_json_storage_bucket_store,
@@ -197,12 +215,12 @@ pub use context_bootstrap::{
 pub use context_bootstrap::{
     SharedWebStorageStore, WebStorageAreaKind, WebStorageMutation, WebStorageMutationRecord,
     WebStorageMutationSubscription, WebStorageString, deep_clone_shared_web_storage_store,
-    new_shared_json_web_storage_store, new_shared_web_storage_store,
-    web_storage_partitioned_area_key,
+    new_shared_web_storage_store, web_storage_partitioned_area_key,
 };
 pub(crate) use context_bootstrap::{
-    construct_form_data_entries_for_form, form_data_entries_multipart_body_with_prefix,
-    form_data_entries_to_string_pairs, form_data_object_from_entries, snapshot_form_data_value,
+    construct_form_data_entries_for_form, form_data_entries_multipart_body,
+    form_data_entries_to_string_pairs, form_data_object_from_entries_for_window,
+    snapshot_form_data_value,
 };
 pub use document_cookie_owner::{
     DocumentCookieBackendConnectionState, DocumentCookieBrowserContextSnapshot,
@@ -216,31 +234,34 @@ pub use host::{
 };
 pub use local_executor::is_on_js_local_executor;
 pub use native_bridge::element::ClientRect as RendererClientRect;
-pub use runtime::RendererRuntimeInspectorMessageResponseOrder;
 pub use runtime::{
     CompletedWorkerRuntimeInspectorCommandDispatch, DetachedParserScriptFetchContinuation,
     DevToolsSessionKey, ExternalRawDocumentBodyStream, JsRuntime, JsRuntimeOwner, PageId,
-    PendingHtmlPage, PendingWorkerRuntimeInspectorSessionResponse, PreparedRendererDocument,
-    RendererAccessibilityPayloadsForObjectId, RendererActivityDiagnostics,
-    RendererAgentAttachmentId, RendererAutofillAddressField, RendererAutofillCreditCard,
-    RendererAutofillTriggerOutcome, RendererAutofillTriggerRequest, RendererBrowserContextRuntime,
-    RendererBrowserContextRuntimeId, RendererBrowserContextRuntimeOwner,
-    RendererBrowserContextRuntimeOwnerAccess, RendererCaptureScreencastFrameReply,
+    PendingHtmlPage, PendingRendererPageReplacement, PendingWorkerRuntimeInspectorSessionResponse,
+    PreparedRendererDocument, RendererAccessibilityPayloadsForObjectId,
+    RendererActivityDiagnostics, RendererAgentAttachmentId, RendererAutofillAddressField,
+    RendererAutofillCreditCard, RendererAutofillTriggerOutcome, RendererAutofillTriggerRequest,
+    RendererAuxiliaryDocumentResponse, RendererAuxiliaryNavigationKind, RendererAuxiliaryWindow,
+    RendererBrowserContextRuntime, RendererBrowserContextRuntimeId,
+    RendererBrowserContextRuntimeOwner, RendererBrowserContextRuntimeOwnerAccess,
+    RendererBrowsingContextGroup, RendererBrowsingContextName, RendererCaptureScreencastFrameReply,
     RendererCaptureScreencastFrameRequest, RendererCaptureScreenshotReply,
-    RendererCaptureScreenshotRequest, RendererCapturedScreencastFrame, RendererCapturedScreenshot,
-    RendererCommandTurnCompletion, RendererCommandTurnOutput, RendererCountEntry,
-    RendererDedicatedWorkerTargetEvent, RendererDedicatedWorkerTargetInfo,
+    RendererCaptureScreenshotRequest, RendererCapturedDocumentEnvironment,
+    RendererCapturedScreencastFrame, RendererCapturedScreenshot, RendererCdpCall,
+    RendererCommandTurnCompletion, RendererCommandTurnOutput, RendererContentStripOptions,
+    RendererCountEntry, RendererDedicatedWorkerTargetEvent, RendererDedicatedWorkerTargetInfo,
     RendererDevToolsAgentToken, RendererDevToolsMainCommandEnvelope, RendererDocumentBoxModel,
     RendererDocumentChildNodeSnapshotEvent, RendererDocumentChildNodeSnapshotEvents,
-    RendererDocumentChildNodeSnapshots, RendererDocumentCommitPermit,
-    RendererDocumentFrontendNodeIdsResolution, RendererDocumentHitTestResult,
-    RendererDocumentIsolateAccountingDiagnostics, RendererDocumentLifecycleEvent,
-    RendererDocumentLifecycleEventKind, RendererDocumentLifecycleIdentity,
-    RendererDocumentLifecycleMilestone, RendererDocumentLifecycleSnapshot,
-    RendererDocumentLifecycleWaitOutcome, RendererDocumentLifecycleWaiter,
-    RendererDocumentNodeAttributesResolution, RendererDocumentNodeClientRect,
-    RendererDocumentNodeGeometry, RendererDocumentNodePropertyResolution,
-    RendererDocumentNodeReference, RendererDocumentNodeTextResolution,
+    RendererDocumentChildNodeSnapshots, RendererDocumentCommandTarget,
+    RendererDocumentCommitPermit, RendererDocumentFrontendNodeIdsResolution,
+    RendererDocumentHitTestResult, RendererDocumentIsolateAccountingDiagnostics,
+    RendererDocumentLifecycleEvent, RendererDocumentLifecycleEventKind,
+    RendererDocumentLifecycleIdentity, RendererDocumentLifecycleMilestone,
+    RendererDocumentLifecycleSnapshot, RendererDocumentLifecycleWaitOutcome,
+    RendererDocumentLifecycleWaiter, RendererDocumentNodeAttributesResolution,
+    RendererDocumentNodeClientRect, RendererDocumentNodeGeometry,
+    RendererDocumentNodePropertyResolution, RendererDocumentNodeReference,
+    RendererDocumentNodeTextResolution, RendererDocumentOptions, RendererDocumentPreparationTarget,
     RendererDocumentQuerySelectorNode, RendererDocumentQuerySelectorResolution,
     RendererDocumentQuerySelectorWithChildNodeSnapshotEvents,
     RendererDocumentSourcedSameDocumentNavigation,
@@ -252,65 +273,79 @@ pub use runtime::{
     RendererDomDebuggerEventListenersResolution, RendererDomDebuggerXhrBreakpoint, RendererDomEdit,
     RendererDomEditOutcome, RendererDomFocusOutcome, RendererDomFrontendNodeBindingResolution,
     RendererDomMutationEvent, RendererDomMutationEventBatch, RendererDomNodeCreationStackFrame,
-    RendererDomNodeCreationStackTrace, RendererDomNodeStackTraceResolution,
-    RendererDomSearchRegistration, RendererDomSearchResultNode, RendererDomSearchResultsResolution,
+    RendererDomNodeCreationStackTrace, RendererDomNodeReference,
+    RendererDomNodeStackTraceResolution, RendererDomSearchRegistration,
+    RendererDomSearchResultNode, RendererDomSearchResultsResolution,
     RendererDomSnapshotCaptureOptions, RendererDomSnapshotCapturePayload, RendererDragData,
     RendererDragDataItem, RendererDraggedDirectory, RendererDraggedFile, RendererFrameToken,
-    RendererGeometryQuad, RendererInputDispatchOutcome, RendererInspectorCommandEnvelope,
-    RendererInspectorCommandRoute, RendererInspectorIngressTicket,
-    RendererInspectorProtocolConfiguration, RendererInspectorProtocolConfigurationCommand,
-    RendererInspectorSessionRestoreSnapshot, RendererJavaScriptDialogCompletion,
-    RendererJavaScriptDialogId, RendererJavaScriptDialogResult, RendererJavaScriptDialogSource,
-    RendererLayoutMetrics, RendererLifecycleDecider, RendererLifecycleDecision,
-    RendererLifecycleEpoch, RendererLifecycleEventStamp, RendererLifecycleSnapshot,
-    RendererLifecycleStartReason, RendererLifecycleTerminationStamp, RendererMainDocumentCommit,
-    RendererMoliDomMemoryDiagnostics, RendererMoliMemoryDiagnostics,
-    RendererMoliMemoryScopeDiagnostics, RendererMoliRuntimeMemoryDiagnostics, RendererOutputCursor,
-    RendererOutputFence, RendererOutputFenceLeaseId, RendererOutputItem, RendererOutputPublication,
-    RendererOutputPublicationOrdering, RendererOutputRecord, RendererOutputResidenceIdentity,
-    RendererOutputStreamCloseReason, RendererOutputStreamControl, RendererOutputStreamEpoch,
-    RendererOutputStreamIdentity, RendererOutputTransportDiagnostics,
+    RendererGeometryQuad, RendererHtmlSerializeOptions, RendererInputDispatchOutcome,
+    RendererInspectorCommandEnvelope, RendererInspectorCommandRoute,
+    RendererInspectorIngressTicket, RendererInspectorProtocolConfiguration,
+    RendererInspectorProtocolConfigurationCommand, RendererInspectorSessionRestoreSnapshot,
+    RendererInterceptedDrag, RendererJavaScriptDialogCompletion, RendererJavaScriptDialogId,
+    RendererJavaScriptDialogResult, RendererJavaScriptDialogSource, RendererLayoutMetrics,
+    RendererLifecycleDecider, RendererLifecycleDecision, RendererLifecycleEpoch,
+    RendererLifecycleEventStamp, RendererLifecycleSnapshot, RendererLifecycleStartReason,
+    RendererLifecycleTerminationStamp, RendererMainDocumentCommit, RendererMainDocumentResource,
+    RendererMarkdownOptions, RendererMoliDomMemoryDiagnostics, RendererMoliMemoryDiagnostics,
+    RendererMoliMemoryScopeDiagnostics, RendererMoliRuntimeMemoryDiagnostics,
+    RendererNativeCommandReadyResponse, RendererNativeCommandResponseGuard,
+    RendererNativeCommandTerminal, RendererNativeOperation, RendererNativeOperationStep,
+    RendererNativeProtocolError, RendererNativeProtocolNotification,
+    RendererNativeProtocolResponse, RendererNativeProtocolStateUpdate, RendererNavigationInitiator,
+    RendererOutputCursor, RendererOutputFence, RendererOutputFenceLeaseId, RendererOutputItem,
+    RendererOutputPublication, RendererOutputPublicationOrdering, RendererOutputRecord,
+    RendererOutputResidenceIdentity, RendererOutputStreamCloseReason, RendererOutputStreamControl,
+    RendererOutputStreamEpoch, RendererOutputStreamIdentity, RendererOutputTransportDiagnostics,
     RendererOutputTransportMessage, RendererOutputTransportReceiver,
     RendererOutputTransportSendError, RendererOutputTransportSender, RendererOwnerAction,
     RendererOwnerCommand, RendererOwnerHandle, RendererOwnerLocalHostId, RendererOwnerReply,
-    RendererOwnerResourceActivitySource, RendererOwnerRuntimeActivitySource, RendererPageCommand,
-    RendererPageCommandPending, RendererPageCommandPostResponseContinuation,
-    RendererPageCookieFacadeSnapshotReply, RendererPageCreationArtifacts,
-    RendererPageCreationDiagnostics, RendererPageCreationPhase, RendererPageCreationProgress,
-    RendererPageDiagnosticsSnapshot, RendererPageDumpFormat, RendererPageDumpOptions,
-    RendererPageDumpStripOptions, RendererPageHandle, RendererPageReply,
-    RendererPageReservationToken, RendererPageState, RendererPageTestingHandle, RendererPageView,
-    RendererPendingDownloadActivation, RendererPendingDownloadResponse,
-    RendererPendingFileChooserActivation, RendererPendingJavaScriptDialog,
-    RendererPendingPopupActivation, RendererPendingSameDocumentNavigation,
-    RendererPendingTopLevelHistoryTraversal, RendererPendingWindowOpenEvent,
-    RendererPerformanceMetricSnapshot, RendererPointerEventProperties,
-    RendererPopupActivationSource, RendererPopupDisposition,
-    RendererPreparedDocumentCommitConfiguration, RendererProtocolObservation,
-    RendererReservedServiceWorkerClient, RendererResourceTextSearchOutcome,
+    RendererOwnerResourceActivitySource, RendererOwnerRuntimeActivitySource,
+    RendererPageAccessError, RendererPageCommand, RendererPageCommandPending,
+    RendererPageCommandPostResponseContinuation, RendererPageCookieFacadeSnapshotReply,
+    RendererPageCreationArtifacts, RendererPageCreationDiagnostics, RendererPageCreationPhase,
+    RendererPageCreationProgress, RendererPageDiagnosticsSnapshot, RendererPageHandle,
+    RendererPageReplacementCommit, RendererPageReplacementError,
+    RendererPageReplacementFailureDisposition, RendererPageReplacementReservationRequest,
+    RendererPageReplacementTarget, RendererPageReply, RendererPageRequestPolicyUpdate,
+    RendererPageReservationToken, RendererPageState, RendererPageStateRevision,
+    RendererPageTestingHandle, RendererPageView, RendererPageWindowIdentity, RendererPdfOptions,
+    RendererPendingAuxiliaryPage, RendererPendingDownloadActivation,
+    RendererPendingDownloadResponse, RendererPendingFileChooserActivation,
+    RendererPendingJavaScriptDialog, RendererPendingPopupActivation,
+    RendererPendingSameDocumentNavigation, RendererPendingTopLevelHistoryTraversal,
+    RendererPendingWindowOpenEvent, RendererPerformanceMetricSnapshot,
+    RendererPointerEventProperties, RendererPopupActivationSource, RendererPopupDisposition,
+    RendererPreparedDocumentCommitConfiguration, RendererPrintToPdfReply,
+    RendererPrintToPdfRequest, RendererProtocolObservation, RendererReservedServiceWorkerClient,
+    RendererResourceContentBody, RendererResourceSearchRequest, RendererResourceTextSearchOutcome,
     RendererRuntimeCommandCausalIdentity, RendererRuntimeCommandOutput,
     RendererRuntimeEvaluationResult, RendererRuntimeHeapSpaceUsage, RendererRuntimeHeapUsage,
     RendererRuntimeInspectorAsyncCompletion, RendererRuntimeInspectorIoCommandClaim,
     RendererRuntimeInspectorIoCommandRoute, RendererRuntimeInspectorMainCommandCompletion,
     RendererRuntimeInspectorMainCommandRoute, RendererRuntimeInspectorMessage,
     RendererRuntimeInspectorMessageBatch, RendererRuntimeInspectorProtocolMessage,
-    RendererRuntimeInspectorProtocolMessageValueMut, RendererRuntimeInspectorResponseChannel,
-    RendererRuntimeInspectorResponseSender, RendererRuntimeObservableSourceItem,
-    RendererRuntimeObservableSourceSummary, RendererRuntimeRealmInfo, RendererRuntimeRemoteObject,
-    RendererRuntimeRemoteObjectResolution, RendererScreenshotClip, RendererScreenshotFormat,
-    RendererScreenshotPurpose, RendererScreenshotRegion, RendererScriptExecutionMemoryDiagnostics,
-    RendererScriptSourceMemoryDiagnostics, RendererScrollIntoViewResult,
-    RendererServiceWorkerConsoleMessage, RendererServiceWorkerExceptionMessage,
-    RendererServiceWorkerFetchDiagnostic, RendererServiceWorkerFetchDiagnosticResult,
-    RendererServiceWorkerMainResourceFetch, RendererServiceWorkerRunIdentity,
-    RendererServiceWorkerTargetEvent, RendererServiceWorkerTargetInfo,
-    RendererServiceWorkerVersionStatus, RendererSetDocumentContentResult,
-    RendererSharedWorkerConsoleMessage, RendererSharedWorkerTargetEvent,
-    RendererSharedWorkerTargetInfo, RendererStyleSheetHeader, RendererStyleSheetInventoryUpdate,
-    RendererStyleSheetPayload, RendererSyntheticResponseBody, RendererTextSearchMatch,
-    RendererTouchPoint, RendererVisualStateToken, RendererWindowDocumentSource,
-    RuntimeConsoleMessageSnapshot, renderer_output_transport_channel,
+    RendererRuntimeInspectorResponseChannel, RendererRuntimeInspectorResponseSender,
+    RendererRuntimeObservableSourceItem, RendererRuntimeObservableSourceSummary,
+    RendererRuntimeRealmInfo, RendererRuntimeRemoteObject, RendererRuntimeRemoteObjectResolution,
+    RendererScreenshotClip, RendererScreenshotFormat, RendererScreenshotRegion,
+    RendererScriptExecutionMemoryDiagnostics, RendererScriptSourceMemoryDiagnostics,
+    RendererScrollIntoViewResult, RendererServiceWorkerConsoleMessage,
+    RendererServiceWorkerExceptionMessage, RendererServiceWorkerFetchDiagnostic,
+    RendererServiceWorkerFetchDiagnosticResult, RendererServiceWorkerMainResourceFetch,
+    RendererServiceWorkerRunIdentity, RendererServiceWorkerTargetEvent,
+    RendererServiceWorkerTargetInfo, RendererServiceWorkerVersionStatus,
+    RendererSetDocumentContentResult, RendererSharedWorkerConsoleMessage,
+    RendererSharedWorkerTargetEvent, RendererSharedWorkerTargetInfo, RendererStyleSheetHeader,
+    RendererStyleSheetInventoryUpdate, RendererStyleSheetPayload, RendererSyntheticResponseBody,
+    RendererTextSearchMatch, RendererTouchPoint, RendererVisualStateToken,
+    RendererWindowDocumentSource, RuntimeConsoleMessageSnapshot, WorkerInspectorError,
+    renderer_output_transport_channel,
 };
+pub use runtime::{
+    RendererElementClickError, RendererElementClickTarget, RendererPreparedPointerClick,
+};
+pub use runtime::{RendererPopupActivationParts, RendererRuntimeInspectorMessageResponseOrder};
 pub use service_worker_runtime::{
     SharedServiceWorkerResourceStore, new_shared_json_service_worker_resource_store,
     new_shared_service_worker_resource_store,
@@ -318,7 +353,7 @@ pub use service_worker_runtime::{
 pub use shared_worker_runtime::RendererSharedWorkerRuntimeDiagnostics;
 pub(crate) use types::{
     DocumentStartScript, PendingSubresourceContinueOutcome, SubresourceAuthCredentials,
-    SubresourceResourceType,
+    SubresourceInterceptionClasses,
 };
 #[allow(unused_imports)]
 pub use types::{ScriptKind, ScriptMode, ScriptRunOutcome, ScriptSourceKind};
@@ -381,3 +416,5 @@ pub mod renderer {
         RendererTopLevelNavigationDispatch, is_on_js_local_executor,
     };
 }
+
+mod web_api_interfaces;

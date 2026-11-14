@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use super::{BackgroundProtocolEvent, NavigationBackgroundEvent};
+use super::{BackgroundProtocolEvent, NavigationBackgroundEvent, RendererOutputDependencies};
 #[cfg(test)]
 use crate::domains::command_output::protocol_message_background_event;
 use serde_json::{Value, json};
@@ -9,9 +9,13 @@ const RECENT_ACTIVITY_TRACE_LIMIT: usize = 128;
 
 #[derive(Debug)]
 pub enum CdpSchedulerEvent {
-    ProtocolWorkPublished {
-        work: crate::domains::activity::ProtocolSchedulerWork,
+    ProtocolTaskPrepared {
+        pending: super::PendingProtocolSchedulerWork,
     },
+    /// A coalesced wake only. The connection retains every concrete work item
+    /// until its scheduler drains the publication FIFO, including when this
+    /// wake is carried by a command which has not completed yet.
+    ProtocolWorkReady,
     PageScreencastStarted {
         registration: crate::domains::page::PageScreencastRegistration,
     },
@@ -26,8 +30,9 @@ pub struct CdpTurnOutcome {
     scheduler_events: Vec<CdpSchedulerEvent>,
 }
 
-/// One renderer-owner turn whose exact publication predecessor must be
-/// projected before its protocol result becomes observable.
+/// One turn whose exact renderer dependencies must be projected before its
+/// protocol result becomes observable. Ordinary owner turns use one stream;
+/// Browser/Target commands explicitly compose several owners.
 ///
 /// This wrapper is intentionally a different type from [`CdpTurnOutcome`]. A
 /// scheduler hook cannot pass it to a protocol-only turn consumer and rely on
@@ -36,7 +41,7 @@ pub struct CdpTurnOutcome {
 #[derive(Debug)]
 pub struct CdpRendererOwnerTurnOutcome {
     turn: CdpTurnOutcome,
-    renderer_output_predecessor: Option<moli_core::RendererOutputFence>,
+    renderer_output_dependencies: RendererOutputDependencies,
 }
 
 impl CdpTurnOutcome {
@@ -118,9 +123,16 @@ impl CdpTurnOutcome {
         self,
         predecessor: Option<moli_core::RendererOutputFence>,
     ) -> CdpRendererOwnerTurnOutcome {
+        self.with_renderer_output_dependencies(predecessor.into())
+    }
+
+    pub(crate) fn with_renderer_output_dependencies(
+        self,
+        dependencies: RendererOutputDependencies,
+    ) -> CdpRendererOwnerTurnOutcome {
         CdpRendererOwnerTurnOutcome {
             turn: self,
-            renderer_output_predecessor: predecessor,
+            renderer_output_dependencies: dependencies,
         }
     }
 
@@ -136,7 +148,7 @@ impl CdpTurnOutcome {
         (
             protocol_events
                 .into_iter()
-                .map(BackgroundProtocolEvent::into_protocol_message)
+                .filter_map(BackgroundProtocolEvent::into_wire_message)
                 .collect(),
             self.scheduler_events,
         )
@@ -175,10 +187,16 @@ impl CdpTurnOutcome {
 }
 
 impl CdpRendererOwnerTurnOutcome {
+    pub fn renderer_output_predecessor(&self) -> Option<moli_core::RendererOutputFence> {
+        self.renderer_output_dependencies
+            .clone()
+            .into_single_stream()
+    }
+
     #[cfg(test)]
     pub fn into_parts(self) -> (Vec<serde_json::Value>, Vec<CdpSchedulerEvent>) {
         assert!(
-            self.renderer_output_predecessor.is_none(),
+            self.renderer_output_dependencies.is_empty(),
             "tests must project an exact renderer predecessor instead of flattening it"
         );
         self.turn.into_parts()
@@ -189,13 +207,13 @@ impl CdpRendererOwnerTurnOutcome {
     ) -> (
         Vec<BackgroundProtocolEvent>,
         Vec<CdpSchedulerEvent>,
-        Option<moli_core::RendererOutputFence>,
+        RendererOutputDependencies,
     ) {
         let (protocol_events, scheduler_events) = self.turn.into_protocol_event_parts();
         (
             protocol_events,
             scheduler_events,
-            self.renderer_output_predecessor,
+            self.renderer_output_dependencies,
         )
     }
 
@@ -207,7 +225,7 @@ impl CdpRendererOwnerTurnOutcome {
         Option<moli_core::RendererOutputFence>,
         Vec<BackgroundProtocolEvent>,
         Vec<CdpSchedulerEvent>,
-        Option<moli_core::RendererOutputFence>,
+        RendererOutputDependencies,
     ) {
         let (
             protocol_events,
@@ -222,15 +240,149 @@ impl CdpRendererOwnerTurnOutcome {
             renderer_output_boundary,
             post_response_events,
             scheduler_events,
-            self.renderer_output_predecessor,
+            self.renderer_output_dependencies,
         )
+    }
+}
+
+#[derive(Default)]
+pub(super) struct CdpConnectionSchedulerState {
+    pending_navigation_background_events: Vec<NavigationBackgroundEvent>,
+    next_deferred_main_document_load_observation_id: u64,
+    next_protocol_work_publish_sequence: u64,
+    published_protocol_work: Vec<crate::ProtocolSchedulerWork>,
+    pub(super) renderer_output_ingress: crate::domains::activity::OrderedRendererOutputIngress,
+    pub(super) runtime_command_output_barriers:
+        crate::domains::activity::RuntimeCommandOutputBarriers,
+    scheduler_events: Vec<CdpSchedulerEvent>,
+    recent_activity_traces: VecDeque<Value>,
+    next_activity_trace_id: u64,
+}
+
+impl CdpConnectionSchedulerState {
+    /// Allocating a publication identity and taking durable ownership are one
+    /// finite operation. Commands and owner continuations carry wakes only.
+    pub(super) fn publish_protocol_work(
+        &mut self,
+        build: impl FnOnce(crate::ProtocolWorkPublishSequence) -> crate::ProtocolSchedulerWork,
+    ) {
+        self.next_protocol_work_publish_sequence = self
+            .next_protocol_work_publish_sequence
+            .checked_add(1)
+            .expect("protocol work publish sequence exhausted");
+        let sequence = crate::domains::activity::ProtocolWorkPublishSequence::new(
+            self.next_protocol_work_publish_sequence,
+        );
+        self.published_protocol_work.push(build(sequence));
+    }
+
+    pub(super) fn protocol_work_publication_mark(&self) -> u64 {
+        self.next_protocol_work_publish_sequence
+    }
+
+    pub(super) fn take_published_protocol_work(&mut self) -> Vec<crate::ProtocolSchedulerWork> {
+        std::mem::take(&mut self.published_protocol_work)
+    }
+
+    pub(super) fn allocate_deferred_main_document_load_observation_id(
+        &mut self,
+    ) -> super::DeferredMainDocumentLoadObservationId {
+        self.next_deferred_main_document_load_observation_id = self
+            .next_deferred_main_document_load_observation_id
+            .checked_add(1)
+            .expect("deferred main-document load observation identity exhausted");
+        super::DeferredMainDocumentLoadObservationId(
+            self.next_deferred_main_document_load_observation_id,
+        )
+    }
+
+    pub(crate) fn push_scheduler_event(&mut self, event: CdpSchedulerEvent) {
+        self.scheduler_events.push(event);
+    }
+
+    pub(super) fn extend_scheduler_events(&mut self, events: Vec<CdpSchedulerEvent>) {
+        self.scheduler_events.extend(events);
+    }
+
+    pub(super) fn scheduler_event_count(&self) -> usize {
+        self.scheduler_events.len() + self.published_protocol_work.len()
+    }
+
+    pub(super) fn bind_renderer_delivery_predecessor_since(
+        &mut self,
+        start: u64,
+        predecessor: moli_core::RendererOutputCursor,
+    ) {
+        let first_new = self
+            .published_protocol_work
+            .partition_point(|work| work.publish_sequence().get() <= start);
+        for work in &mut self.published_protocol_work[first_new..] {
+            work.bind_renderer_delivery_predecessor(predecessor);
+        }
+    }
+
+    pub(super) fn bind_renderer_output_source_since(
+        &mut self,
+        start: u64,
+        source: moli_core::RendererOutputCursor,
+    ) {
+        let first_new = self
+            .published_protocol_work
+            .partition_point(|work| work.publish_sequence().get() <= start);
+        for work in &mut self.published_protocol_work[first_new..] {
+            work.bind_renderer_output_source(source);
+        }
+    }
+
+    pub(super) fn take_scheduler_events(&mut self) -> Vec<CdpSchedulerEvent> {
+        let mut events = std::mem::take(&mut self.scheduler_events);
+        if !self.published_protocol_work.is_empty() {
+            events.push(CdpSchedulerEvent::ProtocolWorkReady);
+        }
+        events
+    }
+
+    pub(super) fn push_activity_trace(&mut self, mut event: Value) {
+        if !moli_trace::cdp_nav_timing_enabled() && !moli_trace::cdp_runtime_trace_enabled() {
+            return;
+        }
+        self.next_activity_trace_id = self.next_activity_trace_id.wrapping_add(1);
+        if let Some(object) = event.as_object_mut() {
+            object.insert("id".to_owned(), json!(self.next_activity_trace_id));
+        }
+        self.recent_activity_traces.push_back(event);
+        while self.recent_activity_traces.len() > RECENT_ACTIVITY_TRACE_LIMIT {
+            self.recent_activity_traces.pop_front();
+        }
+    }
+
+    pub(super) fn push_navigation_background_event(&mut self, event: NavigationBackgroundEvent) {
+        self.pending_navigation_background_events.push(event);
+    }
+
+    pub(super) fn take_navigation_background_events(&mut self) -> Vec<NavigationBackgroundEvent> {
+        std::mem::take(&mut self.pending_navigation_background_events)
+    }
+
+    pub(super) fn moli_memory_diagnostics(&self) -> Value {
+        json!({
+            "pendingNavigationBackgroundEventCount": self.pending_navigation_background_events.len(),
+            "pendingSchedulerEventCount": self.scheduler_events.len(),
+            "pendingProtocolWorkCount": self.published_protocol_work.len(),
+            "recentActivityTraceCount": self.recent_activity_traces.len(),
+            "recentActivityTraces": self
+                .recent_activity_traces
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::devtools_runtime::AutomationEvent;
+    use crate::automation::AutomationEvent;
 
     #[test]
     fn turn_outcome_raw_protocol_messages_regain_typed_sidecars() {
@@ -265,89 +417,5 @@ mod tests {
                     && event.backend_node_id == 42
                     && event.mode == "selectSingle"
         ));
-    }
-}
-
-#[derive(Default)]
-pub(super) struct CdpConnectionSchedulerState {
-    pending_navigation_background_events: Vec<NavigationBackgroundEvent>,
-    next_deferred_main_document_load_observation_id: u64,
-    next_protocol_work_publish_sequence: u64,
-    pub(super) renderer_output_ingress: crate::domains::activity::OrderedRendererOutputIngress,
-    scheduler_events: Vec<CdpSchedulerEvent>,
-    recent_activity_traces: VecDeque<Value>,
-    next_activity_trace_id: u64,
-}
-
-impl CdpConnectionSchedulerState {
-    pub(super) fn allocate_protocol_work_publish_sequence(
-        &mut self,
-    ) -> crate::domains::activity::ProtocolWorkPublishSequence {
-        self.next_protocol_work_publish_sequence = self
-            .next_protocol_work_publish_sequence
-            .checked_add(1)
-            .expect("protocol work publish sequence exhausted");
-        crate::domains::activity::ProtocolWorkPublishSequence::new(
-            self.next_protocol_work_publish_sequence,
-        )
-    }
-
-    pub(super) fn allocate_deferred_main_document_load_observation_id(
-        &mut self,
-    ) -> super::DeferredMainDocumentLoadObservationId {
-        self.next_deferred_main_document_load_observation_id = self
-            .next_deferred_main_document_load_observation_id
-            .checked_add(1)
-            .expect("deferred main-document load observation identity exhausted");
-        super::DeferredMainDocumentLoadObservationId(
-            self.next_deferred_main_document_load_observation_id,
-        )
-    }
-
-    pub(crate) fn push_scheduler_event(&mut self, event: CdpSchedulerEvent) {
-        self.scheduler_events.push(event);
-    }
-
-    pub(super) fn extend_scheduler_events(&mut self, events: Vec<CdpSchedulerEvent>) {
-        self.scheduler_events.extend(events);
-    }
-
-    pub(super) fn take_scheduler_events(&mut self) -> Vec<CdpSchedulerEvent> {
-        std::mem::take(&mut self.scheduler_events)
-    }
-
-    pub(super) fn push_activity_trace(&mut self, mut event: Value) {
-        if !moli_trace::cdp_nav_timing_enabled() && !moli_trace::cdp_runtime_trace_enabled() {
-            return;
-        }
-        self.next_activity_trace_id = self.next_activity_trace_id.wrapping_add(1);
-        if let Some(object) = event.as_object_mut() {
-            object.insert("id".to_owned(), json!(self.next_activity_trace_id));
-        }
-        self.recent_activity_traces.push_back(event);
-        while self.recent_activity_traces.len() > RECENT_ACTIVITY_TRACE_LIMIT {
-            self.recent_activity_traces.pop_front();
-        }
-    }
-
-    pub(super) fn push_navigation_background_event(&mut self, event: NavigationBackgroundEvent) {
-        self.pending_navigation_background_events.push(event);
-    }
-
-    pub(super) fn take_navigation_background_events(&mut self) -> Vec<NavigationBackgroundEvent> {
-        std::mem::take(&mut self.pending_navigation_background_events)
-    }
-
-    pub(super) fn moli_memory_diagnostics(&self) -> Value {
-        json!({
-            "pendingNavigationBackgroundEventCount": self.pending_navigation_background_events.len(),
-            "pendingSchedulerEventCount": self.scheduler_events.len(),
-            "recentActivityTraceCount": self.recent_activity_traces.len(),
-            "recentActivityTraces": self
-                .recent_activity_traces
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-        })
     }
 }

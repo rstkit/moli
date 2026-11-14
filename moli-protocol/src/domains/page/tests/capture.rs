@@ -1,9 +1,105 @@
 use super::*;
 use crate::conn::{Cmd, CommandDispatchContext};
 use crate::domains::page::{
-    PageCommandTaskStep, complete_pending_page_command, try_start_page_command_dispatch,
+    PageCommandTaskStep, completion::complete_finite, try_start_page_command_dispatch,
 };
 use serde_json::Value;
+
+mod emulation;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_snapshot_reads_live_url_and_html_before_adapter_settlement() {
+    use moli_core::{RendererNativeOperation, RendererNativeProtocolResponse, RendererPageCommand};
+    let mut ctx = TestContext::new();
+    let original_url = "https://snapshot.test/start";
+    load_bc_with_target(&mut ctx, "BID-SNAPSHOT", "TID-SNAPSHOT", original_url);
+    ctx.install_buffered_navigation_fixture_for_session_owner(
+        url::Url::parse(original_url).unwrap(),
+        "<!doctype html><body>original</body>".to_owned(),
+        None,
+    )
+    .await;
+    let (pending, guard) = ctx.with_fixture(|conn| conn.loaded_page_mut_for_protocol_access(None).unwrap()
+        .start_cdp_call(1200, None, RendererNativeOperation::new(
+            RendererPageCommand::EvaluateExpression {
+                expression: "history.replaceState(null, '', '#current'); document.body.innerHTML = '<p>snapshot current</p>'".to_owned(),
+                await_promise: false,
+            },
+            |reply| { reply.unwrap(); RendererNativeProtocolResponse::success(json!({})) },
+        )).unwrap());
+    // The renderer is done, but its adapter has not applied the new Page state.
+    // A later handler must capture live document metadata independently.
+    let held_completion = pending.wait().await.unwrap();
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.loaded_page_mut_for_protocol_access(None)
+                .unwrap()
+                .final_url()
+                .as_str(),
+            original_url
+        )
+    });
+    let commands = [
+        (1201, "Page.captureSnapshot"),
+        (1202, "Page.getFrameTree"),
+        (1203, "Page.getResourceTree"),
+    ]
+    .into_iter()
+    .map(|(id, method)| {
+        let raw = json!({"id": id, "method": method}).to_string();
+        let pending =
+            ctx.with_fixture(|conn| conn.try_start_pending_command_dispatch(&raw).unwrap());
+        assert_eq!(pending.kind_name(), "Native");
+        pending
+    })
+    .collect::<Vec<_>>();
+    let mut commands = commands.into_iter();
+    let pending = commands.next().unwrap();
+    let (messages, _) = ctx
+        .complete_command_task_step_for_test(crate::conn::CdpCommandTaskStep::Pending(Box::new(
+            pending,
+        )))
+        .await;
+    let response = messages
+        .iter()
+        .find(|message| message["id"] == 1201)
+        .unwrap();
+    let snapshot = response["result"]["data"].as_str().unwrap();
+    assert!(
+        snapshot.contains("Content-Location: https://snapshot.test/start#current\r\n"),
+        "{snapshot}"
+    );
+    let html = snapshot
+        .split("\r\n\r\n")
+        .nth(2)
+        .unwrap()
+        .split("\r\n--")
+        .next()
+        .unwrap();
+    let html = BASE64_STANDARD.decode(html).unwrap();
+    assert!(
+        String::from_utf8(html)
+            .unwrap()
+            .contains("<p>snapshot current</p>")
+    );
+    for (id, pending) in [1202, 1203].into_iter().zip(commands) {
+        let (messages, _) = ctx
+            .complete_command_task_step_for_test(crate::conn::CdpCommandTaskStep::Pending(
+                Box::new(pending),
+            ))
+            .await;
+        let response = messages.iter().find(|message| message["id"] == id).unwrap();
+        assert_eq!(
+            response["result"]["frameTree"]["frame"]["url"],
+            "https://snapshot.test/start#current"
+        );
+        if id == 1203 {
+            assert!(response["result"]["frameTree"]["resources"].is_array());
+        }
+    }
+    assert!(guard.cancel_or_published().await.is_some());
+    drop(held_completion);
+}
 
 /// cdp.page: captureScreenshot – invalid image format
 #[tokio::test(flavor = "multi_thread")]
@@ -102,6 +198,142 @@ async fn capture_screenshot_accepts_default_equivalent_options() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn capture_screenshot_applies_base_background_alpha_clear_and_css_priority() {
+    let mut ctx = TestContext::new();
+    let fixture = screenshot_data_url(
+        r#"<!doctype html>
+        <style>html,body{margin:0;overflow:hidden}
+        #box{width:4px;height:4px;background:lime}
+        iframe{position:absolute;left:8px;top:0;width:4px;height:4px;border:0}</style>
+        <div id="box"></div><iframe srcdoc="<!doctype html><style>html,body{margin:0;overflow:hidden}</style>"></iframe>"#,
+    );
+    install_active_screenshot_page(&mut ctx, "BID-BG", "TID-BG", "SID-BG", &fixture).await;
+    set_screenshot_viewport(&mut ctx, "SID-BG", 16, 16, 1.0, 150).await;
+
+    for (params, expected) in [
+        (json!({"color": {"r":0,"g":0,"b":0,"a":0}}), [0, 0, 0, 0]),
+        (
+            json!({"color": {"r":255,"g":0,"b":0,"a":0.5}}),
+            [255, 0, 0, 128],
+        ),
+        (
+            json!({"color": {"r":-1,"g":300,"b":128,"a":2}}),
+            [0, 255, 128, 255],
+        ),
+        (json!({}), [255; 4]),
+    ] {
+        ctx.process_async(json!({"id":151,"sessionId":"SID-BG",
+            "method":"Emulation.setDefaultBackgroundColorOverride","params":params}))
+            .await;
+        ctx.expect_result(151, json!({}), Some("SID-BG"));
+        ctx.process_async(json!({"id":152,"sessionId":"SID-BG","method":"Page.captureScreenshot"}))
+            .await;
+        let png = screenshot_png_bytes(&take_response_by_id(&mut ctx, 152));
+        assert_eq!(decode_png_pixel(&png, 1, 8), expected);
+        assert_eq!(
+            decode_png_pixel(&png, 9, 1),
+            expected,
+            "a transparent child must reveal the top-level base"
+        );
+        assert_eq!(
+            decode_png_pixel(&png, 1, 1),
+            [0, 255, 0, 255],
+            "author paint covers the base color"
+        );
+        ctx.process_async(
+            json!({"id":156,"sessionId":"SID-BG","method":"Page.captureScreenshot",
+            "params":{"format":"jpeg", "quality":100}}),
+        )
+        .await;
+        let bytes = screenshot_bytes(&take_response_by_id(&mut ctx, 156));
+        let jpeg = moli_image::decode_jpeg(&bytes).unwrap();
+        let pixel = &jpeg.rgba[((12 * jpeg.width + 1) * 4) as usize..][..4];
+        for channel in 0..3 {
+            let composited =
+                ((u16::from(expected[channel]) * u16::from(expected[3]) + 127) / 255) as u8;
+            assert!(
+                pixel[channel].abs_diff(composited) <= 2,
+                "JPEG pixel {pixel:?}, RGBA base {expected:?}"
+            );
+        }
+        assert_eq!(pixel[3], 255);
+    }
+
+    ctx.process_async(json!({"id":153,"sessionId":"SID-BG",
+        "method":"Emulation.setDefaultBackgroundColorOverride",
+        "params":{"color":{"r":255,"g":0,"b":0}}}))
+        .await;
+    ctx.expect_result(153, json!({}), Some("SID-BG"));
+    ctx.process_async(json!({"id":157,"sessionId":"SID-BG",
+        "method":"Emulation.setDefaultBackgroundColorOverride",
+        "params":{"color":{"r":4294967296_u64,"g":0,"b":0}}}))
+        .await;
+    ctx.expect_error(157, -32602, "Color channels must be int32 values");
+    ctx.install_navigation_fixture_for_session_owner(&fixture, Some("SID-BG"))
+        .await;
+    ctx.process_async(json!({"id":154,"sessionId":"SID-BG","method":"Page.captureScreenshot"}))
+        .await;
+    let png = screenshot_png_bytes(&take_response_by_id(&mut ctx, 154));
+    assert_eq!(
+        decode_png_pixel(&png, 1, 8),
+        [255, 0, 0, 255],
+        "the target override survives navigation"
+    );
+
+    let css_background = screenshot_data_url("<style>html{background:blue}</style>");
+    ctx.install_navigation_fixture_for_session_owner(&css_background, Some("SID-BG"))
+        .await;
+    ctx.process_async(json!({"id":155,"sessionId":"SID-BG","method":"Page.captureScreenshot"}))
+        .await;
+    let png = screenshot_png_bytes(&take_response_by_id(&mut ctx, 155));
+    assert_eq!(
+        decode_png_pixel(&png, 1, 8),
+        [0, 0, 255, 255],
+        "the CSS canvas background takes precedence"
+    );
+
+    let translucent_css = screenshot_data_url("<style>html{background:rgba(0,0,255,.5)}</style>");
+    ctx.install_navigation_fixture_for_session_owner(&translucent_css, Some("SID-BG"))
+        .await;
+    ctx.process_async(json!({"id":161,"sessionId":"SID-BG","method":"Page.captureScreenshot"}))
+        .await;
+    let png = screenshot_png_bytes(&take_response_by_id(&mut ctx, 161));
+    let pixel = decode_png_pixel(&png, 1, 8);
+    assert!(
+        pixel[0].abs_diff(127) <= 1 && pixel[2].abs_diff(128) <= 1,
+        "{pixel:?}"
+    );
+    assert_eq!(
+        [pixel[1], pixel[3]],
+        [0, 255],
+        "translucent CSS blends over the opaque emulated base"
+    );
+
+    // Blink clears the shared base color whenever a Page emulation handler is detached.
+    ctx.process_async(json!({"id":158,"method":"Target.attachToTarget",
+        "params":{"targetId":"TID-BG","flatten":true}}))
+        .await;
+    let attached = take_response_by_id(&mut ctx, 158)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ctx.process_async(json!({"id":159,"method":"Target.detachFromTarget",
+        "params":{"sessionId":attached}}))
+        .await;
+    ctx.expect_result(159, json!({}), None);
+    ctx.install_navigation_fixture_for_session_owner(&fixture, Some("SID-BG"))
+        .await;
+    ctx.process_async(json!({"id":160,"sessionId":"SID-BG","method":"Page.captureScreenshot"}))
+        .await;
+    let png = screenshot_png_bytes(&take_response_by_id(&mut ctx, 160));
+    assert_eq!(
+        decode_png_pixel(&png, 1, 8),
+        [255; 4],
+        "detaching restores the default base color"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn capture_screenshot_uses_pending_renderer_page_command_residence() {
     let mut ctx = TestContext::new();
     install_active_screenshot_page(
@@ -121,18 +353,20 @@ async fn capture_screenshot_uses_pending_renderer_page_command_residence() {
         Some("SID-SCREENSHOT-FENCE"),
         r#"{"id":151,"method":"Page.captureScreenshot","sessionId":"SID-SCREENSHOT-FENCE"}"#,
     );
-    let PageCommandTaskStep::Pending(pending) =
-        try_start_page_command_dispatch(&mut ctx.conn, &cmd)
-            .expect("Page.captureScreenshot should be handled by Page domain")
+    let PageCommandTaskStep::Pending(pending) = ctx
+        .with_fixture(|conn| {
+            try_start_page_command_dispatch(conn, &cmd, &mut CommandDispatchContext::default())
+        })
+        .expect("Page.captureScreenshot should be handled by Page domain")
     else {
         panic!("captureScreenshot should use the pending renderer page-command lane");
     };
 
     let mut command_context = CommandDispatchContext::default();
-    let PageCommandTaskStep::Complete(plan) =
-        complete_pending_page_command(&mut ctx.conn, pending.wait().await, &mut command_context)
-            .await
-    else {
+    let PageCommandTaskStep::Complete(plan) = ({
+        let completed = pending.wait().await;
+        ctx.with_fixture(|conn| complete_finite(conn, completed, &mut command_context))
+    }) else {
         panic!("captureScreenshot should complete after one renderer page command");
     };
     if let Some(predecessor) = command_context.take_renderer_output_predecessor() {
@@ -165,33 +399,33 @@ async fn capture_screenshot_rejects_completion_from_replaced_renderer_attachment
         Some("SID-SCREENSHOT-STALE"),
         r#"{"id":152,"method":"Page.captureScreenshot","sessionId":"SID-SCREENSHOT-STALE"}"#,
     );
-    let PageCommandTaskStep::Pending(pending) =
-        try_start_page_command_dispatch(&mut ctx.conn, &cmd)
-            .expect("Page.captureScreenshot should be handled by Page domain")
+    let PageCommandTaskStep::Pending(pending) = ctx
+        .with_fixture(|conn| {
+            try_start_page_command_dispatch(conn, &cmd, &mut CommandDispatchContext::default())
+        })
+        .expect("Page.captureScreenshot should be handled by Page domain")
     else {
         panic!("captureScreenshot should use the pending renderer page-command lane");
     };
 
     let replacement = ctx
-        .conn
-        .load_page_via_runtime_async(
-            "data:text/html,<style>html%7Bbackground-color%3Agreen%7D</style>",
-        )
+        .build_fixture_page("data:text/html,<style>html%7Bbackground-color%3Agreen%7D</style>")
         .await
         .expect("replacement page should load");
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context")
-        .active_page_target_mut()
-        .runtime_slot
-        .replace_loaded_page(Some(replacement));
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .expect("browser context")
+            .active_page_target_mut()
+            .runtime_slot
+            .replace_loaded_page(Some(replacement))
+    });
 
     let mut command_context = CommandDispatchContext::default();
-    let PageCommandTaskStep::Complete(plan) =
-        complete_pending_page_command(&mut ctx.conn, pending.wait().await, &mut command_context)
-            .await
-    else {
+    let PageCommandTaskStep::Complete(plan) = ({
+        let completed = pending.wait().await;
+        ctx.with_fixture(|conn| complete_finite(conn, completed, &mut command_context))
+    }) else {
         panic!("stale captureScreenshot completion should settle as an error");
     };
     let mut out = Vec::new();
@@ -240,6 +474,26 @@ async fn capture_screenshot_rejects_invalid_quality_and_clip() {
             json!({"clip": {"x": 0, "y": 0, "width": 0, "height": 1, "scale": 1}}),
             "Page.captureScreenshot clip must have a finite origin and positive finite width, height, and scale.",
         ),
+        (
+            20,
+            json!({"clip": {"x": 1, "y": 0, "width": 0, "height": 0, "scale": 1}}),
+            "Page.captureScreenshot clip must have a finite origin and positive finite width, height, and scale.",
+        ),
+        (
+            21,
+            json!({"clip": {"x": 0, "y": 0, "width": -1, "height": -1, "scale": 1}}),
+            "Page.captureScreenshot clip must have a finite origin and positive finite width, height, and scale.",
+        ),
+        (
+            22,
+            json!({"clip": {"x": 0, "y": 0, "width": 0, "height": 0, "scale": 0}}),
+            "Page.captureScreenshot clip must have a finite origin and positive finite width, height, and scale.",
+        ),
+        (
+            23,
+            json!({"clip": {"x": 0, "y": 0, "width": 0, "height": 0, "scale": 1}}),
+            "Page.captureScreenshot clip must have a finite origin and positive finite width, height, and scale.",
+        ),
     ] {
         ctx.process_async(json!({
             "id": id,
@@ -258,17 +512,17 @@ async fn capture_snapshot_returns_minimal_mhtml_for_loaded_page() {
     let page_url = "data:text/html,<div id='x' class='container'><p>Text</p></div>";
     load_bc_with_target(&mut ctx, "BID-MHTML", "TID-MHTML", page_url);
     let page = ctx
-        .conn
-        .load_page_via_runtime_async(page_url)
+        .build_fixture_page(page_url)
         .await
         .expect("page should load");
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context")
-        .active_page_target_mut()
-        .runtime_slot
-        .replace_loaded_page(Some(page));
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .expect("browser context")
+            .active_page_target_mut()
+            .runtime_slot
+            .replace_loaded_page(Some(page))
+    });
 
     ctx.process_async(json!({
         "id": 1110,
@@ -310,17 +564,17 @@ async fn capture_snapshot_dispatch_serializes_html_in_renderer_owner() {
         "data:text/html,<!doctype html><html><body><main id='live'>renderer</main></body></html>";
     load_bc_with_target(&mut ctx, "BID-MHTML-LIVE", "TID-MHTML-LIVE", page_url);
     let page = ctx
-        .conn
-        .load_page_via_runtime_async(page_url)
+        .build_fixture_page(page_url)
         .await
         .expect("page should load");
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context")
-        .active_page_target_mut()
-        .runtime_slot
-        .replace_loaded_page(Some(page));
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .expect("browser context")
+            .active_page_target_mut()
+            .runtime_slot
+            .replace_loaded_page(Some(page))
+    });
 
     let params = serde_json::Value::Null;
     let cmd = Cmd::for_test(
@@ -330,16 +584,20 @@ async fn capture_snapshot_dispatch_serializes_html_in_renderer_owner() {
         None,
         r#"{"id":1120,"method":"Page.captureSnapshot"}"#,
     );
-    let step = try_start_page_command_dispatch(&mut ctx.conn, &cmd)
+    let step = ctx
+        .with_fixture(|conn| {
+            try_start_page_command_dispatch(conn, &cmd, &mut CommandDispatchContext::default())
+        })
         .expect("Page.captureSnapshot should be handled by Page domain");
     let PageCommandTaskStep::Pending(pending) = step else {
         panic!("Page.captureSnapshot should serialize HTML with a renderer page command");
     };
 
     let mut command_context = CommandDispatchContext::default();
-    let step =
-        complete_pending_page_command(&mut ctx.conn, pending.wait().await, &mut command_context)
-            .await;
+    let step = {
+        let completed = pending.wait().await;
+        ctx.with_fixture(|conn| complete_finite(conn, completed, &mut command_context))
+    };
     let PageCommandTaskStep::Complete(plan) = step else {
         panic!("Page.captureSnapshot serialize command should complete in one pending step");
     };
@@ -375,16 +633,22 @@ fn mhtml_snapshot_base64_encodes_html_and_sanitizes_header_url() {
     assert!(!mhtml.contains(html));
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn print_to_pdf_returns_base64_pdf() {
+async fn print_to_pdf_returns_base64_pdf_without_publishing_interactive_geometry() {
     let mut ctx = TestContext::new();
     install_active_screenshot_page(
         &mut ctx,
         "BID-PDF-BASE64",
         "TID-PDF-BASE64",
         "SID-PDF-BASE64",
-        "data:text/html,<style>html,body%7Bmargin%3A0%7D</style><main>pdf</main>",
+        "data:text/html,<style>html,body%7Bmargin%3A0%7Dmain%7Bwidth%3A40px%7D@media print%7Bmain%7Bwidth%3A80px%7D%7D</style><main>pdf</main>",
     )
     .await;
+    let query = json!({
+        "id": 1111,
+        "method": "Runtime.evaluate",
+        "sessionId": "SID-PDF-BASE64",
+        "params": {"expression": "document.querySelector('main').getBoundingClientRect().width"}
+    });
     ctx.process_async(json!({
         "id": 1112,
         "method": "Page.printToPDF",
@@ -394,6 +658,48 @@ async fn print_to_pdf_returns_base64_pdf() {
     let pdf = screenshot_bytes(&take_response_by_id(&mut ctx, 1112));
     assert!(pdf.starts_with(b"%PDF-1.7"));
     assert!(pdf.ends_with(b"%%EOF\n"));
+    let document = lopdf::Document::load_mem(&pdf).unwrap();
+    assert_eq!(document.extract_text(&[1]).unwrap().trim(), "pdf");
+    assert!(document.objects.values().any(|object| {
+        object
+            .as_dict()
+            .is_ok_and(|dict| dict.has(b"FontFile2") || dict.has(b"FontFile3"))
+    }));
+
+    // Printing a cold page must not publish its print-media geometry.
+    ctx.process_async(json!({
+        "id":1113,"method":"Runtime.evaluate","sessionId":"SID-PDF-BASE64",
+        "params":{"expression":"document.querySelector('main').style.width='60px'"}
+    }))
+    .await;
+    take_response_by_id(&mut ctx, 1113);
+    ctx.process_async(query.clone()).await;
+    assert_eq!(
+        take_response_by_id(&mut ctx, 1111)["result"]["result"]["value"],
+        60
+    );
+
+    // Printing a warm page must also leave its previous screen geometry alone.
+    ctx.process_async(json!({
+        "id":1113,"method":"Runtime.evaluate","sessionId":"SID-PDF-BASE64",
+        "params":{"expression":"document.querySelector('main').style.width='100px'"}
+    }))
+    .await;
+    take_response_by_id(&mut ctx, 1113);
+    ctx.process_async(json!({"id":1112,"method":"Page.printToPDF","sessionId":"SID-PDF-BASE64"}))
+        .await;
+    assert!(screenshot_bytes(&take_response_by_id(&mut ctx, 1112)).starts_with(b"%PDF-1.7"));
+    ctx.process_async(query.clone()).await;
+    assert_eq!(
+        take_response_by_id(&mut ctx, 1111)["result"]["result"]["value"],
+        60
+    );
+    ctx.capture_fixture_layout(Some("SID-PDF-BASE64")).await;
+    ctx.process_async(query).await;
+    assert_eq!(
+        take_response_by_id(&mut ctx, 1111)["result"]["result"]["value"],
+        100
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn print_to_pdf_return_as_stream_reads_through_io_domain() {
@@ -497,32 +803,46 @@ async fn capture_screenshot_targets_loaded_background_owner_without_activation()
     bc.set_active_target_id("TID-active".to_owned());
     bc.attach_active_session("SID-active".to_owned());
     bc.insert_page_target_host(background);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.install_navigation_fixture_for_session_owner(
         "data:text/html,<title>Background Screenshot</title><main>background</main>",
         Some("SID-background"),
     )
     .await;
-    ctx.wait_for_scheduler_message("background screenshot fixture load", |message| {
-        message["method"] == json!("Page.loadEventFired")
-            && message["sessionId"] == json!("SID-background")
+    ctx.wait_until_scheduler_state("background screenshot fixture load", |conn| {
+        conn.renderer_document_lifecycle_authoritative_state_for_session_owner(Some(
+            "SID-background",
+        ))
+        .is_some_and(|(_, snapshot)| snapshot.load.is_some())
     })
     .await;
     ctx.sent.clear();
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context")
-        .background_target_mut("TID-background")
-        .expect("background target must exist")
-        .effective_emulation_state
-        .emulated_device_metrics = Some(EmulatedDeviceMetrics {
-        width: 320,
-        height: 240,
-        device_scale_factor: 2.0,
-        screen_width: 320,
-        screen_height: 240,
-    });
+    {
+        let fixture_value = Some(EmulatedDeviceMetrics {
+            width: 320,
+            height: 240,
+            view: None,
+            outer_width: 320,
+            outer_height: 240,
+            device_scale_factor: 2.0,
+            screen_width: 320,
+            screen_height: 240,
+            screen_avail_height: 240,
+
+            window_x: 0,
+            window_y: 0,
+            screen_orientation: Default::default(),
+        });
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .expect("browser context")
+                .background_target_mut("TID-background")
+                .expect("background target must exist")
+                .effective_emulation_state
+                .emulated_device_metrics = fixture_value;
+        });
+    }
 
     ctx.process_async(json!({
         "id": 114,
@@ -532,14 +852,15 @@ async fn capture_screenshot_targets_loaded_background_owner_without_activation()
     .await;
     let response = take_response_by_id(&mut ctx, 114);
     assert_png_dimensions(&screenshot_png_bytes(&response), 1920, 1080);
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(|browser_context| browser_context.active_target_id()),
-        Some("TID-active"),
-        "background Page.captureScreenshot should not activate the target"
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .and_then(|browser_context| browser_context.active_target_id()),
+            Some("TID-active"),
+            "background Page.captureScreenshot should not activate the target"
+        )
+    });
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn capture_screenshot_targets_inactive_loaded_owner_without_activation() {
@@ -552,8 +873,7 @@ async fn capture_screenshot_targets_inactive_loaded_owner_without_activation() {
         "about:blank",
     );
     let page = ctx
-        .conn
-        .load_page_via_runtime_async(
+        .build_fixture_page(
             "data:text/html,<title>Inactive Screenshot</title><main>inactive</main>",
         )
         .await
@@ -567,13 +887,20 @@ async fn capture_screenshot_targets_inactive_loaded_owner_without_activation() {
         .emulated_device_metrics = Some(EmulatedDeviceMetrics {
         width: 500,
         height: 300,
+        view: None,
+        outer_width: 500,
+        outer_height: 300,
         device_scale_factor: 1.5,
         screen_width: 500,
         screen_height: 300,
+        screen_avail_height: 300,
+
+        window_x: 0,
+        window_y: 0,
+        screen_orientation: Default::default(),
     });
     inactive.replace_loaded_page(Some(page));
-    ctx.conn
-        .push_inactive_browser_context_fixture_for_test(inactive);
+    ctx.with_fixture(|conn| conn.push_inactive_browser_context_fixture_for_test(inactive));
 
     ctx.process_async(json!({
         "id": 115,
@@ -583,14 +910,15 @@ async fn capture_screenshot_targets_inactive_loaded_owner_without_activation() {
     .await;
     let response = take_response_by_id(&mut ctx, 115);
     assert_png_dimensions(&screenshot_png_bytes(&response), 1920, 1080);
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .map(|browser_context| browser_context.id.as_str()),
-        Some("BID-active"),
-        "inactive Page.captureScreenshot should not activate its browser context"
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .map(|browser_context| browser_context.id.as_str()),
+            Some("BID-active"),
+            "inactive Page.captureScreenshot should not activate its browser context"
+        )
+    });
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn capture_screenshot_clip_uses_page_coordinates_scale_and_live_dpr() {
@@ -707,6 +1035,8 @@ async fn devtools_node_screenshot_chain_uses_real_box_and_layout_metrics() {
         .as_u64()
         .expect("DOM.querySelector target nodeId");
 
+    ctx.capture_fixture_layout(Some("SID-SCREENSHOT-NODE"))
+        .await;
     ctx.process_async(json!({
         "id": 123,
         "method": "DOM.getBoxModel",
@@ -771,11 +1101,7 @@ async fn install_active_screenshot_page(
     load_bc_with_session(ctx, browser_context_id, target_id, session_id, url);
     ctx.install_navigation_fixture_for_session_owner(url, Some(session_id))
         .await;
-    ctx.wait_for_scheduler_message("screenshot fixture load", |message| {
-        message["method"] == json!("Page.loadEventFired")
-            && message["sessionId"] == json!(session_id)
-    })
-    .await;
+    wait_until_renderer_document_load(ctx, Some(session_id), target_id, LOADER_ID).await;
     ctx.sent.clear();
 }
 
@@ -841,13 +1167,208 @@ fn screenshot_data_url(html: &str) -> String {
         percent_encoding::percent_encode(html.as_bytes(), percent_encoding::NON_ALPHANUMERIC)
     )
 }
-/// cdp.page: getLayoutMetrics – falls back to viewport metrics without a live page
+#[tokio::test(flavor = "multi_thread")]
+async fn get_layout_metrics_initializes_layout_and_reuses_content_until_capture() {
+    let mut ctx = TestContext::new();
+    let session = "SID-COLD-METRICS";
+    install_active_screenshot_page(
+        &mut ctx,
+        "BID-COLD-METRICS",
+        "TID-COLD-METRICS",
+        session,
+        &screenshot_data_url("<!doctype html><style>html,body{margin:0}main{width:80px;height:900px;background:rgb(20,30,40)}</style><main></main>"),
+    ).await;
+    set_screenshot_viewport(&mut ctx, session, 320, 240, 1.0, 120).await;
+
+    ctx.process_async(json!({"id":121,"method":"Page.getLayoutMetrics","sessionId":session}))
+        .await;
+    let response = take_response_by_id(&mut ctx, 121);
+    let result = &response["result"];
+    assert_eq!(result["layoutViewport"]["clientWidth"], 320, "{response}");
+    assert_eq!(result["layoutViewport"]["clientHeight"], 240);
+    assert_eq!(result["visualViewport"]["pageX"], 0.0);
+    assert_eq!(result["visualViewport"]["pageY"], 0.0);
+    assert_eq!(result["visualViewport"]["scale"], 1.0);
+    assert_eq!(
+        result["cssContentSize"],
+        json!({"x":0,"y":0,"width":320.0,"height":900.0})
+    );
+
+    let geometry = json!({
+        "id":122,"method":"Runtime.evaluate","sessionId":session,
+        "params":{"expression":"document.querySelector('main').getBoundingClientRect().width"}
+    });
+    ctx.process_async(geometry.clone()).await;
+    assert_eq!(
+        take_response_by_id(&mut ctx, 122)["result"]["result"]["value"],
+        80
+    );
+
+    // A viewport capture still uses the caller's explicit clip.
+    ctx.process_async(json!({
+        "id":123,"method":"Page.captureScreenshot","sessionId":session,
+        "params":{"format":"png","clip":{
+            "x":result["visualViewport"]["pageX"],
+            "y":result["visualViewport"]["pageY"],
+            "width":320,"height":240,"scale":result["visualViewport"]["scale"]
+        }}
+    }))
+    .await;
+    let png = screenshot_bytes(&take_response_by_id(&mut ctx, 123));
+    assert_png_dimensions(&png, 320, 240);
+    assert_eq!(decode_png_pixel(&png, 20, 20), [20, 30, 40, 255]);
+    ctx.process_async(geometry).await;
+    assert_eq!(
+        take_response_by_id(&mut ctx, 122)["result"]["result"]["value"],
+        80
+    );
+
+    ctx.process_async(json!({"id":124,"method":"Page.getLayoutMetrics","sessionId":session}))
+        .await;
+    let published = take_response_by_id(&mut ctx, 124);
+    assert_eq!(published["result"]["contentSize"]["height"], 900.0);
+
+    // The viewport and scroll offset stay live even when the content extent
+    // still belongs to an older published frame.
+    ctx.process_async(json!({
+        "id":125,"method":"Runtime.evaluate","sessionId":session,
+        "params":{"expression":"window.scrollTo(0,100);document.querySelector('main').style.height='1600px'"}
+    })).await;
+    take_response_by_id(&mut ctx, 125);
+    set_screenshot_viewport(&mut ctx, session, 400, 300, 2.0, 126).await;
+    ctx.process_async(json!({"id":127,"method":"Page.getLayoutMetrics","sessionId":session}))
+        .await;
+    let live = take_response_by_id(&mut ctx, 127);
+    assert_eq!(live["result"]["layoutViewport"]["clientWidth"], 400);
+    assert_eq!(live["result"]["layoutViewport"]["clientHeight"], 300);
+    assert_eq!(live["result"]["visualViewport"]["pageY"], 100.0);
+    assert_eq!(live["result"]["visualViewport"]["scale"], 2.0);
+    assert_eq!(live["result"]["contentSize"]["height"], 900.0);
+    assert_eq!(live["result"]["contentSize"]["width"], 320.0);
+    ctx.capture_fixture_layout(Some(session)).await;
+    ctx.process_async(json!({"id":128,"method":"Page.getLayoutMetrics","sessionId":session}))
+        .await;
+    let refreshed = take_response_by_id(&mut ctx, 128);
+    assert_eq!(refreshed["result"]["cssContentSize"]["height"], 1600.0);
+    assert_eq!(refreshed["result"]["cssContentSize"]["width"], 400.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_page_clip_from_dom_initialized_layout_preserves_capture_semantics() {
+    for (dpr, scale, beyond, width, height) in [
+        (1.0, 1.0, false, 320, 900),
+        (2.0, 1.0, false, 640, 1800),
+        (2.0, 0.5, true, 320, 900),
+    ] {
+        let mut ctx = TestContext::new();
+        let session = "SID-COLD-FULL-SCREENSHOT";
+        install_active_screenshot_page(
+            &mut ctx,
+            "BID-COLD-FULL-SCREENSHOT",
+            "TID-COLD-FULL-SCREENSHOT",
+            session,
+            &screenshot_data_url("<!doctype html><style>html,body{margin:0}main{width:80px;height:900px;background:rgb(20,30,40)}</style><main></main>"),
+        ).await;
+        set_screenshot_viewport(&mut ctx, session, 320, 240, dpr, 120).await;
+
+        let geometry = json!({
+            "id":121,"method":"Runtime.evaluate","sessionId":session,
+            "params":{
+                "expression":"[document.documentElement.clientWidth,document.documentElement.clientHeight,document.querySelector('main').getBoundingClientRect().width]",
+                "returnByValue":true
+            }
+        });
+
+        // Empty clips are invalid both before and after layout publication.
+        let empty_capture = json!({
+            "id":122,"method":"Page.captureScreenshot","sessionId":session,
+            "params":{"format":"png","captureBeyondViewport":beyond,
+                "clip":{"x":0,"y":0,"width":0,"height":0,"scale":scale}}
+        });
+        ctx.process_async(empty_capture.clone()).await;
+        let cold_error = take_response_by_id(&mut ctx, 122);
+        assert_eq!(cold_error["error"]["code"], -32602, "{cold_error}");
+
+        ctx.process_async(geometry.clone()).await;
+        assert_eq!(
+            take_response_by_id(&mut ctx, 121)["result"]["result"]["value"],
+            json!([305, 240, 80])
+        );
+
+        ctx.process_async(json!({
+            "id":123,"method":"Page.getLayoutMetrics","sessionId":session
+        }))
+        .await;
+        let initial = take_response_by_id(&mut ctx, 123);
+        let mut clip = initial["result"]["cssContentSize"].clone();
+        assert_eq!(clip, json!({"x":0,"y":0,"width":320.0,"height":900.0}));
+        clip["scale"] = json!(scale);
+
+        // Rejected clips leave the already published geometry unchanged.
+        // The caller supplies the actual content extent to the screenshot.
+        ctx.process_async(geometry.clone()).await;
+        assert_eq!(
+            take_response_by_id(&mut ctx, 121)["result"]["result"]["value"],
+            json!([305, 240, 80])
+        );
+        ctx.process_async(json!({
+            "id":122,"method":"Page.captureScreenshot","sessionId":session,
+            "params":{"format":"png","captureBeyondViewport":beyond,"clip":clip}
+        }))
+        .await;
+        let png = screenshot_bytes(&take_response_by_id(&mut ctx, 122));
+        assert_png_dimensions(&png, width, height);
+        assert_eq!(decode_png_pixel(&png, 10, 10), [20, 30, 40, 255]);
+
+        ctx.process_async(geometry).await;
+        assert_eq!(
+            take_response_by_id(&mut ctx, 121)["result"]["result"]["value"][2],
+            80
+        );
+        ctx.process_async(json!({
+            "id":123,"method":"Page.getLayoutMetrics","sessionId":session
+        }))
+        .await;
+        let published = take_response_by_id(&mut ctx, 123);
+        assert_eq!(published["result"]["contentSize"]["height"], 900.0);
+
+        ctx.process_async(empty_capture).await;
+        let rejected = take_response_by_id(&mut ctx, 122);
+        assert_eq!(rejected["error"], cold_error["error"]);
+
+        let mut full_clip = published["result"]["cssContentSize"].clone();
+        full_clip["scale"] = json!(scale);
+        ctx.process_async(json!({
+            "id":124,"method":"Page.captureScreenshot","sessionId":session,
+            "params":{"captureBeyondViewport":true,"clip":full_clip}
+        }))
+        .await;
+        let full = screenshot_bytes(&take_response_by_id(&mut ctx, 124));
+        let full_height = (900.0 * dpr * scale) as u32;
+        assert_png_dimensions(&full, width, full_height);
+        assert_eq!(
+            decode_png_pixel(&full, 10, full_height - 10),
+            [20, 30, 40, 255]
+        );
+    }
+}
+
+/// cdp.page: getLayoutMetrics – initializes an actual blank document
 #[tokio::test(flavor = "multi_thread")]
 async fn get_layout_metrics() {
     let mut ctx = TestContext::new();
-    load_bc_with_target(&mut ctx, "BID-9", "FID-000000000X", "about:blank");
-    ctx.process_async(json!({"id": 12, "method": "Page.getLayoutMetrics"}))
-        .await;
+    install_active_screenshot_page(
+        &mut ctx,
+        "BID-9",
+        "FID-000000000X",
+        "SID-BLANK-METRICS",
+        "about:blank",
+    )
+    .await;
+    ctx.process_async(
+        json!({"id": 12, "method": "Page.getLayoutMetrics", "sessionId": "SID-BLANK-METRICS"}),
+    )
+    .await;
     let msg = ctx.take_one();
     let r = &msg["result"];
     assert_eq!(r["layoutViewport"]["clientWidth"], 1920);
@@ -856,7 +1377,7 @@ async fn get_layout_metrics() {
     assert_eq!(r["contentSize"]["height"], 1080.0);
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn get_layout_metrics_uses_viewport_fallback_without_live_page() {
+async fn get_layout_metrics_without_live_page_does_not_fabricate_content_size() {
     let mut ctx = TestContext::new();
     load_bc_with_session(
         &mut ctx,
@@ -889,23 +1410,8 @@ async fn get_layout_metrics_uses_viewport_fallback_without_live_page() {
     }))
     .await;
     let metrics = take_response_by_id(&mut ctx, 122);
-    let result = &metrics["result"];
-    assert_eq!(result["layoutViewport"]["clientWidth"], json!(800));
-    assert_eq!(result["layoutViewport"]["clientHeight"], json!(600));
-    assert_eq!(result["visualViewport"]["scale"], json!(1.0));
-    assert_eq!(
-        result["contentSize"],
-        json!({ "x": 0, "y": 0, "width": 800.0, "height": 600.0 }),
-        "without a live renderer page, content size should use the owner viewport"
-    );
-    assert_eq!(
-        result["cssContentSize"]["width"],
-        result["contentSize"]["width"]
-    );
-    assert_eq!(
-        result["cssContentSize"]["height"],
-        result["contentSize"]["height"]
-    );
+    assert_eq!(metrics["error"]["code"], -32000, "{metrics}");
+    assert_eq!(metrics["error"]["message"], "NoDocumentLoaded");
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_layout_metrics_queries_live_renderer_for_loaded_pages() {
@@ -919,17 +1425,17 @@ async fn get_layout_metrics_queries_live_renderer_for_loaded_pages() {
     );
     let page_url = "data:text/html,<html style='width:2300px;height:1500px'><body style='margin:0;width:2300px;height:1500px'><div style='width:2300px;height:1500px'></div></body></html>";
     let page = ctx
-        .conn
-        .load_page_via_runtime_async(page_url)
+        .build_fixture_page(page_url)
         .await
         .expect("page should load");
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("browser context")
-        .active_page_target_mut()
-        .runtime_slot
-        .replace_loaded_page(Some(page));
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .expect("browser context")
+            .active_page_target_mut()
+            .runtime_slot
+            .replace_loaded_page(Some(page))
+    });
 
     ctx.process_async(json!({
         "id": 125,
@@ -964,7 +1470,7 @@ async fn get_layout_metrics_targets_loaded_background_owner_without_activation()
     bc.attach_active_session("SID-active".to_owned());
     bc.set_target_url("data:text/html,<body>active</body>".to_owned());
     bc.insert_page_target_host(background);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.install_navigation_fixture_for_session_owner(page_url, Some("SID-background"))
         .await;
     ctx.sent.clear();
@@ -999,14 +1505,15 @@ async fn get_layout_metrics_targets_loaded_background_owner_without_activation()
         json!({ "x": 0, "y": 0, "width": 2300.0, "height": 1700.0 }),
         "content size should come from the background owner's live document"
     );
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(|browser_context| browser_context.active_target_id()),
-        Some("TID-active"),
-        "background Page.getLayoutMetrics should not activate the target"
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .and_then(|browser_context| browser_context.active_target_id()),
+            Some("TID-active"),
+            "background Page.getLayoutMetrics should not activate the target"
+        )
+    });
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn get_layout_metrics_targets_inactive_loaded_owner_without_activation() {
@@ -1016,8 +1523,7 @@ async fn get_layout_metrics_targets_inactive_loaded_owner_without_activation() {
     inactive.set_active_target_id("TID-inactive".to_owned());
     inactive.attach_active_session("SID-inactive".to_owned());
     inactive.set_target_url("about:blank".to_owned());
-    ctx.conn
-        .push_inactive_browser_context_fixture_for_test(inactive);
+    ctx.with_fixture(|conn| conn.push_inactive_browser_context_fixture_for_test(inactive));
     ctx.install_navigation_fixture_for_session_owner(page_url, Some("SID-inactive"))
         .await;
     ctx.sent.clear();
@@ -1052,8 +1558,71 @@ async fn get_layout_metrics_targets_inactive_loaded_owner_without_activation() {
         json!({ "x": 0, "y": 0, "width": 2100.0, "height": 1600.0 }),
         "content size should come from the inactive owner's live document"
     );
-    assert!(
-        ctx.conn.browser_context.is_none(),
-        "inactive Page.getLayoutMetrics should not activate its browser context"
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.browser_context.is_none(),
+            "inactive Page.getLayoutMetrics should not activate its browser context"
+        )
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn print_to_pdf_preserves_shaped_text_webfonts_and_selected_pages() {
+    let latin = BASE64_STANDARD.encode(include_bytes!(
+        "../../../../../moli-paint/tests/fixtures/moli-pdf.ttf"
+    ));
+    let cjk = BASE64_STANDARD.encode(include_bytes!(
+        "../../../../../moli-layout/tests/fixtures/moli-cjk.ttf"
+    ));
+    let html = format!(
+        r#"<!doctype html><meta charset="utf-8"><style>
+@font-face{{font-family:Latin;font-weight:400 900;src:url(data:font/ttf;base64,{latin})}}
+@font-face{{font-family:CJK;src:url(data:font/ttf;base64,{cjk})}}
+html,body{{margin:0}} body{{font:650 20px Latin,CJK;white-space:nowrap}}
+.first{{position:absolute;top:20px}} .second{{position:absolute;top:900px}}
+</style><div class=first>Font <span style="color:red">Text</span> 123 中文 office fi</div><div class=second>Second page</div>"#
     );
+    let url = format!("data:text/html;base64,{}", BASE64_STANDARD.encode(html));
+    let mut ctx = TestContext::new_with_target_discovery_and_optional_resource_fetch_mask(
+        false,
+        moli_core::OptionalResourceFetchMask::FONT,
+    );
+    install_active_screenshot_page(
+        &mut ctx,
+        "BID-PDF-TEXT",
+        "TID-PDF-TEXT",
+        "SID-PDF-TEXT",
+        &url,
+    )
+    .await;
+    ctx.process_async(json!({"id": 1300,"method":"Emulation.setDeviceMetricsOverride","sessionId":"SID-PDF-TEXT","params":{"width":800,"height":300,"deviceScaleFactor":2,"mobile":false}})).await;
+    take_response_by_id(&mut ctx, 1300);
+    for (id, ranges, expected) in [
+        (1301, "", "Font Text 123 中文 office fi Second page"),
+        (1302, "2", "Second page"),
+    ] {
+        ctx.process_async(json!({"id":id,"method":"Page.printToPDF","sessionId":"SID-PDF-TEXT","params":{"paperWidth":4.0,"paperHeight":4.0,"marginTop":0,"marginBottom":0,"marginLeft":0,"marginRight":0,"pageRanges":ranges}})).await;
+        let pdf = screenshot_bytes(&take_response_by_id(&mut ctx, id));
+        let document = lopdf::Document::load_mem(&pdf).unwrap();
+        let pages: Vec<_> = document.get_pages().keys().copied().collect();
+        let text = document
+            .extract_text(&pages)
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text, expected);
+        assert_eq!(pages.len(), if ranges.is_empty() { 2 } else { 1 });
+        assert!(
+            document
+                .objects
+                .values()
+                .any(|object| object.as_dict().is_ok_and(|dict| {
+                    dict.get(b"BaseFont")
+                        .and_then(lopdf::Object::as_name)
+                        .is_ok_and(|name| String::from_utf8_lossy(name).contains("MoliPDF"))
+                })),
+            "the configured web font must actually be loaded and embedded"
+        );
+    }
 }

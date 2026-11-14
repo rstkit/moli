@@ -5,7 +5,28 @@
 // 300x150 default concrete-object-size algorithm follow Blink's
 // LayoutSVGRoot::UnscaledNaturalSizingInfo and ConcreteObjectSize.
 
-use std::sync::{Arc, LazyLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
+
+pub use usvg::ElementStyleProperty as SvgStyleProperty;
+/// Shared final style profile, applied after matching the original SVG XML.
+pub type SvgElementStyle = Arc<[SvgStyleProperty]>;
+
+/// Numeric object geometry associated with an original serialized element.
+#[derive(Clone, Debug)]
+pub struct SvgObjectGeometry {
+    pub element_index: usize,
+    pub bounds: [f32; 4],
+    pub transform: [f32; 6],
+}
+
+/// Paint and source geometry produced by one bounded inline SVG parse.
+pub struct SvgScene {
+    pub image: SvgImage,
+    pub objects: Vec<SvgObjectGeometry>,
+}
 
 /// Maximum encoded SVG body admitted to the static image decoder.
 ///
@@ -14,21 +35,137 @@ use std::sync::{Arc, LazyLock};
 /// before `usvg` receives attacker-controlled bytes.
 pub const MAX_ENCODED_SVG_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum DOM-neutral vector work units retained by one decoded SVG image.
-///
-/// A node costs one unit and every path segment costs another. The paint
-/// executor charges the same count against its per-capture operation budget.
-pub const MAX_SVG_PAINT_WORK_UNITS: usize = 250_000;
-
-const MAX_SVG_TREE_DEPTH: usize = 1_024;
 const DEFAULT_OBJECT_WIDTH: f32 = 300.0;
 const DEFAULT_OBJECT_HEIGHT: f32 = 150.0;
 
-static SVG_FONT_DATABASE: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+/// Font faces available to one SVG text parse plus the family that unstyled
+/// `<text>` falls back to.
+struct SvgFonts {
+    database: Arc<usvg::fontdb::Database>,
+    /// An installed family, used wherever `fontdb`'s advertised default is
+    /// absent from the machine.
+    default_family: String,
+}
+
+impl SvgFonts {
+    fn from_database(database: usvg::fontdb::Database) -> Self {
+        // An empty database cannot shape anything; keep usvg's own default so
+        // the failure mode stays "unsupported content is omitted" instead of
+        // naming a family the database would try to match as `""`.
+        let default_family = installed_default_family(&database).unwrap_or_else(|| {
+            database
+                .family_name(&usvg::fontdb::Family::Serif)
+                .to_owned()
+        });
+        Self {
+            database: Arc::new(database),
+            default_family,
+        }
+    }
+
+    /// Builds usvg's resolver so a `<text>` node survives to paint.
+    ///
+    /// usvg drops a text node entirely when its primary font can be neither
+    /// selected nor loaded: `usvg::text::layout` returns no bounding box and
+    /// `usvg::text::convert` gives up, so the subtree never reaches the tree.
+    /// Font selection is a plain family-name lookup, and the shipped
+    /// resolver's final candidate is the `serif` generic. That generic, and
+    /// `Options::font_family`'s `Times New Roman` default, name whatever
+    /// `fontdb` read out of the platform's fontconfig aliases — it keeps only
+    /// the first `prefer` family of each alias, so the *last* alias wins. On
+    /// Debian that is `FreeSerif` from `69-unifont.conf`, which the image does
+    /// not install, so unstyled or uninstalled-family text vanished.
+    ///
+    /// Keep the shipped selector and only add an installed-face fallback after
+    /// it, so family, weight, stretch, and style matching stay upstream.
+    fn resolver(&self) -> usvg::FontResolver<'static> {
+        let shipped = usvg::FontResolver::default_font_selector();
+        let default_family = self.default_family.clone();
+        usvg::FontResolver {
+            select_font: Box::new(move |font, fontdb| {
+                shipped(font, fontdb).or_else(|| {
+                    let names = [usvg::fontdb::Family::Name(default_family.as_str())];
+                    fontdb
+                        .query(&usvg::fontdb::Query {
+                            families: &names,
+                            weight: usvg::fontdb::Weight(font.weight()),
+                            stretch: fontdb_stretch(font.stretch()),
+                            style: fontdb_style(font.style()),
+                        })
+                        // Any installed face is still better than dropping the
+                        // node; per-character fallback then covers glyph gaps.
+                        .or_else(|| fontdb.faces().next().map(|face| face.id))
+                })
+            }),
+            select_fallback: usvg::FontResolver::default_fallback_selector(),
+        }
+    }
+}
+
+static SVG_FONTS: LazyLock<SvgFonts> = LazyLock::new(|| {
     let mut database = usvg::fontdb::Database::new();
     database.load_system_fonts();
-    Arc::new(database)
+    SvgFonts::from_database(database)
 });
+
+/// Returns the first generic family whose advertised name is installed.
+///
+/// `fontdb::Database::query` compares family names exactly, which is the same
+/// comparison usvg's selector performs, so this only accepts a name that can
+/// actually be resolved.
+fn installed_default_family(database: &usvg::fontdb::Database) -> Option<String> {
+    for generic in [
+        usvg::fontdb::Family::Serif,
+        usvg::fontdb::Family::SansSerif,
+        usvg::fontdb::Family::Monospace,
+        usvg::fontdb::Family::Cursive,
+        usvg::fontdb::Family::Fantasy,
+    ] {
+        let name = database.family_name(&generic);
+        if family_is_installed(database, name) {
+            return Some(name.to_owned());
+        }
+    }
+    // No generic resolved: name any installed face rather than a family the
+    // database cannot match. `faces()` follows load order, so this is stable.
+    database
+        .faces()
+        .find_map(|face| face.families.first().map(|family| family.0.clone()))
+}
+
+fn family_is_installed(database: &usvg::fontdb::Database, family: &str) -> bool {
+    let names = [usvg::fontdb::Family::Name(family)];
+    database
+        .query(&usvg::fontdb::Query {
+            families: &names,
+            weight: usvg::fontdb::Weight::NORMAL,
+            stretch: usvg::fontdb::Stretch::Normal,
+            style: usvg::fontdb::Style::Normal,
+        })
+        .is_some()
+}
+
+fn fontdb_stretch(stretch: usvg::FontStretch) -> usvg::fontdb::Stretch {
+    match stretch {
+        usvg::FontStretch::UltraCondensed => usvg::fontdb::Stretch::UltraCondensed,
+        usvg::FontStretch::ExtraCondensed => usvg::fontdb::Stretch::ExtraCondensed,
+        usvg::FontStretch::Condensed => usvg::fontdb::Stretch::Condensed,
+        usvg::FontStretch::SemiCondensed => usvg::fontdb::Stretch::SemiCondensed,
+        usvg::FontStretch::Normal => usvg::fontdb::Stretch::Normal,
+        usvg::FontStretch::SemiExpanded => usvg::fontdb::Stretch::SemiExpanded,
+        usvg::FontStretch::Expanded => usvg::fontdb::Stretch::Expanded,
+        usvg::FontStretch::ExtraExpanded => usvg::fontdb::Stretch::ExtraExpanded,
+        usvg::FontStretch::UltraExpanded => usvg::fontdb::Stretch::UltraExpanded,
+    }
+}
+
+fn fontdb_style(style: usvg::FontStyle) -> usvg::fontdb::Style {
+    match style {
+        usvg::FontStyle::Normal => usvg::fontdb::Style::Normal,
+        usvg::FontStyle::Italic => usvg::fontdb::Style::Italic,
+        usvg::FontStyle::Oblique => usvg::fontdb::Style::Oblique,
+    }
+}
 
 /// Natural SVG sizing data and its CSS default concrete object size.
 ///
@@ -64,7 +201,6 @@ impl SvgImageMetadata {
 pub struct SvgImage {
     tree: usvg::Tree,
     metadata: SvgImageMetadata,
-    paint_work_units: usize,
 }
 
 impl SvgImage {
@@ -75,10 +211,6 @@ impl SvgImage {
     pub const fn metadata(&self) -> SvgImageMetadata {
         self.metadata
     }
-
-    pub const fn paint_work_units(&self) -> usize {
-        self.paint_work_units
-    }
 }
 
 impl std::fmt::Debug for SvgImage {
@@ -87,7 +219,6 @@ impl std::fmt::Debug for SvgImage {
             .debug_struct("SvgImage")
             .field("metadata", &self.metadata)
             .field("tree_size", &self.tree.size())
-            .field("paint_work_units", &self.paint_work_units)
             .finish()
     }
 }
@@ -115,12 +246,10 @@ pub enum SvgDecodeError {
     MissingRoot,
     #[error("SVG concrete object size must be finite and positive")]
     InvalidConcreteSize,
+    #[error("SVG style profile count {actual} does not match {expected} serialized elements")]
+    StyleElementCount { actual: usize, expected: usize },
     #[error("SVG tree could not be parsed: {0}")]
     Parse(#[from] usvg::Error),
-    #[error("SVG tree depth {actual} exceeds the {max}-level limit")]
-    TreeDepthExceeded { actual: usize, max: usize },
-    #[error("SVG contains {actual} vector work units, exceeding the {max}-unit limit")]
-    PaintWorkBudgetExceeded { actual: usize, max: usize },
 }
 
 /// Reads SVG natural sizing without constructing a vector tree.
@@ -173,16 +302,109 @@ pub fn decode_svg_image(bytes: &[u8]) -> Result<SvgImage, SvgDecodeError> {
     decode_svg_image_with_metadata(bytes, metadata)
 }
 
+/// Decodes an original XML input with an embedding document's final styles.
+/// Generated properties do not count towards the encoded user-input budget,
+/// never become selector-visible XML attributes, and share their value storage.
+pub fn decode_inline_svg_scene(
+    bytes: &[u8],
+    styles: &[Option<SvgElementStyle>],
+    viewport: (f32, f32),
+) -> Result<SvgScene, SvgDecodeError> {
+    check_encoded_budget(bytes)?;
+    let source = std::str::from_utf8(bytes).map_err(|_| SvgDecodeError::InvalidUtf8)?;
+    let xml = usvg::roxmltree::Document::parse_with_options(
+        source,
+        usvg::roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| SvgDecodeError::MalformedXml(error.to_string()))?;
+    let elements = xml
+        .descendants()
+        .filter(|node| node.is_element())
+        .collect::<Vec<_>>();
+    if elements.len() != styles.len() {
+        return Err(SvgDecodeError::StyleElementCount {
+            actual: styles.len(),
+            expected: elements.len(),
+        });
+    }
+    let default_size =
+        usvg::Size::from_wh(viewport.0, viewport.1).ok_or(SvgDecodeError::InvalidConcreteSize)?;
+    let overrides = elements
+        .iter()
+        .zip(styles)
+        .filter_map(|(node, style)| style.clone().map(|style| (node.id(), style)))
+        .collect();
+    let sources = elements
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id(), index))
+        .collect::<HashMap<_, _>>();
+    let fonts = &SVG_FONTS;
+    let options = usvg::Options {
+        fontdb: fonts.database.clone(),
+        font_family: fonts.default_family.clone(),
+        font_resolver: fonts.resolver(),
+        default_size,
+        element_styles: Some(Arc::new(overrides)),
+        collect_object_geometry: true,
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(|_, _| None),
+        },
+        ..Default::default()
+    };
+    let mut tree = usvg::Tree::from_xmltree(&xml, &options)?;
+    let objects = tree
+        .take_object_geometry()
+        .into_iter()
+        .filter_map(|geometry| {
+            let rect = geometry.bounding_box;
+            let t = geometry.transform;
+            Some(SvgObjectGeometry {
+                element_index: *sources.get(&geometry.source)?,
+                bounds: [rect.x(), rect.y(), rect.width(), rect.height()],
+                transform: [t.sx, t.ky, t.kx, t.sy, t.tx, t.ty],
+            })
+        })
+        .collect();
+    let metadata = SvgImageMetadata {
+        intrinsic_width: Some(viewport.0),
+        intrinsic_height: Some(viewport.1),
+        intrinsic_ratio: Some(viewport.0 / viewport.1),
+        concrete_width: viewport.0,
+        concrete_height: viewport.1,
+    };
+    Ok(SvgScene {
+        image: SvgImage { tree, metadata },
+        objects,
+    })
+}
+
 /// Parses SVG after the caller has already admitted the immutable byte buffer.
 pub fn decode_svg_image_with_metadata(
     bytes: &[u8],
     metadata: SvgImageMetadata,
 ) -> Result<SvgImage, SvgDecodeError> {
+    decode_svg_image_with_fonts(bytes, metadata, &SVG_FONTS)
+}
+
+fn decode_svg_image_with_fonts(
+    bytes: &[u8],
+    metadata: SvgImageMetadata,
+    fonts: &SvgFonts,
+) -> Result<SvgImage, SvgDecodeError> {
     check_encoded_budget(bytes)?;
     let default_size = usvg::Size::from_wh(metadata.concrete_width, metadata.concrete_height)
         .ok_or(SvgDecodeError::InvalidConcreteSize)?;
     let options = usvg::Options {
-        fontdb: SVG_FONT_DATABASE.clone(),
+        fontdb: fonts.database.clone(),
+        // usvg resolves a missing `font-family` name before consulting
+        // `font_resolver`, so the default must name an installed family.
+        font_family: fonts.default_family.clone(),
+        font_resolver: fonts.resolver(),
         default_size,
         // The default usvg resolver accepts data URLs and local filesystem
         // paths. Image resources must stay behind Moli's fetch and
@@ -195,89 +417,7 @@ pub fn decode_svg_image_with_metadata(
         ..Default::default()
     };
     let tree = usvg::Tree::from_data(bytes, &options)?;
-    let paint_work_units = tree_work_units(&tree)?;
-    Ok(SvgImage {
-        tree,
-        metadata,
-        paint_work_units,
-    })
-}
-
-fn tree_work_units(tree: &usvg::Tree) -> Result<usize, SvgDecodeError> {
-    let mut units = group_work_units(tree.root(), 1)?;
-    for gradient in tree.linear_gradients() {
-        add_work_units(&mut units, 1usize.saturating_add(gradient.stops().len()))?;
-    }
-    for gradient in tree.radial_gradients() {
-        add_work_units(&mut units, 1usize.saturating_add(gradient.stops().len()))?;
-    }
-    for pattern in tree.patterns() {
-        add_work_units(
-            &mut units,
-            1usize.saturating_add(group_work_units(pattern.root(), 1)?),
-        )?;
-    }
-    for clip_path in tree.clip_paths() {
-        add_work_units(
-            &mut units,
-            1usize.saturating_add(group_work_units(clip_path.root(), 1)?),
-        )?;
-    }
-    for mask in tree.masks() {
-        add_work_units(
-            &mut units,
-            1usize.saturating_add(group_work_units(mask.root(), 1)?),
-        )?;
-    }
-    for filter in tree.filters() {
-        add_work_units(&mut units, 1usize.saturating_add(filter.primitives().len()))?;
-        for primitive in filter.primitives() {
-            if let usvg::filter::Kind::Image(image) = primitive.kind() {
-                add_work_units(&mut units, group_work_units(image.root(), 1)?)?;
-            }
-        }
-    }
-    Ok(units)
-}
-
-fn group_work_units(group: &usvg::Group, depth: usize) -> Result<usize, SvgDecodeError> {
-    if depth > MAX_SVG_TREE_DEPTH {
-        return Err(SvgDecodeError::TreeDepthExceeded {
-            actual: depth,
-            max: MAX_SVG_TREE_DEPTH,
-        });
-    }
-    let mut units = 0usize;
-    for node in group.children() {
-        add_work_units(&mut units, 1)?;
-        add_work_units(
-            &mut units,
-            match node {
-                usvg::Node::Group(group) => group_work_units(group, depth + 1)?,
-                usvg::Node::Path(path) => path.data().segments().count(),
-                usvg::Node::Image(image) => match image.kind() {
-                    usvg::ImageKind::SVG(tree) => group_work_units(tree.root(), depth + 1)?,
-                    usvg::ImageKind::JPEG(_)
-                    | usvg::ImageKind::PNG(_)
-                    | usvg::ImageKind::GIF(_)
-                    | usvg::ImageKind::WEBP(_) => 0,
-                },
-                usvg::Node::Text(text) => group_work_units(text.flattened(), depth + 1)?,
-            },
-        )?;
-    }
-    Ok(units)
-}
-
-fn add_work_units(total: &mut usize, additional: usize) -> Result<(), SvgDecodeError> {
-    *total = total.saturating_add(additional);
-    if *total > MAX_SVG_PAINT_WORK_UNITS {
-        return Err(SvgDecodeError::PaintWorkBudgetExceeded {
-            actual: *total,
-            max: MAX_SVG_PAINT_WORK_UNITS,
-        });
-    }
-    Ok(())
+    Ok(SvgImage { tree, metadata })
 }
 
 fn concrete_object_size(width: Option<f32>, height: Option<f32>, ratio: Option<f32>) -> (f32, f32) {
@@ -398,6 +538,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inline_scene_keeps_xml_identity_without_retaining_geometry_in_the_paint_tree() {
+        let source = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><clipPath id="empty"/></defs><rect x="10" y="20" width="30" height="40" clip-path="url(#empty)"/></svg>"##;
+        let profile: SvgElementStyle = Arc::from([SvgStyleProperty::new("fill", "red")]);
+        let styles = [None, None, None, Some(profile)];
+        let mut scene = decode_inline_svg_scene(source, &styles, (100.0, 100.0)).unwrap();
+        let shape = scene
+            .objects
+            .iter()
+            .find(|object| object.element_index == 3)
+            .unwrap();
+        assert_eq!(shape.bounds, [10.0, 20.0, 30.0, 40.0]);
+        assert!(
+            scene.image.tree.root().children().is_empty(),
+            "the clipped shape has no paint node"
+        );
+        assert!(
+            scene.image.tree.take_object_geometry().is_empty(),
+            "numeric geometry is moved out, never duplicated in the retained paint tree"
+        );
+        assert!(matches!(
+            decode_inline_svg_scene(source, &[], (100.0, 100.0)),
+            Err(SvgDecodeError::StyleElementCount { .. })
+        ));
+    }
+
+    #[test]
     fn metadata_preserves_natural_dimensions_and_applies_default_object_size() {
         let explicit = probe_svg_image(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="2in" height="25.4mm"/>"#,
@@ -433,19 +599,61 @@ mod tests {
     }
 
     #[test]
-    fn parsed_tree_retains_vector_work_without_a_raster_surface() {
+    fn parsed_tree_retains_vector_paths_without_a_raster_surface() {
         let svg = decode_svg_image(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><path d="M0 0h10v10z" fill="red"/></svg>"#,
         )
         .unwrap();
         assert_eq!(svg.metadata().concrete_dimensions(), Some((20, 10)));
-        assert!(svg.paint_work_units() >= 2);
+        assert!(matches!(
+            svg.tree().root().children(),
+            [usvg::Node::Path(_)]
+        ));
         assert_eq!(svg.tree().size().width(), 20.0);
         assert_eq!(svg.tree().size().height(), 10.0);
     }
 
     #[test]
-    fn vector_work_budget_includes_definition_subtrees() {
+    fn css_color4_gradient_stops_preserve_style_precedence_and_alpha() {
+        let svg = decode_svg_image(
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+                <defs><linearGradient id="paint">
+                    <stop offset="0" stop-color="#00ff00" style="stop-color:#ff0000;stop-color:color(display-p3 .5 0 0 / .5);stop-opacity:.5"/>
+                    <stop offset="1" stop-color="color(display-p3 0 0 1)"/>
+                </linearGradient></defs>
+                <rect width="20" height="10" fill="url(#paint)"/>
+            </svg>"##,
+        )
+        .unwrap();
+        let stops = svg.tree().linear_gradients()[0].stops();
+        assert_eq!(stops.len(), 2);
+        assert_eq!(stops[0].color(), usvg::Color::new_rgb(140, 0, 0));
+        assert!((stops[0].opacity().get() - 128.0 / 255.0 * 0.5).abs() < 1e-6);
+        assert_eq!(stops[1].color(), usvg::Color::new_rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn css_color4_stylesheet_colors_preserve_current_color_inheritance() {
+        let rules = "stop { stop-color: color(display-p3 .5 0 0); } .endpoint { stop-color: currentColor; color: color(display-p3 0 0 1); }";
+        for stylesheet in [rules.to_owned(), format!("<![CDATA[{rules}]]>")] {
+            let source = format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+                    <style>{stylesheet}</style>
+                    <defs><linearGradient id="paint">
+                        <stop offset="0"/><stop class="endpoint" offset="1"/>
+                    </linearGradient></defs>
+                    <rect width="20" height="10" fill="url(#paint)"/>
+                </svg>"##
+            );
+            let svg = decode_svg_image(source.as_bytes()).unwrap();
+            let stops = svg.tree().linear_gradients()[0].stops();
+            assert_eq!(stops[0].color(), usvg::Color::new_rgb(140, 0, 0));
+            assert_eq!(stops[1].color(), usvg::Color::new_rgb(0, 0, 255));
+        }
+    }
+
+    #[test]
+    fn parsed_tree_preserves_definition_subtrees() {
         let svg = decode_svg_image(
             br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
                 <defs>
@@ -457,7 +665,23 @@ mod tests {
         )
         .unwrap();
 
-        assert!(svg.paint_work_units() >= 10);
+        assert_eq!(svg.tree().clip_paths().len(), 1);
+        assert_eq!(svg.tree().linear_gradients().len(), 1);
+        assert_eq!(svg.tree().linear_gradients()[0].stops().len(), 2);
+    }
+
+    #[test]
+    fn complex_paths_remain_available_for_vector_rendering() {
+        let path = format!("M0 0{}z", "h1v1h-1v-1".repeat(62_501));
+        let source = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><path d="{path}"/></svg>"#,
+        );
+        let svg = decode_svg_image(source.as_bytes()).unwrap();
+        let usvg::Node::Path(path) = &svg.tree().root().children()[0] else {
+            panic!("the vector path must remain available to the renderer");
+        };
+
+        assert!(path.data().segments().count() > 250_000);
     }
 
     #[test]
@@ -501,5 +725,156 @@ mod tests {
             usvg::Node::Image(_) => true,
             usvg::Node::Path(_) | usvg::Node::Text(_) => false,
         })
+    }
+
+    // A text node only survives parsing when its font resolved: usvg drops the
+    // whole subtree otherwise, so "text exists and has glyph paths" is the
+    // consumer-visible behavior the inline-SVG bridge depends on. These use a
+    // database holding only the checked-in Ahem face, so they never depend on
+    // which fonts the host has.
+    fn fonts_with_only_ahem() -> SvgFonts {
+        let mut database = usvg::fontdb::Database::new();
+        database.load_font_data(
+            include_bytes!("../../moli-layout/tests/fixtures/moli-ahem.ttf").to_vec(),
+        );
+        SvgFonts::from_database(database)
+    }
+
+    fn text_nodes<'a>(group: &'a usvg::Group, found: &mut Vec<&'a usvg::Text>) {
+        for node in group.children() {
+            match node {
+                usvg::Node::Group(group) => text_nodes(group, found),
+                usvg::Node::Text(text) => found.push(text),
+                usvg::Node::Path(_) | usvg::Node::Image(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn relative_svg_font_weights_follow_css_ranges() {
+        let fonts = fonts_with_only_ahem();
+        for (inherited, relative, expected) in [
+            ("700", "lighter", 400),
+            ("500", "bolder", 700),
+            ("400", "lighter", 100),
+            ("100", "bolder", 400),
+            ("300", "bolder", 400),
+            ("400", "bolder", 700),
+            ("600", "bolder", 900),
+            ("800", "lighter", 700),
+            ("900", "lighter", 700),
+            ("900", "bolder", 900),
+            ("1", "lighter", 1),
+            ("99", "lighter", 99),
+            ("349.9", "bolder", 400),
+            ("350", "bolder", 700),
+            ("549.9", "bolder", 700),
+            ("550", "bolder", 900),
+            ("749.9", "lighter", 400),
+            ("750", "lighter", 700),
+            ("950", "bolder", 950),
+            ("1000", "bolder", 1000),
+        ] {
+            let source = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="90" height="60"
+                        font-family="Moli Ahem" font-weight="{inherited}">
+                    <text x="8" y="50" font-size="48" font-weight="{relative}">M</text>
+                </svg>"#,
+            );
+            let source = source.as_bytes();
+            let svg = decode_svg_image_with_fonts(
+                source,
+                probe_svg_image(source).expect("metadata"),
+                &fonts,
+            )
+            .expect("relative font weight must parse");
+            let mut texts = Vec::new();
+            text_nodes(svg.tree().root(), &mut texts);
+            assert_eq!(texts.len(), 1, "text must shape without system fonts");
+            assert_eq!(
+                texts[0].chunks()[0].spans()[0].font().weight(),
+                expected,
+                "inherited {inherited} with {relative}",
+            );
+        }
+    }
+
+    #[test]
+    fn relative_svg_font_weights_resolve_each_ancestor_once() {
+        let fonts = fonts_with_only_ahem();
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg" width="90" height="60"
+                font-family="Moli Ahem" font-weight="700">
+            <g font-weight="lighter"><g>
+                <text x="8" y="50" font-size="48" font-weight="bolder">M<tspan font-weight="lighter">M</tspan></text>
+            </g></g>
+        </svg>"#;
+        let svg =
+            decode_svg_image_with_fonts(source, probe_svg_image(source).expect("metadata"), &fonts)
+                .expect("nested relative font weights must parse");
+        let mut texts = Vec::new();
+        text_nodes(svg.tree().root(), &mut texts);
+        assert_eq!(texts.len(), 1);
+        let weights: Vec<_> = texts[0]
+            .chunks()
+            .iter()
+            .flat_map(|chunk| chunk.spans())
+            .map(|span| span.font().weight())
+            .collect();
+        assert_eq!(weights, [700, 400]);
+    }
+
+    #[test]
+    fn unstyled_text_shapes_with_an_installed_default_family() {
+        let fonts = fonts_with_only_ahem();
+        // `fontdb` advertises defaults this database does not contain, which is
+        // the shape of the reported failure.
+        assert!(!family_is_installed(&fonts.database, "Times New Roman"));
+        let source = br##"<svg xmlns="http://www.w3.org/2000/svg" width="90" height="40">
+                <rect width="90" height="40" fill="#087a65"/>
+                <text x="10" y="26" fill="white" font-size="18">SVG OK</text>
+            </svg>"##;
+        let svg =
+            decode_svg_image_with_fonts(source, probe_svg_image(source).expect("metadata"), &fonts)
+                .expect("unstyled text must parse");
+
+        let mut texts = Vec::new();
+        text_nodes(svg.tree().root(), &mut texts);
+        assert_eq!(texts.len(), 1, "text node must survive parsing");
+        let glyph_paths = texts[0]
+            .flattened()
+            .children()
+            .iter()
+            .filter(|node| matches!(node, usvg::Node::Path(_)))
+            .count();
+        assert!(
+            glyph_paths > 0,
+            "text must flatten to glyph paths, got {glyph_paths}"
+        );
+        // The node only exists because a real face was selected: with no
+        // authored family, usvg names `Options::font_family`, which must be the
+        // installed face rather than an absent platform default.
+        let families = texts[0].chunks()[0].spans()[0].font().families();
+        assert_eq!(families.len(), 1, "{families:?}");
+        assert_eq!(families[0], usvg::FontFamily::Named("Moli Ahem".to_owned()));
+    }
+
+    #[test]
+    fn named_family_absent_from_disk_still_shapes_text() {
+        let fonts = fonts_with_only_ahem();
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg" width="90" height="40">
+                <text x="10" y="26" font-family="Missing Family" font-size="18">SVG OK</text>
+            </svg>"#;
+        let svg =
+            decode_svg_image_with_fonts(source, probe_svg_image(source).expect("metadata"), &fonts)
+                .expect("an uninstalled family must not erase the text node");
+
+        let mut texts = Vec::new();
+        text_nodes(svg.tree().root(), &mut texts);
+        assert_eq!(
+            texts.len(),
+            1,
+            "text node must survive an uninstalled family"
+        );
+        assert!(!texts[0].flattened().children().is_empty());
     }
 }

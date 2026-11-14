@@ -1,9 +1,19 @@
 <p align="center">
-  <img
-    src="../assets/moli-browser-banner.jpg"
-    alt="Moli Browser — Struktur zuerst. Pixel bei Bedarf. Open-Source-Browser für KI-Agenten."
-    width="1086"
-  />
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="../assets/moli-browser-banner-dark.jpg"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="../assets/moli-browser-banner.jpg"
+    />
+    <img
+      src="../assets/moli-browser-banner.jpg"
+      alt="Moli Browser — Struktur zuerst. Pixel bei Bedarf. Open-Source-Browser für KI-Agenten."
+      width="1086"
+    />
+  </picture>
 </p>
 
 <h1 align="center">Moli</h1>
@@ -14,7 +24,32 @@
   <a href="README.ja.md">日本語</a> |
   <strong>Deutsch</strong> |
   <a href="README.fr.md">Français</a> |
-  <a href="README.es.md">Español</a>
+  <a href="README.es.md">Español</a> |
+  <a href="README.ko.md">한국어</a>
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/4eXGtdWWnq">
+    <img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2" alt="Discord" />
+  </a>
+  <a href="../assets/moli-feedback-wechat-group.png">
+    <img src="https://img.shields.io/badge/WeChat-Join%20Community-07C160" alt="WeChat" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/lexmount-browser?launch=moli-by-lexmount" target="_blank" rel="noopener noreferrer">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=dark" />
+      <img src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=light" alt="Moli by Lexmount - #1 Product of the Day | Product Hunt" width="250" height="54" />
+    </picture>
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/daily" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/weekly?language=Rust" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
 </p>
 
 Moli ist ein produktionsreifer Headless-Browser für KI-Agenten. Durch sein bedarfsgesteuertes Layout- und Rendering-Design vereint er eine vollständige Browser-Laufzeitumgebung mit einem geringen Ressourcenbedarf.
@@ -90,7 +125,7 @@ So renderst du eine Seite mit Molis Standard-Abschlussstrategie als Markdown:
 ```bash
 moli fetch \
   --dump markdown \
-  --wait-until done \
+  --wait done \
   https://example.com
 ```
 
@@ -193,7 +228,7 @@ Rechenintensive Browser-Operationen sind in Moli standardmäßig deaktiviert und
 | `--layout` | `LayoutPolicy::OnDemand` — echtes Layout, Geometrie, Hit-Testing, Koordinateneingaben, Screenshots und Screencast |
 | `--resource` | Alle optionalen visuellen und Medienressourcengruppen laden |
 | `--image`, `--font`, `--audio`, `--video`, `--media`, `--text-track` | Eine bestimmte optionale Ressourcengruppe einzeln aktivieren |
-| `--profile-dir`, `--http-cache-dir`, `--cookie-file` | Persistenz gezielt aktivieren, je nach Bedarf des Workloads |
+| `--profile-dir`, `--http-cache-dir`, `--cookie` | Persistenz gezielt aktivieren, je nach Bedarf des Workloads |
 
 Das Layoutergebnis ist ein bei Bedarf erzeugter Snapshot, kein dauerhaft gepflegter Zustand: Die erste Geometrieanfrage (Kaltstart) baut aus dem aktuellen DOM/Stil einen temporären Arbeitsbaum auf und friert dessen kanonische Geometrie in einen unveränderlichen, vom DOM unabhängigen `FrozenLayoutTree` ein — nur dieser jeweils neueste Baum wird vorgehalten. Normale Geometrieabfragen können ihn auch nach Seitenänderungen weiterverwenden; Screenshots und Screencasts dagegen bauen jedes Mal neu auf, ersetzen den eingefrorenen Baum und greifen nie auf alte Zeichenergebnisse zurück.
 

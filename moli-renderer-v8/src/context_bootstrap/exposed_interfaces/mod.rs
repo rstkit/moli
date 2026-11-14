@@ -11,21 +11,23 @@ pub(crate) use install::capture_eager_intrinsic_interfaces;
 pub(super) use install::{
     filter_window_exposed_interfaces, initialize_realm_interface_registry,
     install_interface_template_metadata, install_window_exposed_interfaces,
-    install_worker_exposed_interfaces, is_lazy_exposed_interface,
+    install_worker_exposed_interfaces, is_lazy_exposed_interface, is_realm_interface_exposed,
+    prepare_worker_event_target_template,
 };
 #[cfg(test)]
 pub(crate) use install::{
     interface_materialization_count, interface_template_build_count, lazy_window_interface_names,
-    materialized_interface_names, ready_interface_template_names,
+    materialized_interface_names, ready_interface_template_names, realm_interface_is_materialized,
     storage_interface_materialization_count,
 };
 pub(crate) use materialize::{
-    ensure_intrinsic_interface_constructor, ensure_intrinsic_interface_prototype,
-    object_is_intrinsic_interface_instance,
+    build_intrinsic_interface_instance, ensure_intrinsic_interface_constructor,
+    ensure_intrinsic_interface_prototype, materialized_intrinsic_interface_prototype,
 };
 pub(crate) use metadata::RealmKind;
 pub(in crate::context_bootstrap) use metadata::TemplateBuildProfile;
 pub(super) use metadata::constructor_spec_is_eager;
 #[cfg(test)]
 pub(crate) use metadata::dedicated_worker_lazy_interface_names_for_test;
+pub(crate) use realm_registry::has_intrinsic_interface_registry;
 pub(in crate::context_bootstrap) use template_registry::ExposedInterfaceTemplateRegistry;

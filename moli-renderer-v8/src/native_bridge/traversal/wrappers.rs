@@ -1,8 +1,9 @@
+use crate::web_api_interfaces;
 use std::ffi::c_void;
 
 use crate::{
     document_runtime::DomHandle,
-    native_bridge::{JsContextHost, NativeDomBridge},
+    native_bridge::{NativeDomBridge, PageScriptHost},
 };
 use moli_webapi_declare::WebApiFunctionTemplate;
 
@@ -22,7 +23,7 @@ use crate::native_bridge::bindings::set_named_constructor_prototype;
 use crate::webidl::WebIdlCallbackInterface;
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "NodeIterator", enumerable)]
+#[webapi(interface = web_api_interfaces::NodeIterator, enumerable, receiver)]
 struct NodeIteratorPrototypeDeclaration {
     #[webapi(accessor_property, getter = node_iterator_root_getter)]
     root: (),
@@ -43,7 +44,7 @@ struct NodeIteratorPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TreeWalker", enumerable)]
+#[webapi(interface = web_api_interfaces::TreeWalker, enumerable, receiver)]
 struct TreeWalkerPrototypeDeclaration {
     #[webapi(accessor_property, getter = tree_walker_root_getter)]
     root: (),
@@ -108,18 +109,18 @@ pub(crate) fn install_traversal_template_bindings<'s>(
 
 pub(in crate::native_bridge) fn build_node_iterator_wrapper<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     bridge: &mut NativeDomBridge,
     root: DomHandle,
     what_to_show: u32,
     filter: Option<WebIdlCallbackInterface>,
 ) -> v8::Local<'s, v8::Object> {
-    let filter = filter.map(|filter| TraversalFilter::new(scope, runtime_ptr, filter));
-    let id = bridge.register_node_iterator(root, what_to_show, filter);
     let template = bridge.node_iterator_wrapper_template();
     let wrapper = template
         .new_instance(scope)
         .expect("failed to instantiate NodeIterator wrapper");
+    let filter = filter.map(|filter| TraversalFilter::new(scope, runtime_ptr, wrapper, filter));
+    let id = bridge.register_node_iterator(root, what_to_show, filter);
     let runtime_external = v8::External::new(scope, runtime_ptr as *mut c_void);
     assert!(
         wrapper.set_internal_field(0, runtime_external.into()),
@@ -129,24 +130,27 @@ pub(in crate::native_bridge) fn build_node_iterator_wrapper<'s>(
         wrapper.set_internal_field(1, v8::Number::new(scope, id as f64).into()),
         "NodeIterator wrapper must expose its state id field"
     );
+    web_api_interfaces::NodeIterator::DESCRIPTOR
+        .initialize(scope, wrapper)
+        .expect("NodeIterator wrapper must have native identity");
     set_named_constructor_prototype(scope, wrapper, "NodeIterator");
     wrapper
 }
 
 pub(in crate::native_bridge) fn build_tree_walker_wrapper<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     bridge: &mut NativeDomBridge,
     root: DomHandle,
     what_to_show: u32,
     filter: Option<WebIdlCallbackInterface>,
 ) -> v8::Local<'s, v8::Object> {
-    let filter = filter.map(|filter| TraversalFilter::new(scope, runtime_ptr, filter));
-    let id = bridge.register_tree_walker(root, what_to_show, filter);
     let template = bridge.tree_walker_wrapper_template();
     let wrapper = template
         .new_instance(scope)
         .expect("failed to instantiate TreeWalker wrapper");
+    let filter = filter.map(|filter| TraversalFilter::new(scope, runtime_ptr, wrapper, filter));
+    let id = bridge.register_tree_walker(root, what_to_show, filter);
     let runtime_external = v8::External::new(scope, runtime_ptr as *mut c_void);
     assert!(
         wrapper.set_internal_field(0, runtime_external.into()),
@@ -156,6 +160,9 @@ pub(in crate::native_bridge) fn build_tree_walker_wrapper<'s>(
         wrapper.set_internal_field(1, v8::Number::new(scope, id as f64).into()),
         "TreeWalker wrapper must expose its state id field"
     );
+    web_api_interfaces::TreeWalker::DESCRIPTOR
+        .initialize(scope, wrapper)
+        .expect("TreeWalker wrapper must have native identity");
     set_named_constructor_prototype(scope, wrapper, "TreeWalker");
     wrapper
 }

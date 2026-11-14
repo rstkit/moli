@@ -8,6 +8,9 @@ use std::{
 };
 
 use moli_page_types::{DevToolsSessionKey, RendererDevToolsAgentToken};
+use moli_v8_platform::{
+    ProcessEnvironmentInvalidation, ProcessEnvironmentNotifications, ProcessEnvironmentNotifier,
+};
 use parking_lot::Mutex;
 
 use crate::{
@@ -28,11 +31,17 @@ type RendererInspectorInterruptCallback =
 
 pub(crate) struct RendererInspectorInterruptTarget {
     route_id: RendererInspectorSessionExecutorRouteId,
+    close_requested: AtomicBool,
+    page_scoped: bool,
 }
 
 impl RendererInspectorInterruptTarget {
     pub(crate) fn route_id(&self) -> RendererInspectorSessionExecutorRouteId {
         self.route_id
+    }
+
+    pub(crate) fn take_close_request(&self) -> bool {
+        self.close_requested.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -217,6 +226,8 @@ pub(crate) struct RendererInspectorIoIngress {
 
 struct RendererInspectorIoShared {
     state: Mutex<RendererInspectorIoState>,
+    page_pause_wakes:
+        Mutex<BTreeMap<RendererInspectorSessionExecutorRouteId, RendererInspectorPauseLoopWake>>,
     interrupt_armed: AtomicBool,
     owner_wake_armed: AtomicBool,
     interrupt_route: Option<RendererInspectorInterruptRoute>,
@@ -242,6 +253,9 @@ impl RendererInspectorIoOwnerWake {
 
 struct RendererInspectorIoState {
     commands: VecDeque<RendererInspectorIoCommand>,
+    // Isolate-owned notifications, not session commands. They remain eligible
+    // during session detach and an active command's nested debugger pause.
+    environment_notifications: ProcessEnvironmentNotifications,
     active_command_id: Option<u64>,
     // One count per lane is enough: every detach guard completes at most once,
     // and commands stay blocked until all outstanding guards have completed.
@@ -252,6 +266,10 @@ struct RendererInspectorIoState {
 
 impl RendererInspectorIoState {
     fn has_ready(&self) -> bool {
+        !self.closed && (self.environment_notifications.has_pending() || self.has_ready_command())
+    }
+
+    fn has_ready_command(&self) -> bool {
         !self.closed
             && self.active_command_id.is_none()
             && self.commands.iter().any(|command| {
@@ -291,10 +309,6 @@ pub(crate) struct RendererInspectorIoFirstDispatchGuard {
     first_dispatch_tx: Option<RendererInspectorIoFirstDispatchSender>,
 }
 
-pub(crate) struct RendererInspectorIoPostDispatchWakeGuard {
-    ingress: Option<RendererInspectorIoIngress>,
-}
-
 impl Drop for RendererInspectorIoFirstDispatchGuard {
     fn drop(&mut self) {
         let has_ready = self.finish_task(RendererRuntimeInspectorIoCommandClaim::Canceled(
@@ -307,21 +321,13 @@ impl Drop for RendererInspectorIoFirstDispatchGuard {
 }
 
 impl RendererInspectorIoFirstDispatchGuard {
+    /// Release IO admission at backend entry. Wakes post owner work, queue a
+    /// V8 interrupt, or signal the pause loop; they do not dispatch inline.
+    /// The next IO command must not wait for this command's response.
     pub(crate) fn release(&mut self) {
         let has_ready = self.finish_task(RendererRuntimeInspectorIoCommandClaim::Dispatched);
         if has_ready {
             self.ingress.notify_execution_opportunities();
-        }
-    }
-
-    /// Releases the receiver slot and publishes first-dispatch immediately
-    /// before entering V8, but keeps the next execution wake behind the return
-    /// from this dispatch. V8 may enter a nested debugger loop before the call
-    /// returns, so the command's ingress lifecycle must already be settled.
-    pub(crate) fn release_for_dispatch(&mut self) -> RendererInspectorIoPostDispatchWakeGuard {
-        let has_ready = self.finish_task(RendererRuntimeInspectorIoCommandClaim::Dispatched);
-        RendererInspectorIoPostDispatchWakeGuard {
-            ingress: has_ready.then(|| self.ingress.clone()),
         }
     }
 
@@ -352,14 +358,6 @@ impl RendererInspectorIoFirstDispatchGuard {
     }
 }
 
-impl Drop for RendererInspectorIoPostDispatchWakeGuard {
-    fn drop(&mut self) {
-        if let Some(ingress) = self.ingress.take() {
-            ingress.notify_execution_opportunities();
-        }
-    }
-}
-
 impl RendererInspectorIoIngress {
     pub(crate) fn new(
         pause_wake: RendererInspectorPauseLoopWake,
@@ -369,10 +367,35 @@ impl RendererInspectorIoIngress {
             RendererInspectorSessionExecutorRouteId,
         )>,
     ) -> Self {
+        Self::new_with_execution_scope(pause_wake, interrupt_route, false)
+    }
+
+    pub(crate) fn new_for_page(
+        pause_wake: RendererInspectorPauseLoopWake,
+        interrupt_route: (
+            v8::IsolateHandle,
+            RendererInspectorInterruptCallback,
+            RendererInspectorSessionExecutorRouteId,
+        ),
+    ) -> Self {
+        Self::new_with_execution_scope(pause_wake, Some(interrupt_route), true)
+    }
+
+    fn new_with_execution_scope(
+        pause_wake: RendererInspectorPauseLoopWake,
+        interrupt_route: Option<(
+            v8::IsolateHandle,
+            RendererInspectorInterruptCallback,
+            RendererInspectorSessionExecutorRouteId,
+        )>,
+        page_scoped: bool,
+    ) -> Self {
         Self {
             shared: Arc::new(RendererInspectorIoShared {
+                page_pause_wakes: Mutex::new(BTreeMap::new()),
                 state: Mutex::new(RendererInspectorIoState {
                     commands: VecDeque::new(),
+                    environment_notifications: ProcessEnvironmentNotifications::default(),
                     active_command_id: None,
                     session_detaches: BTreeMap::new(),
                     closed: false,
@@ -384,7 +407,11 @@ impl RendererInspectorIoIngress {
                     RendererInspectorInterruptRoute {
                         isolate,
                         callback,
-                        target: Arc::new(RendererInspectorInterruptTarget { route_id }),
+                        target: Arc::new(RendererInspectorInterruptTarget {
+                            route_id,
+                            close_requested: AtomicBool::new(false),
+                            page_scoped,
+                        }),
                     }
                 }),
                 pause_wake,
@@ -399,17 +426,58 @@ impl RendererInspectorIoIngress {
             .map(|route| route.target.route_id())
     }
 
+    /// Publication touches only the shared mailbox. The wake runs outside the
+    /// process configuration lock and reuses idle/interrupt/nested-pause routes.
+    pub(crate) fn environment_notifier(&self) -> ProcessEnvironmentNotifier {
+        let ingress = self.clone();
+        self.shared
+            .state
+            .lock()
+            .environment_notifications
+            .notifier(move || {
+                ingress.notify_execution_opportunities();
+            })
+    }
+
+    pub(crate) fn claim_environment_invalidation(&self) -> Option<ProcessEnvironmentInvalidation> {
+        self.shared.state.lock().environment_notifications.take()
+    }
+
+    pub(crate) fn register_page_pause_wake(
+        &self,
+        route: RendererInspectorSessionExecutorRouteId,
+        wake: RendererInspectorPauseLoopWake,
+    ) {
+        self.shared.page_pause_wakes.lock().insert(route, wake);
+    }
+
+    pub(crate) fn unregister_page_pause_wake(
+        &self,
+        route: RendererInspectorSessionExecutorRouteId,
+    ) {
+        self.shared.page_pause_wakes.lock().remove(&route);
+    }
+
     /// Breaks an active V8 call so target teardown can reach the Page owner.
     ///
     /// Closing the ingress prevents queued IO work from being claimed, but
-    /// the owner may still be inside non-yielding JavaScript. Target close
-    /// owns this isolate's lifetime, so teardown can terminate that execution
-    /// directly instead of depending on another DevTools command.
+    /// the owner may still be inside non-yielding JavaScript. An interrupt
+    /// checks the entered Page before terminating: related Pages may share
+    /// this isolate and their execution must survive an unrelated close.
     pub(crate) fn terminate_execution_for_target_close(&self) -> bool {
-        self.shared
-            .interrupt_route
-            .as_ref()
-            .is_some_and(|route| route.isolate.terminate_execution())
+        let Some(route) = &self.shared.interrupt_route else {
+            return false;
+        };
+        if !route.target.page_scoped {
+            // Renderer-owner shutdown owns the whole isolate, including all
+            // related Pages and any bootstrap that has no context yet.
+            return route.isolate.terminate_execution();
+        }
+        route.target.close_requested.store(true, Ordering::Release);
+        // Do not coalesce this terminal interrupt with ordinary IO work. An
+        // already-running callback may have checked close_requested before
+        // this store and must not consume the only opportunity to stop JS.
+        self.post_interrupt()
     }
 
     pub(crate) fn configure_owner_wake(
@@ -501,7 +569,9 @@ impl RendererInspectorIoIngress {
         &self,
         pause_bridge: &crate::devtools::pause::RendererInspectorPauseBridge,
     ) -> Option<RendererInspectorIoCommand> {
-        pause_bridge.wait_for_pause_work(|| self.claim_for_pause())
+        pause_bridge
+            .wait_for_pause_work(|| self.claim_for_pause())
+            .ok()
     }
 
     fn claim_next(
@@ -509,7 +579,7 @@ impl RendererInspectorIoIngress {
         consumer: RendererInspectorIoCommandConsumer,
     ) -> Option<RendererInspectorIoCommand> {
         let mut state = self.shared.state.lock();
-        if !state.has_ready() {
+        if !state.has_ready_command() {
             return None;
         }
         let position = state
@@ -634,6 +704,7 @@ impl RendererInspectorIoIngress {
         let commands = {
             let mut state = self.shared.state.lock();
             state.closed = true;
+            state.environment_notifications.close();
             state.commands.drain(..).collect::<Vec<_>>()
         };
         self.shared.pause_wake.notify_all();
@@ -678,13 +749,16 @@ impl RendererInspectorIoIngress {
         if self.shared.state.lock().has_ready() {
             self.request_interrupt();
             self.shared.pause_wake.notify_one();
+            for wake in self.shared.page_pause_wakes.lock().values() {
+                wake.notify_all();
+            }
         }
     }
 
     fn request_interrupt(&self) {
-        let Some(route) = self.shared.interrupt_route.as_ref() else {
+        if self.shared.interrupt_route.is_none() {
             return;
-        };
+        }
         if self
             .shared
             .interrupt_armed
@@ -693,6 +767,15 @@ impl RendererInspectorIoIngress {
         {
             return;
         }
+        if !self.post_interrupt() {
+            self.shared.interrupt_armed.store(false, Ordering::Release);
+        }
+    }
+
+    fn post_interrupt(&self) -> bool {
+        let Some(route) = self.shared.interrupt_route.as_ref() else {
+            return false;
+        };
         // Match Chromium's InspectorTaskRunner lifetime protocol: every V8
         // interrupt owns one strong callback target until V8 invokes it. A
         // late callback after executor teardown can therefore safely observe
@@ -707,8 +790,9 @@ impl RendererInspectorIoIngress {
             // above, and V8 rejected the request, so no callback can consume
             // this one strong reference.
             unsafe { drop(Arc::from_raw(callback_target)) };
-            self.shared.interrupt_armed.store(false, Ordering::Release);
+            return false;
         }
+        true
     }
 }
 
@@ -719,6 +803,10 @@ impl std::fmt::Debug for RendererInspectorIoIngress {
             .debug_struct("RendererInspectorIoIngress")
             .field("route_id", &self.route_id())
             .field("queued_tasks", &state.commands.len())
+            .field(
+                "environment_notifications",
+                &state.environment_notifications.has_pending(),
+            )
             .field("active_command_id", &state.active_command_id)
             .field(
                 "interrupt_armed",
@@ -782,6 +870,42 @@ mod tests {
             Some(session.to_owned()),
             RendererInspectorCommandRoute::Io,
         )
+    }
+
+    #[test]
+    fn environment_notifications_are_isolate_owned_and_survive_session_detach() {
+        let ingress = ingress();
+        let agent = RendererDevToolsAgentToken::allocate();
+        let _route = enqueue(&ingress, agent, Some("session-a"), "active");
+        let mut command = ingress.claim_for_owner().unwrap();
+        let guard = ingress.first_dispatch_guard(&mut command);
+        ingress.begin_session_detach(agent, command.ticket().session());
+        let notifier = ingress.environment_notifier();
+        for _ in 0..1_000 {
+            notifier.notify(ProcessEnvironmentInvalidation::LocaleAndDateTime);
+            notifier.notify(ProcessEnvironmentInvalidation::DateTime);
+        }
+        // A nested pause can receive these without releasing the active
+        // command slot or creating another Inspector session.
+        assert!(ingress.claim_for_pause().is_none());
+        assert_eq!(
+            ingress.claim_environment_invalidation(),
+            Some(ProcessEnvironmentInvalidation::LocaleAndDateTime)
+        );
+        assert_eq!(ingress.claim_environment_invalidation(), None);
+        drop(guard);
+        ingress.finish_session_detach(agent, command.ticket().session());
+    }
+
+    #[test]
+    fn closed_isolate_discards_queued_and_late_environment_notifications() {
+        let ingress = ingress();
+        let notifier = ingress.environment_notifier();
+        notifier.notify(ProcessEnvironmentInvalidation::LocaleAndDateTime);
+        ingress.close("isolate disposed");
+        notifier.notify(ProcessEnvironmentInvalidation::DateTime);
+        assert_eq!(ingress.claim_environment_invalidation(), None);
+        assert!(!ingress.shared.state.lock().has_ready());
     }
 
     fn session_response_output(

@@ -2,7 +2,7 @@ use super::*;
 use crate::dom::native::Node;
 use std::collections::HashSet;
 
-impl JsContextHost {
+impl PageScriptHost {
     #[cfg(test)]
     pub(crate) fn child_browsing_context_has_cached_snapshot_for_test(
         &self,
@@ -11,29 +11,6 @@ impl JsContextHost {
         self.child_browsing_contexts
             .get(&handle)
             .is_some_and(ChildBrowsingContextEntry::has_cached_snapshot)
-    }
-
-    pub(crate) fn sync_initial_child_browsing_context_history_floor(
-        &self,
-        scope: &mut v8::PinScope<'_, '_>,
-    ) {
-        let main_document_child_count = self
-            .top_level_child_browsing_context_handles_in_frame_tree_order()
-            .into_iter()
-            .filter(|handle| {
-                self.child_browsing_context_popup_owner_id(*handle)
-                    .is_none()
-            })
-            .count();
-        if main_document_child_count == 0 {
-            return;
-        }
-        let owner = scope.get_current_context().global(scope);
-        set_top_level_history_length_at_least_for_runtime_owner(
-            scope,
-            owner,
-            1.0 + main_document_child_count as f64,
-        );
     }
 
     pub(crate) fn child_browsing_context_count(&self) -> usize {
@@ -82,6 +59,11 @@ impl JsContextHost {
         document: DomHandle,
         out: &mut Vec<DomHandle>,
     ) {
+        // This query projects existing contexts. An empty context registry
+        // cannot contribute a handle, so avoid walking the document.
+        if self.child_browsing_contexts.is_empty() {
+            return;
+        }
         let mut visited_documents = HashSet::new();
         let mut visited_handles = HashSet::new();
         self.collect_child_browsing_context_handles_in_document_order_from_document_inner(
@@ -226,12 +208,43 @@ impl JsContextHost {
         parent: Option<DomHandle>,
         key: &str,
     ) -> Option<DomHandle> {
+        let handle = self.child_browsing_context_named_object_handle(parent, key)?;
+        // Deduplicate before filtering by origin: a cross-origin first match
+        // must not expose a later same-origin child with the same target name.
+        self.child_browsing_context_child_is_same_origin(parent, handle)
+            .then_some(handle)
+    }
+
+    pub(crate) fn child_browsing_context_child_is_same_origin(
+        &self,
+        parent: Option<DomHandle>,
+        child: DomHandle,
+    ) -> bool {
+        let parent = match parent {
+            Some(parent) => self.child_window_access_origin(parent),
+            None => self.main_window_access_origin(),
+        };
+        parent
+            .zip(self.child_window_access_origin(child))
+            .is_some_and(|(parent, child)| parent.is_same_origin(&child))
+    }
+
+    // Named objects also include cross-origin children when a Document's
+    // id/name exposure independently supplies the supported property name.
+    pub(crate) fn child_browsing_context_named_object_handle(
+        &self,
+        parent: Option<DomHandle>,
+        key: &str,
+    ) -> Option<DomHandle> {
+        if key.is_empty() || self.child_browsing_contexts.is_empty() {
+            return None;
+        }
         // Window named access only searches direct scoped children. A full
         // frame-tree search can rediscover the receiver (for example when a
         // nested frame is named `document`) and recursively materialize it.
         let handles = match parent {
-            Some(parent) => self.child_browsing_context_child_frame_handles(parent),
-            None => self.top_level_child_browsing_context_handles_in_frame_tree_order(),
+            Some(parent) => self.child_browsing_context_direct_host_handles(parent),
+            None => self.top_level_child_browsing_context_handles_in_document_order(),
         };
         handles.into_iter().find(|handle| {
             self.dom_host()
@@ -279,6 +292,17 @@ impl JsContextHost {
         key: &str,
         document: DomHandle,
     ) -> Option<DomHandle> {
+        // Navigable lookup searches the current navigable's inclusive subtree.
+        // A same-named descendant must not shadow the source frame itself.
+        if !key.is_empty()
+            && let Some(handle) = self.child_browsing_context_host_for_document_handle(document)
+            && self
+                .child_browsing_contexts
+                .get(&handle)
+                .is_some_and(|entry| entry.matches_browsing_context_name(key))
+        {
+            return Some(handle);
+        }
         self.sync_child_browsing_context_subtree(scope, document);
         self.child_browsing_context_handle_by_name_in_document_order_from_document(key, document)
     }
@@ -371,15 +395,6 @@ impl JsContextHost {
         self.child_browsing_context_host_for_document_handle(document_handle)
             .and_then(|child_handle| self.child_browsing_contexts.get(&child_handle))
             .and_then(|entry| entry.document_referrer_policy())
-    }
-
-    pub(crate) fn child_browsing_context_response_referrer_policy(
-        &self,
-        handle: DomHandle,
-    ) -> Option<String> {
-        self.child_browsing_contexts
-            .get(&handle)
-            .and_then(|entry| entry.document_referrer_policy().map(ToOwned::to_owned))
     }
 
     pub(crate) fn child_browsing_context_policy_container_snapshot(

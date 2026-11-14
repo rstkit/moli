@@ -93,20 +93,44 @@ fn set_receiver_window_alias<'s>(
     let Some(receiver) = window_receiver(scope, args) else {
         return;
     };
-    rv.set(
-        window_hidden_value(scope, receiver, slot)
-            .unwrap_or_else(|| scope.get_current_context().global(scope).into()),
-    );
+    if let Some(value) = super::values::window_alias_value(scope, receiver, slot) {
+        rv.set(value);
+    }
 }
 
-pub(in crate::context_bootstrap) fn window_opener_getter<'s>(
+pub(crate) fn window_opener_getter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if window_receiver(scope, &args).is_some() {
-        rv.set_null();
+    let Some(receiver) = window_receiver(scope, &args) else {
+        return;
+    };
+    if let Some(value) = super::values::window_opener_value(scope, receiver) {
+        rv.set(value);
     }
+}
+
+pub(in crate::context_bootstrap) fn window_opener_setter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(receiver) = window_receiver(scope, &args) else {
+        return;
+    };
+    let value = args.get(0);
+    if value.is_null()
+        && window_child_context_handle(scope, receiver).is_none()
+        && let Some(host) = receiver
+            .get_creation_context(scope)
+            .and_then(context_host_ptr_from_context_slot)
+        && let Some(environment) = unsafe { &*host }.page_script_environment()
+    {
+        environment.set_opener(None);
+    }
+    let key = crate::util::v8str(scope, "opener");
+    let _ = receiver.define_own_property(scope, key.into(), value, v8::PropertyAttribute::NONE);
 }
 
 pub(in crate::context_bootstrap) fn window_inner_width_getter<'s>(
@@ -138,9 +162,15 @@ pub(in crate::context_bootstrap) fn window_outer_width_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if window_receiver(scope, &args).is_some() {
-        rv.set(v8::Number::new(scope, DEFAULT_WINDOW_SURFACE_PROFILE.inner_width).into());
-    }
+    let Some(receiver) = window_receiver(scope, &args) else {
+        return;
+    };
+    let value = window_host_ptr(scope, receiver)
+        .and_then(|host_ptr| unsafe { &*host_ptr }.viewport_surface())
+        .map_or(DEFAULT_WINDOW_SURFACE_PROFILE.inner_width, |v| {
+            f64::from(v.outer_width)
+        });
+    rv.set(v8::Number::new(scope, value).into());
 }
 
 pub(in crate::context_bootstrap) fn window_outer_height_getter<'s>(
@@ -148,9 +178,15 @@ pub(in crate::context_bootstrap) fn window_outer_height_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if window_receiver(scope, &args).is_some() {
-        rv.set(v8::Number::new(scope, DEFAULT_WINDOW_SURFACE_PROFILE.inner_height).into());
-    }
+    let Some(receiver) = window_receiver(scope, &args) else {
+        return;
+    };
+    let value = window_host_ptr(scope, receiver)
+        .and_then(|host_ptr| unsafe { &*host_ptr }.viewport_surface())
+        .map_or(DEFAULT_WINDOW_SURFACE_PROFILE.inner_height, |v| {
+            f64::from(v.outer_height)
+        });
+    rv.set(v8::Number::new(scope, value).into());
 }
 
 pub(in crate::context_bootstrap) fn window_device_pixel_ratio_getter<'s>(
@@ -158,9 +194,15 @@ pub(in crate::context_bootstrap) fn window_device_pixel_ratio_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if window_receiver(scope, &args).is_some() {
-        rv.set(v8::Number::new(scope, DEFAULT_WINDOW_SURFACE_PROFILE.device_pixel_ratio).into());
-    }
+    let Some(receiver) = window_receiver(scope, &args) else {
+        return;
+    };
+    let value = window_host_ptr(scope, receiver)
+        .and_then(|host_ptr| unsafe { &*host_ptr }.viewport_surface())
+        .map_or(DEFAULT_WINDOW_SURFACE_PROFILE.device_pixel_ratio, |v| {
+            v.device_pixel_ratio
+        });
+    rv.set(v8::Number::new(scope, value).into());
 }
 
 pub(in crate::context_bootstrap) fn window_scroll_x_getter<'s>(
@@ -247,7 +289,7 @@ pub(in crate::context_bootstrap) fn window_window_getter<'s>(
     set_receiver_window_alias(scope, &args, WINDOW_SELF_SLOT, rv);
 }
 
-pub(in crate::context_bootstrap) fn window_top_getter<'s>(
+pub(crate) fn window_top_getter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'_, v8::Value>,
@@ -255,7 +297,7 @@ pub(in crate::context_bootstrap) fn window_top_getter<'s>(
     set_receiver_window_alias(scope, &args, WINDOW_TOP_SLOT, rv);
 }
 
-pub(in crate::context_bootstrap) fn window_parent_getter<'s>(
+pub(crate) fn window_parent_getter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'_, v8::Value>,
@@ -277,4 +319,17 @@ pub(in crate::context_bootstrap) fn window_self_getter<'s>(
     rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     set_receiver_window_alias(scope, &args, WINDOW_SELF_SLOT, rv);
+}
+
+pub(crate) fn window_closed_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(receiver) = window_receiver(scope, &args) else {
+        return;
+    };
+    if let Some(value) = super::values::window_closed_value(scope, receiver) {
+        rv.set(value);
+    }
 }

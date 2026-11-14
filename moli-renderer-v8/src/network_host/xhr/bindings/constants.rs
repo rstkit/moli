@@ -1,13 +1,14 @@
 use super::*;
-use crate::context_bootstrap::simple_object_event_set_ordered_handler;
+use crate::context_bootstrap::simple_object_event_set_handler;
 use crate::util::{
     callback_data_index_value, callback_data_item, get_private_value, set_private_value,
 };
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiFunctionTemplate;
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "XMLHttpRequest", enumerable)]
+#[webapi(interface = web_api_interfaces::XMLHttpRequest, enumerable)]
 struct XmlHttpRequestConstantsDeclaration {
     #[webapi(constant = "UNSENT", value = 0u32)]
     _unsent: (),
@@ -22,7 +23,7 @@ struct XmlHttpRequestConstantsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "XMLHttpRequest", enumerable)]
+#[webapi(interface = web_api_interfaces::XMLHttpRequest, enumerable, receiver)]
 struct XmlHttpRequestPrototypeAccessorsDeclaration {
     #[webapi(accessor_property, getter = xhr_number_getter, data = callback_data_index_value(scope, 0))]
     ready_state: (),
@@ -41,7 +42,7 @@ struct XmlHttpRequestPrototypeAccessorsDeclaration {
     response_type: (),
     #[webapi(accessor_property = "responseURL", getter = xhr_string_getter, data = callback_data_index_value(scope, 5))]
     response_url: (),
-    #[webapi(accessor_property, getter = xhr_value_getter, data = callback_data_index_value(scope, 6))]
+    #[webapi(accessor_property, getter = xhr_response_getter, data = callback_data_index_value(scope, 6))]
     response: (),
     #[webapi(
         accessor_property,
@@ -69,14 +70,14 @@ struct XmlHttpRequestPrototypeAccessorsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "XMLHttpRequest", enumerable)]
+#[webapi(interface = web_api_interfaces::XMLHttpRequest, enumerable, receiver)]
 struct XmlHttpRequestResponseXmlAccessorDeclaration {
     #[webapi(accessor_property = "responseXML", getter = xhr_response_xml_getter, data = callback_data_index_value(scope, 7))]
     response_xml: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "XMLHttpRequestEventTarget", enumerable)]
+#[webapi(interface = web_api_interfaces::XMLHttpRequestEventTarget, enumerable, receiver)]
 struct XmlHttpRequestEventTargetPrototypeAccessorsDeclaration {
     #[webapi(accessor_property, getter = xhr_value_getter, setter = xhr_value_setter, data = callback_data_index_value(scope, 12))]
     onload: (),
@@ -104,8 +105,8 @@ struct XhrTimeoutArgs {
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "XMLHttpRequest.responseType")]
 struct XhrResponseTypeArgs {
-    #[webidl(required, converter = "enum")]
-    value: XmlHttpRequestResponseType,
+    #[webidl(default = "undefined", converter = "dom_string")]
+    value: String,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -153,10 +154,7 @@ fn xhr_number_getter(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        rv.set(v8::Number::new(scope, 0.0).into());
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let Some(key) = callback_data_item(
         scope,
         &args,
@@ -175,14 +173,7 @@ fn xhr_string_getter(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        rv.set(
-            v8_string(scope, "")
-                .map(|value| value.into())
-                .unwrap_or_else(|| v8::undefined(scope).into()),
-        );
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let Some(key) = callback_data_item(
         scope,
         &args,
@@ -197,8 +188,13 @@ fn xhr_string_getter(
         return;
     };
     let value = xhr_state_string_property(scope, xhr, key).unwrap_or_default();
+    let value = if key == XHR_RESPONSE_URL_SLOT {
+        value.split_once('#').map_or(value.as_str(), |(url, _)| url)
+    } else {
+        value.as_str()
+    };
     rv.set(
-        v8_string(scope, &value)
+        v8_string(scope, value)
             .map(|string| string.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
     );
@@ -209,9 +205,7 @@ fn xhr_response_text_getter(
     args: v8::FunctionCallbackArguments<'_>,
     rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let response_type = xhr_state_string_property(scope, xhr, XHR_RESPONSE_TYPE_SLOT)
         .as_deref()
         .and_then(XmlHttpRequestResponseType::parse)
@@ -229,14 +223,33 @@ fn xhr_response_text_getter(
     xhr_string_getter(scope, args, rv);
 }
 
+fn xhr_response_getter(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let xhr = xhr_receiver_target(scope, args.this());
+    let response_type = xhr_state_string_property(scope, xhr, XHR_RESPONSE_TYPE_SLOT)
+        .as_deref()
+        .and_then(XmlHttpRequestResponseType::parse)
+        .unwrap_or(XmlHttpRequestResponseType::Default);
+    if !matches!(
+        response_type,
+        XmlHttpRequestResponseType::Default | XmlHttpRequestResponseType::Text
+    ) && xhr_ready_state(scope, xhr) != XhrReadyState::Done
+    {
+        rv.set_null();
+        return;
+    }
+    xhr_value_getter(scope, args, rv);
+}
+
 fn xhr_response_xml_getter(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let response_type = xhr_state_string_property(scope, xhr, XHR_RESPONSE_TYPE_SLOT)
         .as_deref()
         .and_then(XmlHttpRequestResponseType::parse)
@@ -259,10 +272,7 @@ fn xhr_bool_getter(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        rv.set(v8::Boolean::new(scope, false).into());
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let Some(key) = callback_data_item(
         scope,
         &args,
@@ -281,10 +291,7 @@ fn xhr_value_getter(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        rv.set_null();
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let Some(key) = callback_data_item(
         scope,
         &args,
@@ -306,10 +313,7 @@ fn xhr_upload_getter(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        rv.set_undefined();
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     rv.set(
         xhr_upload_object(scope, xhr)
             .map(|object| object.into())
@@ -322,9 +326,7 @@ fn xhr_timeout_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let Some(parsed) = webidl::parse_args::<XhrTimeoutArgs>(scope, &args) else {
         return;
     };
@@ -347,32 +349,34 @@ fn xhr_response_type_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
+    let xhr = xhr_receiver_target(scope, args.this());
+    let Some(parsed) = webidl::parse_args::<XhrResponseTypeArgs>(scope, &args) else {
         return;
     };
-    let ready_state = xhr_state_number_property(scope, xhr, XHR_READY_STATE_SLOT).unwrap_or(0.0);
-    if matches!(ready_state as u32, 3 | 4) {
+    // WebIDL enum attribute setters ignore unknown tokens after ToString,
+    // before running the attribute's state checks.
+    let Some(response_type) = XmlHttpRequestResponseType::parse(&parsed.value) else {
+        return;
+    };
+    if response_type == XmlHttpRequestResponseType::Document
+        && xhr_current_context_is_worker_global(scope)
+    {
+        return;
+    }
+    let ready_state = xhr_ready_state(scope, xhr);
+    if matches!(ready_state, XhrReadyState::Loading | XhrReadyState::Done) {
         xhr_throw_invalid_state(
             scope,
             "XMLHttpRequest.responseType cannot be changed once loading has started.",
         );
         return;
     }
-    let Some(parsed) = webidl::parse_args::<XhrResponseTypeArgs>(scope, &args) else {
-        return;
-    };
-    let response_type = parsed.value;
     let async_request = xhr_state_bool_property(scope, xhr, XHR_ASYNC_SLOT).unwrap_or(true);
     if xhr_is_synchronous_document_request(scope, async_request) {
         xhr_throw_invalid_access(
             scope,
             "Failed to set the 'responseType' property on 'XMLHttpRequest': The response type cannot be changed for synchronous requests made from a document.",
         );
-        return;
-    }
-    if response_type == XmlHttpRequestResponseType::Document
-        && xhr_current_context_is_worker_global(scope)
-    {
         return;
     }
     set_xhr_state_string(scope, xhr, XHR_RESPONSE_TYPE_SLOT, response_type.label());
@@ -383,12 +387,10 @@ fn xhr_with_credentials_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        return;
-    };
-    let ready_state = xhr_state_number_property(scope, xhr, XHR_READY_STATE_SLOT).unwrap_or(0.0);
+    let xhr = xhr_receiver_target(scope, args.this());
+    let ready_state = xhr_ready_state(scope, xhr);
     let send_flag = xhr_state_bool_property(scope, xhr, XHR_SEND_FLAG_SLOT).unwrap_or(false);
-    if ready_state as u32 != 0 && (ready_state as u32 != 1 || send_flag) {
+    if ready_state != XhrReadyState::Unsent && (ready_state != XhrReadyState::Opened || send_flag) {
         xhr_throw_invalid_state(
             scope,
             "XMLHttpRequest.withCredentials cannot be changed in the current state.",
@@ -401,14 +403,12 @@ fn xhr_with_credentials_setter<'s>(
     set_xhr_state_bool(scope, xhr, XHR_WITH_CREDENTIALS_SLOT, parsed.value);
 }
 
-fn xhr_value_setter(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+fn xhr_value_setter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(xhr) = args.this().to_object(scope) else {
-        return;
-    };
+    let xhr = xhr_receiver_target(scope, args.this());
     let Some(key) = callback_data_item(
         scope,
         &args,
@@ -423,7 +423,7 @@ fn xhr_value_setter(
         v8::undefined(scope).into()
     };
     let stored = if xhr_event_type_for_handler_slot(key).is_some() {
-        if value.is_function() {
+        if value.is_object() {
             value
         } else {
             v8::null(scope).into()
@@ -432,16 +432,10 @@ fn xhr_value_setter(
         value
     };
     set_xhr_state_value(scope, xhr, key, stored);
-    set_private_value(scope, xhr, key, stored);
     if let Some(event_type) = xhr_event_type_for_handler_slot(key) {
-        simple_object_event_set_ordered_handler(
-            scope,
-            xhr,
-            XHR_SIMPLE_EVENT_TARGET_LISTENERS_SLOT,
-            event_type,
-            key,
-            stored.is_function(),
-        );
+        simple_object_event_set_handler(scope, xhr, event_type, key, stored);
+    } else {
+        set_private_value(scope, xhr, key, stored);
     }
 }
 

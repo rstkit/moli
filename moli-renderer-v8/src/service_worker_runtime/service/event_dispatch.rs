@@ -19,6 +19,7 @@ struct ServiceWorkerNavigationPreloadDispatch {
     event_id: ServiceWorkerEventId,
     owner: ServiceWorkerRunOwner,
     request_url: url::Url,
+    request_method: String,
     request_mode: moli_fetch::RequestMode,
     request_client: ResourceRequestClient,
     resource_task_runner: crate::network::RendererResourceTaskRunner,
@@ -27,7 +28,7 @@ struct ServiceWorkerNavigationPreloadDispatch {
 }
 
 fn service_worker_fetch_event_can_use_navigation_preload(job: &ServiceWorkerFetchJob) -> bool {
-    job.request_mode == moli_fetch::RequestMode::Navigate
+    job.request.request_mode == moli_fetch::RequestMode::Navigate
         && matches!(
             job.destination,
             ServiceWorkerRequestDestination::Document | ServiceWorkerRequestDestination::Iframe
@@ -38,50 +39,33 @@ fn navigation_preload_request_for_job(
     job: &ServiceWorkerFetchJob,
     header_value: &str,
 ) -> Result<moli_fetch::Request, String> {
-    let mut headers = job.request_headers.clone();
+    let mut headers = job.request.request_headers.clone();
     headers.retain(|(name, _)| !name.eq_ignore_ascii_case("service-worker-navigation-preload"));
-    headers.push((
+    let preload_header = moli_fetch::RequestHeaders::from_byte_strings(&[(
         "Service-Worker-Navigation-Preload".to_owned(),
         header_value.to_owned(),
-    ));
-    moli_fetch::Request::new_bytes(
-        &job.request_method,
-        job.request_url.as_str(),
-        job.request_body_bytes.clone(),
-        headers,
-    )
-    .map(|request| {
-        let request = if job.network_context.frame_id.is_some() {
-            request.with_subframe_navigation_cookie_context()
+    )])
+    .map_err(|error| error.to_string())?;
+    headers.extend_from_slice(&preload_header);
+    let mut request = super::fetch_settlement::service_worker_network_fallback_request_for_job(job);
+    request.request_headers = headers;
+    Ok(request
+        .with_redirect_mode(moli_fetch::RequestRedirectMode::Manual)
+        .with_browser_navigation_kind(if job.is_reload {
+            moli_fetch::BrowserNavigationRequestKind::Reload
         } else {
-            request.with_top_level_navigation_cookie_context()
-        };
-        request
-            .with_initiator_url(&job.network_context.document_url)
-            .with_request_mode(job.request_mode)
-            .with_credentials_mode(job.credentials_mode)
-            // Chromium reports the first navigation preload redirect to
-            // `preloadResponse` as an opaqueredirect response instead of
-            // following it internally.
-            .with_redirect_mode(moli_fetch::RequestRedirectMode::Manual)
-            .with_fetch_priority_hint(job.priority)
-            .with_browser_navigation_kind(if job.is_reload {
-                moli_fetch::BrowserNavigationRequestKind::Reload
-            } else {
-                moli_fetch::BrowserNavigationRequestKind::Navigate
-            })
-            .with_page_network_policy()
-    })
-    .map_err(|error| error.to_string())
+            moli_fetch::BrowserNavigationRequestKind::Navigate
+        })
+        .with_page_network_policy())
 }
 
 fn navigation_preload_response_head(
     head: moli_fetch::ResponseHead,
+    request_url: &Url,
 ) -> MaterializedServiceWorkerFetchResponseHead {
-    MaterializedServiceWorkerFetchResponseHead {
-        final_url: Some(head.final_url),
-        response_type: "default".to_owned(),
-        redirected: head.redirected,
+    moli_fetch_types::FetchResponseHead {
+        metadata: head.fetch_metadata(&request_url.into(), moli_fetch::RequestMode::Navigate),
+        status_text: head.status_text().to_owned(),
         status: head.status,
         headers: head.headers,
     }
@@ -130,7 +114,7 @@ async fn stream_navigation_preload_response(
     };
 
     let body_source_id = new_network_body_source_id();
-    let response_head = navigation_preload_response_head(raw.head());
+    let response_head = navigation_preload_response_head(raw.head(), &dispatch.request_url);
     if !service.mark_navigation_preload_response_started(dispatch.event_id, &dispatch.owner) {
         cancel_handle.cancel();
         return;
@@ -139,6 +123,7 @@ async fn stream_navigation_preload_response(
         event_id: dispatch.event_id,
         owner: dispatch.owner.clone(),
         request_url: dispatch.request_url,
+        request_method: dispatch.request_method,
         request_mode: dispatch.request_mode,
         body_source_id,
         response_head,
@@ -258,27 +243,58 @@ impl ServiceWorkerRuntimeService {
     }
 
     pub(crate) fn dispatch_controlled_fetch(&self, dispatch: ServiceWorkerFetchDispatch) -> bool {
+        let request = &dispatch.request;
+        let native_request = {
+            let origin = dispatch.network_context.request_origin.clone();
+            moli_fetch::Request::new_browser(
+                &request.method,
+                request.url.clone(),
+                request.body.clone(),
+                moli_fetch::RequestHeaders::from_byte_strings(&request.headers)
+                    .expect("service worker request headers are ByteStrings"),
+                origin,
+            )
+            .with_initiator_url(&dispatch.network_context.document_url)
+            .with_request_mode(request.request_mode)
+            .with_credentials_mode(request.credentials_mode)
+            .with_redirect_mode(request.redirect_mode)
+            .with_fetch_priority_hint(request.priority)
+            .with_subresource_request_metadata(moli_fetch::SubresourceRequestMetadata {
+                referrer_policy: (!request.metadata.referrer_policy.is_empty())
+                    .then(|| request.metadata.referrer_policy.clone()),
+                ..Default::default()
+            })
+            .with_fetch_referrer(&request.metadata.referrer)
+            .expect("service worker requests retain a validated Fetch referrer")
+        };
+        self.dispatch_controlled_fetch_request(dispatch, native_request)
+    }
+
+    /// Resource interception already owns the complete browser request. Keep
+    /// its redirect headers, partition and policy when the worker falls back.
+    pub(crate) fn dispatch_controlled_fetch_request(
+        &self,
+        dispatch: ServiceWorkerFetchDispatch,
+        native_request: moli_fetch::Request,
+    ) -> bool {
         let request = dispatch.request.clone();
+        // Synthetic redirects advance this retained request before a network
+        // fallback can bind the owner's cookie scope on its transport copy.
+        let native_request = dispatch
+            .request_client
+            .bind_browser_site_context(native_request);
+        let initial_redirect_count = native_request.redirect_count();
         let fetch_job = ServiceWorkerFetchJob {
+            request: native_request,
+            initial_redirect_count,
             internal_id: dispatch.internal_id,
             owner: None,
-            request_url: request.url.clone(),
-            request_method: request.method.clone(),
-            request_headers: request.headers.clone(),
-            request_body: dispatch.request_body_text,
-            request_body_bytes: request.body.clone(),
             cors_preflight_request_headers: dispatch.cors_preflight_request_headers,
             client_id: request.client_id,
             resulting_client_id: request.resulting_client_id,
             destination: request.destination,
             is_reload: request.is_reload,
             metadata: request.metadata.clone(),
-            request_mode: request.request_mode,
-            credentials_mode: request.credentials_mode,
-            redirect_mode: request.redirect_mode,
-            priority: request.priority,
-            redirect_chain: Vec::new(),
-            redirect_count: 0,
             request_cookie_report: dispatch.request_cookie_report,
             network_context: dispatch.network_context,
             completion_tx: dispatch.completion_tx,
@@ -296,8 +312,25 @@ impl ServiceWorkerRuntimeService {
     pub(super) fn dispatch_controlled_fetch_job(
         &self,
         mut fetch_job: ServiceWorkerFetchJob,
-        request: ServiceWorkerFetchRequest,
+        mut request: ServiceWorkerFetchRequest,
     ) -> Result<(), Box<ServiceWorkerFetchJob>> {
+        if let Err(error) = fetch_job
+            .request
+            .browser_origin()
+            .and_then(|_| fetch_job.request.admit_request_url(&fetch_job.request.url))
+        {
+            self.complete_fetch_with_failure(fetch_job, error.to_string());
+            return Ok(());
+        }
+        fetch_job.request.browser_request_metadata = Some(
+            super::fetch_settlement::service_worker_fetch_browser_metadata(
+                fetch_job.network_context.resource_type,
+            ),
+        );
+        fetch_job
+            .request_client
+            .prepare_service_worker_request(&mut fetch_job.request);
+        request.headers = fetch_job.request.request_headers.to_byte_strings();
         let (dispatch_event, start_launch, fallback_job) = {
             let mut state = self.inner.state.lock();
             let (document_url, storage_key) = match state.live_clients.get(&request.client_id) {
@@ -1398,8 +1431,9 @@ impl ServiceWorkerRuntimeService {
             return None;
         }
 
-        let request_url = job.request_url.clone();
-        let request_mode = job.request_mode;
+        let request_url = job.request.url.clone();
+        let request_mode = job.request.request_mode;
+        let request_method = job.request.method.clone();
         let request_client = job.request_client.clone();
         let resource_task_runner = job.resource_task_runner.clone();
         let cancel_handle = moli_fetch::FetchCancelHandle::new();
@@ -1418,6 +1452,7 @@ impl ServiceWorkerRuntimeService {
             event_id: event.event_id,
             owner: event.owner.clone(),
             request_url,
+            request_method,
             request_mode,
             request_client,
             resource_task_runner,

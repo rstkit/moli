@@ -7,12 +7,42 @@ use super::{
 use crate::RendererOutputFence;
 use anyhow::{Result, bail};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageDocumentCommandTarget {
+    pub(super) target: moli_renderer_v8::RendererDocumentCommandTarget,
+    pub(super) network_pause: Option<moli_renderer_v8::network::ResourceInterceptionPause>,
+}
+
+impl PageDocumentCommandTarget {
+    pub(crate) fn new(target: moli_renderer_v8::RendererDocumentCommandTarget) -> Self {
+        Self {
+            target,
+            network_pause: None,
+        }
+    }
+    pub fn document(&self) -> crate::RendererDocumentLifecycleIdentity {
+        self.target.document()
+    }
+    pub fn start(&self, command: RendererPageCommand) -> Result<PendingPageCommand> {
+        self.target
+            .enqueue(command)
+            .map(PendingPageCommand::from_renderer)
+    }
+}
+
 pub struct PendingPageCommand {
     pending: RendererPageCommandPending,
     renderer_agent_attachment_id: Option<RendererAgentAttachmentId>,
 }
 
 impl PendingPageCommand {
+    pub(crate) fn from_renderer(pending: RendererPageCommandPending) -> Self {
+        Self {
+            pending,
+            renderer_agent_attachment_id: None,
+        }
+    }
+
     pub fn renderer_agent_attachment_id(&self) -> Option<RendererAgentAttachmentId> {
         self.renderer_agent_attachment_id
     }
@@ -61,12 +91,60 @@ pub enum CompletedRuntimeInspectorCommandDispatch {
     },
 }
 
+impl CompletedRuntimeInspectorCommandDispatch {
+    pub fn renderer_output_predecessor(&self) -> Option<RendererOutputFence> {
+        match self {
+            Self::Owner(completion) | Self::OwnerSessionResponse { completion, .. } => {
+                completion.renderer_output_predecessor()
+            }
+            Self::OwnerSessionErrorSettled(predecessor)
+            | Self::InspectorSessionResponse { predecessor, .. } => Some(predecessor.clone()),
+            Self::Inspector => None,
+        }
+    }
+}
+
 pub struct CompletedPageCommand {
     output: RendererCommandTurnOutput,
     renderer_agent_attachment_id: Option<RendererAgentAttachmentId>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Document command returned an unexpected renderer reply")]
+struct UnexpectedDocumentCommandReply;
+
 impl CompletedPageCommand {
+    /// Fetch settlement owns its exact renderer output; Page adoption is not
+    /// required to acknowledge the already-executed native operation.
+    pub fn into_unit_reply(self) -> Result<()> {
+        self.into_unit_page_command_turn().map(drop)
+    }
+
+    pub fn into_subresource_continue_outcome(
+        self,
+    ) -> Result<crate::page::PendingSubresourceContinueOutcome> {
+        match self.output.into_reply_and_state().0 {
+            RendererPageReply::PendingSubresourceContinueOutcome(outcome) => Ok(outcome),
+            _ => Err(UnexpectedDocumentCommandReply.into()),
+        }
+    }
+
+    pub fn into_document_bidi_node_shared_id(
+        self,
+    ) -> Result<crate::page::RendererDomBidiNodeSharedIdResolution> {
+        match self.output.into_reply_and_state().0 {
+            RendererPageReply::DocumentBidiNodeSharedId(result) => Ok(result),
+            _ => Err(UnexpectedDocumentCommandReply.into()),
+        }
+    }
+
+    pub fn into_document_bidi_node_binding(self) -> Result<()> {
+        match self.output.into_reply_and_state().0 {
+            RendererPageReply::DocumentBidiNodeBindingRegistered => Ok(()),
+            _ => Err(UnexpectedDocumentCommandReply.into()),
+        }
+    }
+
     /// Returns the exact renderer output position produced by this command.
     ///
     /// Protocol dispatch must capture this before a command-specific decoder
@@ -123,15 +201,22 @@ impl CompletedPageCommand {
     /// replayed while that replacement Page is installed.
     pub fn into_unit_page_command_turn(self) -> Result<RendererCommandTurnOutput> {
         if !matches!(self.output.completion().reply(), RendererPageReply::Unit) {
-            return Err(anyhow::anyhow!(
-                "unit page command returned an unexpected renderer reply"
-            ));
+            return Err(UnexpectedDocumentCommandReply.into());
         }
         Ok(self.output)
     }
 }
 
 impl Page {
+    pub fn document_command_target(
+        &self,
+        document: crate::RendererDocumentLifecycleIdentity,
+    ) -> Result<PageDocumentCommandTarget> {
+        self.handle
+            .document_command_target(document)
+            .map(PageDocumentCommandTarget::new)
+    }
+
     pub(crate) fn start_page_command(
         &self,
         mut command: RendererPageCommand,
@@ -157,7 +242,11 @@ impl Page {
         })
     }
 
-    fn start_full_page_command(
+    pub fn start_runtime_realm_inventory(&self) -> Result<PendingPageCommand> {
+        self.start_full_page_command(RendererPageCommand::RuntimeRealmInventory)
+    }
+
+    pub(super) fn start_full_page_command(
         &self,
         mut command: RendererPageCommand,
     ) -> Result<PendingPageCommand> {
@@ -272,9 +361,14 @@ impl Page {
 
     pub(super) fn page_reply_kind(reply: &RendererPageReply) -> &'static str {
         match reply {
+            RendererPageReply::WebMcp(_) => "a WebMCP command result",
             RendererPageReply::RuntimeEvaluationResult(_) => "a runtime evaluation result reply",
+            RendererPageReply::ElementClickPreparation(_) => "an element click preparation reply",
+            RendererPageReply::ElementClickDispatch(_) => "an element click dispatch reply",
             RendererPageReply::Bool(_) => "a bool reply",
             RendererPageReply::OptionalBool(_) => "an optional bool reply",
+            #[cfg(feature = "ace-protocol")]
+            RendererPageReply::AcePageTask(_) => "AcePageTask",
             RendererPageReply::InputDispatchOutcome(_) => "an input dispatch outcome reply",
             RendererPageReply::RuntimeInspectorProtocolMessages(_) => {
                 "runtime inspector protocol messages"
@@ -294,6 +388,7 @@ impl Page {
             RendererPageReply::OptionalExecutionContextId(_) => {
                 "an optional execution context reply"
             }
+            RendererPageReply::DocumentNodeRequested { .. } => "a requested document node reply",
             RendererPageReply::OptionalDocumentNodeObjectSnapshot(_) => {
                 "an optional document node object snapshot"
             }
@@ -313,6 +408,7 @@ impl Page {
             RendererPageReply::DocumentNodePropertyResolution(_) => {
                 "a document node property resolution"
             }
+            RendererPageReply::OptionalAccessibilityNodes(_) => "optional accessibility nodes",
             RendererPageReply::OptionalAccessibilityPayloads(_) => {
                 "optional accessibility payloads"
             }
@@ -332,7 +428,7 @@ impl Page {
             RendererPageReply::DocumentPerformSearch(_) => {
                 "a document perform search registration reply"
             }
-            RendererPageReply::DocumentSearchResults(_) => "a document search results reply",
+            RendererPageReply::DocumentSearchResults { .. } => "a document search results reply",
             RendererPageReply::DocumentSearchResultsDiscarded => {
                 "a document search results discarded reply"
             }
@@ -389,6 +485,7 @@ impl Page {
             RendererPageReply::AppManifestLoadPreparation(_) => "an app manifest load preparation",
             RendererPageReply::ChildFrameTreeSnapshots(_) => "child frame tree snapshots",
             RendererPageReply::OptionalString(_) => "an optional string reply",
+            RendererPageReply::SerializedDocument { .. } => "a serialized document reply",
             RendererPageReply::OptionalU64(_) => "an optional u64 reply",
             RendererPageReply::Usize(_) => "a usize reply",
             RendererPageReply::SetDocumentContentResult(_) => "a set-document-content result reply",
@@ -397,9 +494,18 @@ impl Page {
             RendererPageReply::PageDiagnosticsSnapshot(_) => "a page diagnostics snapshot reply",
             RendererPageReply::CookieFacadeSnapshot(_) => "a cookie facade snapshot reply",
             RendererPageReply::LayoutMetrics(_) => "a layout metrics reply",
+            RendererPageReply::PrintToPdf(_) => "a print to PDF reply",
             RendererPageReply::CaptureScreenshot(_) => "a capture screenshot reply",
             RendererPageReply::CaptureScreencastFrame(_) => "a capture screencast frame reply",
             RendererPageReply::Unit => "a unit reply",
+            RendererPageReply::NativeCommandReady(_) => "an unsettled native frontend reply",
+            RendererPageReply::NativeCommandPublished => "a published native frontend reply",
+            // Another dependency may enable the renderer's ACE feature without
+            // enabling this crate's feature. Keep normal replies exhaustive when
+            // ACE is enabled here, and tolerate that mixed configuration otherwise.
+            #[cfg(not(feature = "ace-protocol"))]
+            #[allow(unreachable_patterns)]
+            _ => "an unknown renderer reply",
         }
     }
 

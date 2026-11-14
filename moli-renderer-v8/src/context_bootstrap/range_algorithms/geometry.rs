@@ -1,5 +1,5 @@
 use super::*;
-use crate::util::{call_object_method, object_string_property, serialize_v8_array};
+use crate::util::{call_object_method, object_string_property};
 
 enum NativeRangeGeometryQuery {
     Text,
@@ -11,6 +11,13 @@ fn native_range_client_rects<'s>(
     range: v8::Local<'s, v8::Object>,
 ) -> Option<Result<Vec<ClientRect>, moli_layout::LayoutError>> {
     let boundaries = native_range_boundary_handles(scope, range)?;
+    native_range_client_rects_for_boundaries(scope, boundaries)
+}
+
+pub(super) fn native_range_client_rects_for_boundaries(
+    scope: &mut v8::PinScope<'_, '_>,
+    boundaries: RangeBoundaryHandles,
+) -> Option<Result<Vec<ClientRect>, moli_layout::LayoutError>> {
     let host_ptr = context_host_ptr_from_global_bridge(scope)?;
     let host = unsafe { &*host_ptr };
     if !host.layout_policy().uses_real_layout() {
@@ -122,12 +129,14 @@ fn native_range_client_rects<'s>(
     if queries.is_empty() {
         return Some(Ok(Vec::new()));
     }
-    let answers = observable_geometry_batch(
+    let answers = match observable_geometry_batch(
         host,
         document,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
         &moli_layout::LayoutQueryBatch::new(queries),
-    );
+    ) {
+        Err(moli_layout::LayoutError::NoLayoutSnapshot) => return Some(Ok(Vec::new())),
+        answers => answers,
+    };
     Some(answers.and_then(|answers| {
         let mut rects = Vec::new();
         for (kind, answer) in kinds.into_iter().zip(answers.answers) {
@@ -147,7 +156,7 @@ fn native_range_client_rects<'s>(
                     ));
                 }
             };
-            rects.extend(quads.into_iter().map(client_rect_from_layout_quad));
+            rects.extend(quads.into_iter().map(ClientRect::from));
         }
         Ok(rects)
     }))
@@ -161,18 +170,6 @@ fn collect_range_geometry_subtree(
     out.push(root);
     for child in dom_host.child_handles(root) {
         collect_range_geometry_subtree(dom_host, child, out);
-    }
-}
-
-fn client_rect_from_layout_quad(quad: moli_layout::LayoutQuad) -> ClientRect {
-    let rect = quad.bounding_rect();
-    ClientRect {
-        left: f64::from(rect.x),
-        top: f64::from(rect.y),
-        right: f64::from(rect.right()),
-        bottom: f64::from(rect.bottom()),
-        width: f64::from(rect.width),
-        height: f64::from(rect.height),
     }
 }
 
@@ -330,7 +327,7 @@ pub(in crate::context_bootstrap) fn range_geometry_dom_rect<'s>(
 pub(in crate::context_bootstrap) fn range_geometry_client_rects<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     range: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Array>> {
+) -> Option<v8::Local<'s, v8::Object>> {
     if let Some(rects) = native_range_client_rects(scope, range) {
         return match rects {
             Ok(rects) => {
@@ -338,7 +335,7 @@ pub(in crate::context_bootstrap) fn range_geometry_client_rects<'s>(
                     .into_iter()
                     .filter_map(|rect| new_dom_rect_from_client_rect(scope, rect))
                     .collect::<Vec<_>>();
-                serialize_v8_array(scope, rects)
+                Some(dom_rect_list::build_dom_rect_list_object(scope, &rects))
             }
             Err(error) => {
                 throw_range_layout_error(scope, error);
@@ -348,12 +345,12 @@ pub(in crate::context_bootstrap) fn range_geometry_client_rects<'s>(
     }
     if let Some(rect) = collapsed_text_range_client_rect(scope, range) {
         let rect = new_dom_rect_from_client_rect(scope, rect)?;
-        return serialize_v8_array(scope, [rect]);
+        return Some(dom_rect_list::build_dom_rect_list_object(scope, &[rect]));
     }
     let target = range_geometry_target(scope, range)?;
     let rect = client_rect_for_object(scope, target)?;
     let rect = new_dom_rect_from_client_rect(scope, rect)?;
-    serialize_v8_array(scope, [rect])
+    Some(dom_rect_list::build_dom_rect_list_object(scope, &[rect]))
 }
 
 pub(in crate::context_bootstrap) fn new_dom_rect_zero<'s>(

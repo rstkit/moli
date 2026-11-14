@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     document_runtime::{DocumentRuntime, DomHandle},
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
 };
 
 pub(super) struct TreeInsertionPlan<'a> {
@@ -16,7 +16,6 @@ pub(super) struct TreeInsertionPlan<'a> {
     pub(super) lifecycle_connected_roots_before_insert: Vec<DomHandle>,
     pub(super) adoption: TreeAdoptionPlan,
     pub(super) focus_reset_handle_before_insert: Option<DomHandle>,
-    pub(super) scroll_anchor_adjustment: Option<(f64, f64)>,
     pub(super) live_range_plan: Option<LiveRangePreInsertPlan>,
     pub(super) node_iterator_plan: Vec<NodeIteratorRemovalPlan>,
     pub(super) subtree_plan: InsertionSubtreePlan,
@@ -40,7 +39,6 @@ pub(super) enum TreeInsertionSelectednessPolicy {
 pub(super) struct TreeInsertionPlanOptions {
     live_range_mode: TreeInsertionLiveRangeMode,
     inserting_fragment_children: bool,
-    scroll_anchor_adjustment: Option<(f64, f64)>,
     selectedness_policy: TreeInsertionSelectednessPolicy,
 }
 
@@ -69,13 +67,11 @@ impl TreeInsertionPlanOptions {
     pub(super) fn insert(
         reference_child: Option<DomHandle>,
         inserting_fragment_children: bool,
-        scroll_anchor_adjustment: Option<(f64, f64)>,
         selectedness_policy: TreeInsertionSelectednessPolicy,
     ) -> Self {
         Self {
             live_range_mode: TreeInsertionLiveRangeMode::Insert { reference_child },
             inserting_fragment_children,
-            scroll_anchor_adjustment,
             selectedness_policy,
         }
     }
@@ -84,7 +80,6 @@ impl TreeInsertionPlanOptions {
         Self {
             live_range_mode: TreeInsertionLiveRangeMode::Replace { old_child },
             inserting_fragment_children,
-            scroll_anchor_adjustment: None,
             selectedness_policy: TreeInsertionSelectednessPolicy::CaptureAndRestore,
         }
     }
@@ -92,10 +87,10 @@ impl TreeInsertionPlanOptions {
 
 impl DocumentRuntime {
     pub(super) fn tree_insertion_plan<'a>(
-        &self,
+        &mut self,
         parent: DomHandle,
         insertion_roots: &'a [DomHandle],
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         options: TreeInsertionPlanOptions,
     ) -> TreeInsertionPlan<'a> {
         let live_range_plan = if unsafe { &mut *host_ptr }.live_ranges_is_empty() {
@@ -147,7 +142,6 @@ impl DocumentRuntime {
             lifecycle_connected_roots_before_insert,
             adoption,
             focus_reset_handle_before_insert,
-            scroll_anchor_adjustment: options.scroll_anchor_adjustment,
             live_range_plan,
             node_iterator_plan,
             subtree_plan,

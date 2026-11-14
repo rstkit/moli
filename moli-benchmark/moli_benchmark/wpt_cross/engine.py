@@ -15,14 +15,15 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
 from ..config import REPO_ROOT, ReservedPort, clear_proxy_env, reserve_port
 from ..sampling import ResourceSampler
-from ..serve import probe_url
+from ..serve import _join_log_drain_threads, _start_log_drain_threads, probe_url
 from ..versions import sha256_file
 
 
@@ -41,6 +42,7 @@ class EngineDriverHandle:
     binary: Path | None = None
     binary_sha256: str | None = None
     binary_version: str | None = None
+    log_threads: list[threading.Thread] = field(default_factory=list, repr=False)
 
 
 def _binary_version(binary: Path, version_args: tuple[str, ...]) -> str | None:
@@ -56,20 +58,6 @@ def _binary_version(binary: Path, version_args: tuple[str, ...]) -> str | None:
         return None
     output = (completed.stdout or completed.stderr).strip()
     return output.splitlines()[0] if output else None
-
-
-def _drain_pipes(handle: EngineDriverHandle) -> None:
-    for stream, label in ((handle.process.stdout, "stdout"), (handle.process.stderr, "stderr")):
-        if stream is None:
-            continue
-        try:
-            while True:
-                line = stream.readline()
-                if not line:
-                    break
-                handle.logs.append(f"{label}: {line.decode('utf-8', errors='replace').rstrip()}")
-        except OSError:
-            continue
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:
@@ -112,6 +100,32 @@ class EngineDriver:
     # leave this as None and fall back to CDP.
     cli_fetch_command: Callable[[Path, str, float], list[str]] | None = None
 
+    def with_fixture_tls(self, authority: Any) -> "EngineDriver":
+        """Trust only this run's local fixture authority/public key.
+
+        Moli keeps ordinary CA and hostname verification. Chrome uses the
+        dedicated test-server SPKI mechanism used by upstream wptrunner.
+        Never fall back to ignoring all certificate errors or to plain HTTP.
+        """
+        original_command = self.build_command
+        original_fetch = self.cli_fetch_command
+        if self.name == "moli":
+            certificate = str(authority.ca_certificate)
+            def command(binary: Path, port: int, profile: Path | None) -> list[str]:
+                return [*original_command(binary, port, profile), "--ca-cert", certificate]
+            def fetch(binary: Path, url: str, timeout: float) -> list[str]:
+                assert original_fetch is not None
+                return [*original_fetch(binary, url, timeout), "--ca-cert", certificate]
+            return replace(self, build_command=command, cli_fetch_command=fetch if original_fetch is not None else None)
+        if self.name == "chrome":
+            fingerprint = authority.server_spki_sha256
+            def command(binary: Path, port: int, profile: Path | None) -> list[str]:
+                argv = original_command(binary, port, profile)
+                argv.insert(1, "--ignore-certificate-errors-spki-list=" + fingerprint)
+                return argv
+            return replace(self, build_command=command)
+        raise RuntimeError(f"engine {self.name} has no local WPT certificate trust configuration")
+
     def resolve_binary(self, override: str | None = None) -> Path:
         raw = override or os.environ.get(self.binary_env_var)
         if raw:
@@ -149,6 +163,8 @@ class EngineDriver:
                     stderr=subprocess.PIPE,
                     start_new_session=True,
                 )
+                logs: list[str] = []
+                log_threads = _start_log_drain_threads(process, logs)
             except BaseException:
                 reserved.close()
                 if temp_dir is not None:
@@ -163,6 +179,8 @@ class EngineDriver:
                 endpoint=endpoint,
                 sampler=sampler,
                 port_lease=reserved,
+                logs=logs,
+                log_threads=log_threads,
                 temp_dir=temp_dir,
                 binary=binary,
                 binary_sha256=sha256_file(binary),
@@ -173,7 +191,7 @@ class EngineDriver:
             version_url = endpoint + "/json/version"
             while time.perf_counter() < deadline:
                 if process.poll() is not None:
-                    _drain_pipes(handle)
+                    _join_log_drain_threads(handle.log_threads)
                     log_tail = "; ".join(handle.logs[-20:])
                     self.shutdown(handle)
                     last_error = RuntimeError(
@@ -206,7 +224,7 @@ class EngineDriver:
             return {}
         try:
             _terminate(handle.process)
-            _drain_pipes(handle)
+            _join_log_drain_threads(handle.log_threads)
             resources = handle.sampler.stop()
         finally:
             handle.port_lease.close()
@@ -291,7 +309,7 @@ ENGINES: dict[str, EngineDriver] = {
         default_binary_names=("moli",),
         build_command=_moli_command,
         cli_fetch_command=_moli_fetch,
-        version_args=("version",),
+        version_args=("--version",),
     ),
     "lightpanda": EngineDriver(
         name="lightpanda",

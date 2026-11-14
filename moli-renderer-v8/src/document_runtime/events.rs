@@ -1,5 +1,4 @@
 use super::*;
-use crate::dom::native::Node;
 use crate::host::HostTimerOwner;
 use crate::host::PublicEventDispatchResult;
 use crate::script_provenance::CompiledStringProvenance;
@@ -20,6 +19,15 @@ use crate::script_provenance::CompiledStringProvenance;
 // That keeps this commit structural rather than semantic, which is the safest way to start
 // shrinking `document_runtime.rs`.
 impl DocumentRuntime {
+    /// A reused Window and retained nodes keep their existing EventTargets.
+    /// The new Document has a fresh handle and receives no old listeners.
+    pub(crate) fn retain_event_targets_from_initial_document(&mut self, initial: &mut Self) {
+        self.events = std::mem::take(&mut initial.events);
+        // Timers belong to the retained LocalWindow and concrete realm. Child
+        // and isolated-realm timers have already been canceled by retirement.
+        self.timeouts = std::mem::take(&mut initial.timeouts);
+    }
+
     pub(crate) fn clear_event_state_for_document_replacement(
         &mut self,
         document_handle: DomHandle,
@@ -47,7 +55,7 @@ impl DocumentRuntime {
     pub(crate) fn dispatch_public_event_best_effort<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         dispatch_target: EventTargetHandle,
         event: v8::Local<'s, v8::Object>,
         context: &str,
@@ -71,12 +79,20 @@ impl DocumentRuntime {
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
         callback: v8::Local<'s, v8::Function>,
-        delay_ms: u32,
+        delay_ms: u64,
         owner: HostTimerOwner,
         extra_args: Vec<v8::Global<v8::Value>>,
     ) -> u32 {
         self.timeouts
             .queue_once(scope, callback, delay_ms, owner, extra_args)
+    }
+
+    pub(crate) fn queue_internal_task<'s>(
+        &mut self,
+        scope: &mut v8::PinScope<'s, '_>,
+        callback: v8::Local<'s, v8::Function>,
+    ) -> bool {
+        self.timeouts.queue_internal_task(scope, callback)
     }
 
     pub(crate) fn queue_timeout_with_receiver<'s>(
@@ -88,8 +104,14 @@ impl DocumentRuntime {
         owner: HostTimerOwner,
         extra_args: Vec<v8::Global<v8::Value>>,
     ) -> u32 {
-        self.timeouts
-            .queue_once_with_receiver(scope, callback, receiver, delay_ms, owner, extra_args)
+        self.timeouts.queue_once_with_receiver(
+            scope,
+            callback,
+            receiver,
+            u64::from(delay_ms),
+            owner,
+            extra_args,
+        )
     }
 
     pub(crate) fn queue_window_timer_callback<'s>(
@@ -217,6 +239,14 @@ impl DocumentRuntime {
         self.timeouts.queue_source_interval_with_receiver(
             scope, context, receiver, source, provenance, delay_ms, owner, extra_args,
         )
+    }
+
+    pub(crate) fn queue_networking_task<'s>(
+        &mut self,
+        scope: &mut v8::PinScope<'s, '_>,
+        callback: v8::Local<'s, v8::Function>,
+    ) -> u32 {
+        self.timeouts.queue_networking_task(scope, callback)
     }
 
     pub(crate) fn queue_resource_timing_buffer_full_task<'s>(
@@ -359,32 +389,6 @@ impl DocumentRuntime {
         self.events.clear_event_handler_property(target, event_type)
     }
 
-    pub(crate) fn sync_body_window_messageerror_content_attribute(
-        &mut self,
-        handle: DomHandle,
-        name: &str,
-        namespace: Option<&str>,
-        present: bool,
-    ) -> Option<crate::native_bridge::EventCallbackId> {
-        if namespace.is_some() || !name.eq_ignore_ascii_case("onmessageerror") {
-            return None;
-        }
-        let document_handle = self.document_handle();
-        let dom = self.dom_host().dom();
-        let body_handle = dom
-            .node(document_handle)
-            .and_then(Node::as_document)
-            .and_then(|document| document.body_or_frameset_handle(dom, document_handle));
-        if body_handle != Some(handle) {
-            return None;
-        }
-        if present {
-            self.clear_event_handler_property(EventTargetHandle::Window, "messageerror")
-        } else {
-            self.set_event_handler_property(EventTargetHandle::Window, "messageerror", None)
-        }
-    }
-
     pub(crate) fn event_handler_property_callback_id(
         &self,
         target: EventTargetHandle,
@@ -401,56 +405,23 @@ impl DocumentRuntime {
     pub(crate) fn dispatch_document_event(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         event_type: &str,
     ) -> std::result::Result<(), String> {
-        let (bubbles, cancelable) = host_event_defaults(event_type);
-        let document_handle = self.document_handle();
-        let document_target = EventTargetHandle::Node(document_handle);
-        // `DOMContentLoaded` and similar document-scoped lifecycle events are observable from
-        // both `document.addEventListener(...)` and `window.addEventListener(...)`.
-        //
-        // The older `dispatch_host_event(...)` helper only dispatches against a single concrete
-        // target and does not walk the document -> window propagation path. That was good enough
-        // for host-only events like `load` on `window`, but it is incorrect for document events:
-        // `window.addEventListener('DOMContentLoaded', ...)` would never fire even though the
-        // event defaults say it bubbles.
-        //
-        // Here we intentionally build a real propagation path rooted at `document`, create a host
-        // event whose original target is also `document`, and then route it through the same
-        // public-event dispatch path used for DOM events. That keeps `event.target === document`
-        // while still letting the listener bubble up to `window`.
-        let propagation_path = self.build_propagation_path(document_target, false);
-        let document_value = event_target_value(scope, host_ptr, document_target)?;
-        let event = create_host_event(
-            scope,
-            event_type,
-            document_value,
-            document_value,
-            bubbles,
-            cancelable,
-        )?;
-        dispatch_public_event_with_original_target(
-            &mut self.events,
-            scope,
-            host_ptr,
-            document_target,
-            document_target,
-            &propagation_path,
-            event,
-        )
-        .map(|_| ())
+        let target = EventTargetHandle::Node(self.document_handle());
+        let event = self.prepare_native_event_dispatch(target, target, event_type);
+        self.dispatch_native_event_in_scope(scope, host_ptr, event)
     }
 
     pub(crate) fn dispatch_public_event<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         dispatch_target: EventTargetHandle,
         event: v8::Local<'s, v8::Object>,
     ) -> std::result::Result<PublicEventDispatchResult, String> {
         let event_type = public_event_type(scope, event);
-        let composed = event
+        let composed = crate::context_bootstrap::event_backing(scope, event)
             .get(scope, v8str(scope, "composed").into())
             .is_some_and(|value| value.boolean_value(scope));
         let mut path = if let Some(source_target) =
@@ -467,32 +438,6 @@ impl DocumentRuntime {
             scope,
             host_ptr,
             dispatch_target,
-            &path,
-            event,
-        )
-    }
-
-    pub(crate) fn dispatch_public_event_with_original_target<'s, 'i>(
-        &mut self,
-        scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
-        dispatch_target: EventTargetHandle,
-        original_target: EventTargetHandle,
-        event: v8::Local<'s, v8::Object>,
-    ) -> std::result::Result<PublicEventDispatchResult, String> {
-        let event_type = public_event_type(scope, event);
-        let composed = event
-            .get(scope, v8str(scope, "composed").into())
-            .is_some_and(|value| value.boolean_value(scope));
-        let mut path = self.build_propagation_path(dispatch_target, composed);
-        self.append_child_document_window_to_path(scope, host_ptr, &mut path);
-        trim_window_from_subresource_load_path(dispatch_target, event_type.as_deref(), &mut path);
-        dispatch_public_event_with_original_target(
-            &mut self.events,
-            scope,
-            host_ptr,
-            dispatch_target,
-            original_target,
             &path,
             event,
         )
@@ -559,7 +504,7 @@ impl DocumentRuntime {
     fn append_child_document_window_to_path(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         path: &mut Vec<EventTargetHandle>,
     ) {
         if path
@@ -687,7 +632,9 @@ fn public_event_type(
     scope: &mut v8::PinScope<'_, '_>,
     event: v8::Local<'_, v8::Object>,
 ) -> Option<String> {
-    object_string_property(scope, event, "type")
+    crate::context_bootstrap::event_attribute(scope, event, "type")
+        .and_then(|value| value.to_string(scope))
+        .map(|value| value.to_rust_string_lossy(scope))
 }
 
 fn trim_window_from_subresource_load_path(
@@ -708,19 +655,17 @@ fn trim_window_from_subresource_load_path(
 
 fn source_target_for_reference_event(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     event: v8::Local<'_, v8::Object>,
 ) -> Option<EventTargetHandle> {
-    let event_type = event
-        .get(scope, v8str(scope, "type").into())?
-        .to_string(scope)?
-        .to_rust_string_lossy(scope);
-    let source_property = match event_type.as_str() {
-        "beforetoggle" | "command" | "interest" | "loseinterest" | "toggle" => "source",
-        "submit" => "submitter",
+    let event_type = public_event_type(scope, event)?;
+    let source = match event_type.as_str() {
+        "beforetoggle" | "command" | "interest" | "loseinterest" | "toggle" => {
+            crate::context_bootstrap::event_attribute(scope, event, "source")?
+        }
+        "submit" => crate::context_bootstrap::submit_event_submitter_value(scope, event)?,
         _ => return None,
     };
-    let source = event.get(scope, v8str(scope, source_property).into())?;
     if source.is_null_or_undefined() || !source.is_object() {
         return None;
     }

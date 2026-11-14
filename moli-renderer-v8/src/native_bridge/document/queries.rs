@@ -3,12 +3,12 @@ use super::super::super::{
     util::{throw_type_error, v8_string},
 };
 use super::super::node::{
-    node_arg_handle, node_is_document, node_or_foreign_arg_handle_preserve_detached,
-    node_runtime_and_handle_from_args_or_detached, set_wrapped_node_or_null,
+    node_is_document, node_or_foreign_arg_handle_preserve_detached,
+    node_runtime_and_handle_from_args_or_detached,
 };
 use super::super::traversal;
 use super::super::{
-    JsContextHost, runtime_ptr_from_object, set_wrapped_handle_or_null_for_receiver,
+    PageScriptHost, runtime_ptr_from_object, set_wrapped_handle_or_null_for_receiver,
     throw_dom_exception,
 };
 use super::{
@@ -37,7 +37,7 @@ pub(in crate::native_bridge) use traversal_factories::{
     node_create_node_iterator_callback, node_create_tree_walker_callback,
 };
 pub(in crate::native_bridge) use xpath::{
-    bridge_detached_document_evaluate_callback, node_document_create_ns_resolver_callback,
-    node_document_evaluate_callback,
+    bridge_detached_document_evaluate_callback, node_document_create_expression_callback,
+    node_document_create_ns_resolver_callback, node_document_evaluate_callback,
 };
 pub(crate) use xpath::{evaluate_live_xpath_search_node_handles, install_xpath_template_bindings};

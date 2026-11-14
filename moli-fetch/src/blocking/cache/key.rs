@@ -6,6 +6,7 @@ use url::Url;
 
 use crate::{FetchConfig, Request};
 
+use super::super::literal_cookie_header_for_request;
 use super::vary::request_headers_allow_http_cache;
 
 pub(super) fn cache_store_and_key_for_request(
@@ -15,7 +16,7 @@ pub(super) fn cache_store_and_key_for_request(
     cookie_header: Option<&str>,
 ) -> Option<(HttpCacheStore, String)> {
     let cache_dir = config.http_cache_dir()?;
-    if !request.cache_mode().allows_http_cache()
+    if !request.effective_cache_mode().allows_http_cache()
         || !request.method.eq_ignore_ascii_case("GET")
         || request.body.is_some()
         || request.auth().is_some()
@@ -23,7 +24,8 @@ pub(super) fn cache_store_and_key_for_request(
         || !config.default_request_headers().is_empty()
         || !subresource_validation_allows_http_cache(request)
         || cookie_header.is_some()
-        || !request_headers_allow_http_cache(&request.request_headers)
+        || literal_cookie_header_for_request(config, request, request_url).is_some()
+        || !request_headers_allow_http_cache(&request.request_headers.to_byte_strings())
         || !matches!(request_url.scheme(), "http" | "https")
         || !request_url.username().is_empty()
         || request_url.password().is_some()
@@ -68,7 +70,7 @@ fn cache_key_material_for_request(request: &Request, request_url: &Url) -> Strin
     // is narrow, but baking browser partition dimensions into the key prevents
     // accidental cross-frame reuse when the cacheable request surface expands.
     format!(
-        "moli-http-cache-key-v3\nurl:{}\nsite-for-cookies:{}\ntop-frame-origin:{}\nnetwork-partition-key:{}\nrequest-type:{:?}\ncredentials:{}\nstorage-access:{:?}",
+        "moli-http-cache-key-v3\nurl:{}\nsite-for-cookies:{}\ntop-frame-origin:{}\nnetwork-partition-key:{}\nrequest-type:{}\ncredentials:{}\nstorage-access:{:?}",
         normalized_request_url,
         cache_partition_url_component(browser_context.site_for_cookies_url.as_ref(), request_url),
         cache_partition_url_component(
@@ -79,7 +81,11 @@ fn cache_key_material_for_request(request: &Request, request_url: &Url) -> Strin
             request_url,
         ),
         request.network_partition_key().unwrap_or(""),
-        request.cookie_context.request_type,
+        if request.cookie_context.is_top_level_navigation() {
+            "TopLevelNavigation"
+        } else {
+            "Subresource"
+        },
         request.credentials_mode.as_ref(),
         browser_context.storage_access_status,
     )

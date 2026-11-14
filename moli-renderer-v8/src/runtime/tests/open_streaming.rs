@@ -21,6 +21,492 @@ struct OpenStreamingPage {
     activity_wake_rx: RendererExternalActivityTestReceiver,
 }
 
+async fn recv_timer_console_publication(
+    receiver: &mut RendererExternalActivityTestReceiver,
+    page: &RendererPageHandle,
+    marker: &str,
+) -> RendererOutputPublication {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(publication) = receiver.recv().await {
+            if !publication_is_for_page(&publication, page) {
+                continue;
+            }
+            let contains_marker = publication.records().iter().any(|record| {
+                let RendererOutputItem::Observation(RendererProtocolObservation::RuntimeInspector(
+                    batch,
+                )) = record.item()
+                else {
+                    return false;
+                };
+                batch.messages.iter().any(|message| {
+                    let RendererRuntimeInspectorMessage::Protocol(message) = message else {
+                        return false;
+                    };
+                    let message = message.value();
+                    message["method"] == "Runtime.consoleAPICalled"
+                        && message["params"]["args"][0]["value"] == marker
+                })
+            });
+            if contains_marker {
+                return publication;
+            }
+        }
+        panic!("renderer output closed before timer console marker {marker}");
+    })
+    .await
+    .expect("the timer must autonomously publish its console output")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timer_console_output_during_open_stream_does_not_wait_for_load() {
+    let mut source = OpenStreamingPage::create(
+        "https://timer-output-before-load.test",
+        "<!doctype html><body>open stream",
+    )
+    .await;
+    dispatch_runtime_protocol_for_test(
+        &source.page,
+        serde_json::json!({"id": 1, "method": "Runtime.enable"}),
+    )
+    .await
+    .expect("Runtime.enable should dispatch while the parser is waiting for input");
+    source
+        .page
+        .run_async_command(RendererPageCommand::EvaluateExpression {
+            expression: "setTimeout(() => console.log('timer-before-load'), 0)".to_owned(),
+            await_promise: false,
+        })
+        .await
+        .expect("timer should schedule without closing the source stream");
+    let publication = recv_timer_console_publication(
+        &mut source.activity_wake_rx,
+        &source.page,
+        "timer-before-load",
+    )
+    .await;
+    let ordering = publication.ordering();
+    assert!(
+        !source.body_tx.is_closed(),
+        "the original parser must still be waiting for more input"
+    );
+    source.finish().await;
+    assert_eq!(
+        ordering,
+        super::super::RendererOutputPublicationOrdering::Unconstrained,
+        "a timer that ran before Load must not acquire a Load predecessor"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timer_console_output_after_load_keeps_source_document_when_callback_replaces_it() {
+    let runtime = JsRuntime::initialize();
+    let (output_tx, mut output_rx) = renderer_external_activity_test_channel();
+    runtime.set_renderer_output_transport_sender(output_tx);
+    let loader =
+        ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).expect("default loader");
+    let mut page = create_test_html_page(
+        &runtime,
+        &loader,
+        url::Url::parse("https://timer-output-after-load.test/").unwrap(),
+        "<!doctype html><body>loaded document",
+    )
+    .await;
+    let (source_snapshot, _) = page
+        .run_async_command(RendererPageCommand::PageDiagnosticsSnapshot)
+        .await
+        .expect("loaded page identity should be available");
+    let RendererPageReply::PageDiagnosticsSnapshot(source_snapshot) = source_snapshot else {
+        panic!("expected the loaded Document's diagnostics");
+    };
+    let source_document = source_snapshot
+        .document_lifecycle_identity()
+        .expect("loaded page must retain its exact Document identity");
+    dispatch_runtime_protocol_for_test(
+        &page,
+        serde_json::json!({"id": 1, "method": "Runtime.enable"}),
+    )
+    .await
+    .expect("Runtime.enable should dispatch after Load");
+    page.run_async_command(RendererPageCommand::EvaluateExpression {
+        expression: r#"setTimeout(() => {
+            document.open();
+            document.write('<!doctype html><body>replacement');
+            console.log('timer-after-load-replacement');
+        }, 0)"#
+            .to_owned(),
+        await_promise: false,
+    })
+    .await
+    .expect("replacement timer should schedule");
+    let publication =
+        recv_timer_console_publication(&mut output_rx, &page, "timer-after-load-replacement").await;
+    let (replacement_snapshot, _) = page
+        .run_async_command(RendererPageCommand::PageDiagnosticsSnapshot)
+        .await
+        .expect("replacement page identity should be available");
+    let RendererPageReply::PageDiagnosticsSnapshot(replacement_snapshot) = replacement_snapshot
+    else {
+        panic!("expected the replacement Document's diagnostics");
+    };
+    let replacement_document = replacement_snapshot
+        .document_lifecycle_identity()
+        .expect("replacement must retain its exact Document identity");
+    page.close_async()
+        .await
+        .expect("the replacement stream should close with the page");
+    assert_ne!(source_document, replacement_document);
+    assert_eq!(
+        publication.ordering(),
+        super::super::RendererOutputPublicationOrdering::AfterPendingPageLoad { source_document },
+        "a post-load timer must keep its source Document's fence across replacement"
+    );
+}
+
+const SELF_REPLACE_WHILE_PARSING_HTML: &str = r#"<!doctype html><script>
+globalThis.__sourceDocument = true;
+setTimeout(() => location.replace(location.href), 0);
+</script>"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn location_replace_commits_while_source_phase_one_stream_remains_open() {
+    let (base_url, server) = spawn_owner_wake_server_with_content_type(
+        "/page",
+        "<!doctype html><main id='replacement'>replacement document</main>",
+        "text/html",
+        Duration::ZERO,
+    )
+    .await;
+    // The timer runs as Page work after the parser has parked waiting for
+    // more body input. Keep the source stream open throughout the commit.
+    let mut source = OpenStreamingPage::create(&base_url, SELF_REPLACE_WHILE_PARSING_HTML).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_page_lifecycle_until(
+            &mut source.activity_wake_rx,
+            &source.page,
+            RendererDocumentLifecycleMilestone::Load,
+        ),
+    )
+    .await
+    .expect("self-replacement must reach Load before the source stream reaches EOF");
+    tokio::time::timeout(Duration::from_secs(5), source.body_tx.closed())
+        .await
+        .expect("committing the replacement must release the source body receiver");
+    tokio::time::timeout(Duration::from_secs(5), source.completion_tx.closed())
+        .await
+        .expect("committing the replacement must release the source completion receiver");
+    assert!(
+        source.completion_tx.send(Ok(())).is_err(),
+        "the discarded phase-one bridge must release its completion receiver"
+    );
+    let (reply, _) = source
+        .page
+        .run_async_command(RendererPageCommand::EvaluateExpression {
+            expression: "JSON.stringify([!!document.getElementById('replacement'), document.readyState, history.length, typeof __sourceDocument])".to_owned(),
+            await_promise: false,
+        })
+        .await
+        .expect("replacement Document should remain usable after phase-one settlement");
+    assert_eq!(
+        renderer_json_value(reply),
+        Some(serde_json::json!("[true,\"complete\",1,\"undefined\"]"))
+    );
+    let state = RendererPageTestingHandle::new_for_testing(&source.page)
+        .current_page_state_async()
+        .await
+        .expect("replacement state should be published");
+    assert_eq!(state.final_url().as_str(), format!("{base_url}/page"));
+    assert_eq!(
+        has_pending_location_navigation_for_test(&source.page).await,
+        Some(false)
+    );
+
+    source
+        .page
+        .close_async()
+        .await
+        .expect("replacement Page should close");
+    server.await.expect("self-replacement server should finish");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn location_replace_source_detach_panic_retires_open_source_stream() {
+    assert_post_commit_panic_retires_open_source_stream("x-moli-test-panic-after-source-detach")
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn location_replace_source_retirement_panic_retires_open_source_stream() {
+    assert_post_commit_panic_retires_open_source_stream(
+        "x-moli-test-panic-during-source-retirement",
+    )
+    .await;
+}
+
+async fn assert_post_commit_panic_retires_open_source_stream(injection_header: &'static str) {
+    let (base_url, server) = spawn_owner_wake_server_with_content_type_and_headers(
+        "/page",
+        "<!doctype html><main>replacement</main>",
+        "text/html",
+        vec![(injection_header, "1")],
+        Duration::ZERO,
+    )
+    .await;
+    let mut source = OpenStreamingPage::create(&base_url, SELF_REPLACE_WHILE_PARSING_HTML).await;
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("replacement response should reach the commit boundary")
+        .expect("source-detach panic server should finish");
+
+    // Exercise both the retained source residence just after detach_global and
+    // the consumed parser during teardown. The guard must already be Committed.
+    tokio::time::timeout(Duration::from_secs(5), source.body_tx.closed())
+        .await
+        .expect("post-detach panic must retire the source body receiver");
+    // Body and completion receivers are dropped separately on another thread.
+    // The body close notification does not synchronize completion retirement.
+    tokio::time::timeout(Duration::from_secs(5), source.completion_tx.closed())
+        .await
+        .expect("post-detach panic must retire the source completion receiver");
+    assert!(
+        source.completion_tx.send(Ok(())).is_err(),
+        "post-detach retirement must release the source completion receiver"
+    );
+    assert!(
+        source
+            .page
+            .run_async_command(RendererPageCommand::EvaluateExpression {
+                expression: "document.readyState".to_owned(),
+                await_promise: false,
+            })
+            .await
+            .is_err(),
+        "the retired source must not accept commands"
+    );
+    let runtime = source._runtime_owner.handle();
+    assert_eq!(
+        runtime.renderer_page_count_for_testing(),
+        0,
+        "the detached source must never be restored as a live Page"
+    );
+
+    let loader = source._loader_owner.handle();
+    let mut survivor = create_test_html_page(
+        &runtime,
+        &loader,
+        url::Url::parse("about:blank").expect("survivor URL"),
+        "<!doctype html><main>survivor</main>",
+    )
+    .await;
+    survivor
+        .close_async()
+        .await
+        .expect("renderer owner should remain usable after the commit panic");
+    assert_eq!(runtime.renderer_page_count_for_testing(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn location_replace_without_document_preserves_pending_phase_one_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind no-Document navigation server");
+    let address = listener.local_addr().expect("navigation server address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("accept self-replacement request");
+        let request = read_owner_wake_http_request_head(&mut stream).await;
+        assert_eq!(request.lines().next().unwrap(), "GET /page HTTP/1.1");
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write no-Document navigation response");
+    });
+    let mut source = OpenStreamingPage::create(
+        &format!("http://{address}"),
+        SELF_REPLACE_WHILE_PARSING_HTML,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("self-replacement request should reach the server")
+        .expect("no-Document navigation server should finish");
+    // This command is ordered after the checked-out navigation task, so the
+    // 204 has been settled before the remaining source bytes are delivered.
+    let (reply, _) = source
+        .page
+        .run_async_command(RendererPageCommand::EvaluateExpression {
+            expression: "__sourceDocument".to_owned(),
+            await_promise: false,
+        })
+        .await
+        .expect("the source Document must remain active after a 204 navigation");
+    assert_eq!(renderer_json_value(reply), Some(serde_json::json!(true)));
+    source
+        .body_tx
+        .send(b"<script>globalThis.__sourceTailParsed = true;</script>".to_vec())
+        .await
+        .expect("the pending parser must retain its source body receiver");
+    drop(source.body_tx);
+    source
+        .completion_tx
+        .send(Ok(()))
+        .expect("source body should finish");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_page_lifecycle_until(
+            &mut source.activity_wake_rx,
+            &source.page,
+            RendererDocumentLifecycleMilestone::Load,
+        ),
+    )
+    .await
+    .expect("the source parser should resume and reach Load after the 204");
+    let (reply, _) = source
+        .page
+        .run_async_command(RendererPageCommand::EvaluateExpression {
+            expression:
+                "JSON.stringify([__sourceDocument, __sourceTailParsed, document.readyState])"
+                    .to_owned(),
+            await_promise: false,
+        })
+        .await
+        .expect("source parser tail should execute in the original Document");
+    assert_eq!(
+        renderer_json_value(reply),
+        Some(serde_json::json!("[true,true,\"complete\"]"))
+    );
+    source
+        .page
+        .close_async()
+        .await
+        .expect("source Page should close");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn location_replace_commit_precondition_failure_preserves_open_source_stream() {
+    assert_failed_prepared_navigation_preserves_open_source_stream(
+        "x-moli-test-missing-navigation-script-environment",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn location_replace_window_proxy_validation_failure_preserves_open_source_stream() {
+    assert_failed_prepared_navigation_preserves_open_source_stream(
+        "x-moli-test-mismatched-navigation-page-id",
+    )
+    .await;
+}
+
+async fn assert_failed_prepared_navigation_preserves_open_source_stream(
+    injection_header: &'static str,
+) {
+    let (base_url, server) = spawn_owner_wake_server_with_content_type_and_headers(
+        "/page",
+        "<!doctype html><main id='replacement'>replacement document</main>",
+        "text/html",
+        vec![(injection_header, "1")],
+        Duration::ZERO,
+    )
+    .await;
+    let mut source = OpenStreamingPage::create(
+        &base_url,
+        r#"<!doctype html><script>
+globalThis.__sourceWindow = window;
+globalThis.__sourceDocument = document;
+globalThis.__sourceUnloadEvents = [];
+for (const type of ['pagehide', 'unload']) {
+  addEventListener(type, () => __sourceUnloadEvents.push(type));
+}
+document.addEventListener('visibilitychange', () => __sourceUnloadEvents.push('visibilitychange'));
+setTimeout(() => location.replace(location.href), 0);
+</script>"#,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the replacement response must exist before testing commit failure")
+        .expect("prepared navigation failure server should finish");
+
+    // Owner commands are ordered after the checked-out navigation task. The
+    // response reached Prepared, but its fallible commit must return a Live
+    // entry with the original context, inspector and parser still resident.
+    let messages = dispatch_runtime_protocol_for_test(
+        &source.page,
+        serde_json::json!({
+            "id": 1,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": "window === __sourceWindow && document === __sourceDocument && !document.getElementById('replacement')",
+                "returnByValue": true
+            }
+        }),
+    )
+    .await
+    .expect("commit validation failure must preserve the source Inspector context");
+    let response = runtime_protocol_response_by_id(&messages, 1)
+        .expect("source Inspector evaluation should reply");
+    assert_eq!(response["result"]["result"]["value"], true);
+    assert_eq!(
+        has_pending_location_navigation_for_test(&source.page).await,
+        Some(false)
+    );
+    assert!(
+        !source.body_tx.is_closed(),
+        "a failed Prepared commit must retain the source body receiver"
+    );
+    source
+        .body_tx
+        .send(b"<script>globalThis.__sourceTailParsed = true;</script>".to_vec())
+        .await
+        .expect("the retained source parser must accept later body bytes");
+    drop(source.body_tx);
+    source
+        .completion_tx
+        .send(Ok(()))
+        .expect("the original source stream must retain its completion receiver");
+    let events = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_page_lifecycle_until(
+            &mut source.activity_wake_rx,
+            &source.page,
+            RendererDocumentLifecycleMilestone::Load,
+        ),
+    )
+    .await
+    .expect("the original source parser must resume and reach Load after commit failure");
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.kind,
+            RendererDocumentLifecycleEventKind::Terminated {
+                reason: super::super::RendererDocumentTerminationReason::SupersededByCrossDocumentNavigation,
+                ..
+            }
+        )),
+        "a failed Prepared commit must not terminate the source lifecycle"
+    );
+    let (reply, _) = source
+        .page
+        .run_async_command(RendererPageCommand::EvaluateExpression {
+            expression: "JSON.stringify([window === __sourceWindow, document === __sourceDocument, __sourceTailParsed, document.readyState, __sourceUnloadEvents])".to_owned(),
+            await_promise: false,
+        })
+        .await
+        .expect("the source Document must remain usable after its parser reaches EOF");
+    assert_eq!(
+        renderer_json_value(reply),
+        Some(serde_json::json!("[true,true,true,\"complete\",[]]"))
+    );
+    source
+        .page
+        .close_async()
+        .await
+        .expect("source Page should close after a failed Prepared commit");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn owner_loop_executes_async_script_while_main_document_stream_remains_open() {
     assert_open_stream_work_executes_before_eof(ASYNC_SCRIPT_HTML, "async script").await;
@@ -154,6 +640,11 @@ async fn assert_open_stream_work_executes_before_eof(html: &str, work_label: &st
         .unwrap_or_else(|_| panic!("{work_label} should execute while the stream remains open"))
         .unwrap_or_else(|_| panic!("{work_label} effect signal should remain open"));
 
+    assert!(
+        !page.body_tx.is_closed(),
+        "the main-Document stream must remain open until the work effect is observed"
+    );
+
     page.finish().await;
     server.await.expect("open-stream server should finish");
 }
@@ -177,7 +668,7 @@ impl OpenStreamingPage {
 
         let (mut page, _, _, creation_artifacts, pending_download) = tokio::time::timeout(
             Duration::from_secs(2),
-            runtime.create_streaming_raw_page_from_external_body_with_inspector_session_restores(
+            runtime.create_streaming_raw_page_from_external_body(
                 page_url.clone(),
                 page_url,
                 None,
@@ -185,27 +676,10 @@ impl OpenStreamingPage {
                 0,
                 Vec::new(),
                 200,
-                vec![("content-type".to_owned(), "text/html".to_owned())],
+                vec![("content-type".to_owned(), b"text/html".to_vec())],
                 &loader,
                 crate::RendererWebStorageHandles::ephemeral(),
                 raw_body,
-                None,
-                None,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-                None,
-                false,
-                false,
-                1.0,
-                Default::default(),
-                None,
-                false,
-                Vec::new(),
-                false,
-                None,
-                Vec::new(),
                 false,
                 PageVmInitStage::Load,
                 RendererReplyBoundary::DocumentCommit,
@@ -213,8 +687,9 @@ impl OpenStreamingPage {
                 RendererNavigationReplyPolicy::FollowBeforeReply,
                 None,
                 None,
-                None,
-                None,
+                crate::RendererDocumentOptions {
+                    ..Default::default()
+                },
             ),
         )
         .await
@@ -316,6 +791,9 @@ async fn spawn_open_stream_work_effect_server() -> (
             .write_all(work_response.as_bytes())
             .await
             .expect("write open-stream work response");
+        // Finish the advertised Connection: close response before waiting for
+        // its side effect. Only the main-Document stream should remain open.
+        drop(work_stream);
 
         let (mut effect_stream, _) = listener
             .accept()
@@ -387,6 +865,7 @@ async fn spawn_open_stream_module_graph_server() -> (
             .write_all(root_response.as_bytes())
             .await
             .expect("write open-stream module root response");
+        drop(root_stream);
 
         let (mut dependency_stream, _) = listener
             .accept()
@@ -461,6 +940,7 @@ async fn spawn_open_stream_child_document_server() -> (
             .write_all(child_response.as_bytes())
             .await
             .expect("write open-stream child Document response");
+        drop(child_stream);
 
         let (mut effect_stream, _) = listener
             .accept()

@@ -2,6 +2,7 @@ use super::NativeDom;
 use super::element::Element;
 use super::node::{NativeNodeId, Node};
 use crate::forms::parse_non_negative_integer_prefix;
+use selectors::attr::CaseSensitivity;
 
 impl NativeDom {
     pub fn is_html_element_named(&self, node_id: NativeNodeId, local_name: &str) -> bool {
@@ -127,8 +128,21 @@ impl NativeDom {
         class_name: &str,
         include_root: bool,
     ) -> Vec<NativeNodeId> {
+        let document = self.node(root).and_then(|node| {
+            node.as_document().or_else(|| {
+                self.node(node.owner_document()?)
+                    .and_then(Node::as_document)
+            })
+        });
+        let case_sensitivity = if document.is_some_and(|document| {
+            document.quirks_mode() == selectors::matching::QuirksMode::Quirks
+        }) {
+            CaseSensitivity::AsciiCaseInsensitive
+        } else {
+            CaseSensitivity::CaseSensitive
+        };
         self.collect_matching_elements(root, include_root, |element, _| {
-            element.matches_class_names(class_name)
+            element.matches_class_names_with_case_sensitivity(class_name, case_sensitivity)
         })
     }
 
@@ -152,31 +166,46 @@ impl NativeDom {
             .map(|document| document.is_html_document())
     }
 
+    pub(crate) fn light_subtree_handles(
+        &self,
+        root: NativeNodeId,
+        include_root: bool,
+    ) -> impl Iterator<Item = NativeNodeId> + '_ {
+        let first = self.node(root).and_then(|node| {
+            if include_root {
+                Some(root)
+            } else {
+                node.first_child()
+            }
+        });
+        std::iter::successors(first, move |&handle| {
+            if let Some(child) = self.first_child(handle) {
+                return Some(child);
+            }
+            let mut current = handle;
+            while current != root {
+                if let Some(sibling) = self.next_sibling(current) {
+                    return Some(sibling);
+                }
+                current = self.parent_node(current)?;
+            }
+            None
+        })
+    }
+
     fn collect_matching_elements(
         &self,
         root: NativeNodeId,
         include_root: bool,
         mut predicate: impl FnMut(&Element, NativeNodeId) -> bool,
     ) -> Vec<NativeNodeId> {
-        if self.node(root).is_none() {
-            return Vec::new();
-        }
-
-        let mut stack = Vec::new();
-        if include_root {
-            stack.push(root);
-        } else {
-            stack.extend(self.child_ids_reversed(root));
-        }
-
         let mut out = Vec::new();
-        while let Some(handle) = stack.pop() {
+        for handle in self.light_subtree_handles(root, include_root) {
             if let Some(element) = self.node(handle).and_then(Node::as_element)
                 && predicate(element, handle)
             {
                 out.push(handle);
             }
-            stack.extend(self.child_ids_reversed(handle));
         }
         out
     }

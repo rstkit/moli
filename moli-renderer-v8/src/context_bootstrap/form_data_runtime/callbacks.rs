@@ -5,20 +5,22 @@ use super::storage::{
     normalize_form_data_value, push_form_data_entry, set_form_data_entries,
 };
 use super::*;
+use crate::context_bootstrap::exposed_interfaces::ensure_intrinsic_interface_constructor;
 use crate::{
     callback_invocation::invoke_synchronous_webidl_callback_function,
     native_bridge::{
-        JsContextHost,
+        PageScriptHost,
         element::{form_associated_form_owner, is_valid_submit_button},
-        node_runtime_and_handle_from_object, throw_dom_exception,
+        node_relevant_context, node_runtime_and_handle_from_object_or_detached,
+        throw_dom_exception,
     },
     util::serialize_v8_iter_array,
-    webidl,
+    web_api_interfaces, webidl,
 };
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct FormDataEventInitDeclaration<'scope> {
     form_data: v8::Local<'scope, v8::Object>,
     bubbles: bool,
@@ -28,10 +30,10 @@ struct FormDataEventInitDeclaration<'scope> {
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "FormData")]
 struct FormDataConstructorArgs<'s> {
-    #[webidl(converter = "raw")]
-    form: Option<v8::Local<'s, v8::Value>>,
-    #[webidl(index = 1, converter = "raw")]
-    submitter: Option<v8::Local<'s, v8::Value>>,
+    #[webidl(interface = web_api_interfaces::HTMLFormElement)]
+    form: Option<v8::Local<'s, v8::Object>>,
+    #[webidl(index = 1, nullable, interface = web_api_interfaces::HTMLElement)]
+    submitter: Option<v8::Local<'s, v8::Object>>,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -115,77 +117,48 @@ pub(super) fn form_data_constructor_callback<'s>(
         return;
     }
 
-    let mut entries = Vec::new();
     let Some(parsed) = webidl::parse_args::<FormDataConstructorArgs<'s>>(scope, &args) else {
         return;
     };
+    let submitter = parsed.submitter;
+    let mut entries = Vec::new();
     if let Some(form) = parsed.form {
-        let Ok(form) = v8::Local::<v8::Object>::try_from(form) else {
-            throw_type_error(scope, "FormData constructor requires an HTMLFormElement");
-            return;
-        };
-        if object_string_property_defined(scope, form, "tagName")
-            .is_none_or(|tag| !tag.eq_ignore_ascii_case("form"))
-        {
-            throw_type_error(scope, "FormData constructor requires an HTMLFormElement");
-            return;
-        }
-        let Ok((form_runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, form)
+        let Ok((form_runtime_ptr, form_handle)) =
+            node_runtime_and_handle_from_object_or_detached(scope, form)
         else {
             throw_type_error(scope, "FormData constructor requires an HTMLFormElement");
             return;
         };
-        let submitter = match parsed.submitter {
-            Some(value) if value.is_null_or_undefined() => None,
-            Some(value) => match v8::Local::<v8::Object>::try_from(value) {
-                Ok(submitter) => {
-                    let Ok((submitter_runtime_ptr, submitter_handle)) =
-                        node_runtime_and_handle_from_object(scope, submitter)
-                    else {
-                        throw_type_error(
-                            scope,
-                            "FormData constructor submitter must be a submit button",
-                        );
-                        return;
-                    };
-                    if submitter_runtime_ptr != form_runtime_ptr {
-                        throw_dom_exception(
-                            scope,
-                            "NotFoundError",
-                            8,
-                            "The specified element is not owned by this form element.",
-                        );
-                        return;
-                    }
-                    let runtime = unsafe { &*form_runtime_ptr };
-                    if !is_valid_submit_button(runtime, submitter_handle) {
-                        throw_type_error(
-                            scope,
-                            "FormData constructor submitter must be a submit button",
-                        );
-                        return;
-                    }
-                    if form_associated_form_owner(runtime, submitter_handle) != Some(form_handle) {
-                        throw_dom_exception(
-                            scope,
-                            "NotFoundError",
-                            8,
-                            "The specified element is not owned by this form element.",
-                        );
-                        return;
-                    }
-                    Some(submitter)
-                }
-                Err(_) => {
-                    throw_type_error(
-                        scope,
-                        "FormData constructor submitter must be an HTMLElement or null",
-                    );
-                    return;
-                }
-            },
-            None => None,
-        };
+        if let Some(submitter) = submitter {
+            let Ok((submitter_runtime_ptr, submitter_handle)) =
+                node_runtime_and_handle_from_object_or_detached(scope, submitter)
+            else {
+                throw_type_error(
+                    scope,
+                    "FormData constructor submitter must be a submit button",
+                );
+                return;
+            };
+            let runtime = unsafe { &*submitter_runtime_ptr };
+            if !is_valid_submit_button(runtime, submitter_handle) {
+                throw_type_error(
+                    scope,
+                    "FormData constructor submitter must be a submit button",
+                );
+                return;
+            }
+            if submitter_runtime_ptr != form_runtime_ptr
+                || form_associated_form_owner(runtime, submitter_handle) != Some(form_handle)
+            {
+                throw_dom_exception(
+                    scope,
+                    "NotFoundError",
+                    8,
+                    "The specified element is not owned by this form element.",
+                );
+                return;
+            }
+        }
         let Some(next_entries) = construct_form_data_entries_for_form(
             scope,
             form_runtime_ptr,
@@ -204,7 +177,7 @@ pub(super) fn form_data_constructor_callback<'s>(
 
 pub(crate) fn construct_form_data_entries_for_form<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     form_handle: crate::document_runtime::DomHandle,
     form: v8::Local<'s, v8::Object>,
     submitter: Option<v8::Local<'s, v8::Object>>,
@@ -219,6 +192,8 @@ pub(crate) fn construct_form_data_entries_for_form<'s>(
         return None;
     }
 
+    let context = node_relevant_context(scope, form).unwrap_or_else(|| scope.get_current_context());
+    let scope = &mut v8::ContextScope::new(scope, context);
     let entries = serialize_form_data_controls(scope, runtime_ptr, form_handle, submitter);
     let entries = dispatch_form_data_event_with_entries(scope, form, &entries).unwrap_or(entries);
     unsafe { &mut *runtime_ptr }.end_form_data_construction(form_handle);
@@ -239,10 +214,7 @@ fn dispatch_form_data_event_with_entries<'s>(
 fn new_empty_form_data_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let global = scope.get_current_context().global(scope);
-    let constructor = global
-        .get(scope, v8str(scope, "FormData").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
+    let constructor = ensure_intrinsic_interface_constructor(scope, "FormData").ok()?;
     constructor.new_instance(scope, &[])
 }
 
@@ -252,7 +224,7 @@ fn dispatch_form_data_event<'s>(
     form_data: v8::Local<'s, v8::Object>,
 ) {
     let Ok((runtime_ptr, form_handle)) =
-        crate::native_bridge::node_runtime_and_handle_from_object(scope, form)
+        node_runtime_and_handle_from_object_or_detached(scope, form)
     else {
         return;
     };
@@ -272,10 +244,7 @@ fn new_form_data_event<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     form_data: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let global = scope.get_current_context().global(scope);
-    let constructor = global
-        .get(scope, v8str(scope, "FormDataEvent").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
+    let constructor = ensure_intrinsic_interface_constructor(scope, "FormDataEvent").ok()?;
     let init = FormDataEventInitDeclaration::new(form_data, true, false)
         .bind(scope)
         .expect("FormDataEvent init declaration should bind");

@@ -1,11 +1,11 @@
-use moli_protocol::devtools_runtime::{
-    DevToolsActivateTargetCommand, DevToolsCaptureScreenshotClip, DevToolsCaptureScreenshotCommand,
-    DevToolsCloseTargetCommand, DevToolsCommand, DevToolsCreateTargetCommand,
+use moli_protocol::automation::{
+    AutomationCommand, DevToolsActivateTargetCommand, DevToolsCaptureScreenshotClip,
+    DevToolsCaptureScreenshotCommand, DevToolsCloseTargetCommand, DevToolsCreateTargetCommand,
     DevToolsDevicePixelRatioSetting, DevToolsGetLayoutMetricsCommand, DevToolsGetTargetsCommand,
-    DevToolsGetTargetsResult, DevToolsLayoutMetricsResult, DevToolsPrintToPdfCommand,
-    DevToolsPrintToPdfTransferMode, DevToolsRemoteHandleId, DevToolsScreenshotElementClip,
-    DevToolsSetViewportCommand, DevToolsSetWindowStateCommand, DevToolsTargetId,
-    DevToolsTargetKind, DevToolsViewportSetting, DevToolsWindowState,
+    DevToolsGetTargetsResult, DevToolsPrintToPdfCommand, DevToolsPrintToPdfTransferMode,
+    DevToolsRemoteHandleId, DevToolsScreenshotElementClip, DevToolsSetViewportCommand,
+    DevToolsSetWindowStateCommand, DevToolsTargetId, DevToolsTargetKind, DevToolsViewportSetting,
+    DevToolsWindowState,
 };
 use serde_json::{Value, json};
 
@@ -19,8 +19,8 @@ pub const CLASSIC_HEADLESS_SCREEN_WIDTH: u32 = 1920;
 pub const CLASSIC_HEADLESS_SCREEN_HEIGHT: u32 = 1080;
 pub const CLASSIC_HEADLESS_AVAILABLE_HEIGHT: u32 = 1040;
 
-pub fn create_initial_target_command(context: &ClassicDevToolsCommandContext) -> DevToolsCommand {
-    DevToolsCommand::CreateTarget(DevToolsCreateTargetCommand {
+pub fn create_initial_target_command(context: &ClassicDevToolsCommandContext) -> AutomationCommand {
+    AutomationCommand::CreateTarget(DevToolsCreateTargetCommand {
         context: context.command_context(),
         url: "about:blank".to_owned(),
         browser_context_id: None,
@@ -28,8 +28,8 @@ pub fn create_initial_target_command(context: &ClassicDevToolsCommandContext) ->
     })
 }
 
-pub fn layout_metrics_command(context: &ClassicDevToolsCommandContext) -> DevToolsCommand {
-    DevToolsCommand::GetLayoutMetrics(DevToolsGetLayoutMetricsCommand {
+pub fn layout_metrics_command(context: &ClassicDevToolsCommandContext) -> AutomationCommand {
+    AutomationCommand::GetLayoutMetrics(DevToolsGetLayoutMetricsCommand {
         context: context.command_context(),
     })
 }
@@ -90,18 +90,6 @@ impl ClassicWindowRect {
     }
 }
 
-pub fn classic_window_rect_from_metrics(
-    position: ClassicWindowPosition,
-    metrics: DevToolsLayoutMetricsResult,
-) -> ClassicWindowRect {
-    ClassicWindowRect {
-        x: position.x,
-        y: position.y,
-        width: metrics.layout_viewport_width,
-        height: metrics.layout_viewport_height,
-    }
-}
-
 pub fn set_window_rect_update(params: &Value) -> Result<ClassicWindowRectUpdate, ClassicError> {
     let Some(params) = params.as_object() else {
         return Err(ClassicError::new(
@@ -121,7 +109,7 @@ pub fn set_window_rect_command(
     context: &ClassicDevToolsCommandContext,
     width: u32,
     height: u32,
-) -> DevToolsCommand {
+) -> AutomationCommand {
     set_window_rect_command_with_screen(context, width, height, None, None)
 }
 
@@ -131,8 +119,8 @@ pub fn set_window_rect_command_with_screen(
     height: u32,
     screen_width: Option<u32>,
     screen_height: Option<u32>,
-) -> DevToolsCommand {
-    DevToolsCommand::SetViewport(DevToolsSetViewportCommand {
+) -> AutomationCommand {
+    AutomationCommand::SetViewport(DevToolsSetViewportCommand {
         context: context.command_context(),
         browser_context_ids: Vec::new(),
         viewport: DevToolsViewportSetting::Dimensions { width, height },
@@ -166,7 +154,7 @@ pub fn classic_window_rect_for_state(
 pub fn set_window_state_command(
     context: &ClassicDevToolsCommandContext,
     state: ClassicWindowState,
-) -> Option<DevToolsCommand> {
+) -> Option<AutomationCommand> {
     let rect = classic_window_rect_for_state(
         ClassicWindowRect {
             x: 0,
@@ -193,7 +181,7 @@ pub fn set_window_state_command(
 pub fn set_window_surface_state_command(
     context: &ClassicDevToolsCommandContext,
     state: ClassicWindowState,
-) -> DevToolsCommand {
+) -> AutomationCommand {
     set_window_surface_state_command_from_devtools(
         context,
         match state {
@@ -206,15 +194,15 @@ pub fn set_window_surface_state_command(
 
 pub fn set_window_normal_surface_state_command(
     context: &ClassicDevToolsCommandContext,
-) -> DevToolsCommand {
+) -> AutomationCommand {
     set_window_surface_state_command_from_devtools(context, DevToolsWindowState::Normal)
 }
 
 fn set_window_surface_state_command_from_devtools(
     context: &ClassicDevToolsCommandContext,
     state: DevToolsWindowState,
-) -> DevToolsCommand {
-    DevToolsCommand::SetWindowState(DevToolsSetWindowStateCommand {
+) -> AutomationCommand {
+    AutomationCommand::SetWindowState(DevToolsSetWindowStateCommand {
         context: context.command_context(),
         state,
     })
@@ -271,8 +259,8 @@ fn optional_window_dimension(
     Ok(Some(value as u32))
 }
 
-pub fn screenshot_command(context: &ClassicDevToolsCommandContext) -> DevToolsCommand {
-    DevToolsCommand::CaptureScreenshot(DevToolsCaptureScreenshotCommand {
+pub fn screenshot_command(context: &ClassicDevToolsCommandContext) -> AutomationCommand {
+    AutomationCommand::CaptureScreenshot(DevToolsCaptureScreenshotCommand {
         context: context.command_context(),
         format: Some("png".to_owned()),
         quality: None,
@@ -285,8 +273,8 @@ pub fn screenshot_command(context: &ClassicDevToolsCommandContext) -> DevToolsCo
 pub fn element_screenshot_command(
     context: &ClassicDevToolsCommandContext,
     object_id: impl Into<String>,
-) -> DevToolsCommand {
-    DevToolsCommand::CaptureScreenshot(DevToolsCaptureScreenshotCommand {
+) -> AutomationCommand {
+    AutomationCommand::CaptureScreenshot(DevToolsCaptureScreenshotCommand {
         context: context.command_context(),
         format: Some("png".to_owned()),
         quality: None,
@@ -303,10 +291,10 @@ pub fn element_screenshot_command(
 pub fn print_page_command(
     context: &ClassicDevToolsCommandContext,
     params: &Value,
-) -> Result<DevToolsCommand, ClassicError> {
+) -> Result<AutomationCommand, ClassicError> {
     let margin = classic_print_margin(params.get("margin"))?;
     let page = classic_print_page(params.get("page"))?;
-    Ok(DevToolsCommand::PrintToPdf(DevToolsPrintToPdfCommand {
+    Ok(AutomationCommand::PrintToPdf(DevToolsPrintToPdfCommand {
         context: context.command_context(),
         landscape: classic_print_orientation(params.get("orientation"))?,
         print_background: optional_bool(params, "background")?,
@@ -457,15 +445,7 @@ fn classic_print_scale(scale: Option<&Value>) -> Result<Option<f64>, ClassicErro
 }
 
 fn optional_bool(params: &Value, field: &str) -> Result<Option<bool>, ClassicError> {
-    let Some(value) = params.get(field) else {
-        return Ok(None);
-    };
-    value.as_bool().map(Some).ok_or_else(|| {
-        ClassicError::new(
-            ClassicErrorCode::InvalidArgument,
-            format!("{field} must be a boolean"),
-        )
-    })
+    super::parsing::optional_bool_value(params.get(field), field)
 }
 
 fn classic_print_page_ranges(page_ranges: Option<&Value>) -> Result<Option<String>, ClassicError> {
@@ -526,8 +506,8 @@ fn valid_classic_print_page_range(range: &str) -> bool {
     start > 0 && end >= start
 }
 
-pub fn window_handles_command(context: &ClassicDevToolsCommandContext) -> DevToolsCommand {
-    DevToolsCommand::GetTargets(DevToolsGetTargetsCommand {
+pub fn window_handles_command(context: &ClassicDevToolsCommandContext) -> AutomationCommand {
+    AutomationCommand::GetTargets(DevToolsGetTargetsCommand {
         context: context.command_context(),
         root: None,
         max_depth: None,
@@ -555,8 +535,8 @@ pub fn new_window_type(params: &Value) -> Result<String, ClassicError> {
     .to_owned())
 }
 
-pub fn new_window_command(context: &ClassicDevToolsCommandContext) -> DevToolsCommand {
-    DevToolsCommand::CreateTarget(DevToolsCreateTargetCommand {
+pub fn new_window_command(context: &ClassicDevToolsCommandContext) -> AutomationCommand {
+    AutomationCommand::CreateTarget(DevToolsCreateTargetCommand {
         context: context.command_context(),
         url: "about:blank".to_owned(),
         browser_context_id: None,
@@ -567,9 +547,9 @@ pub fn new_window_command(context: &ClassicDevToolsCommandContext) -> DevToolsCo
 pub fn switch_window_command(
     context: &ClassicDevToolsCommandContext,
     params: &Value,
-) -> Result<DevToolsCommand, ClassicError> {
+) -> Result<AutomationCommand, ClassicError> {
     let handle = required_string(params, "handle")?;
-    Ok(DevToolsCommand::ActivateTarget(
+    Ok(AutomationCommand::ActivateTarget(
         DevToolsActivateTargetCommand {
             context: ClassicDevToolsCommandContext::with_target_id(&context.session_id, handle)
                 .command_context(),
@@ -581,9 +561,9 @@ pub fn switch_window_command(
 pub fn activate_window_command(
     context: &ClassicDevToolsCommandContext,
     target_id: impl AsRef<str>,
-) -> DevToolsCommand {
+) -> AutomationCommand {
     let target_id = target_id.as_ref();
-    DevToolsCommand::ActivateTarget(DevToolsActivateTargetCommand {
+    AutomationCommand::ActivateTarget(DevToolsActivateTargetCommand {
         context: ClassicDevToolsCommandContext::with_target_id(&context.session_id, target_id)
             .command_context(),
         target_id: DevToolsTargetId::from(target_id),
@@ -592,14 +572,14 @@ pub fn activate_window_command(
 
 pub fn close_window_command(
     context: &ClassicDevToolsCommandContext,
-) -> Result<DevToolsCommand, ClassicError> {
+) -> Result<AutomationCommand, ClassicError> {
     let Some(target_id) = context.target_id.as_deref() else {
         return Err(ClassicError::new(
             ClassicErrorCode::NoSuchWindow,
             "current window not found",
         ));
     };
-    Ok(DevToolsCommand::CloseTarget(DevToolsCloseTargetCommand {
+    Ok(AutomationCommand::CloseTarget(DevToolsCloseTargetCommand {
         context: context.command_context(),
         target_id: DevToolsTargetId::from(target_id),
     }))

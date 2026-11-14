@@ -1,6 +1,4 @@
-use super::{
-    ABORT_CONTROLLER_SIGNAL_SLOT, AbortStore, abort_error_value, create_signal_with_prototype,
-};
+use super::{ABORT_CONTROLLER_SIGNAL_SLOT, AbortStore, abort_error_value, create_signal};
 use crate::util::{context_host_ptr_from_global_bridge, get_private_value, v8str};
 
 pub(crate) fn abort_controller_constructor_callback(
@@ -22,17 +20,7 @@ pub(crate) fn abort_controller_constructor_callback(
         rv.set_undefined();
         return;
     };
-    let global = scope.get_current_context().global(scope);
-    let Some(signal_ctor) = global
-        .get(scope, v8str(scope, "AbortSignal").into())
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-    else {
-        rv.set(args.this().into());
-        return;
-    };
-    let Some(signal) =
-        create_signal_with_prototype(scope, signal_ctor, unsafe { &mut *host_ptr }, false, None)
-    else {
+    let Some(signal) = create_signal(scope, unsafe { &mut *host_ptr }, false, None) else {
         rv.set(args.this().into());
         return;
     };
@@ -48,7 +36,9 @@ pub(crate) fn abort_controller_signal_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    match get_private_value(scope, args.this(), ABORT_CONTROLLER_SIGNAL_SLOT) {
+    let controller = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("AbortController receiver is checked by the binding");
+    match get_private_value(scope, controller, ABORT_CONTROLLER_SIGNAL_SLOT) {
         Some(value) => rv.set(value),
         None => rv.set_null(),
     }
@@ -59,12 +49,13 @@ pub(crate) fn abort_controller_abort_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+    let Some(_) = context_host_ptr_from_global_bridge(scope) else {
         rv.set_undefined();
         return;
     };
-    let controller = args.this();
-    let Some(controller_id) = AbortStore::controller_id_from_object(scope, controller) else {
+    let controller = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("AbortController receiver is checked by the binding");
+    let Some(_) = AbortStore::controller_id_from_object(scope, controller) else {
         rv.set_undefined();
         return;
     };
@@ -79,26 +70,6 @@ pub(crate) fn abort_controller_abort_callback<'s>(
     } else {
         abort_error_value(scope)
     };
-    let host = unsafe { &mut *host_ptr };
-    let Some(signal_id) = host
-        .native_bridge_mut()
-        .abort
-        .controllers
-        .get(&controller_id)
-        .copied()
-    else {
-        rv.set_undefined();
-        return;
-    };
-    if host
-        .native_bridge_mut()
-        .abort
-        .signal_state(signal_id)
-        .is_some_and(|state| state.aborted)
-    {
-        rv.set_undefined();
-        return;
-    }
-    host.abort_signal(scope, signal, reason);
+    crate::native_bridge::abort::abort_signal(scope, signal, reason);
     rv.set_undefined();
 }

@@ -1,10 +1,11 @@
 use super::install::install_attr_instance_properties;
 use super::*;
 use crate::util::set_null_prototype;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct AttrStateDeclaration<'scope> {
     name: v8::Local<'scope, v8::String>,
     value: v8::Local<'scope, v8::String>,
@@ -17,7 +18,7 @@ struct AttrStateDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Attr")]
+#[webapi(interface = web_api_interfaces::Attr)]
 struct AttrObjectDeclaration<'scope> {
     #[webapi(slot = ATTR_STATE_SLOT)]
     state: v8::Local<'scope, v8::Object>,

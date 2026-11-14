@@ -36,9 +36,6 @@ pub(crate) fn style_set_property_callback<'s>(
         throw_style_declaration_method_illegal_invocation(scope, "setProperty");
         return;
     };
-    if args.length() > 1 && args.get(1).is_undefined() {
-        return;
-    }
     let Some(parsed) = webidl::parse_args::<CssStyleDeclarationSetPropertyArgs>(scope, &args)
     else {
         return;
@@ -179,7 +176,7 @@ pub(crate) fn style_set_property_callback<'s>(
     );
 }
 
-fn retain_unaffected_style_entries(
+pub(super) fn retain_unaffected_style_entries(
     entries: &mut Vec<StyleEntry>,
     property: &str,
     affected_names: &[String],

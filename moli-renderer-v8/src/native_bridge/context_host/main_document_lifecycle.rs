@@ -1,4 +1,4 @@
-use super::JsContextHost;
+use super::PageScriptHost;
 use crate::frame_owner_model::{
     DocumentLinkEventOwner, DocumentLoadDelayTokenId, FrameDocumentTaskOwner,
     MainDocumentCompleteLifecycleAction, MainDocumentDomContentLoadedLifecycleAction,
@@ -17,21 +17,23 @@ use crate::{
     },
 };
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn plan_and_commit_current_main_runtime_script_start(
         &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
         node: crate::document_runtime::DomHandle,
         host_script_handle: &str,
     ) -> std::result::Result<Option<CommittedInlineClassicScript>, String> {
-        let runtime = unsafe { &mut *self.runtime };
+        let runtime = unsafe { &mut *self.document_runtime };
         let Some(plan) = runtime.host_plan_script_start(node, host_script_handle) else {
             return Ok(None);
         };
-        self.commit_current_main_runtime_script_start(runtime, plan)
+        self.commit_current_main_runtime_script_start(scope, runtime, plan)
     }
 
     pub(crate) fn commit_current_main_runtime_script_start(
         &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
         runtime: &mut DocumentRuntime,
         plan: RuntimeScriptStartPlan,
     ) -> std::result::Result<Option<CommittedInlineClassicScript>, String> {
@@ -81,6 +83,30 @@ impl JsContextHost {
                     host_script_handle,
                     source,
                 )))
+            }
+            PreparedRuntimeScriptStartCommit::InlineImportMap {
+                node,
+                base_url,
+                source,
+            } => {
+                debug_assert!(load_delay_binding.is_none());
+                let nonce = crate::host::script_element_nonce_for_csp(runtime.dom_host(), node)
+                    .map(str::to_owned);
+                let request =
+                    crate::content_security_policy::ContentSecurityPolicyScriptElementRequest {
+                        nonce: nonce.as_deref(),
+                        integrity: None,
+                        parser_inserted: false,
+                    };
+                let host_ptr: *mut PageScriptHost = self;
+                if let Some(source) =
+                    crate::native_bridge::element::inline_script_source_for_execution(
+                        scope, host_ptr, node, &source, request,
+                    )
+                {
+                    runtime.register_runtime_owned_import_map_source(&source, &base_url);
+                }
+                Ok(None)
             }
             PreparedRuntimeScriptStartCommit::Admission {
                 reservation,
@@ -168,7 +194,7 @@ impl JsContextHost {
     /// Commit the lifecycle authority for a plan prepared by
     /// `DocumentRuntime`.
     ///
-    /// This method deliberately does not dereference `self.runtime`. The
+    /// This method deliberately does not dereference `self.document_runtime`. The
     /// caller owns the mutable runtime phase, temporarily borrows the context
     /// host only for this exact FrameOwnerStore transaction, and then applies
     /// the committed value back to the runtime synchronously.
@@ -181,22 +207,20 @@ impl JsContextHost {
                 let binding = self.accept_current_main_style_load_event(element)?;
                 Some(ConnectedStyleLoadEventAdmission::LoadDelaying(binding))
             }
-            ConnectedStyleLoadEventPlan::NonBlockingModulepreload { element } => {
-                let owner = self.accept_current_main_modulepreload_event_owner(element)?;
-                Some(ConnectedStyleLoadEventAdmission::NonBlockingModulepreload(
-                    owner,
-                ))
+            ConnectedStyleLoadEventPlan::NonBlockingLink { element } => {
+                let owner = self.accept_current_main_link_event_owner(element)?;
+                Some(ConnectedStyleLoadEventAdmission::NonBlockingLink(owner))
             }
         }
     }
 
-    pub(crate) fn accept_current_main_modulepreload_event_owner(
+    pub(crate) fn accept_current_main_link_event_owner(
         &self,
         element: crate::document_runtime::DomHandle,
     ) -> Option<DocumentLinkEventOwner> {
         let owner = self.current_main_document_task_owner()?;
         self.frame_owner_store
-            .accept_current_main_modulepreload_event_owner(owner, element)
+            .accept_current_main_link_event_owner(owner, element)
     }
 
     pub(crate) fn main_style_load_event_is_current(

@@ -1,13 +1,13 @@
+use crate::automation::{
+    AutomationEvent, DevToolsFrameId, DevToolsLoaderId, DevToolsNetworkInterceptId,
+    DevToolsNetworkResourceType, DevToolsRequestId, DevToolsTargetId, NetworkAuthChallengeEvent,
+    NetworkRequestEvent,
+};
 use crate::conn::{BackgroundProtocolEvent, CdpConnection, build_event};
 use crate::conn::{
     FetchAuthChallenge, NavigationDispatchState, PendingFetchAuthNavigation,
     PendingFetchNavigation, PendingSubresourceFetchAuthRequest,
     PendingSubresourceFetchResponseRequest,
-};
-use crate::devtools_runtime::{
-    AutomationEvent, DevToolsFrameId, DevToolsLoaderId, DevToolsNetworkInterceptId,
-    DevToolsNetworkResourceType, DevToolsRequestId, DevToolsTargetId, NetworkAuthChallengeEvent,
-    NetworkRequestEvent,
 };
 use crate::domains::network;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -17,92 +17,80 @@ use moli_core::page::{
     SubresourceAuthChallenge, SubresourceAuthCredentials, extract_subresource_auth_challenge,
     subresource_auth_credentials_for_challenge,
 };
-use serde_json::Value;
+use moli_protocol_cdp_defs::LocalCdpEvent;
+use serde_json::{Value, json};
 use url::Url;
 
 use super::params::HeaderEntry;
 
-pub(crate) fn decode_base64_to_string(body: &str) -> Result<String, ()> {
-    let decoded = decode_base64_bytes(body)?;
-    String::from_utf8(decoded).map_err(|_| ())
-}
-
+// CDP Unicode input uses UTF-8; binary input remains raw HTTP bytes.
 pub(super) fn response_headers_from_params(
     response_headers: Option<Vec<HeaderEntry>>,
-    binary_response_headers: Option<impl AsRef<str>>,
-) -> Result<Vec<(String, String)>, ()> {
-    if let Some(binary_response_headers) = binary_response_headers {
-        parse_binary_response_headers(binary_response_headers.as_ref())
-    } else {
-        Ok(response_headers
-            .unwrap_or_default()
-            .into_iter()
-            .map(|header| (header.name, header.value))
-            .collect())
-    }
+    binary_response_headers: Option<&str>,
+) -> Result<Vec<(String, Vec<u8>)>, ()> {
+    Ok(
+        response_headers_with_presence_from_params(response_headers, binary_response_headers)?
+            .unwrap_or_default(),
+    )
 }
 
 pub(super) fn response_headers_with_presence_from_params(
     response_headers: Option<Vec<HeaderEntry>>,
-    binary_response_headers: Option<impl AsRef<str>>,
-) -> Result<Option<Vec<(String, String)>>, ()> {
-    if let Some(binary_response_headers) = binary_response_headers {
-        parse_binary_response_headers(binary_response_headers.as_ref()).map(Some)
+    binary_response_headers: Option<&str>,
+) -> Result<Option<Vec<(String, Vec<u8>)>>, ()> {
+    if let Some(encoded) = binary_response_headers {
+        parse_binary_response_headers(encoded).map(|headers| Some(headers.into_iter().collect()))
     } else {
         Ok(response_headers.map(|headers| {
-            headers
-                .into_iter()
-                .map(|header| (header.name, header.value))
-                .collect()
+            moli_fetch::ResponseHeaders::from_utf8(
+                headers
+                    .into_iter()
+                    .map(|header| (header.name, header.value))
+                    .collect(),
+            )
+            .into_iter()
+            .collect()
         }))
     }
 }
 
-pub(crate) fn parse_binary_response_headers(encoded: &str) -> Result<Vec<(String, String)>, ()> {
+pub(crate) fn parse_binary_response_headers(
+    encoded: &str,
+) -> Result<moli_fetch::ResponseHeaders, ()> {
     let decoded = decode_base64_bytes(encoded)?;
     let mut headers = Vec::new();
     for entry in decoded.split(|byte| *byte == b'\0') {
         if entry.is_empty() {
             continue;
         }
-        let Some(separator) = entry.iter().position(|byte| *byte == b':') else {
-            return Err(());
-        };
+        let separator = entry.iter().position(|byte| *byte == b':').ok_or(())?;
         let (name, value) = entry.split_at(separator);
-        let name = trim_ascii(name);
-        let value = trim_ascii_start(&value[1..]);
-        if HeaderName::from_bytes(name).is_err() || HeaderValue::from_bytes(value).is_err() {
-            return Err(());
-        }
-        let name = String::from_utf8_lossy(name).trim().to_owned();
-        if name.is_empty() {
-            return Err(());
-        }
-        let value = String::from_utf8_lossy(value).to_string();
-        headers.push((name, value));
+        let name = trim_ows(name);
+        let value = trim_ows_start(&value[1..]);
+        HeaderName::from_bytes(name).map_err(|_| ())?;
+        HeaderValue::from_bytes(value).map_err(|_| ())?;
+        headers.push((
+            std::str::from_utf8(name).map_err(|_| ())?.to_owned(),
+            value.to_vec(),
+        ));
     }
-    Ok(headers)
+    Ok(moli_fetch::ResponseHeaders::from_bytes(headers))
 }
 
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    trim_ascii_start(trim_ascii_end(bytes))
-}
-
-fn trim_ascii_start(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    &bytes[start..]
-}
-
-fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
+fn trim_ows(bytes: &[u8]) -> &[u8] {
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    &bytes[..end]
+        .rposition(|byte| !matches!(byte, b' ' | b'\t'))
+        .map_or(0, |index| index + 1);
+    trim_ows_start(&bytes[..end])
+}
+
+fn trim_ows_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
+    &bytes[start..]
 }
 
 pub(crate) fn decode_base64_bytes(input: &str) -> Result<Vec<u8>, ()> {
@@ -147,7 +135,9 @@ pub(crate) fn pending_fetch_auth_navigation_required_event(
     let (payload, event) =
         pending_fetch_auth_navigation_required_parts(pending, blocked_intercepts);
     BackgroundProtocolEvent::immediate_automation_event(
-        build_event("Fetch.authRequired", payload, session_id),
+        LocalCdpEvent::FetchAuthRequired,
+        payload,
+        session_id,
         event,
     )
 }
@@ -174,7 +164,7 @@ fn emit_navigation_auth_required(
     out.extend(
         events
             .into_iter()
-            .map(BackgroundProtocolEvent::into_protocol_message),
+            .filter_map(BackgroundProtocolEvent::into_wire_message),
     );
 }
 
@@ -206,7 +196,7 @@ fn navigation_auth_required_parts(
         url: navigation.requested_url.as_str().to_owned(),
         document_url: Some(navigation.requested_url.as_str().to_owned()),
         method: Some(navigation.request_method.clone()),
-        request_headers: navigation.request_headers.clone(),
+        request_headers: navigation.request_headers.to_byte_strings(),
         request_body: navigation.request_body.clone(),
         request_initiator_type: None,
         bidi_request_initiator_type: None,
@@ -252,7 +242,9 @@ pub(crate) fn pending_subresource_auth_required_event(
     let (payload, event) =
         pending_subresource_auth_required_parts(request_id, pending, blocked_intercepts);
     BackgroundProtocolEvent::immediate_automation_event(
-        build_event("Fetch.authRequired", payload, session_id),
+        LocalCdpEvent::FetchAuthRequired,
+        payload,
+        session_id,
         event,
     )
 }
@@ -270,7 +262,7 @@ fn pending_subresource_auth_required_parts(
         url: pending.url.as_str().to_owned(),
         document_url: Some(pending.document_url.as_str().to_owned()),
         method: Some(pending.method.clone()),
-        request_headers: pending.request_headers.clone(),
+        request_headers: pending.request_headers.to_byte_strings(),
         request_body: pending.request_body.clone(),
         request_initiator_type: None,
         bidi_request_initiator_type: None,
@@ -313,7 +305,7 @@ pub(crate) fn navigation_response_stage_request_paused_event(
     final_url: &url::Url,
     request_cookie_report: Option<&StoredCookieQueryReport>,
     response_status: u16,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
 ) -> BackgroundProtocolEvent {
     let (payload, event) = navigation_response_stage_request_paused_parts(
         fetch_request_id,
@@ -324,7 +316,9 @@ pub(crate) fn navigation_response_stage_request_paused_event(
         response_headers,
     );
     BackgroundProtocolEvent::immediate_automation_event(
-        build_event("Fetch.requestPaused", payload, session_id),
+        LocalCdpEvent::FetchRequestPaused,
+        payload,
+        session_id,
         event,
     )
 }
@@ -335,7 +329,7 @@ fn navigation_response_stage_request_paused_parts(
     final_url: &url::Url,
     request_cookie_report: Option<&StoredCookieQueryReport>,
     response_status: u16,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
 ) -> (Value, AutomationEvent) {
     let network_event = NetworkRequestEvent {
         target_id: DevToolsTargetId::from(navigation.frame_id.as_str()),
@@ -345,7 +339,7 @@ fn navigation_response_stage_request_paused_parts(
         url: final_url.as_str().to_owned(),
         document_url: None,
         method: Some(navigation.request_method.clone()),
-        request_headers: navigation.request_headers.clone(),
+        request_headers: navigation.request_headers.to_byte_strings(),
         request_body: navigation.request_body.clone(),
         request_initiator_type: None,
         bidi_request_initiator_type: None,
@@ -389,7 +383,9 @@ pub(crate) fn pending_subresource_response_stage_request_paused_event(
         blocked_intercepts,
     );
     BackgroundProtocolEvent::immediate_automation_event(
-        build_event("Fetch.requestPaused", payload, session_id),
+        LocalCdpEvent::FetchRequestPaused,
+        payload,
+        session_id,
         event,
     )
 }
@@ -407,7 +403,7 @@ fn pending_subresource_response_stage_request_paused_parts(
         url: pending.url.as_str().to_owned(),
         document_url: Some(pending.document_url.as_str().to_owned()),
         method: Some(pending.method.clone()),
-        request_headers: pending.request_headers.clone(),
+        request_headers: pending.request_headers.to_byte_strings(),
         request_body: pending.request_body.clone(),
         request_initiator_type: None,
         bidi_request_initiator_type: None,
@@ -438,7 +434,7 @@ fn pending_subresource_response_stage_request_paused_parts(
     (payload, AutomationEvent::RequestPaused(network_event))
 }
 
-pub(crate) fn extract_auth_challenge(headers: &[(String, String)]) -> Option<FetchAuthChallenge> {
+pub(crate) fn extract_auth_challenge(headers: &[(String, Vec<u8>)]) -> Option<FetchAuthChallenge> {
     extract_subresource_auth_challenge(headers).map(|challenge| FetchAuthChallenge {
         origin: String::new(),
         source: challenge.source,
@@ -502,7 +498,7 @@ pub(crate) fn request_paused_background_event(
         url: pending.navigation.requested_url.as_str().to_owned(),
         document_url: Some(pending.navigation.requested_url.as_str().to_owned()),
         method: Some(pending.navigation.request_method.clone()),
-        request_headers: pending.navigation.request_headers.clone(),
+        request_headers: pending.navigation.request_headers.to_byte_strings(),
         request_body: pending.navigation.request_body.clone(),
         request_initiator_type: None,
         bidi_request_initiator_type: None,
@@ -531,10 +527,13 @@ pub(crate) fn request_paused_background_event(
             .map(DevToolsRequestId::from),
         auth_challenge: None,
     };
-    let payload = network::fetch_request_paused_params(&network_event);
-    let message = build_event("Fetch.requestPaused", payload, session_id);
-    BackgroundProtocolEvent::immediate_automation_event(
+    let mut payload = network::fetch_request_paused_params(&network_event);
+    if let Some(previous) = &pending.redirected_request_id {
+        payload["redirectedRequestId"] = json!(previous);
+    }
+    let message = build_event(LocalCdpEvent::FetchRequestPaused, payload, session_id);
+    BackgroundProtocolEvent::inspector_message(
         message,
-        AutomationEvent::RequestPaused(network_event),
+        Some(AutomationEvent::RequestPaused(network_event)),
     )
 }

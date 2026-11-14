@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
-use moli_protocol::devtools_runtime::{
-    DevToolsCommandContext, DevToolsNavigationWait, DevToolsProtocol, DevToolsSessionId,
-    DevToolsTargetId,
+use moli_protocol::automation::{
+    AutomationContext, DevToolsNavigationWait, DevToolsSessionId, DevToolsTargetId,
+    FrontendProtocol,
 };
 
 use crate::actions::ClassicActionState;
@@ -21,6 +21,7 @@ pub enum ClassicErrorCode {
     InvalidElementState,
     InvalidSelector,
     ElementNotInteractable,
+    ElementClickIntercepted,
     InvalidSessionId,
     JavascriptError,
     NoSuchAlert,
@@ -49,6 +50,7 @@ impl ClassicErrorCode {
             Self::InvalidElementState => "invalid element state",
             Self::InvalidSelector => "invalid selector",
             Self::ElementNotInteractable => "element not interactable",
+            Self::ElementClickIntercepted => "element click intercepted",
             Self::InvalidSessionId => "invalid session id",
             Self::JavascriptError => "javascript error",
             Self::NoSuchAlert => "no such alert",
@@ -240,7 +242,7 @@ impl ClassicPromptHandler {
 pub struct ClassicDevToolsCommandContext {
     pub session_id: String,
     pub target_id: Option<String>,
-    protocol: DevToolsProtocol,
+    protocol: FrontendProtocol,
 }
 
 impl ClassicDevToolsCommandContext {
@@ -248,7 +250,7 @@ impl ClassicDevToolsCommandContext {
         Self {
             session_id: session_id.into(),
             target_id: None,
-            protocol: DevToolsProtocol::WebDriverClassic,
+            protocol: FrontendProtocol::WebDriverClassic,
         }
     }
 
@@ -256,12 +258,12 @@ impl ClassicDevToolsCommandContext {
         Self {
             session_id: session_id.into(),
             target_id: Some(target_id.into()),
-            protocol: DevToolsProtocol::WebDriverClassic,
+            protocol: FrontendProtocol::WebDriverClassic,
         }
     }
 
     pub fn with_protocol_and_target_id(
-        protocol: DevToolsProtocol,
+        protocol: FrontendProtocol,
         session_id: impl Into<String>,
         target_id: impl Into<String>,
     ) -> Self {
@@ -272,8 +274,8 @@ impl ClassicDevToolsCommandContext {
         }
     }
 
-    pub(crate) fn command_context(&self) -> DevToolsCommandContext {
-        DevToolsCommandContext {
+    pub(crate) fn command_context(&self) -> AutomationContext {
+        AutomationContext {
             protocol: self.protocol,
             session_id: Some(DevToolsSessionId::from(self.session_id.as_str())),
             target_id: self.target_id.as_deref().map(DevToolsTargetId::from),
@@ -338,7 +340,6 @@ impl ClassicPageLoadStrategy {
 
 #[derive(Debug, Default)]
 pub struct ClassicSessionRegistry {
-    next_session_id: u64,
     sessions: BTreeMap<String, ClassicSessionState>,
 }
 
@@ -366,8 +367,7 @@ impl ClassicSessionRegistry {
         page_load_strategy: ClassicPageLoadStrategy,
         unhandled_prompt_behavior: ClassicUnhandledPromptBehavior,
     ) -> ClassicSessionState {
-        self.next_session_id = self.next_session_id.wrapping_add(1);
-        let session_id = format!("classic-session-{}", self.next_session_id);
+        let session_id = uuid::Uuid::new_v4().to_string();
         let session = ClassicSessionState {
             session_id: session_id.clone(),
             current_target_id: None,

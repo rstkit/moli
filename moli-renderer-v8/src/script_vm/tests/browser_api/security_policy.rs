@@ -1,6 +1,150 @@
 use super::*;
 
 #[test]
+fn document_open_keeps_policy_and_processes_meta_in_the_new_stream() {
+    for owner in ["window", "frame.contentWindow"] {
+        let mut vm = new_storage_test_vm("https://document-open-policy.test/");
+        vm.document_runtime
+            .dom_host_mut()
+            .reset_html_document_shell();
+        assert_eq!(
+            vm.eval(&format!(
+                r#"(() => {{
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const popup = open();
+                    const owner = {owner};
+                    const doc = owner.document;
+                    const RealmEvalError = owner.eval('EvalError');
+                    const meta = doc.createElement('meta');
+                    meta.setAttribute('http-equiv', 'Content-Security-Policy');
+                    meta.setAttribute('content', "script-src 'self' 'unsafe-inline' 'unsafe-eval'");
+                    doc.head.appendChild(meta);
+                    const evaluate = () => {{
+                        try {{ return owner.eval('40 + 2'); }}
+                        catch (error) {{ return error.name + ':' + (error instanceof RealmEvalError); }}
+                    }};
+                    const before = evaluate();
+                    doc.open(); doc.close();
+                    const after = evaluate();
+                    meta.setAttribute('content', "script-src 'self' 'unsafe-inline'");
+                    doc.head.appendChild(meta);
+                    const tightened = evaluate();
+                    doc.open(); doc.close();
+                    const retained = evaluate();
+                    const sameDocument = doc === owner.document;
+                    popup.close(); frame.remove();
+                    return JSON.stringify([before, after, tightened, retained, sameDocument]);
+                }})()"#
+            ))
+            .unwrap(),
+            r#"[42,42,"EvalError:true","EvalError:true",true]"#,
+            "{owner}: document.open must retain installed CSP while processing reinserted meta in the new stream",
+        );
+    }
+}
+
+#[tokio::test]
+async fn document_open_keeps_policy_for_lightweight_popup_javascript_execution() {
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+    let mut vm = new_storage_page_task_executor_test_vm_with_loader(
+        "https://document-open-popup-policy.test/",
+        &loader,
+    );
+    vm.eval(
+        r#"globalThis.__popupOpenCspResult = 'pending';
+        (async () => {
+            const popup = open();
+            const doc = popup.document;
+            const meta = doc.createElement('meta');
+            meta.httpEquiv = 'Content-Security-Policy';
+            meta.content = "script-src 'self' 'unsafe-inline' 'unsafe-eval'";
+            doc.head.appendChild(meta);
+            const evaluate = () => new Promise(resolve => {
+                window.addEventListener('message', event => {
+                    if (event.source === popup) resolve(event.data);
+                }, {once: true});
+                popup.location.href = `javascript:
+                    try { opener.postMessage(eval('40 + 2'), '*'); }
+                    catch (error) {
+                        opener.postMessage(error.name + ':' + (error instanceof EvalError), '*');
+                    }
+                    void 0;
+                `;
+            });
+            try {
+                const before = await evaluate();
+                // main's lightweight popup stream retains its head. Remove the
+                // meta explicitly to isolate installed-policy lifetime from
+                // the separate full popup input-stream replacement work.
+                meta.remove();
+                doc.open(); doc.close();
+                const after = await evaluate();
+                meta.content = "script-src 'self' 'unsafe-inline'";
+                doc.head.appendChild(meta);
+                const tightened = await evaluate();
+                meta.remove();
+                doc.open(); doc.close();
+                const retained = await evaluate();
+                return [before, after, tightened, retained, doc === popup.document];
+            } finally { popup.close(); }
+        })().then(
+            value => __popupOpenCspResult = JSON.stringify(value),
+            error => __popupOpenCspResult = String(error)
+        );"#,
+    )
+    .unwrap();
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(__popupOpenCspResult !== 'pending')",
+        "true",
+        "popup document.open CSP retention through native Javascript URL tasks",
+    )
+    .await;
+    assert_eq!(
+        vm.eval("__popupOpenCspResult").unwrap(),
+        r#"[42,42,"EvalError:true","EvalError:true",true]"#,
+    );
+}
+
+#[test]
+fn inline_script_and_handler_csp_accept_base64url_hashes() {
+    for hash in [
+        "sha256-1u5siURgPyHwZ-QAD8UUU8_PSFeCLQfQgff1wmWe30c=",
+        "sha384-dfgfWBTXEJmr8n1u3heMCmQspfZzXztxsa6b_uRqupCtR1-hV5y1NIRIuk1GgyfX",
+        "sha512-yuIija81LFQ7iw1A1DtvkYIsDvqIgpOAzeloywzVVvfCZdYs43Z-Dh0lhILbiEstq4O56dtDfie_iALMCVjEMA==",
+    ] {
+        for unsafe_hashes in [false, true] {
+            let mut vm = new_storage_test_vm("https://inline-hash-csp.test/");
+            vm.document_runtime
+                .dom_host_mut()
+                .reset_html_document_shell();
+            let policy = format!(
+                "script-src '{hash}' {}",
+                if unsafe_hashes { "'unsafe-hashes'" } else { "" }
+            );
+            vm.set_response_content_security_policies(&[policy]);
+            let result = vm
+                .eval(&format!(
+                    "JSON.stringify({})",
+                    include_str!("../../../../tests/fixtures/csp-inline-hash.js")
+                ))
+                .unwrap();
+            assert_eq!(
+                result,
+                if unsafe_hashes {
+                    "[1,2,2,2]"
+                } else {
+                    "[1,1,1,1]"
+                },
+                "{hash}"
+            );
+        }
+    }
+}
+
+#[test]
 fn module_fetch_csp_uses_captured_parser_metadata_and_nonce() {
     let mut vm = new_storage_test_vm("https://module-csp-provenance.test/page.html");
     vm.set_response_content_security_policies(&[
@@ -12,8 +156,10 @@ fn module_fetch_csp_uses_captured_parser_metadata_and_nonce() {
 
     let dynamic_metadata = crate::module_runtime::ModuleFetchMetadata::default();
     assert!(
-        vm.csp_blocked_module_fetch_error_for_owner(&key, &dynamic_metadata)
-            .is_none(),
+        vm.document_runtime
+            .module_fetch_csp_context(key.url(), key.kind(), &dynamic_metadata)
+            .check_initial_request(key.url())
+            .is_ok(),
         "strict-dynamic must allow a non-parser-inserted module request"
     );
 
@@ -25,8 +171,10 @@ fn module_fetch_csp_uses_captured_parser_metadata_and_nonce() {
             },
         );
     assert!(
-        vm.csp_blocked_module_fetch_error_for_owner(&key, &parser_metadata)
-            .is_some(),
+        vm.document_runtime
+            .module_fetch_csp_context(key.url(), key.kind(), &parser_metadata)
+            .check_initial_request(key.url())
+            .is_err(),
         "the same URL must remain blocked when parser metadata says parser-inserted"
     );
 
@@ -39,8 +187,10 @@ fn module_fetch_csp_uses_captured_parser_metadata_and_nonce() {
             },
         );
     assert!(
-        vm.csp_blocked_module_fetch_error_for_owner(&key, &trusted_parser_metadata)
-            .is_none(),
+        vm.document_runtime
+            .module_fetch_csp_context(key.url(), key.kind(), &trusted_parser_metadata)
+            .check_initial_request(key.url())
+            .is_ok(),
         "a matching inherited nonce must authorize a parser-inserted module descendant"
     );
 }
@@ -790,6 +940,12 @@ async fn style_preload_csp_blocks_before_typed_resource_and_dispatches_async_err
         "",
         "CSP failure must not synchronously dispatch the preload error"
     );
+    let owner = vm.current_main_document_task_owner().unwrap();
+    assert_eq!(
+        vm.current_main_document_has_style_load_event_delay(owner),
+        Some(false),
+        "the queued CSP error must not delay Window load for a preload"
+    );
 
     assert_eq!(
         drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm),
@@ -1061,4 +1217,129 @@ async fn prepared_parser_inline_script_csp_blocks_before_v8_execution_and_report
             .expect("unknown parser source position should remain observable"),
         r#"[{"blockedURI":"inline","effectiveDirective":"script-src-elem","lineNumber":0,"columnNumber":0}]"#
     );
+}
+
+#[test]
+fn document_csp_eval_keywords_preserve_source_token_boundaries() {
+    for from_meta in [false, true] {
+        for keyword in ["unsafe-eval", "wasm-unsafe-eval"] {
+            for (prefix, suffix, valid) in [
+                ("", "", true),
+                ("\t\n", " \r\u{000c}", true),
+                ("\u{000b}", "", false),
+                ("", "\u{000b}", false),
+            ] {
+                let policy = format!("default-src 'none'; script-src {prefix}'{keyword}'{suffix}");
+                let mut vm = new_storage_test_vm("https://csp-source-tokens.test/");
+                if from_meta {
+                    vm.document_runtime
+                        .dom_host_mut()
+                        .reset_html_document_shell();
+                    vm.eval(&format!(
+                    "const meta = document.createElement('meta'); meta.httpEquiv = 'Content-Security-Policy'; meta.content = {}; document.head.appendChild(meta);",
+                    serde_json::to_string(&policy).unwrap(),
+                )).expect("install meta CSP without changing source token boundaries");
+                } else {
+                    vm.set_response_content_security_policies(std::slice::from_ref(&policy));
+                }
+                let result = vm
+                    .eval(&format!(
+                        "JSON.stringify({})",
+                        include_str!("../../../../tests/fixtures/csp-eval-source-tokens.js"),
+                    ))
+                    .expect("CSP execution probe");
+                let expected = serde_json::json!([
+                    if valid && keyword == "unsafe-eval" {
+                        "allowed"
+                    } else {
+                        "EvalError"
+                    },
+                    if valid && keyword == "unsafe-eval" {
+                        "allowed"
+                    } else {
+                        "EvalError"
+                    },
+                    if valid { "allowed" } else { "CompileError" },
+                ]);
+                assert_eq!(result, expected.to_string(), "meta={from_meta}: {policy:?}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn eval_csp_violation_reports_external_script_scheme_and_call_location() {
+    let source = r#"
+globalThis.__evalCspErrorName = "";
+try {
+  eval("globalThis.__blockedEvalRan = true");
+} catch (error) {
+  globalThis.__evalCspErrorName = error.name;
+}
+"#;
+
+    for (index, (script_url, expected_source_file)) in [
+        ("data:text/javascript,eval-source", "data"),
+        (
+            "blob:https://eval-source-location.test/00000000-0000-0000-0000-000000000000",
+            "blob",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut vm = new_storage_test_vm("https://eval-source-location.test/page.html");
+        vm.set_response_content_security_policies(&["script-src data: blob:".to_owned()]);
+        vm.eval(
+            r#"
+globalThis.__evalCspViolations = [];
+document.addEventListener("securitypolicyviolation", event => {
+  globalThis.__evalCspViolations.push({
+    blockedURI: event.blockedURI,
+    sourceFile: event.sourceFile,
+    linePositive: event.lineNumber > 0,
+    columnPositive: event.columnNumber > 0,
+  });
+});
+"#,
+        )
+        .expect("eval CSP observer should install");
+
+        let script_url = Url::parse(script_url).expect("external script URL");
+        let script = PreparedScript {
+            position: index,
+            node_id: NodeId::new(index + 1),
+            kind: ScriptKind::Classic,
+            mode: ScriptMode::Async,
+            source_kind: ScriptSourceKind::External,
+            fetch_metadata: crate::planning::ScriptFetchMetadata::default(),
+            source: ScriptSource::External,
+            url: script_url.clone(),
+            base_url: script_url,
+            initiator_url: Url::parse("https://eval-source-location.test/page.html")
+                .expect("initiator URL"),
+            host_script_handle: None,
+        };
+
+        vm.execute_loaded_prepared_script_source(&script, source, None)
+            .await
+            .expect("external script with blocked eval should complete");
+        assert_eq!(
+            drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm),
+            1
+        );
+        assert_eq!(
+            vm.eval(
+                r#"JSON.stringify({
+                  errorName: globalThis.__evalCspErrorName,
+                  ran: globalThis.__blockedEvalRan === true,
+                  violations: globalThis.__evalCspViolations,
+                })"#
+            )
+            .expect("eval CSP result should remain observable"),
+            format!(
+                r#"{{"errorName":"EvalError","ran":false,"violations":[{{"blockedURI":"eval","sourceFile":"{expected_source_file}","linePositive":true,"columnPositive":true}}]}}"#
+            )
+        );
+    }
 }

@@ -61,6 +61,7 @@ impl RendererPreparedNetworkResourceLoad {
             RendererNetworkResourceLoadResponse {
                 final_url: head.final_url,
                 status: head.status,
+                status_text: head.status_text,
                 headers: head.headers,
                 body,
                 completion_error,
@@ -68,6 +69,7 @@ impl RendererPreparedNetworkResourceLoad {
                 cookie_set_reports: head.cookie_set_reports,
                 redirect_chain: head.redirect_chain.into_iter().map(Into::into).collect(),
                 from_cache: head.from_cache,
+                cache_state: head.cache_state,
                 negotiated_http_version: head.negotiated_http_version,
                 network_request_headers,
             },
@@ -83,13 +85,38 @@ pub enum RendererNetworkResourceLoadOutcome {
 pub struct RendererNetworkResourceLoadResponse {
     pub final_url: url::Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
     pub completion_error: Option<String>,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirect_chain: Vec<NavigationRedirect>,
     pub from_cache: bool,
+    pub cache_state: moli_fetch::ResponseCacheState,
     pub negotiated_http_version: Option<moli_fetch::NegotiatedHttpVersion>,
     pub network_request_headers: Option<Vec<(String, String)>>,
+}
+
+impl RendererNetworkResourceLoadResponse {
+    pub fn head(&self) -> moli_fetch::ResponseHead {
+        moli_fetch::ResponseHead {
+            final_url: self.final_url.clone(),
+            status: self.status,
+            status_text: self.status_text.clone(),
+            headers: self.headers.clone(),
+            request_cookie_report: self.request_cookie_report.clone(),
+            cookie_set_reports: self.cookie_set_reports.clone(),
+            redirected: !self.redirect_chain.is_empty(),
+            redirect_chain: self
+                .redirect_chain
+                .iter()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+            from_cache: self.from_cache,
+            cache_state: self.cache_state,
+            negotiated_http_version: self.negotiated_http_version,
+        }
+    }
 }

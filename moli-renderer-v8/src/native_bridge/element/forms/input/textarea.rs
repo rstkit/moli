@@ -140,7 +140,7 @@ pub(in crate::native_bridge) fn textarea_default_value_setter_function<'s>(
 
 fn detached_textarea_value_attribute<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     receiver: v8::Local<'s, v8::Object>,
     handle: DomHandle,
 ) -> Option<String> {
@@ -325,19 +325,7 @@ fn textarea_limited_unsigned_setter<'s>(
     set_reflected_attribute(scope, runtime_ptr, handle, attribute, &value.to_string());
 }
 
-fn parse_positive_integer_prefix(value: &str) -> Option<u32> {
-    let value = value.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
-    let value = value.strip_prefix('+').unwrap_or(value);
-    let digits = value
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits
-        .parse::<i32>()
-        .ok()
-        .filter(|value| *value > 0)
-        .map(|value| value as u32)
-}
+use moli_dom::forms::parse_positive_integer_prefix;
 
 pub(in crate::native_bridge) fn textarea_wrap_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,

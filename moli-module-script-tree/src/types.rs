@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use url::Url;
 
@@ -176,6 +177,7 @@ pub enum ModuleKind {
     JavaScript,
     Json,
     Css,
+    Text,
     WebAssembly,
 }
 
@@ -471,8 +473,6 @@ pub struct CompiledModuleSnapshot {
     pub effective_fetch_metadata: ModuleFetchMetadata,
     pub requested_modules: Vec<ModuleRequestRecord>,
     pub phase: ModuleImportPhase,
-    pub has_parse_error: bool,
-    pub parse_error: Option<ModuleLoadError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,14 +516,17 @@ impl FetchedModuleSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleSource {
-    Text(String),
-    Binary(Vec<u8>),
+    /// Share decoded text across fetch clients and the renderer's compiled record.
+    Text(Arc<str>),
+    /// Share immutable Wasm bytes across fetch clients and compilation.
+    Binary(Arc<[u8]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleLoadError {
     pub stage: ModuleLoadStage,
     pub key: Option<Box<ModuleMapKey>>,
+    pub module_entry: Option<ModuleEntryId>,
     pub message: String,
     pub error_constructor: Option<ModuleErrorConstructorKind>,
 }
@@ -533,6 +536,7 @@ impl ModuleLoadError {
         Self {
             stage,
             key: None,
+            module_entry: None,
             message: message.into(),
             error_constructor: None,
         }
@@ -540,6 +544,11 @@ impl ModuleLoadError {
 
     pub fn with_key(mut self, key: ModuleMapKey) -> Self {
         self.key = Some(Box::new(key));
+        self
+    }
+
+    pub fn with_module_entry(mut self, entry: ModuleEntryId) -> Self {
+        self.module_entry = Some(entry);
         self
     }
 
@@ -551,7 +560,11 @@ impl ModuleLoadError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModuleErrorConstructorKind {
+    Error,
     SyntaxError,
+    TypeError,
+    WebAssemblyCompileError,
+    WebAssemblyLinkError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

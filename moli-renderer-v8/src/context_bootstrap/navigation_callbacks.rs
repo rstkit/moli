@@ -1,10 +1,8 @@
 use super::history_runtime::cancel_pending_precommit_history_traversal;
-use super::location_navigation::{
-    LocationNavigationKind, NavigationNavigateHistoryKind, navigate_location_object,
-};
+use super::location_navigation::{LocationNavigationKind, NavigationNavigateHistoryKind};
 use super::location_runtime::{is_same_document_fragment_navigation, location_href_slot};
 use super::navigation_cross_document::handle_navigation_navigate_cross_document;
-use super::navigation_entry::{history_entries, history_index, navigation_current_entry};
+use super::navigation_entry::{history_entries, navigation_current_entry};
 use super::navigation_entry_state::{
     clone_navigation_entry_state, clone_navigation_state_arg_for_result, set_navigation_entry_state,
 };
@@ -26,7 +24,7 @@ use super::navigation_result::{
     navigation_immediate_result_with_value, navigation_pending_result,
     navigation_rejected_dom_exception_result, navigation_rejected_invalid_state_result,
     navigation_rejected_value_result, navigation_result_with_pending_commit,
-    queue_same_document_navigation_finished,
+    queue_same_document_navigation_finished, suppress_unhandled_rejection,
 };
 use super::navigation_serialize::sync_child_navigation_entry_seed_from_owner;
 use super::navigation_window::{

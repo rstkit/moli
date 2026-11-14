@@ -1,13 +1,15 @@
 use super::*;
 use crate::{
     custom_elements,
-    dom::native::DomHost,
+    dom::native::{DomHost, DomMutationEffects},
     dom_parser::DOM_PARSER_FOREIGN_NODE_SLOT,
+    native_bridge::node::node_backing_object,
     util::{
         context_host_ptr_from_global_bridge, get_private_object, get_private_value,
         set_private_value,
     },
 };
+use smallvec::SmallVec;
 
 pub(in crate::native_bridge::document) fn detached_is_node<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -171,6 +173,20 @@ fn detached_set_owner_document_inner<'s>(
     }
 }
 
+pub(super) fn owner_document_native_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    owner_document: v8::Local<'s, v8::Object>,
+) -> Option<DomHandle> {
+    detached_native_handle_for_runtime(scope, runtime_ptr, owner_document).or_else(|| {
+        node_runtime_and_handle_from_object(scope, owner_document)
+            .ok()
+            .and_then(|(node_runtime_ptr, handle)| {
+                (node_runtime_ptr == runtime_ptr).then_some(handle)
+            })
+    })
+}
+
 fn sync_detached_native_owner_document<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     node: v8::Local<'s, v8::Object>,
@@ -183,8 +199,7 @@ fn sync_detached_native_owner_document<'s>(
     let Some(handle) = detached_native_handle_for_runtime(scope, runtime_ptr, node) else {
         return false;
     };
-    let Some(document_handle) =
-        detached_native_handle_for_runtime(scope, runtime_ptr, owner_document)
+    let Some(document_handle) = owner_document_native_handle(scope, runtime_ptr, owner_document)
     else {
         return false;
     };
@@ -281,9 +296,10 @@ fn detached_sync_children_projection<'s>(
 
 pub(crate) fn detached_native_handle_for_runtime<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     node: v8::Local<'s, v8::Object>,
 ) -> Option<DomHandle> {
+    let node = node_backing_object(scope, node)?;
     let value = get_private_value(scope, node, DETACHED_NATIVE_HANDLE_SLOT)?;
     let big = v8::Local::<v8::BigInt>::try_from(value).ok()?;
     let (index, lossless) = big.u64_value();
@@ -450,7 +466,7 @@ fn detached_state_node_type<'s>(
 
 pub(crate) fn detached_native_object_for_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
     unsafe { &*runtime_ptr }.dom_host().node(handle)?;
@@ -477,14 +493,15 @@ pub(crate) fn detached_native_object_for_handle<'s>(
             })
             .unwrap_or(wrapper)
     };
+    let backing = node_backing_object(scope, object)?;
     let value = v8::BigInt::new_from_u64(scope, handle.index() as u64);
-    set_private_value(scope, object, DETACHED_NATIVE_HANDLE_SLOT, value.into());
+    set_private_value(scope, backing, DETACHED_NATIVE_HANDLE_SLOT, value.into());
     Some(object)
 }
 
 pub(crate) fn paired_detached_native_object_for_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
     unsafe { &*runtime_ptr }.dom_host().node(handle)?;
@@ -495,6 +512,17 @@ pub(crate) fn paired_detached_native_object_for_handle<'s>(
             .cached_handle_wrapper(scope, handle)
     }?;
     get_private_object(scope, wrapper, DOM_PARSER_FOREIGN_NODE_SLOT)
+}
+
+pub(in crate::native_bridge) fn canonical_detached_node_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    node: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let backing = node_backing_object(scope, node)?;
+    // This slot is an identity association, not a copy of native state. Keep
+    // it on the backing too so aliases need no realm or host lookup to find
+    // the canonical Proxy after adoption.
+    Some(get_private_object(scope, backing, DOM_PARSER_FOREIGN_NODE_SLOT).unwrap_or(backing))
 }
 
 fn detached_native_related_object<'s>(
@@ -531,7 +559,7 @@ fn detached_native_owner_document_object<'s>(
 }
 
 fn detached_native_node_is_element(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<bool> {
     unsafe { &*runtime_ptr }
@@ -578,7 +606,7 @@ pub(in crate::native_bridge::document) fn detached_native_mutation_child_node_ob
 
 fn detached_native_child_node_objects_for_handles<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     child_handles: Vec<DomHandle>,
 ) -> Option<Vec<v8::Local<'s, v8::Object>>> {
     let mut children = Vec::with_capacity(child_handles.len());
@@ -621,23 +649,6 @@ fn detached_native_element_child_objects<'s>(
     )
 }
 
-fn detached_native_contains<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    node: v8::Local<'s, v8::Object>,
-    other: v8::Local<'s, v8::Object>,
-) -> Option<bool> {
-    let runtime_ptr = context_host_ptr_from_global_bridge(scope)?;
-    let handle = detached_native_handle_for_runtime(scope, runtime_ptr, node)?;
-    let other_handle = detached_native_handle_for_runtime(scope, runtime_ptr, other)?;
-    Some(
-        handle == other_handle
-            || unsafe { &*runtime_ptr }
-                .dom_host()
-                .dom()
-                .contains(handle, other_handle),
-    )
-}
-
 fn detached_native_is_connected_to_tree_root<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     node: v8::Local<'s, v8::Object>,
@@ -664,8 +675,14 @@ pub(in crate::native_bridge) fn define_detached_native_handle(
     node: v8::Local<'_, v8::Object>,
     handle: DomHandle,
 ) {
+    let node = v8::Local::new(scope, node);
+    let Some(backing) = node_backing_object(scope, node) else {
+        return;
+    };
     let value = v8::BigInt::new_from_u64(scope, handle.index() as u64);
-    set_private_value(scope, node, DETACHED_NATIVE_HANDLE_SLOT, value.into());
+    set_private_value(scope, backing, DETACHED_NATIVE_HANDLE_SLOT, value.into());
+    // The handle lives only on the backing. The wrapper association must keep
+    // the factory's canonical JavaScript object, including a native Proxy.
     pair_detached_native_handle_with_wrapper(scope, node, handle);
 }
 
@@ -781,42 +798,6 @@ pub(in crate::native_bridge::document) fn sync_detached_native_set_attribute_ns<
         local_name,
         value,
     );
-}
-
-pub(crate) fn write_detached_native_attribute<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    element: v8::Local<'s, v8::Object>,
-    name: &str,
-    value: &str,
-) -> bool {
-    let Some(runtime_ptr) = context_host_ptr_from_global_bridge(scope) else {
-        return false;
-    };
-    let Some(handle) = detached_native_handle_for_runtime(scope, runtime_ptr, element) else {
-        return false;
-    };
-    if unsafe { &*runtime_ptr }
-        .dom_host()
-        .node(handle)
-        .and_then(|node| node.as_element())
-        .is_none()
-    {
-        return false;
-    }
-    clear_detached_iframe_context_before_navigation_attribute_change(
-        scope,
-        runtime_ptr,
-        element,
-        handle,
-        name,
-        Some(value),
-    );
-    let changed =
-        unsafe { &mut *runtime_ptr }.set_attribute(scope, runtime_ptr, handle, name, value);
-    if changed {
-        detached_record_tree_mutation(scope, element);
-    }
-    true
 }
 
 pub(crate) fn write_detached_native_attribute_appending_to_current_reaction_queue<'s>(
@@ -944,7 +925,7 @@ pub(crate) fn remove_detached_native_attribute_ns_appending_to_current_reaction_
 
 fn clear_detached_iframe_context_before_navigation_attribute_change<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     element: v8::Local<'s, v8::Object>,
     handle: DomHandle,
     name: &str,
@@ -970,7 +951,7 @@ fn clear_detached_iframe_context_before_navigation_attribute_change<'s>(
 pub(in crate::native_bridge::document) fn detached_native_element_runtime_and_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     element: v8::Local<'s, v8::Object>,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     let runtime_ptr = context_host_ptr_from_global_bridge(scope)?;
     let handle = detached_native_handle_for_runtime(scope, runtime_ptr, element)?;
     unsafe { &*runtime_ptr }
@@ -978,19 +959,6 @@ pub(in crate::native_bridge::document) fn detached_native_element_runtime_and_ha
         .node(handle)
         .and_then(|node| node.as_element())?;
     Some((runtime_ptr, handle))
-}
-
-pub(crate) fn with_detached_native_element_reaction_scope<'scope, 'pin, R>(
-    scope: &mut v8::PinScope<'scope, 'pin>,
-    element: v8::Local<'scope, v8::Object>,
-    op: impl FnOnce(&mut v8::PinScope<'scope, 'pin>) -> R,
-) -> Option<R> {
-    let (runtime_ptr, _) = detached_native_element_runtime_and_handle(scope, element)?;
-    Some(custom_elements::with_custom_element_reaction_scope(
-        scope,
-        runtime_ptr,
-        op,
-    ))
 }
 
 pub(crate) fn read_detached_native_attribute<'s>(
@@ -1130,11 +1098,15 @@ pub(in crate::native_bridge::document) fn write_detached_native_text_content_app
     )
 }
 
-fn pair_detached_native_handle_with_wrapper(
+pub(in crate::native_bridge::document) fn pair_detached_native_handle_with_wrapper(
     scope: &mut v8::PinScope<'_, '_>,
     node: v8::Local<'_, v8::Object>,
     handle: DomHandle,
 ) {
+    let node = v8::Local::new(scope, node);
+    let Some(node) = canonical_detached_node_object(scope, node) else {
+        return;
+    };
     let Some(runtime_ptr) = context_host_ptr_from_global_bridge(scope) else {
         return;
     };
@@ -1191,7 +1163,7 @@ pub(in crate::native_bridge::document) fn detached_tree_query_version<'s>(
     value.uint32_value(scope).map(u64::from)
 }
 
-pub(in crate::native_bridge::document) fn detached_record_tree_mutation<'s>(
+pub(in crate::native_bridge) fn detached_record_tree_mutation<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     node: v8::Local<'s, v8::Object>,
 ) {
@@ -1211,10 +1183,49 @@ pub(in crate::native_bridge::document) fn detached_record_tree_mutation<'s>(
     );
 }
 
+pub(crate) fn detached_record_native_tree_mutations(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    dom_host: &DomHost,
+    effects: &DomMutationEffects,
+) {
+    // Native-backed detached nodes can use the ordinary Node mutation path.
+    // Keep their document-local query version in sync there too. These facts
+    // are available even when no MutationObserver has enabled record capture.
+    let inputs = effects.style();
+    let targets = inputs
+        .child_list_mutations()
+        .iter()
+        .map(|mutation| mutation.target())
+        .chain(
+            inputs
+                .attribute_mutations()
+                .iter()
+                .map(|mutation| mutation.target()),
+        )
+        .chain(inputs.character_data_mutations().iter().copied());
+    // The usual parser mutation has one owner document, which fits inline.
+    let mut documents = SmallVec::<[_; 1]>::new();
+    for target in targets {
+        if let Some(document) = dom_host.owner_document_handle(target)
+            && !documents.contains(&document)
+        {
+            documents.push(document);
+        }
+    }
+    for document in documents {
+        if let Some(object) = paired_detached_native_object_for_handle(scope, runtime_ptr, document)
+        {
+            detached_record_tree_mutation(scope, object);
+        }
+    }
+}
+
 pub(in crate::native_bridge::document) fn detached_state_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     node: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
+    let node = node_backing_object(scope, node)?;
     get_private_object(scope, node, DETACHED_STATE_SLOT)
 }
 
@@ -1222,6 +1233,7 @@ pub(in crate::native_bridge::document) fn detached_live_delegate_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     node: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
+    let node = node_backing_object(scope, node)?;
     get_private_object(scope, node, DETACHED_LIVE_DELEGATE_SLOT)
 }
 
@@ -1393,32 +1405,6 @@ pub(crate) fn detached_is_connected<'s>(
     false
 }
 
-pub(in crate::native_bridge::document) fn detached_contains<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    node: v8::Local<'s, v8::Object>,
-    other: v8::Local<'s, v8::Object>,
-) -> bool {
-    if node.strict_equals(other.into()) {
-        return true;
-    }
-    if let Some(contains) = detached_native_contains(scope, node, other) {
-        return contains;
-    }
-    if let Some(delegate) = detached_live_delegate_object(scope, node) {
-        let candidate = detached_live_delegate_object(scope, other).unwrap_or(other);
-        return call_object_method(scope, delegate, "contains", &[candidate.into()])
-            .is_some_and(|value| value.boolean_value(scope));
-    }
-    let mut current = detached_parent_node_object(scope, other);
-    while let Some(candidate) = current {
-        if candidate.strict_equals(node.into()) {
-            return true;
-        }
-        current = detached_parent_node_object(scope, candidate);
-    }
-    false
-}
-
 pub(in crate::native_bridge::document) fn detached_element_children_objects<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     node: v8::Local<'s, v8::Object>,
@@ -1467,5 +1453,7 @@ pub(in crate::native_bridge::document) fn define_detached_state<'s>(
     object: v8::Local<'s, v8::Object>,
     state: v8::Local<'s, v8::Object>,
 ) {
-    set_private_value(scope, object, DETACHED_STATE_SLOT, state.into());
+    if let Some(backing) = node_backing_object(scope, object) {
+        set_private_value(scope, backing, DETACHED_STATE_SLOT, state.into());
+    }
 }

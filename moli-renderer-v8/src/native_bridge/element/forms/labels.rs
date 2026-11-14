@@ -1,5 +1,6 @@
 use super::*;
 use crate::native_bridge::document::{detached_form_owner_object, detached_label_control_object};
+use crate::native_bridge::set_wrapped_handle_or_null_for_receiver;
 
 fn is_labelable_element(element: &Element) -> bool {
     if element.namespace() != "http://www.w3.org/1999/xhtml" {
@@ -12,7 +13,7 @@ fn is_labelable_element(element: &Element) -> bool {
     }
 }
 
-fn is_labelable_handle(runtime: &JsContextHost, handle: DomHandle, element: &Element) -> bool {
+fn is_labelable_handle(runtime: &PageScriptHost, handle: DomHandle, element: &Element) -> bool {
     if crate::custom_elements::is_form_associated_custom_element_handle(runtime, handle) {
         return true;
     }
@@ -34,7 +35,7 @@ fn is_label_interactive_content(element: &Element) -> bool {
     }
 }
 
-fn label_tree_scope_root(runtime: &JsContextHost, label_handle: DomHandle) -> DomHandle {
+fn label_tree_scope_root(runtime: &PageScriptHost, label_handle: DomHandle) -> DomHandle {
     runtime
         .dom_host()
         .root_node_handle(label_handle)
@@ -42,7 +43,7 @@ fn label_tree_scope_root(runtime: &JsContextHost, label_handle: DomHandle) -> Do
 }
 
 fn element_by_id_in_label_tree_scope(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     label_handle: DomHandle,
     id: &str,
 ) -> Option<DomHandle> {
@@ -51,7 +52,7 @@ fn element_by_id_in_label_tree_scope(
 }
 
 fn collect_shadow_including_labels_from(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     include_root: bool,
     out: &mut Vec<DomHandle>,
@@ -69,7 +70,7 @@ fn collect_shadow_including_labels_from(
 }
 
 fn collect_shadow_including_labels_at(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     out: &mut Vec<DomHandle>,
 ) {
@@ -90,7 +91,7 @@ fn collect_shadow_including_labels_at(
     }
 }
 
-fn shadow_including_label_handles(runtime: &JsContextHost) -> Vec<DomHandle> {
+fn shadow_including_label_handles(runtime: &PageScriptHost) -> Vec<DomHandle> {
     let mut labels = Vec::new();
     let (root, include_root) = (runtime.dom_host().document_handle(), false);
     collect_shadow_including_labels_from(runtime, root, include_root, &mut labels);
@@ -98,7 +99,7 @@ fn shadow_including_label_handles(runtime: &JsContextHost) -> Vec<DomHandle> {
 }
 
 fn shadow_including_contains(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     candidate: DomHandle,
 ) -> bool {
@@ -125,7 +126,10 @@ fn shadow_including_contains(
     false
 }
 
-fn label_handles_for_control(runtime: &JsContextHost, control_handle: DomHandle) -> Vec<DomHandle> {
+fn label_handles_for_control(
+    runtime: &PageScriptHost,
+    control_handle: DomHandle,
+) -> Vec<DomHandle> {
     if runtime.dom_host().is_connected(control_handle) {
         return shadow_including_label_handles(runtime);
     }
@@ -173,7 +177,7 @@ fn label_handles_for_control(runtime: &JsContextHost, control_handle: DomHandle)
 }
 
 fn first_implicit_label_control_from_node(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
     let element = runtime.dom_host().node(handle).and_then(Node::as_element);
@@ -203,7 +207,7 @@ fn first_implicit_label_control_from_node(
 }
 
 fn first_implicit_label_control(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     label_handle: DomHandle,
 ) -> Option<DomHandle> {
     let mut child = runtime.dom_host().first_child(label_handle);
@@ -217,7 +221,7 @@ fn first_implicit_label_control(
 }
 
 pub(in crate::native_bridge) fn label_control_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     label_handle: DomHandle,
 ) -> Option<DomHandle> {
     let label = runtime
@@ -245,7 +249,7 @@ pub(in crate::native_bridge) fn label_control_handle(
 }
 
 fn label_reflected_control_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     label_handle: DomHandle,
 ) -> Option<DomHandle> {
     let label = runtime
@@ -275,8 +279,8 @@ fn label_reflected_control_handle(
     label_control_handle(runtime, label_handle)
 }
 
-pub(in crate::native_bridge) fn control_label_handles(
-    runtime: &JsContextHost,
+pub(crate) fn control_label_handles(
+    runtime: &PageScriptHost,
     control_handle: DomHandle,
 ) -> Vec<DomHandle> {
     let Some(element) = runtime
@@ -297,7 +301,7 @@ pub(in crate::native_bridge) fn control_label_handles(
 }
 
 pub(in crate::native_bridge) fn label_activation_control_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     target_handle: DomHandle,
 ) -> Option<DomHandle> {
     let mut current = Some(target_handle);
@@ -318,7 +322,7 @@ pub(in crate::native_bridge) fn label_activation_control_handle(
 }
 
 pub(in crate::native_bridge) fn label_receives_programmatic_focus(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     label_handle: DomHandle,
 ) -> bool {
     let Some(label) = runtime
@@ -384,7 +388,7 @@ pub(in crate::native_bridge) fn label_control_getter_function<'s>(
         return;
     };
     let owner = label_reflected_control_handle(unsafe { &*runtime_ptr }, handle);
-    set_wrapped_node_or_null(scope, &mut rv, runtime_ptr, owner);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), owner);
 }
 
 pub(in crate::native_bridge) fn label_form_getter_function<'s>(
@@ -408,7 +412,7 @@ pub(in crate::native_bridge) fn label_form_getter_function<'s>(
     let runtime = unsafe { &*runtime_ptr };
     let owner = label_control_handle(runtime, handle)
         .and_then(|control| super::owner::form_associated_form_owner(runtime, control));
-    set_wrapped_node_or_null(scope, &mut rv, runtime_ptr, owner);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), owner);
 }
 
 pub(in crate::native_bridge) fn control_labels_getter_function<'s>(

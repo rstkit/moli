@@ -4,6 +4,11 @@ import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 
+import { runPuppeteerAriaQuerySmoke } from './puppeteer_aria_queries.mjs';
+import { runPuppeteerShadowAccessibilitySmoke } from './puppeteer_shadow_accessibility.mjs';
+import { runPuppeteerAccessibilityVisibilitySmoke } from './puppeteer_accessibility_visibility.mjs';
+import { runPuppeteerAccessibilityNamesSmoke } from './puppeteer_accessibility_names.mjs';
+import { runPuppeteerAccessibilityWhitespaceSmoke } from './puppeteer_accessibility_whitespace.mjs';
 import {
   activateXPathElement,
   runPuppeteerDomInteractionSmoke,
@@ -42,7 +47,7 @@ async function withTimeout(label, promise, timeoutMs = 10000) {
   }
 }
 
-async function discoverWebSocket(endpoint) {
+async function discoverBrowser(endpoint) {
   const response = await fetch(`${endpoint.replace(/\/$/, '')}/json/version`);
   if (!response.ok) {
     throw new Error(`CDP discovery failed with HTTP ${response.status}`);
@@ -51,7 +56,7 @@ async function discoverWebSocket(endpoint) {
   if (typeof payload.webSocketDebuggerUrl !== 'string' || !payload.webSocketDebuggerUrl) {
     throw new Error(`CDP discovery response did not include webSocketDebuggerUrl: ${JSON.stringify(payload)}`);
   }
-  return payload.webSocketDebuggerUrl;
+  return payload;
 }
 
 async function listPageTargets(endpoint) {
@@ -126,7 +131,7 @@ async function runPuppeteerReconnectSmoke(puppeteer, endpoint, browserWSEndpoint
   try {
     firstBrowser = await withTimeout(
       'first Puppeteer reconnect probe connect',
-      puppeteer.connect({ browserWSEndpoint, protocolTimeout: 10000 }),
+      puppeteer.connect({ browserURL: endpoint, protocolTimeout: 10000 }),
     );
     const originalPage = await pageByTargetId(
       firstBrowser,
@@ -169,6 +174,7 @@ async function runPuppeteerReconnectSmoke(puppeteer, endpoint, browserWSEndpoint
     }
     completed = true;
     return {
+      discoveredThroughBrowserURL: true,
       existingTargetReused: true,
       firstEvaluation: firstResult,
       replacementEvaluation: replacementResult.answer,
@@ -218,8 +224,9 @@ async function main() {
   }
   const puppeteer = loadPuppeteer();
   trace('loaded puppeteer-core');
-  const browserWSEndpoint = await discoverWebSocket(endpoint);
-  const isMoliEndpoint = browserWSEndpoint.endsWith('/devtools/browser/moli-browser');
+  const discovery = await discoverBrowser(endpoint);
+  const browserWSEndpoint = discovery.webSocketDebuggerUrl;
+  const isMoliEndpoint = typeof discovery['Moli-Version'] === 'string';
   trace(`discovered ${browserWSEndpoint}`);
   const results = [];
   const record = (name, data = {}) => results.push({ name, ok: true, ...data });
@@ -318,11 +325,26 @@ async function main() {
       'Puppeteer workercreated',
       new Promise(resolve => page.once('workercreated', resolve)),
     );
-    await withTimeout('create DedicatedWorker', page.evaluate(() => {
-      globalThis.__puppeteerDedicatedWorker = new Worker('/worker.js', {
+    // workercreated announces the DevTools attachment before the worker script
+    // is necessarily running. Wait for a fixture reply before reading worker
+    // globals: Chromium can crash on location access during initialization.
+    const workerReady = await withTimeout('DedicatedWorker fixture ready', page.evaluate(() => {
+      const worker = globalThis.__puppeteerDedicatedWorker = new Worker('/worker.js', {
         name: 'puppeteer-dedicated-worker',
       });
+      return new Promise((resolve, reject) => {
+        worker.addEventListener('message', event => resolve(event.data), { once: true });
+        worker.addEventListener('error', event => reject(new Error(event.message)), { once: true });
+        worker.postMessage('puppeteer-worker-ready');
+      });
     }));
+    if (
+      workerReady?.echoed !== 'puppeteer-worker-ready'
+      || workerReady.pathname !== '/worker.js'
+      || workerReady.selfEqualsGlobal !== true
+    ) {
+      throw new Error(`unexpected Puppeteer DedicatedWorker readiness reply: ${JSON.stringify(workerReady)}`);
+    }
     const dedicatedWorker = await workerCreated;
     const dedicatedWorkerProbe = await withTimeout(
       'WebWorker.evaluate',
@@ -424,6 +446,7 @@ async function main() {
       );
     }
     record('puppeteer_dedicated_worker_target_runtime_lifecycle', {
+      fixtureReady: true,
       navigationDestroyed: true,
       workerConsoleMessages,
     });
@@ -437,6 +460,36 @@ async function main() {
     }
     record('puppeteer_evaluate_fetch');
 
+    const ariaQueryResult = await withTimeout(
+      'Puppeteer ARIA selectors',
+      runPuppeteerAriaQuerySmoke(page),
+    );
+    record('puppeteer_aria_selector_workflow', ariaQueryResult);
+
+    const shadowAccessibilityResult = await withTimeout(
+      'Puppeteer Shadow DOM accessibility workflow',
+      runPuppeteerShadowAccessibilitySmoke(page),
+    );
+    record('puppeteer_shadow_accessibility_workflow', shadowAccessibilityResult);
+
+    const accessibilityVisibilityResult = await withTimeout(
+      'Puppeteer accessibility visibility',
+      runPuppeteerAccessibilityVisibilitySmoke(page),
+    );
+    record('puppeteer_accessibility_visibility_workflow', accessibilityVisibilityResult);
+
+    const accessibilityNamesResult = await withTimeout(
+      'Puppeteer accessibility descendant names',
+      runPuppeteerAccessibilityNamesSmoke(page),
+    );
+    record('puppeteer_accessibility_names_workflow', accessibilityNamesResult);
+
+    const accessibilityWhitespaceResult = await withTimeout(
+      'Puppeteer accessibility name whitespace',
+      runPuppeteerAccessibilityWhitespaceSmoke(page),
+    );
+    record('puppeteer_accessibility_whitespace_workflow', accessibilityWhitespaceResult);
+
     const domInteractionResult = await withTimeout(
       'Puppeteer DOM interaction matrix',
       runPuppeteerDomInteractionSmoke(page),
@@ -444,6 +497,9 @@ async function main() {
     );
     record('puppeteer_dom_selector_activation_workflow', domInteractionResult);
 
+    const layoutClient = await page.createCDPSession();
+    await layoutClient.send('Page.captureScreenshot');
+    await layoutClient.detach();
     const nameHandle = await withTimeout('page.$(#name)', page.$('#name'));
     if (!nameHandle) {
       throw new Error('Puppeteer ElementHandle lookup for #name returned null');
@@ -814,6 +870,9 @@ async function main() {
         globalThis.__puppeteerPositionClickCount += 1;
       });
     }));
+    const positionLayout = await page.createCDPSession();
+    await positionLayout.send('Page.captureScreenshot');
+    await positionLayout.detach();
     let positionClickError = null;
     try {
       await withTimeout('page.click(position boundary)', page.click('#position-click'));

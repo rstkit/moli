@@ -81,6 +81,7 @@ where
 pub struct LayoutPassRequest {
     pub viewport: LayoutViewport,
     pub reason: LayoutFlushReason,
+    environment: crate::LayoutEnvironment,
     paint_capture: Option<PaintCaptureRequest>,
 }
 
@@ -89,6 +90,9 @@ impl LayoutPassRequest {
         Self {
             viewport,
             reason,
+            environment: crate::LayoutEnvironment {
+                scrollbars_hidden: false,
+            },
             paint_capture: None,
         }
     }
@@ -104,23 +108,20 @@ impl LayoutPassRequest {
         reason: LayoutFlushReason,
         paint_capture: PaintCaptureRequest,
     ) -> Self {
-        Self {
-            viewport,
-            reason,
-            paint_capture: Some(paint_capture),
-        }
+        let mut request = Self::new(viewport, reason);
+        request.paint_capture = Some(paint_capture);
+        request
+    }
+
+    /// Sets document-wide runtime policy without changing authored CSS styles.
+    pub const fn with_environment(mut self, environment: crate::LayoutEnvironment) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Whether this demand also needs immutable software-paint input.
     pub const fn requests_paint(self) -> bool {
         self.paint_capture.is_some()
-    }
-
-    /// Whether this demand needs a complete embedded-frame input projection.
-    /// Paint always composes child frames, while coordinate input needs their
-    /// source-bearing geometry without retaining independent child snapshots.
-    pub const fn requests_embedded_frames(self) -> bool {
-        self.requests_paint() || matches!(self.reason, LayoutFlushReason::HitTest)
     }
 
     /// Whether paint snapshots for this demand should include CSS backgrounds.
@@ -193,7 +194,7 @@ where
     build_layout_pass_with_embedded_frames(source, styles, services, request, &mut NoEmbeddedFrames)
 }
 
-/// Builds one complete layout result and resolves embedded frame pixels after
+/// Builds one complete layout result and resolves embedded frame geometry after
 /// the parent numeric layout has established their exact content viewports.
 ///
 /// This is a one-shot composition seam, not a per-Document cache. Child trees
@@ -214,6 +215,7 @@ where
     let started = Instant::now();
     let phase_started = Instant::now();
     let mut world = build_layout_world(source, styles)?;
+    world.environment = request.environment;
     let box_tree_elapsed = phase_started.elapsed();
     debug_assert!(
         world
@@ -226,7 +228,7 @@ where
     prepare_list_markers(&mut world)?;
     let list_marker_elapsed = phase_started.elapsed();
     let phase_started = Instant::now();
-    prepare_form_controls(&mut world)?;
+    prepare_form_controls(&mut world, styles)?;
     let form_control_elapsed = phase_started.elapsed();
     let phase_started = Instant::now();
     prepare_inline_contexts(&mut world, services);
@@ -234,56 +236,55 @@ where
     world.validate_invariants()?;
     let phase_started = Instant::now();
     let numeric_metrics = compute_world_layout_with_scrollbars(&mut world, request.viewport);
+    let object_geometry = prepare_svg_content(&mut world, source);
     let numeric_layout_elapsed = phase_started.elapsed();
     let phase_started = Instant::now();
     let mut embedded_frames = HashMap::new();
-    if request.requests_embedded_frames() {
-        for index in 0..world.boxes.len() {
-            let layout_box = &world.boxes[index];
-            if !layout_box.element_semantics().is_some_and(|semantics| {
-                semantics.replaced == Some(crate::LayoutReplacedKind::Frame)
-            }) {
-                continue;
-            }
-            let Some(source) = layout_box.source() else {
-                continue;
-            };
-            let layout = layout_box.final_layout();
-            let width = (layout.size.width
-                - layout.border.left
-                - layout.border.right
-                - layout.padding.left
-                - layout.padding.right)
-                .max(0.0);
-            let height = (layout.size.height
-                - layout.border.top
-                - layout.border.bottom
-                - layout.padding.top
-                - layout.padding.bottom)
-                .max(0.0);
-            if width <= 0.0 || height <= 0.0 {
-                continue;
-            }
-            let viewport = LayoutViewport::new(
-                css_viewport_dimension(width),
-                css_viewport_dimension(height),
-                request.viewport.device_pixel_ratio,
-            );
-            if let Some(snapshot) = frames.render_embedded_frame(source, viewport)? {
-                embedded_frames.insert(crate::LayoutBoxId::from_index(index), (source, snapshot));
-            }
+    for (index, layout_box) in world.boxes.iter().enumerate() {
+        if !layout_box
+            .element_semantics()
+            .is_some_and(|semantics| semantics.replaced == Some(crate::LayoutReplacedKind::Frame))
+        {
+            continue;
+        }
+        let Some(source) = layout_box.source() else {
+            continue;
+        };
+        let layout = layout_box.final_layout();
+        let width = (layout.size.width
+            - layout.border.left
+            - layout.border.right
+            - layout.padding.left
+            - layout.padding.right)
+            .max(0.0);
+        let height = (layout.size.height
+            - layout.border.top
+            - layout.border.bottom
+            - layout.padding.top
+            - layout.padding.bottom)
+            .max(0.0);
+        if width <= 0.0 || height <= 0.0 {
+            continue;
+        }
+        let viewport = LayoutViewport::new(
+            css_viewport_dimension(width),
+            css_viewport_dimension(height),
+            request.viewport.device_pixel_ratio,
+        );
+        if let Some(snapshot) = frames.render_embedded_frame(source, viewport)? {
+            embedded_frames.insert(crate::LayoutBoxId::from_index(index), (source, snapshot));
         }
     }
     let embedded_frame_elapsed = phase_started.elapsed();
     finish_layout_pass(
         &world,
-        source.root(),
+        source,
         request.viewport,
         request.reason,
         started,
         request.paint_capture,
+        object_geometry,
         embedded_frames,
-        request.requests_embedded_frames(),
         crate::projection::LayoutPassPhaseMetrics {
             box_tree_elapsed,
             list_marker_elapsed,
@@ -302,6 +303,55 @@ where
                 .feedback_overflow_recomputed_node_count,
         },
     )
+}
+
+fn prepare_svg_content<S: LayoutSource>(
+    world: &mut crate::LayoutWorld<S::NodeId>,
+    source: &S,
+) -> Vec<crate::LayoutObjectGeometry<S::NodeId>> {
+    let mut objects = Vec::new();
+    for (index, layout_box) in world.boxes.iter_mut().enumerate() {
+        if !layout_box
+            .element_semantics()
+            .is_some_and(|semantics| semantics.replaced == Some(crate::LayoutReplacedKind::Svg))
+        {
+            continue;
+        }
+        let Some(node) = layout_box.source() else {
+            continue;
+        };
+        let layout = layout_box.final_layout;
+        let zoom = layout_box.style.effective_zoom();
+        let viewport = crate::LayoutSize::new(
+            ((layout.size.width
+                - layout.border.left
+                - layout.border.right
+                - layout.padding.left
+                - layout.padding.right
+                - layout.scrollbar_size.width)
+                / zoom)
+                .max(0.0),
+            ((layout.size.height
+                - layout.border.top
+                - layout.border.bottom
+                - layout.padding.top
+                - layout.padding.bottom
+                - layout.scrollbar_size.height)
+                / zoom)
+                .max(0.0),
+        );
+        if let Some(content) = source.svg_content(node, &layout_box.style, viewport) {
+            layout_box.replaced_image = content.image;
+            objects.extend(content.objects.into_iter().map(|(source, quad)| {
+                crate::LayoutObjectGeometry {
+                    source,
+                    owner: crate::LayoutOutputBoxId::from_index(index),
+                    quad,
+                }
+            }));
+        }
+    }
+    objects
 }
 
 /// Resolves `overflow:auto` with a monotonic browser-style feedback loop.
@@ -339,7 +389,10 @@ where
 {
     let root_id = world.root;
     let defining_body = world.viewport_scroll_policy.defining_body();
-    world.viewport_scroll_policy.prepare_scrollbar_layout();
+    let scrollbars_hidden = world.environment.scrollbars_hidden;
+    world
+        .viewport_scroll_policy
+        .prepare_scrollbar_layout(scrollbars_hidden);
     for (index, layout_box) in world.boxes.iter_mut().enumerate() {
         let id = crate::LayoutBoxId::from_index(index);
         if id == root_id {
@@ -347,7 +400,9 @@ where
         } else if defining_body == Some(id) {
             layout_box.style.prepare_viewport_defining_body_layout();
         } else {
-            layout_box.style.prepare_scrollbar_layout(false);
+            layout_box
+                .style
+                .prepare_scrollbar_layout(false, scrollbars_hidden);
         }
     }
 
@@ -366,6 +421,12 @@ where
             metrics.first_pass_elapsed = preparation_elapsed + elapsed;
         } else {
             metrics.followup_passes_elapsed += elapsed;
+        }
+        // Hidden controls cannot introduce an automatic gutter. Final output
+        // projection still computes scroll extents, so this demand needs no
+        // scrollbar-feedback overflow projection or corrective numeric pass.
+        if scrollbars_hidden {
+            break;
         }
         let phase_started = Instant::now();
         touched.append(&mut pending_feedback_seeds);

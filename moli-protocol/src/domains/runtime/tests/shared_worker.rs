@@ -1,8 +1,8 @@
 use super::*;
 
-use crate::devtools_runtime::{
-    DevToolsCommand, DevToolsCommandContext, DevToolsCommandResult, DevToolsGetRealmsCommand,
-    DevToolsProtocol, DevToolsSessionId, DevToolsTargetId, RuntimeExecutionContextEvent,
+use crate::automation::{
+    AutomationCommand, AutomationContext, AutomationResult, DevToolsGetRealmsCommand,
+    DevToolsSessionId, DevToolsTargetId, FrontendProtocol, RuntimeExecutionContextEvent,
 };
 
 async fn wait_until_runtime_expression_true(
@@ -53,10 +53,11 @@ fn record_shared_worker_runtime_context(ctx: &mut TestContext, session_id: &str,
         context_type: Some("worker".to_owned()),
         grant_universal_access: None,
     };
-    ctx.conn
-        .shared_worker_target_for_session_mut(Some(session_id))
-        .expect("shared worker target session should exist")
-        .record_runtime_execution_context_created_event(&event);
+    ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session_mut(Some(session_id))
+            .expect("shared worker target session should exist")
+            .record_runtime_execution_context_created_event(&event)
+    });
 }
 
 #[tokio::test]
@@ -103,6 +104,27 @@ async fn runtime_enable_on_shared_worker_session_replays_real_worker_context() {
     }))
     .await;
 
+    let response_index = ctx
+        .sent
+        .iter()
+        .position(|message| message["id"] == json!(72))
+        .expect("enable response");
+    for method in [
+        "Runtime.executionContextCreated",
+        "Runtime.consoleAPICalled",
+    ] {
+        let event_index = ctx
+            .sent
+            .iter()
+            .position(|message| message["method"] == json!(method))
+            .expect("buffered Runtime replay");
+        assert!(
+            event_index < response_index,
+            "{method} must precede the enable reply: {:#?}",
+            ctx.sent
+        );
+    }
+
     ctx.expect_result(72, json!({}), Some("SID-shared-worker"));
     let context_event = ctx.take_first_matching("shared worker execution context", |message| {
         message["method"] == json!("Runtime.executionContextCreated")
@@ -142,20 +164,20 @@ async fn get_realms_on_shared_worker_target_waits_for_renderer_context() {
     let mut ctx = TestContext::new();
     load_shared_worker_target(&mut ctx, "SID-shared-worker");
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(DevToolsCommand::GetRealms(DevToolsGetRealmsCommand {
-            context: DevToolsCommandContext {
-                protocol: DevToolsProtocol::WebDriverBidi,
-                session_id: Some(DevToolsSessionId::from("bidi-session-1")),
-                target_id: Some(DevToolsTargetId::from("TID-shared-worker")),
-                browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(AutomationCommand::GetRealms(
+            DevToolsGetRealmsCommand {
+                context: AutomationContext {
+                    protocol: FrontendProtocol::WebDriverBidi,
+                    session_id: Some(DevToolsSessionId::from("bidi-session-1")),
+                    target_id: Some(DevToolsTargetId::from("TID-shared-worker")),
+                    browser_context_id: None,
+                },
+                realm_type: Some("shared-worker".to_owned()),
             },
-            realm_type: Some("shared-worker".to_owned()),
-        }))
-        .await
-        .into_parts();
-    let DevToolsCommandResult::Realms(result) = result.expect("getRealms should succeed") else {
+        ))
+        .await;
+    let AutomationResult::Realms(result) = result.expect("getRealms should succeed") else {
         panic!("expected Realms result");
     };
 
@@ -172,20 +194,20 @@ async fn get_realms_on_shared_worker_target_returns_real_renderer_realm() {
     load_shared_worker_target(&mut ctx, "SID-shared-worker");
     record_shared_worker_runtime_context(&mut ctx, "SID-shared-worker", 81_081);
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(DevToolsCommand::GetRealms(DevToolsGetRealmsCommand {
-            context: DevToolsCommandContext {
-                protocol: DevToolsProtocol::WebDriverBidi,
-                session_id: Some(DevToolsSessionId::from("bidi-session-1")),
-                target_id: Some(DevToolsTargetId::from("TID-shared-worker")),
-                browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(AutomationCommand::GetRealms(
+            DevToolsGetRealmsCommand {
+                context: AutomationContext {
+                    protocol: FrontendProtocol::WebDriverBidi,
+                    session_id: Some(DevToolsSessionId::from("bidi-session-1")),
+                    target_id: Some(DevToolsTargetId::from("TID-shared-worker")),
+                    browser_context_id: None,
+                },
+                realm_type: Some("shared-worker".to_owned()),
             },
-            realm_type: Some("shared-worker".to_owned()),
-        }))
-        .await
-        .into_parts();
-    let DevToolsCommandResult::Realms(result) = result.expect("getRealms should succeed") else {
+        ))
+        .await;
+    let AutomationResult::Realms(result) = result.expect("getRealms should succeed") else {
         panic!("expected Realms result");
     };
 
@@ -211,20 +233,20 @@ async fn get_realms_global_enumeration_waits_for_shared_worker_renderer_context(
     let mut ctx = TestContext::new();
     load_shared_worker_target(&mut ctx, "SID-shared-worker");
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(DevToolsCommand::GetRealms(DevToolsGetRealmsCommand {
-            context: DevToolsCommandContext {
-                protocol: DevToolsProtocol::WebDriverBidi,
-                session_id: Some(DevToolsSessionId::from("bidi-session-1")),
-                target_id: None,
-                browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(AutomationCommand::GetRealms(
+            DevToolsGetRealmsCommand {
+                context: AutomationContext {
+                    protocol: FrontendProtocol::WebDriverBidi,
+                    session_id: Some(DevToolsSessionId::from("bidi-session-1")),
+                    target_id: None,
+                    browser_context_id: None,
+                },
+                realm_type: Some("shared-worker".to_owned()),
             },
-            realm_type: Some("shared-worker".to_owned()),
-        }))
-        .await
-        .into_parts();
-    let DevToolsCommandResult::Realms(result) = result.expect("getRealms should succeed") else {
+        ))
+        .await;
+    let AutomationResult::Realms(result) = result.expect("getRealms should succeed") else {
         panic!("expected Realms result");
     };
 
@@ -243,20 +265,20 @@ async fn get_realms_global_enumeration_includes_shared_worker_real_renderer_real
     load_shared_worker_target(&mut ctx, "SID-shared-worker");
     record_shared_worker_runtime_context(&mut ctx, "SID-shared-worker", 81_081);
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(DevToolsCommand::GetRealms(DevToolsGetRealmsCommand {
-            context: DevToolsCommandContext {
-                protocol: DevToolsProtocol::WebDriverBidi,
-                session_id: Some(DevToolsSessionId::from("bidi-session-1")),
-                target_id: None,
-                browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(AutomationCommand::GetRealms(
+            DevToolsGetRealmsCommand {
+                context: AutomationContext {
+                    protocol: FrontendProtocol::WebDriverBidi,
+                    session_id: Some(DevToolsSessionId::from("bidi-session-1")),
+                    target_id: None,
+                    browser_context_id: None,
+                },
+                realm_type: Some("shared-worker".to_owned()),
             },
-            realm_type: Some("shared-worker".to_owned()),
-        }))
-        .await
-        .into_parts();
-    let DevToolsCommandResult::Realms(result) = result.expect("getRealms should succeed") else {
+        ))
+        .await;
+    let AutomationResult::Realms(result) = result.expect("getRealms should succeed") else {
         panic!("expected Realms result");
     };
 
@@ -574,22 +596,23 @@ onconnect = event => {
 
     let background_url = "data:text/html,<!doctype html><body>background</body>";
     let background_page = ctx
-        .conn
-        .load_page_via_runtime_async(background_url)
+        .build_fixture_page(background_url)
         .await
         .expect("background diagnostics page should load");
-    let browser_context = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("browser context should remain installed");
-    let mut background = crate::conn::PageTargetHost::with_url(
-        "TID-diagnostics-document-worker-bg".to_owned(),
-        Some("SID-diagnostics-document-worker-bg".to_owned()),
-        background_url.to_owned(),
-    );
-    background.replace_loaded_page(Some(background_page));
-    browser_context.insert_page_target_host(background);
+    ctx.with_fixture(|conn| {
+        let browser_context = {
+            conn.browser_context
+                .as_mut()
+                .expect("browser context should remain installed")
+        };
+        let mut background = crate::conn::PageTargetHost::with_url(
+            "TID-diagnostics-document-worker-bg".to_owned(),
+            Some("SID-diagnostics-document-worker-bg".to_owned()),
+            background_url.to_owned(),
+        );
+        background.replace_loaded_page(Some(background_page));
+        browser_context.insert_page_target_host(background);
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -600,7 +623,10 @@ onconnect = event => {
 
     let response = take_response_by_id(&mut ctx, 90_022);
     let isolate_scope = &response["result"]["isolateScope"];
-    assert_eq!(isolate_scope["documentIsolateModel"], json!("page-vm"));
+    assert_eq!(
+        isolate_scope["documentIsolateModel"],
+        json!("related-pages")
+    );
     assert_eq!(isolate_scope["loadedDocumentPageCount"], json!(2));
     assert_eq!(
         isolate_scope["loadedDocumentRendererOwnerCount"],
@@ -770,13 +796,13 @@ onconnect = event => {
     assert_eq!(isolate_scope["loadedDocumentPageCount"], json!(2));
     assert_eq!(
         isolate_scope["loadedDocumentRendererOwnerCount"],
-        json!(2),
-        "opener and popup must remain independently schedulable: {response:?}"
+        json!(1),
+        "related opener and popup share their renderer owner: {response:?}"
     );
     assert_eq!(
         isolate_scope["estimatedDocumentIsolateCount"],
-        json!(2),
-        "popup PageVM must be counted as a second document isolate: {response:?}"
+        json!(1),
+        "related popup and opener must count as one document isolate: {response:?}"
     );
     assert_eq!(
         isolate_scope["documentContextCount"],
@@ -801,8 +827,8 @@ onconnect = event => {
     );
     assert_eq!(
         isolate_scope["estimatedLiveV8IsolateCount"],
-        json!(4),
-        "combo should be two page document isolates plus two worker isolates: {response:?}"
+        json!(3),
+        "combo should be one related-page document isolate plus two worker isolates: {response:?}"
     );
     assert_eq!(
         response["result"]["activeBrowserContext"]["backgroundLoadedPageCount"],
@@ -827,18 +853,25 @@ async fn runtime_enable_replays_page_and_shared_worker_contexts_to_their_own_ses
         90_020,
         "context-replay-isolation",
         r#"
-onconnect = event => {
-  event.ports[0].postMessage('ready');
-};
+globalThis.sharedWorkerBootReady = new Promise(resolve => {
+  onconnect = event => {
+    console.warn('worker boot warning');
+    resolve('booted');
+    event.ports[0].postMessage('ready');
+  };
+});
 "#,
     )
     .await;
-    record_shared_worker_console(
-        &mut ctx,
-        &shared_worker_session_id,
-        "warn: worker boot warning",
-    );
-    record_shared_worker_runtime_context(&mut ctx, &shared_worker_session_id, 90_021);
+    ctx.process_and_wait_for_response_async(json!({
+        "id": 90_024,
+        "method": "Runtime.evaluate",
+        "sessionId": shared_worker_session_id,
+        "params": {"expression":"sharedWorkerBootReady", "awaitPromise":true, "returnByValue":true}
+    }))
+    .await;
+    let ready = take_response_by_id(&mut ctx, 90_024);
+    assert_eq!(ready["result"]["result"]["value"], json!("booted"));
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -946,14 +979,8 @@ onconnect = event => {
         worker_console["params"]["args"][0]["value"],
         json!("worker boot warning")
     );
-    assert_ne!(
-        worker_console["params"]["executionContextId"],
-        json!(page_context_id),
-        "worker console replay must not use the page execution context id"
-    );
     assert_eq!(
-        worker_console["params"]["executionContextId"],
-        json!(90_021),
+        worker_console["params"]["executionContextId"], worker_context["params"]["context"]["id"],
         "worker console replay should use the real shared worker execution context id"
     );
     assert!(
@@ -962,6 +989,24 @@ onconnect = event => {
                 && message["params"]["context"]["auxData"]["frameId"] != json!("TID-page")
         }),
         "shared worker Runtime.enable must not replay page context or console output: {worker_messages:?}"
+    );
+    ctx.process_and_wait_for_response_async(json!({
+        "id": 90_025,
+        "method": "Runtime.evaluate",
+        "sessionId": shared_worker_session_id,
+        "params": {
+            "expression": "sharedWorkerBootReady",
+            "contextId": worker_console["params"]["executionContextId"],
+            "awaitPromise": true,
+            "returnByValue": true
+        }
+    }))
+    .await;
+    let worker_context_roundtrip = take_response_by_id(&mut ctx, 90_025);
+    assert_eq!(
+        worker_context_roundtrip["result"]["result"]["value"],
+        json!("booted"),
+        "the replayed context must address the real Worker in its session"
     );
 }
 
@@ -1000,17 +1045,19 @@ onconnect = event => {
     .await;
     let add_binding = take_response_by_id(&mut ctx, 90_011);
     assert_eq!(add_binding["result"], json!({}));
-    assert!(
-        ctx.conn
-            .shared_worker_target_for_session(Some(&shared_worker_session_id))
-            .expect("shared worker target should exist")
-            .runtime_bindings(&shared_worker_session_id)
-            .iter()
-            .any(|binding| {
-                binding.name == "sharedWorkerBinding" && binding.execution_context_name.is_none()
-            }),
-        "shared worker addBinding should persist on the target state"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.shared_worker_target_for_session(Some(&shared_worker_session_id))
+                .expect("shared worker target should exist")
+                .runtime_bindings(&shared_worker_session_id)
+                .iter()
+                .any(|binding| {
+                    binding.name == "sharedWorkerBinding"
+                        && binding.execution_context_name.is_none()
+                }),
+            "shared worker addBinding should persist on the target state"
+        )
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -1044,15 +1091,16 @@ onconnect = event => {
     .await;
     let remove_binding = take_response_by_id(&mut ctx, 90_013);
     assert_eq!(remove_binding["result"], json!({}));
-    assert!(
-        ctx.conn
-            .shared_worker_target_for_session(Some(&shared_worker_session_id))
-            .expect("shared worker target should exist")
-            .runtime_bindings(&shared_worker_session_id)
-            .iter()
-            .all(|binding| binding.name != "sharedWorkerBinding"),
-        "shared worker removeBinding should clear persisted target state"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.shared_worker_target_for_session(Some(&shared_worker_session_id))
+                .expect("shared worker target should exist")
+                .runtime_bindings(&shared_worker_session_id)
+                .iter()
+                .all(|binding| binding.name != "sharedWorkerBinding"),
+            "shared worker removeBinding should clear persisted target state"
+        )
+    });
 
     ctx.sent.clear();
     ctx.process_async(json!({
@@ -1183,7 +1231,7 @@ onconnect = event => {
         "sessionId": shared_worker_session_id
     })
     .to_string();
-    let step = ctx.conn.start_command_dispatch(&raw);
+    let step = ctx.with_fixture(|conn| conn.start_command_dispatch(&raw));
     assert!(
         matches!(&step, CdpCommandTaskStep::Pending(_)),
         "shared worker HeapProfiler.collectGarbage should dispatch to the worker V8 HeapProfiler agent"
@@ -1518,28 +1566,6 @@ onconnect = event => {
             )
         })
         .to_owned();
-    let worker_target = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should exist");
-    assert!(
-        worker_target.has_runtime_remote_object_id(&shared_worker_session_id, &objects_id),
-        "shared worker Runtime.queryObjects result handle should be target-local: {query_response:?}"
-    );
-    assert_eq!(
-        worker_target.runtime_remote_object_group(&shared_worker_session_id, &objects_id),
-        Some("worker-query-results"),
-        "shared worker Runtime.queryObjects should register its result in the explicit objectGroup"
-    );
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                std::slice::from_ref(&objects_id)
-            )
-            .is_err(),
-        "active page owner should see shared worker queryObjects result as another target's handle"
-    );
 
     ctx.process_async(json!({
         "id": 90_093,
@@ -1551,19 +1577,8 @@ onconnect = event => {
     }))
     .await;
     assert_eq!(take_response_by_id(&mut ctx, 90_093)["result"], json!({}));
-    let worker_target = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should exist");
-    assert!(
-        !worker_target.has_runtime_remote_object_id(&shared_worker_session_id, &objects_id),
-        "shared worker Runtime.releaseObjectGroup should clear queryObjects result handle"
-    );
-    assert_eq!(
-        worker_target.runtime_remote_object_group(&shared_worker_session_id, &objects_id),
-        None,
-        "shared worker Runtime.releaseObjectGroup should clear queryObjects result group"
-    );
+
+    assert_native_objects_released(&mut ctx, Some(&shared_worker_session_id), &[objects_id]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1631,28 +1646,6 @@ onconnect = event => {
             )
         })
         .to_owned();
-    let worker_target = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should exist");
-    assert!(
-        worker_target.has_runtime_remote_object_id(&shared_worker_session_id, &object_id),
-        "shared worker Runtime.runScript result handle should be target-local: {run_response:?}"
-    );
-    assert_eq!(
-        worker_target.runtime_remote_object_group(&shared_worker_session_id, &object_id),
-        Some("worker-compiled-script-results"),
-        "shared worker Runtime.runScript should register its result in the explicit objectGroup"
-    );
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                std::slice::from_ref(&object_id)
-            )
-            .is_err(),
-        "active page owner should see shared worker runScript result as another target's handle"
-    );
 
     ctx.process_async(json!({
         "id": 90_104,
@@ -1664,14 +1657,8 @@ onconnect = event => {
     }))
     .await;
     assert_eq!(take_response_by_id(&mut ctx, 90_104)["result"], json!({}));
-    let worker_target = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should exist");
-    assert!(
-        !worker_target.has_runtime_remote_object_id(&shared_worker_session_id, &object_id),
-        "shared worker Runtime.releaseObjectGroup should clear runScript result handle"
-    );
+
+    assert_native_objects_released(&mut ctx, Some(&shared_worker_session_id), &[object_id]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1690,14 +1677,15 @@ onconnect = event => {
     )
     .await;
 
-    ctx.conn
-        .shared_worker_target_for_session_mut(Some(&shared_worker_session_id))
-        .expect("shared worker target should exist")
-        .upsert_runtime_binding_definition(
-            &shared_worker_session_id,
-            "replayedSharedWorkerBinding".to_owned(),
-            None,
-        );
+    ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session_mut(Some(&shared_worker_session_id))
+            .expect("shared worker target should exist")
+            .upsert_runtime_binding_definition(
+                &shared_worker_session_id,
+                "replayedSharedWorkerBinding".to_owned(),
+                None,
+            )
+    });
 
     ctx.process_async(json!({
         "id": 90_110,
@@ -1732,17 +1720,18 @@ onconnect = event => {
                 && message["params"]["name"] == json!("replayedSharedWorkerBinding")
         });
     assert_eq!(binding_called["params"]["payload"], json!("after-replay"));
-    assert!(
-        ctx.conn
-            .shared_worker_target_for_session(Some(&shared_worker_session_id))
-            .expect("shared worker target should exist")
-            .runtime_bindings_requiring_replay(&shared_worker_session_id)
-            .is_empty(),
-        "successful replay should clear the target replay-pending marker"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.shared_worker_target_for_session(Some(&shared_worker_session_id))
+                .expect("shared worker target should exist")
+                .runtime_bindings_requiring_replay(&shared_worker_session_id)
+                .is_empty(),
+            "successful replay should clear the target replay-pending marker"
+        )
+    });
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn shared_worker_runtime_remote_objects_are_target_local_and_release_clears_registry() {
+async fn shared_worker_native_objects_are_target_local_and_release_invalidates_them() {
     let mut ctx = TestContext::new();
     with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
     let shared_worker_session_id = start_attached_shared_worker_session(
@@ -1782,15 +1771,6 @@ onconnect = event => {
             panic!("shared worker Runtime.evaluate should return an object handle: {response:?}")
         })
         .to_owned();
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                std::slice::from_ref(&object_id),
-            )
-            .is_err(),
-        "active page owner should see the shared worker handle as belonging to another target"
-    );
 
     ctx.process_async(json!({
         "id": 90_212,
@@ -1804,7 +1784,7 @@ onconnect = event => {
     assert_eq!(active_release["error"]["code"], json!(-32000));
     assert_eq!(
         active_release["error"]["message"],
-        json!("Cannot find object with given id")
+        json!("Cannot find context with specified id")
     );
 
     ctx.process_async(json!({
@@ -1817,104 +1797,6 @@ onconnect = event => {
     }))
     .await;
     assert_eq!(take_response_by_id(&mut ctx, 90_213)["result"], json!({}));
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(None, &[object_id])
-            .is_ok(),
-        "successful shared worker release should remove the handle from target-local ownership"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn shared_worker_runtime_remote_objects_do_not_cross_peer_worker_targets() {
-    let mut ctx = TestContext::new();
-    with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
-    let first_session_id = start_attached_shared_worker_session(
-        &mut ctx,
-        90_240,
-        "remote-object-peer-a",
-        r#"
-onconnect = event => {
-  event.ports[0].postMessage("ready-a");
-};
-"#,
-    )
-    .await;
-    let second_session_id = start_attached_shared_worker_session(
-        &mut ctx,
-        90_260,
-        "remote-object-peer-b",
-        r#"
-onconnect = event => {
-  event.ports[0].postMessage("ready-b");
-};
-"#,
-    )
-    .await;
-
-    ctx.process_async(json!({
-        "id": 90_270,
-        "method": "Runtime.evaluate",
-        "sessionId": first_session_id,
-        "params": {
-            "expression": "({ owner: 'first-shared-worker' })"
-        }
-    }))
-    .await;
-    let response = take_response_by_id(&mut ctx, 90_270);
-    let object_id = response["result"]["result"]["objectId"]
-        .as_str()
-        .unwrap_or_else(|| {
-            panic!(
-                "first shared worker Runtime.evaluate should return an object handle: {response:?}"
-            )
-        })
-        .to_owned();
-
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                Some(&second_session_id),
-                std::slice::from_ref(&object_id),
-            )
-            .is_err(),
-        "peer shared worker target should see the first worker handle as belonging to another target"
-    );
-    ctx.process_async(json!({
-        "id": 90_271,
-        "method": "Runtime.releaseObject",
-        "sessionId": second_session_id,
-        "params": {
-            "objectId": object_id
-        }
-    }))
-    .await;
-    let peer_release = take_response_by_id(&mut ctx, 90_271);
-    assert_eq!(peer_release["error"]["code"], json!(-32000));
-    assert_eq!(
-        peer_release["error"]["message"],
-        json!("Cannot find object with given id")
-    );
-
-    ctx.process_async(json!({
-        "id": 90_272,
-        "method": "Runtime.releaseObject",
-        "sessionId": first_session_id,
-        "params": {
-            "objectId": object_id
-        }
-    }))
-    .await;
-    assert_eq!(take_response_by_id(&mut ctx, 90_272)["result"], json!({}));
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                Some(&second_session_id),
-                &[object_id],
-            )
-            .is_ok(),
-        "successful release by the owning worker should clear the handle from target-local ownership"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1938,12 +1820,12 @@ onconnect = event => {
 "#,
     )
     .await;
-    let target_id = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&first_session_id))
-        .expect("shared worker target should exist")
-        .target_id
-        .clone();
+    let target_id = ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session(Some(&first_session_id))
+            .expect("shared worker target should exist")
+            .target_id
+            .clone()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -2063,12 +1945,13 @@ onconnect = event => {
     }))
     .await;
     assert_eq!(take_response_by_id(&mut ctx, 92_015)["result"], json!({}));
-    assert!(
-        ctx.conn
-            .shared_worker_target_for_session(Some(&first_session_id))
-            .is_some(),
-        "detaching the second shared worker session must not detach the first session"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.shared_worker_target_for_session(Some(&first_session_id))
+                .is_some(),
+            "detaching the second shared worker session must not detach the first session"
+        )
+    });
 
     ctx.process_async(json!({
         "id": 92_016,
@@ -2158,12 +2041,12 @@ onconnect = event => {
 "#,
     )
     .await;
-    let target_id = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&first_session_id))
-        .expect("shared worker target should exist")
-        .target_id
-        .clone();
+    let target_id = ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session(Some(&first_session_id))
+            .expect("shared worker target should exist")
+            .target_id
+            .clone()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -2300,10 +2183,12 @@ onconnect = event => {
 #[tokio::test(flavor = "multi_thread")]
 async fn target_close_target_terminates_shared_worker_and_cleans_target_state() {
     let mut ctx = TestContext::new();
-    ctx.conn.set_target_discovery_for_owner(
-        None,
-        crate::conn::CdpTargetFilter::default_target_discovery(),
-    );
+    ctx.with_fixture(|conn| {
+        conn.set_target_discovery_for_owner(
+            None,
+            crate::conn::CdpTargetFilter::default_target_discovery(),
+        )
+    });
     with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
     let shared_worker_session_id = start_attached_shared_worker_session(
         &mut ctx,
@@ -2342,12 +2227,12 @@ onconnect = event => {
             .any(|message| message["id"] == json!(90_291)),
         "timer-backed shared worker awaitPromise should still be pending before Target.closeTarget"
     );
-    let target_id = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should be attached before target close")
-        .target_id
-        .clone();
+    let target_id = ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session(Some(&shared_worker_session_id))
+            .expect("shared worker target should be attached before target close")
+            .target_id
+            .clone()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -2379,22 +2264,22 @@ onconnect = event => {
         },
     );
     assert_eq!(destroyed["params"]["targetId"], json!(target_id));
-    assert_eq!(
-        ctx.conn.session_route(Some(&shared_worker_session_id)),
-        None
-    );
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(|context| context.shared_worker_target(&target_id))
-            .is_none(),
-        "Target.closeTarget should remove the shared worker CDP target state"
-    );
-    assert!(
-        !ctx.conn.has_pending_inspector_awaits(),
-        "Target.closeTarget should drain shared worker pending awaits"
-    );
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some(&shared_worker_session_id)), None));
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.browser_context
+                .as_ref()
+                .and_then(|context| context.shared_worker_target(&target_id))
+                .is_none(),
+            "Target.closeTarget should remove the shared worker CDP target state"
+        )
+    });
+    ctx.with_fixture(|conn| {
+        assert!(
+            !conn.has_pending_inspector_awaits(),
+            "Target.closeTarget should drain shared worker pending awaits"
+        )
+    });
 
     ctx.process_async(json!({
         "id": 90_293,
@@ -2445,7 +2330,7 @@ onconnect = event => {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn shared_worker_runtime_object_groups_inherit_and_clear_on_detach() {
+async fn shared_worker_native_group_children_work_before_session_detach() {
     let mut ctx = TestContext::new();
     with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
     let shared_worker_session_id = start_attached_shared_worker_session(
@@ -2512,16 +2397,16 @@ onconnect = event => {
             )
         })
         .to_owned();
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                &[parent_object_id.clone(), child_object_id.clone()],
-            )
-            .is_err(),
-        "active page owner should see grouped shared worker handles as another target's handles"
-    );
 
+    ctx.process_async(json!({"id":998_501,"method":"Runtime.getProperties","sessionId":shared_worker_session_id,"params":{"objectId":child_object_id,"ownProperties":true}})).await;
+    let child = take_response_by_id(&mut ctx, 998_501);
+    assert!(
+        child["result"]["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == json!("answer") && p["value"]["value"] == json!(42))
+    );
     ctx.process_async(json!({
         "id": 90_313,
         "method": "Target.detachFromTarget",
@@ -2531,15 +2416,6 @@ onconnect = event => {
     }))
     .await;
     assert_eq!(take_response_by_id(&mut ctx, 90_313)["result"], json!({}));
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                &[parent_object_id, child_object_id],
-            )
-            .is_ok(),
-        "shared worker target detach should clear target-local remote object ownership"
-    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_worker_pending_await_fails_on_target_detach() {
@@ -2583,11 +2459,12 @@ onconnect = event => {
             .any(|message| message["id"] == json!(90_411)),
         "timer-backed shared worker awaitPromise should still be pending before detach"
     );
-    assert!(
-        ctx.conn
-            .has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
-        "shared worker awaitPromise should register against the shared worker target"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
+            "shared worker awaitPromise should register against the shared worker target"
+        )
+    });
 
     ctx.process_async(json!({
         "id": 90_412,
@@ -2602,18 +2479,22 @@ onconnect = event => {
     assert_eq!(failed_await["sessionId"], shared_worker_session_id);
     assert_eq!(failed_await["error"]["code"], json!(-32000));
     assert_eq!(failed_await["error"]["message"], json!("Target detached"));
-    assert!(
-        !ctx.conn.has_pending_inspector_awaits(),
-        "detaching the shared worker target should drain the pending await registry"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            !conn.has_pending_inspector_awaits(),
+            "detaching the shared worker target should drain the pending await registry"
+        )
+    });
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn real_shared_worker_close_cleans_runtime_state_before_destroy_events() {
     let mut ctx = TestContext::new();
-    ctx.conn.set_target_discovery_for_owner(
-        None,
-        crate::conn::CdpTargetFilter::default_target_discovery(),
-    );
+    ctx.with_fixture(|conn| {
+        conn.set_target_discovery_for_owner(
+            None,
+            crate::conn::CdpTargetFilter::default_target_discovery(),
+        )
+    });
     with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
     let worker_source = r#"
 globalThis.__closeProbe = { child: { answer: 42 } };
@@ -2664,15 +2545,6 @@ onconnect = event => {
             .as_str()
             .unwrap_or_else(|| panic!("shared worker close probe should return an object handle"))
             .to_owned();
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                std::slice::from_ref(&close_probe_object_id),
-            )
-            .is_err(),
-        "active page owner should see the shared worker handle as another target's handle"
-    );
 
     ctx.process_async(json!({
         "id": 90_513,
@@ -2691,17 +2563,18 @@ onconnect = event => {
             .any(|message| message["id"] == json!(90_513)),
         "timer-backed shared worker awaitPromise should still be pending before worker close"
     );
-    assert!(
-        ctx.conn
-            .has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
-        "shared worker awaitPromise should register against the shared worker target"
-    );
-    let closing_target_id = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should still be attached before close")
-        .target_id
-        .clone();
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
+            "shared worker awaitPromise should register against the shared worker target"
+        )
+    });
+    let closing_target_id = ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session(Some(&shared_worker_session_id))
+            .expect("shared worker target should still be attached before close")
+            .target_id
+            .clone()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -2767,31 +2640,23 @@ onconnect = event => {
         failed_await_index < detached_index && detached_index < destroyed_index,
         "real worker close must fail pending awaits before detached/destroyed events: {teardown_messages:?}"
     );
-    assert_eq!(
-        ctx.conn.session_route(Some(&shared_worker_session_id)),
-        None
-    );
-    assert!(
-        !ctx.conn.has_pending_inspector_awaits(),
-        "destroying the shared worker target should drain pending awaits"
-    );
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                std::slice::from_ref(&close_probe_object_id),
-            )
-            .is_ok(),
-        "destroying the shared worker target should remove target-local remote object ownership"
-    );
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(|context| context.shared_worker_target(&closing_target_id))
-            .is_none(),
-        "real shared worker close should remove the destroyed target state"
-    );
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some(&shared_worker_session_id)), None));
+    ctx.with_fixture(|conn| {
+        assert!(
+            !conn.has_pending_inspector_awaits(),
+            "destroying the shared worker target should drain pending awaits"
+        )
+    });
+
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.browser_context
+                .as_ref()
+                .and_then(|context| context.shared_worker_target(&closing_target_id))
+                .is_none(),
+            "real shared worker close should remove the destroyed target state"
+        )
+    });
 
     let replacement_session_id =
         start_attached_shared_worker_session(&mut ctx, 90_520, "real-close-cleanup", worker_source)
@@ -2824,14 +2689,20 @@ onconnect = event => {
         json!("undefined"),
         "target-local Runtime.addBinding state from the destroyed shared worker must not replay into a fresh target"
     );
+    assert!(
+        !close_probe_object_id.is_empty(),
+        "the native close probe owns a real object handle"
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn page_navigation_teardown_terminates_shared_worker_and_cleans_target_state() {
     let mut ctx = TestContext::new();
-    ctx.conn.set_target_discovery_for_owner(
-        None,
-        crate::conn::CdpTargetFilter::default_target_discovery(),
-    );
+    ctx.with_fixture(|conn| {
+        conn.set_target_discovery_for_owner(
+            None,
+            crate::conn::CdpTargetFilter::default_target_discovery(),
+        )
+    });
     with_loaded_document_for_active_target_async(
         &mut ctx,
         "<!doctype html><body>before</body>",
@@ -2891,6 +2762,10 @@ onconnect = event => {
             )
         })
         .to_owned();
+    assert!(
+        !teardown_probe_object_id.is_empty(),
+        "native Inspector returned a real handle"
+    );
 
     ctx.process_async(json!({
         "id": 90_613,
@@ -2909,17 +2784,18 @@ onconnect = event => {
             .any(|message| message["id"] == json!(90_613)),
         "timer-backed shared worker awaitPromise should still be pending before page navigation"
     );
-    assert!(
-        ctx.conn
-            .has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
-        "shared worker awaitPromise should register against the shared worker target"
-    );
-    let terminating_target_id = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should be attached before navigation teardown")
-        .target_id
-        .clone();
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
+            "shared worker awaitPromise should register against the shared worker target"
+        )
+    });
+    let terminating_target_id = ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session(Some(&shared_worker_session_id))
+            .expect("shared worker target should be attached before navigation teardown")
+            .target_id
+            .clone()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -2981,31 +2857,23 @@ onconnect = event => {
         failed_await_index < detached_index && detached_index < destroyed_index,
         "client removal must fail pending awaits before detached/destroyed events: {teardown_messages:?}"
     );
-    assert_eq!(
-        ctx.conn.session_route(Some(&shared_worker_session_id)),
-        None
-    );
-    assert!(
-        !ctx.conn.has_pending_inspector_awaits(),
-        "client removal should drain shared worker pending awaits"
-    );
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                std::slice::from_ref(&teardown_probe_object_id),
-            )
-            .is_ok(),
-        "destroying the shared worker target should remove target-local remote object ownership"
-    );
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(|context| context.shared_worker_target(&terminating_target_id))
-            .is_none(),
-        "client removal should remove the destroyed shared worker target state"
-    );
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some(&shared_worker_session_id)), None));
+    ctx.with_fixture(|conn| {
+        assert!(
+            !conn.has_pending_inspector_awaits(),
+            "client removal should drain shared worker pending awaits"
+        )
+    });
+
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.browser_context
+                .as_ref()
+                .and_then(|context| context.shared_worker_target(&terminating_target_id))
+                .is_none(),
+            "client removal should remove the destroyed shared worker target state"
+        )
+    });
 
     let replacement_session_id = start_attached_shared_worker_session(
         &mut ctx,
@@ -3092,12 +2960,12 @@ onconnect = event => {
         worker_source,
     )
     .await;
-    let shared_worker_target_id = ctx
-        .conn
-        .shared_worker_target_for_session(Some(&shared_worker_session_id))
-        .expect("shared worker target should exist after first client")
-        .target_id
-        .clone();
+    let shared_worker_target_id = ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session(Some(&shared_worker_session_id))
+            .expect("shared worker target should exist after first client")
+            .target_id
+            .clone()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -3175,8 +3043,8 @@ onconnect = event => {
         "peer SharedWorker client to connect",
     )
     .await;
-    assert_eq!(
-        ctx.conn
+    ctx.with_fixture(|conn| { assert_eq!(
+        conn
             .browser_context
             .as_ref()
             .expect("browser context should exist")
@@ -3184,7 +3052,7 @@ onconnect = event => {
             .shared_worker_running_worker_isolate_count_for_diagnostics(),
         1,
         "same-origin pages with the same SharedWorker key should share one running worker isolate"
-    );
+    ) });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -3207,12 +3075,12 @@ onconnect = event => {
         }),
         "owner page navigation must not detach/destroy a SharedWorker target with a peer client: {navigation_messages:?}"
     );
-    assert!(
-        ctx.conn
+    ctx.with_fixture(|conn| { assert!(
+        conn
             .shared_worker_target_for_session(Some(&shared_worker_session_id))
             .is_some(),
         "attached SharedWorker target state must survive owner page navigation while a peer client remains"
-    );
+    ) });
 
     ctx.process_async(json!({
         "id": 90_715,
@@ -3358,11 +3226,12 @@ async fn shared_worker_await_promise_timer_reply_arrives_through_renderer_receiv
         "timer-backed shared worker awaitPromise should defer until the worker timer settles: {:?}",
         ctx.sent
     );
-    assert!(
-        ctx.conn
-            .has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
-        "shared worker awaitPromise should register against the shared worker target"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
+            "shared worker awaitPromise should register against the shared worker target"
+        )
+    });
 
     ctx.process_async(json!({
         "id": 84,
@@ -3391,11 +3260,12 @@ async fn shared_worker_await_promise_timer_reply_arrives_through_renderer_receiv
         response["result"]["result"]["value"],
         json!("late:deferred:deferred-runtime-probe")
     );
-    assert!(
-        !ctx.conn
-            .has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
-        "settled shared worker awaitPromise should clear the target pending-await entry"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            !conn.has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
+            "settled shared worker awaitPromise should clear the target pending-await entry"
+        )
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3425,27 +3295,36 @@ onconnect = event => {
         }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("shared worker Runtime.evaluate awaitPromise should start as a pending command");
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(1), pending.wait())
-        .await
-        .expect("initial Worker Inspector dispatch must not wait for Promise settlement");
-    let CdpCommandTaskStep::Complete(outcome) =
-        ctx.conn.complete_pending_command_dispatch(completed).await
-    else {
-        panic!("a Worker session response must not enter the AdapterReply deferred-reply lane");
-    };
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("shared worker Runtime.evaluate awaitPromise should start as a pending command")
+    });
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut step = CdpCommandTaskStep::Pending(Box::new(pending));
+        let mut command_context = crate::conn::CommandDispatchContext::default();
+        loop {
+            match step {
+                CdpCommandTaskStep::Complete(outcome) => break outcome,
+                CdpCommandTaskStep::Pending(pending) => {
+                    assert!(!pending.waits_for_scheduler_deferred_inspector_reply(),
+                        "a Worker session response must not enter the AdapterReply deferred-reply lane");
+                    let completed = pending.wait().await;
+                    step = ctx.state.with_state(|state| state.complete_command_dispatch_with_context(completed, &mut command_context))
+                        .expect("live test owner");
+                }
+            }
+        }
+    }).await.expect("initial Worker Inspector dispatch must not wait for Promise settlement");
     assert!(
         outcome.into_parts().0.is_empty(),
         "the unresolved terminal response must remain in the Worker session output journal"
     );
-    assert!(
-        ctx.conn
-            .has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
-        "the unresolved await must remain registered to its exact Worker session"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.has_pending_inspector_awaits_for_session_owner(Some(&shared_worker_session_id)),
+            "the unresolved await must remain registered to its exact Worker session"
+        )
+    });
 
     ctx.process_async(json!({
         "id": 91_103,
@@ -3491,15 +3370,6 @@ onconnect = event => {
             panic!("shared worker Runtime.evaluate should return an object handle: {response:?}")
         })
         .to_owned();
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(
-                None,
-                std::slice::from_ref(&object_id),
-            )
-            .is_err(),
-        "active page owner should see the grouped shared worker handle as another target's handle"
-    );
 
     ctx.process_async(json!({
         "id": 90_911,
@@ -3513,12 +3383,7 @@ onconnect = event => {
     let release = take_response_by_id(&mut ctx, 90_911);
     assert_eq!(release["sessionId"], json!(shared_worker_session_id));
     assert_eq!(release["result"], json!({}));
-    assert!(
-        ctx.conn
-            .validate_runtime_remote_object_ids_for_session_owner(None, &[object_id])
-            .is_ok(),
-        "successful shared worker releaseObjectGroup should remove grouped handles from the target-local registry"
-    );
+    assert_native_objects_released(&mut ctx, Some(&shared_worker_session_id), &[object_id]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3605,13 +3470,15 @@ async fn shared_worker_discard_console_entries_is_target_local() {
     let mut ctx = TestContext::new();
     load_shared_worker_target(&mut ctx, "SID-shared-worker");
     {
-        let browser_context = ctx
-            .conn
-            .browser_context
-            .as_mut()
-            .expect("browser context should exist");
-        browser_context.set_active_target_id("TID-page");
-        browser_context.attach_active_session("SID-page");
+        ctx.with_fixture(|conn| {
+            let browser_context = {
+                conn.browser_context
+                    .as_mut()
+                    .expect("browser context should exist")
+            };
+            browser_context.set_active_target_id("TID-page");
+            browser_context.attach_active_session("SID-page");
+        });
     }
     record_shared_worker_console(&mut ctx, "SID-shared-worker", "warn: worker boot warning");
 
@@ -3640,15 +3507,15 @@ async fn shared_worker_discard_console_entries_is_target_local() {
         "Runtime.discardConsoleEntries should suppress buffered shared worker Runtime console replay: {:?}",
         ctx.sent
     );
-    assert_eq!(
-        ctx.conn.session_route(Some("SID-page")),
+    ctx.with_fixture(|conn| { assert_eq!(
+        conn.session_route(Some("SID-page")),
         Some(crate::conn::CdpSessionRoute::PageTarget {
             browser_context_id: "BID-shared".to_owned(),
             target_id: "TID-page".to_owned(),
             session_key: moli_page_types::DevToolsSessionKey::Primary,
         }),
         "shared worker Runtime.discardConsoleEntries must not consume or rewrite the page session route"
-    );
+    ) });
     assert!(
         ctx.sent.iter().all(|message| {
             message["method"] != json!("Runtime.consoleAPICalled")
@@ -3657,4 +3524,258 @@ async fn shared_worker_discard_console_entries_is_target_local() {
         "shared worker Runtime console output must not replay on the active page session: {:?}",
         ctx.sent
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_navigator_query_overrides_are_independent_of_the_page() {
+    let mut ctx = TestContext::new();
+    with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
+    ctx.process_and_wait_for_response_async(json!({"id":99000,"method":"Emulation.setHardwareConcurrencyOverride","params":{"hardwareConcurrency":2}})).await;
+    ctx.expect_result(99000, json!({}), None);
+    ctx.process_and_wait_for_response_async(json!({"id":99015,"method":"Emulation.setDataSaverOverride","params":{"dataSaverEnabled":true}})).await;
+    ctx.expect_result(99015, json!({}), None);
+    let worker = start_attached_shared_worker_session(
+        &mut ctx,
+        99001,
+        "native-hardware",
+        "onconnect = () => {};",
+    )
+    .await;
+    ctx.process_and_wait_for_response_async(json!({"id":99019,"sessionId":worker,"method":"Emulation.setAutomationOverride","params":{"enabled":true}})).await;
+    ctx.expect_result(99019, json!({}), Some(&worker));
+    ctx.process_and_wait_for_response_async(json!({"id":99020,"sessionId":worker,"method":"Runtime.evaluate","params":{"expression":"'webdriver' in navigator","returnByValue":true}})).await;
+    assert_eq!(
+        take_response_by_id(&mut ctx, 99020)["result"]["result"]["value"],
+        json!(false)
+    );
+    for (params, worker_expected) in [
+        (json!({}), false),
+        (json!({"dataSaverEnabled":true}), true),
+        (json!({"dataSaverEnabled":false}), false),
+    ] {
+        ctx.process_and_wait_for_response_async(json!({"id":99016,"sessionId":worker,"method":"Emulation.setDataSaverOverride","params":params})).await;
+        ctx.expect_result(99016, json!({}), Some(&worker));
+        for (id, session, expected) in [
+            (99017, None, true),
+            (99018, Some(worker.as_str()), worker_expected),
+        ] {
+            let mut request = json!({"id":id,"method":"Runtime.evaluate","params":{"expression":"globalThis.heldConnection ??= navigator.connection; [heldConnection.saveData, heldConnection === navigator.connection]","returnByValue":true}});
+            if let Some(session) = session {
+                request["sessionId"] = json!(session);
+            }
+            ctx.process_and_wait_for_response_async(request).await;
+            assert_eq!(
+                take_response_by_id(&mut ctx, id)["result"]["result"]["value"],
+                json!([expected, true])
+            );
+        }
+    }
+    for (id, session, expected) in [(99010, None, 2), (99011, Some(worker.as_str()), 4)] {
+        let mut request = json!({"id":id,"method":"Runtime.evaluate","params":{"expression":"navigator.hardwareConcurrency","returnByValue":true}});
+        if let Some(session) = session {
+            request["sessionId"] = json!(session);
+        }
+        ctx.process_and_wait_for_response_async(request).await;
+        assert_eq!(
+            take_response_by_id(&mut ctx, id)["result"]["result"]["value"],
+            json!(expected)
+        );
+    }
+    for (value, valid) in [(3, true), (0, false)] {
+        ctx.process_and_wait_for_response_async(json!({"id":99012,"sessionId":worker,"method":"Emulation.setHardwareConcurrencyOverride","params":{"hardwareConcurrency":value}})).await;
+        let reply = take_response_by_id(&mut ctx, 99012);
+        if valid {
+            assert_eq!(reply["result"], json!({}), "{reply}");
+        } else {
+            assert_eq!(reply["error"]["code"], -32602, "{reply}");
+        }
+        for (id, session, expected) in [(99013, None, 2), (99014, Some(worker.as_str()), 3)] {
+            let mut request = json!({"id":id,"method":"Runtime.evaluate","params":{"expression":"navigator.hardwareConcurrency","returnByValue":true}});
+            if let Some(session) = session {
+                request["sessionId"] = json!(session);
+            }
+            ctx.process_and_wait_for_response_async(request).await;
+            assert_eq!(
+                take_response_by_id(&mut ctx, id)["result"]["result"]["value"],
+                json!(expected)
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_worker_emulation_activation_tracks_user_agent_commands() {
+    async fn snapshot(ctx: &mut TestContext, session_id: Option<&str>) -> serde_json::Value {
+        let mut request = json!({
+            "id": 99190, "method": "Runtime.evaluate",
+            "params": {
+                "expression": "globalThis.heldNavigator ??= navigator; globalThis.heldConnection ??= navigator.connection; [heldNavigator.hardwareConcurrency, heldConnection.saveData, heldNavigator.userAgent]",
+                "returnByValue": true
+            }
+        });
+        if let Some(session_id) = session_id {
+            request["sessionId"] = json!(session_id);
+        }
+        ctx.process_and_wait_for_response_async(request).await;
+        take_response_by_id(ctx, 99190)["result"]["result"]["value"].clone()
+    }
+
+    let mut ctx = TestContext::new();
+    with_loaded_document_async(&mut ctx, "<!doctype html><body></body>").await;
+    let page_baseline = snapshot(&mut ctx, None).await;
+    let first = start_attached_shared_worker_session(
+        &mut ctx,
+        99100,
+        "emulation-activation-order",
+        "onconnect = () => {};",
+    )
+    .await;
+    let baseline = snapshot(&mut ctx, Some(&first)).await;
+    let target_id = ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session(Some(&first))
+            .unwrap()
+            .target_id
+            .clone()
+    });
+    ctx.process_async(json!({
+        "id": 99102, "method": "Target.attachToTarget",
+        "params": {"targetId": target_id, "flatten": true}
+    }))
+    .await;
+    let second = take_response_by_id(&mut ctx, 99102)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Invalid UA commands must not reserve a place in the Worker agent order.
+    // Both CDP spellings validate before publishing any state.
+    for method in [
+        "Emulation.setUserAgentOverride",
+        "Network.setUserAgentOverride",
+    ] {
+        ctx.process_and_wait_for_response_async(json!({
+            "id": 99103, "sessionId": first, "method": method,
+            "params": {"userAgent": "invalid\nagent"}
+        }))
+        .await;
+        ctx.expect_error(99103, -32602, "Invalid characters found in userAgent");
+        assert_eq!(snapshot(&mut ctx, Some(&first)).await, baseline);
+        assert_eq!(snapshot(&mut ctx, None).await, page_baseline);
+    }
+    ctx.process_and_wait_for_response_async(json!({
+        "id": 99104, "sessionId": first, "method": "Emulation.setHardwareConcurrencyOverride",
+        "params": {"hardwareConcurrency": 0}
+    }))
+    .await;
+    ctx.expect_error(
+        99104,
+        -32602,
+        "HardwareConcurrency must be a positive int32",
+    );
+
+    // UA alone activates the second agent before the first sets concurrency.
+    // Clearing UA must preserve that position for subsequent query overrides.
+    ctx.process_and_wait_for_response_async(json!({
+        "id": 99109, "sessionId": second, "method": "Emulation.setUserAgentOverride",
+        "params": {"userAgent": "worker-emulation-order"}
+    }))
+    .await;
+    ctx.expect_result(99109, json!({}), Some(&second));
+    ctx.process_and_wait_for_response_async(json!({
+        "id": 99110, "sessionId": first, "method": "Emulation.setHardwareConcurrencyOverride",
+        "params": {"hardwareConcurrency": 2}
+    }))
+    .await;
+    ctx.expect_result(99110, json!({}), Some(&first));
+    ctx.process_and_wait_for_response_async(json!({
+        "id": 99111, "sessionId": second, "method": "Network.setUserAgentOverride",
+        "params": {"userAgent": ""}
+    }))
+    .await;
+    ctx.expect_result(99111, json!({}), Some(&second));
+    for (session, method, params, expected) in [
+        (
+            &second,
+            "Emulation.setDataSaverOverride",
+            json!({"dataSaverEnabled": true}),
+            json!([2, true]),
+        ),
+        (
+            &first,
+            "Emulation.setHardwareConcurrencyOverride",
+            json!({"hardwareConcurrency": 2}),
+            json!([2, true]),
+        ),
+        (
+            &second,
+            "Emulation.setHardwareConcurrencyOverride",
+            json!({"hardwareConcurrency": 8}),
+            json!([2, true]),
+        ),
+        (
+            &first,
+            "Emulation.setDataSaverOverride",
+            json!({"dataSaverEnabled": false}),
+            json!([2, false]),
+        ),
+        (
+            &second,
+            "Emulation.setDataSaverOverride",
+            json!({"dataSaverEnabled": true}),
+            json!([2, false]),
+        ),
+        (
+            &first,
+            "Emulation.setDataSaverOverride",
+            json!({}),
+            json!([2, true]),
+        ),
+        (
+            &second,
+            "Emulation.setHardwareConcurrencyOverride",
+            json!({"hardwareConcurrency": 6}),
+            json!([2, true]),
+        ),
+        (
+            &first,
+            "Emulation.setHardwareConcurrencyOverride",
+            json!({"hardwareConcurrency": 3}),
+            json!([3, true]),
+        ),
+    ] {
+        ctx.process_and_wait_for_response_async(json!({
+            "id": 99105, "sessionId": session, "method": method, "params": params
+        }))
+        .await;
+        ctx.expect_result(99105, json!({}), Some(session));
+        assert_eq!(
+            snapshot(&mut ctx, Some(session)).await,
+            json!([expected[0], expected[1], baseline[2]])
+        );
+    }
+    ctx.process_async(json!({
+        "id": 99106, "method": "Target.detachFromTarget", "params": {"sessionId": first}
+    }))
+    .await;
+    ctx.expect_result(99106, json!({}), None);
+    assert_eq!(
+        snapshot(&mut ctx, Some(&second)).await,
+        json!([6, true, baseline[2]])
+    );
+    ctx.process_async(json!({
+        "id": 99107, "method": "Target.detachFromTarget", "params": {"sessionId": second}
+    }))
+    .await;
+    ctx.expect_result(99107, json!({}), None);
+    ctx.process_async(json!({
+        "id": 99108, "method": "Target.attachToTarget",
+        "params": {"targetId": target_id, "flatten": true}
+    }))
+    .await;
+    let observer = take_response_by_id(&mut ctx, 99108)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(snapshot(&mut ctx, Some(&observer)).await, baseline);
+    assert_eq!(snapshot(&mut ctx, None).await, page_baseline);
 }

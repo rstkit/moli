@@ -1,7 +1,8 @@
+use moli_protocol_cdp_defs::LocalCdpEvent;
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::Arc;
 
-use crate::devtools_runtime::AutomationEvent;
+use crate::automation::AutomationEvent;
 use serde_json::Value;
 
 use crate::conn::{BackgroundEventSender, BackgroundProtocolEvent, build_event};
@@ -277,7 +278,7 @@ impl MainDocumentProgressQueueHandle {
         self.lock_drain().append_source(source);
     }
 
-    fn mark_output_visible_until(&self, boundary: MainDocumentProgressOutputBoundary) {
+    pub(super) fn mark_output_visible_until(&self, boundary: MainDocumentProgressOutputBoundary) {
         self.lock_drain().mark_output_visible_until(boundary);
     }
 
@@ -438,15 +439,15 @@ impl<'a> MainDocumentProgressOutputTarget<'a> {
 
     pub(super) fn push_automation_event(
         &mut self,
-        method: &str,
+        method: LocalCdpEvent,
         params: Value,
         session_id: Option<&str>,
         event: AutomationEvent,
     ) {
         let protocol_event = build_event(method, params, session_id);
-        self.push_background_event(BackgroundProtocolEvent::immediate_automation_event(
+        self.push_background_event(BackgroundProtocolEvent::inspector_message(
             protocol_event,
-            event,
+            Some(event),
         ));
     }
 }

@@ -22,13 +22,14 @@ async fn worker_websocket_runtime_activity_emits_cdp_websocket_events_without_pa
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("SID-1".to_owned());
-    ctx.conn.insert_browser_context(bc);
+    ctx.with_fixture(|conn| conn.insert_browser_context(bc));
     ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
         .await;
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("SID-1"))
-        .expect("worker websocket fixture target")
-        .enable_primary_network_events();
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("SID-1"))
+            .expect("worker websocket fixture target")
+            .enable_primary_network_events()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -154,7 +155,7 @@ fetch('/api')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 46,
@@ -304,7 +305,7 @@ async fn enabling_and_disabling_sessions_replays_aggregated_headers_to_loaded_pa
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
     assert!(bc.assign_attached_session_to_target("TID-1", "SID-attached".to_owned()));
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     for (session_id, session_key) in [
         ("SID-1", moli_page_types::DevToolsSessionKey::Primary),
         (
@@ -312,14 +313,16 @@ async fn enabling_and_disabling_sessions_replays_aggregated_headers_to_loaded_pa
             moli_page_types::DevToolsSessionKey::Attached("SID-attached".to_owned()),
         ),
     ] {
-        ctx.conn.register_session_route_for_test(
-            session_id,
-            crate::conn::CdpSessionRoute::PageTarget {
-                browser_context_id: "BID-1".to_owned(),
-                target_id: "TID-1".to_owned(),
-                session_key,
-            },
-        );
+        ctx.with_fixture(|conn| {
+            conn.register_session_route_for_test(
+                session_id,
+                crate::conn::CdpSessionRoute::PageTarget {
+                    browser_context_id: "BID-1".to_owned(),
+                    target_id: "TID-1".to_owned(),
+                    session_key,
+                },
+            )
+        });
     }
 
     ctx.process_async(json!({
@@ -424,21 +427,29 @@ async fn enabling_and_disabling_sessions_replays_aggregated_headers_to_loaded_pa
     ctx.expect_result(50_013, json!({}), Some("SID-attached"));
     fetch_header(&mut ctx, 50_014, &api_url, "aux-after-enable").await;
 
-    ctx.conn
-        .clear_devtools_network_session_policy_async("SID-attached")
-        .await
-        .expect("detaching the attached session should restore effective request policy");
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_mut()
-            .unwrap()
-            .remove_page_session_binding(
-                "TID-1",
-                "SID-attached",
-                &moli_page_types::DevToolsSessionKey::Attached("SID-attached".to_owned()),
+    {
+        let (owner, pending) = ctx.with_fixture(|conn| {
+            (
+                crate::conn::CommandOwnerScope::capture(conn, Some("SID-attached")),
+                conn.start_clear_devtools_network_session_policy("SID-attached"),
             )
-    );
+        });
+        ctx.finish_fixture_page_updates(owner, pending)
+    }
+    .await
+    .expect("detaching the attached session should restore effective request policy");
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.browser_context
+                .as_mut()
+                .unwrap()
+                .remove_page_session_binding(
+                    "TID-1",
+                    "SID-attached",
+                    &moli_page_types::DevToolsSessionKey::Attached("SID-attached".to_owned()),
+                )
+        })
+    });
     fetch_header(&mut ctx, 50_015, &api_url, "primary").await;
 
     server.abort();
@@ -491,7 +502,7 @@ fetch('/binary')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_290,
@@ -598,7 +609,7 @@ fetch('/slow')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_286,
@@ -725,7 +736,7 @@ fetch('/slow-clone')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_328,
@@ -837,7 +848,7 @@ fetch('/partial')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_380,
@@ -983,7 +994,7 @@ fetch('/binary')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_294,
@@ -1096,7 +1107,7 @@ fetch('/large-binary')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_316,
@@ -1220,7 +1231,7 @@ fetch('/data')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_299,
@@ -1306,13 +1317,13 @@ fetch('/api')
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
     {
-        let mut jar = bc.cookie_store_for_test().lock();
+        let mut jar = bc.cookie_store_for_test().lock().unwrap();
         jar.store_response_headers(
             &Url::parse(&api_url).unwrap(),
-            &[("set-cookie".to_owned(), "sid=1; Path=/api".to_owned())],
+            &[("set-cookie".to_owned(), b"sid=1; Path=/api".to_vec())],
         );
     }
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 491,
@@ -1424,7 +1435,7 @@ xhr.send();
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 60,
@@ -1547,7 +1558,7 @@ xhr.send('challenge-payload');
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 64,
@@ -1671,7 +1682,7 @@ xhr.send('challenge-payload');
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 66,
@@ -1800,7 +1811,8 @@ async fn parser_external_script_applies_extra_http_headers() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    ctx.enable_page_events_for_test(Some("SID-1"));
 
     ctx.process_async(json!({
         "id": 70_000,
@@ -1905,7 +1917,7 @@ async fn parser_blocking_stylesheet_emits_subresource_network_events_and_capture
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 70_101,
@@ -2044,7 +2056,7 @@ async fn parser_style_import_emits_subresource_network_events_and_captures_body(
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 70_201,
@@ -2176,7 +2188,7 @@ async fn parser_external_script_emits_subresource_network_events_and_captures_bo
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 70_004,
@@ -2298,7 +2310,7 @@ worker.onmessage = event => {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 70_019,
@@ -2394,7 +2406,7 @@ fetch('/api')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 40,
@@ -2537,7 +2549,7 @@ document.body.setAttribute('data-xhr-status', String(xhr.status));
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 43,
@@ -2667,7 +2679,7 @@ fetch('{api_url}').catch(() => {{ document.body.setAttribute('data-fetch-failed'
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 52,
@@ -2781,7 +2793,7 @@ xhr.send();
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 55,
@@ -2908,7 +2920,7 @@ fetch('/api-start')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 46,
@@ -3096,16 +3108,16 @@ fetch('{start_url}', {{ credentials: 'include' }})
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
     {
-        let mut jar = bc.cookie_store_for_test().lock();
+        let mut jar = bc.cookie_store_for_test().lock().unwrap();
         jar.store_response_headers(
             &Url::parse(&final_url).unwrap(),
             &[(
                 "set-cookie".to_owned(),
-                "strict=1; Path=/; SameSite=Strict".to_owned(),
+                b"strict=1; Path=/; SameSite=Strict".to_vec(),
             )],
         );
     }
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 471,
@@ -3335,13 +3347,18 @@ fetch('{target_url}', {{ credentials: 'include' }})
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
     {
-        let mut jar = bc.cookie_store_for_test().lock();
+        let mut jar = bc.cookie_store_for_test().lock().unwrap();
         jar.store_response_headers(
             &Url::parse("http://127.0.0.1:8443/").unwrap(),
-            &[("set-cookie".to_owned(), "sid=1; Path=/".to_owned())],
+            // The caller is localhost and the cookie host is 127.0.0.1, so
+            // opt into cross-site use while testing that cookie ports are ignored.
+            &[(
+                "set-cookie".to_owned(),
+                b"sid=1; Path=/; SameSite=None; Secure".to_vec(),
+            )],
         );
     }
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 481,
@@ -3428,13 +3445,13 @@ fetch('{target_url}')
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
     {
-        let mut jar = bc.cookie_store_for_test().lock();
+        let mut jar = bc.cookie_store_for_test().lock().unwrap();
         jar.store_response_headers(
             &Url::parse(&format!("http://localhost:{}/", addr.port())).unwrap(),
-            &[("set-cookie".to_owned(), "sid=1; Path=/; Secure".to_owned())],
+            &[("set-cookie".to_owned(), b"sid=1; Path=/; Secure".to_vec())],
         );
     }
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 483,
@@ -3521,7 +3538,7 @@ xhr.send();
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 49,
@@ -3595,5 +3612,166 @@ xhr.send();
         Some("SID-1"),
     );
 
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cdp_utf8_headers_coexist_with_fetch_and_xhr_byte_strings() {
+    const PROBE: &str = r#"
+        const headers = { 'x-web': '\u00e9\u00ff', 'x-override': '\u00e9' };
+        function xhrProbe(async) {
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('GET', '/echo', async);
+                for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+                xhr.onload = () => resolve(JSON.parse(xhr.responseText));
+                xhr.onerror = () => reject(new Error('XHR failed'));
+                xhr.send();
+            });
+        }
+        const results = await Promise.all([
+            fetch('/redirect', { headers }).then(response => response.json()),
+            xhrProbe(true),
+            xhrProbe(false)
+        ]);
+    "#;
+    async fn echo(headers: axum::http::HeaderMap) -> impl IntoResponse {
+        axum::Json(json!({
+            "cdp": headers.get("x-cdp").map(|value| value.as_bytes()),
+            "web": headers.get("x-web").map(|value| value.as_bytes()),
+            "override": headers.get("x-override").map(|value| value.as_bytes()),
+        }))
+    }
+    let worker_script = format!("(async () => {{ {PROBE} postMessage(results); }})()");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/page", get(plain_page))
+                .route("/echo", get(echo))
+                .route(
+                    "/redirect",
+                    get(|| async { axum::response::Redirect::temporary("/echo") }),
+                )
+                .route(
+                    "/worker.js",
+                    get(move || async move {
+                        ([(CONTENT_TYPE.as_str(), "text/javascript")], worker_script)
+                    }),
+                ),
+        )
+        .await
+        .unwrap();
+    });
+    let mut ctx = TestContext::new();
+    let mut bc = BrowserContext::new("BID-1".into());
+    bc.set_active_target_id("TID-1");
+    bc.attach_active_session("SID-1");
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    ctx.process_async(json!({
+        "id": 0, "method": "Network.enable", "sessionId": "SID-1"
+    }))
+    .await;
+    ctx.expect_result(0, json!({}), Some("SID-1"));
+    ctx.process_async(json!({
+        "id": 1, "method": "Network.setExtraHTTPHeaders", "sessionId": "SID-1",
+        "params": { "headers": { "x-cdp": "é中", "X-Override": "中" } }
+    }))
+    .await;
+    ctx.expect_result(1, json!({}), Some("SID-1"));
+    ctx.process_async(json!({
+        "id": 2, "method": "Page.navigate", "sessionId": "SID-1",
+        "params": { "url": format!("http://{addr}/page") }
+    }))
+    .await;
+    ctx.process_async(json!({
+        "id": 3, "method": "Runtime.evaluate", "sessionId": "SID-1",
+        "params": {
+            "expression": format!(r#"(async () => {{
+                {PROBE}
+                const workerResults = await new Promise((resolve, reject) => {{
+                    const worker = new Worker('/worker.js');
+                    worker.onmessage = event => {{ worker.terminate(); resolve(event.data); }};
+                    worker.onerror = () => reject(new Error('Worker failed'));
+                }});
+                return JSON.stringify(results.concat(workerResults));
+            }})()"#),
+            "awaitPromise": true, "returnByValue": true
+        }
+    }))
+    .await;
+    wait_until_messages(
+        &mut ctx,
+        Some("SID-1"),
+        "mixed header encoding probe",
+        |messages| messages.iter().any(|message| message["id"] == json!(3)),
+    )
+    .await;
+    let expected =
+        json!({ "cdp": [0xc3, 0xa9, 0xe4, 0xb8, 0xad], "web": [0xe9, 0xff], "override": [0xe9] });
+    ctx.expect_result(3, json!({ "result": { "type": "string", "value": serde_json::to_string(&vec![expected; 6]).unwrap() } }), Some("SID-1"));
+    ctx.process_async(json!({
+        "id": 4, "method": "Fetch.enable", "sessionId": "SID-1",
+        "params": { "patterns": [{ "urlPattern": "*/echo", "requestStage": "Request" }] }
+    }))
+    .await;
+    ctx.expect_result(4, json!({}), Some("SID-1"));
+    for replace_headers in [false, true] {
+        ctx.sent.clear();
+        ctx.process_async(json!({
+            "id": 5, "method": "Runtime.evaluate", "sessionId": "SID-1",
+            "params": {
+                "expression": r#"fetch('/echo', {headers: {'x-web': '\u00e9\u00ff', 'x-override': '\u00e9'}}).then(response => response.text())"#,
+                "awaitPromise": true, "returnByValue": true
+            }
+        })).await;
+        wait_until_messages(
+            &mut ctx,
+            Some("SID-1"),
+            "byte header request pause",
+            |messages| {
+                messages
+                    .iter()
+                    .any(|message| message["method"] == "Fetch.requestPaused")
+            },
+        )
+        .await;
+        let messages = ctx.take_all();
+        let paused = messages
+            .iter()
+            .find(|message| message["method"] == "Fetch.requestPaused")
+            .unwrap();
+        let mut params = json!({"requestId": paused["params"]["requestId"]});
+        if replace_headers {
+            params["headers"] = json!([
+                {"name": "x-cdp", "value": "é中"},
+                {"name": "x-web", "value": "é中"},
+                {"name": "x-override", "value": "é"}
+            ]);
+        }
+        ctx.process_async(json!({
+            "id": 6, "method": "Fetch.continueRequest", "sessionId": "SID-1", "params": params
+        }))
+        .await;
+        wait_until_messages(
+            &mut ctx,
+            Some("SID-1"),
+            "continued byte header request",
+            |messages| messages.iter().any(|message| message["id"] == json!(5)),
+        )
+        .await;
+        let expected = if replace_headers {
+            json!({"cdp": [0xc3, 0xa9, 0xe4, 0xb8, 0xad], "web": [0xc3, 0xa9, 0xe4, 0xb8, 0xad], "override": [0xc3, 0xa9]})
+        } else {
+            json!({"cdp": [0xc3, 0xa9, 0xe4, 0xb8, 0xad], "web": [0xe9, 0xff], "override": [0xe9]})
+        };
+        ctx.expect_result(
+            5,
+            json!({"result": {"type": "string", "value": expected.to_string()}}),
+            Some("SID-1"),
+        );
+    }
     server.abort();
 }

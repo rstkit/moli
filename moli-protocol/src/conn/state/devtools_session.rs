@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ops::{Index, IndexMut},
+    rc::Rc,
 };
 
 use super::{
@@ -25,12 +27,29 @@ use moli_page_types::{
     RendererDomDebuggerXhrBreakpoint,
 };
 
+/// One closing state shared by a committed binding and its domain handlers.
+/// Prepared handlers retain this state before their binding is committed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DevToolsSessionLifecycle(Rc<Cell<bool>>);
+
+impl DevToolsSessionLifecycle {
+    pub(crate) fn is_closing(&self) -> bool {
+        self.0.get()
+    }
+
+    pub(crate) fn mark_closing(&self) {
+        self.0.set(true);
+    }
+}
+
 /// CDP domain-handler state owned by one DevTools session.
 ///
 /// Browser-side policy and renderer-inspector state live together here so
 /// attachment, replay, and disposal all address the same session object.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct DevToolsSessionState {
+    pub(crate) lifecycle: DevToolsSessionLifecycle,
+    pub(crate) web_mcp_enabled: bool,
     pub(crate) dom_session_state: DevToolsDomSessionState,
     pub(crate) dom_debugger_event_listener_breakpoints:
         BTreeSet<RendererDomDebuggerEventListenerBreakpoint>,
@@ -43,13 +62,21 @@ pub(crate) struct DevToolsSessionState {
     pub(crate) emulation_session_state: DevToolsEmulationSessionState,
     pub(crate) runtime_bindings: Vec<RuntimeBindingDefinition>,
     pub(crate) runtime_binding_replay_pending: BTreeSet<(String, Option<String>)>,
-    pub(crate) runtime_remote_object_ids: HashSet<String>,
-    pub(crate) runtime_remote_object_groups: HashMap<String, String>,
-    pub(crate) runtime_remote_object_realms: HashMap<String, String>,
-    pub(crate) runtime_remote_object_aliases: HashMap<String, String>,
+    pub(crate) dom_remote_object_node_cache: HashMap<String, serde_json::Value>,
+    pub(crate) bidi_handles: crate::conn::bidi_handles::BidiHandles,
+
+    // Exported node identities outlive their Document so a first Classic use
+    // after navigation still reports stale. Entries contain no JS roots.
+    pub(crate) webdriver_node_references: HashMap<String, super::WebDriverNodeReference>,
     pub(crate) emitted_child_default_execution_context_ids: HashSet<i64>,
     pub(crate) inspector_session_state: InspectorSessionState,
     pub(crate) pending_inspector_awaits: TargetPendingInspectorAwaitRegistry,
+}
+
+impl DevToolsSessionState {
+    pub(crate) fn is_closing(&self) -> bool {
+        self.lifecycle.is_closing()
+    }
 }
 
 /// Every DevTools session attached to one Page target.
@@ -58,11 +85,15 @@ pub(crate) struct DevToolsSessionState {
 /// target sessions use `Attached(session_id)`. Keeping both in one ordered map
 /// gives attachment, disposal, replay, and effective-domain aggregation one
 /// source of truth.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct DevToolsSessionRegistry {
     primary_session_id: Option<String>,
     states: BTreeMap<DevToolsSessionKey, DevToolsSessionState>,
     attached_order: Vec<String>,
+    pub(crate) navigator_emulation: moli_page_types::NavigatorEmulationSessions,
+    // Live, non-cloneable authority stays outside DevToolsSessionState, whose
+    // snapshots may outlive attachment. Removing an entry releases its claims.
+    environment_owners: BTreeMap<DevToolsSessionKey, moli_core::ProcessEnvironmentOwner>,
 }
 
 impl Default for DevToolsSessionRegistry {
@@ -74,6 +105,8 @@ impl Default for DevToolsSessionRegistry {
                 DevToolsSessionState::default(),
             )]),
             attached_order: Vec::new(),
+            navigator_emulation: Default::default(),
+            environment_owners: BTreeMap::new(),
         }
     }
 }
@@ -119,6 +152,16 @@ impl DevToolsSessionRegistry {
         self.states.get(session_key)
     }
 
+    /// Configuration replay can only inherit live sessions. Cleanup and
+    /// already accepted receipts deliberately continue to use session().
+    pub(crate) fn session_for_configuration(
+        &self,
+        session_key: &DevToolsSessionKey,
+    ) -> Option<&DevToolsSessionState> {
+        self.session(session_key)
+            .filter(|state| !state.is_closing())
+    }
+
     pub(crate) fn ensure_session(
         &mut self,
         session_key: &DevToolsSessionKey,
@@ -148,6 +191,8 @@ impl DevToolsSessionRegistry {
 
     pub(crate) fn remove_attached(&mut self, session_id: &str) -> Option<DevToolsSessionState> {
         let key = DevToolsSessionKey::Attached(session_id.to_owned());
+        self.environment_owners.remove(&key);
+        self.navigator_emulation.remove(&key);
         let removed = self.states.remove(&key);
         if removed.is_some() {
             self.attached_order
@@ -172,6 +217,8 @@ impl DevToolsSessionRegistry {
                     return None;
                 }
                 self.primary_session_id = None;
+                self.environment_owners.remove(session_key);
+                self.navigator_emulation.remove(session_key);
                 Some(std::mem::take(self.primary_mut()))
             }
             DevToolsSessionKey::Attached(attached_session_id)
@@ -324,6 +371,9 @@ impl DevToolsSessionRegistry {
         session_key: &DevToolsSessionKey,
         browser_identity_override: Option<DevToolsBrowserIdentityOverride>,
     ) {
+        if browser_identity_override.is_some() {
+            self.navigator_emulation.session_mut(session_key);
+        }
         let state = self.ensure_session(session_key);
         state.emulation_session_state.browser_identity_override = browser_identity_override;
     }
@@ -332,57 +382,54 @@ impl DevToolsSessionRegistry {
         &mut self,
         session_key: &DevToolsSessionKey,
         locale_override: Option<String>,
-    ) -> Result<(), &'static str> {
-        let current_session_owns_override = self
-            .states
-            .get(session_key)
-            .is_some_and(|state| state.emulation_session_state.locale_override.is_some());
-        let another_session_owns_override = self.states.iter().any(|(candidate, state)| {
-            candidate != session_key && state.emulation_session_state.locale_override.is_some()
-        });
-        if !current_session_owns_override && another_session_owns_override {
-            return Err("Another locale override is already in effect");
-        }
-        self.ensure_session(session_key)
-            .emulation_session_state
-            .locale_override = locale_override;
-        Ok(())
+    ) -> Result<(), moli_v8_platform::ProcessEnvironmentError> {
+        self.update_environment_owner(session_key, |owner| {
+            owner.set_locale(locale_override.as_deref())
+        })
     }
 
     pub(crate) fn set_timezone_override(
         &mut self,
         session_key: &DevToolsSessionKey,
         timezone_override: Option<String>,
-    ) -> Result<(), &'static str> {
-        let current_session_owns_override = self
-            .states
-            .get(session_key)
-            .is_some_and(|state| state.emulation_session_state.timezone_override.is_some());
-        let another_session_owns_override = self.states.iter().any(|(candidate, state)| {
-            candidate != session_key && state.emulation_session_state.timezone_override.is_some()
-        });
-        if timezone_override.is_some()
-            && !current_session_owns_override
-            && another_session_owns_override
-        {
-            return Err("Timezone override is already in effect");
+    ) -> Result<(), moli_v8_platform::ProcessEnvironmentError> {
+        self.update_environment_owner(session_key, |owner| {
+            owner.set_timezone(timezone_override.as_deref())
+        })
+    }
+
+    fn update_environment_owner(
+        &mut self,
+        key: &DevToolsSessionKey,
+        update: impl FnOnce(
+            &moli_core::ProcessEnvironmentOwner,
+        ) -> Result<(), moli_v8_platform::ProcessEnvironmentError>,
+    ) -> Result<(), moli_v8_platform::ProcessEnvironmentError> {
+        let owner = self.environment_owners.entry(key.clone()).or_default();
+        let result = update(owner);
+        // Reconcile on both success and failure. An invalid update must retain
+        // an existing claim; a rejected first claim or same-timezone non-owner
+        // success must leave neither an owner entry nor a phantom session.
+        if owner.has_override() {
+            self.ensure_session(key);
+        } else {
+            self.environment_owners.remove(key);
         }
-        self.ensure_session(session_key)
-            .emulation_session_state
-            .timezone_override = timezone_override;
-        Ok(())
+        result
     }
 
-    pub(crate) fn effective_locale_override(&self) -> Option<&str> {
-        self.states
+    #[cfg(test)]
+    pub(crate) fn effective_locale_override(&self) -> Option<String> {
+        self.environment_owners
             .values()
-            .find_map(|state| state.emulation_session_state.locale_override.as_deref())
+            .find_map(moli_core::ProcessEnvironmentOwner::locale)
     }
 
-    pub(crate) fn effective_timezone_override(&self) -> Option<&str> {
-        self.states
+    #[cfg(test)]
+    pub(crate) fn effective_timezone_override(&self) -> Option<String> {
+        self.environment_owners
             .values()
-            .find_map(|state| state.emulation_session_state.timezone_override.as_deref())
+            .find_map(moli_core::ProcessEnvironmentOwner::timezone)
     }
 
     pub(crate) fn clear_network_state(&mut self, session_key: &DevToolsSessionKey) {
@@ -392,11 +439,10 @@ impl DevToolsSessionRegistry {
     }
 
     pub(crate) fn clear_emulation_policy_state(&mut self, session_key: &DevToolsSessionKey) {
+        self.environment_owners.remove(session_key);
         if let Some(state) = self.states.get_mut(session_key) {
             let emulation = &mut state.emulation_session_state;
             emulation.browser_identity_override = None;
-            emulation.locale_override = None;
-            emulation.timezone_override = None;
         }
     }
 
@@ -405,7 +451,13 @@ impl DevToolsSessionRegistry {
     }
 
     pub(crate) fn has_non_default_state(&self) -> bool {
-        self.primary() != &DevToolsSessionState::default() || !self.attached_is_empty()
+        !self.navigator_emulation.is_empty()
+            || self.primary() != &DevToolsSessionState::default()
+            || !self.attached_is_empty()
+            || self
+                .environment_owners
+                .values()
+                .any(moli_core::ProcessEnvironmentOwner::has_override)
     }
 
     pub(crate) fn has_pending_inspector_awaits(&self) -> bool {
@@ -450,6 +502,9 @@ impl DevToolsSessionRegistry {
     ) -> Result<Vec<SessionRendererCallReplay>, RendererCallIdExhausted> {
         let mut replays = Vec::new();
         for (key, state) in &mut self.states {
+            if state.is_closing() {
+                continue;
+            }
             let (frontend_session_id, renderer_inspector_session_id) = match key {
                 DevToolsSessionKey::Primary => (primary_session_id.map(str::to_owned), None),
                 DevToolsSessionKey::Attached(session_id) => {
@@ -498,6 +553,9 @@ impl DevToolsSessionRegistry {
     pub(crate) fn runtime_bindings_for_renderer(&self) -> Vec<RuntimeBindingDefinition> {
         let mut bindings = Vec::new();
         for (key, state) in &self.states {
+            if state.is_closing() {
+                continue;
+            }
             for binding in &state.runtime_bindings {
                 let binding = binding.with_devtools_session(key.clone());
                 if !bindings.iter().any(|existing| existing == &binding) {
@@ -514,7 +572,11 @@ impl DevToolsSessionRegistry {
         self.states
             .iter()
             .filter_map(|(key, state)| {
+                if state.is_closing() {
+                    return None;
+                }
                 let requires_restore = state.runtime_session_state.runtime_frontend_enabled
+                    || state.web_mcp_enabled
                     || state.console_output_session_state.console_enabled
                     || !state.runtime_bindings.is_empty()
                     || !state.dom_debugger_event_listener_breakpoints.is_empty()
@@ -526,6 +588,7 @@ impl DevToolsSessionRegistry {
                         state.inspector_session_state.v8_state.clone(),
                     ),
                     protocol_configuration: RendererInspectorProtocolConfiguration {
+                        web_mcp_enabled: state.web_mcp_enabled,
                         runtime_bindings: state.runtime_bindings.clone(),
                         runtime_frontend_enabled: state
                             .runtime_session_state
@@ -545,7 +608,7 @@ impl DevToolsSessionRegistry {
 
     pub(crate) fn page_bypass_csp_enabled(&self) -> bool {
         self.states()
-            .any(|state| state.page_session_state.page_bypass_csp_enabled)
+            .any(|state| !state.is_closing() && state.page_session_state.page_bypass_csp_enabled)
     }
 }
 
@@ -657,45 +720,24 @@ pub(crate) struct DevToolsNetworkSessionState {
     pub(crate) cache_disabled: bool,
     pub(crate) bypass_service_worker: bool,
     pub(crate) blocked_url_patterns: Vec<String>,
-    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) extra_headers: moli_fetch::RequestHeaders,
     pub(crate) service_worker_fetch_diagnostic_entries: usize,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub(crate) struct DevToolsEmulationSessionState {
+    pub(crate) default_background_color: Option<[u8; 4]>,
     // UA, Accept-Language, and platform are independent handler contributions.
     pub(crate) browser_identity_override: Option<DevToolsBrowserIdentityOverride>,
-    // Locale and timezone are exclusive controller claims, unlike UA fields.
-    pub(crate) locale_override: Option<String>,
-    pub(crate) timezone_override: Option<String>,
     pub(crate) network_conditions: Option<super::EmulatedNetworkConditions>,
     pub(crate) geolocation_override: Option<super::EmulatedGeolocationOverrideState>,
     pub(crate) emulated_media: super::EmulatedMediaOverrides,
     pub(crate) emulated_device_metrics: Option<super::EmulatedDeviceMetrics>,
-    pub(crate) cpu_throttling_rate: f64,
-    pub(crate) touch_emulation_enabled: bool,
+    pub(crate) max_touch_points: u32,
     pub(crate) emit_touch_events_for_mouse: bool,
     pub(crate) focus_emulation_enabled: bool,
     pub(crate) script_execution_disabled: bool,
-}
-
-impl Default for DevToolsEmulationSessionState {
-    fn default() -> Self {
-        Self {
-            browser_identity_override: None,
-            locale_override: None,
-            timezone_override: None,
-            network_conditions: None,
-            geolocation_override: None,
-            emulated_media: super::EmulatedMediaOverrides::default(),
-            emulated_device_metrics: None,
-            cpu_throttling_rate: 1.0,
-            touch_emulation_enabled: false,
-            emit_touch_events_for_mouse: false,
-            focus_emulation_enabled: false,
-            script_execution_disabled: false,
-        }
-    }
+    pub(crate) scrollbars_hidden: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -748,7 +790,7 @@ pub(crate) struct DevToolsNetworkPolicyAggregate {
     pub(crate) cache_disabled: bool,
     pub(crate) bypass_service_worker: bool,
     pub(crate) blocked_url_patterns: Vec<String>,
-    pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) extra_headers: moli_fetch::RequestHeaders,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -804,9 +846,8 @@ impl DevToolsSessionState {
         &mut self,
         cdp_request_id: u64,
         session_id: Option<&str>,
-        object_group: Option<&str>,
     ) {
-        self.try_register_pending_inspector_await(cdp_request_id, session_id, object_group)
+        self.try_register_pending_inspector_await(cdp_request_id, session_id)
             .expect("pending Inspector await frontend command id must be unique per session");
     }
 
@@ -814,23 +855,21 @@ impl DevToolsSessionState {
         &mut self,
         cdp_request_id: u64,
         session_id: Option<&str>,
-        object_group: Option<&str>,
     ) -> Result<(), DuplicatePendingRendererCommand> {
         self.pending_inspector_awaits
-            .try_insert(cdp_request_id, session_id, object_group)
+            .try_insert(cdp_request_id, session_id)
     }
 
     pub(crate) fn register_pending_bidi_channel_listener(
         &mut self,
         cdp_request_id: u64,
         session_id: Option<&str>,
-        object_group: Option<&str>,
+
         listener: crate::conn::BidiChannelListenerResidence,
     ) {
         self.pending_inspector_awaits.insert_bidi_channel_listener(
             cdp_request_id,
             session_id,
-            object_group,
             listener,
         );
     }
@@ -862,18 +901,6 @@ impl DevToolsSessionState {
     ) -> Option<RendererCommandCorrelation> {
         self.pending_inspector_awaits
             .renderer_call_for_frontend(cdp_request_id)
-    }
-
-    pub(crate) fn renderer_command_descriptor_for_renderer_if_attachment_matches(
-        &self,
-        renderer_call_id: moli_page_types::RendererCallId,
-        dispatched_attachment_id: Option<moli_page_types::RendererAgentAttachmentId>,
-    ) -> Option<RendererCommandDescriptor> {
-        self.pending_inspector_awaits
-            .renderer_command_descriptor_for_renderer_if_attachment_matches(
-                renderer_call_id,
-                dispatched_attachment_id,
-            )
     }
 
     pub(crate) fn prepare_renderer_call_replays(
@@ -947,98 +974,9 @@ impl DevToolsSessionState {
         self.pending_inspector_awaits.drain_all()
     }
 
-    pub(crate) fn register_runtime_remote_object_ids<I>(&mut self, object_ids: I)
-    where
-        I: IntoIterator<Item = String>,
-    {
-        self.runtime_remote_object_ids.extend(object_ids);
-    }
+    pub(crate) fn clear_runtime_context_metadata(&mut self) {
+        self.bidi_handles.clear();
 
-    pub(crate) fn register_runtime_remote_object_ids_with_realm<I>(
-        &mut self,
-        object_ids: I,
-        realm_id: &str,
-    ) where
-        I: IntoIterator<Item = String>,
-    {
-        for object_id in object_ids {
-            self.runtime_remote_object_ids.insert(object_id.clone());
-            self.runtime_remote_object_realms
-                .insert(object_id, realm_id.to_owned());
-        }
-    }
-
-    pub(crate) fn register_runtime_remote_object_alias_with_realm(
-        &mut self,
-        alias_id: String,
-        object_id: String,
-        realm_id: &str,
-    ) {
-        self.runtime_remote_object_ids.insert(object_id.clone());
-        self.runtime_remote_object_realms
-            .insert(object_id.clone(), realm_id.to_owned());
-        self.runtime_remote_object_aliases
-            .insert(alias_id.clone(), object_id);
-        self.runtime_remote_object_realms
-            .insert(alias_id, realm_id.to_owned());
-    }
-
-    pub(crate) fn register_runtime_remote_object_ids_with_group<I>(
-        &mut self,
-        object_ids: I,
-        object_group: &str,
-    ) where
-        I: IntoIterator<Item = String>,
-    {
-        for object_id in object_ids {
-            self.runtime_remote_object_ids.insert(object_id.clone());
-            self.runtime_remote_object_groups
-                .insert(object_id, object_group.to_owned());
-        }
-    }
-
-    pub(crate) fn unregister_runtime_remote_object_ids(&mut self, object_ids: &[String]) {
-        let object_ids = object_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let alias_ids_to_remove = self
-            .runtime_remote_object_aliases
-            .iter()
-            .filter_map(|(alias_id, object_id)| {
-                (object_ids.contains(alias_id.as_str()) || object_ids.contains(object_id.as_str()))
-                    .then_some(alias_id.clone())
-            })
-            .collect::<Vec<_>>();
-
-        for object_id in object_ids {
-            self.runtime_remote_object_ids.remove(object_id);
-            self.runtime_remote_object_groups.remove(object_id);
-            self.runtime_remote_object_realms.remove(object_id);
-        }
-
-        for alias_id in alias_ids_to_remove {
-            self.runtime_remote_object_aliases.remove(&alias_id);
-            self.runtime_remote_object_realms.remove(&alias_id);
-        }
-    }
-
-    pub(crate) fn unregister_runtime_remote_object_group(&mut self, object_group: &str) {
-        let object_ids = self
-            .runtime_remote_object_groups
-            .iter()
-            .filter_map(|(object_id, group)| {
-                (group == object_group).then_some(object_id.to_owned())
-            })
-            .collect::<Vec<_>>();
-        self.unregister_runtime_remote_object_ids(&object_ids);
-    }
-
-    pub(crate) fn clear_runtime_remote_object_tracking(&mut self) {
-        self.runtime_remote_object_ids.clear();
-        self.runtime_remote_object_groups.clear();
-        self.runtime_remote_object_realms.clear();
-        self.runtime_remote_object_aliases.clear();
         self.clear_child_default_context_emission_state();
     }
 
@@ -1072,71 +1010,8 @@ impl DevToolsSessionState {
         self.emitted_child_default_execution_context_ids.clear();
     }
 
-    pub(crate) fn clear_runtime_remote_objects_for_realm(&mut self, realm_id: &str) {
-        let object_ids = self
-            .runtime_remote_object_realms
-            .iter()
-            .filter_map(|(object_id, realm)| (realm == realm_id).then_some(object_id.clone()))
-            .collect::<Vec<_>>();
-        self.unregister_runtime_remote_object_ids(&object_ids);
-    }
-
-    pub(crate) fn runtime_remote_object_group(&self, object_id: &str) -> Option<&str> {
-        self.runtime_remote_object_groups
-            .get(object_id)
-            .or_else(|| {
-                self.runtime_remote_object_aliases
-                    .get(object_id)
-                    .and_then(|object_id| self.runtime_remote_object_groups.get(object_id))
-            })
-            .map(String::as_str)
-    }
-
-    pub(crate) fn has_runtime_remote_object_id(&self, object_id: &str) -> bool {
-        self.runtime_remote_object_ids.contains(object_id)
-            || self.runtime_remote_object_aliases.contains_key(object_id)
-    }
-
-    pub(crate) fn runtime_remote_object_realm(&self, object_id: &str) -> Option<&str> {
-        self.runtime_remote_object_realms
-            .get(object_id)
-            .or_else(|| {
-                self.runtime_remote_object_aliases
-                    .get(object_id)
-                    .and_then(|object_id| self.runtime_remote_object_realms.get(object_id))
-            })
-            .map(String::as_str)
-    }
-
-    pub(crate) fn runtime_remote_object_alias(&self, object_id: &str) -> Option<&str> {
-        self.runtime_remote_object_aliases
-            .get(object_id)
-            .map(String::as_str)
-    }
-
-    pub(crate) fn take_runtime_remote_object_cleanup_plan(&mut self) -> (Vec<String>, Vec<String>) {
-        let grouped_object_ids = self
-            .runtime_remote_object_groups
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
-        let mut object_groups = self
-            .runtime_remote_object_groups
-            .values()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut ungrouped_object_ids = self
-            .runtime_remote_object_ids
-            .iter()
-            .filter(|object_id| !grouped_object_ids.contains(*object_id))
-            .cloned()
-            .collect::<Vec<_>>();
-        object_groups.sort();
-        ungrouped_object_ids.sort();
-        self.clear_runtime_remote_object_tracking();
-        (object_groups, ungrouped_object_ids)
+    pub(crate) fn clear_bidi_references_for_realm(&mut self, realm_id: &str) {
+        self.bidi_handles.clear_realm(realm_id);
     }
 }
 
@@ -1160,9 +1035,95 @@ impl DevToolsDomStorageSessionState {
     }
 }
 
+impl DevToolsSessionState {
+    pub(crate) fn pending_console_domain_messages<'a>(
+        &self,
+        messages: &'a [moli_core::page::RuntimeConsoleMessageSnapshot],
+    ) -> &'a [moli_core::page::RuntimeConsoleMessageSnapshot] {
+        if !self.console_output_session_state.console_enabled {
+            return &[];
+        }
+        &messages[self
+            .console_output_session_state
+            .console_domain_entries
+            .min(messages.len())..]
+    }
+
+    pub(crate) fn pending_runtime_console_messages<'a>(
+        &self,
+        messages: &'a [moli_core::page::RuntimeConsoleMessageSnapshot],
+        has_execution_context: bool,
+    ) -> &'a [moli_core::page::RuntimeConsoleMessageSnapshot] {
+        if !self.runtime_session_state.runtime_frontend_enabled || !has_execution_context {
+            return &[];
+        }
+        &messages[self
+            .console_output_session_state
+            .runtime_console_entries
+            .min(messages.len())..]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_session_and_handlers_share_closing_without_a_second_write() {
+        let mut conn = crate::conn::CdpConnection::new();
+        let mut browser =
+            crate::conn::BrowserContext::new_with_page_for_test("BID-lifecycle", "TID-lifecycle");
+        browser.attach_active_session("SID-lifecycle");
+        conn.install_browser_context_fixture_for_test(browser);
+        let owner = crate::conn::CommandOwnerScope::for_session("SID-lifecycle");
+        let lifecycle = conn
+            .target_devtools_session_state_for_owner(&owner)
+            .unwrap()
+            .lifecycle
+            .clone();
+
+        conn.target_control.mark_session_closing("SID-lifecycle");
+
+        assert!(lifecycle.is_closing());
+        assert!(
+            conn.target_devtools_session_state_for_owner(&owner)
+                .unwrap()
+                .is_closing()
+        );
+        assert!(conn.session_disposal_wait("SID-lifecycle").is_some());
+    }
+
+    #[test]
+    fn reused_binding_does_not_inherit_the_retired_handlers_closing_state() {
+        let mut conn = crate::conn::CdpConnection::new();
+        let mut browser =
+            crate::conn::BrowserContext::new_with_page_for_test("BID-lifecycle", "TID-lifecycle");
+        browser.attach_active_session("SID-lifecycle");
+        conn.install_browser_context_fixture_for_test(browser);
+        let owner = crate::conn::CommandOwnerScope::for_session("SID-lifecycle");
+        let route = conn.session_route(Some("SID-lifecycle")).unwrap();
+        let original = conn
+            .target_devtools_session_state_for_owner(&owner)
+            .unwrap()
+            .lifecycle
+            .clone();
+        conn.target_control.mark_session_closing("SID-lifecycle");
+        conn.with_target_devtools_session_state_for_owner_mut(&owner, |state| {
+            state.lifecycle = DevToolsSessionLifecycle::default()
+        })
+        .unwrap();
+        conn.register_session_route_for_test("SID-lifecycle", route);
+
+        original.mark_closing();
+        assert!(original.is_closing());
+        assert!(!conn.session_is_closing("SID-lifecycle"));
+        assert!(
+            !conn
+                .target_devtools_session_state_for_owner(&owner)
+                .unwrap()
+                .is_closing()
+        );
+    }
 
     fn binding(name: &str) -> RuntimeBindingDefinition {
         RuntimeBindingDefinition {
@@ -1232,7 +1193,8 @@ mod tests {
         primary.extra_headers = vec![
             ("X-Primary".to_owned(), "primary".to_owned()),
             ("X-Shared".to_owned(), "primary".to_owned()),
-        ];
+        ]
+        .into();
 
         let attached_b = &mut sessions.ensure_attached("SID-b").network_session_state;
         attached_b.network_enabled = true;
@@ -1240,18 +1202,19 @@ mod tests {
         attached_b.extra_headers = vec![
             ("X-B".to_owned(), "b".to_owned()),
             ("x-shared".to_owned(), "b".to_owned()),
-        ];
+        ]
+        .into();
 
         let attached_a = &mut sessions.ensure_attached("SID-a").network_session_state;
         attached_a.network_enabled = false;
         attached_a.cache_disabled = true;
-        attached_a.extra_headers = vec![("X-Ignored".to_owned(), "a".to_owned())];
+        attached_a.extra_headers = vec![("X-Ignored".to_owned(), "a".to_owned())].into();
 
         let policy = sessions.effective_network_policy();
         assert!(policy.cache_disabled);
         assert!(policy.bypass_service_worker);
         assert_eq!(
-            policy.extra_headers,
+            policy.extra_headers.to_byte_strings(),
             vec![
                 ("X-Primary".to_owned(), "primary".to_owned()),
                 ("x-shared".to_owned(), "b".to_owned()),
@@ -1264,7 +1227,7 @@ mod tests {
         assert!(policy.cache_disabled);
         assert!(!policy.bypass_service_worker);
         assert_eq!(
-            policy.extra_headers,
+            policy.extra_headers.to_byte_strings(),
             vec![
                 ("X-Primary".to_owned(), "primary".to_owned()),
                 ("X-Shared".to_owned(), "primary".to_owned()),
@@ -1354,17 +1317,20 @@ mod tests {
             sessions
                 .set_locale_override(&session_b, Some("de-DE".to_owned()))
                 .unwrap_err(),
-            "Another locale override is already in effect"
+            moli_v8_platform::ProcessEnvironmentError::LocaleOverrideInUse
         );
         assert_eq!(
             sessions.set_locale_override(&session_b, None).unwrap_err(),
-            "Another locale override is already in effect",
+            moli_v8_platform::ProcessEnvironmentError::LocaleOverrideInUse,
             "Chromium treats a non-owner locale clear as a new claim"
         );
         sessions
             .set_locale_override(&session_a, Some("it-IT".to_owned()))
             .unwrap();
-        assert_eq!(sessions.effective_locale_override(), Some("it-IT"));
+        assert_eq!(
+            sessions.effective_locale_override().as_deref(),
+            Some("it-IT")
+        );
 
         sessions
             .set_timezone_override(&session_a, Some("Europe/Paris".to_owned()))
@@ -1373,22 +1339,131 @@ mod tests {
             sessions
                 .set_timezone_override(&session_b, Some("America/New_York".to_owned()))
                 .unwrap_err(),
-            "Timezone override is already in effect"
+            moli_v8_platform::ProcessEnvironmentError::TimezoneOverrideInUse
         );
         sessions
             .set_timezone_override(&session_b, None)
             .expect("Chromium accepts a non-owner timezone clear as a no-op");
-        assert_eq!(sessions.effective_timezone_override(), Some("Europe/Paris"));
+        assert_eq!(
+            sessions.effective_timezone_override().as_deref(),
+            Some("Europe/Paris")
+        );
 
         sessions.remove_attached("SID-a");
-        assert_eq!(sessions.effective_locale_override(), None);
-        assert_eq!(sessions.effective_timezone_override(), None);
+        assert_eq!(sessions.effective_locale_override().as_deref(), None);
+        assert_eq!(sessions.effective_timezone_override().as_deref(), None);
         sessions
             .set_locale_override(&session_b, Some("de-DE".to_owned()))
             .unwrap();
         sessions
             .set_timezone_override(&session_b, Some("America/New_York".to_owned()))
             .unwrap();
+    }
+
+    #[test]
+    fn environment_admission_does_not_retain_rejected_or_unowned_sessions() {
+        let mut sessions = DevToolsSessionRegistry::default();
+        let owner = DevToolsSessionKey::Attached("SID-owner".to_owned());
+        let peer = DevToolsSessionKey::Attached("SID-peer".to_owned());
+        assert!(
+            sessions
+                .set_locale_override(&peer, Some("fr\0FR".to_owned()))
+                .is_err()
+        );
+        assert!(
+            sessions
+                .set_timezone_override(&peer, Some("Mars/Olympus".to_owned()))
+                .is_err()
+        );
+        assert!(sessions.environment_owners.is_empty());
+        assert!(sessions.session(&peer).is_none());
+
+        sessions
+            .set_locale_override(&owner, Some("fr_FR".to_owned()))
+            .unwrap();
+        sessions
+            .set_timezone_override(&owner, Some("Europe/Paris".to_owned()))
+            .unwrap();
+        assert!(sessions.set_locale_override(&peer, None).is_err());
+        assert!(
+            sessions
+                .set_timezone_override(&peer, Some("Asia/Shanghai".to_owned()))
+                .is_err()
+        );
+        sessions
+            .set_timezone_override(&peer, Some("Europe/Paris".to_owned()))
+            .expect("same-timezone success does not grant ownership");
+        sessions.set_timezone_override(&peer, None).unwrap();
+        assert_eq!(sessions.environment_owners.len(), 1);
+        assert!(sessions.environment_owners.contains_key(&owner));
+        assert!(sessions.session(&peer).is_none());
+        assert_eq!(sessions.attached_len(), 1);
+    }
+
+    #[test]
+    fn environment_owner_survives_failed_updates_and_partial_clear() {
+        let mut sessions = DevToolsSessionRegistry::default();
+        let key = DevToolsSessionKey::Attached("SID-owner".to_owned());
+        sessions
+            .set_locale_override(&key, Some("fr_FR".to_owned()))
+            .unwrap();
+        sessions
+            .set_timezone_override(&key, Some("Europe/Paris".to_owned()))
+            .unwrap();
+        assert!(
+            sessions
+                .set_locale_override(&key, Some("fr\0FR".to_owned()))
+                .is_err()
+        );
+        assert!(
+            sessions
+                .set_timezone_override(&key, Some("Mars/Olympus".to_owned()))
+                .is_err()
+        );
+        assert_eq!(
+            sessions.effective_locale_override().as_deref(),
+            Some("fr_FR")
+        );
+        assert_eq!(
+            sessions.effective_timezone_override().as_deref(),
+            Some("Europe/Paris")
+        );
+
+        sessions.set_locale_override(&key, None).unwrap();
+        assert_eq!(sessions.effective_locale_override(), None);
+        assert_eq!(sessions.environment_owners.len(), 1);
+        assert_eq!(
+            sessions.effective_timezone_override().as_deref(),
+            Some("Europe/Paris")
+        );
+        sessions.set_timezone_override(&key, None).unwrap();
+        assert!(sessions.environment_owners.is_empty());
+        assert!(
+            sessions.session(&key).is_some(),
+            "clearing claims is not detach"
+        );
+    }
+
+    #[test]
+    fn policy_snapshots_cannot_retain_environment_authority_after_registry_drop() {
+        let mut sessions = DevToolsSessionRegistry::default();
+        sessions.attach_primary("SID-primary".to_owned());
+        let key = DevToolsSessionKey::Primary;
+        sessions
+            .set_locale_override(&key, Some("fr_FR".to_owned()))
+            .unwrap();
+        sessions
+            .set_timezone_override(&key, Some("Europe/Paris".to_owned()))
+            .unwrap();
+        let snapshot = sessions.primary().clone();
+        drop(sessions);
+
+        let replacement = moli_core::ProcessEnvironmentOwner::default();
+        replacement.set_locale(Some("de_DE")).unwrap();
+        replacement.set_timezone(Some("Asia/Shanghai")).unwrap();
+        drop(snapshot);
+        assert_eq!(replacement.locale().as_deref(), Some("de_DE"));
+        assert_eq!(replacement.timezone().as_deref(), Some("Asia/Shanghai"));
     }
 
     #[test]
@@ -1445,10 +1520,10 @@ mod tests {
         let mut sessions = DevToolsSessionRegistry::default();
         sessions
             .primary_mut()
-            .register_pending_inspector_await(1, Some("SID-primary"), None);
+            .register_pending_inspector_await(1, Some("SID-primary"));
         sessions
             .ensure_attached("SID-attached")
-            .register_pending_inspector_await(2, Some("SID-attached"), Some("group"));
+            .register_pending_inspector_await(2, Some("SID-attached"));
 
         assert!(sessions.has_pending_inspector_awaits());
         assert_eq!(sessions.pending_inspector_await_count(), 2);

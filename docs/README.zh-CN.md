@@ -1,9 +1,19 @@
 <p align="center">
-  <img
-    src="../assets/moli-browser-banner.jpg"
-    alt="Moli 浏览器——结构优先，按需生成像素，面向 AI 智能体的开源浏览器。"
-    width="1086"
-  />
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="../assets/moli-browser-banner-dark.jpg"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="../assets/moli-browser-banner.jpg"
+    />
+    <img
+      src="../assets/moli-browser-banner.jpg"
+      alt="Moli 浏览器——结构优先，按需生成像素，面向 AI 智能体的开源浏览器。"
+      width="1086"
+    />
+  </picture>
 </p>
 
 <h1 align="center">Moli</h1>
@@ -14,7 +24,32 @@
   <a href="README.ja.md">日本語</a> |
   <a href="README.de.md">Deutsch</a> |
   <a href="README.fr.md">Français</a> |
-  <a href="README.es.md">Español</a>
+  <a href="README.es.md">Español</a> |
+  <a href="README.ko.md">한국어</a>
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/4eXGtdWWnq">
+    <img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2" alt="Discord" />
+  </a>
+  <a href="../assets/moli-feedback-wechat-group.png">
+    <img src="https://img.shields.io/badge/WeChat-Join%20Community-07C160" alt="WeChat" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/lexmount-browser?launch=moli-by-lexmount" target="_blank" rel="noopener noreferrer">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=dark" />
+      <img src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=light" alt="Moli by Lexmount - #1 Product of the Day | Product Hunt" width="250" height="54" />
+    </picture>
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/daily" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/weekly?language=Rust" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
 </p>
 
 Moli 是一款面向 AI 智能体、可用于生产环境的无头浏览器。它采用按需布局与渲染的设计，兼顾完整的浏览器运行时与轻量的资源占用。
@@ -89,7 +124,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/lexmount/moli/rele
 ```bash
 moli fetch \
   --dump markdown \
-  --wait-until done \
+  --wait done \
   https://example.com
 ```
 
@@ -192,7 +227,7 @@ Moli 是 Lexmount 旗下的开源无头浏览器；Lexmount Browser 则是围绕
 | `--layout` | `LayoutPolicy::OnDemand`——提供真实的布局、几何信息、命中测试、坐标输入、截图和屏幕串流 |
 | `--resource` | 拉取所有可选的视觉/媒体资源类别 |
 | `--image`、`--font`、`--audio`、`--video`、`--media`、`--text-track` | 单独启用某一类可选资源 |
-| `--profile-dir`、`--http-cache-dir`、`--cookie-file` | 按工作负载需要，选择性开启持久化能力 |
+| `--profile-dir`、`--http-cache-dir`、`--cookie` | 按工作负载需要，选择性开启持久化能力 |
 
 布局结果是按需采样的一份快照，而不是持续维护的状态：第一次几何请求（冷启动）会根据当前 DOM/样式构建临时工作布局树，再把工作树丢弃后无法重算的几何冻结成一棵与 DOM 无关、不可变的 `FrozenLayoutTree`，长期只保留最新的这一棵树。在此之后，即便页面发生了变化，普通几何读取也可能复用旧树。截图始终重新构建并替换冻结树。每个屏幕串流订阅只记录一个不透明的视觉状态 token：状态未变时不产帧，状态变化时才新鲜渲染一帧；绘制结果不会被复用。
 
@@ -263,6 +298,7 @@ Kitesurf 是远程服务，无法测量 CPU、内存和进程数，因此资源�
 
 - 不提供 GUI 浏览器、持久化窗口、GPU 合成器，也不实现保留式的多帧绘制架构。
 - 不追求与 Chrome 像素级一致的渲染效果，也不提供高保真的 Canvas/WebGL/媒体播放能力。
+- 环境模拟支持 offline 切换；CPU 节流、网络延迟/吞吐、丢包及连接类型覆盖暂不支持，请求会返回协议错误。CPU rate ≤ 1 和非正的网络延迟/吞吐值用于取消节流；不支持的组合会在改变 offline 状态前整体拒绝。
 - 在 `--layout` 模式下支持软件截图和基于光栅化的 CDP PDF 生成，但没有实现 Chrome 的全部截图/打印模式。
 
 遇到不支持的协议路径，Moli 会直接明确报错——它不会假装某个浏览器操作、事件、网络观测或者视觉结果已经发生。

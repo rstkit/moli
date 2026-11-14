@@ -1,9 +1,19 @@
 <p align="center">
-  <img
-    src="../assets/moli-browser-banner.jpg"
-    alt="Moli Browser — La estructura primero. Píxeles bajo demanda. Un navegador de código abierto para agentes de IA."
-    width="1086"
-  />
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="../assets/moli-browser-banner-dark.jpg"
+    />
+    <source
+      media="(prefers-color-scheme: light)"
+      srcset="../assets/moli-browser-banner.jpg"
+    />
+    <img
+      src="../assets/moli-browser-banner.jpg"
+      alt="Moli Browser — La estructura primero. Píxeles bajo demanda. Un navegador de código abierto para agentes de IA."
+      width="1086"
+    />
+  </picture>
 </p>
 
 <h1 align="center">Moli</h1>
@@ -14,7 +24,32 @@
   <a href="README.ja.md">日本語</a> |
   <a href="README.de.md">Deutsch</a> |
   <a href="README.fr.md">Français</a> |
-  <strong>Español</strong>
+  <strong>Español</strong> |
+  <a href="README.ko.md">한국어</a>
+</p>
+
+<p align="center">
+  <a href="https://discord.gg/4eXGtdWWnq">
+    <img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2" alt="Discord" />
+  </a>
+  <a href="../assets/moli-feedback-wechat-group.png">
+    <img src="https://img.shields.io/badge/WeChat-Join%20Community-07C160" alt="WeChat" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/lexmount-browser?launch=moli-by-lexmount" target="_blank" rel="noopener noreferrer">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=dark" />
+      <img src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=light" alt="Moli by Lexmount - #1 Product of the Day | Product Hunt" width="250" height="54" />
+    </picture>
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/daily" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/weekly?language=Rust" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
 </p>
 
 Moli es un navegador headless para agentes de IA, listo para producción. Su diseño de layout y renderizado bajo demanda combina un entorno de ejecución de navegador completo con un consumo reducido de recursos.
@@ -90,7 +125,7 @@ Renderiza la página a Markdown con la estrategia de finalización predeterminad
 ```bash
 moli fetch \
   --dump markdown \
-  --wait-until done \
+  --wait done \
   https://example.com
 ```
 
@@ -194,7 +229,7 @@ En Moli, las operaciones caras del navegador hay que activarlas explícitamente:
 | `--layout` | `LayoutPolicy::OnDemand`: layout real, geometría, hit-testing, inputs por coordenadas, capturas de pantalla y screencast |
 | `--resource` | Descarga todas las familias opcionales de recursos visuales y multimedia |
 | `--image`, `--font`, `--audio`, `--video`, `--media`, `--text-track` | Activa por separado una familia concreta de recursos opcionales |
-| `--profile-dir`, `--http-cache-dir`, `--cookie-file` | Activa de forma selectiva la persistencia que necesite tu carga de trabajo |
+| `--profile-dir`, `--http-cache-dir`, `--cookie` | Activa de forma selectiva la persistencia que necesite tu carga de trabajo |
 
 El resultado del layout es una instantánea tomada bajo demanda, no un estado que se mantiene todo el tiempo: la primera petición de geometría (cold start) construye un árbol de trabajo temporal a partir del DOM y los estilos actuales, congela su geometría canónica en un `FrozenLayoutTree` inmutable e independiente del DOM, y se queda solo con ese árbol, el más reciente. Las lecturas de geometría normales pueden reutilizarlo aunque la página haya cambiado entretanto. Las capturas de pantalla siempre reconstruyen y sustituyen el árbol congelado. Cada suscripción de screencast solo conserva un token opaco del estado visual: un token sin cambios evita el trabajo, mientras que un cambio genera un frame nuevo. Los resultados de pintado nunca se reutilizan.
 

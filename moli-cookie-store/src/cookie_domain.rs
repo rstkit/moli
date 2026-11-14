@@ -137,6 +137,14 @@ impl CookieDomain {
 impl TryFrom<&str> for CookieDomain {
     type Error = crate::Error;
     fn try_from(value: &str) -> Result<CookieDomain, Self::Error> {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for CookieDomain {
+    type Err = crate::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         idna::domain_to_ascii(value.trim())
             .map_err(super::IdnaErrors::from)
             .map_err(Into::into)
@@ -287,6 +295,34 @@ mod tests {
             CookieDomain::Suffix(String::from(".example.com")),
             CookieDomain::try_from("..example.com").expect("unable to parse domain")
         );
+    }
+
+    #[test]
+    fn unicode_cookie_domains_match_canonical_ascii_urls() {
+        let expected = CookieDomain::Suffix(String::from("xn--bcher-kva.example"));
+        let parsed = CookieDomain::try_from(".bücher.example")
+            .expect("Unicode cookie domain should be canonicalized");
+        assert_eq!(parsed, expected);
+        matches(true, &parsed, "https://bücher.example/");
+        matches(true, &parsed, "https://xn--bcher-kva.example/");
+        matches(true, &parsed, "https://sub.xn--bcher-kva.example/");
+        matches(false, &parsed, "https://other.example/");
+
+        let raw =
+            RawCookie::parse("idna=1; Domain=.bücher.example").expect("raw Unicode domain cookie");
+        let from_raw = CookieDomain::try_from(&raw)
+            .expect("raw Unicode cookie domain should be canonicalized");
+        assert_eq!(from_raw, expected);
+        matches(true, &from_raw, "https://xn--bcher-kva.example/");
+
+        let request = Url::parse("https://bücher.example/").expect("Unicode request URL");
+        let host_only = CookieDomain::host_only(&request).expect("Unicode host-only cookie");
+        assert_eq!(
+            host_only,
+            CookieDomain::HostOnly(String::from("xn--bcher-kva.example"))
+        );
+        matches(true, &host_only, "https://xn--bcher-kva.example/");
+        matches(false, &host_only, "https://sub.xn--bcher-kva.example/");
     }
 
     #[test]

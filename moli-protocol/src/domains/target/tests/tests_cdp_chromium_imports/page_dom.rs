@@ -187,24 +187,26 @@ async fn rust_cdp_capability_page_set_download_behavior_alias_contract() {
     }))
     .await;
     ctx.expect_result(112_005, json!({}), Some(&attached.session_id));
-    let (browser_context_id, _) = ctx
-        .conn
-        .target_owner_identity_for_session(Some(&attached.session_id))
-        .expect("attached page target should have a browser context");
-    let settings = ctx
-        .conn
-        .download_behavior
-        .effective_for_browser_context(Some(browser_context_id.as_str()));
+    let (browser_context_id, _) = ctx.with_fixture(|conn| {
+        conn.target_owner_identity_for_session(Some(&attached.session_id))
+            .expect("attached page target should have a browser context")
+    });
+    let settings = ctx.with_fixture(|conn| {
+        conn.download_behavior
+            .effective_for_browser_context(Some(browser_context_id.as_str()))
+    });
     assert_eq!(settings.behavior, "allow");
     assert_eq!(
         settings.download_path.as_deref(),
         Some("/tmp/moli-page-downloads")
     );
     assert!(!settings.automation_events_enabled);
-    assert!(
-        !ctx.conn.download_behavior.automation_events_enabled,
-        "Page.setDownloadBehavior must not enable Browser download events"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            !conn.download_behavior.automation_events_enabled,
+            "Page.setDownloadBehavior must not enable Browser download events"
+        )
+    });
 }
 
 // Chromium source:
@@ -382,6 +384,7 @@ async fn rust_cdp_chromium_import_dom_get_box_model_contract() {
     }))
     .await;
     let selected = take_response_by_id(&mut ctx, 114_007);
+    ctx.capture_fixture_layout(Some(&attached.session_id)).await;
     let node_id = selected["result"]["nodeId"]
         .as_i64()
         .unwrap_or_else(|| panic!("selected node id: {selected}"));

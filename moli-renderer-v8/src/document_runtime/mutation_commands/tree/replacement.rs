@@ -9,7 +9,7 @@ use crate::{
     document_runtime::{DocumentRuntime, DomHandle},
     dom::native::Node,
     mutation_coordinator::RuntimeMutationOptions,
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
 };
 
 struct TreeReplacementPlan<'a> {
@@ -21,7 +21,7 @@ impl DocumentRuntime {
     pub(crate) fn replace_child_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         new_child: DomHandle,
         old_child: DomHandle,
@@ -39,7 +39,7 @@ impl DocumentRuntime {
     fn replace_child_with_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         new_child: DomHandle,
         old_child: DomHandle,
@@ -100,7 +100,7 @@ impl DocumentRuntime {
             insertion_plan.insertion_roots,
             inserted_was_connected,
         );
-        let removal_plan = self.tree_removal_plan(scope, host_ptr, parent, old_child);
+        let removal_plan = self.tree_removal_plan(host_ptr, parent, old_child);
         let (inserted, removed, prepublished_removals) = if unsafe { &*host_ptr }
             .has_dom_debugger_dom_breakpoints()
         {
@@ -132,6 +132,7 @@ impl DocumentRuntime {
                     insertion_plan.insertion_roots,
                     &mut inserted,
                     &mut prepublished_removals,
+                    false,
                 )
             {
                 return false;
@@ -151,6 +152,7 @@ impl DocumentRuntime {
                     insertion_plan.insertion_roots,
                     &mut inserted,
                     &mut prepublished_removals,
+                    false,
                 )
             {
                 return false;
@@ -238,7 +240,7 @@ impl DocumentRuntime {
     fn dispatch_tree_replacement_side_effects_after_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         replacement_plan: &TreeReplacementPlan<'_>,
         reaction_policy: TreeReactionDispatchPolicy,
     ) {
@@ -274,5 +276,11 @@ impl DocumentRuntime {
             }
         }
         self.preserve_selectedness_for_insertion_plan(scope, host_ptr, insertion_plan);
+        self.queue_image_relevant_mutation_loads(
+            scope,
+            host_ptr,
+            &replacement_plan.removal.image_relevant_mutation_plan,
+            crate::types::SubresourceRequestInitiatorType::Script,
+        );
     }
 }

@@ -16,7 +16,7 @@ use super::{
     document_runtime::DomHandle,
     exception_reporting::{V8ExceptionReport, build_event_handler_exception_report},
     native_bridge::CALLBACK_ERROR_WINDOW_HANDLE_SLOT,
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
     util::{v8_string, v8str},
 };
 
@@ -32,8 +32,7 @@ pub(super) use self::events::{
     DispatchStatus, HostEventTargetRegistry, PublicEventDispatchResult, create_host_event,
     dispatch_host_event, dispatch_public_event, dispatch_public_event_with_original_target,
     event_dispatch_status, event_target_value, host_event_defaults, invoke_prepared_event_callback,
-    invoke_prepared_event_callback_on_object, report_event_callback_exception,
-    report_event_listener_exception,
+    report_event_callback_exception, report_event_listener_exception,
 };
 pub(crate) use self::events::{EventListenerInspectorSnapshot, EventListenerRegistration};
 pub(super) use self::scripts::{
@@ -47,6 +46,7 @@ pub(super) use self::scripts::{
     begin_prepared_document_write_script_start, build_runtime_prepared_script,
     cancel_runtime_script_start_admission, dispatch_script_event,
     finish_runtime_script_start_admission, plan_script_start, prepare_runtime_script_start_commit,
+    script_element_nonce_for_csp,
 };
 #[cfg(test)]
 pub(super) use self::scripts::{

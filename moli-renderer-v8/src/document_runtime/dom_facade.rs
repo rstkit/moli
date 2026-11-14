@@ -1,8 +1,9 @@
 use super::mutation_commands::{
-    apply_runtime_mutation_effects_to_dom_host, finish_runtime_mutation_effects,
+    RuntimeMutationApplyResult, finish_runtime_mutation_effects, prepare_runtime_mutation_effects,
 };
 use super::*;
 use crate::parser::{ParserPlanningReadView, ParserScriptRead};
+use crate::parser_mutation_effects::{ParserMutationEffectsOwner, apply_parser_mutation_effects};
 use crate::stylesheet_blocking::StylesheetElementRead;
 use html5ever::tree_builder::QuirksMode;
 // This slice collects the remaining low-level facade methods that mostly forward into `DomHost`
@@ -13,18 +14,14 @@ use html5ever::tree_builder::QuirksMode;
 // selector semantics or orchestrate mutation side effects on their own.
 impl DocumentRuntime {
     pub(crate) fn document_design_mode_enabled(&self, document: DomHandle) -> bool {
-        self.design_mode_documents.contains(&document)
+        self.dom_host
+            .document_design_mode_enabled_for_handle(document)
+            .unwrap_or(false)
     }
 
     pub(crate) fn set_document_design_mode_enabled(&mut self, document: DomHandle, enabled: bool) {
-        if !self.dom_host.node(document).is_some_and(Node::is_document) {
-            return;
-        }
-        if enabled {
-            self.design_mode_documents.insert(document);
-        } else {
-            self.design_mode_documents.remove(&document);
-        }
+        self.dom_host
+            .set_document_design_mode_enabled_for_handle(document, enabled);
     }
 
     pub(crate) fn snapshot_document(&self) -> NativeDom {
@@ -51,7 +48,7 @@ impl DocumentRuntime {
             shadow_bindings.extend(parked_bindings);
         }
         dom_host.restore_shadow_root_bindings(shadow_bindings);
-        self.dom_host = LiveRuntimeDomHost::from_dom_host(dom_host);
+        self.dom_host.dom_host = dom_host;
         self.style_source_document_sync_pending = true;
         for handle in started_scripts {
             let _ = self.dom_host.set_script_already_started(handle, true);
@@ -94,62 +91,11 @@ impl DocumentRuntime {
     pub(crate) fn apply_parser_stream_mutation_effects_to_live_dom_host(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         effects: DomMutationEffects,
     ) {
-        let connected_roots = effects.tree().connected_roots().to_vec();
-        let form_owner_effects = effects.clone();
         self.assert_active_parser_document_incarnation();
-        let result = {
-            let dom_host = self.dom_host.borrow_mut();
-            apply_runtime_mutation_effects_to_dom_host(
-                &mut self.mutations,
-                &self.document,
-                self.script_lifecycle.scripts_mut(),
-                &mut self.events,
-                scope,
-                host_ptr,
-                dom_host,
-                effects,
-                RuntimeMutationOptions::parser_tree_sink(),
-            )
-        };
-        let _ = finish_runtime_mutation_effects(self, scope, host_ptr, result);
-        if !connected_roots.is_empty() {
-            self.ensure_parser_custom_element_reaction_queue(host_ptr);
-            crate::custom_elements::enqueue_connected_and_form_callbacks_for_already_upgraded_subtrees(
-                scope,
-                host_ptr,
-                &connected_roots,
-            );
-        }
-        if self.form_owner_mutation_effects_touch_html_form(&form_owner_effects) {
-            self.ensure_parser_custom_element_reaction_queue(host_ptr);
-            crate::custom_elements::enqueue_form_association_callbacks_for_all(scope, host_ptr);
-        }
-    }
-
-    fn form_owner_mutation_effects_touch_html_form(&self, effects: &DomMutationEffects) -> bool {
-        let dom_host = self.dom_host();
-        effects
-            .tree()
-            .connected_roots()
-            .iter()
-            .chain(effects.tree().disconnected_roots())
-            .copied()
-            .any(|root| subtree_contains_html_form(dom_host, root))
-            || effects
-                .style()
-                .child_list_mutations()
-                .iter()
-                .any(|mutation| {
-                    mutation
-                        .added_nodes()
-                        .iter()
-                        .chain(mutation.removed_nodes())
-                        .copied()
-                        .any(|root| subtree_contains_html_form(dom_host, root))
-                })
+        apply_parser_mutation_effects(scope, host_ptr, self, &effects);
     }
 
     pub(crate) fn parser_runtime_dom_node_exists(&mut self, node_id: DomHandle) -> bool {
@@ -318,17 +264,7 @@ impl DocumentRuntime {
             .text_content(node_id)
     }
 
-    pub(crate) fn create_parser_element_without_attributes_in_live_dom_host(
-        &mut self,
-        local_name: String,
-        namespace: String,
-        prefix: Option<String>,
-    ) -> DomHandle {
-        self.dom_host_mut_for_active_parser_step()
-            .create_parser_element_without_attributes(local_name, namespace, prefix)
-    }
-
-    pub(crate) fn create_parser_element_for_document_without_attributes_in_live_dom_host(
+    pub(crate) fn create_element_for_document_without_attributes_in_live_dom_host(
         &mut self,
         document_handle: DomHandle,
         local_name: String,
@@ -336,12 +272,29 @@ impl DocumentRuntime {
         prefix: Option<String>,
     ) -> DomHandle {
         self.dom_host_mut_for_active_parser_step()
-            .create_parser_element_without_attributes_for_document(
+            .create_element_without_attributes_for_document(
                 document_handle,
                 local_name,
                 namespace,
                 prefix,
             )
+    }
+
+    pub(crate) fn create_parser_element_for_document_without_attributes_in_live_dom_host(
+        &mut self,
+        construction: &moli_dom::native::ParserConstruction,
+        document_handle: DomHandle,
+        local_name: String,
+        namespace: String,
+        prefix: Option<String>,
+    ) -> DomHandle {
+        construction.create_element(
+            self.dom_host_mut_for_active_parser_step(),
+            document_handle,
+            local_name,
+            namespace,
+            prefix,
+        )
     }
 
     pub(crate) fn add_attrs_if_missing_for_parser_in_live_dom_host(
@@ -414,32 +367,23 @@ impl DocumentRuntime {
         &mut self,
         node_id: DomHandle,
         text: String,
-    ) {
+    ) -> DomMutationEffects {
         let host = self.dom_host_mut_for_active_parser_step();
-        if let Some(text_node) = host
-            .node_mut(node_id)
-            .and_then(|node| node.data_mut().as_text_mut())
-        {
-            let mut merged = text;
-            merged.push_str(text_node.data());
-            text_node.set_data(merged);
-        }
+        let Some(previous) = host.node(node_id).and_then(Node::as_text) else {
+            return DomMutationEffects::default();
+        };
+        let mut merged = text;
+        merged.push_str(previous.data());
+        host.set_text_content_effects(node_id, &merged)
     }
 
     pub(crate) fn append_text_to_text_node_in_live_dom_host(
         &mut self,
         node_id: DomHandle,
         text: String,
-    ) {
-        let host = self.dom_host_mut_for_active_parser_step();
-        if let Some(text_node) = host
-            .node_mut(node_id)
-            .and_then(|node| node.data_mut().as_text_mut())
-        {
-            let mut merged = text_node.data().to_owned();
-            merged.push_str(&text);
-            text_node.set_data(merged);
-        }
+    ) -> DomMutationEffects {
+        self.dom_host_mut_for_active_parser_step()
+            .append_text_to_text_node_effects(node_id, &text)
     }
 
     pub(crate) fn push_parse_error_in_live_dom_host(&mut self, error: String) {
@@ -616,7 +560,7 @@ impl DocumentRuntime {
     pub(crate) fn clone_node(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         deep: bool,
     ) -> Option<DomHandle> {
@@ -624,7 +568,11 @@ impl DocumentRuntime {
         let registry_retargets =
             custom_elements::registry_association_retargets_for_clone(host_ptr, handle, clone);
         custom_elements::apply_registry_association_retargets(host_ptr, &registry_retargets);
-        if !custom_elements::upgrade_subtree_if_defined(scope, host_ptr, clone) {
+        let upgraded =
+            custom_elements::with_custom_element_reaction_scope(scope, host_ptr, |scope| {
+                custom_elements::upgrade_subtree_if_defined(scope, host_ptr, clone)
+            });
+        if !upgraded {
             return None;
         }
         Some(clone)
@@ -633,7 +581,7 @@ impl DocumentRuntime {
     pub(crate) fn import_node(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         handle: DomHandle,
         deep: bool,
@@ -648,7 +596,11 @@ impl DocumentRuntime {
             fallback_registry,
         );
         custom_elements::apply_registry_association_retargets(host_ptr, &registry_retargets);
-        if !custom_elements::upgrade_subtree_if_defined(scope, host_ptr, clone) {
+        let upgraded =
+            custom_elements::with_custom_element_reaction_scope(scope, host_ptr, |scope| {
+                custom_elements::upgrade_subtree_if_defined(scope, host_ptr, clone)
+            });
+        if !upgraded {
             return None;
         }
         Some(clone)
@@ -657,7 +609,7 @@ impl DocumentRuntime {
     pub(crate) fn adopt_node(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         handle: DomHandle,
     ) -> Option<DomHandle> {
@@ -679,7 +631,7 @@ impl DocumentRuntime {
     pub(crate) fn adopt_native_node_collecting_adoption_reactions(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         handle: DomHandle,
     ) -> Option<DomHandle> {
@@ -696,7 +648,7 @@ impl DocumentRuntime {
     pub(crate) fn adopt_native_node_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         handle: DomHandle,
     ) -> Option<DomHandle> {
@@ -711,12 +663,12 @@ impl DocumentRuntime {
     fn adopt_native_node_enqueuing_adoption_reactions(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         handle: DomHandle,
     ) -> Option<DomHandle> {
         let plan = TreeAdoptionPlan::before_standalone_adoption(
-            &self.dom_host,
+            &mut self.dom_host,
             host_ptr,
             handle,
             document_handle,
@@ -727,7 +679,7 @@ impl DocumentRuntime {
     fn apply_native_adoption_plan(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         root: DomHandle,
         plan: &TreeAdoptionPlan,
     ) -> Option<DomHandle> {
@@ -751,8 +703,7 @@ impl DocumentRuntime {
             scope,
             host_ptr,
             root,
-            previous_owner_document,
-            new_document,
+            plan,
             &stylesheet_owner_changes,
         );
         Some(adopted)
@@ -761,23 +712,16 @@ impl DocumentRuntime {
     fn sync_native_adoption_context_after_owner_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
-        previous_owner_document: DomHandle,
-        document_handle: DomHandle,
+        plan: &TreeAdoptionPlan,
         stylesheet_owner_changes: &[crate::dom::native::DomStylesheetOwnerChange],
     ) {
-        if previous_owner_document == document_handle {
+        if plan.documents().is_none_or(|(old, new)| old == new) {
             return;
         }
+        plan.clear_shadow_root_adopted_style_sheets(scope, host_ptr);
         let runtime = unsafe { &mut *host_ptr };
-        for shadow_root in runtime.shadow_roots_in_subtree(handle) {
-            crate::native_bridge::element::clear_shadow_root_adopted_style_sheets(
-                scope,
-                runtime,
-                shadow_root,
-            );
-        }
         runtime.apply_stylesheet_owner_changes(stylesheet_owner_changes);
         runtime.migrate_inline_style_metadata_in_subtree(handle);
         runtime.note_style_subtree_context_change(handle);
@@ -786,7 +730,7 @@ impl DocumentRuntime {
     fn queue_image_loads_after_owner_document_change(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         root: DomHandle,
     ) {
         let mut stack = vec![root];
@@ -855,32 +799,30 @@ impl DocumentRuntime {
     }
 }
 
-pub(super) fn sync_style_sources_from_dom_mutation_effects(
-    host_ptr: *mut JsContextHost,
-    effects: &DomMutationEffects,
-) {
-    if effects.stylesheet_owners().changes().is_empty() {
-        return;
-    }
-    unsafe { &mut *host_ptr }.apply_stylesheet_owner_changes(effects.stylesheet_owners().changes());
-}
+impl ParserMutationEffectsOwner for DocumentRuntime {
+    type Prepared = RuntimeMutationApplyResult;
 
-fn subtree_contains_html_form(dom_host: &DomHost, root: DomHandle) -> bool {
-    let mut stack = vec![root];
-    while let Some(handle) = stack.pop() {
-        if dom_host.is_html_element_named(handle, "form") {
-            return true;
-        }
-        let mut child = dom_host.first_child(handle);
-        while let Some(current) = child {
-            stack.push(current);
-            child = dom_host.next_sibling(current);
-        }
-        if let Some(shadow_root) = dom_host.shadow_root_handle(handle) {
-            stack.push(shadow_root);
-        }
+    fn prepare_parser_mutation_effects(&mut self, effects: &DomMutationEffects) -> Self::Prepared {
+        prepare_runtime_mutation_effects(
+            self.dom_host(),
+            self.document.url(),
+            effects,
+            RuntimeMutationOptions::parser_tree_sink(),
+        )
     }
-    false
+
+    fn ensure_parser_reaction_queue(&mut self, host_ptr: *mut PageScriptHost) {
+        self.ensure_parser_custom_element_reaction_queue(host_ptr);
+    }
+
+    fn finish_parser_mutation_effects(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        prepared: Self::Prepared,
+    ) {
+        let _ = finish_runtime_mutation_effects(self, scope, host_ptr, prepared);
+    }
 }
 
 #[cfg(test)]

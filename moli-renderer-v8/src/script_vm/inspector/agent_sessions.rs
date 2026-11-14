@@ -1,5 +1,5 @@
 use super::{
-    InspectorOutbound,
+    InspectorOutbound, RendererInspectorIsolateBackendHandle,
     context_registry::DocumentInspectorContextGroupId,
     v8_backend::{RendererInspectorIsolateBackend, RendererInspectorSessionExecutorRegistration},
 };
@@ -55,6 +55,8 @@ impl RendererDevToolsSessionDispatch {
 
 #[derive(Clone)]
 pub(super) struct RendererDevToolsSessionConnection {
+    debugger_pauses_enabled: bool,
+    isolate_backend: RendererInspectorIsolateBackendHandle,
     context_group_id: DocumentInspectorContextGroupId,
     agent_token: RendererDevToolsAgentToken,
     output_journal: Option<RendererTurnOutputJournal>,
@@ -62,30 +64,35 @@ pub(super) struct RendererDevToolsSessionConnection {
 
 impl RendererDevToolsSessionConnection {
     pub(super) fn new(
+        isolate_backend: RendererInspectorIsolateBackendHandle,
         context_group_id: DocumentInspectorContextGroupId,
         agent_token: RendererDevToolsAgentToken,
         output_journal: Option<RendererTurnOutputJournal>,
     ) -> Self {
         Self {
+            debugger_pauses_enabled: false,
+            isolate_backend,
             context_group_id,
             agent_token,
             output_journal,
         }
     }
 
-    fn outbound(
-        &self,
-        backend: &RendererInspectorIsolateBackend,
-        session_key: DevToolsSessionKey,
-    ) -> InspectorOutbound {
+    fn outbound(&self, session_key: DevToolsSessionKey) -> InspectorOutbound {
         InspectorOutbound::for_frontend(
             self.agent_token,
             session_key.clone(),
-            backend
+            self.isolate_backend
                 .devtools_target()
                 .outbound_route(self.agent_token, session_key),
             self.output_journal.clone(),
         )
+        .with_debugger_pauses_enabled(self.debugger_pauses_enabled)
+    }
+
+    pub(super) fn with_debugger_pauses_enabled(mut self, enabled: bool) -> Self {
+        self.debugger_pauses_enabled = enabled;
+        self
     }
 }
 
@@ -125,13 +132,17 @@ impl RendererDevToolsAgentSessions {
             .cloned()
             .unwrap_or_default();
         let session = self.frontend.entry(session_key.clone()).or_insert_with(|| {
-            let outbound = connection.outbound(backend, session_key.clone());
+            let outbound = connection.outbound(session_key.clone());
             RendererDevToolsSession::connect(
                 backend,
                 connection.context_group_id,
                 outbound,
                 None,
-                Some((connection.agent_token, session_key.clone())),
+                Some((
+                    connection.isolate_backend.clone(),
+                    connection.agent_token,
+                    session_key.clone(),
+                )),
             )
         });
         session
@@ -191,17 +202,18 @@ impl RendererDevToolsAgentSessions {
                 drop(_executor_registration);
                 (outbound, replayed_runtime_bindings)
             }
-            None => (
-                connection.outbound(backend, session_key.clone()),
-                Vec::new(),
-            ),
+            None => (connection.outbound(session_key.clone()), Vec::new()),
         };
         let mut session = RendererDevToolsSession::connect(
             backend,
             connection.context_group_id,
             outbound,
             Some(v8_state),
-            Some((connection.agent_token, session_key.clone())),
+            Some((
+                connection.isolate_backend.clone(),
+                connection.agent_token,
+                session_key.clone(),
+            )),
         );
         session.replayed_runtime_bindings = replayed_runtime_bindings;
         self.frontend.insert(session_key, session);
@@ -214,13 +226,17 @@ impl RendererDevToolsAgentSessions {
         session_key: DevToolsSessionKey,
     ) {
         self.frontend.entry(session_key.clone()).or_insert_with(|| {
-            let outbound = connection.outbound(backend, session_key.clone());
+            let outbound = connection.outbound(session_key.clone());
             RendererDevToolsSession::connect(
                 backend,
                 connection.context_group_id,
                 outbound,
                 None,
-                Some((connection.agent_token, session_key.clone())),
+                Some((
+                    connection.isolate_backend.clone(),
+                    connection.agent_token,
+                    session_key.clone(),
+                )),
             )
         });
     }
@@ -348,11 +364,17 @@ impl RendererDevToolsSession {
     fn connect(
         backend: &mut RendererInspectorIsolateBackend,
         context_group_id: DocumentInspectorContextGroupId,
-        outbound: InspectorOutbound,
+        mut outbound: InspectorOutbound,
         state: Option<&V8InspectorSessionState>,
-        frontend_session_route: Option<(RendererDevToolsAgentToken, DevToolsSessionKey)>,
+        frontend_session_route: Option<(
+            RendererInspectorIsolateBackendHandle,
+            RendererDevToolsAgentToken,
+            DevToolsSessionKey,
+        )>,
     ) -> Self {
+        let native_binding = outbound.prepare_native_session_binding();
         let first_attach_state = b"{}";
+        let first_attach = state.is_none();
         let state = state.map_or(
             first_attach_state.as_slice(),
             V8InspectorSessionState::as_bytes,
@@ -364,16 +386,23 @@ impl RendererDevToolsSession {
             })),
             state,
         );
+        // Set the default before any route can publish frontend commands.
+        // Reattach restores opaque V8 state, including explicit pause settings.
+        if first_attach {
+            session.set_skip_all_pauses(!outbound.debugger_pauses_enabled());
+        }
         let session = Rc::new(session);
-        let executor_registration = frontend_session_route.map(|(agent_token, session_key)| {
-            backend.register_session_executor_route(
-                context_group_id,
-                agent_token,
-                session_key,
-                &session,
-                outbound.clone(),
-            )
-        });
+        *native_binding.borrow_mut() = Rc::downgrade(&session);
+        let executor_registration =
+            frontend_session_route.map(|(page_backend, agent_token, session_key)| {
+                page_backend.register_session_executor_route(
+                    context_group_id,
+                    agent_token,
+                    session_key,
+                    &session,
+                    outbound.clone(),
+                )
+            });
         Self {
             session,
             outbound,
@@ -426,7 +455,12 @@ mod tests {
         let _response_capture = session.outbound.capture_dispatch_responses();
         dispatch_with_runtime_defaults(&session.session, request, &session.outbound)
             .expect("Inspector session dispatch");
-        session.outbound.take_messages_after(snapshot)
+        session
+            .outbound
+            .take_messages_after(snapshot)
+            .into_iter()
+            .map(|message| message.into_value())
+            .collect()
     }
 
     fn assert_successful_response(messages: &[Value], call_id: u64) {
@@ -441,14 +475,158 @@ mod tests {
     }
 
     #[test]
+    fn debugger_pause_defaults_preserve_explicit_and_restored_settings() {
+        crate::ensure_v8_for_test();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let mut backend = RendererInspectorIsolateBackend::new(&mut isolate);
+        let context_group_id = DocumentInspectorContextGroupId::next();
+        let registration_id = DocumentInspectorContextRegistrationId::next();
+        let default_context = {
+            let scope = pin!(v8::HandleScope::new(&mut isolate));
+            let scope = &mut scope.init();
+            let context = v8::Context::new(scope, Default::default());
+            backend.context_created_with_unique_id(
+                context,
+                context_group_id,
+                b"https://example.test/",
+                b"https://example.test",
+                br#"{"isDefault":true,"type":"default"}"#,
+            );
+            v8::Global::new(scope, context)
+        };
+        backend.context_registry.set_default_context(
+            context_group_id,
+            default_context,
+            registration_id,
+        );
+        for debugging in [false, true] {
+            let outbound = || {
+                InspectorOutbound::for_agent(RendererDevToolsAgentToken::allocate())
+                    .with_debugger_pauses_enabled(debugging)
+            };
+            let session = RendererDevToolsSession::connect(
+                &mut backend,
+                context_group_id,
+                outbound(),
+                None,
+                None,
+            );
+            assert_eq!(
+                state_json(&session.v8_state())["Debugger"]["skipAllPauses"],
+                !debugging,
+                "the native default must exist before the first frontend command",
+            );
+            assert!(session.outbound.values_after(0).is_empty());
+            if !debugging {
+                crate::inspector_session::tests::assert_debugger_defaults(|request| {
+                    dispatch(&session, request)
+                });
+            }
+            assert_successful_response(
+                &dispatch(&session, r#"{"id":6,"method":"Debugger.enable"}"#),
+                6,
+            );
+            assert_eq!(
+                state_json(&session.v8_state())["Debugger"]["skipAllPauses"]
+                    .as_bool()
+                    .unwrap_or(false),
+                !debugging,
+            );
+            let initial_state = session.v8_state();
+            drop(session);
+            let session = RendererDevToolsSession::connect(
+                &mut backend,
+                context_group_id,
+                outbound(),
+                Some(&initial_state),
+                None,
+            );
+            assert_eq!(
+                state_json(&session.v8_state())["Debugger"]["skipAllPauses"],
+                !debugging,
+                "restoring a session must preserve its existing pause default",
+            );
+            assert_successful_response(
+                &dispatch(
+                    &session,
+                    r#"{"id":7,"method":"Debugger.setSkipAllPauses","params":{"skip":false}}"#,
+                ),
+                7,
+            );
+            assert_successful_response(
+                &dispatch(&session, r#"{"id":8,"method":"Debugger.enable"}"#),
+                8,
+            );
+            let state = session.v8_state();
+            assert_eq!(state_json(&state)["Debugger"]["skipAllPauses"], false);
+            drop(session);
+            let restored = RendererDevToolsSession::connect(
+                &mut backend,
+                context_group_id,
+                outbound(),
+                Some(&state),
+                None,
+            );
+            assert_successful_response(
+                &dispatch(&restored, r#"{"id":9,"method":"Debugger.enable"}"#),
+                9,
+            );
+            assert_eq!(
+                state_json(&restored.v8_state())["Debugger"]["skipAllPauses"],
+                false
+            );
+            assert_successful_response(
+                &dispatch(&restored, r#"{"id":10,"method":"Debugger.disable"}"#),
+                10,
+            );
+            assert_successful_response(
+                &dispatch(&restored, r#"{"id":11,"method":"Debugger.enable"}"#),
+                11,
+            );
+            assert_eq!(
+                state_json(&restored.v8_state())["Debugger"]["skipAllPauses"],
+                false,
+                "disable and subsequent enable must follow V8's native reset behavior",
+            );
+        }
+        let session = RendererDevToolsSession::connect(
+            &mut backend,
+            context_group_id,
+            InspectorOutbound::for_agent(RendererDevToolsAgentToken::allocate()),
+            None,
+            None,
+        );
+        assert_successful_response(
+            &dispatch(
+                &session,
+                r#"{"id":12,"method":"Debugger.setSkipAllPauses","params":{"skip":false}}"#,
+            ),
+            12,
+        );
+        assert_successful_response(
+            &dispatch(&session, r#"{"id":13,"method":"Debugger.enable"}"#),
+            13,
+        );
+        assert_eq!(
+            state_json(&session.v8_state())["Debugger"]["skipAllPauses"],
+            false,
+            "a client override before first enable must not be reset",
+        );
+    }
+
+    #[test]
     fn frontend_reattach_preserves_replay_state_without_exposing_internal_session() {
         crate::ensure_v8_for_test();
         let mut isolate = v8::Isolate::new(Default::default());
         let mut backend = RendererInspectorIsolateBackend::new(&mut isolate);
         let context_group_id = DocumentInspectorContextGroupId::next();
         let agent_token = RendererDevToolsAgentToken::allocate();
-        let connection =
-            RendererDevToolsSessionConnection::new(context_group_id, agent_token, None);
+        let connection = RendererDevToolsSessionConnection::new(
+            backend.handle(),
+            context_group_id,
+            agent_token,
+            None,
+        );
         let session_key = DevToolsSessionKey::Attached("SID-agent-sessions".to_owned());
         let binding = RuntimeBindingRegistration {
             devtools_session: None,
@@ -622,7 +800,7 @@ mod tests {
         let restored_context = restored_messages
             .iter()
             .find(|message| {
-                message.get("method").and_then(Value::as_str)
+                message.method()
                     == Some("Runtime.executionContextCreated")
             })
             .unwrap_or_else(|| {
@@ -631,7 +809,8 @@ mod tests {
                 )
             });
         assert_eq!(
-            restored_context["params"]["context"]["origin"], "https://example.test",
+            restored_context.value()["params"]["context"]["origin"],
+            "https://example.test",
             "V8ContextInfo must carry the embedder-bound origin without outbound JSON rewriting"
         );
         let formatter_probe = serde_json::json!({
@@ -758,19 +937,13 @@ mod tests {
         let messages = restored.outbound.values_after(0);
         let cleared_index = messages
             .iter()
-            .position(|message| {
-                message.get("method").and_then(Value::as_str)
-                    == Some("Runtime.executionContextsCleared")
-            })
+            .position(|message| message.method() == Some("Runtime.executionContextsCleared"))
             .unwrap_or_else(|| {
                 panic!("restored Runtime session should clear old contexts: {messages:?}")
             });
         let created_index = messages
             .iter()
-            .position(|message| {
-                message.get("method").and_then(Value::as_str)
-                    == Some("Runtime.executionContextCreated")
-            })
+            .position(|message| message.method() == Some("Runtime.executionContextCreated"))
             .unwrap_or_else(|| {
                 panic!("restored Runtime session should report the new context: {messages:?}")
             });

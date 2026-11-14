@@ -28,7 +28,7 @@ thread_local! {
 
 static NEXT_SESSION_EXECUTOR_ROUTE_ID: AtomicUsize = AtomicUsize::new(1);
 
-struct EnteredOwnerWakeIsolateGuard(*const v8::Isolate);
+struct EnteredOwnerWakeIsolateGuard(*mut v8::Isolate);
 
 impl Drop for EnteredOwnerWakeIsolateGuard {
     fn drop(&mut self) {
@@ -36,6 +36,7 @@ impl Drop for EnteredOwnerWakeIsolateGuard {
         // constructing the guard, and all V8 scopes created afterwards have
         // been dropped before this guard runs.
         unsafe {
+            finish_page_close_termination(&mut *self.0);
             (*self.0).exit();
         }
     }
@@ -43,7 +44,7 @@ impl Drop for EnteredOwnerWakeIsolateGuard {
 
 pub(super) fn allocate_session_executor_route_id() -> usize {
     NEXT_SESSION_EXECUTOR_ROUTE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .expect("renderer Inspector session-executor route ID exhausted")
@@ -92,9 +93,63 @@ pub(super) unsafe extern "C" fn dispatch_inspector_interrupt(
     };
     let mut isolate_ptr = isolate;
     let isolate = unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(&mut isolate_ptr) };
+    if callback_target.take_close_request()
+        && terminate_entered_page_for_close(isolate, callback_target.route_id())
+    {
+        return;
+    }
+    dispatch_environment_notifications(&session_executor, isolate);
     with_scoped_inspector_microtasks(isolate, || {
         session_executor.dispatch_next_io_command_from_interrupt();
     });
+}
+
+struct InspectorPageCloseTermination;
+
+fn terminate_entered_page_for_close(
+    isolate: &mut v8::Isolate,
+    route: RendererInspectorSessionExecutorRouteId,
+) -> bool {
+    let owns_entry = {
+        let scope = pin!(v8::HandleScope::new(isolate));
+        let scope = &mut scope.init();
+        let Some(context) = scope.try_get_entered_or_microtask_context() else {
+            return false;
+        };
+        context
+            .get_slot::<RendererInspectorSessionExecutorRouteId>()
+            .is_some_and(|entered| *entered == route)
+    };
+    if owns_entry {
+        isolate.set_slot(InspectorPageCloseTermination);
+        isolate.terminate_execution();
+    }
+    owns_entry
+}
+
+/// Clear only our close-induced termination, after all entered contexts have
+/// unwound. The next live Page in this isolate must be able to run normally.
+pub(crate) fn finish_page_close_termination(isolate: &mut v8::Isolate) {
+    if isolate
+        .get_slot::<InspectorPageCloseTermination>()
+        .is_none()
+    {
+        return;
+    }
+    let still_entered = {
+        let scope = pin!(v8::HandleScope::new(isolate));
+        scope
+            .init()
+            .try_get_entered_or_microtask_context()
+            .is_some()
+    };
+    if !still_entered
+        && isolate
+            .remove_slot::<InspectorPageCloseTermination>()
+            .is_some()
+    {
+        isolate.cancel_terminate_execution();
+    }
 }
 
 pub(crate) fn dispatch_inspector_io_owner_wake(wake: RendererInspectorIoOwnerWake) {
@@ -115,6 +170,7 @@ pub(crate) fn dispatch_inspector_io_owner_wake(wake: RendererInspectorIoOwnerWak
         isolate.enter();
     }
     let _entered_isolate = EnteredOwnerWakeIsolateGuard(isolate);
+    dispatch_environment_notifications(&session_executor, isolate);
     let scope = pin!(v8::HandleScope::new(isolate));
     let scope = &mut scope.init();
     with_scoped_inspector_microtasks(scope, || {
@@ -125,6 +181,33 @@ pub(crate) fn dispatch_inspector_io_owner_wake(wake: RendererInspectorIoOwnerWak
 pub(crate) fn dispatch_inspector_main_owner_wake(
     wake: RendererInspectorMainOwnerWake,
 ) -> Option<RendererInspectorMainOwnerDispatch> {
-    session_executor(wake.route_id())
-        .and_then(|session_executor| session_executor.claim_next_main_command_from_owner())
+    let session_executor = session_executor(wake.route_id())?;
+    // Main and IO have separate owner wake channels. Do not let selection of
+    // a Main wake overtake an environment notification already in IO ingress.
+    // Only enter V8 when there is concrete notification work to execute.
+    if let Some(invalidation) = session_executor
+        .environment_ingress()
+        .claim_environment_invalidation()
+    {
+        let isolate = unsafe { &mut *session_executor.isolate.get() };
+        let isolate = unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(isolate) };
+        unsafe { isolate.enter() };
+        let _entered_isolate = EnteredOwnerWakeIsolateGuard(isolate);
+        invalidation.notify_isolate(isolate);
+    }
+    session_executor.claim_next_main_command_from_owner()
+}
+
+fn dispatch_environment_notifications(
+    session_executor: &RendererInspectorSessionExecutorLocal,
+    isolate: &mut v8::Isolate,
+) {
+    // Consume one merged batch. A publication racing application retains its
+    // own wake instead of making this callback drain an unbounded producer.
+    if let Some(invalidation) = session_executor
+        .environment_ingress()
+        .claim_environment_invalidation()
+    {
+        invalidation.notify_isolate(isolate);
+    }
 }

@@ -1,18 +1,19 @@
+mod interfaces;
 use super::objects::{build_webgl_debug_renderer_info_object, build_webgl_lose_context_object};
 use super::*;
+use crate::web_api_interfaces;
 use crate::{
     util::{callback_data_item, get_private_value, set_private_value, v8_string, v8str},
     webidl,
 };
+pub(super) use interfaces::install_value_template_bindings;
 use moli_webapi_declare::{WebApiObject, WebApiValue};
 
-const WEBGL_HANDLE_KIND_SLOT: &str = "__moliWebGlHandleKind";
 const WEBGL_VIEWPORT_SLOT: &str = "__moliWebGlViewport";
 const WEBGL_ERROR_SLOT: &str = "__moliWebGlError";
 const WEBGL_VIEWPORT: u32 = 0x0BA2;
 const WEBGL_INVALID_VALUE: u32 = 0x0501;
 const WEBGL_MAX_VIEWPORT_DIMS: [i32; 2] = [8192, 8192];
-const WEBGL2_CONTEXT_BRAND_SLOT: &str = "__moliWebGl2ContextBrand";
 const WEBGL2_DRAWING_BUFFER_COLOR_SPACE_SLOT: &str = "__moliWebGl2DrawingBufferColorSpace";
 const WEBGL2_UNPACK_COLOR_SPACE_SLOT: &str = "__moliWebGl2UnpackColorSpace";
 const WEBGL2_COLOR_SPACE_SLOTS: &[&str] = &[
@@ -56,7 +57,7 @@ struct WebGlViewportArgs {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebGlContextStateDeclaration<'s> {
     #[webapi(slot = WEBGL_VIEWPORT_SLOT)]
     viewport: v8::Local<'s, v8::Array>,
@@ -90,61 +91,50 @@ struct WebGl2GetInternalformatParameterArgs {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "WebGLBuffer", fallback_to_string_tag = "WebGLBuffer")]
-struct WebGlBufferHandleDeclaration {
-    #[webapi(slot = WEBGL_HANDLE_KIND_SLOT)]
-    kind: &'static str,
-}
-
-#[derive(WebApiObject)]
-#[webapi(interface = "WebGLProgram", fallback_to_string_tag = "WebGLProgram")]
-struct WebGlProgramHandleDeclaration {
-    #[webapi(slot = WEBGL_HANDLE_KIND_SLOT)]
-    kind: &'static str,
-}
-
-#[derive(WebApiObject)]
-#[webapi(interface = "WebGLShader", fallback_to_string_tag = "WebGLShader")]
-struct WebGlShaderHandleDeclaration {
-    #[webapi(slot = WEBGL_HANDLE_KIND_SLOT)]
-    kind: &'static str,
-}
+#[webapi(
+    interface = web_api_interfaces::WebGLBuffer,
+    fallback_to_string_tag = "WebGLBuffer"
+)]
+struct WebGlBufferHandleDeclaration {}
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "WebGLUniformLocation",
+    interface = web_api_interfaces::WebGLProgram,
+    fallback_to_string_tag = "WebGLProgram"
+)]
+struct WebGlProgramHandleDeclaration {}
+
+#[derive(WebApiObject)]
+#[webapi(
+    interface = web_api_interfaces::WebGLShader,
+    fallback_to_string_tag = "WebGLShader"
+)]
+struct WebGlShaderHandleDeclaration {}
+
+#[derive(WebApiObject)]
+#[webapi(
+    interface = web_api_interfaces::WebGLUniformLocation,
     fallback_to_string_tag = "WebGLUniformLocation"
 )]
-struct WebGlUniformLocationHandleDeclaration {
-    #[webapi(slot = WEBGL_HANDLE_KIND_SLOT)]
-    kind: &'static str,
-}
+struct WebGlUniformLocationHandleDeclaration {}
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "WebGLFramebuffer",
+    interface = web_api_interfaces::WebGLFramebuffer,
     fallback_to_string_tag = "WebGLFramebuffer"
 )]
-struct WebGlFramebufferHandleDeclaration {
-    #[webapi(slot = WEBGL_HANDLE_KIND_SLOT)]
-    kind: &'static str,
-}
+struct WebGlFramebufferHandleDeclaration {}
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "WebGLRenderbuffer",
+    interface = web_api_interfaces::WebGLRenderbuffer,
     fallback_to_string_tag = "WebGLRenderbuffer"
 )]
-struct WebGlRenderbufferHandleDeclaration {
-    #[webapi(slot = WEBGL_HANDLE_KIND_SLOT)]
-    kind: &'static str,
-}
+struct WebGlRenderbufferHandleDeclaration {}
 
 #[derive(WebApiObject)]
-#[webapi(interface = "WebGL2RenderingContext")]
+#[webapi(interface = web_api_interfaces::WebGL2RenderingContext)]
 struct WebGl2ContextObjectDeclaration {
-    #[webapi(slot = WEBGL2_CONTEXT_BRAND_SLOT, init = true)]
-    brand: (),
     #[webapi(slot = WEBGL2_DRAWING_BUFFER_COLOR_SPACE_SLOT)]
     drawing_buffer_color_space: String,
     #[webapi(slot = WEBGL2_UNPACK_COLOR_SPACE_SLOT)]
@@ -512,7 +502,7 @@ pub(crate) fn webgl_create_buffer_callback(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = WebGlBufferHandleDeclaration { kind: "buffer" }
+    let value = WebGlBufferHandleDeclaration::new()
         .bind(scope)
         .expect("WebGLBuffer handle declaration should bind");
     rv.set(value.into());
@@ -523,11 +513,9 @@ pub(crate) fn webgl_create_framebuffer_callback(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = WebGlFramebufferHandleDeclaration {
-        kind: "framebuffer",
-    }
-    .bind(scope)
-    .expect("WebGLFramebuffer handle declaration should bind");
+    let value = WebGlFramebufferHandleDeclaration::new()
+        .bind(scope)
+        .expect("WebGLFramebuffer handle declaration should bind");
     rv.set(value.into());
 }
 
@@ -536,11 +524,9 @@ pub(crate) fn webgl_create_renderbuffer_callback(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = WebGlRenderbufferHandleDeclaration {
-        kind: "renderbuffer",
-    }
-    .bind(scope)
-    .expect("WebGLRenderbuffer handle declaration should bind");
+    let value = WebGlRenderbufferHandleDeclaration::new()
+        .bind(scope)
+        .expect("WebGLRenderbuffer handle declaration should bind");
     rv.set(value.into());
 }
 
@@ -557,7 +543,7 @@ pub(crate) fn webgl_create_program_callback(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = WebGlProgramHandleDeclaration { kind: "program" }
+    let value = WebGlProgramHandleDeclaration::new()
         .bind(scope)
         .expect("WebGLProgram handle declaration should bind");
     rv.set(value.into());
@@ -568,7 +554,7 @@ pub(crate) fn webgl_create_shader_callback(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = WebGlShaderHandleDeclaration { kind: "shader" }
+    let value = WebGlShaderHandleDeclaration::new()
         .bind(scope)
         .expect("WebGLShader handle declaration should bind");
     rv.set(value.into());
@@ -579,11 +565,9 @@ pub(crate) fn webgl_uniform_location_callback(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = WebGlUniformLocationHandleDeclaration {
-        kind: "uniformLocation",
-    }
-    .bind(scope)
-    .expect("WebGLUniformLocation handle declaration should bind");
+    let value = WebGlUniformLocationHandleDeclaration::new()
+        .bind(scope)
+        .expect("WebGLUniformLocation handle declaration should bind");
     rv.set(value.into());
 }
 
@@ -750,7 +734,7 @@ pub(crate) fn webgl_get_context_attributes_callback(
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct WebGlContextAttributes {
     alpha: bool,
     antialias: bool,
@@ -794,30 +778,28 @@ pub(crate) fn webgl_get_shader_precision_format_callback(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = WebGlShaderPrecisionFormat::default()
+    let prototype = crate::context_bootstrap::ensure_intrinsic_interface_prototype(
+        scope,
+        "WebGLShaderPrecisionFormat",
+    )
+    .expect("WebGLShaderPrecisionFormat intrinsic prototype should be available");
+    let value = WebGlShaderPrecisionFormat::new(prototype, 23, 127, 127)
         .bind(scope)
         .expect("WebGL shader precision format declaration should bind");
     rv.set(value.into());
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
-struct WebGlShaderPrecisionFormat {
+#[webapi(interface = web_api_interfaces::WebGLShaderPrecisionFormat)]
+struct WebGlShaderPrecisionFormat<'s> {
+    #[webapi(prototype)]
+    prototype: v8::Local<'s, v8::Object>,
+    #[webapi(slot = interfaces::PRECISION)]
     precision: i32,
-    #[webapi(data_property = "rangeMin")]
+    #[webapi(slot = interfaces::RANGE_MIN)]
     range_min: i32,
-    #[webapi(data_property = "rangeMax")]
+    #[webapi(slot = interfaces::RANGE_MAX)]
     range_max: i32,
-}
-
-impl Default for WebGlShaderPrecisionFormat {
-    fn default() -> Self {
-        Self {
-            precision: 23,
-            range_min: 127,
-            range_max: 127,
-        }
-    }
 }
 
 pub(crate) fn webgl_lose_context_noop_callback(
@@ -841,8 +823,7 @@ fn is_webgl2_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, object, WEBGL2_CONTEXT_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
+    web_api_interfaces::WebGL2RenderingContext::is_instance(scope, object)
 }
 
 pub(crate) fn webgl2_color_space_getter_callback<'s>(
@@ -850,7 +831,7 @@ pub(crate) fn webgl2_color_space_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if get_private_value(scope, args.this(), WEBGL2_CONTEXT_BRAND_SLOT).is_none() {
+    if !web_api_interfaces::WebGL2RenderingContext::is_instance(scope, args.this()) {
         throw_type_error(scope, "Illegal invocation");
         return;
     }
@@ -879,7 +860,7 @@ pub(crate) fn webgl2_color_space_setter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if get_private_value(scope, args.this(), WEBGL2_CONTEXT_BRAND_SLOT).is_none() {
+    if !web_api_interfaces::WebGL2RenderingContext::is_instance(scope, args.this()) {
         throw_type_error(scope, "Illegal invocation");
         return;
     }

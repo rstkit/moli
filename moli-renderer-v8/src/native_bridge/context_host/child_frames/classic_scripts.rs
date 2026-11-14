@@ -1,4 +1,4 @@
-use super::{ChildBrowsingContextEntry, JsContextHost};
+use super::{ChildBrowsingContextEntry, PageScriptHost};
 use crate::{
     detached_event_target::dispatch_detached_simple_event,
     document_runtime::DomHandle,
@@ -99,12 +99,12 @@ impl ChildBrowsingContextEntry {
             .is_executing_parser_script()
     }
 
-    fn push_child_current_script(&mut self, script_handle: DomHandle) {
+    fn push_child_current_script(&mut self, script_handle: Option<DomHandle>) {
         self.classic_script_document_state
             .push_current_script(script_handle);
     }
 
-    fn pop_child_current_script(&mut self, script_handle: DomHandle) {
+    fn pop_child_current_script(&mut self, script_handle: Option<DomHandle>) {
         self.classic_script_document_state
             .pop_current_script(script_handle);
     }
@@ -114,7 +114,7 @@ impl ChildBrowsingContextEntry {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     fn child_classic_script_network_attribution(
         &self,
         child_handle: DomHandle,
@@ -182,15 +182,20 @@ impl JsContextHost {
     pub(crate) fn push_frame_script_job_current_script(
         &mut self,
         job: &FrameScriptJob,
-    ) -> Option<(DomHandle, DomHandle)> {
+    ) -> Option<(DomHandle, Option<DomHandle>)> {
         let script_handle = job.current_script?;
         let child_handle = self.frame_owner_child_handle_for_script_job(job)?;
+        let script_handle = self
+            .dom_host()
+            .containing_shadow_root(script_handle)
+            .is_none()
+            .then_some(script_handle);
         let entry = self.child_browsing_contexts.get_mut(&child_handle)?;
         entry.push_child_current_script(script_handle);
         Some((child_handle, script_handle))
     }
 
-    pub(crate) fn pop_child_current_script(&mut self, token: (DomHandle, DomHandle)) {
+    pub(crate) fn pop_child_current_script(&mut self, token: (DomHandle, Option<DomHandle>)) {
         let (child_handle, script_handle) = token;
         if let Some(entry) = self.child_browsing_contexts.get_mut(&child_handle) {
             entry.pop_child_current_script(script_handle);
@@ -290,13 +295,23 @@ impl JsContextHost {
             .unwrap_or_else(|| self.document_character_set().to_owned());
         let completion_tx = self.resource_completion_tx.clone();
         let task_loader = loader.clone();
+        let browser_context_runtime = self.browser_context_runtime();
+        let client_id = self.service_worker_client_id_for_subresource_owner(
+            crate::native_bridge::context_host::OwnerDispatchScope::Child(handle),
+        );
+        let document_url = network_attribution.document_url.clone();
         loader.spawn_resource_task(async move {
             let outcome =
-                crate::planning::load_prepared_script_source_outcome_with_document_character_set(
+                crate::planning::load_service_worker_aware_external_script_source_outcome(
                     &script_for_load,
+                    &task_loader.fetch_context().request_origin(),
                     task_loader.request_client(),
+                    task_loader.task_runner(),
                     Some(&document_character_set),
                     None,
+                    browser_context_runtime,
+                    client_id,
+                    document_url,
                 )
                 .await;
             let _ = completion_tx.send_child_classic_script(ChildClassicScriptLoadCompletion {
@@ -479,7 +494,7 @@ impl JsContextHost {
             return false;
         }
         let _ = self.child_browsing_context_document_wrapper(scope, event.child_handle);
-        let host_ptr = self as *mut JsContextHost;
+        let host_ptr = self as *mut PageScriptHost;
         let Some(target) =
             self.native_bridge_mut()
                 .wrap_handle(scope, host_ptr, event.script_handle)
@@ -681,6 +696,7 @@ impl JsContextHost {
             .expect("child classic external source load request must carry a load id");
         if let Some(outcome) = crate::planning::immediate_external_script_source_load_outcome(
             &script_for_load,
+            &loader.fetch_context().request_origin(),
             Some(&document_character_set),
         ) {
             let application =
@@ -701,13 +717,23 @@ impl JsContextHost {
             return;
         }
         let task_loader = loader.clone();
+        let browser_context_runtime = self.browser_context_runtime();
+        let client_id = self.service_worker_client_id_for_subresource_owner(
+            crate::native_bridge::context_host::OwnerDispatchScope::Child(child_handle),
+        );
+        let document_url = network_attribution.document_url.clone();
         loader.spawn_resource_task(async move {
             let outcome =
-                crate::planning::load_prepared_script_source_outcome_with_document_character_set(
+                crate::planning::load_service_worker_aware_external_script_source_outcome(
                     &script_for_load,
+                    &task_loader.fetch_context().request_origin(),
                     task_loader.request_client(),
+                    task_loader.task_runner(),
                     Some(&document_character_set),
                     None,
+                    browser_context_runtime,
+                    client_id,
+                    document_url,
                 )
                 .await;
             let _ = completion_tx.send_child_classic_script(ChildClassicScriptLoadCompletion {
@@ -833,7 +859,7 @@ impl ChildBrowsingContextEntry {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(in crate::native_bridge::context_host) fn install_empty_child_classic_script_runner_for_current_document(
         &mut self,
         handle: DomHandle,
@@ -1067,7 +1093,7 @@ impl JsContextHost {
             .frame_parser_classic_scripts
             .current_parser_blocking_stylesheet_signatures(document_owner)
             .is_some_and(|signatures| {
-                self.frame_document_blocking_stylesheets
+                self.frame_document_stylesheets
                     .blocks_signatures(document_owner, signatures)
             });
         if stylesheet_blocked {
@@ -1141,7 +1167,7 @@ impl JsContextHost {
             .frame_parser_classic_scripts
             .current_deferred_stylesheet_signatures(document_owner)
             .is_some_and(|signatures| {
-                self.frame_document_blocking_stylesheets
+                self.frame_document_stylesheets
                     .blocks_signatures(document_owner, signatures)
             });
         if stylesheet_blocked {
@@ -1248,7 +1274,7 @@ impl JsContextHost {
                     .child_document_script_schedulers
                     .parser_ordered_module_blocking_stylesheet_signatures(pending_script_id)
                     .is_some_and(|signatures| {
-                        self.frame_document_blocking_stylesheets
+                        self.frame_document_stylesheets
                             .blocks_signatures(document_owner, signatures)
                     });
                 if stylesheet_blocked {

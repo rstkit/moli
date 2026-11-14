@@ -1,3 +1,5 @@
+use anyhow::{Context as _, Result};
+
 use super::target_session_owner::{TargetSessionOwnerMut, TargetSessionOwnerRef};
 use super::*;
 use crate::conn::{
@@ -12,6 +14,11 @@ pub(crate) struct TargetEmulationStateUpdate<'a> {
 }
 
 impl TargetEmulationStateUpdate<'_> {
+    pub(crate) fn set_default_background_color(&mut self, color: Option<[u8; 4]>) {
+        self.raw.default_background_color = color;
+        self.effective.default_background_color = color;
+    }
+
     pub(crate) fn set_network_conditions(
         &mut self,
         network_conditions: Option<EmulatedNetworkConditions>,
@@ -41,14 +48,9 @@ impl TargetEmulationStateUpdate<'_> {
         self.effective.emulated_device_metrics = emulated_device_metrics;
     }
 
-    pub(crate) fn set_cpu_throttling_rate(&mut self, cpu_throttling_rate: f64) {
-        self.raw.cpu_throttling_rate = cpu_throttling_rate;
-        self.effective.cpu_throttling_rate = cpu_throttling_rate;
-    }
-
-    pub(crate) fn set_touch_emulation_enabled(&mut self, enabled: bool) {
-        self.raw.touch_emulation_enabled = enabled;
-        self.effective.touch_emulation_enabled = enabled;
+    pub(crate) fn set_max_touch_points(&mut self, max_touch_points: u32) {
+        self.raw.max_touch_points = max_touch_points;
+        self.effective.max_touch_points = max_touch_points;
     }
 
     pub(crate) fn set_emit_touch_events_for_mouse(&mut self, enabled: bool) {
@@ -64,6 +66,17 @@ impl TargetEmulationStateUpdate<'_> {
     pub(crate) fn set_script_execution_disabled(&mut self, disabled: bool) {
         self.raw.script_execution_disabled = disabled;
         self.effective.script_execution_disabled = disabled;
+    }
+
+    pub(crate) fn set_scrollbars_hidden(&mut self, hidden: bool) -> bool {
+        // Blink ignores a setter that repeats this handler's raw value, even
+        // when another handler has since changed the shared renderer value.
+        if self.raw.scrollbars_hidden == hidden {
+            return false;
+        }
+        self.raw.scrollbars_hidden = hidden;
+        self.effective.scrollbars_hidden = hidden;
+        true
     }
 }
 
@@ -85,21 +98,19 @@ impl TargetSessionOwnerMut<'_> {
         true
     }
 
-    fn set_devtools_locale_override(
-        &mut self,
-        locale_override: Option<String>,
-    ) -> Result<(), &'static str> {
+    fn set_devtools_locale_override(&mut self, locale_override: Option<String>) -> Result<()> {
         self.mutate_page_state(|state, session_key| {
-            state.set_devtools_locale_override(session_key, locale_override)
+            state
+                .set_devtools_locale_override(session_key, locale_override)
+                .map_err(Into::into)
         })
     }
 
-    fn set_devtools_timezone_override(
-        &mut self,
-        timezone_override: Option<String>,
-    ) -> Result<(), &'static str> {
+    fn set_devtools_timezone_override(&mut self, timezone_override: Option<String>) -> Result<()> {
         self.mutate_page_state(|state, session_key| {
-            state.set_devtools_timezone_override(session_key, timezone_override)
+            state
+                .set_devtools_timezone_override(session_key, timezone_override)
+                .map_err(Into::into)
         })
     }
 
@@ -107,21 +118,22 @@ impl TargetSessionOwnerMut<'_> {
         &mut self,
         locale_override: Option<String>,
         fallback_identity: &moli_browser_profile::BrowserIdentityProfile,
-    ) -> bool {
+    ) -> Result<()> {
         self.mutate_page_state(|state, _session_key| {
-            state.set_base_locale_override(locale_override.clone());
+            state.set_base_locale_override(locale_override.clone())?;
             state
                 .network_policy
                 .set_base_accept_language_override(locale_override, fallback_identity);
-        });
-        true
+            Ok(())
+        })
     }
 
-    fn set_base_timezone_override(&mut self, timezone_override: Option<String>) -> bool {
+    fn set_base_timezone_override(&mut self, timezone_override: Option<String>) -> Result<()> {
         self.mutate_page_state(|state, _session_key| {
-            state.set_base_timezone_override(timezone_override);
-        });
-        true
+            state
+                .set_base_timezone_override(timezone_override)
+                .map_err(Into::into)
+        })
     }
 }
 
@@ -143,6 +155,20 @@ impl TargetSessionOwnerRef<'_> {
 }
 
 impl CdpConnection {
+    pub(crate) fn default_background_color_for_owner(
+        &self,
+        owner: &crate::conn::CommandOwnerScope,
+    ) -> [u8; 4] {
+        self.target_session_owner_ref_for_owner(owner)
+            .and_then(|owner| {
+                owner
+                    .browser_context
+                    .page_target(&owner.target_id)
+                    .and_then(|target| target.effective_emulation_state.default_background_color)
+            })
+            .unwrap_or([255; 4])
+    }
+
     pub(crate) fn update_emulation_state_for_session_owner(
         &mut self,
         session_id: Option<&str>,
@@ -165,9 +191,9 @@ impl CdpConnection {
         &mut self,
         session_id: Option<&str>,
         locale_override: Option<String>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<()> {
         self.target_session_owner_mut(session_id)
-            .ok_or("BrowserContextNotLoaded")?
+            .context(crate::conn::BrowserContextNotLoaded)?
             .set_devtools_locale_override(locale_override)
     }
 
@@ -175,9 +201,9 @@ impl CdpConnection {
         &mut self,
         session_id: Option<&str>,
         timezone_override: Option<String>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<()> {
         self.target_session_owner_mut(session_id)
-            .ok_or("BrowserContextNotLoaded")?
+            .context(crate::conn::BrowserContextNotLoaded)?
             .set_devtools_timezone_override(timezone_override)
     }
 
@@ -185,21 +211,21 @@ impl CdpConnection {
         &mut self,
         owner: &crate::conn::CommandOwnerScope,
         locale_override: Option<String>,
-    ) -> bool {
+    ) -> Result<()> {
         let fallback_identity = self.base_browser_identity.clone();
         self.target_session_owner_mut_for_owner(owner)
-            .is_some_and(|mut owner| {
-                owner.set_base_locale_override(locale_override, &fallback_identity)
-            })
+            .context(crate::conn::BrowserContextNotLoaded)?
+            .set_base_locale_override(locale_override, &fallback_identity)
     }
 
     pub(crate) fn set_base_timezone_override_for_owner(
         &mut self,
         owner: &crate::conn::CommandOwnerScope,
         timezone_override: Option<String>,
-    ) -> bool {
+    ) -> Result<()> {
         self.target_session_owner_mut_for_owner(owner)
-            .is_some_and(|mut owner| owner.set_base_timezone_override(timezone_override))
+            .context(crate::conn::BrowserContextNotLoaded)?
+            .set_base_timezone_override(timezone_override)
     }
 
     pub(crate) fn emit_touch_events_for_mouse_for_session_owner(
@@ -221,6 +247,23 @@ impl CdpConnection {
             .cloned()
     }
 
+    pub(crate) fn update_navigator_emulation_for_session_owner(
+        &mut self,
+        session_id: Option<&str>,
+        update: impl FnOnce(
+            &mut moli_page_types::NavigatorEmulationSessions,
+            &moli_page_types::DevToolsSessionKey,
+        ),
+    ) -> Result<()> {
+        let mut owner = self
+            .target_session_owner_mut(session_id)
+            .context(crate::conn::BrowserContextNotLoaded)?;
+        owner.mutate_page_state(|target, key| {
+            update(&mut target.devtools_sessions.navigator_emulation, key)
+        });
+        Ok(())
+    }
+
     pub(crate) fn disable_emulation_session_handler_for_session_owner(
         &mut self,
         session_id: &str,
@@ -233,9 +276,17 @@ impl CdpConnection {
                     .ensure_session(session_key)
                     .emulation_session_state,
             );
+            let previous_queries = target.devtools_sessions.navigator_emulation.effective();
             target
+                .devtools_sessions
+                .navigator_emulation
+                .remove(session_key);
+            let mut delta = target
                 .effective_emulation_state
-                .disable_session_handler(&raw)
+                .disable_session_handler(&raw);
+            delta.navigator_queries =
+                previous_queries != target.devtools_sessions.navigator_emulation.effective();
+            delta
         }))
     }
 }

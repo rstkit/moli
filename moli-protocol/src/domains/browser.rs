@@ -1,15 +1,18 @@
+use anyhow::Result;
+
+use anyhow::Context;
 use chromiumoxide_cdp::cdp::browser_protocol::browser::{
-    CancelDownloadParams, SetWindowBoundsParams,
+    CancelDownloadParams, GetWindowBoundsParams, SetWindowBoundsParams,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::str::FromStr;
 
-use crate::conn::{BrowserWindowBounds, CdpConnection, Cmd};
-use crate::devtools_runtime::{
-    DevToolsCommand, DevToolsCommandResult, DevToolsError, DevToolsErrorKind,
+use crate::automation::{
+    AutomationCommand, AutomationResult, DevToolsError, DevToolsErrorKind,
     DevToolsSetDownloadBehaviorCommand, DevToolsSetPermissionCommand,
 };
+use crate::conn::{BrowserWindowBounds, CapturedBody, CdpConnection, Cmd, DownloadCommandError};
 use crate::domains::actions::BrowserAction;
 use crate::domains::command_output::CommandOutputPlan;
 use crate::version;
@@ -47,7 +50,7 @@ pub(crate) enum BrowserCommandTaskStep {
 
 enum PendingBrowserCommandKind {
     OpenDownloadAsStream {
-        pending: tokio::task::JoinHandle<Result<Vec<u8>, String>>,
+        pending: tokio::task::JoinHandle<Result<CapturedBody, DownloadCommandError>>,
     },
     ApplyPermissionOverrides {
         pending: Vec<PendingBrowserPageCommand>,
@@ -56,7 +59,7 @@ enum PendingBrowserCommandKind {
 
 enum CompletedBrowserCommandKind {
     OpenDownloadAsStream {
-        completed: Result<Vec<u8>, String>,
+        completed: Result<CapturedBody>,
     },
     ApplyPermissionOverrides {
         completed: Vec<CompletedBrowserPageCommand>,
@@ -70,13 +73,16 @@ struct PendingBrowserPageCommand {
 
 struct CompletedBrowserPageCommand {
     target: PendingBrowserPageTarget,
-    completed: Result<CompletedPageCommand, String>,
+    completed: Result<CompletedPageCommand>,
 }
 
 #[derive(Clone)]
 struct PendingBrowserPageTarget {
+    host: crate::conn::PageTargetHostIdentity,
     browser_context_id: String,
     target_id: String,
+    page_id: u64,
+    attachment_id: Option<moli_core::page::RendererAgentAttachmentId>,
 }
 
 impl PendingBrowserCommandDispatch {
@@ -86,8 +92,8 @@ impl PendingBrowserCommandDispatch {
                 CompletedBrowserCommandKind::OpenDownloadAsStream {
                     completed: pending
                         .await
-                        .map_err(|error| error.to_string())
-                        .and_then(|result| result),
+                        .map_err(anyhow::Error::from)
+                        .and_then(|result| result.map_err(anyhow::Error::from)),
                 }
             }
             PendingBrowserCommandKind::ApplyPermissionOverrides { pending } => {
@@ -95,11 +101,7 @@ impl PendingBrowserCommandDispatch {
                 for page_command in pending {
                     completed.push(CompletedBrowserPageCommand {
                         target: page_command.target,
-                        completed: page_command
-                            .pending
-                            .wait()
-                            .await
-                            .map_err(|error| error.to_string()),
+                        completed: page_command.pending.wait().await,
                     });
                 }
                 CompletedBrowserCommandKind::ApplyPermissionOverrides { completed }
@@ -158,7 +160,10 @@ pub(crate) fn try_start_browser_command_dispatch(
     match action {
         BrowserAction::GetVersion => BrowserCommandTaskStep::Complete(get_version(conn)),
         BrowserAction::GetWindowForTarget => {
-            BrowserCommandTaskStep::Complete(get_window_for_target(conn))
+            BrowserCommandTaskStep::Complete(get_window_for_target(conn, cmd))
+        }
+        BrowserAction::GetWindowBounds => {
+            BrowserCommandTaskStep::Complete(get_window_bounds(conn, cmd))
         }
         BrowserAction::SetWindowBounds => {
             BrowserCommandTaskStep::Complete(set_window_bounds(conn, cmd))
@@ -180,8 +185,9 @@ fn get_version(conn: &CdpConnection) -> CommandOutputPlan {
     CommandOutputPlan::result(json!({
         "protocolVersion": version::PROTOCOL_VERSION,
         "product": version::PRODUCT,
+        "moliVersion": version::MOLI_VERSION,
         "revision": version::REVISION,
-        "userAgent": conn.user_agent(),
+        "userAgent": conn.browser_user_agent(),
         "jsVersion": version::js_version(),
     }))
 }
@@ -208,10 +214,51 @@ fn bounds_json(bounds: &BrowserWindowBounds) -> Value {
     value
 }
 
-fn get_window_for_target(conn: &CdpConnection) -> CommandOutputPlan {
+fn get_window_for_target(conn: &mut CdpConnection, cmd: &Cmd<'_>) -> CommandOutputPlan {
+    #[derive(Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Params {
+        target_id: Option<String>,
+    }
+    let params: Params = match cmd.get_params() {
+        Ok(params) => params.unwrap_or_default(),
+        Err(_) => return CommandOutputPlan::error(-32602, "InvalidParams"),
+    };
+    let target_id = params
+        .target_id
+        .or_else(|| {
+            conn.target_owner_identity_for_session(cmd.session_id)
+                .and_then(|(_, id)| id)
+        })
+        .unwrap_or_else(|| conn.default_target_id().to_owned());
+    let page_target_id = conn
+        .primary_page_target_id_for_tab_target_id(&target_id)
+        .unwrap_or(&target_id);
+    let key = if conn.default_placeholder_is_logically_active(page_target_id) {
+        (conn.default_browser_context_id().to_owned(), 0)
+    } else if let Some((context, target)) = conn
+        .browser_context
+        .iter()
+        .chain(conn.inactive_browser_contexts.iter())
+        .find_map(|context| {
+            context
+                .page_target(page_target_id)
+                .map(|target| (context, target))
+        })
+    {
+        (context.id.clone(), target.window_id)
+    } else {
+        return CommandOutputPlan::error(-32000, "No browser window found");
+    };
+    let next_id = DEV_TOOLS_WINDOW_ID + conn.browser_window_ids.len() as u32;
+    let window_id = *conn.browser_window_ids.entry(key).or_insert(next_id);
+    let bounds = conn
+        .browser_window_bounds
+        .entry(window_id)
+        .or_insert_with(|| conn.window_bounds.clone());
     CommandOutputPlan::result(json!({
-        "windowId": DEV_TOOLS_WINDOW_ID,
-        "bounds": bounds_json(&conn.window_bounds)
+        "windowId": window_id,
+        "bounds": bounds_json(bounds)
     }))
 }
 
@@ -265,6 +312,44 @@ fn optional_i64_to_u32(value: Option<i64>) -> Result<Option<u32>, ()> {
     value.map(u32::try_from).transpose().map_err(|_| ())
 }
 
+fn window_is_live(conn: &CdpConnection, window_id: u32) -> bool {
+    conn.browser_window_ids
+        .iter()
+        .any(|((context_id, local_id), id)| {
+            *id == window_id
+                && (conn
+                    .browser_context_by_id(context_id)
+                    .is_some_and(|context| {
+                        context
+                            .page_targets
+                            .iter()
+                            .any(|target| target.window_id == *local_id)
+                    })
+                    || (*local_id == 0
+                        && context_id == conn.default_browser_context_id()
+                        && conn.default_placeholder_is_logically_active(conn.default_target_id())))
+        })
+}
+
+fn get_window_bounds(conn: &mut CdpConnection, cmd: &Cmd<'_>) -> CommandOutputPlan {
+    let params: GetWindowBoundsParams = match cmd.get_params() {
+        Ok(Some(params)) => params,
+        _ => {
+            return CommandOutputPlan::error(-32602, "InvalidParams");
+        }
+    };
+    let Ok(window_id) = u32::try_from(*params.window_id.inner()) else {
+        return CommandOutputPlan::error(-32602, "InvalidParams");
+    };
+    if !window_is_live(conn, window_id) {
+        return CommandOutputPlan::error(-32000, "Browser window not found");
+    }
+    let Some(bounds) = conn.browser_window_bounds.get(&window_id) else {
+        return CommandOutputPlan::error(-32000, "Browser window not found");
+    };
+    CommandOutputPlan::result(json!({ "bounds": bounds_json(bounds) }))
+}
+
 fn set_window_bounds(conn: &mut CdpConnection, cmd: &Cmd<'_>) -> CommandOutputPlan {
     let params: SetWindowBoundsParams = match cmd.get_params() {
         Ok(Some(params)) => params,
@@ -273,9 +358,15 @@ fn set_window_bounds(conn: &mut CdpConnection, cmd: &Cmd<'_>) -> CommandOutputPl
         }
     };
 
-    if *params.window_id.inner() != i64::from(DEV_TOOLS_WINDOW_ID) {
+    let Ok(window_id) = u32::try_from(*params.window_id.inner()) else {
         return CommandOutputPlan::error(-32602, "InvalidParams");
+    };
+    if !window_is_live(conn, window_id) {
+        return CommandOutputPlan::error(-32000, "Browser window not found");
     }
+    let Some(window_bounds) = conn.browser_window_bounds.get_mut(&window_id) else {
+        return CommandOutputPlan::error(-32602, "InvalidParams");
+    };
 
     let left = match optional_i64_to_i32(params.bounds.left) {
         Ok(left) => left,
@@ -301,12 +392,13 @@ fn set_window_bounds(conn: &mut CdpConnection, cmd: &Cmd<'_>) -> CommandOutputPl
             return CommandOutputPlan::error(-32602, "InvalidParams");
         }
     };
-    conn.window_bounds.left = left;
-    conn.window_bounds.top = top;
-    conn.window_bounds.width = width;
-    conn.window_bounds.height = height;
+    // Omitted fields keep their current value, as in Chromium.
+    window_bounds.left = left.or(window_bounds.left);
+    window_bounds.top = top.or(window_bounds.top);
+    window_bounds.width = width.or(window_bounds.width);
+    window_bounds.height = height.or(window_bounds.height);
     if let Some(window_state) = params.bounds.window_state {
-        conn.window_bounds.window_state = window_state.as_ref().to_owned();
+        window_bounds.window_state = window_state.as_ref().to_owned();
     }
 
     CommandOutputPlan::success()
@@ -350,26 +442,11 @@ pub(crate) fn set_download_behavior_command_output_plan(
 
 pub(crate) fn execute_devtools_browser_command(
     conn: &mut CdpConnection,
-    command: DevToolsCommand,
-) -> Result<DevToolsCommandResult, DevToolsError> {
+    command: AutomationCommand,
+) -> Result<AutomationResult, DevToolsError> {
     match command {
-        DevToolsCommand::SetDownloadBehavior(command) => {
+        AutomationCommand::SetDownloadBehavior(command) => {
             execute_devtools_set_download_behavior(conn, command)
-        }
-        _ => Err(DevToolsError::new(
-            DevToolsErrorKind::Unsupported,
-            "UnsupportedDevToolsCommand",
-        )),
-    }
-}
-
-pub(crate) async fn execute_devtools_browser_command_async(
-    conn: &mut CdpConnection,
-    command: DevToolsCommand,
-) -> Result<DevToolsCommandResult, DevToolsError> {
-    match command {
-        DevToolsCommand::SetPermission(command) => {
-            execute_devtools_set_permission_command_async(conn, command).await
         }
         _ => Err(DevToolsError::new(
             DevToolsErrorKind::Unsupported,
@@ -381,7 +458,7 @@ pub(crate) async fn execute_devtools_browser_command_async(
 fn execute_devtools_set_download_behavior(
     conn: &mut CdpConnection,
     command: DevToolsSetDownloadBehaviorCommand,
-) -> Result<DevToolsCommandResult, DevToolsError> {
+) -> Result<AutomationResult, DevToolsError> {
     let target_contexts = match command.user_contexts {
         Some(user_contexts) => {
             if user_contexts.is_empty() {
@@ -413,7 +490,7 @@ fn execute_devtools_set_download_behavior(
             }
             None => conn.download_behavior.reset_global(),
         }
-        return Ok(DevToolsCommandResult::Empty);
+        return Ok(AutomationResult::Empty);
     };
 
     if !is_valid_download_behavior(behavior.behavior.as_str()) {
@@ -440,13 +517,13 @@ fn execute_devtools_set_download_behavior(
             behavior.events_enabled,
         ),
     }
-    Ok(DevToolsCommandResult::Empty)
+    Ok(AutomationResult::Empty)
 }
 
-async fn execute_devtools_set_permission_command_async(
+pub(crate) fn prepare_devtools_set_permission_command(
     conn: &mut CdpConnection,
     command: DevToolsSetPermissionCommand,
-) -> Result<DevToolsCommandResult, DevToolsError> {
+) -> Result<Option<PendingBrowserCommandDispatch>, DevToolsError> {
     let browser_context_id = command.browser_context_id.as_ref().map(|id| id.as_str());
     if validate_browser_context_id(conn, browser_context_id).is_err() {
         return Err(DevToolsError::new(
@@ -474,20 +551,21 @@ async fn execute_devtools_set_permission_command_async(
         });
 
     let pending = start_loaded_page_permission_override_commands(conn)
-        .map_err(|error| DevToolsError::new(DevToolsErrorKind::Internal, error))?;
+        .map_err(|error| DevToolsError::new(DevToolsErrorKind::Internal, format!("{error:#}")))?;
     if pending.is_empty() {
-        return Ok(DevToolsCommandResult::Empty);
+        return Ok(None);
     }
-    let completed = PendingBrowserCommandDispatch {
+    Ok(Some(PendingBrowserCommandDispatch {
         command_id: None,
-        response_session_id: command
-            .context
-            .session_id
-            .map(|session_id| session_id.into_string()),
+        response_session_id: command.context.session_id.map(|id| id.into_string()),
         kind: PendingBrowserCommandKind::ApplyPermissionOverrides { pending },
-    }
-    .wait()
-    .await;
+    }))
+}
+
+pub(crate) fn finish_devtools_set_permission_command(
+    conn: &mut CdpConnection,
+    completed: CompletedBrowserCommandDispatch,
+) -> Result<AutomationResult, DevToolsError> {
     let CompletedBrowserCommandKind::ApplyPermissionOverrides {
         completed: commands,
     } = completed.kind
@@ -495,13 +573,11 @@ async fn execute_devtools_set_permission_command_async(
         unreachable!("set permission can only wait for permission override commands")
     };
     for command in commands {
-        let completion = command
-            .completed
-            .map_err(|error| DevToolsError::new(DevToolsErrorKind::Internal, error))?;
-        finish_pending_permission_override_command(conn, command.target, completion)
-            .map_err(|error| DevToolsError::new(DevToolsErrorKind::Internal, error))?;
+        finish_pending_permission_override_command(conn, command).map_err(|error| {
+            DevToolsError::new(DevToolsErrorKind::Internal, format!("{error:#}"))
+        })?;
     }
-    Ok(DevToolsCommandResult::Empty)
+    Ok(AutomationResult::Empty)
 }
 
 fn cancel_download(conn: &mut CdpConnection, cmd: &Cmd<'_>) -> CommandOutputPlan {
@@ -514,7 +590,7 @@ fn cancel_download(conn: &mut CdpConnection, cmd: &Cmd<'_>) -> CommandOutputPlan
 
     match conn.cancel_download(&params.guid) {
         Ok(()) => CommandOutputPlan::success(),
-        Err(message) => CommandOutputPlan::error(-32602, message),
+        Err(error) => CommandOutputPlan::error(-32602, error.to_string()),
     }
 }
 
@@ -535,7 +611,7 @@ fn start_open_download_as_stream_command(
             response_session_id: cmd.session_id.map(str::to_owned),
             kind: PendingBrowserCommandKind::OpenDownloadAsStream { pending },
         }),
-        Err(message) => browser_error_step(-32602, message),
+        Err(error) => browser_error_step(-32602, error.to_string()),
     }
 }
 
@@ -641,7 +717,7 @@ fn start_reset_permissions_command(
     start_apply_permission_overrides_command(conn, cmd)
 }
 
-fn browser_error_step(code: i32, message: impl Into<String>) -> BrowserCommandTaskStep {
+fn browser_error_step(code: i32, message: impl std::fmt::Display) -> BrowserCommandTaskStep {
     BrowserCommandTaskStep::Complete(CommandOutputPlan::error(code, message))
 }
 
@@ -655,7 +731,7 @@ fn start_apply_permission_overrides_command(
 ) -> BrowserCommandTaskStep {
     let pending = match start_loaded_page_permission_override_commands(conn) {
         Ok(pending) => pending,
-        Err(message) => return browser_error_step(-32000, message),
+        Err(error) => return browser_error_step(-32000, format!("{error:#}")),
     };
     if pending.is_empty() {
         return browser_success_step();
@@ -669,7 +745,7 @@ fn start_apply_permission_overrides_command(
 
 fn start_loaded_page_permission_override_commands(
     conn: &mut CdpConnection,
-) -> Result<Vec<PendingBrowserPageCommand>, String> {
+) -> Result<Vec<PendingBrowserPageCommand>> {
     let all_overrides = conn.permission_overrides.clone();
     let mut pending = Vec::new();
     for browser_context in conn
@@ -693,19 +769,22 @@ fn start_loaded_page_permission_override_commands(
             .collect::<Vec<_>>();
         for target in browser_context.page_targets.iter_mut() {
             let target_id = target.target_id().to_owned();
+            let host = target.host_identity();
             let Some(page) = target.loaded_page_mut() else {
                 continue;
             };
+            let page_command = page
+                .start_set_permission_overrides(&effective_overrides)
+                .context("failed to update page permission overrides")?;
             pending.push(PendingBrowserPageCommand {
                 target: PendingBrowserPageTarget {
                     browser_context_id: browser_context_id.clone(),
                     target_id,
+                    host,
+                    page_id: page.page_id(),
+                    attachment_id: page_command.renderer_agent_attachment_id(),
                 },
-                pending: page
-                    .start_set_permission_overrides(&effective_overrides)
-                    .map_err(|error| {
-                        format!("failed to update page permission overrides: {error}")
-                    })?,
+                pending: page_command,
             });
         }
     }
@@ -722,22 +801,14 @@ pub(crate) fn complete_pending_browser_command(
                 let stream = conn.finish_open_download_as_stream(bytes);
                 CommandOutputPlan::result(json!({ "stream": stream }))
             }
-            Err(message) => CommandOutputPlan::error(-32602, message),
+            Err(error) => CommandOutputPlan::error(-32602, format!("{error:#}")),
         },
         CompletedBrowserCommandKind::ApplyPermissionOverrides {
             completed: commands,
         } => {
             for command in commands {
-                let completion = match command.completed {
-                    Ok(completion) => completion,
-                    Err(error) => {
-                        return CommandOutputPlan::error(-32000, error);
-                    }
-                };
-                if let Err(error) =
-                    finish_pending_permission_override_command(conn, command.target, completion)
-                {
-                    return CommandOutputPlan::error(-32000, error);
+                if let Err(error) = finish_pending_permission_override_command(conn, command) {
+                    return CommandOutputPlan::error(-32000, format!("{error:#}"));
                 }
             }
             CommandOutputPlan::success()
@@ -747,16 +818,33 @@ pub(crate) fn complete_pending_browser_command(
 
 fn finish_pending_permission_override_command(
     conn: &mut CdpConnection,
-    target: PendingBrowserPageTarget,
-    completion: CompletedPageCommand,
-) -> Result<(), String> {
+    command: CompletedBrowserPageCommand,
+) -> Result<()> {
+    let target = command.target;
     let page = conn
         .browser_context_by_id_mut(&target.browser_context_id)
         .and_then(|browser_context| browser_context.page_target_mut(&target.target_id))
+        .filter(|current| target.host.matches(&current.host_identity()))
         .and_then(|target| target.loaded_page_mut())
-        .ok_or_else(|| "NoDocumentLoaded".to_owned())?;
-    page.finish_set_permission_overrides(completion)
-        .map_err(|error| error.to_string())
+        .filter(|page| {
+            page.page_id() == target.page_id
+                && page.renderer_agent_attachment_id() == target.attachment_id
+        });
+    if let Some(page) = page {
+        let completion = command.completed?;
+        return page.finish_set_permission_overrides(completion);
+    }
+
+    // Browser policy was committed before dispatch and is replayed when a new
+    // Page is installed. A retired projection may finish or be cancelled; it
+    // cannot invalidate that policy or install its PageState on a new owner.
+    match command.completed {
+        Ok(completion) => completion.into_unit_page_command_turn().map(drop),
+        Err(_) => Ok(()),
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests;

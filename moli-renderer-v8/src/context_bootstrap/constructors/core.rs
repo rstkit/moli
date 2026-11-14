@@ -1,4 +1,4 @@
-use super::super::media_queries::install_simple_event_target_methods;
+use super::super::media_queries::initialize_simple_event_target;
 use super::*;
 
 pub(in crate::context_bootstrap) fn event_target_constructor_callback<'s>(
@@ -14,7 +14,7 @@ pub(in crate::context_bootstrap) fn event_target_constructor_callback<'s>(
         return;
     }
     let target = args.this();
-    install_simple_event_target_methods(scope, target, "__moliEventTargetListeners", false);
+    initialize_simple_event_target(scope, target);
     rv.set(target.into());
 }
 
@@ -39,6 +39,18 @@ pub(in crate::context_bootstrap) fn illegal_constructor_callback(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     throw_type_error(scope, "Illegal constructor");
+}
+
+pub(in crate::context_bootstrap) fn shell_constructor_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    if !args.is_construct_call() {
+        throw_type_error(scope, "Constructor requires the 'new' operator.");
+        return;
+    }
+    unsupported_constructor_callback(scope, args, rv);
 }
 
 pub(in crate::context_bootstrap) fn unsupported_constructor_callback(

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::devtools_runtime::{
+use crate::automation::{
     DevToolsScriptException, DevToolsStackCallFrame, DevToolsStackTrace, DevToolsTargetId,
     LogEntryEvent, RuntimeConsoleEvent, ScriptExceptionEvent,
 };
@@ -422,21 +422,7 @@ pub(super) fn log_domain_items<'a>(
     items
 }
 
-pub(in crate::domains) fn runtime_console_message_type_and_text(
-    message: &str,
-) -> (&'static str, &str) {
-    let Some((level, text)) = message.split_once(": ") else {
-        return ("log", message);
-    };
-    match level {
-        "debug" => ("debug", text),
-        "warn" => ("warning", text),
-        "error" => ("error", text),
-        "info" => ("info", text),
-        "log" => ("log", text),
-        _ => ("log", message),
-    }
-}
+pub(in crate::domains) use self::console_message_level_and_text as runtime_console_message_type_and_text;
 
 pub(in crate::domains) fn console_message_added_background_event(
     session_id: Option<&str>,
@@ -605,8 +591,8 @@ fn parse_stack_location(location: &str) -> Option<(&str, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use crate::automation::AutomationEvent;
     use crate::conn::BackgroundProtocolEvent;
-    use crate::devtools_runtime::AutomationEvent;
     use serde_json::json;
 
     use super::ObservableOutputItem;
@@ -767,7 +753,7 @@ Error: Console
 
     #[test]
     fn runtime_console_background_event_preserves_sidecar_and_message() {
-        let target_id = crate::devtools_runtime::DevToolsTargetId::from("TID-1");
+        let target_id = crate::automation::DevToolsTargetId::from("TID-1");
         let event = super::runtime_console_api_called_background_event(
             Some("SID-1"),
             Some(&target_id),
@@ -808,7 +794,7 @@ Error: Console
 
     #[test]
     fn runtime_exception_background_event_preserves_sidecar_and_message() {
-        let target_id = crate::devtools_runtime::DevToolsTargetId::from("TID-1");
+        let target_id = crate::automation::DevToolsTargetId::from("TID-1");
         let event = super::runtime_exception_thrown_background_event(
             Some("SID-1"),
             Some(&target_id),

@@ -1,11 +1,12 @@
 use super::*;
+use crate::context_bootstrap::indexed_db::indexed_db_transaction_status;
 use crate::webidl;
 
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "IDBTransaction.objectStore")]
 struct IdbTransactionObjectStoreArgs {
-    #[webidl(required)]
-    name: String,
+    #[webidl(required, converter = "raw")]
+    name: webidl::DomString16,
 }
 
 pub(in crate::context_bootstrap::indexed_db) fn idb_transaction_object_store_callback<'s>(
@@ -19,9 +20,7 @@ pub(in crate::context_bootstrap::indexed_db) fn idb_transaction_object_store_cal
     let Some(parsed) = webidl::parse_args::<IdbTransactionObjectStoreArgs>(scope, &args) else {
         return;
     };
-    if !object_bool_property(scope, transaction, INDEXED_DB_TRANSACTION_ACTIVE_SLOT)
-        .unwrap_or(false)
-    {
+    if !indexed_db_transaction_status(scope, transaction).is_some_and(|state| state.active) {
         let error = dom_exception_value(
             scope,
             "The transaction is not active.",
@@ -30,8 +29,10 @@ pub(in crate::context_bootstrap::indexed_db) fn idb_transaction_object_store_cal
         scope.throw_exception(error);
         return;
     }
-    let name = parsed.name;
-    let Some(database) = object_property_as_object(scope, transaction, "db") else {
+    let name = moli_indexeddb::IndexedDbName::from_utf16(parsed.name.0);
+    let Some(database) =
+        crate::context_bootstrap::indexed_db::indexed_db_transaction_database(scope, transaction)
+    else {
         rv.set_undefined();
         return;
     };

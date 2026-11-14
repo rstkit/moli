@@ -8,10 +8,11 @@ use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
 
+use crate::automation::FrontendProtocol;
 use crate::conn::{CommandOwnerScope, ResponseCommitReady};
-use crate::devtools_runtime::DevToolsProtocol;
 use crate::domains::network::{
     CompletedDocumentProgressTransfer, CompletedDownloadProgressTransfer,
+    CompletedMainDocumentNetworkEvents,
 };
 
 use super::browser_context::BrowserContext;
@@ -79,6 +80,8 @@ pub(crate) struct RendererMainDocumentCommitSeed {
     timestamp: f64,
     inherited_security_origin: String,
     inherited_secure_context_type: String,
+    browsing_context_group: Option<super::navigation::NavigationBrowsingContextGroup>,
+    navigation_initiator: Option<moli_core::page::RendererNavigationInitiator>,
 }
 
 impl RendererMainDocumentCommitSeed {
@@ -87,11 +90,23 @@ impl RendererMainDocumentCommitSeed {
             frame_id: navigation.frame_id.clone(),
             loader_id: navigation.loader_id.clone(),
             timestamp: navigation.timestamp,
-            inherited_security_origin: navigation.source_document_security.security_origin.clone(),
+            browsing_context_group: None,
+            navigation_initiator: navigation.navigation_initiator.clone(),
+            inherited_security_origin: navigation
+                .initial_document_environment
+                .as_ref()
+                .map(|environment| environment.origin().to_owned())
+                .unwrap_or_else(|| navigation.source_document_security.security_origin.clone()),
             inherited_secure_context_type: navigation
-                .source_document_security
-                .secure_context_type
-                .clone(),
+                .initial_document_environment
+                .as_ref()
+                .map(|environment| environment.secure_context_type().to_owned())
+                .unwrap_or_else(|| {
+                    navigation
+                        .source_document_security
+                        .secure_context_type
+                        .clone()
+                }),
         }
     }
 
@@ -111,7 +126,17 @@ impl RendererMainDocumentCommitSeed {
             timestamp,
             inherited_security_origin: source_document_security.security_origin,
             inherited_secure_context_type: source_document_security.secure_context_type,
+            browsing_context_group: None,
+            navigation_initiator: None,
         }
+    }
+
+    pub(crate) fn with_browsing_context_group(
+        mut self,
+        group: Option<super::navigation::NavigationBrowsingContextGroup>,
+    ) -> Self {
+        self.browsing_context_group = group;
+        self
     }
 
     pub(crate) fn resolve(
@@ -144,7 +169,16 @@ impl RendererMainDocumentCommitSeed {
                 .map(|error_page| error_page.unreachable_url().as_str().to_owned()),
             security_origin,
             secure_context_type,
+            document_referrer: self
+                .navigation_initiator
+                .as_ref()
+                .map(|initiator| initiator.document_referrer(final_url)),
             timestamp: self.timestamp,
+            session_history_position: None,
+            browsing_context_group: self
+                .browsing_context_group
+                .as_ref()
+                .map(|group| group.resolve(final_url)),
         }
     }
 }
@@ -158,13 +192,13 @@ pub(crate) enum CompletedDownloadBody {
 #[derive(Debug)]
 pub(crate) struct CompletedDownloadBodyArtifact {
     body: CompletedDownloadBody,
-    response_headers: Vec<(String, String)>,
+    response_headers: Vec<(String, Vec<u8>)>,
 }
 
 impl CompletedDownloadBodyArtifact {
     pub(crate) fn from_body(
         body: CompletedDownloadBody,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
     ) -> Self {
         Self {
             body,
@@ -172,22 +206,22 @@ impl CompletedDownloadBodyArtifact {
         }
     }
 
-    pub(crate) fn into_parts(self) -> (CompletedDownloadBody, Vec<(String, String)>) {
+    pub(crate) fn into_parts(self) -> (CompletedDownloadBody, Vec<(String, Vec<u8>)>) {
         (self.body, self.response_headers)
     }
 }
 
 #[derive(Debug)]
-pub struct LoadedNavigation {
-    pub page: Page,
+pub struct LoadedNavigation<PageValue = Page> {
+    pub page: PageValue,
     pub pending_download: Option<RendererPendingDownloadActivation>,
     pub page_creation_artifacts: RendererPageCreationArtifacts,
     pub requested_url: Url,
     pub final_url: Url,
     pub request_method: String,
-    pub request_headers: Vec<(String, String)>,
+    pub request_headers: moli_fetch::RequestHeaders,
     pub response_status: u16,
-    pub response_headers: Vec<(String, String)>,
+    pub response_headers: Vec<(String, Vec<u8>)>,
     pub response_from_cache: bool,
     pub initial_runtime_realms: Vec<RendererRuntimeRealmInfo>,
     pub renderer_output_predecessor: Option<moli_core::RendererOutputFence>,
@@ -222,10 +256,17 @@ pub struct DownloadNavigation {
 }
 
 #[derive(Debug)]
+/// A 204/205 response retains the current Document and aborts the navigation.
+pub struct NoContentNavigation {
+    pub(crate) final_url: Url,
+    pub(crate) network_events: CompletedMainDocumentNetworkEvents,
+}
+
+#[derive(Debug)]
 pub enum NavigationLoadOutcome {
     ResponseCommitReady(Box<ResponseCommitReady>),
-    Loaded(Box<LoadedNavigation>),
     Download(Box<DownloadNavigation>),
+    NoContent(Box<NoContentNavigation>),
     NetworkFailure(String),
 }
 
@@ -248,52 +289,83 @@ pub(crate) enum NavigationResultProjection {
     Cdp(Value),
     WebDriverClassic(Value),
     WebDriverBidi(Value),
+    Automation {
+        protocol: FrontendProtocol,
+        payload: Value,
+        result: crate::domains::page::AutomationNavigationResult,
+    },
 }
 
 impl NavigationResultProjection {
-    pub(crate) fn new(protocol: DevToolsProtocol, payload: Value) -> Self {
-        match protocol {
-            DevToolsProtocol::Cdp => Self::Cdp(payload),
-            DevToolsProtocol::WebDriverClassic => Self::WebDriverClassic(payload),
-            DevToolsProtocol::WebDriverBidi => Self::WebDriverBidi(payload),
+    pub(crate) fn automation_result(
+        &self,
+    ) -> Option<&crate::domains::page::AutomationNavigationResult> {
+        match self {
+            Self::Automation { result, .. } => Some(result),
+            _ => None,
         }
     }
 
-    pub(crate) fn protocol(&self) -> DevToolsProtocol {
+    pub(crate) fn with_payload(mut self, payload: Value) -> Self {
+        *self.payload_mut() = payload;
+        self
+    }
+
+    pub(crate) fn new(protocol: FrontendProtocol, payload: Value) -> Self {
+        match protocol {
+            FrontendProtocol::Cdp => Self::Cdp(payload),
+            FrontendProtocol::WebDriverClassic => Self::WebDriverClassic(payload),
+            FrontendProtocol::WebDriverBidi => Self::WebDriverBidi(payload),
+        }
+    }
+
+    pub(crate) fn protocol(&self) -> FrontendProtocol {
         match self {
-            Self::Cdp(_) => DevToolsProtocol::Cdp,
-            Self::WebDriverClassic(_) => DevToolsProtocol::WebDriverClassic,
-            Self::WebDriverBidi(_) => DevToolsProtocol::WebDriverBidi,
+            Self::Cdp(_) => FrontendProtocol::Cdp,
+            Self::WebDriverClassic(_) => FrontendProtocol::WebDriverClassic,
+            Self::WebDriverBidi(_) => FrontendProtocol::WebDriverBidi,
+            Self::Automation { protocol, .. } => *protocol,
         }
     }
 
     pub(crate) fn payload(&self) -> &Value {
         match self {
-            Self::Cdp(payload) | Self::WebDriverClassic(payload) | Self::WebDriverBidi(payload) => {
-                payload
-            }
+            Self::Cdp(payload)
+            | Self::WebDriverClassic(payload)
+            | Self::WebDriverBidi(payload)
+            | Self::Automation { payload, .. } => payload,
         }
     }
 
     pub(crate) fn payload_mut(&mut self) -> &mut Value {
         match self {
-            Self::Cdp(payload) | Self::WebDriverClassic(payload) | Self::WebDriverBidi(payload) => {
-                payload
-            }
+            Self::Cdp(payload)
+            | Self::WebDriverClassic(payload)
+            | Self::WebDriverBidi(payload)
+            | Self::Automation { payload, .. } => payload,
         }
     }
 
     pub(crate) fn into_payload(self) -> Value {
         match self {
-            Self::Cdp(payload) | Self::WebDriverClassic(payload) | Self::WebDriverBidi(payload) => {
-                payload
-            }
+            Self::Cdp(payload)
+            | Self::WebDriverClassic(payload)
+            | Self::WebDriverBidi(payload)
+            | Self::Automation { payload, .. } => payload,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct NavigationDispatchState {
+    pub(crate) web_mcp_invocation: Option<moli_page_types::RendererWebMcpNavigation>,
+    pub(crate) navigation_initiator: Option<moli_core::page::RendererNavigationInitiator>,
+    pub(crate) initial_document_environment:
+        Option<moli_core::page::RendererCapturedDocumentEnvironment>,
+    pub(crate) auxiliary_document_response:
+        Option<moli_core::page::RendererAuxiliaryDocumentResponse>,
+    pub(crate) redirect_chain: Vec<moli_fetch::RedirectInfo>,
+    pub(crate) redirect_headers: Option<moli_fetch::RequestHeaders>,
     pub navigate_id: Option<u64>,
     pub(crate) owner: CommandOwnerScope,
     pub(crate) result_projection: NavigationResultProjection,
@@ -302,29 +374,30 @@ pub struct NavigationDispatchState {
     pub request_id: Option<String>,
     pub loader_id: String,
     pub request_announced: bool,
+    pub(crate) announced_redirects: usize,
     pub requested_url: Url,
     pub request_method: String,
     /// Text projection used by CDP request events and Fetch interception.
     pub request_body: Option<String>,
     /// Authoritative bytes used for transport. This differs from the text
     /// projection for multipart form data containing binary file payloads.
-    pub request_body_bytes: Option<Vec<u8>>,
-    pub request_headers: Vec<(String, String)>,
+    pub request_body_bytes: Option<bytes::Bytes>,
+    pub request_headers: moli_fetch::RequestHeaders,
     pub request_load_policy: NavigationRequestLoadPolicy,
     pub timestamp: f64,
     pub(crate) source_document_security: NavigationSourceDocumentSecurityContext,
 }
 
 impl NavigationDispatchState {
-    pub(crate) fn clone_request_body_bytes(&self) -> Option<Vec<u8>> {
+    pub(crate) fn clone_request_body_bytes(&self) -> Option<bytes::Bytes> {
         self.request_body_bytes
             .clone()
-            .or_else(|| self.request_body.clone().map(String::into_bytes))
+            .or_else(|| self.request_body.clone().map(bytes::Bytes::from))
     }
 
-    pub(crate) fn set_request_body_text(&mut self, body: String) {
-        self.request_body_bytes = Some(body.as_bytes().to_vec());
-        self.request_body = Some(body);
+    pub(crate) fn set_request_body_bytes(&mut self, body: bytes::Bytes) {
+        self.request_body = Some(String::from_utf8_lossy(&body).into_owned());
+        self.request_body_bytes = Some(body);
     }
 }
 
@@ -334,6 +407,7 @@ pub enum NavigationRequestLoadPolicy {
     DocumentInitiated,
     BrowserInitiated,
     Reload,
+    DocumentInitiatedReload,
 }
 
 #[derive(Debug, Serialize)]

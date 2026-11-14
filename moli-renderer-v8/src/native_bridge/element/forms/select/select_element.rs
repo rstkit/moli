@@ -1,5 +1,7 @@
 use super::helpers::{element_option_value, select_option_handles, selected_index_for_select};
 use super::*;
+use crate::native_bridge::bridge::wrapped_handle_value_for_receiver;
+use crate::native_bridge::set_wrapped_handle_or_null_for_receiver;
 use crate::{
     native_bridge::{
         callback_value_dom_handle,
@@ -54,7 +56,7 @@ fn select_getter_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
     member: &'static str,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     html_element_getter_receiver(scope, receiver, "HTMLSelectElement", member, "select")
 }
 
@@ -62,7 +64,7 @@ fn select_setter_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
     member: &'static str,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     html_element_setter_receiver(scope, receiver, "HTMLSelectElement", member, "select")
 }
 
@@ -70,7 +72,7 @@ fn select_method_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
     method: &'static str,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     let Ok((runtime_ptr, handle)) =
         node_runtime_and_handle_from_object_or_detached(scope, receiver)
     else {
@@ -111,7 +113,7 @@ fn set_select_boolean_attribute_on_receiver<'s>(
     attribute: &'static str,
     property: &'static str,
     value: v8::Local<'s, v8::Value>,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     let (runtime_ptr, handle) = select_setter_receiver(scope, receiver, property)?;
     set_reflected_boolean_attribute(
         scope,
@@ -215,13 +217,11 @@ pub(in crate::native_bridge) fn select_indexed_getter<'s>(
     else {
         return v8::Intercepted::kNo;
     };
-    let Some(node) = runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, option)
+    let Some(node) = wrapped_handle_value_for_receiver(scope, runtime_ptr, args.holder(), option)
     else {
         return v8::Intercepted::kNo;
     };
-    rv.set(node.into());
+    rv.set(node);
     v8::Intercepted::kYes
 }
 
@@ -330,14 +330,11 @@ pub(in crate::native_bridge) fn select_indexed_descriptor<'s>(
     else {
         return v8::Intercepted::kNo;
     };
-    let Some(value) = runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, option)
+    let Some(value) = wrapped_handle_value_for_receiver(scope, runtime_ptr, args.holder(), option)
     else {
         return v8::Intercepted::kNo;
     };
-    let Ok(descriptor) =
-        DataPropertyDescriptorDeclaration::new(value.into(), true, true).bind(scope)
+    let Ok(descriptor) = DataPropertyDescriptorDeclaration::new(value, true, true).bind(scope)
     else {
         return v8::Intercepted::kNo;
     };
@@ -395,7 +392,7 @@ pub(in crate::native_bridge) fn select_item_callback<'s>(
         rv.set_null();
         return;
     };
-    set_wrapped_node_or_null(scope, &mut rv, runtime_ptr, Some(option));
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), Some(option));
 }
 
 pub(in crate::native_bridge) fn select_named_item_callback<'s>(
@@ -423,7 +420,7 @@ pub(in crate::native_bridge) fn select_named_item_callback<'s>(
                 .and_then(Node::as_element)
                 .is_some_and(|element| element.matches_named_item_key(&parsed.name))
         });
-    set_wrapped_node_or_null(scope, &mut rv, runtime_ptr, option);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), option);
 }
 
 pub(in crate::native_bridge) fn select_remove_callback<'s>(
@@ -704,14 +701,14 @@ pub(in crate::native_bridge) fn select_value_setter_function<'s>(
     rv.set_undefined();
 }
 
-fn is_select_add_candidate(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_select_add_candidate(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime.dom_host().is_html_element_named(handle, "option")
         || runtime.dom_host().is_html_element_named(handle, "optgroup")
 }
 
 pub(in crate::native_bridge) fn select_add_insertion_point<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     select_handle: DomHandle,
     added_handle: DomHandle,
     before: Option<v8::Local<'s, v8::Value>>,
@@ -777,7 +774,7 @@ pub(in crate::native_bridge) fn select_add_insertion_point<'s>(
 
 pub(in crate::native_bridge) fn resize_select_options(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     select_handle: DomHandle,
     next_len: usize,
 ) {
@@ -806,7 +803,7 @@ pub(in crate::native_bridge) fn resize_select_options(
 
 pub(in crate::native_bridge) fn set_select_indexed_option(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     select_handle: DomHandle,
     index: u32,
     value: v8::Local<'_, v8::Value>,
@@ -866,7 +863,7 @@ pub(in crate::native_bridge) fn set_select_indexed_option(
 
 pub(in crate::native_bridge) fn normalize_single_select_selectedness(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     select_handle: DomHandle,
 ) {
     let runtime = unsafe { &mut *runtime_ptr };

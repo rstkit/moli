@@ -1,8 +1,9 @@
 use super::*;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "ReadableStream")]
+#[webapi(interface = web_api_interfaces::ReadableStream)]
 struct ReadableStreamShellDeclaration {
     #[webapi(slot = READABLE_STREAM_QUEUE_SLOT, init = "array")]
     queue: (),
@@ -31,7 +32,7 @@ struct ReadableStreamShellDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "WritableStream")]
+#[webapi(interface = web_api_interfaces::WritableStream)]
 struct WritableStreamShellDeclaration {
     #[webapi(slot = WRITABLE_STREAM_LOCKED_SLOT, init = false)]
     locked: (),
@@ -58,7 +59,7 @@ struct WritableStreamShellDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "TransformStream")]
+#[webapi(interface = web_api_interfaces::TransformStream)]
 struct TransformStreamShellDeclaration {
     #[webapi(slot = TRANSFORM_STREAM_READABLE_SLOT, init = "null")]
     readable: (),
@@ -67,7 +68,7 @@ struct TransformStreamShellDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ReadableStream")]
+#[webapi(interface = web_api_interfaces::ReadableStream)]
 struct ReadableStreamObjectDeclaration<'scope> {
     #[webapi(slot = READABLE_STREAM_QUEUE_SLOT, init = "array")]
     queue: (),
@@ -96,14 +97,14 @@ struct ReadableStreamObjectDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct ReadableStreamStartRejectedDataDeclaration<'scope> {
     #[webapi(slot = READABLE_STREAM_START_REJECTED_STREAM_SLOT)]
     stream: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct ReadableStreamStartFulfilledDataDeclaration<'scope> {
     #[webapi(slot = READABLE_STREAM_START_REJECTED_STREAM_SLOT)]
     stream: v8::Local<'scope, v8::Object>,
@@ -116,7 +117,7 @@ const READABLE_STREAM_START_PULL_AFTER_START_SLOT: &str = "__moliReadableStreamS
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "WritableStream",
+    interface = web_api_interfaces::WritableStream,
     scope_lifetime = 'scope,
 )]
 struct WritableStreamObjectDeclaration<'scope, 'value> {
@@ -145,7 +146,7 @@ struct WritableStreamObjectDeclaration<'scope, 'value> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TransformStream")]
+#[webapi(fragment, prototype = "TransformStream")]
 struct TransformStreamObjectDeclaration<'scope> {
     #[webapi(slot = TRANSFORM_STREAM_READABLE_SLOT)]
     readable: v8::Local<'scope, v8::Object>,
@@ -213,6 +214,14 @@ pub(in crate::context_bootstrap) fn initialize_transform_stream_object<'s>(
     TransformStreamObjectDeclaration::new(readable, writable)
         .initialize(scope, stream)
         .expect("TransformStream declaration should initialize object");
+    // Encoding wrappers share endpoint storage, but are separate interfaces.
+    let interface = match mode {
+        Some("text-encoder") => "TextEncoderStream",
+        Some("text-decoder") => "TextDecoderStream",
+        _ => "TransformStream",
+    };
+    web_api_interfaces::initialize(scope, stream, interface)
+        .expect("stream identity should initialize");
 }
 
 pub(in crate::context_bootstrap) fn initialize_webidl_transform_stream_object<'s>(
@@ -314,6 +323,9 @@ pub(in crate::context_bootstrap) fn initialize_webidl_transform_stream_object<'s
     TransformStreamObjectDeclaration::new(readable, writable)
         .initialize(scope, stream)
         .expect("TransformStream declaration should initialize object");
+    web_api_interfaces::TransformStream::DESCRIPTOR
+        .initialize(scope, stream)
+        .expect("TransformStream identity should initialize");
 }
 
 fn install_transform_stream_readable_pull_algorithm<'s>(
@@ -606,15 +618,15 @@ fn initialize_readable_stream_object_fields<'s>(
     let source_value = source
         .map(|value| value.into())
         .unwrap_or_else(|| v8::null(scope).into());
-    let algorithms = v8::Array::new(scope, 4);
-    let _ = algorithms.set_index(scope, READABLE_STREAM_ALGORITHM_SOURCE_INDEX, source_value);
-    let _ = algorithms.set_index(scope, READABLE_STREAM_ALGORITHM_PULL_INDEX, pull_algorithm);
-    let _ = algorithms.set_index(
+    let algorithms = v8::Array::new_with_elements(
         scope,
-        READABLE_STREAM_ALGORITHM_CANCEL_INDEX,
-        cancel_algorithm,
+        &[
+            source_value,
+            pull_algorithm,
+            cancel_algorithm,
+            size_algorithm,
+        ],
     );
-    let _ = algorithms.set_index(scope, READABLE_STREAM_ALGORITHM_SIZE_INDEX, size_algorithm);
     let controller = super::super::stream_objects::new_readable_stream_controller_object(
         scope,
         stream,

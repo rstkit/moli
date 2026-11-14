@@ -1,42 +1,33 @@
 use super::*;
+use crate::context_bootstrap::indexed_db::{
+    IndexedDbRequestReadyState, IndexedDbRequestValue, set_indexed_db_request_ready_state,
+    set_request_value,
+};
 
-pub(super) fn finish_aborted_upgrade_open<'s>(
+pub(in crate::context_bootstrap::indexed_db::tasks::dispatch) fn finish_aborted_upgrade_open<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     request: v8::Local<'s, v8::Object>,
+    database: v8::Local<'s, v8::Object>,
 ) {
-    if let Some(database) = object_property_as_object(scope, request, "result") {
-        set_indexed_db_slot_value(
-            scope,
-            database,
-            INDEXED_DB_DATABASE_UPGRADE_TRANSACTION_SLOT,
-            v8::null(scope).into(),
-        );
-        close_indexed_db_database_connection(scope, database);
-    }
-    let error = dom_exception_value(scope, "The upgrade transaction was aborted.", "AbortError");
-    set_indexed_db_request_surface_value(
+    close_indexed_db_database_connection(scope, database);
+    // The upgrade's abort event has finished. Reset the open request until its
+    // own error task publishes the final result and done flag.
+    set_request_value(
         scope,
         request,
-        INDEXED_DB_REQUEST_ERROR_SLOT,
-        "error",
-        error,
+        IndexedDbRequestValue::Error,
+        v8::null(scope).into(),
     );
-    let done = v8str(scope, "done").into();
-    set_indexed_db_request_surface_value(
-        scope,
-        request,
-        INDEXED_DB_REQUEST_READY_STATE_SLOT,
-        "readyState",
-        done,
-    );
+
+    set_indexed_db_request_ready_state(scope, request, IndexedDbRequestReadyState::Pending);
     let undefined = v8::undefined(scope).into();
-    set_indexed_db_request_surface_value(
+    set_request_value(scope, request, IndexedDbRequestValue::Result, undefined);
+    set_request_value(
         scope,
         request,
-        INDEXED_DB_REQUEST_RESULT_SLOT,
-        "result",
-        undefined,
+        IndexedDbRequestValue::Transaction,
+        v8::null(scope).into(),
     );
-    let _ = dispatch_idb_named_event(scope, request, "error", |_, _| {});
-    release_request_dispatch_refs(scope, request);
+    let error = dom_exception_value(scope, "The database open was aborted.", "AbortError");
+    store_request_error(scope, request, error);
 }

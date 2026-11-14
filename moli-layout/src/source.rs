@@ -1,6 +1,6 @@
 use std::{fmt::Debug, hash::Hash, sync::Arc};
 
-use crate::{LayoutError, ResolvedLayoutStyle};
+use crate::{LayoutDisplay, LayoutError, ResolvedLayoutStyle};
 
 /// Source-node category needed by CSS box construction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +56,26 @@ pub enum LayoutElementCategory {
     FormControl(LayoutFormControlKind),
 }
 
+/// Retention of source and generated children, before further normalization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildBoxPolicy {
+    None,
+    All,
+    ColumnsOnly,
+}
+
 impl LayoutElementCategory {
+    /// DOM-specific `display: contents` suppression is applied by the adapter.
+    pub const fn child_box_policy(self, replaced: bool, display: LayoutDisplay) -> ChildBoxPolicy {
+        match display {
+            LayoutDisplay::None | LayoutDisplay::TableColumn => ChildBoxPolicy::None,
+            LayoutDisplay::Contents => ChildBoxPolicy::All,
+            _ if replaced || matches!(self, Self::LineBreak) => ChildBoxPolicy::None,
+            LayoutDisplay::TableColumnGroup => ChildBoxPolicy::ColumnsOnly,
+            _ => ChildBoxPolicy::All,
+        }
+    }
+
     pub const fn debug_name(self) -> &'static str {
         match self {
             Self::Generic => "generic",
@@ -176,6 +195,39 @@ pub enum LayoutInputControlKind {
 }
 
 impl LayoutInputControlKind {
+    pub fn from_type_attribute(value: Option<&str>) -> Self {
+        use LayoutInputControlKind as Input;
+        match value
+            .map(str::trim)
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "button" => Input::Button,
+            "checkbox" => Input::Checkbox,
+            "color" => Input::Color,
+            "date" => Input::Date,
+            "datetime-local" => Input::DateTimeLocal,
+            "email" => Input::Email,
+            "file" => Input::File,
+            "hidden" => Input::Hidden,
+            "image" => Input::Image,
+            "month" => Input::Month,
+            "number" => Input::Number,
+            "password" => Input::Password,
+            "radio" => Input::Radio,
+            "range" => Input::Range,
+            "reset" => Input::Reset,
+            "search" => Input::Search,
+            "submit" => Input::Submit,
+            "tel" => Input::Telephone,
+            "time" => Input::Time,
+            "url" => Input::Url,
+            "week" => Input::Week,
+            _ => Input::Text,
+        }
+    }
+
     pub const fn debug_name(self) -> &'static str {
         match self {
             Self::Button => "form-input-button",
@@ -252,6 +304,8 @@ pub struct LayoutListData {
 pub struct LayoutFormControlData {
     pub value: Arc<str>,
     pub placeholder: Arc<str>,
+    /// Display labels in option order, independently of selectedness.
+    pub option_labels: Vec<Arc<str>>,
     pub size: Option<u16>,
     pub columns: u16,
     pub rows: u16,
@@ -266,6 +320,7 @@ impl Default for LayoutFormControlData {
         Self {
             value: Arc::from(""),
             placeholder: Arc::from(""),
+            option_labels: Vec::new(),
             size: None,
             columns: 20,
             rows: 2,
@@ -274,6 +329,14 @@ impl Default for LayoutFormControlData {
             disabled: false,
             multiple: false,
         }
+    }
+}
+
+impl LayoutFormControlData {
+    pub(crate) fn select_rows(&self) -> u16 {
+        self.size
+            .unwrap_or(if self.multiple { 4 } else { 1 })
+            .max(1)
     }
 }
 
@@ -341,6 +404,17 @@ impl LayoutElementSemantics {
         self.replaced.is_some()
     }
 
+    pub(crate) fn is_select_listbox(&self) -> bool {
+        matches!(
+            self.category,
+            LayoutElementCategory::FormControl(LayoutFormControlKind::Select)
+        ) && self
+            .metadata
+            .form_control
+            .as_ref()
+            .is_some_and(|data| data.select_rows() > 1)
+    }
+
     pub(crate) fn is_html_element(&self, local_name: &str) -> bool {
         self.namespace == LayoutNamespace::Html && self.local_name.as_ref() == local_name
     }
@@ -365,25 +439,30 @@ impl LayoutElementSemantics {
     /// must apply it for Moli's Servo backend.
     pub(crate) fn display_contents_is_none(&self) -> bool {
         self.namespace == LayoutNamespace::Html
-            && matches!(
-                self.local_name.as_ref(),
-                "br" | "wbr"
-                    | "meter"
-                    | "progress"
-                    | "canvas"
-                    | "embed"
-                    | "object"
-                    | "audio"
-                    | "iframe"
-                    | "img"
-                    | "video"
-                    | "frame"
-                    | "frameset"
-                    | "input"
-                    | "textarea"
-                    | "select"
-            )
+            && html_display_contents_is_none(self.local_name.as_ref())
     }
+}
+
+/// HTML elements whose `display: contents` used value suppresses their subtree.
+pub fn html_display_contents_is_none(local_name: &str) -> bool {
+    matches!(
+        local_name,
+        "br" | "wbr"
+            | "meter"
+            | "progress"
+            | "canvas"
+            | "embed"
+            | "object"
+            | "audio"
+            | "iframe"
+            | "img"
+            | "video"
+            | "frame"
+            | "frameset"
+            | "input"
+            | "textarea"
+            | "select"
+    )
 }
 
 /// Pseudo-elements that can participate in box construction.
@@ -443,7 +522,7 @@ pub(crate) struct LayoutCssImageResources {
     pub(crate) mask: Vec<Option<LayoutImageResource>>,
 }
 
-/// One document selection projected onto a source text node in UTF-16 units.
+/// A document or form-control selection sampled in UTF-16 units.
 ///
 /// Equal endpoints represent a caret. The range is sampled before the
 /// synchronous one-shot pass and copied into pass-local state; paint never
@@ -464,6 +543,14 @@ impl LayoutTextSelection {
     }
 }
 
+/// A resolved hyperlink, sampled only for document export. A same-document
+/// destination retains source identity only until paint projection finishes.
+#[derive(Clone, Debug)]
+pub struct LayoutHyperlink<N> {
+    pub url: std::sync::Arc<str>,
+    pub destination: Option<N>,
+}
+
 /// A short-lived, read-only view of the renderer's canonical flat tree.
 pub trait LayoutSource {
     type NodeId: Copy + Debug + Eq + Hash;
@@ -482,6 +569,18 @@ pub trait LayoutSource {
     fn root_is_document_element(&self) -> bool {
         false
     }
+    /// The source Document's rendering mode, sampled for this layout pass.
+    /// Synthetic sources use standards mode unless they explicitly opt in.
+    fn quirks_mode(&self) -> style::context::QuirksMode {
+        style::context::QuirksMode::NoQuirks
+    }
+    /// Whether the embedding context disables user scrolling of this viewport,
+    /// including its scrollbar UI and gutters, independently of CSS overflow.
+    /// Sampled for this layout pass; descendant scroll containers and
+    /// programmatic viewport scrolling keep their ordinary behavior.
+    fn disables_viewport_user_scrolling(&self) -> bool {
+        false
+    }
     /// Returns the parent in the same flattened tree exposed by [`Self::flat_children`].
     /// The view root must return `None`, even when it has a DOM parent outside the view.
     fn flat_parent(&self, node: Self::NodeId) -> Option<Self::NodeId>;
@@ -492,7 +591,13 @@ pub trait LayoutSource {
     fn text(&self, node: Self::NodeId) -> Option<&str>;
     fn label(&self, node: Self::NodeId) -> String;
 
-    /// Returns the active document selection intersecting one source text node.
+    /// Returns a link owned by this element, with its URL resolved against the
+    /// document base. Ancestor links are handled by the export projection.
+    fn hyperlink(&self, _node: Self::NodeId) -> Option<LayoutHyperlink<Self::NodeId>> {
+        None
+    }
+
+    /// Returns the active selection for a source text node or text control.
     fn text_selection(&self, _node: Self::NodeId) -> Option<LayoutTextSelection> {
         None
     }
@@ -524,6 +629,18 @@ pub trait LayoutSource {
         None
     }
 
+    /// Resolves inline SVG after its CSS viewport has completed numeric layout.
+    /// Object quads use unzoomed CSS pixels relative to the SVG content origin.
+    /// The returned geometry and optional paint resource belong to this pass.
+    fn svg_content(
+        &self,
+        _node: Self::NodeId,
+        _style: &ResolvedLayoutStyle,
+        _viewport: crate::LayoutSize,
+    ) -> Option<LayoutSvgContent<Self::NodeId>> {
+        None
+    }
+
     /// Samples one renderer-owned CSS `url()` image into the current pass.
     ///
     /// The URL is already absolute according to Stylo's stylesheet base URL.
@@ -532,6 +649,12 @@ pub trait LayoutSource {
     fn css_image_resource(&self, _resolved_url: &str) -> Option<LayoutImageResource> {
         None
     }
+}
+
+/// Geometry and paint sampled from the same inline SVG input.
+pub struct LayoutSvgContent<N> {
+    pub image: Option<LayoutImageResource>,
+    pub objects: Vec<(N, crate::LayoutQuad)>,
 }
 
 /// One element's primary style and the pseudo styles eagerly cascaded with it.
@@ -605,12 +728,21 @@ where
         Ok(None)
     }
 
+    fn placeholder_style(
+        &mut self,
+        _node: N,
+    ) -> Result<Option<ResolvedLayoutPseudoStyle>, LayoutError> {
+        Ok(None)
+    }
+
     fn anonymous_style(
         &mut self,
-        _owner: N,
-        parent: &ResolvedLayoutStyle,
+        context: crate::LayoutAnonymousStyleContext<'_, N>,
         display: crate::LayoutDisplay,
     ) -> Result<ResolvedLayoutStyle, LayoutError> {
-        Ok(ResolvedLayoutStyle::anonymous_from(parent, display))
+        Ok(ResolvedLayoutStyle::anonymous_from(
+            context.parent_style(),
+            display,
+        ))
     }
 }

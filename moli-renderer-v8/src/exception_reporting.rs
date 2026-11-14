@@ -12,6 +12,7 @@ const LOG_CALLBACK_CONTEXT_MAX_BYTES: usize = 4 * 1024;
 const VALUE_DEBUG_SUMMARY_MAX_BYTES: usize = 160 * 4;
 const VALUE_DEBUG_OBJECT_SUMMARY_MAX_BYTES: usize = 240 * 4;
 
+#[derive(Clone)]
 pub(super) struct V8ExceptionReport {
     pub(super) summary: String,
     pub(super) source: Option<String>,
@@ -26,7 +27,6 @@ pub(super) struct V8ExceptionReport {
 #[derive(Clone, Copy)]
 pub(super) enum CallbackExceptionLogLevel {
     Debug,
-    Error,
 }
 
 impl V8ExceptionReport {
@@ -116,11 +116,12 @@ fn exception_stack_property<'s>(
     local_value_to_string(scope, stack).filter(|stack| !stack.is_empty())
 }
 
-pub(super) fn build_event_handler_exception_report<'s>(
+/// Module creation must not eagerly read Error.stack or call an author's
+/// Error.prepareStackTrace hook while retaining a parse exception.
+pub(super) fn build_exception_report_without_stack<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     exception: Option<v8::Local<'s, v8::Value>>,
     message: Option<v8::Local<'s, v8::Message>>,
-    stack_value: Option<v8::Local<'s, v8::Value>>,
 ) -> V8ExceptionReport {
     // Prefer v8::Message when it exists because it carries richer source text, but do not
     // assume it is present or complete for every exception path.
@@ -137,8 +138,16 @@ pub(super) fn build_event_handler_exception_report<'s>(
     };
     let source = message
         .and_then(|message| message.get_script_resource_name(scope))
+        .filter(|value| !value.is_null_or_undefined())
         .and_then(|value| local_value_to_string(scope, value))
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            // A later JavaScript throw has its own V8 source location. Only
+            // fill the missing filename of the original JSON parse failure.
+            exception.and_then(|exception| {
+                crate::module_runtime::json_module_exception_source_url(scope, exception)
+            })
+        });
     let line = message.and_then(|message| message.get_line_number(scope));
     let column = message.and_then(|message| {
         // V8 may report an "unknown" start column via a sentinel that would overflow when turned
@@ -149,24 +158,31 @@ pub(super) fn build_event_handler_exception_report<'s>(
         .and_then(|message| message.get_source_line(scope))
         .map(|line| line.to_rust_string_lossy(scope))
         .filter(|line| !line.is_empty());
-    let stack = stack_value
-        .and_then(|value| local_value_to_string(scope, value))
-        .filter(|stack| !stack.is_empty())
-        .or_else(|| exception.and_then(|exception| exception_stack_property(scope, exception)));
-
-    let mut report = V8ExceptionReport {
+    V8ExceptionReport {
         summary,
         source,
         line,
         column,
         source_line,
-        stack,
+        stack: None,
         callback_context: None,
         exception: exception.map(|exception| v8::Global::new(scope, exception)),
-    };
+    }
+}
+
+pub(super) fn build_event_handler_exception_report<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    exception: Option<v8::Local<'s, v8::Value>>,
+    message: Option<v8::Local<'s, v8::Message>>,
+    stack_value: Option<v8::Local<'s, v8::Value>>,
+) -> V8ExceptionReport {
+    let mut report = build_exception_report_without_stack(scope, exception, message);
+    report.stack = stack_value
+        .and_then(|value| local_value_to_string(scope, value))
+        .filter(|stack| !stack.is_empty())
+        .or_else(|| exception.and_then(|exception| exception_stack_property(scope, exception)));
     if let Some(stack_trace) = v8::StackTrace::current_stack_trace(scope, 32) {
-        // Use the current stack only to fill holes; when v8::Message already gave us a
-        // location, keep that as the primary source of truth.
+        // Preserve the existing diagnostic fallback for callers that request a stack.
         fill_location_from_stack_trace(scope, &mut report, stack_trace);
     }
     report
@@ -255,19 +271,6 @@ pub(super) fn log_callback_exception(
                 "{log_label}"
             );
             log_stack(DiagnosticLogLevel::Debug, report);
-        }
-        CallbackExceptionLogLevel::Error => {
-            error!(
-                callback = callback_name,
-                message = &*fields.message,
-                source = &*fields.source,
-                line = report.line.unwrap_or(0),
-                column = report.column.unwrap_or(0),
-                source_line = &*fields.source_line,
-                callback_context = &*fields.callback_context,
-                "{log_label}"
-            );
-            log_stack(DiagnosticLogLevel::Error, report);
         }
     }
 }
@@ -527,11 +530,11 @@ fn eval_debug_probe(scope: &mut v8::PinScope<'_, '_>, source: &str) -> String {
         return "<alloc failed>".to_owned();
     };
     let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-    let scope = try_catch.init();
+    let mut scope = try_catch.init();
     let Some(script) = v8::Script::compile(&scope, source, None) else {
         return "<compile failed>".to_owned();
     };
-    let Some(result) = script.run(&scope) else {
+    let Some(result) = crate::script_execution::execute_compiled_script(&mut scope, script) else {
         return scope
             .exception()
             .and_then(|value| value.to_string(&scope))
@@ -721,7 +724,9 @@ fn invoke_callback_with_report_inner<'s>(
     {
         let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
         let mut scope = try_catch.init();
-        if let Some(returned) = handler.call(&scope, receiver, args) {
+        if let Some(returned) =
+            crate::script_execution::call_function(&mut scope, handler, receiver, args)
+        {
             returned_value = Some(v8::Global::new(&scope, returned));
         } else {
             if scope.is_execution_terminating() {

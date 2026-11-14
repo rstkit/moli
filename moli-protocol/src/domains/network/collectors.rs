@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::conn::CapturedBody;
-use crate::devtools_runtime::{
-    DevToolsAddNetworkDataCollectorCommand, DevToolsAddNetworkDataCollectorResult,
-    DevToolsCommandResult, DevToolsError, DevToolsErrorKind, DevToolsNetworkDataCollectorId,
-    DevToolsNetworkDataType,
+use anyhow::Result;
+
+use crate::automation::{
+    AutomationResult, DevToolsAddNetworkDataCollectorCommand,
+    DevToolsAddNetworkDataCollectorResult, DevToolsError, DevToolsErrorKind,
+    DevToolsNetworkDataCollectorId, DevToolsNetworkDataType,
 };
+use crate::conn::CapturedBody;
 
 const MAX_TOTAL_COLLECTED_SIZE: u64 = 200_000_000;
 
@@ -19,7 +22,7 @@ struct NetworkDataCollectorConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct NetworkDataCollectorStore {
-    collectors: HashMap<String, NetworkDataCollectorConfig>,
+    collectors: HashMap<String, Arc<NetworkDataCollectorConfig>>,
     disowned: HashSet<(String, DevToolsNetworkDataType, String)>,
     collected_bodies: HashMap<(String, DevToolsNetworkDataType), CollectedNetworkDataBody>,
 }
@@ -30,11 +33,60 @@ pub(crate) struct CollectedNetworkDataBody {
     collector_ids: HashSet<String>,
 }
 
+pub(super) struct NetworkDataCollectorIdentity {
+    id: DevToolsNetworkDataCollectorId,
+    config: Arc<NetworkDataCollectorConfig>,
+}
+
+impl NetworkDataCollectorIdentity {
+    pub(super) fn id(&self) -> &DevToolsNetworkDataCollectorId {
+        &self.id
+    }
+}
+
 impl NetworkDataCollectorStore {
+    pub(super) fn capture_collector(
+        &self,
+        id: &DevToolsNetworkDataCollectorId,
+    ) -> Result<NetworkDataCollectorIdentity, DevToolsError> {
+        let config = self
+            .collectors
+            .get(id.as_str())
+            .ok_or_else(no_such_network_collector)?;
+        Ok(NetworkDataCollectorIdentity {
+            id: id.clone(),
+            config: config.clone(),
+        })
+    }
+
+    pub(super) fn capture_body_collectors(
+        &self,
+        ids: &HashSet<String>,
+    ) -> Vec<NetworkDataCollectorIdentity> {
+        ids.iter()
+            .filter_map(|id| self.capture_collector(&id.as_str().into()).ok())
+            .collect()
+    }
+
+    pub(super) fn collector_is_current(&self, original: &NetworkDataCollectorIdentity) -> bool {
+        self.collectors
+            .get(original.id.as_str())
+            .is_some_and(|current| Arc::ptr_eq(current, &original.config))
+    }
+
+    pub(super) fn ensure_collector_is_current(
+        &self,
+        original: &NetworkDataCollectorIdentity,
+    ) -> Result<(), DevToolsError> {
+        self.collector_is_current(original)
+            .then_some(())
+            .ok_or_else(no_such_network_collector)
+    }
+
     pub(crate) fn add_collector(
         &mut self,
         command: DevToolsAddNetworkDataCollectorCommand,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
+    ) -> Result<AutomationResult, DevToolsError> {
         if command.max_encoded_data_size < 1
             || command.max_encoded_data_size > MAX_TOTAL_COLLECTED_SIZE
         {
@@ -46,7 +98,7 @@ impl NetworkDataCollectorStore {
         let collector_id = command.collector_id.into_string();
         self.collectors.insert(
             collector_id.clone(),
-            NetworkDataCollectorConfig {
+            Arc::new(NetworkDataCollectorConfig {
                 data_types: command.data_types.into_iter().collect(),
                 max_encoded_data_size: command.max_encoded_data_size,
                 target_ids: command
@@ -59,9 +111,9 @@ impl NetworkDataCollectorStore {
                     .into_iter()
                     .map(|browser_context_id| browser_context_id.into_string())
                     .collect(),
-            },
+            }),
         );
-        Ok(DevToolsCommandResult::AddNetworkDataCollector(
+        Ok(AutomationResult::AddNetworkDataCollector(
             DevToolsAddNetworkDataCollectorResult {
                 collector_id: DevToolsNetworkDataCollectorId::from(collector_id),
             },
@@ -140,24 +192,6 @@ impl NetworkDataCollectorStore {
             return Ok(false);
         }
         Ok(body_was_collected_by_collector)
-    }
-
-    pub(crate) fn body_has_owned_collector(
-        &self,
-        request_id: &str,
-        data_type: DevToolsNetworkDataType,
-        collector_ids: &HashSet<String>,
-    ) -> bool {
-        collector_ids.iter().any(|collector_id| {
-            self.collectors
-                .get(collector_id)
-                .is_some_and(|collector| collector.collects_data_type(data_type))
-                && !self.disowned.contains(&(
-                    request_id.to_owned(),
-                    data_type,
-                    collector_id.clone(),
-                ))
-        })
     }
 
     pub(crate) fn disown_data(
@@ -248,8 +282,13 @@ impl CollectedNetworkDataBody {
         }
     }
 
-    pub(crate) fn body_bytes_limited(&self, limit: usize) -> anyhow::Result<Vec<u8>> {
+    #[cfg(test)]
+    pub(crate) fn body_bytes_limited(&self, limit: usize) -> Result<Vec<u8>> {
         self.body.materialize_bytes_limited(limit)
+    }
+
+    pub(super) fn captured_body(&self) -> &CapturedBody {
+        &self.body
     }
 
     pub(crate) fn was_collected_by(&self, collector_id: &str) -> bool {
@@ -268,6 +307,10 @@ impl CollectedNetworkDataBody {
 fn no_such_network_collector() -> DevToolsError {
     DevToolsError::new(
         DevToolsErrorKind::NoSuchNetworkCollector,
-        "no such network collector",
+        NoSuchNetworkCollector,
     )
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("no such network collector")]
+struct NoSuchNetworkCollector;

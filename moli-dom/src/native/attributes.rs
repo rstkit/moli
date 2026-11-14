@@ -56,11 +56,14 @@ impl NativeDom {
     }
 
     pub fn set_attribute(&mut self, node_id: NativeNodeId, name: &str, value: &str) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        super::serialization_probe::record(super::serialization_probe::Access::Mutation);
         let Some(normalized_name) = self.normalized_attribute_name(node_id, name) else {
             return false;
         };
         let base_document =
             self.base_element_attribute_owner_document(node_id, None, &normalized_name);
+        let referrer_attribute = self.is_meta_referrer_attribute(node_id, None, &normalized_name);
         let changed = self
             .node_mut(node_id)
             .and_then(|node| node.data_mut().as_element_mut())
@@ -69,6 +72,9 @@ impl NativeDom {
             });
         if changed && let Some(document) = base_document {
             self.process_base_element(document, false);
+        }
+        if referrer_attribute {
+            self.process_meta_referrer(node_id);
         }
         changed
     }
@@ -81,6 +87,8 @@ impl NativeDom {
         local_name: &str,
         value: &str,
     ) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        super::serialization_probe::record(super::serialization_probe::Access::Mutation);
         let namespace = namespace.unwrap_or_default();
         let base_document =
             self.base_element_attribute_owner_document(node_id, Some(namespace), local_name);
@@ -98,10 +106,15 @@ impl NativeDom {
         if changed && let Some(document) = base_document {
             self.process_base_element(document, false);
         }
+        if self.is_meta_referrer_attribute(node_id, Some(namespace), local_name) {
+            self.process_meta_referrer(node_id);
+        }
         changed
     }
 
     pub fn remove_attribute(&mut self, node_id: NativeNodeId, name: &str) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        super::serialization_probe::record(super::serialization_probe::Access::Mutation);
         let Some(normalized_name) = self.normalized_attribute_name(node_id, name) else {
             return false;
         };
@@ -123,6 +136,8 @@ impl NativeDom {
         namespace: Option<&str>,
         local_name: &str,
     ) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        super::serialization_probe::record(super::serialization_probe::Access::Mutation);
         let namespace = namespace.unwrap_or_default();
         let base_document =
             self.base_element_attribute_owner_document(node_id, Some(namespace), local_name);

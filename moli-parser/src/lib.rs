@@ -5,6 +5,7 @@
 
 mod html;
 mod html_input;
+mod input_prefix;
 mod live_target;
 mod script_planning;
 mod session;
@@ -19,7 +20,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use html5ever::tree_builder::QuirksMode;
 use moli_dom::native::NativeNodeId;
 use moli_stylesheet_blocking::{
-    DocumentBlockingStylesheetSignature, DocumentOwnedBlockingStylesheetDiscoveryInput,
+    DocumentBlockingStylesheetSignature, DocumentOwnedStylesheetDiscoveryInput,
 };
 
 pub use html::{
@@ -75,10 +76,11 @@ struct HtmlTreeSinkState {
     pending_custom_element_construction_handoffs:
         VecDeque<html::ParserCustomElementConstructionHandoff>,
     pending_blocking_stylesheet_pause: Option<NativeNodeId>,
-    discovered_blocking_stylesheet_inputs: VecDeque<DocumentOwnedBlockingStylesheetDiscoveryInput>,
-    captured_blocking_stylesheet_nodes: HashSet<NativeNodeId>,
+    discovered_stylesheet_inputs: VecDeque<DocumentOwnedStylesheetDiscoveryInput>,
+    captured_stylesheet_nodes: HashSet<NativeNodeId>,
     captured_blocking_stylesheet_signatures: HashSet<DocumentBlockingStylesheetSignature>,
     finishing_tree_builder: bool,
+    non_nonceable_parser_scripts: HashSet<NativeNodeId>,
     current_position: ParserSourcePosition,
     script_start_positions: HashMap<NativeNodeId, ParserSourcePosition>,
 }
@@ -95,10 +97,11 @@ impl Default for HtmlTreeSinkState {
             defined_autonomous_custom_elements: HashSet::new(),
             pending_custom_element_construction_handoffs: VecDeque::new(),
             pending_blocking_stylesheet_pause: None,
-            discovered_blocking_stylesheet_inputs: VecDeque::new(),
-            captured_blocking_stylesheet_nodes: HashSet::new(),
+            discovered_stylesheet_inputs: VecDeque::new(),
+            captured_stylesheet_nodes: HashSet::new(),
             captured_blocking_stylesheet_signatures: HashSet::new(),
             finishing_tree_builder: false,
+            non_nonceable_parser_scripts: HashSet::new(),
             current_position: ParserSourcePosition::default(),
             script_start_positions: HashMap::new(),
         }

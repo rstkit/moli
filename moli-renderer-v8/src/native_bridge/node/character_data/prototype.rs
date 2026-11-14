@@ -1,5 +1,6 @@
+use crate::web_api_interfaces;
 use crate::{
-    native_bridge::{document, node::node_runtime_and_handle_from_args},
+    native_bridge::{document, node::node_runtime_and_handle_from_args_or_detached},
     webidl,
 };
 use moli_webapi_declare::WebApiFunctionTemplate;
@@ -7,7 +8,7 @@ use moli_webapi_declare::WebApiFunctionTemplate;
 use super::*;
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CharacterData", enumerable)]
+#[webapi(interface = web_api_interfaces::CharacterData, enumerable, receiver)]
 struct CharacterDataPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -30,7 +31,7 @@ struct CharacterDataPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Text", enumerable)]
+#[webapi(interface = web_api_interfaces::Text, enumerable, receiver)]
 struct TextPrototypeDeclaration {
     #[webapi(accessor_property, getter = text_whole_text_getter_callback)]
     whole_text: (),
@@ -39,17 +40,17 @@ struct TextPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ProcessingInstruction", enumerable)]
+#[webapi(interface = web_api_interfaces::ProcessingInstruction, enumerable, receiver)]
 struct ProcessingInstructionPrototypeDeclaration {
     #[webapi(accessor_property, getter = processing_instruction_target_getter_callback)]
     target: (),
 }
 
-fn receiver_is_live_node<'a>(
+fn receiver_has_native_node<'a>(
     scope: &mut v8::PinScope<'a, '_>,
     args: &v8::FunctionCallbackArguments<'a>,
 ) -> bool {
-    node_runtime_and_handle_from_args(scope, args).is_ok()
+    node_runtime_and_handle_from_args_or_detached(scope, args).is_ok()
 }
 
 fn character_data_append_data_callback<'a>(
@@ -57,7 +58,7 @@ fn character_data_append_data_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     rv: v8::ReturnValue<'a, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
+    if receiver_has_native_node(scope, &args) {
         node_append_data_callback(scope, args, rv);
     } else {
         document::detached_character_data_append_data_callback(scope, args, rv);
@@ -69,7 +70,7 @@ fn character_data_delete_data_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     rv: v8::ReturnValue<'a, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
+    if receiver_has_native_node(scope, &args) {
         node_delete_data_callback(scope, args, rv);
     } else {
         document::detached_character_data_delete_data_callback(scope, args, rv);
@@ -81,7 +82,7 @@ fn character_data_insert_data_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     rv: v8::ReturnValue<'a, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
+    if receiver_has_native_node(scope, &args) {
         node_insert_data_callback(scope, args, rv);
     } else {
         document::detached_character_data_insert_data_callback(scope, args, rv);
@@ -93,7 +94,7 @@ fn character_data_replace_data_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     rv: v8::ReturnValue<'a, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
+    if receiver_has_native_node(scope, &args) {
         node_replace_data_callback(scope, args, rv);
     } else {
         document::detached_character_data_replace_data_callback(scope, args, rv);
@@ -105,7 +106,7 @@ fn character_data_substring_data_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     rv: v8::ReturnValue<'a, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
+    if receiver_has_native_node(scope, &args) {
         node_substring_data_callback(scope, args, rv);
     } else {
         document::detached_character_data_substring_data_callback(scope, args, rv);
@@ -117,7 +118,7 @@ fn text_split_text_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     rv: v8::ReturnValue<'a, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
+    if receiver_has_native_node(scope, &args) {
         node_split_text_callback(scope, args, rv);
     } else {
         document::detached_text_split_text_callback(scope, args, rv);
@@ -129,8 +130,9 @@ fn character_data_data_getter_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
-        let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.this())
+    if receiver_has_native_node(scope, &args) {
+        let Ok((runtime_ptr, handle)) =
+            node_runtime_and_handle_from_object_or_detached(scope, args.this())
         else {
             rv.set_undefined();
             return;
@@ -144,11 +146,7 @@ fn character_data_data_getter_callback<'a>(
         super::helpers::set_utf16_return_value(scope, &mut rv, &units);
         return;
     }
-    let value = Some(document::detached_character_data_value(scope, args.this()));
-    let Some(value) = value else {
-        rv.set_undefined();
-        return;
-    };
+    let value = document::detached_character_data_value(scope, args.this());
     let Some(value) = v8_string(scope, &value) else {
         rv.set_null();
         return;
@@ -161,7 +159,7 @@ fn character_data_data_setter_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if receiver_is_live_node(scope, &args) {
+    if receiver_has_native_node(scope, &args) {
         let Some(value) = super::helpers::dom_string_utf16_value_or_throw(
             scope,
             args.get(0),
@@ -170,7 +168,8 @@ fn character_data_data_setter_callback<'a>(
         ) else {
             return;
         };
-        let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.this())
+        let Ok((runtime_ptr, handle)) =
+            node_runtime_and_handle_from_object_or_detached(scope, args.this())
         else {
             return;
         };
@@ -180,7 +179,9 @@ fn character_data_data_setter_callback<'a>(
             .map(|units| units.len() as u32)
             .unwrap_or(0);
         let inserted_count = value.len() as u32;
-        let _ = runtime.set_character_data_utf16_units(scope, runtime_ptr, handle, &value);
+        if runtime.set_character_data_utf16_units(scope, runtime_ptr, handle, &value) {
+            document::detached_record_tree_mutation(scope, args.this());
+        }
         crate::context_bootstrap::live_ranges_character_data_reset(
             scope,
             handle,
@@ -215,7 +216,7 @@ fn character_data_length_getter_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let length = if receiver_is_live_node(scope, &args) {
+    let length = if receiver_has_native_node(scope, &args) {
         node_character_data_length_from_object(scope, args.this())
     } else {
         document::detached_character_data_length(scope, args.this())
@@ -228,12 +229,15 @@ fn text_whole_text_getter_callback<'a>(
     args: v8::FunctionCallbackArguments<'a>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = if receiver_is_live_node(scope, &args) {
-        node_whole_text_value_from_object(scope, args.this())
-    } else {
-        document::detached_text_whole_text_value(scope, args.this())
-    };
-    let Some(value) = value else {
+    if receiver_has_native_node(scope, &args) {
+        let Some(units) = node_whole_text_utf16_units_from_object(scope, args.this()) else {
+            rv.set_undefined();
+            return;
+        };
+        super::helpers::set_utf16_return_value(scope, &mut rv, &units);
+        return;
+    }
+    let Some(value) = document::detached_text_whole_text_value(scope, args.this()) else {
         rv.set_undefined();
         return;
     };
@@ -253,7 +257,8 @@ fn processing_instruction_target_getter_callback<'a>(
         if let Some(value) = document::detached_processing_instruction_target(scope, args.this()) {
             value
         } else {
-            let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.this())
+            let Ok((runtime_ptr, handle)) =
+                node_runtime_and_handle_from_object_or_detached(scope, args.this())
             else {
                 webidl::throw_type_error(
                     scope,

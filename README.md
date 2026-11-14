@@ -24,12 +24,31 @@
   <a href="docs/README.ja.md">日本語</a> |
   <a href="docs/README.de.md">Deutsch</a> |
   <a href="docs/README.fr.md">Français</a> |
-  <a href="docs/README.es.md">Español</a>
+  <a href="docs/README.es.md">Español</a> |
+  <a href="docs/README.ko.md">한국어</a>
 </p>
 
 <p align="center">
   <a href="https://discord.gg/4eXGtdWWnq">
     <img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2" alt="Discord" />
+  </a>
+  <a href="assets/moli-feedback-wechat-group.png">
+    <img src="https://img.shields.io/badge/WeChat-Join%20Community-07C160" alt="WeChat" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://www.producthunt.com/products/lexmount-browser?launch=moli-by-lexmount" target="_blank" rel="noopener noreferrer">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=dark" />
+      <img src="https://api.producthunt.com/widgets/embed-image/v1/top-post-badge.svg?post_id=moli-by-lexmount&amp;period=daily&amp;theme=light" alt="Moli by Lexmount - #1 Product of the Day | Product Hunt" width="250" height="54" />
+    </picture>
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/daily" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
+  </a>
+  <a href="https://trendshift.io/repositories/128243?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-128243" target="_blank" rel="noopener noreferrer">
+    <img src="https://trendshift.io/api/badge/trendshift/repositories/128243/weekly?language=Rust" alt="lexmount%2Fmoli | Trendshift" width="250" height="55" />
   </a>
 </p>
 
@@ -109,7 +128,7 @@ Render the page as Markdown with Moli's default completion strategy:
 ```bash
 moli fetch \
   --dump markdown \
-  --wait-until done \
+  --wait done \
   https://example.com
 ```
 
@@ -129,6 +148,20 @@ moli fetch --layout --dump screenshot https://example.com > page.png
 moli fetch --layout --dump screenshot_full https://example.com > full-page.png
 moli fetch --layout --dump pdf https://example.com > page.pdf
 ```
+
+To export a page after an explicit interaction, combine `--eval` (or
+`--eval-file`) with `--dump`. The expression runs after page readiness;
+promises are awaited, and any pending navigation is followed before export.
+Its return value is discarded without serialization. An exception fails the
+command without emitting a dump.
+
+```bash
+moli fetch --eval 'document.querySelector("button.show-details").click()' \
+  --dump markdown https://example.com
+```
+
+Only the supplied expression performs interactions. Without `--dump`,
+`--eval` retains its expression-value output behavior.
 
 Run `fetch --help` for the complete option list, including output formats,
 page-load/response waits, profiles, proxy settings, resource policies, and
@@ -162,6 +195,9 @@ console.log(await page.locator("body").innerText());
 
 await browser.close();
 ```
+
+The [WebMCP playground](moli-playground/webmcp/README.md) includes a CLI to list
+and call any site's native WebMCP tools, plus booking, restaurant, and pizza demos.
 
 ## Why Moli
 
@@ -243,7 +279,7 @@ enabled by default:
 | `--layout` | `LayoutPolicy::OnDemand` — real layout, geometry, hit-testing, coordinate input, screenshots, screencast |
 | `--resource` | Fetch all optional visual/media resource families |
 | `--image`, `--font`, `--audio`, `--video`, `--media`, `--text-track` | Enable one specific optional resource family |
-| `--profile-dir`, `--http-cache-dir`, `--cookie-file` | Selectively enable the persistence required by the workload |
+| `--profile-dir`, `--http-cache-dir`, `--cookie` | Selectively enable the persistence required by the workload |
 
 Layout is an on-demand snapshot rather than continuously maintained state. The
 first geometry request (a cold start) builds a working layout tree from the
@@ -356,7 +392,7 @@ Its current intentional boundaries include:
   paint architecture.
 - It does not pursue pixel-for-pixel parity with Chrome or provide
   high-fidelity Canvas/WebGL/media playback.
-- `--layout` supports software screenshots and raster-backed CDP PDF
+- `--layout` supports software screenshots and native CDP/CLI PDF with embedded fonts
   generation, but not every Chrome screenshot or print mode is implemented.
 
 Unsupported protocol paths return explicit errors — Moli never pretends that a

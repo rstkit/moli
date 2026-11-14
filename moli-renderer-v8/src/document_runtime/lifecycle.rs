@@ -37,6 +37,19 @@ fn image_is_small_for_priority_boost(element: &crate::dom::native::Element) -> b
 // the host document state accessors, current-script/parser visibility
 // bookkeeping, and pending resource-load delivery that feed DCL/load decisions.
 impl DocumentRuntime {
+    pub(crate) fn retire_v8_execution_state_for_context_teardown(&mut self) {
+        self.timeouts = HostTimeoutScheduler::default();
+        self.events = HostEventTargetRegistry::default();
+        self.script_lifecycle.clear_for_context_teardown();
+        self.root_document_parser = None;
+        self.document_write_script_preload_scanner = None;
+        self.document_write_script_preloads.clear();
+        self.pending_parser_blocking_work = None;
+        self.pending_parser_post_step_runtime_work = Default::default();
+        self.reset_main_parser_continuation_for_document_replacement();
+        self.main_document_script_preloads.clear();
+    }
+
     pub(crate) fn bind_main_document_script_preload_store(
         &mut self,
         store: crate::runtime::DocumentScriptPreloadStore,
@@ -134,9 +147,35 @@ impl DocumentRuntime {
             .current_document_resource_loader()
             .expect("stylesheet fetch requires its committed Document authority");
         crate::stylesheet_blocking::RendererStylesheetFetcher::new(
-            authority.request_client().clone(),
-            authority.task_runner(),
+            authority,
             self.stylesheet_service_worker_fetch_context(),
+        )
+    }
+
+    pub(super) fn stylesheet_fetcher_for_owner(
+        &self,
+        owner: DomHandle,
+        host_ptr: *mut PageScriptHost,
+    ) -> crate::stylesheet_blocking::RendererStylesheetFetcher {
+        if host_ptr.is_null() {
+            return self.stylesheet_fetcher();
+        }
+        let host = unsafe { &*host_ptr };
+        let scope = host
+            .owner_dispatch_scope_for_node(owner)
+            .expect("stylesheet owner must have a Document scope");
+        let loader = host
+            .document_resource_loader_for_dispatch_scope(scope)
+            .expect("stylesheet owner must retain its Document authority");
+        let client_id = host.service_worker_client_id_for_subresource_owner(scope);
+        crate::stylesheet_blocking::RendererStylesheetFetcher::new(
+            loader,
+            Some(
+                crate::stylesheet_blocking::ServiceWorkerStylesheetFetchContext {
+                    browser_context_runtime: host.browser_context_runtime(),
+                    client_id,
+                },
+            ),
         )
     }
 
@@ -149,8 +188,7 @@ impl DocumentRuntime {
             .current_document_resource_loader()
             .expect("stylesheet preload requires its committed Document authority");
         crate::stylesheet_blocking::RendererStylesheetFetcher::for_speculative_preload(
-            authority.request_client().clone(),
-            authority.task_runner(),
+            authority,
             self.stylesheet_service_worker_fetch_context(),
             request_resource_type,
             link_preload,
@@ -261,16 +299,9 @@ impl DocumentRuntime {
         self.document_write_script_preload_scanner = None;
         self.main_document_script_preloads = Default::default();
         self.document_write_script_preloads.clear();
-        self.pending_document_write_external_script_load = None;
-        self.pending_document_write_stylesheet_blocked_script = None;
-        self.pending_document_write_stylesheet_parser_pause = None;
+        self.pending_parser_blocking_work = None;
         self.root_document_parser = None;
-        self.delivered_meta_content_security_policies
-            .get_mut()
-            .clear();
-        self.processed_meta_content_security_policy_handles
-            .get_mut()
-            .clear();
+        self.reset_meta_content_security_policy_processing_for_document(self.document_handle());
         self.document_input_stream_opened = true;
         self.set_document_ready_state(DocumentReadyState::Loading);
     }
@@ -500,7 +531,7 @@ impl DocumentRuntime {
     pub(crate) fn queue_current_main_document_image_load_events(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) {
         let handles = (0..self.dom_host.dom().nodes().len())
             .map(crate::document_runtime::DomHandle::new)
@@ -532,7 +563,7 @@ impl DocumentRuntime {
     pub(crate) fn queue_current_main_document_media_loads(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) {
         let handles = (0..self.dom_host.dom().nodes().len())
             .map(DomHandle::new)

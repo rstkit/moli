@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use tokio::sync::watch;
 
 use crate::conn::CdpSessionRoute;
+use crate::conn::state::DevToolsSessionLifecycle;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedAttachSession {
@@ -85,28 +88,32 @@ impl DetachedTargetSession {
     }
 }
 
-#[cfg(test)]
 impl CommittedAttachSession {
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
 
+    #[cfg(test)]
     pub(crate) fn owner_session_id(&self) -> Option<&str> {
         self.owner_session_id.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn target_id(&self) -> &str {
         &self.target_id
     }
 
+    #[cfg(test)]
     pub(crate) fn route(&self) -> &CdpSessionRoute {
         &self.route
     }
 
+    #[cfg(test)]
     pub(crate) fn auto_attached(&self) -> bool {
         self.auto_attached
     }
 
+    #[cfg(test)]
     pub(crate) fn waiting_for_debugger(&self) -> bool {
         self.waiting_for_debugger
     }
@@ -156,6 +163,49 @@ struct AttachedTargetSession {
     route: CdpSessionRoute,
     auto_attached: bool,
     waiting_for_debugger: bool,
+    lifecycle: DevToolsSessionLifecycle,
+    closed: SessionClosed,
+    worker_attachment: Option<Box<super::TargetWorkerProtocolAttachmentIdentity>>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionClosed(Rc<watch::Sender<bool>>);
+
+impl Default for SessionClosed {
+    fn default() -> Self {
+        Self(Rc::new(watch::channel(false).0))
+    }
+}
+
+impl PartialEq for SessionClosed {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for SessionClosed {}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionDisposalWait(watch::Receiver<bool>);
+
+impl PartialEq for SessionDisposalWait {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_channel(&other.0)
+    }
+}
+impl Eq for SessionDisposalWait {}
+
+impl SessionDisposalWait {
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    pub(crate) async fn wait(mut self) {
+        while !*self.0.borrow_and_update() {
+            if self.0.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -169,6 +219,73 @@ pub(crate) struct TargetSessionRegistry {
 }
 
 impl TargetSessionRegistry {
+    pub(crate) fn bind_worker_attachment(
+        &mut self,
+        session_id: &str,
+        attachment: super::TargetWorkerProtocolAttachmentIdentity,
+    ) {
+        let session = self
+            .attached_sessions
+            .get_mut(session_id)
+            .expect("worker provenance binds an admitted session");
+        assert_eq!(attachment.session_id(), session_id);
+        assert_eq!(attachment.target_id(), session.target_id);
+        session.worker_attachment = Some(Box::new(attachment));
+    }
+
+    pub(crate) fn worker_attachment(
+        &self,
+        session_id: &str,
+    ) -> Option<&super::TargetWorkerProtocolAttachmentIdentity> {
+        self.attached_sessions
+            .get(session_id)?
+            .worker_attachment
+            .as_deref()
+    }
+
+    pub(crate) fn close_session_waiters(&self) {
+        for session in self.attached_sessions.values() {
+            session.closed.0.send_replace(true);
+        }
+    }
+
+    pub(crate) fn mark_session_closing(&mut self, session_id: &str) {
+        if let Some(session) = self.attached_sessions.get_mut(session_id) {
+            session.lifecycle.mark_closing();
+        }
+    }
+
+    pub(crate) fn bind_session_lifecycle(
+        &mut self,
+        session_id: &str,
+        lifecycle: DevToolsSessionLifecycle,
+    ) {
+        self.attached_sessions
+            .get_mut(session_id)
+            .expect("committed session binding")
+            .lifecycle = lifecycle;
+    }
+
+    pub(crate) fn session_is_closing(&self, session_id: &str) -> bool {
+        self.attached_sessions
+            .get(session_id)
+            .is_some_and(|session| session.lifecycle.is_closing())
+    }
+
+    pub(crate) fn session_binding_lifetime(&self, session_id: &str) -> Option<SessionDisposalWait> {
+        self.attached_sessions
+            .get(session_id)
+            .map(|session| SessionDisposalWait(session.closed.0.subscribe()))
+    }
+
+    pub(crate) fn session_disposal_wait(&self, session_id: &str) -> Option<SessionDisposalWait> {
+        let session = self.attached_sessions.get(session_id)?;
+        session
+            .lifecycle
+            .is_closing()
+            .then(|| SessionDisposalWait(session.closed.0.subscribe()))
+    }
+
     pub(crate) fn commit_attached_session(
         &mut self,
         prepared: PreparedAttachSession,
@@ -189,6 +306,9 @@ impl TargetSessionRegistry {
                 route: route.clone(),
                 auto_attached,
                 waiting_for_debugger,
+                lifecycle: DevToolsSessionLifecycle::default(),
+                closed: SessionClosed::default(),
+                worker_attachment: None,
             },
         );
         self.attached_sessions_by_target
@@ -266,6 +386,7 @@ impl TargetSessionRegistry {
         session_id: &str,
     ) -> Option<DetachedTargetSession> {
         let session = self.attached_sessions.remove(session_id)?;
+        session.closed.0.send_replace(true);
         remove_indexed_session(
             &mut self.attached_sessions_by_target,
             &session.target_id,
@@ -366,18 +487,26 @@ impl TargetSessionRegistry {
             })
     }
 
-    /// Releases the debugger-on-start barrier contributed by one attached
-    /// session.
-    ///
-    /// V8 keeps one barrier per inspector session and resumes the target only
-    /// after every waiting session has run `Runtime.runIfWaitingForDebugger`
-    /// (or detached). Keep that per-session transition in the attachment
-    /// registry instead of treating `waitingForDebugger` as immutable event
-    /// metadata.
+    /// A Page's renderer startup pause is shared by its Inspector sessions:
+    /// any Runtime.runIfWaitingForDebugger resumes that Page. Browser-side tab
+    /// throttles remain session-owned; detaching one session also leaves other
+    /// waiting sessions in place until the renderer is explicitly resumed.
     pub(crate) fn release_waiting_for_debugger_session(&mut self, session_id: &str) -> bool {
         let Some(session) = self.attached_sessions.get_mut(session_id) else {
             return false;
         };
+        if matches!(session.route, CdpSessionRoute::PageTarget { .. }) {
+            let route = session.route.clone();
+            let mut released = false;
+            for session in self
+                .attached_sessions
+                .values_mut()
+                .filter(|session| route.addresses_same_target_as(&session.route))
+            {
+                released |= std::mem::take(&mut session.waiting_for_debugger);
+            }
+            return released;
+        }
         std::mem::take(&mut session.waiting_for_debugger)
     }
 
@@ -402,6 +531,7 @@ impl TargetSessionRegistry {
         session_ids
     }
 
+    #[cfg(test)]
     pub(crate) fn attached_session_cascade_for_root_frontend(&self) -> Vec<String> {
         let mut session_ids = Vec::new();
         let mut visited = HashSet::new();
@@ -806,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn target_session_registry_releases_each_debugger_barrier_exactly_once() {
+    fn target_session_registry_resumes_the_page_for_all_attached_inspector_sessions() {
         let mut registry = TargetSessionRegistry::default();
         for session_id in ["SID-first", "SID-second"] {
             registry.commit_attached_session(PreparedAttachSession::new(
@@ -821,9 +951,9 @@ mod tests {
 
         assert!(registry.target_has_waiting_for_debugger_session("TID-page"));
         assert!(registry.release_waiting_for_debugger_session("SID-first"));
-        assert!(registry.target_has_waiting_for_debugger_session("TID-page"));
+        assert!(!registry.target_has_waiting_for_debugger_session("TID-page"));
         assert!(!registry.release_waiting_for_debugger_session("SID-first"));
-        assert!(registry.release_waiting_for_debugger_session("SID-second"));
+        assert!(!registry.release_waiting_for_debugger_session("SID-second"));
         assert!(!registry.target_has_waiting_for_debugger_session("TID-page"));
         assert!(!registry.release_waiting_for_debugger_session("SID-missing"));
     }

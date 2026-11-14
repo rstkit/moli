@@ -2,7 +2,7 @@
 
 use std::{borrow::Cow, sync::Once};
 
-use cssparser::{Parser, ParserInput, ToCss, Token, TokenSerializationType};
+use cssparser::{Parser, ToCss, Token, TokenSerializationType};
 pub use style::moli_rule_tree::{
     CssConditionRuleView, CssCounterStyleRuleView, CssFontFaceRuleView,
     CssFontFeatureValueEntryView, CssFontFeatureValuesRuleView, CssImportRuleView,
@@ -13,9 +13,9 @@ use style::{
     context::QuirksMode,
     custom_properties::AttrTaint,
     font_face::FontFaceRule,
-    parser::ParserContext,
+    parser::{Parse, ParserContext},
     properties::{PropertyDeclarationBlock, parse_property_declaration_list},
-    stylesheets::{CssRuleType, Namespaces, Origin, UrlExtraData},
+    stylesheets::{CssRuleType, Namespaces, Origin, PageSelectors, UrlExtraData},
 };
 use style_traits::{CssStringWriter, ParsingMode};
 
@@ -39,6 +39,46 @@ pub struct CssFontFaceDescriptorEntryView {
 
 pub fn parse_stylesheet_rule_texts_with_stylo(css_text: &str) -> Vec<CssParsedRuleText> {
     style::moli_rule_tree::parse_stylesheet_rule_texts(css_text)
+}
+
+/// Discover the import graph using the same grammar and supports conditions as
+/// the native stylesheet. Preserve the first URL for each network identity so
+/// parser blocking and CSSOM installation can share one load operation.
+pub fn stylesheet_import_urls_with_stylo(css_text: &str, base_url: &url::Url) -> Vec<url::Url> {
+    let stylesheet = style::moli_rule_tree::parse_stylesheet_rule_tree(css_text);
+    let guard = stylesheet.shared_lock.read();
+    let contents = stylesheet.contents.read_with(&guard);
+    let mut identities = std::collections::HashSet::new();
+    let mut urls = Vec::new();
+    for rule in &contents.rules.read_with(&guard).0 {
+        let style::stylesheets::CssRule::Import(rule) = rule else {
+            continue;
+        };
+        let rule = rule.read_with(&guard);
+        if rule
+            .supports
+            .as_ref()
+            .is_some_and(|supports| !supports.enabled)
+        {
+            continue;
+        }
+        // The detached tree uses about:blank. Resolve the original CSS URL
+        // against this owner's processing base, including CSS escape decoding.
+        let css_url = style_traits::ToCss::to_css_string(&rule.url);
+        let mut parser = Parser::new(&css_url);
+        let Ok(href) = parser.expect_url_or_string() else {
+            continue;
+        };
+        let Ok(url) = base_url.join(&href) else {
+            continue;
+        };
+        let mut identity = url.clone();
+        identity.set_fragment(None);
+        if identities.insert(identity) {
+            urls.push(url);
+        }
+    }
+    urls
 }
 
 pub fn parse_stylesheet_rule_snapshots_with_stylo(css_text: &str) -> Vec<CssRuleSnapshot> {
@@ -97,8 +137,8 @@ pub fn parse_font_face_descriptor_entry_with_stylo(
 /// comments between otherwise adjacent range tokens. Refuse the rewrite when
 /// removing a comment would merge two tokens, so invalid input stays invalid.
 fn remove_css_comments_without_retokenizing(value: &str) -> Option<String> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     let mut output = String::with_capacity(value.len());
     let mut original_tokens = Vec::new();
     let mut removed_comment = false;
@@ -130,8 +170,8 @@ fn remove_css_comments_without_retokenizing(value: &str) -> Option<String> {
 }
 
 fn css_token_fingerprints(value: &str) -> Option<Vec<(TokenSerializationType, String)>> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     let mut tokens = Vec::new();
     loop {
         let Ok(token) = input.next_including_whitespace_and_comments().cloned() else {
@@ -219,8 +259,8 @@ fn parse_descriptor_declaration_block_with_stylo(
     rule_type: CssRuleType,
 ) -> Option<String> {
     with_descriptor_declaration_context(rule_type, |context| {
-        let mut input = ParserInput::new(style_text);
-        let mut input = Parser::new(&mut input);
+        let input = style_text;
+        let mut input = Parser::new(input);
         let block = parse_property_declaration_list(context, &mut input, &[]);
         Some(declaration_block_css_text(&block))
     })
@@ -234,7 +274,7 @@ fn declaration_block_css_text(block: &PropertyDeclarationBlock) -> String {
     css_text.trim_end().to_owned()
 }
 
-fn with_descriptor_declaration_context<R>(
+pub(crate) fn with_descriptor_declaration_context<R>(
     rule_type: CssRuleType,
     f: impl FnOnce(&ParserContext) -> Option<R>,
 ) -> Option<R> {
@@ -434,7 +474,26 @@ pub fn normalize_keyframe_selector_text_with_stylo(selector_text: &str) -> Optio
 }
 
 pub fn normalize_page_selector_text_with_stylo(selector_text: &str) -> Option<String> {
-    style::moli_rule_tree::normalize_page_selector_text(selector_text)
+    with_descriptor_declaration_context(CssRuleType::Page, |context| {
+        let selectors = parse_page_selectors_with_stylo_context(selector_text, context).ok()?;
+        Some(style_traits::ToCss::to_css_string(&selectors))
+    })
+}
+
+/// Parse the selector list shared by CSSPageRule validation and live mutation.
+pub fn parse_page_selectors_with_stylo_context(
+    selector_text: &str,
+    context: &ParserContext,
+) -> Result<PageSelectors, CssRuleInsertError> {
+    let mut input = Parser::new(selector_text);
+    // CSS whitespace and comments can form an empty selector list. Unicode
+    // whitespace outside CSS's whitespace set still belongs to identifiers.
+    if input.is_exhausted() {
+        return Ok(PageSelectors::default());
+    }
+    input
+        .parse_entirely(|input| PageSelectors::parse(context, input))
+        .map_err(|_| CssRuleInsertError::Syntax)
 }
 
 pub fn keyframe_selector_texts_match_with_stylo(
@@ -1220,6 +1279,28 @@ mod tests {
 
     #[test]
     fn native_stylesheet_adapter_exposes_stylo_page_selector_helper() {
+        for empty in ["", " \t\r\n\u{000c}", "/**/", " /*comment*/ /**/ "] {
+            assert_eq!(
+                normalize_page_selector_text_with_stylo(empty),
+                Some(String::new())
+            );
+        }
+        for identifier in [
+            "name\u{00a0}",
+            "\u{00a0}",
+            "\u{2003}:left",
+            "name\\ ",
+            "\\ name",
+        ] {
+            assert_eq!(
+                normalize_page_selector_text_with_stylo(identifier),
+                Some(identifier.to_owned())
+            );
+        }
+        assert_eq!(
+            normalize_page_selector_text_with_stylo("name\u{000b}"),
+            None
+        );
         assert_eq!(
             normalize_page_selector_text_with_stylo(":RIGHT"),
             Some(String::from(":right"))

@@ -11,8 +11,8 @@ mod responses;
 mod types;
 
 fn geometry_border_quad(
-    geometry: &moli_protocol::devtools_runtime::DevToolsDomGeometryResult,
-) -> Option<&moli_protocol::devtools_runtime::DevToolsDomQuad> {
+    geometry: &moli_protocol::automation::DevToolsDomGeometryResult,
+) -> Option<&moli_protocol::automation::DevToolsDomQuad> {
     geometry
         .box_model
         .as_ref()
@@ -46,17 +46,16 @@ pub use commands::{
     classic_element_id, classic_element_reference, classic_elements_from_locate_nodes_result,
     classic_elements_from_query_result, classic_error_from_devtools_error, classic_property_value,
     classic_rect_from_geometry, classic_shadow_root_id, classic_shadow_root_reference,
-    classic_text_value, classic_window_rect_for_state, classic_window_rect_from_metrics,
-    clear_element_command, close_window_command, create_initial_target_command,
-    current_url_command, delete_all_cookies_command, delete_cookie_command, describe_node_command,
-    describe_node_reference_command, element_click_command, element_click_prepare_commands,
-    element_click_prepare_reference_commands, element_screenshot_command, execute_async_command,
-    execute_sync_command, find_element_command, find_element_command_with_root,
-    frame_id_for_element_command, get_cookies_command, get_element_attributes_command,
-    get_element_attributes_reference_command, get_element_computed_label_command,
-    get_element_computed_role_command, get_element_css_value_command,
-    get_element_displayed_command, get_element_enabled_command, get_element_property_command,
-    get_element_property_reference_command, get_element_rect_command,
+    classic_text_value, classic_window_rect_for_state, clear_element_command, close_window_command,
+    create_initial_target_command, current_url_command, delete_all_cookies_command,
+    delete_cookie_command, describe_node_command, describe_node_reference_command,
+    element_click_command, element_geometry_prepare_commands, element_screenshot_command,
+    execute_async_command, execute_sync_command, find_element_command,
+    find_element_command_with_root, frame_id_for_element_command, get_cookies_command,
+    get_element_attributes_command, get_element_attributes_reference_command,
+    get_element_computed_label_command, get_element_computed_role_command,
+    get_element_css_value_command, get_element_displayed_command, get_element_enabled_command,
+    get_element_property_command, get_element_property_reference_command, get_element_rect_command,
     get_element_rect_reference_command, get_element_rendered_text_command,
     get_element_shadow_root_command, get_element_tag_name_command, get_element_text_command,
     get_element_text_reference_command, history_traversal_entry, layout_metrics_command,

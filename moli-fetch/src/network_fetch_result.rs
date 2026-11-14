@@ -1,3 +1,7 @@
+use crate::headers::{
+    decode_http_header_bytes, parse_http_header_line, parse_http_response_header_line,
+};
+
 use std::{fmt, sync::Arc};
 
 use moli_cookie_jar::StoredCookieQueryReport;
@@ -56,12 +60,12 @@ impl NetworkRequestObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkResponseObservation {
     status: u16,
-    headers: Vec<(String, String)>,
+    headers: Vec<(String, Vec<u8>)>,
     truncated: bool,
 }
 
 impl NetworkResponseObservation {
-    pub fn new(status: u16, headers: Vec<(String, String)>) -> Self {
+    pub fn new(status: u16, headers: Vec<(String, Vec<u8>)>) -> Self {
         Self {
             status,
             headers,
@@ -73,7 +77,7 @@ impl NetworkResponseObservation {
         self.status
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
+    pub fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
     }
 
@@ -233,7 +237,7 @@ impl NetworkObservationRecorder {
         if state.journal.truncated {
             return;
         }
-        let line = String::from_utf8_lossy(data);
+        let line = decode_http_header_bytes(data);
         let line = line.trim_end_matches(['\r', '\n']);
 
         if let Some(status) = parse_status_line(line) {
@@ -273,7 +277,7 @@ impl NetworkObservationRecorder {
             response.truncated = true;
             return;
         }
-        if let Some(header) = parse_header_line(line) {
+        if let Some(header) = parse_http_response_header_line(data) {
             response.headers.push(header);
         }
     }
@@ -299,7 +303,7 @@ struct NetworkObservationRecorderState {
 
 struct PendingResponseObservation {
     status: u16,
-    headers: Vec<(String, String)>,
+    headers: Vec<(String, Vec<u8>)>,
     observed_bytes: usize,
     truncated: bool,
 }
@@ -323,7 +327,7 @@ fn bounded_header_data(data: &[u8]) -> (&[u8], bool) {
 }
 
 fn parse_request_header_block(data: &[u8]) -> Vec<(String, String)> {
-    String::from_utf8_lossy(data)
+    decode_http_header_bytes(data)
         .lines()
         .enumerate()
         .filter_map(|(index, line)| {
@@ -331,7 +335,7 @@ fn parse_request_header_block(data: &[u8]) -> Vec<(String, String)> {
             if (index == 0 && is_http_request_line(line)) || line.starts_with(':') {
                 return None;
             }
-            parse_header_line(line)
+            parse_http_header_line(line)
         })
         .collect()
 }
@@ -349,15 +353,6 @@ fn is_http_request_line(line: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
         && !target.is_empty()
         && version.starts_with("HTTP/")
-}
-
-fn parse_header_line(line: &str) -> Option<(String, String)> {
-    let (name, value) = line.split_once(':')?;
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    Some((name.to_owned(), value.trim().to_owned()))
 }
 
 fn parse_status_line(line: &str) -> Option<u16> {
@@ -389,8 +384,8 @@ pub struct NetworkFetchFailureContext {
 pub struct NetworkFetchFailureRequestContext {
     current_url: Url,
     request_method: String,
-    request_body: Option<Vec<u8>>,
-    request_headers: Vec<(String, String)>,
+    request_body: Option<bytes::Bytes>,
+    request_headers: crate::RequestHeaders,
     redirect_chain: Vec<RedirectInfo>,
 }
 
@@ -398,8 +393,8 @@ impl NetworkFetchFailureRequestContext {
     pub(crate) fn new(
         current_url: Url,
         request_method: String,
-        request_body: Option<Vec<u8>>,
-        request_headers: Vec<(String, String)>,
+        request_body: Option<bytes::Bytes>,
+        request_headers: crate::RequestHeaders,
         redirect_chain: Vec<RedirectInfo>,
     ) -> Self {
         Self {
@@ -419,11 +414,11 @@ impl NetworkFetchFailureRequestContext {
         &self.request_method
     }
 
-    pub fn request_body(&self) -> Option<&[u8]> {
-        self.request_body.as_deref()
+    pub fn request_body(&self) -> Option<&bytes::Bytes> {
+        self.request_body.as_ref()
     }
 
-    pub fn request_headers(&self) -> &[(String, String)] {
+    pub fn request_headers(&self) -> &crate::RequestHeaders {
         &self.request_headers
     }
 
@@ -438,7 +433,7 @@ impl NetworkFetchFailureContext {
         observation_journal: NetworkObservationJournal,
     ) -> anyhow::Error {
         let network_error_text = crate::error::browser_network_error_text(&source);
-        let reason = source.to_string();
+        let reason = format!("{source:#}");
         source.context(Self {
             observation_journal,
             network_error_text,
@@ -453,7 +448,7 @@ impl NetworkFetchFailureContext {
         request_context: NetworkFetchFailureRequestContext,
     ) -> anyhow::Error {
         let network_error_text = crate::error::browser_network_error_text(&source);
-        let reason = source.to_string();
+        let reason = format!("{source:#}");
         source.context(Self {
             observation_journal,
             network_error_text,
@@ -470,8 +465,9 @@ impl NetworkFetchFailureContext {
         self.network_error_text
     }
 
-    /// Returns the single human-readable transport or policy reason captured
-    /// before this machine-readable context was attached.
+    /// Returns the human-readable transport or policy error chain captured
+    /// before this machine-readable context was attached, including the
+    /// underlying curl error code and detailed error buffer when available.
     pub fn reason(&self) -> &str {
         &self.reason
     }
@@ -592,6 +588,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn network_failure_reason_preserves_curl_code_and_details() {
+        for (code, detail, network_error_text) in [
+            (
+                curl_sys::CURLE_ABORTED_BY_CALLBACK,
+                "transfer cancelled",
+                crate::NET_ERR_ABORTED_ERROR_TEXT,
+            ),
+            (
+                curl_sys::CURLE_PEER_FAILED_VERIFICATION,
+                "SSL certificate problem: unable to get local issuer certificate",
+                "net::ERR_CERT_AUTHORITY_INVALID",
+            ),
+            (
+                curl_sys::CURLE_COULDNT_RESOLVE_HOST,
+                "Could not resolve host: example.test",
+                "net::ERR_NAME_NOT_RESOLVED",
+            ),
+            (
+                curl_sys::CURLE_COULDNT_CONNECT,
+                "Failed to connect to example.test: Connection refused",
+                "net::ERR_CONNECTION_REFUSED",
+            ),
+        ] {
+            for with_request_context in [false, true] {
+                let mut curl_error = curl::Error::new(code);
+                curl_error.set_extra(detail.to_owned());
+                let source = anyhow::Error::new(curl_error).context("curl request failed");
+                let journal = NetworkObservationJournal::default();
+                let error = if with_request_context {
+                    NetworkFetchFailureContext::attach_with_request_context(
+                        source,
+                        journal,
+                        NetworkFetchFailureRequestContext::new(
+                            Url::parse("https://example.test/").unwrap(),
+                            "GET".to_owned(),
+                            None,
+                            Vec::new().into(),
+                            Vec::new(),
+                        ),
+                    )
+                } else {
+                    NetworkFetchFailureContext::attach(source, journal)
+                };
+                let failure = error.downcast_ref::<NetworkFetchFailureContext>().unwrap();
+                let reason = failure.reason();
+                assert!(reason.starts_with("curl request failed: "), "{reason}");
+                assert!(reason.contains(&format!("[{code}]")), "{reason}");
+                assert!(reason.contains(detail), "{reason}");
+                assert_eq!(failure.network_error_text(), network_error_text);
+                assert_eq!(error.downcast_ref::<curl::Error>().unwrap().code(), code);
+            }
+        }
+    }
+
+    #[test]
     fn network_fetch_failure_context_preserves_source_without_repeating_it() {
         let source = std::io::Error::other("transport failure sentinel");
         let error = NetworkFetchFailureContext::attach_with_request_context(
@@ -601,7 +652,7 @@ mod tests {
                 Url::parse("http://localhost/").expect("test URL should parse"),
                 "GET".to_owned(),
                 None,
-                Vec::new(),
+                Vec::new().into(),
                 Vec::new(),
             ),
         )
@@ -633,8 +684,8 @@ mod tests {
             request_context: Some(NetworkFetchFailureRequestContext::new(
                 Url::parse("https://example.test/").expect("test URL should parse"),
                 "POST".to_owned(),
-                Some(b"secret request body".to_vec()),
-                vec![("Authorization".to_owned(), "secret token".to_owned())],
+                Some(bytes::Bytes::from_static(b"secret request body")),
+                vec![("Authorization".to_owned(), "secret token".to_owned())].into(),
                 Vec::new(),
             )),
         };

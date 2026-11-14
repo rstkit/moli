@@ -1,5 +1,10 @@
-use super::super::JsContextHost;
-use super::{WorkerConnectionState, WorkerExecutionState, WorkerRelayTerminalState};
+use crate::content_security_policy::ContentSecurityPolicy;
+
+use super::super::PageScriptHost;
+use super::{
+    WorkerConnectionState, WorkerExecutionState, WorkerModuleStaticImportPolicySnapshot,
+    WorkerRelayTerminalState,
+};
 use crate::RendererSyntheticResponseBody;
 use crate::network::loads::{ResourceLoadDisposition, ResourceLoadKind, ResourceLoadLease};
 use crate::page_task_queue::{
@@ -13,7 +18,7 @@ use crate::types::{DedicatedWorkerId, SubresourcePolicyContext};
 use crate::worker::{
     WorkerGlobalKind, WorkerHandle, WorkerNetworkPolicy, WorkerPendingFetchContinue,
     WorkerPendingXhrContinue, WorkerRuntimeEvent, WorkerScriptKind, WorkerScriptSource,
-    WorkerSpawnOptions, spawn_worker_with_options,
+    WorkerSecureContextPolicy, WorkerSpawnOptions, spawn_worker_with_options,
 };
 use moli_storage_key::MoliStorageKey;
 use url::Url;
@@ -25,8 +30,8 @@ struct LoadedWorkerScript {
     response_referrer_policy: Option<String>,
     network_partition_key: Option<String>,
     policy_context: SubresourcePolicyContext,
-    content_security_policies: Vec<String>,
-    content_security_report_only_policies: Vec<String>,
+    content_security_policies: Vec<ContentSecurityPolicy>,
+    content_security_report_only_policies: Vec<ContentSecurityPolicy>,
     content_security_reporting_endpoints:
         crate::content_security_policy::ContentSecurityPolicyReportingEndpoints,
 }
@@ -55,7 +60,7 @@ impl WorkerScriptLoadFailure {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn register_dedicated_worker_outside_settings_load(
         &self,
         dispatch_scope: super::super::OwnerDispatchScope,
@@ -89,9 +94,9 @@ impl JsContextHost {
     ) -> Result<RendererDedicatedWorkerMessageEvent, Box<crate::worker::WorkerToParentMessage>>
     {
         match message {
-            crate::worker::WorkerToParentMessage::Post(payload) => {
-                Ok(RendererDedicatedWorkerMessageEvent::Message(payload))
-            }
+            crate::worker::WorkerToParentMessage::Post(payload) => Ok(
+                RendererDedicatedWorkerMessageEvent::Message(Box::new(payload)),
+            ),
             crate::worker::WorkerToParentMessage::Error {
                 message,
                 filename,
@@ -205,6 +210,7 @@ impl JsContextHost {
             .browser_context_runtime()
             .allocate_dedicated_worker_instance_id();
         let client_event_producer = self.dedicated_worker_client_event_producer(worker_id, &owner);
+        let creator_message_security = self.window_message_source_security(owner.dispatch_scope());
         self.workers.insert(
             worker_id,
             WorkerConnectionState {
@@ -221,8 +227,10 @@ impl JsContextHost {
                     outside_settings_load,
                     name,
                     module_credentials_mode,
+                    module_static_import_policy: None,
                     storage_key_top_level_site,
                     creator_storage_key,
+                    creator_message_security,
                     reserved_service_worker_client_id,
                 },
             },
@@ -235,11 +243,13 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         script_url: Url,
         initiator_url: Url,
+        creator_secure_context: bool,
         network_partition_key: Option<String>,
         creator_policy_context: SubresourcePolicyContext,
         script_kind: WorkerScriptKind,
         module_credentials_mode: moli_fetch::RequestCredentialsMode,
         document_referrer_policy: Option<String>,
+        document_content_security_policies: Vec<ContentSecurityPolicy>,
         name: String,
         reserved_service_worker_client_id: Option<ServiceWorkerClientId>,
     ) -> bool {
@@ -264,7 +274,10 @@ impl JsContextHost {
         let request_client = outside_settings_load.request_client();
         let cancel_handle = moli_fetch::FetchCancelHandle::new();
         outside_settings_load.attach_cancel_handle(cancel_handle.clone());
-        let creator_secure_context = moli_url::is_potentially_trustworthy_url(&initiator_url);
+        let module_static_import_policy = Box::new(WorkerModuleStaticImportPolicySnapshot {
+            initiator_url: initiator_url.clone(),
+            content_security_policies: document_content_security_policies,
+        });
         let task_runner = outside_settings_load.task_runner();
         let fetch_task_runner = task_runner.clone();
         let load_task = task_runner.spawn_abortable(async move {
@@ -290,10 +303,9 @@ impl JsContextHost {
                     if final_url.fragment().is_none() {
                         final_url.set_fragment(script_url.fragment());
                     }
-                    let secure_context = crate::worker::worker_secure_context_for_script_url(
-                        final_url,
-                        creator_secure_context,
-                    );
+                    let secure_context =
+                        WorkerSecureContextPolicy::Inherited(creator_secure_context)
+                            .resolve(final_url);
                     let _ = client_event_producer.send(
                         RendererDedicatedWorkerClientEvent::ScriptLoaded {
                             script_url: final_url.to_string(),
@@ -329,6 +341,7 @@ impl JsContextHost {
                     load_task: slot,
                     terminated,
                     name: loading_name,
+                    module_static_import_policy: loading_module_static_import_policy,
                     ..
                 } => {
                     if *terminated {
@@ -336,6 +349,7 @@ impl JsContextHost {
                         return false;
                     }
                     *loading_name = name;
+                    *loading_module_static_import_policy = Some(module_static_import_policy);
                     *slot = Some(load_task);
                     true
                 }
@@ -419,23 +433,28 @@ impl JsContextHost {
         response_referrer_policy: Option<String>,
         network_partition_key: Option<String>,
         policy_context: SubresourcePolicyContext,
-        content_security_policies: Vec<String>,
-        content_security_report_only_policies: Vec<String>,
+        content_security_policies: Vec<ContentSecurityPolicy>,
+        content_security_report_only_policies: Vec<ContentSecurityPolicy>,
         content_security_reporting_endpoints:
             crate::content_security_policy::ContentSecurityPolicyReportingEndpoints,
     ) -> bool {
+        struct FinishLoadingWorkerSpawn {
+            pending_messages: Vec<V8StructuredClonePayload>,
+            name: String,
+            storage_key_top_level_site: String,
+            creator_storage_key: MoliStorageKey,
+            creator_message_security:
+                Option<crate::context_bootstrap::RuntimeMessageSourceSecurity>,
+            reserved_service_worker_client_id: Option<ServiceWorkerClientId>,
+            module_credentials_mode: moli_fetch::RequestCredentialsMode,
+            module_static_import_policy: Option<Box<WorkerModuleStaticImportPolicySnapshot>>,
+            request_client: crate::network::ResourceRequestClient,
+        }
+
         enum FinishLoadingAction {
             MissingOrRunning,
             DiscardTerminated,
-            Spawn {
-                pending_messages: Vec<V8StructuredClonePayload>,
-                name: String,
-                storage_key_top_level_site: String,
-                creator_storage_key: MoliStorageKey,
-                reserved_service_worker_client_id: Option<ServiceWorkerClientId>,
-                module_credentials_mode: moli_fetch::RequestCredentialsMode,
-                request_client: crate::network::ResourceRequestClient,
-            },
+            Spawn(Box<FinishLoadingWorkerSpawn>),
         }
 
         let action = match self.workers.get_mut(&worker_id) {
@@ -446,8 +465,10 @@ impl JsContextHost {
                     terminated,
                     name,
                     module_credentials_mode,
+                    module_static_import_policy,
                     storage_key_top_level_site,
                     creator_storage_key,
+                    creator_message_security,
                     reserved_service_worker_client_id,
                     outside_settings_load,
                 } => {
@@ -455,70 +476,56 @@ impl JsContextHost {
                     if *terminated {
                         FinishLoadingAction::DiscardTerminated
                     } else {
-                        FinishLoadingAction::Spawn {
+                        FinishLoadingAction::Spawn(Box::new(FinishLoadingWorkerSpawn {
                             pending_messages: std::mem::take(pending_messages),
                             name: name.clone(),
                             storage_key_top_level_site: storage_key_top_level_site.clone(),
                             creator_storage_key: creator_storage_key.clone(),
+                            creator_message_security: creator_message_security.clone(),
                             reserved_service_worker_client_id: reserved_service_worker_client_id
                                 .take(),
                             module_credentials_mode: *module_credentials_mode,
+                            module_static_import_policy: module_static_import_policy.take(),
                             request_client: outside_settings_load.request_client(),
-                        }
+                        }))
                     }
                 }
                 WorkerExecutionState::Running { .. } => FinishLoadingAction::MissingOrRunning,
             },
             None => FinishLoadingAction::MissingOrRunning,
         };
-        let (
+        let FinishLoadingWorkerSpawn {
             pending_messages,
             name,
             storage_key_top_level_site,
             creator_storage_key,
+            creator_message_security,
             reserved_service_worker_client_id,
             module_credentials_mode,
+            module_static_import_policy,
             request_client,
-        ) = match action {
+        } = match action {
             FinishLoadingAction::MissingOrRunning => return false,
             FinishLoadingAction::DiscardTerminated => {
                 self.forget_worker(worker_id);
                 return false;
             }
-            FinishLoadingAction::Spawn {
-                pending_messages,
-                name,
-                storage_key_top_level_site,
-                creator_storage_key,
-                reserved_service_worker_client_id,
-                module_credentials_mode,
-                request_client,
-            } => (
-                pending_messages,
-                name,
-                storage_key_top_level_site,
-                creator_storage_key,
-                reserved_service_worker_client_id,
-                module_credentials_mode,
-                request_client,
-            ),
+            FinishLoadingAction::Spawn(spawn) => *spawn,
         };
         let network_policy = WorkerNetworkPolicy {
-            secure_context,
+            secure_context: WorkerSecureContextPolicy::Inherited(secure_context),
             permission_overrides: self.permission_overrides().to_vec(),
-            extra_http_headers: self.extra_http_headers().to_vec(),
+            extra_http_headers: self.extra_http_headers().clone(),
             network_offline: self.network_offline(),
             blocked_url_patterns: self.blocked_url_patterns().to_vec(),
             network_partition_key,
-            fetch_subresource_interception_enabled: self.fetch_subresource_interception_enabled(),
-            fetch_subresource_interception_resource_type: self
-                .fetch_subresource_interception_resource_type(),
         };
         let mut spawn_options = WorkerSpawnOptions::with_source_and_request_client(
             script_source,
             script_url,
             request_client,
         )
+        .with_interception_context(self.native_interception_context())
         .with_script_kind(script_kind)
         .with_module_credentials_mode(module_credentials_mode)
         .with_referrer_policy(response_referrer_policy)
@@ -532,12 +539,20 @@ impl JsContextHost {
         .with_global_kind(WorkerGlobalKind::Dedicated { name })
         .with_storage_key_top_level_site(Some(storage_key_top_level_site))
         .with_creator_storage_key(creator_storage_key)
+        .with_creator_message_security(creator_message_security)
         .with_storage_bucket_store(Some(self.storage_bucket_store()))
         .with_indexed_db_manager(self.indexed_db_manager())
         .with_pause_evaluation_until_debugger(
             self.browser_context_runtime()
                 .dedicated_worker_pause_on_start_for_devtools(),
         );
+        if let Some(policy) = module_static_import_policy {
+            spawn_options = spawn_options
+                .with_module_static_import_initiator_url(policy.initiator_url)
+                .with_module_static_import_content_security_policies(
+                    policy.content_security_policies,
+                );
+        }
         if let Some(client_id) = reserved_service_worker_client_id {
             spawn_options = spawn_options.with_reserved_service_worker_client_id(client_id);
         }
@@ -812,7 +827,7 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         request: WorkerPendingFetchContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> bool {
         self.workers
             .get_mut(&worker_id)
@@ -835,7 +850,7 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         request: WorkerPendingXhrContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> bool {
         self.workers
             .get_mut(&worker_id)
@@ -980,7 +995,7 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.workers
@@ -1005,7 +1020,7 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.workers
@@ -1030,7 +1045,7 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.workers
@@ -1055,7 +1070,7 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.workers
@@ -1080,7 +1095,7 @@ impl JsContextHost {
         worker_id: DedicatedWorkerId,
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) -> bool {
         self.workers
@@ -1430,9 +1445,12 @@ async fn fetch_worker_script_source(
     request_url.set_fragment(None);
     let mut request = moli_fetch::Request::new("GET", request_url.as_str(), None, vec![])
         .map_err(WorkerScriptLoadFailure::without_response)?
+        .with_request_mode(moli_fetch::RequestMode::SameOrigin)
+        .with_browser_request_metadata(moli_fetch::BrowserRequestMetadata::Worker)
         .with_page_network_policy()
         .with_network_partition_key(network_partition_key.clone())
         .with_initiator_url(initiator_url)
+        .with_request_origin(moli_url::WebOrigin::from_url(initiator_url))
         .with_credentials_mode(match script_kind {
             WorkerScriptKind::Classic => moli_fetch::RequestCredentialsMode::SameOrigin,
             WorkerScriptKind::Module => module_credentials_mode,
@@ -1561,7 +1579,7 @@ fn loaded_worker_script_from_navigation_response(
 }
 
 fn dedicated_worker_policy_context_from_headers(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     creator_policy_context: SubresourcePolicyContext,
 ) -> SubresourcePolicyContext {
     SubresourcePolicyContext {
@@ -1586,14 +1604,14 @@ mod tests {
             cross_origin_isolated: true,
             ..Default::default()
         };
-        let headers = vec![
+        let headers: Vec<(String, Vec<u8>)> = vec![
             (
                 "Cross-Origin-Embedder-Policy".to_owned(),
-                "credentialless".to_owned(),
+                b"credentialless".to_vec(),
             ),
             (
                 "Document-Isolation-Policy".to_owned(),
-                "isolate-and-credentialless".to_owned(),
+                b"isolate-and-credentialless".to_vec(),
             ),
         ];
 

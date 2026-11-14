@@ -1,4 +1,3 @@
-use std::pin::pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
@@ -30,7 +29,6 @@ use crate::host::{
 use crate::module_script_continuation::{
     ModuleScriptContinuation, ModuleScriptEvaluationContinuation, ModuleScriptEvaluationUpdate,
 };
-use crate::native_bridge::JsContextHost;
 use crate::network::ResourceRequestClient;
 use crate::page_task_queue::PageTaskQueue;
 use crate::page_task_queue::{
@@ -48,7 +46,9 @@ use crate::script_vm::{
 };
 #[cfg(test)]
 use crate::script_vm::{MainDocumentLifecycleBody, NonScriptPageTaskExecutionOutcome};
-use crate::types::{ScriptExecutionReport, SubresourceResourceType};
+use crate::types::{
+    ScriptExecutionReport, SubresourceNetworkRequestHandle, SubresourceResourceType,
+};
 use crate::types::{ScriptKind, ScriptMode, ScriptSourceKind, SubresourceRequestInitiatorType};
 
 fn preload_like_resource_initiator_type(resource_type: SubresourceResourceType) -> &'static str {
@@ -59,7 +59,8 @@ fn preload_like_resource_initiator_type(resource_type: SubresourceResourceType) 
         SubresourceResourceType::Media => "video",
         SubresourceResourceType::Video => "video",
         SubresourceResourceType::TextTrack => "track",
-        SubresourceResourceType::Fetch
+        SubresourceResourceType::Document
+        | SubresourceResourceType::Fetch
         | SubresourceResourceType::EventSource
         | SubresourceResourceType::Font
         | SubresourceResourceType::Ping
@@ -115,6 +116,53 @@ impl ScriptVm {
         task_runner: crate::network::RendererResourceTaskRunner,
         admission: RuntimeScriptAdmission,
     ) {
+        // Check CSP before starting the source fetch. A CORS or network failure
+        // must not bypass CSP reporting by skipping the execution boundary.
+        let (payload, binding) = admission.into_parts();
+        let payload = match payload {
+            crate::host::RuntimeScriptAdmissionPayload::Script(script)
+                if script.source_kind == crate::types::ScriptSourceKind::External =>
+            {
+                let request = self.content_security_policy_script_element_request(&script);
+                if let Some(violation) = self
+                    .document_runtime
+                    .script_element_request_csp_violation_with_request(&script.url, request)
+                {
+                    if let Some(report_only) = self
+                        .document_runtime
+                        .script_element_request_csp_report_only_violation_with_request(
+                            &script.url,
+                            request,
+                        )
+                    {
+                        self.queue_content_security_policy_violation_event_best_effort(
+                            &report_only,
+                        );
+                    }
+                    self.queue_content_security_policy_violation_event_best_effort(&violation);
+                    let message = format!(
+                        "Refused to load script `{}` because it violates the document Content Security Policy directive `{}`",
+                        script.url, violation.effective_directive,
+                    );
+                    let failure_kind = if script.kind == crate::types::ScriptKind::Module {
+                        crate::host::QueuedScriptFailureKind::ModuleTopLevelLoad
+                    } else {
+                        crate::host::QueuedScriptFailureKind::Immediate
+                    };
+                    crate::host::RuntimeScriptAdmissionPayload::Failed(
+                        crate::host::FailedDynamicScript {
+                            script,
+                            message,
+                            failure_kind,
+                        },
+                    )
+                } else {
+                    crate::host::RuntimeScriptAdmissionPayload::Script(script)
+                }
+            }
+            payload => payload,
+        };
+        let admission = RuntimeScriptAdmission::from_boxed_payload(Box::new(payload), binding);
         let document_character_set = self.document_runtime.document_character_set().to_owned();
         let service_worker_context = {
             let host = self._context_host.borrow();
@@ -124,11 +172,17 @@ impl ScriptVm {
                 document_url: self.document_runtime.document_url().clone(),
             }
         };
+        let request_origin = self
+            .current_main_document_resource_loader()
+            .expect("dynamic script requires its Document authority")
+            .fetch_context()
+            .request_origin();
         self.document_runtime
             .runtime_script_work_mut()
             .dynamic_scripts
             .enqueue_admission(
                 loader,
+                request_origin,
                 task_runner,
                 admission,
                 Some(&document_character_set),
@@ -976,7 +1030,7 @@ impl ScriptVm {
                     );
                     return Ok(NonScriptPageTaskExecutionOutcome::None);
                 };
-                self.accept_main_document_blocking_stylesheet_inputs(owner, &inputs);
+                self.accept_main_document_stylesheet_inputs(owner, &inputs);
                 Ok(NonScriptPageTaskExecutionOutcome::None)
             }
             PostParseLifecycleWork::AdvanceMainParserDeferredScripts { .. } => {
@@ -2220,38 +2274,44 @@ impl ScriptVm {
         &mut self,
         ready: crate::document_runtime::ReadyConnectedStyleLoad,
     ) -> bool {
-        let context_ptr: *const v8::Global<v8::Context> = &self.page_default_context;
-        let context_host = self._context_host.clone();
-        let document_runtime = &mut self.document_runtime;
-        self.renderer_document_isolate
-            .with_renderer_document_isolate_mut(|isolate| {
-                let scope = pin!(v8::HandleScope::new(isolate));
-                let scope = &mut scope.init();
-                let context = unsafe { v8::Local::new(scope, &*context_ptr) };
-                let scope = &mut v8::ContextScope::new(scope, context);
-                let host_ptr: *mut JsContextHost = (*context_host).as_ptr();
-                if ready.load_event_binding().is_some_and(|binding| {
-                    !unsafe { &*host_ptr }.main_style_load_event_is_current(binding)
-                }) {
-                    return false;
-                }
-                document_runtime.dispatch_pending_style_load(scope, host_ptr, ready)
-            })
+        if self.current_main_world().is_none() {
+            let host_ptr = (*self._context_host).as_ptr();
+            if ready.load_event_binding().is_some_and(|binding| {
+                !unsafe { &*host_ptr }.main_style_load_event_is_current(binding)
+            }) {
+                return false;
+            }
+            let has_handler = ["onload", "onerror"].into_iter().any(|name| {
+                self.document_runtime
+                    .dom_host()
+                    .get_attribute(ready.owner(), name)
+                    .is_some()
+            });
+            if !has_handler {
+                self.document_runtime
+                    .consume_pending_style_load(host_ptr, &ready);
+                return true;
+            }
+        }
+        self.with_main_world_document_scope(|scope, host_ptr, document_runtime| {
+            if ready.load_event_binding().is_some_and(|binding| {
+                !unsafe { &*host_ptr }.main_style_load_event_is_current(binding)
+            }) {
+                return Ok(false);
+            }
+            Ok(document_runtime.dispatch_pending_style_load(scope, host_ptr, ready))
+        })
+        .unwrap_or_else(|error| {
+            self.record_runtime_warning(format_args!("style handler dispatch failed: {error}"));
+            false
+        })
     }
 
     pub(crate) fn apply_pending_stylesheet_source_css_projections(&mut self) {
-        let context_ptr: *const v8::Global<v8::Context> = &self.page_default_context;
-        let context_host = self._context_host.clone();
-        let document_runtime = &mut self.document_runtime;
-        self.renderer_document_isolate
-            .with_renderer_document_isolate_mut(|isolate| {
-                let scope = pin!(v8::HandleScope::new(isolate));
-                let scope = &mut scope.init();
-                let context = unsafe { v8::Local::new(scope, &*context_ptr) };
-                let scope = &mut v8::ContextScope::new(scope, context);
-                let host_ptr: *mut JsContextHost = (*context_host).as_ptr();
-                document_runtime.apply_pending_stylesheet_source_css_projections(scope, host_ptr);
-            });
+        let _ = self.with_current_main_world_document_scope(|scope, host_ptr, document_runtime| {
+            document_runtime.apply_pending_stylesheet_source_css_projections(scope, host_ptr);
+            Ok(())
+        });
     }
 
     pub(crate) fn settle_stylesheet_link_clients(
@@ -2261,35 +2321,29 @@ impl ScriptVm {
         if clients.is_empty() {
             return;
         }
-        let context_ptr: *const v8::Global<v8::Context> = &self.page_default_context;
-        let context_host = self._context_host.clone();
-        let document_runtime = &mut self.document_runtime;
-        self.renderer_document_isolate
-            .with_renderer_document_isolate_mut(|isolate| {
-                let scope = pin!(v8::HandleScope::new(isolate));
-                let scope = &mut scope.init();
-                let context = unsafe { v8::Local::new(scope, &*context_ptr) };
-                let scope = &mut v8::ContextScope::new(scope, context);
-                let host_ptr: *mut JsContextHost = (*context_host).as_ptr();
+        if let Err(error) =
+            self.with_main_world_document_scope(|scope, host_ptr, document_runtime| {
                 document_runtime
                     .settle_stylesheet_link_clients_in_current_scope(scope, host_ptr, clients);
-            });
+                Ok(())
+            })
+        {
+            self.record_runtime_warning(format_args!(
+                "stylesheet client settlement failed: {error}"
+            ));
+        }
     }
 
     pub(crate) fn dispatch_preload_like_link_error_event(&mut self, handle: DomHandle) -> bool {
-        let context_ptr: *const v8::Global<v8::Context> = &self.page_default_context;
-        let context_host = self._context_host.clone();
-        let document_runtime = &mut self.document_runtime;
-        self.renderer_document_isolate
-            .with_renderer_document_isolate_mut(|isolate| {
-                let scope = pin!(v8::HandleScope::new(isolate));
-                let scope = &mut scope.init();
-                let context = unsafe { v8::Local::new(scope, &*context_ptr) };
-                let scope = &mut v8::ContextScope::new(scope, context);
-                let host_ptr: *mut JsContextHost = (*context_host).as_ptr();
-                document_runtime.dispatch_preload_like_link_error_event(scope, host_ptr, handle);
-            });
-        true
+        self.with_main_world_document_scope(|scope, host_ptr, document_runtime| {
+            document_runtime.dispatch_preload_like_link_error_event(scope, host_ptr, handle);
+            Ok(())
+        })
+        .map(|_| true)
+        .unwrap_or_else(|error| {
+            self.record_runtime_warning(format_args!("stylesheet error dispatch failed: {error}"));
+            false
+        })
     }
 
     pub(crate) fn bind_prepared_script_handle_if_needed(
@@ -2350,7 +2404,7 @@ impl ScriptVm {
             .prime_document_lifecycle_processing_for_owner(self._context_host.as_ref().as_ptr());
         self.apply_connected_style_load_prime_result(prime_result);
         self.record_ready_stylesheet_network_results();
-        self.reconcile_document_web_fonts_for_layout();
+        self.reconcile_document_font_resources();
     }
 
     pub(crate) fn apply_connected_style_load_prime_result(
@@ -2400,22 +2454,18 @@ impl ScriptVm {
             return;
         }
 
-        let context_ptr: *const v8::Global<v8::Context> = &self.page_default_context;
-        let context_host = self._context_host.clone();
-        let document_runtime = &mut self.document_runtime;
-        self.renderer_document_isolate
-            .with_renderer_document_isolate_mut(|isolate| {
-                let scope = pin!(v8::HandleScope::new(isolate));
-                let scope = &mut scope.init();
-                let context = unsafe { v8::Local::new(scope, &*context_ptr) };
-                let scope = &mut v8::ContextScope::new(scope, context);
-                let host_ptr: *mut JsContextHost = (*context_host).as_ptr();
+        if let Err(error) =
+            self.with_main_world_document_scope(|scope, host_ptr, document_runtime| {
                 for violation in violations {
                     document_runtime.queue_content_security_policy_violation_event_best_effort(
                         scope, host_ptr, &violation,
                     );
                 }
-            });
+                Ok(())
+            })
+        {
+            self.record_runtime_warning(format_args!("CSP violation dispatch failed: {error}"));
+        }
     }
 
     pub(crate) fn record_ready_stylesheet_network_results(&mut self) {
@@ -2562,7 +2612,7 @@ impl ScriptVm {
                             host.accept_current_main_stylesheet_subresource_load_delay()
                         else {
                             tracing::debug!(
-                                url = %resource.request_url(),
+                                url = ?resource.request_url(),
                                 kind = ?resource.kind(),
                                 "skipping stylesheet subresource for stale main document owner"
                             );
@@ -2582,13 +2632,7 @@ impl ScriptVm {
             );
         }
         for (root, responses) in import_graph_results {
-            if host
-                .install_live_stylesheet_import_graph(root.clone(), &responses)
-                .is_some()
-            {
-                let _ =
-                    host.refresh_live_stylesheet_after_import_graph(root.owner, root.stylesheet_id);
-            }
+            let _ = host.install_and_refresh_live_stylesheet_import_graph(root, &responses);
         }
         for blocking_import_graph in blocking_import_graphs {
             let (source, roots, graph) = blocking_import_graph.into_parts();
@@ -2626,13 +2670,9 @@ impl ScriptVm {
                 }
             }
             for root in roots {
-                match host.install_live_stylesheet_import_graph(root.clone(), &responses) {
+                match host.install_and_refresh_live_stylesheet_import_graph(root, &responses) {
                     Some(graph_successful) => {
                         successful &= graph_successful;
-                        let _ = host.refresh_live_stylesheet_after_import_graph(
-                            root.owner,
-                            root.stylesheet_id,
-                        );
                     }
                     None => successful = false,
                 }
@@ -2709,22 +2749,71 @@ impl ScriptVm {
         request_initiator_type: SubresourceRequestInitiatorType,
         result: &std::result::Result<crate::protocol_types::NavigationResponse, String>,
     ) {
-        let performance_entry =
+        self.record_script_subresource_network_result_with_handle(
+            document_url,
+            request_url,
+            request_initiator_type,
+            result,
+            None,
+        );
+    }
+
+    pub(crate) fn record_parser_script_subresource_network_result(
+        &mut self,
+        document_url: Url,
+        request_url: Url,
+        result: &std::result::Result<crate::protocol_types::NavigationResponse, String>,
+        request_handle: Option<SubresourceNetworkRequestHandle>,
+    ) {
+        self.record_script_subresource_network_result_with_handle(
+            document_url,
+            request_url,
+            SubresourceRequestInitiatorType::Parser,
+            result,
+            request_handle,
+        );
+    }
+
+    fn record_script_subresource_network_result_with_handle(
+        &mut self,
+        document_url: Url,
+        request_url: Url,
+        request_initiator_type: SubresourceRequestInitiatorType,
+        result: &std::result::Result<crate::protocol_types::NavigationResponse, String>,
+        request_handle: Option<SubresourceNetworkRequestHandle>,
+    ) {
+        let mut performance_entry =
             crate::context_bootstrap::ResourcePerformanceEntry::from_network_result(
                 request_url.as_str(),
                 "script",
                 None,
                 result,
             );
+        if request_initiator_type == SubresourceRequestInitiatorType::Parser
+            && let Ok(response) = result
+            && let Some(loader) = self.current_main_document_resource_loader()
+        {
+            let origin = loader.fetch_context().request_origin();
+            if origin.same_origin_url(&document_url) {
+                performance_entry =
+                    performance_entry.with_initiator_url(crate::resource_initiator::response_url(
+                        document_url.as_str().to_owned(),
+                        &origin,
+                        &response.final_url,
+                        response.cache_state,
+                    ));
+            }
+        }
         self._context_host
             .borrow_mut()
-            .record_get_subresource_network_result_with_initiator(
+            .record_get_subresource_network_result_with_handle(
                 None,
                 document_url,
                 request_url,
                 SubresourceResourceType::Script,
                 request_initiator_type,
                 result,
+                request_handle,
             );
         self.record_resource_performance_entries(vec![performance_entry]);
     }
@@ -2798,7 +2887,10 @@ mod tests {
 
         assert_eq!(resources.len(), 1);
         assert_eq!(
-            resources[0].request_url().as_str(),
+            resources[0]
+                .request_url()
+                .expect("URL-backed font fixture")
+                .as_str(),
             "https://example.test/assets/fonts/demo.woff2"
         );
         assert_eq!(

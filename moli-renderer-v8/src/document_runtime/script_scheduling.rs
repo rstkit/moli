@@ -102,12 +102,9 @@ mod tests {
         FrameDocumentTaskOwner::new(FrameSchedulerLaneId(1), LocalWindowId(2), DocumentId(3))
     }
 
-    fn parse_document_with_blocking_stylesheet_inputs(
+    fn parse_document_with_stylesheet_inputs(
         html: &str,
-    ) -> (
-        NativeDom,
-        Vec<crate::DocumentOwnedBlockingStylesheetDiscoveryInput>,
-    ) {
+    ) -> (NativeDom, Vec<crate::DocumentOwnedStylesheetDiscoveryInput>) {
         let (document, _, inputs) = crate::parse_html_test_fixture_with_parser_outputs(
             Url::parse("https://example.com/").unwrap(),
             html.to_owned(),
@@ -146,8 +143,17 @@ mod tests {
             Url::parse("https://example.com/").unwrap(),
             "<!doctype html><html><body></body></html>".to_owned(),
         );
-        let mut runtime = DocumentRuntime::new(&document);
         let mut task_queue = crate::page_task_queue::PageTaskQueueTestHarness::new();
+        let sender = task_queue.owner_attached_runtime_page_task_sender_for_test();
+        let (parser_boundary_tx, _parser_boundary_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = DocumentRuntime::from_main_frame_dom_host(
+            DomHost::from_dom(document),
+            main_document_owner(),
+            Some(sender.page_task_sender()),
+            parser_boundary_tx,
+            sender.stylesheet_task_sender(),
+            sender.main_parser_continuation_sender(),
+        );
         let mut report = ScriptExecutionReport::default();
         let detached_run = ScriptRun::skipped(
             NodeId::new(99),
@@ -188,10 +194,22 @@ mod tests {
             task_queue.post_parse_pop_front(),
             Some(work) if work.is_domcontentloaded_task()
         ));
-        assert!(matches!(
-            task_queue.post_parse_pop_front(),
-            Some(work) if work.is_async_phase_document_script()
-        ));
+        let async_task = task_queue
+            .task_sources()
+            .take_main_document_runtime_for_executor_test()
+            .expect("async work must enter the independent ready runtime source");
+        assert_eq!(async_task.owner().document_owner(), main_document_owner());
+        let crate::page_task_queue::RendererPageMainDocumentRuntimeAction::ExecuteReadyPostParseWork(
+            async_work,
+        ) = async_task.into_action()
+        else {
+            panic!("async work must retain its executable payload");
+        };
+        assert!(
+            async_work
+                .into_post_parse_work()
+                .is_async_phase_document_script()
+        );
         assert!(matches!(
             task_queue.post_parse_pop_front(),
             Some(work) if work.detached_run_count() == 1
@@ -285,18 +303,16 @@ mod tests {
     }
     #[tokio::test]
     async fn blocking_stylesheets_gate_defer_like_post_parse_work_by_snapshot() {
-        let (document, blocking_stylesheet_inputs) = parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) = parse_document_with_stylesheet_inputs(
             "<!doctype html><html><head><link rel=stylesheet href='/app.css'><script defer src='/app.js'></script></head><body></body></html>",
         );
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
         let script = document.script_handles()[0];
-        let blocker = blocking_stylesheet_inputs
+        let blocker = stylesheet_inputs
             .first()
             .expect("stylesheet before defer script should be discovered");
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         let mut blocking_signatures_before = HashSet::new();
         blocking_signatures_before.insert(blocker.signature().clone());
@@ -319,18 +335,16 @@ mod tests {
 
     #[tokio::test]
     async fn parser_deferred_owner_source_keeps_snapshot_gate_without_queue_markers() {
-        let (document, blocking_stylesheet_inputs) = parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) = parse_document_with_stylesheet_inputs(
             "<!doctype html><html><head><link rel=stylesheet href='/app.css'><script defer src='/app.js'></script></head><body></body></html>",
         );
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
         let script_node = document.script_handles()[0];
-        let blocker = blocking_stylesheet_inputs
+        let blocker = stylesheet_inputs
             .first()
             .expect("stylesheet before defer script");
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         let task_owner =
             FrameDocumentTaskOwner::new(FrameSchedulerLaneId(1), LocalWindowId(2), DocumentId(3));
@@ -458,15 +472,13 @@ mod tests {
 
     #[tokio::test]
     async fn domcontentloaded_task_is_not_directly_blocked_by_stylesheets() {
-        let (document, blocking_stylesheet_inputs) = parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) = parse_document_with_stylesheet_inputs(
             "<!doctype html><html><head><link rel=stylesheet href='/app.css'><script defer src='/app.js'></script></head><body></body></html>",
         );
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
-        assert!(!blocking_stylesheet_inputs.is_empty());
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        assert!(!stylesheet_inputs.is_empty());
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         assert!(
             !runtime

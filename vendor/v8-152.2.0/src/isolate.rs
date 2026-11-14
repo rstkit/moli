@@ -2093,6 +2093,19 @@ impl Isolate {
     }
   }
 
+  /// Invalidates this isolate's cached default locale after an ICU default
+  /// locale change. Existing explicitly constructed Intl objects are unchanged.
+  pub fn locale_configuration_change_notification(&mut self) {
+    unsafe extern "C" {
+      fn v8__Isolate__LocaleConfigurationChangeNotification(
+        isolate: *mut RealIsolate,
+      );
+    }
+    unsafe {
+      v8__Isolate__LocaleConfigurationChangeNotification(self.as_real_ptr());
+    }
+  }
+
   /// Returns true if there is ongoing background work within V8 that will
   /// eventually post a foreground task, like asynchronous WebAssembly
   /// compilation.
@@ -2376,7 +2389,7 @@ fn current_thread_id() -> usize {
     // from another TLS destructor, where panicking would abort the process.
     // A relaxed global counter is sufficient because IDs are only compared.
     let id = NEXT_THREAD_ID
-      .fetch_update(
+      .try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |next| next.checked_add(1),

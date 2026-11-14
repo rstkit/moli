@@ -4,7 +4,7 @@ use crate::webidl;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain, receiver = crate::context_bootstrap::is_window_receiver)]
 struct WindowLocationAccessorDeclaration {
     #[webapi(
         accessor_property,
@@ -17,7 +17,7 @@ struct WindowLocationAccessorDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain, receiver_access_check, receiver = crate::context_bootstrap::is_window_receiver)]
 struct WindowHistoryAccessorDeclaration {
     #[webapi(
         accessor_property,
@@ -28,7 +28,7 @@ struct WindowHistoryAccessorDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain, receiver_access_check, receiver = crate::context_bootstrap::is_window_receiver)]
 struct WindowNavigationAccessorDeclaration {
     #[webapi(
         accessor_property,
@@ -40,7 +40,7 @@ struct WindowNavigationAccessorDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct DocumentLocationAccessorDeclaration {
     #[webapi(
         accessor_property,
@@ -50,6 +50,62 @@ struct DocumentLocationAccessorDeclaration {
         dont_delete
     )]
     location: (),
+}
+
+pub(crate) fn install_constructed_document_location_runtime_state<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
+) -> anyhow::Result<()> {
+    set_private_value(
+        scope,
+        document,
+        WINDOW_LOCATION_SLOT,
+        v8::null(scope).into(),
+    );
+    install_document_location_accessor(scope, document)
+}
+
+fn install_document_location_accessor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    document: v8::Local<'s, v8::Object>,
+) -> anyhow::Result<()> {
+    // Unforgeable attributes reuse their getter and setter within a realm,
+    // including across the HTMLDocument and XMLDocument interfaces.
+    const ACCESSORS_SLOT: &str = "__moliDocumentLocationAccessors";
+    let global = scope.get_current_context().global(scope);
+    let descriptor = if let Some(cached) = get_private_value(scope, global, ACCESSORS_SLOT)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+    {
+        cached
+    } else {
+        let template = v8::Object::new(scope);
+        DocumentLocationAccessorDeclaration::default()
+            .initialize(scope, template)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to initialize Document.location: {error:?}")
+            })?;
+        let descriptor = template
+            .get_own_property_descriptor(scope, v8str(scope, "location").into())
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("Document.location accessor descriptor is missing"))?;
+        set_private_value(scope, global, ACCESSORS_SLOT, descriptor.into());
+        descriptor
+    };
+    let getter = descriptor
+        .get(scope, v8str(scope, "get").into())
+        .ok_or_else(|| anyhow::anyhow!("Document.location getter is missing"))?;
+    let setter = descriptor
+        .get(scope, v8str(scope, "set").into())
+        .ok_or_else(|| anyhow::anyhow!("Document.location setter is missing"))?;
+    crate::definitions::define_get_set_property(
+        scope,
+        document,
+        v8str(scope, "location").into(),
+        getter,
+        setter,
+        v8::PropertyAttribute::DONT_DELETE,
+        "location",
+    )
 }
 
 pub(crate) fn sync_document_location_runtime_state_from_window<'s>(
@@ -85,6 +141,15 @@ pub(crate) fn sync_window_location_runtime_state<'s>(
     };
     sync_location_object(scope, location, href);
     install_public_window_location_accessor(scope, window);
+}
+
+pub(crate) fn window_location_href<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    window: v8::Local<'s, v8::Object>,
+) -> Option<String> {
+    let location =
+        v8::Local::<v8::Object>::try_from(window_location_slot_value(scope, window)?).ok()?;
+    super::slots::location_href_slot(scope, location)
 }
 
 pub(crate) fn sync_window_location_history_navigation_runtime_surface<'s>(
@@ -256,5 +321,5 @@ fn install_public_location_accessor<'s>(
     if object.has_own_property(scope, key.into()).unwrap_or(false) {
         return;
     }
-    let _ = DocumentLocationAccessorDeclaration::default().initialize(scope, object);
+    let _ = install_document_location_accessor(scope, object);
 }

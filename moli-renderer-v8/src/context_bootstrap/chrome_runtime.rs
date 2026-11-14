@@ -19,7 +19,7 @@ const INSTALL_STATE_NOT_INSTALLED: &str = "not_installed";
 const RUNNING_STATE_CANNOT_RUN: &str = "cannot_run";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct ChromeInstallStateDeclaration {
     #[webapi(data_property = "DISABLED")]
     disabled: &'static str,
@@ -30,7 +30,7 @@ struct ChromeInstallStateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct ChromeRunningStateDeclaration {
     #[webapi(data_property = "CANNOT_RUN")]
     cannot_run: &'static str,
@@ -41,7 +41,7 @@ struct ChromeRunningStateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", enumerable)]
+#[webapi(plain, enumerable)]
 struct ChromeAppDeclaration<'scope> {
     #[webapi(
         native_data_property = "isInstalled",
@@ -376,6 +376,12 @@ fn run_chrome_app_install_state_callback<'s>(
         .expect("chrome.app.installState trampoline must retain its callback");
     let receiver = v8::undefined(scope);
     let state: v8::Local<'s, v8::Value> = v8str(scope, INSTALL_STATE_NOT_INSTALLED).into();
-    let _ = callback.call(scope, receiver.into(), &[state]);
+    let _ = crate::util::call_script_visible_function(
+        scope,
+        callback,
+        receiver.into(),
+        &[state],
+        "chrome.app.installState callback",
+    );
     rv.set_undefined();
 }

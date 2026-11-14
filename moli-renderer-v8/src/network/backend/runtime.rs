@@ -5,15 +5,18 @@ use std::{
     rc::{Rc, Weak as RcWeak},
     sync::{
         Arc, Weak as ArcWeak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use moli_cookie_jar::SharedBrowserCookieStore;
+use moli_disk_pool::DiskPool;
 use moli_fetch::{FetchClient, FetchClientHandle, FetchConfig, FetchRuntimeJoinReport};
+use moli_parkable_image::{ParkableImageManager, ParkableImagePolicy};
 use parking_lot::{Mutex, RwLock};
 
 use super::{
+    BrowserParkableImageDiagnostics, BrowserResourceDiskPoolDiagnostics,
     BrowserResourceRuntimeDiagnostics, SharedMemoryResourceCacheDiagnostics,
     memory_cache::SharedMemoryResourceCache,
 };
@@ -24,6 +27,23 @@ use crate::network::loads::{
 
 static NEXT_BROWSER_RESOURCE_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_BROWSER_RESOURCE_OWNER_ROOT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Failure to access a resource runtime through its browser-context owner root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BrowserResourceRuntimeOwnerError {
+    #[error("browser resource runtime owner root is shut down")]
+    RootShutDown,
+    #[error("browser resource runtime belongs to another owner root")]
+    DifferentOwnerRoot,
+    #[error("browser resource runtime owner is no longer registered")]
+    OwnerUnregistered,
+    #[error("browser resource runtime binding has no active registered owner")]
+    NoActiveOwner,
+    #[error("browser resource runtime owner root has been dropped")]
+    RootDropped,
+    #[error("browser resource runtime registrar/root identity mismatch")]
+    RegistrarRootMismatch,
+}
 
 /// Long-lived transport and renderer memory-cache state for one browser context.
 ///
@@ -45,6 +65,7 @@ pub struct BrowserResourceRuntimeOwner {
     runtime_id: u64,
     runtime: ArcWeak<BrowserResourceRuntimeInner>,
     fetch_owner: FetchClient,
+    resource_executor: Option<tokio::runtime::Runtime>,
     _thread_affine: PhantomData<Rc<()>>,
 }
 
@@ -126,7 +147,12 @@ struct BrowserResourceRuntimeInner {
     id: u64,
     owner_root_id: AtomicU64,
     client: FetchClientHandle,
+    task_runner: crate::network::RendererResourceTaskRunner,
     memory_cache: Mutex<SharedMemoryResourceCache>,
+    disk_pool: Option<DiskPool>,
+    parkable_images: ParkableImageManager,
+    parkable_image_schedule_notify: Arc<tokio::sync::Notify>,
+    parkable_image_scheduler_started: AtomicBool,
     detached_keepalive_loads: DetachedKeepaliveLoadRegistry,
 }
 
@@ -138,16 +164,42 @@ impl BrowserResourceRuntimeOwner {
         config: &FetchConfig,
         cookie_store: SharedBrowserCookieStore,
     ) -> BrowserResourceRuntimeOwnerRegistration {
+        // A browser-scoped resource executor keeps Send loading futures moving
+        // when a renderer or Worker synchronously waits. Its sole lifetime owner
+        // stays here, outside all cloneable request/Document handles.
+        let resource_executor = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(crate::tokio_blocking_budget::tokio_blocking_thread_budget())
+            .thread_name("moli-resources")
+            .enable_all()
+            .build()
+            .expect("browser resource executor should initialize");
+        let task_runner = crate::network::RendererResourceTaskRunner::from_tokio_handle(
+            resource_executor.handle().clone(),
+        );
         let fetch_owner = FetchClient::new(config, cookie_store);
         let runtime_id = NEXT_BROWSER_RESOURCE_RUNTIME_ID
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
+        let disk_pool = DiskPool::new(None).ok();
+        let parkable_image_schedule_notify = Arc::new(tokio::sync::Notify::new());
+        let schedule_notify = Arc::clone(&parkable_image_schedule_notify);
+        let parkable_images = ParkableImageManager::new_with_schedule_wakeup(
+            disk_pool.clone(),
+            ParkableImagePolicy::default(),
+            move || schedule_notify.notify_one(),
+        );
         let runtime = BrowserResourceRuntime {
             inner: Arc::new(BrowserResourceRuntimeInner {
                 id: runtime_id,
                 owner_root_id: AtomicU64::new(0),
                 client: fetch_owner.handle(),
+                task_runner,
                 memory_cache: Mutex::new(SharedMemoryResourceCache::default()),
+                parkable_images,
+                disk_pool,
+                parkable_image_schedule_notify,
+                parkable_image_scheduler_started: AtomicBool::new(false),
                 detached_keepalive_loads: DetachedKeepaliveLoadRegistry::default(),
             }),
         };
@@ -155,6 +207,7 @@ impl BrowserResourceRuntimeOwner {
             runtime_id,
             runtime: Arc::downgrade(&runtime.inner),
             fetch_owner,
+            resource_executor: Some(resource_executor),
             _thread_affine: PhantomData,
         };
         BrowserResourceRuntimeOwnerRegistration {
@@ -166,7 +219,7 @@ impl BrowserResourceRuntimeOwner {
 }
 
 impl BrowserResourceRuntime {
-    fn bind_owner_root(&self, root_id: u64) -> Result<(), &'static str> {
+    fn bind_owner_root(&self, root_id: u64) -> Result<(), BrowserResourceRuntimeOwnerError> {
         match self.inner.owner_root_id.compare_exchange(
             0,
             root_id,
@@ -175,12 +228,16 @@ impl BrowserResourceRuntime {
         ) {
             Ok(_) => Ok(()),
             Err(existing) if existing == root_id => Ok(()),
-            Err(_) => Err("browser resource runtime belongs to another owner root"),
+            Err(_) => Err(BrowserResourceRuntimeOwnerError::DifferentOwnerRoot),
         }
     }
 
     fn owner_root_id(&self) -> u64 {
         self.inner.owner_root_id.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn task_runner(&self) -> crate::network::RendererResourceTaskRunner {
+        self.inner.task_runner.clone()
     }
 
     pub fn cookie_store(&self) -> SharedBrowserCookieStore {
@@ -207,10 +264,49 @@ impl BrowserResourceRuntime {
         self.inner.memory_cache.lock().diagnostics()
     }
 
+    pub fn disk_pool(&self) -> Option<DiskPool> {
+        self.inner.disk_pool.clone()
+    }
+
+    pub fn disk_pool_diagnostics(&self) -> Option<BrowserResourceDiskPoolDiagnostics> {
+        self.inner
+            .disk_pool
+            .as_ref()
+            .map(|pool| pool.diagnostics().into())
+    }
+
+    pub fn parkable_image_manager(&self) -> ParkableImageManager {
+        self.inner.parkable_images.clone()
+    }
+
+    pub fn parkable_image_diagnostics(&self) -> BrowserParkableImageDiagnostics {
+        self.inner.parkable_images.diagnostics().into()
+    }
+
+    pub(crate) fn ensure_parkable_image_scheduler(
+        &self,
+        runner: &crate::network::RendererResourceTaskRunner,
+    ) {
+        if self
+            .inner
+            .parkable_image_scheduler_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let weak_runtime = Arc::downgrade(&self.inner);
+        let schedule_notify = Arc::clone(&self.inner.parkable_image_schedule_notify);
+        runner.spawn(run_parkable_image_scheduler(weak_runtime, schedule_notify));
+    }
+
     pub fn diagnostics(&self) -> BrowserResourceRuntimeDiagnostics {
         BrowserResourceRuntimeDiagnostics {
             runtime_id: self.runtime_id_for_diagnostics(),
             memory_cache: self.memory_cache_diagnostics(),
+            disk_pool: self.disk_pool_diagnostics(),
+            parkable_images: self.parkable_image_diagnostics(),
             detached_keepalive_loads: self.detached_keepalive_diagnostics(),
         }
     }
@@ -254,17 +350,79 @@ impl BrowserResourceRuntime {
     }
 }
 
+async fn run_parkable_image_scheduler(
+    weak_runtime: ArcWeak<BrowserResourceRuntimeInner>,
+    schedule_notify: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        // Arm the notification before reading the deadline so a concurrent
+        // state transition cannot be lost between inspection and waiting.
+        let notified = schedule_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        let Some(runtime) = weak_runtime.upgrade() else {
+            return;
+        };
+        let next_deadline = runtime.parkable_images.next_parking_deadline();
+        drop(runtime);
+
+        match next_deadline {
+            Some(deadline) => {
+                let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+                tokio::pin!(sleep);
+                tokio::select! {
+                    () = notified.as_mut() => continue,
+                    () = sleep.as_mut() => {}
+                }
+            }
+            None => {
+                notified.await;
+                continue;
+            }
+        }
+
+        let Some(runtime) = weak_runtime.upgrade() else {
+            return;
+        };
+        let manager = runtime.parkable_images.clone();
+        drop(runtime);
+        if tokio::task::spawn_blocking(move || manager.park_images())
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 impl BrowserResourceRuntimeOwner {
     pub fn request_shutdown(&self) {
         self.fetch_owner.request_shutdown();
     }
 
     pub fn join(&mut self) -> FetchRuntimeJoinReport {
-        self.fetch_owner.join()
+        let report = self.fetch_owner.join();
+        if let Some(executor) = self.resource_executor.take() {
+            // Owners can be disposed from an embedding Tokio runtime. Cancel
+            // outstanding Send futures without blocking or dropping a runtime
+            // inside another runtime's async context.
+            executor.shutdown_background();
+        }
+        report
     }
 
     fn runtime_is_gone(&self) -> bool {
         self.runtime.upgrade().is_none()
+    }
+}
+
+impl Drop for BrowserResourceRuntimeOwner {
+    fn drop(&mut self) {
+        self.fetch_owner.request_shutdown();
+        if let Some(executor) = self.resource_executor.take() {
+            executor.shutdown_background();
+        }
     }
 }
 
@@ -302,9 +460,9 @@ impl BrowserResourceRuntimeOwnerSet {
     fn replace_owned(
         &mut self,
         registration: BrowserResourceRuntimeOwnerRegistration,
-    ) -> Result<BrowserResourceRuntime, &'static str> {
+    ) -> Result<BrowserResourceRuntime, BrowserResourceRuntimeOwnerError> {
         if self.terminal {
-            return Err("browser resource runtime owner root is shut down");
+            return Err(BrowserResourceRuntimeOwnerError::RootShutDown);
         }
         let (runtime, owner) = registration.into_parts();
         runtime.bind_owner_root(self.root_id)?;
@@ -319,12 +477,15 @@ impl BrowserResourceRuntimeOwnerSet {
         Ok(runtime)
     }
 
-    fn adopt_registered(&mut self, runtime: BrowserResourceRuntime) -> Result<(), &'static str> {
+    fn adopt_registered(
+        &mut self,
+        runtime: BrowserResourceRuntime,
+    ) -> Result<(), BrowserResourceRuntimeOwnerError> {
         if self.terminal {
-            return Err("browser resource runtime owner root is shut down");
+            return Err(BrowserResourceRuntimeOwnerError::RootShutDown);
         }
         if runtime.owner_root_id() != self.root_id {
-            return Err("browser resource runtime belongs to another owner root");
+            return Err(BrowserResourceRuntimeOwnerError::DifferentOwnerRoot);
         }
         let runtime_id = runtime.runtime_id_for_diagnostics();
         if !self
@@ -332,7 +493,7 @@ impl BrowserResourceRuntimeOwnerSet {
             .iter()
             .any(|owner| owner.runtime_id == runtime_id)
         {
-            return Err("browser resource runtime owner is no longer registered");
+            return Err(BrowserResourceRuntimeOwnerError::OwnerUnregistered);
         }
         self.binding.replace(runtime);
         self.active_runtime_id = Some(runtime_id);
@@ -340,9 +501,11 @@ impl BrowserResourceRuntimeOwnerSet {
         Ok(())
     }
 
-    fn current_registered(&mut self) -> Result<BrowserResourceRuntime, &'static str> {
+    fn current_registered(
+        &mut self,
+    ) -> Result<BrowserResourceRuntime, BrowserResourceRuntimeOwnerError> {
         if self.terminal {
-            return Err("browser resource runtime owner root is shut down");
+            return Err(BrowserResourceRuntimeOwnerError::RootShutDown);
         }
         let _ = self.reap_retired();
         let runtime = self.binding.current();
@@ -353,24 +516,27 @@ impl BrowserResourceRuntimeOwnerSet {
                 .iter()
                 .any(|owner| owner.runtime_id == runtime_id)
         {
-            return Err("browser resource runtime binding has no active registered owner");
+            return Err(BrowserResourceRuntimeOwnerError::NoActiveOwner);
         }
         Ok(runtime)
     }
 
-    fn validate_registered(&self, runtime: &BrowserResourceRuntime) -> Result<(), &'static str> {
+    fn validate_registered(
+        &self,
+        runtime: &BrowserResourceRuntime,
+    ) -> Result<(), BrowserResourceRuntimeOwnerError> {
         if self.terminal {
-            return Err("browser resource runtime owner root is shut down");
+            return Err(BrowserResourceRuntimeOwnerError::RootShutDown);
         }
         if runtime.owner_root_id() != self.root_id {
-            return Err("browser resource runtime belongs to another owner root");
+            return Err(BrowserResourceRuntimeOwnerError::DifferentOwnerRoot);
         }
         if !self
             .owners
             .iter()
             .any(|owner| owner.runtime_id == runtime.runtime_id_for_diagnostics())
         {
-            return Err("browser resource runtime owner is no longer registered");
+            return Err(BrowserResourceRuntimeOwnerError::OwnerUnregistered);
         }
         Ok(())
     }
@@ -473,14 +639,16 @@ impl Drop for BrowserResourceRuntimeOwnerRoot {
 impl BrowserResourceRuntimeOwnerRegistrar {
     fn with_owner_set<T>(
         &self,
-        operation: impl FnOnce(&BrowserResourceRuntimeOwnerSet) -> Result<T, &'static str>,
-    ) -> Result<T, &'static str> {
+        operation: impl FnOnce(
+            &BrowserResourceRuntimeOwnerSet,
+        ) -> Result<T, BrowserResourceRuntimeOwnerError>,
+    ) -> Result<T, BrowserResourceRuntimeOwnerError> {
         let Some(root) = self.inner.upgrade() else {
-            return Err("browser resource runtime owner root has been dropped");
+            return Err(BrowserResourceRuntimeOwnerError::RootDropped);
         };
         let owners = root.borrow();
         if self.root_id != owners.root_id {
-            return Err("browser resource runtime registrar/root identity mismatch");
+            return Err(BrowserResourceRuntimeOwnerError::RegistrarRootMismatch);
         }
         operation(&owners)
     }
@@ -488,13 +656,13 @@ impl BrowserResourceRuntimeOwnerRegistrar {
     pub fn replace_owned(
         &self,
         registration: BrowserResourceRuntimeOwnerRegistration,
-    ) -> Result<BrowserResourceRuntime, &'static str> {
+    ) -> Result<BrowserResourceRuntime, BrowserResourceRuntimeOwnerError> {
         let Some(root) = self.inner.upgrade() else {
-            return Err("browser resource runtime owner root has been dropped");
+            return Err(BrowserResourceRuntimeOwnerError::RootDropped);
         };
         let mut owners = root.borrow_mut();
         if self.root_id != owners.root_id {
-            return Err("browser resource runtime registrar/root identity mismatch");
+            return Err(BrowserResourceRuntimeOwnerError::RegistrarRootMismatch);
         }
         owners.replace_owned(registration)
     }
@@ -502,24 +670,26 @@ impl BrowserResourceRuntimeOwnerRegistrar {
     pub(crate) fn adopt_registered(
         &self,
         runtime: BrowserResourceRuntime,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), BrowserResourceRuntimeOwnerError> {
         let Some(root) = self.inner.upgrade() else {
-            return Err("browser resource runtime owner root has been dropped");
+            return Err(BrowserResourceRuntimeOwnerError::RootDropped);
         };
         let mut owners = root.borrow_mut();
         if self.root_id != owners.root_id {
-            return Err("browser resource runtime registrar/root identity mismatch");
+            return Err(BrowserResourceRuntimeOwnerError::RegistrarRootMismatch);
         }
         owners.adopt_registered(runtime)
     }
 
-    pub(crate) fn current_registered(&self) -> Result<BrowserResourceRuntime, &'static str> {
+    pub(crate) fn current_registered(
+        &self,
+    ) -> Result<BrowserResourceRuntime, BrowserResourceRuntimeOwnerError> {
         let Some(root) = self.inner.upgrade() else {
-            return Err("browser resource runtime owner root has been dropped");
+            return Err(BrowserResourceRuntimeOwnerError::RootDropped);
         };
         let mut owners = root.borrow_mut();
         if self.root_id != owners.root_id {
-            return Err("browser resource runtime registrar/root identity mismatch");
+            return Err(BrowserResourceRuntimeOwnerError::RegistrarRootMismatch);
         }
         owners.current_registered()
     }
@@ -527,7 +697,7 @@ impl BrowserResourceRuntimeOwnerRegistrar {
     pub(crate) fn validate_registered(
         &self,
         runtime: &BrowserResourceRuntime,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), BrowserResourceRuntimeOwnerError> {
         self.with_owner_set(|owners| owners.validate_registered(runtime))
     }
 
@@ -546,6 +716,7 @@ impl Drop for BrowserResourceRuntimeOwnerSet {
 
 impl Drop for BrowserResourceRuntimeInner {
     fn drop(&mut self) {
+        self.parkable_image_schedule_notify.notify_one();
         self.client.request_shutdown();
     }
 }
@@ -593,6 +764,32 @@ mod tests {
 
     fn registration() -> BrowserResourceRuntimeOwnerRegistration {
         BrowserResourceRuntimeOwner::new(&FetchConfig::default(), new_shared_browser_cookie_store())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parkable_image_scheduler_runs_after_the_last_reader_release_grace() -> Result<()> {
+        let (root, binding) = BrowserResourceRuntimeOwnerRoot::new(registration());
+        let runtime = binding.current();
+        let runner = crate::network::RendererResourceTaskRunner::from_current_tokio()?;
+        runtime.ensure_parkable_image_scheduler(&runner);
+        let manager = runtime.parkable_image_manager();
+        let image = manager.from_frozen_bytes(vec![7; 4096]);
+
+        let snapshot = image.snapshot()?;
+        drop(snapshot);
+        timeout(Duration::from_secs(5), async {
+            while manager.diagnostics().parked_count == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reader-release deadline should wake the image scheduler");
+
+        assert_eq!(manager.diagnostics().resident_count, 0);
+        assert_eq!(manager.diagnostics().parked_count, 1);
+        drop((image, manager, runtime, binding));
+        root.shutdown_and_join();
+        Ok(())
     }
 
     #[test]
@@ -667,7 +864,8 @@ mod tests {
         let callback_runtime = old_runtime.clone();
         let (callback_tx, callback_rx) = std_mpsc::channel();
         client.fetch_text_callback(
-            Request::get(&format!("http://{addr}/callback"))?,
+            Request::get(&format!("http://{addr}/callback"))?
+                .with_request_origin(moli_url::WebOrigin::Opaque),
             move |result| {
                 let thread_name = std::thread::current()
                     .name()
@@ -775,7 +973,8 @@ mod tests {
         let client = ResourceRequestClient::from_browser_resource_runtime(old_runtime.clone());
         let mut response = client
             .fetch_raw_stream_with_cancel(
-                Request::get(&format!("http://{addr}/stream"))?,
+                Request::get(&format!("http://{addr}/stream"))?
+                    .with_request_origin(moli_url::WebOrigin::Opaque),
                 FetchCancelHandle::new(),
             )
             .await?;

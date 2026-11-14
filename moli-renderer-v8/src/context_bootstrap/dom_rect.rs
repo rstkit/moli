@@ -1,48 +1,25 @@
 use super::*;
 use crate::util::{callback_data_index_value, get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
+use webidl::WebIdlDictionarySerialize;
 
 const DOM_RECT_X_SLOT: &str = "__moliDomRectX";
 const DOM_RECT_Y_SLOT: &str = "__moliDomRectY";
 const DOM_RECT_WIDTH_SLOT: &str = "__moliDomRectWidth";
 const DOM_RECT_HEIGHT_SLOT: &str = "__moliDomRectHeight";
-const DOM_RECT_BRAND_SLOT: &str = "__moliDomRectBrand";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "DOMRect")]
-struct DomRectObjectDeclaration {
-    #[webapi(slot = DOM_RECT_BRAND_SLOT, init = true)]
-    brand: (),
-
-    #[webapi(slot = DOM_RECT_X_SLOT)]
-    x: f64,
-    #[webapi(slot = DOM_RECT_Y_SLOT)]
-    y: f64,
-    #[webapi(slot = DOM_RECT_WIDTH_SLOT)]
-    width: f64,
-    #[webapi(slot = DOM_RECT_HEIGHT_SLOT)]
-    height: f64,
-}
+#[webapi(interface = web_api_interfaces::DOMRect)]
+struct DomRectObjectDeclaration {}
 
 #[derive(WebApiObject)]
-#[webapi(interface = "DOMRectReadOnly")]
-struct DomRectReadOnlyObjectDeclaration {
-    #[webapi(slot = DOM_RECT_BRAND_SLOT, init = true)]
-    brand: (),
-
-    #[webapi(slot = DOM_RECT_X_SLOT)]
-    x: f64,
-    #[webapi(slot = DOM_RECT_Y_SLOT)]
-    y: f64,
-    #[webapi(slot = DOM_RECT_WIDTH_SLOT)]
-    width: f64,
-    #[webapi(slot = DOM_RECT_HEIGHT_SLOT)]
-    height: f64,
-}
+#[webapi(interface = web_api_interfaces::DOMRectReadOnly)]
+struct DomRectReadOnlyObjectDeclaration {}
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "DOMRectReadOnly")]
+#[webapi(interface = web_api_interfaces::DOMRectReadOnly, receiver)]
 struct DomRectReadOnlyPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -105,7 +82,7 @@ struct DomRectReadOnlyPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "DOMRect")]
+#[webapi(interface = web_api_interfaces::DOMRect, receiver)]
 struct DomRectPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -142,7 +119,7 @@ struct DomRectPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "DOMRectReadOnly")]
+#[webapi(interface = web_api_interfaces::DOMRectReadOnly, enumerable)]
 struct DomRectReadOnlyConstructorDeclaration {
     #[webapi(
         static_method = "fromRect",
@@ -153,7 +130,7 @@ struct DomRectReadOnlyConstructorDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "DOMRect")]
+#[webapi(interface = web_api_interfaces::DOMRect, enumerable)]
 struct DomRectConstructorDeclaration {
     #[webapi(
         static_method = "fromRect",
@@ -164,7 +141,7 @@ struct DomRectConstructorDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct DomRectJsonDeclaration {
     #[webapi(data_property, enumerable)]
     x: f64,
@@ -219,16 +196,20 @@ struct DomRectReadOnlyConstructorArgs {
 }
 
 #[derive(Clone, Copy, Default, webidl::WebIdlDictionary)]
-#[webidl(prefix = "DOMRectInit")]
-struct DomRectInit {
+#[webidl(prefix = "DOMRectInit", snapshot)]
+pub(super) struct DomRectInit {
     #[webidl(default = 0.0)]
-    x: f64,
+    #[webidl(snapshot_slot = DOM_RECT_HEIGHT_SLOT)]
+    pub(super) height: f64,
     #[webidl(default = 0.0)]
-    y: f64,
+    #[webidl(snapshot_slot = DOM_RECT_WIDTH_SLOT)]
+    pub(super) width: f64,
     #[webidl(default = 0.0)]
-    width: f64,
+    #[webidl(snapshot_slot = DOM_RECT_X_SLOT)]
+    pub(super) x: f64,
     #[webidl(default = 0.0)]
-    height: f64,
+    #[webidl(snapshot_slot = DOM_RECT_Y_SLOT)]
+    pub(super) y: f64,
 }
 
 pub(super) fn dom_rect_readonly_constructor_callback<'s>(
@@ -290,21 +271,21 @@ pub(crate) fn build_dom_rect_object<'s>(
     width: f64,
     height: f64,
 ) -> v8::Local<'s, v8::Object> {
-    DomRectObjectDeclaration::new(x, y, width, height)
-        .bind(scope)
-        .expect("DOMRect declaration should bind")
+    let object = v8::Object::new(scope);
+    initialize_dom_rect_object(scope, object, x, y, width, height);
+    object
 }
 
-fn build_dom_rect_readonly_object<'s>(
+pub(super) fn build_dom_rect_readonly_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     x: f64,
     y: f64,
     width: f64,
     height: f64,
 ) -> v8::Local<'s, v8::Object> {
-    DomRectReadOnlyObjectDeclaration::new(x, y, width, height)
-        .bind(scope)
-        .expect("DOMRectReadOnly declaration should bind")
+    let object = v8::Object::new(scope);
+    initialize_dom_rect_readonly_object(scope, object, x, y, width, height);
+    object
 }
 
 fn initialize_dom_rect_object<'s>(
@@ -315,7 +296,15 @@ fn initialize_dom_rect_object<'s>(
     width: f64,
     height: f64,
 ) {
-    DomRectObjectDeclaration::new(x, y, width, height)
+    DomRectInit {
+        x,
+        y,
+        width,
+        height,
+    }
+    .initialize_snapshot(scope, object)
+    .expect("DOMRect state");
+    DomRectObjectDeclaration::new()
         .bind_into(scope, object)
         .expect("DOMRect declaration should initialize object");
 }
@@ -328,7 +317,15 @@ fn initialize_dom_rect_readonly_object<'s>(
     width: f64,
     height: f64,
 ) {
-    DomRectReadOnlyObjectDeclaration::new(x, y, width, height)
+    DomRectInit {
+        x,
+        y,
+        width,
+        height,
+    }
+    .initialize_snapshot(scope, object)
+    .expect("DOMRect state");
+    DomRectReadOnlyObjectDeclaration::new()
         .bind_into(scope, object)
         .expect("DOMRectReadOnly declaration should initialize object");
 }
@@ -374,7 +371,7 @@ fn dom_rect_from_rect_callback<'s>(
     rv.set(build_dom_rect_object(scope, init.x, init.y, init.width, init.height).into());
 }
 
-fn dom_rect_init_arg<'s>(
+pub(super) fn dom_rect_init_arg<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     prefix: &'static str,
@@ -410,13 +407,9 @@ fn dom_rect_writable_getter_callback<'s>(
         rv.set_undefined();
         return;
     };
-    if !dom_rect_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
-    rv.set(
-        get_private_value(scope, args.this(), slot).unwrap_or_else(|| v8::undefined(scope).into()),
-    );
+    let receiver = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("validated DOMRectReadOnly receiver");
+    rv.set(get_private_value(scope, receiver, slot).unwrap_or_else(|| v8::undefined(scope).into()));
 }
 
 fn dom_rect_readonly_getter_callback<'s>(
@@ -433,11 +426,9 @@ fn dom_rect_readonly_getter_callback<'s>(
         rv.set_undefined();
         return;
     };
-    if !dom_rect_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
-    let value = dom_rect_readonly_attribute_value(scope, args.this(), attribute);
+    let receiver = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("validated DOMRectReadOnly receiver");
+    let value = dom_rect_readonly_attribute_value(scope, receiver, attribute);
     rv.set(v8::Number::new(scope, value).into());
 }
 
@@ -455,10 +446,8 @@ fn dom_rect_setter_callback<'s>(
         rv.set_undefined();
         return;
     };
-    if !dom_rect_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
+    let receiver = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("validated DOMRect receiver");
     let value = match webidl::convert::<webidl::UnrestrictedDouble>(
         scope,
         args.get(0),
@@ -470,12 +459,7 @@ fn dom_rect_setter_callback<'s>(
             return;
         }
     };
-    set_private_value(
-        scope,
-        args.this(),
-        slot,
-        v8::Number::new(scope, value).into(),
-    );
+    set_private_value(scope, receiver, slot, v8::Number::new(scope, value).into());
     rv.set_undefined();
 }
 
@@ -484,11 +468,8 @@ fn dom_rect_to_json_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let this = args.this();
-    if !dom_rect_receiver_branded(scope, this) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
+    let this = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("validated DOMRectReadOnly receiver");
     let declaration = DomRectJsonDeclaration {
         x: dom_rect_slot(this, scope, DOM_RECT_X_SLOT),
         y: dom_rect_slot(this, scope, DOM_RECT_Y_SLOT),
@@ -560,12 +541,36 @@ fn dom_rect_slot<'s>(
         .unwrap_or(0.0)
 }
 
-fn dom_rect_receiver_branded<'s>(
+pub(crate) fn dom_rect_clone_data<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, DOM_RECT_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
+    object: v8::Local<'s, v8::Object>,
+) -> Option<(bool, [f64; 4])> {
+    if !web_api_interfaces::DOMRectReadOnly::is_instance(scope, object) {
+        return None;
+    }
+    let object = moli_webapi_declare::web_api_object_target(scope, object)?;
+    let mutable = web_api_interfaces::DOMRect::is_instance(scope, object);
+    Some((
+        mutable,
+        [
+            dom_rect_slot(object, scope, DOM_RECT_X_SLOT),
+            dom_rect_slot(object, scope, DOM_RECT_Y_SLOT),
+            dom_rect_slot(object, scope, DOM_RECT_WIDTH_SLOT),
+            dom_rect_slot(object, scope, DOM_RECT_HEIGHT_SLOT),
+        ],
+    ))
+}
+
+pub(crate) fn build_dom_rect_clone_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    mutable: bool,
+    [x, y, width, height]: [f64; 4],
+) -> v8::Local<'s, v8::Object> {
+    if mutable {
+        build_dom_rect_object(scope, x, y, width, height)
+    } else {
+        build_dom_rect_readonly_object(scope, x, y, width, height)
+    }
 }
 
 const DOM_RECT_WRITABLE_ATTRIBUTE_SLOTS: &[&str] = &[

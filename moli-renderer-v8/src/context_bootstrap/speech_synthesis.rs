@@ -1,29 +1,23 @@
-use super::{
-    SIMPLE_EVENT_TARGET_ORDERED_HANDLERS_SLOT, SIMPLE_EVENT_TARGET_SLOT,
-    simple_object_event_set_ordered_handler,
-};
+use super::{SIMPLE_EVENT_TARGET_LISTENERS_SLOT, simple_object_event_set_handler};
 use crate::util::{
     callback_data_index_value, callback_data_item, get_private_value, set_private_value,
     throw_type_error,
 };
+use crate::web_api_interfaces;
 use anyhow::Result;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject, v8};
 
-const SPEECH_SYNTHESIS_BRAND_SLOT: &str = "__lmSpeechSynthesisBrand";
 const SPEECH_SYNTHESIS_PENDING_SLOT: &str = "__lmSpeechSynthesisPending";
 const SPEECH_SYNTHESIS_SPEAKING_SLOT: &str = "__lmSpeechSynthesisSpeaking";
 const SPEECH_SYNTHESIS_PAUSED_SLOT: &str = "__lmSpeechSynthesisPaused";
-const SPEECH_SYNTHESIS_LISTENERS_SLOT: &str = "__lmSpeechSynthesisListeners";
 const SPEECH_SYNTHESIS_ONVOICESCHANGED_SLOT: &str = "__lmSpeechSynthesisOnvoiceschanged";
 
-const SPEECH_UTTERANCE_BRAND_SLOT: &str = "__lmSpeechSynthesisUtteranceBrand";
 const SPEECH_UTTERANCE_TEXT_SLOT: &str = "__lmSpeechSynthesisUtteranceText";
 const SPEECH_UTTERANCE_LANG_SLOT: &str = "__lmSpeechSynthesisUtteranceLang";
 const SPEECH_UTTERANCE_VOICE_SLOT: &str = "__lmSpeechSynthesisUtteranceVoice";
 const SPEECH_UTTERANCE_VOLUME_SLOT: &str = "__lmSpeechSynthesisUtteranceVolume";
 const SPEECH_UTTERANCE_RATE_SLOT: &str = "__lmSpeechSynthesisUtteranceRate";
 const SPEECH_UTTERANCE_PITCH_SLOT: &str = "__lmSpeechSynthesisUtterancePitch";
-const SPEECH_UTTERANCE_LISTENERS_SLOT: &str = "__lmSpeechSynthesisUtteranceListeners";
 const SPEECH_UTTERANCE_ONSTART_SLOT: &str = "__lmSpeechSynthesisUtteranceOnstart";
 const SPEECH_UTTERANCE_ONEND_SLOT: &str = "__lmSpeechSynthesisUtteranceOnend";
 const SPEECH_UTTERANCE_ONERROR_SLOT: &str = "__lmSpeechSynthesisUtteranceOnerror";
@@ -32,7 +26,6 @@ const SPEECH_UTTERANCE_ONRESUME_SLOT: &str = "__lmSpeechSynthesisUtteranceOnresu
 const SPEECH_UTTERANCE_ONMARK_SLOT: &str = "__lmSpeechSynthesisUtteranceOnmark";
 const SPEECH_UTTERANCE_ONBOUNDARY_SLOT: &str = "__lmSpeechSynthesisUtteranceOnboundary";
 
-const SPEECH_VOICE_BRAND_SLOT: &str = "__lmSpeechSynthesisVoiceBrand";
 const SPEECH_VOICE_URI_SLOT: &str = "__lmSpeechSynthesisVoiceUri";
 const SPEECH_VOICE_NAME_SLOT: &str = "__lmSpeechSynthesisVoiceName";
 const SPEECH_VOICE_LANG_SLOT: &str = "__lmSpeechSynthesisVoiceLang";
@@ -40,11 +33,8 @@ const SPEECH_VOICE_LOCAL_SERVICE_SLOT: &str = "__lmSpeechSynthesisVoiceLocalServ
 const SPEECH_VOICE_DEFAULT_SLOT: &str = "__lmSpeechSynthesisVoiceDefault";
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "SpeechSynthesis")]
+#[webapi(interface = web_api_interfaces::SpeechSynthesis)]
 struct SpeechSynthesisObjectDeclaration {
-    #[webapi(slot = SPEECH_SYNTHESIS_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = SPEECH_SYNTHESIS_PENDING_SLOT, init = false)]
     pending: (),
 
@@ -57,15 +47,12 @@ struct SpeechSynthesisObjectDeclaration {
     #[webapi(slot = SPEECH_SYNTHESIS_ONVOICESCHANGED_SLOT, init = "null")]
     onvoiceschanged: (),
 
-    #[webapi(slot = SIMPLE_EVENT_TARGET_SLOT, value = SPEECH_SYNTHESIS_LISTENERS_SLOT)]
-    event_target_slot: (),
-
-    #[webapi(slot = SIMPLE_EVENT_TARGET_ORDERED_HANDLERS_SLOT, init = true)]
-    ordered_handlers: (),
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "SpeechSynthesis", enumerable)]
+#[webapi(interface = web_api_interfaces::SpeechSynthesis, enumerable)]
 struct SpeechSynthesisPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -112,11 +99,8 @@ struct SpeechSynthesisPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "SpeechSynthesisUtterance")]
+#[webapi(interface = web_api_interfaces::SpeechSynthesisUtterance)]
 struct SpeechSynthesisUtteranceObjectDeclaration<'scope> {
-    #[webapi(slot = SPEECH_UTTERANCE_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = SPEECH_UTTERANCE_TEXT_SLOT)]
     text: v8::Local<'scope, v8::String>,
 
@@ -156,15 +140,12 @@ struct SpeechSynthesisUtteranceObjectDeclaration<'scope> {
     #[webapi(slot = SPEECH_UTTERANCE_ONBOUNDARY_SLOT, init = "null")]
     onboundary: (),
 
-    #[webapi(slot = SIMPLE_EVENT_TARGET_SLOT, value = SPEECH_UTTERANCE_LISTENERS_SLOT)]
-    event_target_slot: (),
-
-    #[webapi(slot = SIMPLE_EVENT_TARGET_ORDERED_HANDLERS_SLOT, init = true)]
-    ordered_handlers: (),
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "SpeechSynthesisUtterance", enumerable)]
+#[webapi(interface = web_api_interfaces::SpeechSynthesisUtterance, enumerable)]
 struct SpeechSynthesisUtterancePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -241,7 +222,7 @@ struct SpeechSynthesisUtterancePrototypeDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "SpeechSynthesisVoice", enumerable)]
+#[webapi(interface = web_api_interfaces::SpeechSynthesisVoice, enumerable)]
 struct SpeechSynthesisVoicePrototypeDeclaration {
     #[webapi(accessor_property = "voiceURI", getter = speech_voice_getter, data = callback_data_index_value(scope, 0))]
     voice_uri: (),
@@ -392,7 +373,6 @@ pub(in crate::context_bootstrap) fn speech_synthesis_utterance_constructor_callb
     let lang = v8::String::empty(scope);
     let utterance = args.this();
     let declaration = SpeechSynthesisUtteranceObjectDeclaration {
-        brand: (),
         text,
         lang,
         voice: (),
@@ -406,8 +386,7 @@ pub(in crate::context_bootstrap) fn speech_synthesis_utterance_constructor_callb
         onresume: (),
         onmark: (),
         onboundary: (),
-        event_target_slot: (),
-        ordered_handlers: (),
+        event_listeners: (),
     };
     if declaration.initialize(scope, utterance).is_err() {
         rv.set_undefined();
@@ -421,7 +400,7 @@ fn speech_synthesis_state_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
     let Some(slot) = callback_data_item(
@@ -443,7 +422,7 @@ fn speech_synthesis_speak_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
     if args.length() == 0 {
@@ -456,7 +435,9 @@ fn speech_synthesis_speak_callback<'s>(
     let utterance = args.get(0);
     let branded = v8::Local::<v8::Object>::try_from(utterance)
         .ok()
-        .is_some_and(|object| has_brand(scope, object, SPEECH_UTTERANCE_BRAND_SLOT));
+        .is_some_and(|object| {
+            web_api_interfaces::SpeechSynthesisUtterance::is_instance(scope, object)
+        });
     if !branded {
         throw_type_error(
             scope,
@@ -477,7 +458,7 @@ fn speech_synthesis_cancel_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
     rv.set_undefined();
@@ -488,7 +469,7 @@ fn speech_synthesis_pause_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
     rv.set_undefined();
@@ -499,7 +480,7 @@ fn speech_synthesis_resume_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
     rv.set_undefined();
@@ -510,7 +491,7 @@ fn speech_synthesis_get_voices_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
     rv.set(v8::Array::new(scope, 0).into());
@@ -521,7 +502,7 @@ fn speech_synthesis_onvoiceschanged_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
     rv.set(
@@ -535,16 +516,15 @@ fn speech_synthesis_onvoiceschanged_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_SYNTHESIS_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesis") {
         return;
     }
-    set_event_handler(
+    simple_object_event_set_handler(
         scope,
         args.this(),
-        args.get(0),
-        SPEECH_SYNTHESIS_LISTENERS_SLOT,
         "voiceschanged",
         SPEECH_SYNTHESIS_ONVOICESCHANGED_SLOT,
+        args.get(0),
     );
 }
 
@@ -553,7 +533,7 @@ fn speech_utterance_string_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     let Some(slot) = callback_data_item(
@@ -576,7 +556,7 @@ fn speech_utterance_string_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     let Some(slot) = callback_data_item(
@@ -598,7 +578,7 @@ fn speech_utterance_voice_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     rv.set(
@@ -612,7 +592,7 @@ fn speech_utterance_voice_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     let value = args.get(0);
@@ -627,7 +607,7 @@ fn speech_utterance_voice_setter<'s>(
     }
     let valid = v8::Local::<v8::Object>::try_from(value)
         .ok()
-        .is_some_and(|object| has_brand(scope, object, SPEECH_VOICE_BRAND_SLOT));
+        .is_some_and(|object| web_api_interfaces::SpeechSynthesisVoice::is_instance(scope, object));
     if !valid {
         throw_type_error(
             scope,
@@ -643,7 +623,7 @@ fn speech_utterance_float_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     let Some(attribute) = callback_data_item(
@@ -666,7 +646,7 @@ fn speech_utterance_float_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     let Some(attribute) = callback_data_item(
@@ -701,7 +681,7 @@ fn speech_utterance_event_handler_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     let Some(handler) = callback_data_item(
@@ -724,7 +704,7 @@ fn speech_utterance_event_handler_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_UTTERANCE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisUtterance") {
         return;
     }
     let Some(handler) = callback_data_item(
@@ -735,13 +715,12 @@ fn speech_utterance_event_handler_setter<'s>(
     ) else {
         return;
     };
-    set_event_handler(
+    simple_object_event_set_handler(
         scope,
         args.this(),
-        args.get(0),
-        SPEECH_UTTERANCE_LISTENERS_SLOT,
         handler.event_type,
         handler.slot,
+        args.get(0),
     );
 }
 
@@ -750,7 +729,7 @@ fn speech_voice_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !require_brand(scope, args.this(), SPEECH_VOICE_BRAND_SLOT) {
+    if !require_brand(scope, args.this(), "SpeechSynthesisVoice") {
         return;
     }
     let Some(slot) = callback_data_item(
@@ -767,49 +746,16 @@ fn speech_voice_getter<'s>(
     );
 }
 
-fn set_event_handler<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    target: v8::Local<'s, v8::Object>,
-    value: v8::Local<'s, v8::Value>,
-    listeners_slot: &'static str,
-    event_type: &'static str,
-    handler_slot: &'static str,
-) {
-    let active = v8::Local::<v8::Object>::try_from(value)
-        .ok()
-        .is_some_and(|callback| callback.is_callable());
-    let stored = if active {
-        value
-    } else {
-        v8::null(scope).into()
-    };
-    set_private_value(scope, target, handler_slot, stored);
-    simple_object_event_set_ordered_handler(
-        scope,
-        target,
-        listeners_slot,
-        event_type,
-        handler_slot,
-        active,
-    );
-}
-
 fn require_brand<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
     slot: &'static str,
 ) -> bool {
-    if has_brand(scope, receiver, slot) {
+    if web_api_interfaces::descriptor(slot)
+        .is_some_and(|interface| interface.is_instance(scope, receiver))
+    {
         return true;
     }
     throw_type_error(scope, "Illegal invocation");
     false
-}
-
-fn has_brand<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-    slot: &'static str,
-) -> bool {
-    get_private_value(scope, receiver, slot).is_some_and(|value| value.is_true())
 }

@@ -15,7 +15,7 @@ use crate::{
     },
     document_runtime::DomHandle,
     native_bridge::{
-        JsContextHost,
+        PageScriptHost,
         document::detached_native_handle_for_runtime,
         node::{node_is_document, node_runtime_and_handle_from_object},
     },
@@ -48,7 +48,7 @@ const ADOPTED_STYLE_SHEETS_ARRAY_OWNER_DOCUMENT: i32 = 1;
 const ADOPTED_STYLE_SHEETS_ARRAY_OWNER_SHADOW_ROOT: i32 = 2;
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct AdoptedStyleSheetsArrayMutationMethodsDeclaration {
     #[webapi(
         method,
@@ -164,6 +164,7 @@ fn set_document_adopted_style_sheets_for_receiver<'s>(
     let holder = receiver;
     let Some(next_array) = normalize_adopted_style_sheets_assignment(
         scope,
+        receiver,
         value,
         AdoptedStyleSheetsArrayOwner::Document {
             validation_document: handle,
@@ -189,26 +190,44 @@ fn set_document_adopted_style_sheets_for_receiver<'s>(
 
 pub(in crate::native_bridge) fn normalize_adopted_style_sheets_assignment<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
     owner: AdoptedStyleSheetsArrayOwner,
     target_document: Option<DomHandle>,
 ) -> Option<v8::Local<'s, v8::Array>> {
-    let array = if value.is_null_or_undefined() {
-        v8::Array::new(scope, 0)
-    } else {
-        let Ok(array) = v8::Local::<v8::Array>::try_from(value) else {
-            webidl::throw_type_error(
-                scope,
-                "DocumentOrShadowRoot.adoptedStyleSheets must be an array.",
-            );
+    let options = webidl::InterfaceOptions {
+        name: crate::web_api_interfaces::CSSStyleSheet::NAME,
+        brand_check: crate::web_api_interfaces::CSSStyleSheet::is_instance,
+    };
+    let sheets = match webidl::convert_with_options::<webidl::Sequence<webidl::InterfaceObject>>(
+        scope,
+        value,
+        webidl::Context::member("DocumentOrShadowRoot", "adoptedStyleSheets"),
+        &options,
+    ) {
+        Ok(sheets) => sheets,
+        Err(error) => {
+            webidl::throw_error(scope, &error);
             return None;
-        };
-        array
+        }
+    };
+    let values = sheets
+        .0
+        .into_iter()
+        .map(|sheet| sheet.0.into())
+        .collect::<Vec<_>>();
+    let context = receiver.get_creation_context(scope)?;
+    let array = {
+        let scope = &mut v8::ContextScope::new(scope, context);
+        v8::Array::new_with_elements(scope, &values)
     };
     if !validate_adopted_style_sheet_array(scope, array, target_document) {
         return None;
     }
-    install_adopted_style_sheets_array_mutation_methods(scope, array, owner);
+    {
+        let scope = &mut v8::ContextScope::new(scope, context);
+        install_adopted_style_sheets_array_mutation_methods(scope, array, owner);
+    }
     Some(array)
 }
 
@@ -435,7 +454,7 @@ fn adopted_style_sheets_array_owner<'s>(
 }
 
 fn adopted_style_sheets_owner_document(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     owner: AdoptedStyleSheetsArrayOwner,
 ) -> Option<DomHandle> {
     match owner {
@@ -563,7 +582,7 @@ fn get_document_style_sheets_for_receiver<'s>(
 fn document_runtime_and_handle_from_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     if let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, receiver)
         && node_is_document(unsafe { &*runtime_ptr }, handle)
     {
@@ -599,7 +618,7 @@ pub(in crate::native_bridge) fn document_fonts_getter_function<'s>(
 fn document_fonts_for_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     holder: v8::Local<'s, v8::Object>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
@@ -614,26 +633,10 @@ fn document_fonts_for_receiver<'s>(
         rv.set(existing);
         return;
     }
-    let global = scope.get_current_context().global(scope);
-    let Some(ctor_value) = global.get(scope, v8str(scope, "FontFaceSet").into()) else {
+    let Some(fonts) = create_document_font_face_set(scope, holder) else {
         rv.set_undefined();
         return;
     };
-    let Ok(ctor) = v8::Local::<v8::Function>::try_from(ctor_value) else {
-        rv.set_undefined();
-        return;
-    };
-    let Some(fonts) = ctor.new_instance(scope, &[]) else {
-        rv.set_undefined();
-        return;
-    };
-    set_private_value(
-        scope,
-        fonts,
-        FONT_FACE_SET_OWNER_DOCUMENT_SLOT,
-        holder.into(),
-    );
-    let _ = holder.set(scope, slot.into(), fonts.into());
     if !is_detached {
         let _ = sync_document_fonts(scope, holder, runtime, handle);
     }
@@ -653,25 +656,28 @@ pub(in crate::native_bridge::document) fn detached_document_fonts_getter<'s>(
         rv.set(existing);
         return;
     }
-    let global = scope.get_current_context().global(scope);
-    let Some(ctor_value) = global.get(scope, v8str(scope, "FontFaceSet").into()) else {
+    let Some(fonts) = create_document_font_face_set(scope, holder) else {
         rv.set_undefined();
         return;
     };
-    let Ok(ctor) = v8::Local::<v8::Function>::try_from(ctor_value) else {
-        rv.set_undefined();
-        return;
-    };
-    let Some(fonts) = ctor.new_instance(scope, &[]) else {
-        rv.set_undefined();
-        return;
-    };
+    rv.set(fonts.into());
+}
+
+fn create_document_font_face_set<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    holder: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    // FontFaceSource creates its set natively in the Document's realm; the
+    // public FontFaceSet interface object is not a callable constructor.
+    let context = holder.get_creation_context(scope)?;
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let fonts = crate::context_bootstrap::new_font_face_set(scope)?;
     set_private_value(
         scope,
         fonts,
         FONT_FACE_SET_OWNER_DOCUMENT_SLOT,
         holder.into(),
     );
-    let _ = holder.set(scope, slot.into(), fonts.into());
-    rv.set(fonts.into());
+    let _ = holder.set(scope, v8str(scope, FONTS_SLOT).into(), fonts.into());
+    Some(fonts)
 }

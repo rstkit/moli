@@ -1,6 +1,6 @@
 //! Public geometry request/answer types and the batch dispatcher.
 
-use std::{fmt::Debug, hash::Hash, ops::Range};
+use std::{collections::HashMap, fmt::Debug, hash::Hash, ops::Range};
 
 use crate::LayoutError;
 
@@ -10,7 +10,7 @@ use super::{
         LayoutBoxModel, LayoutFragmentId, LayoutOutputBoxId, LayoutPoint, LayoutQuad,
         LayoutResolvedGridTracks, LayoutSize, LayoutViewport,
     },
-    pass_result::{LayoutFlushReason, LayoutPassMetrics},
+    pass_result::LayoutPassMetrics,
     tree::FrozenLayoutTree,
 };
 
@@ -23,6 +23,8 @@ pub struct LayoutNodeOutput {
     /// a `display: contents` source. They do not manufacture CSSOM rects for
     /// the box-suppressed element itself.
     pub scroll_proxy_boxes: Vec<LayoutOutputBoxId>,
+    /// Indices of non-CSS object geometry in the same frozen tree.
+    pub object_geometry: Vec<usize>,
 }
 
 /// Document-level dimensions returned from the unified output.
@@ -33,7 +35,7 @@ pub struct LayoutDocumentMetrics {
     pub content_size: LayoutSize,
 }
 
-/// CSSOM View and observer metrics for one source element.
+/// CSSOM View metrics for one source element.
 ///
 /// Transformed quads use viewport CSS pixels and therefore include CSS
 /// `zoom`. Offset, size, and scroll fields are untransformed and have the
@@ -63,6 +65,25 @@ pub struct LayoutElementMetrics<N> {
     pub clips_overflow: bool,
     pub visible: bool,
     pub pointer_events: bool,
+}
+
+/// One ResizeObserver box size in logical CSS pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayoutResizeObserverSize {
+    pub inline_size: f32,
+    pub block_size: f32,
+}
+
+/// CSS-box ResizeObserver sizes projected wholly from one frozen principal box.
+/// The physical content size is used for contentRect width/height. The logical
+/// content and border pairs use the writing axes and effective zoom captured
+/// with the geometry, independently of authored box-sizing. This owned answer
+/// does not add state to the frozen tree or provide SVG bounding-box semantics.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LayoutResizeObserverMetrics {
+    pub content_size: LayoutSize,
+    pub content_box_size: LayoutResizeObserverSize,
+    pub border_box_size: LayoutResizeObserverSize,
 }
 
 /// One scroll container on a target's layout ancestor chain.
@@ -111,6 +132,10 @@ pub enum LayoutQuery<N> {
         utf16_range: Range<usize>,
     },
     ElementMetrics {
+        source: N,
+    },
+    /// Physical content dimensions and logical CSS content/border sizes for RO.
+    ResizeObserverMetrics {
         source: N,
     },
     /// Used Grid row and column tracks for a principal Grid container.
@@ -166,6 +191,7 @@ pub enum LayoutQueryAnswer<N> {
     ContentQuads(Vec<LayoutQuad>),
     TextRangeRects(Vec<LayoutQuad>),
     ElementMetrics(Option<LayoutElementMetrics<N>>),
+    ResizeObserverMetrics(Option<LayoutResizeObserverMetrics>),
     UsedGridTracks(Option<LayoutResolvedGridTracks>),
     ScrollIntoViewGeometry(Option<LayoutScrollIntoViewGeometry<N>>),
     IntersectionGeometry(Option<LayoutIntersectionGeometry>),
@@ -188,13 +214,10 @@ pub trait GeometryProvider {
 
     /// Answers a batch from the provider's latest layout state.
     ///
-    /// The provider decides whether this requires a fresh pass or can reuse an
-    /// already-owned tree; callers must not assume that one call equals one
-    /// layout computation.
+    /// Reading never computes layout. Real-layout providers require a tree
+    /// published by a screenshot or screencast frame.
     fn answer(
         &mut self,
-        reason: LayoutFlushReason,
-        viewport: LayoutViewport,
         queries: &LayoutQueryBatch<Self::NodeId>,
     ) -> Result<LayoutAnswers<Self::NodeId>, LayoutError>;
 }
@@ -208,66 +231,154 @@ where
         batch: &LayoutQueryBatch<N>,
         metrics: LayoutPassMetrics,
     ) -> LayoutAnswers<N> {
+        self.answer_queries_with(batch, metrics, |_| None)
+    }
+
+    /// Answers a batch while letting the renderer specialize queries such as
+    /// shadow-tree offsetParent visibility before their default is computed.
+    /// Source lookup belongs to this operation, never to the retained tree.
+    pub fn answer_queries_with(
+        &self,
+        batch: &LayoutQueryBatch<N>,
+        metrics: LayoutPassMetrics,
+        mut specialize: impl FnMut(&LayoutQuery<N>) -> Option<LayoutQueryAnswer<N>>,
+    ) -> LayoutAnswers<N> {
+        let mut outputs = HashMap::new();
+        // Tiny batches keep the allocation-free direct source lookup. Count
+        // eligible queries, including repeats of a source used by many ranges.
+        if batch
+            .queries
+            .iter()
+            .filter_map(LayoutQuery::fragment_source)
+            .take(4)
+            .count()
+            == 4
+        {
+            outputs.extend(
+                batch
+                    .queries
+                    .iter()
+                    .filter_map(LayoutQuery::fragment_source)
+                    .map(|source| (source, None)),
+            );
+            self.source_outputs(&mut outputs);
+        }
         let answers = batch
             .queries
             .iter()
-            .map(|query| match query {
-                LayoutQuery::DocumentMetrics => {
-                    LayoutQueryAnswer::DocumentMetrics(LayoutDocumentMetrics {
-                        viewport: self.viewport,
-                        viewport_scroll: self.viewport_scroll,
-                        content_size: self.content_size,
-                    })
+            .map(|query| {
+                if let Some(answer) = specialize(query) {
+                    return answer;
                 }
-                LayoutQuery::BoxModel { source } => {
-                    LayoutQueryAnswer::BoxModel(self.box_model_for_source(*source))
+                if let Some(output) = query
+                    .fragment_source()
+                    .and_then(|source| outputs.get(&source))
+                {
+                    return self.answer_fragment_query(query, output.as_ref());
                 }
-                LayoutQuery::ClientRects { source } => {
-                    LayoutQueryAnswer::ClientRects(self.client_rects_for_source(*source))
-                }
-                LayoutQuery::ContentQuads { source } => {
-                    LayoutQueryAnswer::ContentQuads(self.content_quads_for_source(*source))
-                }
-                LayoutQuery::TextRangeRects {
-                    source,
-                    utf16_range,
-                } => LayoutQueryAnswer::TextRangeRects(
-                    self.text_range_rects(*source, utf16_range.clone()),
-                ),
-                LayoutQuery::ElementMetrics { source } => {
-                    LayoutQueryAnswer::ElementMetrics(self.element_metrics_for_source(*source))
-                }
-                LayoutQuery::UsedGridTracks { source } => {
-                    LayoutQueryAnswer::UsedGridTracks(self.used_grid_tracks_for_source(*source))
-                }
-                LayoutQuery::ScrollIntoViewGeometry { source } => {
-                    LayoutQueryAnswer::ScrollIntoViewGeometry(
-                        self.scroll_into_view_geometry_for_source(*source),
-                    )
-                }
-                LayoutQuery::IntersectionGeometry { target, root } => {
-                    LayoutQueryAnswer::IntersectionGeometry(
-                        self.intersection_geometry(*target, *root),
-                    )
-                }
-                LayoutQuery::HitTest {
-                    point,
-                    ignore_pointer_events_none,
-                } => LayoutQueryAnswer::HitTest(self.hit_test(*point, *ignore_pointer_events_none)),
-                LayoutQuery::HitTestAll {
-                    point,
-                    ignore_pointer_events_none,
-                } => LayoutQueryAnswer::HitTestAll(
-                    self.hit_test_all(*point, *ignore_pointer_events_none),
-                ),
-                LayoutQuery::CaretPosition { point } => {
-                    LayoutQueryAnswer::CaretPosition(self.caret_position(*point))
-                }
-                LayoutQuery::EventOffset { source, point } => {
-                    LayoutQueryAnswer::EventOffset(self.event_offset_for_source(*source, *point))
-                }
+                self.answer_query(query)
             })
             .collect();
         LayoutAnswers { answers, metrics }
+    }
+
+    fn answer_fragment_query(
+        &self,
+        query: &LayoutQuery<N>,
+        output: Option<&LayoutNodeOutput>,
+    ) -> LayoutQueryAnswer<N> {
+        match query {
+            LayoutQuery::BoxModel { .. } => LayoutQueryAnswer::BoxModel(
+                output.and_then(|output| self.box_model_for_output(output)),
+            ),
+            LayoutQuery::ClientRects { .. } => LayoutQueryAnswer::ClientRects(
+                output.map_or_else(Vec::new, |output| self.client_rects_for_output(output)),
+            ),
+            LayoutQuery::ContentQuads { .. } => LayoutQueryAnswer::ContentQuads(
+                output.map_or_else(Vec::new, |output| self.content_quads_for_output(output)),
+            ),
+            LayoutQuery::TextRangeRects { utf16_range, .. } => {
+                LayoutQueryAnswer::TextRangeRects(output.map_or_else(Vec::new, |output| {
+                    self.text_range_rects_for_output(output, utf16_range.clone())
+                }))
+            }
+            _ => unreachable!("fragment-source query"),
+        }
+    }
+
+    /// Answers one query without allocating a batch. Consumers can specialize
+    /// selected queries without first computing and discarding their defaults.
+    pub fn answer_query(&self, query: &LayoutQuery<N>) -> LayoutQueryAnswer<N> {
+        match query {
+            LayoutQuery::DocumentMetrics => {
+                LayoutQueryAnswer::DocumentMetrics(LayoutDocumentMetrics {
+                    viewport: self.viewport,
+                    viewport_scroll: self.viewport_scroll,
+                    content_size: self.content_size,
+                })
+            }
+            LayoutQuery::BoxModel { source } => {
+                LayoutQueryAnswer::BoxModel(self.box_model_for_source(*source))
+            }
+            LayoutQuery::ClientRects { source } => {
+                LayoutQueryAnswer::ClientRects(self.client_rects_for_source(*source))
+            }
+            LayoutQuery::ContentQuads { source } => {
+                LayoutQueryAnswer::ContentQuads(self.content_quads_for_source(*source))
+            }
+            LayoutQuery::TextRangeRects {
+                source,
+                utf16_range,
+            } => LayoutQueryAnswer::TextRangeRects(
+                self.text_range_rects(*source, utf16_range.clone()),
+            ),
+            LayoutQuery::ElementMetrics { source } => {
+                LayoutQueryAnswer::ElementMetrics(self.element_metrics_for_source(*source))
+            }
+            LayoutQuery::ResizeObserverMetrics { source } => {
+                LayoutQueryAnswer::ResizeObserverMetrics(
+                    self.resize_observer_metrics_for_source(*source),
+                )
+            }
+            LayoutQuery::UsedGridTracks { source } => {
+                LayoutQueryAnswer::UsedGridTracks(self.used_grid_tracks_for_source(*source))
+            }
+            LayoutQuery::ScrollIntoViewGeometry { source } => {
+                LayoutQueryAnswer::ScrollIntoViewGeometry(
+                    self.scroll_into_view_geometry_for_source(*source),
+                )
+            }
+            LayoutQuery::IntersectionGeometry { target, root } => {
+                LayoutQueryAnswer::IntersectionGeometry(self.intersection_geometry(*target, *root))
+            }
+            LayoutQuery::HitTest {
+                point,
+                ignore_pointer_events_none,
+            } => LayoutQueryAnswer::HitTest(self.hit_test(*point, *ignore_pointer_events_none)),
+            LayoutQuery::HitTestAll {
+                point,
+                ignore_pointer_events_none,
+            } => LayoutQueryAnswer::HitTestAll(
+                self.hit_test_all(*point, *ignore_pointer_events_none),
+            ),
+            LayoutQuery::CaretPosition { point } => {
+                LayoutQueryAnswer::CaretPosition(self.caret_position(*point))
+            }
+            LayoutQuery::EventOffset { source, point } => {
+                LayoutQueryAnswer::EventOffset(self.event_offset_for_source(*source, *point))
+            }
+        }
+    }
+}
+
+impl<N: Copy> LayoutQuery<N> {
+    fn fragment_source(&self) -> Option<N> {
+        match self {
+            Self::BoxModel { source }
+            | Self::ClientRects { source }
+            | Self::ContentQuads { source }
+            | Self::TextRangeRects { source, .. } => Some(*source),
+            _ => None,
+        }
     }
 }

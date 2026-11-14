@@ -22,6 +22,12 @@ use tracing::trace;
 const MAX_V8_BACKGROUND_WORKER_THREADS: usize = 8;
 
 mod cpu_tracing;
+mod environment;
+
+pub use environment::{
+    ProcessEnvironmentError, ProcessEnvironmentInvalidation, ProcessEnvironmentNotifications,
+    ProcessEnvironmentNotifier, ProcessEnvironmentOwner,
+};
 
 pub use cpu_tracing::{
     PendingV8CpuTraceStart, PendingV8CpuTraceStop, V8CpuProfileSegment, V8CpuTraceConfiguration,
@@ -134,6 +140,7 @@ struct IsolateRuntimeRegistration {
     handle: tokio::runtime::Handle,
     wake: V8ForegroundTaskWake,
     generation: IsolateRegistrationGeneration,
+    environment_notifications: ProcessEnvironmentNotifier,
 }
 
 #[derive(Clone)]
@@ -230,6 +237,22 @@ fn registered_isolate_owners() -> Vec<RegisteredIsolateOwner> {
         .collect()
 }
 
+/// Publish only to live mailboxes and retain only the notifiers needing a wake.
+/// The caller must release its configuration lock before waking or dropping
+/// these callbacks. Foreground routes and runtime handles are not needed here.
+fn publish_environment_invalidation(
+    invalidation: ProcessEnvironmentInvalidation,
+) -> Vec<ProcessEnvironmentNotifier> {
+    registry_map()
+        .values()
+        .filter(|registration| {
+            registration.generation.is_active()
+                && registration.environment_notifications.publish(invalidation)
+        })
+        .map(|registration| registration.environment_notifications.clone())
+        .collect()
+}
+
 fn registered_isolate_owner(
     isolate_addr: usize,
     registration_id: u64,
@@ -252,6 +275,7 @@ fn dispatch_isolate_owner_callback(
                 handle,
                 wake,
                 generation,
+                ..
             },
     } = owner;
     handle.spawn(async move {
@@ -274,6 +298,7 @@ fn dispatch_isolate_owner_callback(
 fn register_isolate_with_wake(
     isolate_ptr: v8::UnsafeRawIsolatePtr,
     wake: V8ForegroundTaskWake,
+    environment_notifications: ProcessEnvironmentNotifier,
 ) -> IsolateRegistrationGeneration {
     let isolate_key = unsafe_raw_isolate_addr(isolate_ptr);
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -281,19 +306,25 @@ fn register_isolate_with_wake(
     };
     let generation = IsolateRegistrationGeneration::new();
     let mut guard = registry_map();
-    if let Some(previous) = guard.insert(
+    let previous = guard.insert(
         isolate_key,
         IsolateRuntimeRegistration {
             handle,
             wake,
             generation: generation.clone(),
+            environment_notifications,
         },
-    ) {
+    );
+    if let Some(previous) = &previous {
         // A raw isolate address may be reused after disposal. Invalidate queued
         // work from the previous generation before publishing the replacement.
         previous.generation.cancel();
+        previous.environment_notifications.close();
     }
     drop(guard);
+    // Captured owner state may reenter the registry or environment controller
+    // from its destructor, just as it can from an explicitly invoked callback.
+    drop(previous);
     trace!(isolate = isolate_key, "registered isolate with V8 platform");
     cpu_tracing::isolate_registered(isolate_key, generation.clone());
     generation
@@ -311,12 +342,23 @@ pub struct V8PlatformIsolateRegistration {
 }
 
 impl V8PlatformIsolateRegistration {
-    pub fn register(isolate: &mut v8::OwnedIsolate, wake: V8ForegroundTaskWake) -> Self {
+    /// Register an isolate and its owner task routes. The environment mailbox
+    /// belongs to this exact isolate; its wake must schedule owner work even
+    /// while paused, never synchronously enter V8. Unregister closes the mailbox.
+    pub fn register(
+        isolate: &mut v8::OwnedIsolate,
+        wake: V8ForegroundTaskWake,
+        environment_notifications: ProcessEnvironmentNotifier,
+    ) -> Self {
         // SAFETY: `OwnedIsolate::as_raw_isolate_ptr` returns the V8 isolate
         // pointer used by platform foreground-task callbacks. Ownership remains
         // with `OwnedIsolate`; this registration stores only the address value.
         let isolate_ptr = unsafe { isolate.as_raw_isolate_ptr() };
-        let generation = register_isolate_with_wake(isolate_ptr, wake);
+        let generation = register_isolate_with_wake(isolate_ptr, wake, environment_notifications);
+        // Bootstrap may have primed caches before registration. Register first,
+        // then reset once: changes before registration are read from ICU, and
+        // changes racing this reset already have an owner notification queued.
+        ProcessEnvironmentInvalidation::LocaleAndDateTime.notify_isolate(isolate);
         Self {
             isolate_ptr: AtomicCell::new(isolate_ptr),
             generation,
@@ -339,11 +381,18 @@ impl V8PlatformIsolateRegistration {
         if !isolate_ptr.is_null() {
             let isolate_key = unsafe_raw_isolate_addr(isolate_ptr);
             let mut registry = registry_map();
-            if registry.get(&isolate_key).is_some_and(|registration| {
+            let retired = if registry.get(&isolate_key).is_some_and(|registration| {
                 registration.generation.is_same_generation(&self.generation)
             }) {
-                registry.remove(&isolate_key);
+                registry.remove(&isolate_key)
+            } else {
+                None
+            };
+            if let Some(registration) = &retired {
+                registration.environment_notifications.close();
             }
+            drop(registry);
+            drop(retired);
             trace!(
                 isolate = isolate_key,
                 "unregistered isolate from V8 platform"
@@ -373,6 +422,7 @@ impl v8::PlatformImpl for MoliPlatformImpl {
                 handle,
                 wake,
                 generation,
+                ..
             } = registration;
             handle.spawn(async move {
                 if !generation.is_active() {
@@ -413,6 +463,7 @@ impl v8::PlatformImpl for MoliPlatformImpl {
                 handle,
                 wake,
                 generation,
+                ..
             } = registration;
             let delay = Duration::from_secs_f64(delay_in_seconds);
             handle.spawn(async move {
@@ -450,6 +501,7 @@ impl v8::PlatformImpl for MoliPlatformImpl {
                 handle,
                 wake,
                 generation,
+                ..
             } = registration;
             handle.spawn(async move {
                 if !generation.is_active() {
@@ -533,6 +585,85 @@ mod tests {
         let _ = register_isolate_with_wake(
             v8::UnsafeRawIsolatePtr::null(),
             V8ForegroundTaskWake::new(|| {}),
+            ProcessEnvironmentNotifications::default().notifier(|| {}),
+        );
+    }
+
+    #[test]
+    fn owner_callback_captures_are_released_outside_the_registry_lock() {
+        struct ObserveDrop {
+            name: &'static str,
+            tx: std::sync::mpsc::Sender<(&'static str, bool)>,
+        }
+
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                // Probe without blocking: a regression should fail an assertion,
+                // not deadlock the test while dropping an owner callback.
+                let unlocked = ISOLATE_RUNTIME_REGISTRY.try_lock().is_some();
+                let _ = self.tx.send((self.name, unlocked));
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut observations = Vec::new();
+        runtime.block_on(async {
+            for replace in [false, true] {
+                let mut marker = 0_u8;
+                let isolate_ptr = fake_isolate_ptr((&mut marker as *mut u8).cast());
+                let (tx, rx) = std::sync::mpsc::channel();
+                let foreground = ObserveDrop {
+                    name: "foreground",
+                    tx: tx.clone(),
+                };
+                let environment = ObserveDrop {
+                    name: "environment",
+                    tx,
+                };
+                let generation = register_isolate_with_wake(
+                    isolate_ptr,
+                    V8ForegroundTaskWake::queued(move |_| {
+                        std::hint::black_box(&foreground);
+                    }),
+                    ProcessEnvironmentNotifications::default().notifier(move || {
+                        std::hint::black_box(&environment);
+                    }),
+                );
+                let owner = V8PlatformIsolateRegistration {
+                    isolate_ptr: AtomicCell::new(isolate_ptr),
+                    generation,
+                };
+                if replace {
+                    let generation = register_isolate_with_wake(
+                        isolate_ptr,
+                        V8ForegroundTaskWake::queued(|_| {}),
+                        ProcessEnvironmentNotifications::default().notifier(|| {}),
+                    );
+                    let replacement = V8PlatformIsolateRegistration {
+                        isolate_ptr: AtomicCell::new(isolate_ptr),
+                        generation,
+                    };
+                    drop(owner);
+                    drop(replacement);
+                } else {
+                    drop(owner);
+                }
+                let dropped: Vec<_> = rx.try_iter().collect();
+                assert_eq!(dropped.len(), 2, "both captures must be released");
+                observations.extend(dropped.into_iter().map(|(name, unlocked)| {
+                    (
+                        if replace { "replace" } else { "unregister" },
+                        name,
+                        unlocked,
+                    )
+                }));
+            }
+        });
+        assert!(
+            observations.iter().all(|(_, _, unlocked)| *unlocked),
+            "owner callback destructors must be free to reenter the registry: {observations:?}"
         );
     }
 
@@ -547,8 +678,13 @@ mod tests {
         let isolate_ptr = fake_isolate_ptr(raw);
 
         runtime.block_on(async {
-            let generation =
-                register_isolate_with_wake(isolate_ptr, V8ForegroundTaskWake::new(|| {}));
+            let notifications = ProcessEnvironmentNotifications::default();
+            let notifier = notifications.notifier(|| panic!("retired owner must not be woken"));
+            let generation = register_isolate_with_wake(
+                isolate_ptr,
+                V8ForegroundTaskWake::new(|| {}),
+                notifier.clone(),
+            );
             let registration = lookup_registration(raw)
                 .expect("registered isolate should expose its runtime registration");
             let owner = V8PlatformIsolateRegistration {
@@ -556,7 +692,19 @@ mod tests {
                 generation,
             };
 
+            let delayed_wakes =
+                publish_environment_invalidation(ProcessEnvironmentInvalidation::DateTime);
+            assert_eq!(delayed_wakes.len(), 1);
             owner.unregister();
+            for notifier in delayed_wakes {
+                notifier.wake();
+            }
+            notifier.notify(ProcessEnvironmentInvalidation::LocaleAndDateTime);
+            assert_eq!(
+                notifications.take(),
+                None,
+                "unregister closes retained mailbox clones"
+            );
 
             assert!(
                 !registration.generation.is_active(),
@@ -577,15 +725,21 @@ mod tests {
         let isolate_ptr = fake_isolate_ptr(raw);
 
         runtime.block_on(async {
-            let first_generation =
-                register_isolate_with_wake(isolate_ptr, V8ForegroundTaskWake::new(|| {}));
+            let first_generation = register_isolate_with_wake(
+                isolate_ptr,
+                V8ForegroundTaskWake::new(|| {}),
+                ProcessEnvironmentNotifications::default().notifier(|| {}),
+            );
             let first = V8PlatformIsolateRegistration {
                 isolate_ptr: AtomicCell::new(isolate_ptr),
                 generation: first_generation.clone(),
             };
 
-            let second_generation =
-                register_isolate_with_wake(isolate_ptr, V8ForegroundTaskWake::new(|| {}));
+            let second_generation = register_isolate_with_wake(
+                isolate_ptr,
+                V8ForegroundTaskWake::new(|| {}),
+                ProcessEnvironmentNotifications::default().notifier(|| {}),
+            );
             let second = V8PlatformIsolateRegistration {
                 isolate_ptr: AtomicCell::new(isolate_ptr),
                 generation: second_generation.clone(),

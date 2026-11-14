@@ -3,11 +3,14 @@ from __future__ import annotations
 import base64
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Awaitable
 
 from . import SmokeState
 from ..assertions import SmokeError, assert_equal, wait_until
-from ..helpers import attach_cdp_event_collector, evaluate_xhr
+from ..config import is_moli_browser
+from ..fixture import TRANSPARENT_PNG
+from ..helpers import isolated_network_page, read_io_to_eof, attach_cdp_event_collector, evaluate_xhr
 
 
 BODY_TAKEN_CONTINUE_RESPONSE_ERROR = "Unable to continue request as is after body is taken"
@@ -144,11 +147,12 @@ async def run_page_network_group(state: SmokeState) -> None:
     await _verify_response_stage_fetch_body_stream(state)
     await _verify_response_stage_fetch_binary_body(state)
     await _verify_response_stage_fetch_binary_body_stream(state)
-    await _verify_fetch_auth_challenge(state)
-    await _verify_fetch_auth_cancel(state)
-    await _verify_fetch_auth_response_stage(state)
+    for scenario in [_verify_fetch_auth_challenge, _verify_fetch_auth_cancel, _verify_fetch_auth_response_stage]:
+        async with isolated_network_page(state) as isolated:
+            await scenario(isolated)
     await _verify_redirect_chain_network_events(state)
     await _verify_parser_script_network_events(state)
+    await _verify_intercepted_parser_script_networkidle(state)
     await _verify_parser_stylesheet_network_events(state)
     await _verify_parser_stylesheet_network_events_without_script_gate(state)
     await _verify_chromium_resource_type_network_matrix(state)
@@ -287,6 +291,57 @@ async def run_websocket_group(state: SmokeState) -> None:
             "eventMethods": request_methods,
         },
     )
+    await _verify_websocket_handshake_header_casing(state)
+
+
+async def _verify_websocket_handshake_header_casing(state: SmokeState) -> None:
+    page = state.page
+    await page.evaluate("document.cookie = 'smoke_ws_header_case=1; Path=/'")
+    try:
+        result = await page.evaluate(
+            """async () => await new Promise((resolve, reject) => {
+              const url = new URL('/ws-echo?handshakeHeaders=1', location.href);
+              url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+              const socket = new WebSocket(url.href, 'smoke');
+              let result;
+              const timer = setTimeout(() => {
+                socket.close();
+                reject(new Error('WebSocket header echo timed out'));
+              }, 5000);
+              socket.onopen = () => socket.send('headers');
+              socket.onmessage = event => {
+                result = { data: event.data, origin: location.origin, userAgent: navigator.userAgent };
+                socket.close(1000, 'done');
+              };
+              socket.onerror = () => {
+                clearTimeout(timer);
+                reject(new Error('WebSocket header echo failed'));
+              };
+              socket.onclose = event => {
+                clearTimeout(timer);
+                if (result) resolve(result);
+                else reject(new Error(`WebSocket header echo closed without a reply: ${event.code}`));
+              };
+            })"""
+        )
+        # The server echoes HTTP field names as received, before case-insensitive
+        # lookup. CDP header dictionaries cannot prove the spelling on the wire.
+        headers = json.loads(result["data"])
+        for name in ["Origin", "User-Agent", "Cookie", "Sec-WebSocket-Protocol"]:
+            assert_equal(
+                [field for field, _ in headers if field.lower() == name.lower()],
+                [name],
+                f"HTTP/1.1 WebSocket {name} spelling",
+            )
+        values = {name.lower(): value for name, value in headers}
+        assert_equal(values["origin"], result["origin"], "WebSocket Origin value")
+        assert_equal(values["user-agent"], result["userAgent"], "WebSocket User-Agent value")
+        assert_equal(values["sec-websocket-protocol"], "smoke", "WebSocket subprotocol value")
+        if "smoke_ws_header_case=1" not in values["cookie"].split("; "):
+            raise SmokeError(f"WebSocket cookie was lost: {headers!r}")
+        state.record("websocket_http1_browser_header_casing", {"headers": headers})
+    finally:
+        await page.evaluate("document.cookie = 'smoke_ws_header_case=; Max-Age=0; Path=/'")
 
 
 async def run_download_group(state: SmokeState) -> None:
@@ -301,6 +356,33 @@ async def run_download_group(state: SmokeState) -> None:
     download_path = await download.path()
     assert_equal(Path(download_path).read_text(encoding="utf-8"), "download contents", "download artifact contents")
     state.record("download_event_and_artifact")
+
+    # Ordinary attachment links first start a Document navigation. Use real
+    # pointer input so Playwright also waits for that navigation to terminate.
+    for selector, name in [
+        ("#attachment-download", "attachment_download_mouse_click"),
+        ("#redirect-download", "redirect_attachment_download_mouse_click"),
+    ]:
+        source_url = f"{fixture}/download-page"
+        await page.goto(source_url, wait_until="load", timeout=10_000)
+        await page.evaluate("globalThis.__attachmentDownloadSource = {}")
+        async with page.expect_download(timeout=10_000) as attachment_info:
+            await page.locator(selector).click(timeout=10_000)
+        attachment = await attachment_info.value
+        assert_equal(attachment.suggested_filename, "smoke-download.txt", f"{name} filename")
+        assert_equal(attachment.url, f"{fixture}/download", f"{name} final URL")
+        with TemporaryDirectory(prefix="moli-attachment-") as directory:
+            saved_path = Path(directory) / "saved.txt"
+            await attachment.save_as(saved_path)
+            assert_equal(saved_path.read_bytes(), b"download contents", f"{name} saved contents")
+        assert_equal(await attachment.failure(), None, f"{name} completed download")
+        assert_equal(page.url, source_url, f"{name} retained Document URL")
+        assert_equal(
+            await page.evaluate("typeof globalThis.__attachmentDownloadSource"),
+            "object",
+            f"{name} retained source realm",
+        )
+        state.record(name)
 
     await page.goto(f"{fixture}/download-page", wait_until="load", timeout=10_000)
     async with page.expect_download(timeout=10_000) as slow_download_info:
@@ -320,37 +402,42 @@ async def _verify_fetch_network_events(state: SmokeState) -> None:
     observed_fetch = await page.evaluate("async () => await fetch('/api-continue').then(response => response.json())")
     assert_equal(observed_fetch.get("routeHeader"), None, "unrouted fetch should reach fixture server")
 
-    def saw_fetch_events() -> bool:
-        events = subresource_events[fetch_network_start:]
-        request = _find_request(events, "Fetch", f"{fixture}/api-continue")
-        request_id = request and request["params"].get("requestId")
-        if not request_id:
-            return False
-        matching_indices = {
-            method: next(
-                (
-                    index
-                    for index, event in enumerate(events)
-                    if event["method"] == method and event["params"].get("requestId") == request_id
-                ),
-                None,
-            )
-            for method in ("Network.responseReceived", "Network.dataReceived", "Network.loadingFinished")
-        }
-        response_index = matching_indices["Network.responseReceived"]
-        data_index = matching_indices["Network.dataReceived"]
-        finished_index = matching_indices["Network.loadingFinished"]
-        if response_index is None or data_index is None or finished_index is None:
-            return False
-        data_params = events[data_index]["params"]
-        return bool(
-            response_index < data_index < finished_index
-            and data_params.get("dataLength", 0) > 0
-            and data_params.get("encodedDataLength", 0) > 0
-        )
+    await wait_until(
+        lambda: _completed_request_id(
+            subresource_events[fetch_network_start:], "Fetch", f"{fixture}/api-continue"
+        ) is not None,
+        "Fetch Network events",
+    )
+    events = subresource_events[fetch_network_start:]
+    request_id = _completed_request_id(events, "Fetch", f"{fixture}/api-continue")
+    if request_id is None:
+        raise SmokeError("completed Fetch request disappeared from the event trace")
+    state.record("fetch_network_events", {
+        "requestId": request_id,
+        **_fetch_network_event_summary(events, request_id),
+    })
 
-    await wait_until(saw_fetch_events, "Fetch Network events")
-    state.record("fetch_network_events")
+
+def _fetch_network_event_summary(events: list[dict[str, Any]], request_id: str) -> dict[str, Any]:
+    matching = [event for event in events if event["params"].get("requestId") == request_id]
+    methods = [event["method"] for event in matching]
+    assert_equal(methods[:2], ["Network.requestWillBeSent", "Network.responseReceived"], "Fetch Network start order")
+    assert_equal(methods[-1:], ["Network.loadingFinished"], "Fetch Network terminal")
+    data_events = matching[2:-1]
+    assert_equal({event["method"] for event in data_events}, {"Network.dataReceived"}, "Fetch Network data order")
+    totals = {"dataLength": 0, "encodedDataLength": 0}
+    for event in data_events:
+        for key in totals:
+            value = event["params"].get(key)
+            if type(value) is not int or value < 0:
+                raise SmokeError(f"invalid Fetch Network {key}: {event}")
+            totals[key] += value
+    # Chromium can deliver decoded bytes first, then flush encoded byte counts
+    # in a later dataReceived event whose dataLength is zero. Neither counter
+    # has to be positive in the first chunk; the completed nonempty body does.
+    if any(value <= 0 for value in totals.values()):
+        raise SmokeError(f"nonempty Fetch Network body must report positive byte totals: {matching}")
+    return {"eventMethods": methods, **totals}
 
 
 async def _verify_xhr_network_events(state: SmokeState) -> None:
@@ -828,8 +915,12 @@ async def _verify_response_stage_xhr_get_response_body(state: SmokeState) -> Non
             raise SmokeError(f"missing response-stage XHR networkId: {paused}")
 
         body = await state.cdp.send("Fetch.getResponseBody", {"requestId": request_id})
-        assert_equal(body.get("body"), "response-stage body", "XHR response-stage Fetch.getResponseBody body")
-        assert_equal(body.get("base64Encoded"), False, "XHR response-stage Fetch.getResponseBody encoding")
+        assert_equal(
+            body.get("body"),
+            base64.b64encode(b"response-stage body").decode("ascii"),
+            "XHR response-stage Fetch.getResponseBody body",
+        )
+        assert_equal(body.get("base64Encoded"), True, "XHR response-stage Fetch.getResponseBody encoding")
 
         await state.cdp.send("Fetch.continueResponse", {"requestId": request_id})
         await wait_until(
@@ -923,32 +1014,36 @@ async def _verify_response_stage_fetch_body_stream(state: SmokeState) -> None:
         stream_handle = stream.get("stream")
         if not isinstance(stream_handle, str) or not stream_handle:
             raise SmokeError(f"missing Fetch.takeResponseBodyAsStream handle: {stream}")
-        offset_chunk = await state.cdp.send(
-            "IO.read", {"handle": stream_handle, "offset": 9, "size": 5}
-        )
-        assert_equal(
-            offset_chunk.get("base64Encoded"),
-            False,
-            "Fetch response-stage stream offset chunk encoding",
-        )
-        assert_equal(offset_chunk.get("data"), "stage", "Fetch response-stage stream offset chunk")
-        assert_equal(offset_chunk.get("eof"), False, "Fetch response-stage stream offset chunk eof")
         first_chunk = await state.cdp.send(
-            "IO.read", {"handle": stream_handle, "offset": 0, "size": 8}
+            "IO.read", {"handle": stream_handle, "size": 8}
         )
         assert_equal(first_chunk.get("base64Encoded"), False, "Fetch response-stage stream first chunk encoding")
         assert_equal(first_chunk.get("data"), "response", "Fetch response-stage stream first chunk")
         assert_equal(first_chunk.get("eof"), False, "Fetch response-stage stream first chunk eof")
-        tail_chunk = await state.cdp.send("IO.read", {"handle": stream_handle})
+        if is_moli_browser():
+            offset_chunk = await state.cdp.send(
+                "IO.read", {"handle": stream_handle, "offset": 9, "size": 5}
+            )
+            assert_equal(
+                offset_chunk.get("base64Encoded"),
+                False,
+                "Fetch response-stage stream offset chunk encoding",
+            )
+            assert_equal(offset_chunk.get("data"), "stage", "Fetch response-stage stream offset chunk")
+            assert_equal(offset_chunk.get("eof"), False, "Fetch response-stage stream offset chunk eof")
+            reset = await state.cdp.send("IO.read", {"handle": stream_handle, "offset": 0, "size": 8})
+            assert_equal(reset, first_chunk, "Moli buffered stream supports seeking back to the first chunk")
+        tail_chunk = await read_io_to_eof(state.cdp, stream_handle)
         assert_equal(tail_chunk.get("base64Encoded"), False, "Fetch response-stage stream tail encoding")
         assert_equal(tail_chunk.get("data"), "-stage body", "Fetch response-stage stream tail chunk")
         assert_equal(tail_chunk.get("eof"), True, "Fetch response-stage stream tail eof")
 
-        await _expect_cdp_error(
-            state.cdp.send("Fetch.continueResponse", {"requestId": request_id}),
-            BODY_TAKEN_CONTINUE_RESPONSE_ERROR,
-            "Fetch response-stage stream continueResponse after body taken",
-        )
+        if is_moli_browser():
+            await _expect_cdp_error(
+                state.cdp.send("Fetch.continueResponse", {"requestId": request_id}),
+                BODY_TAKEN_CONTINUE_RESPONSE_ERROR,
+                "Fetch response-stage stream continueResponse after body taken",
+            )
         await state.cdp.send(
             "Fetch.fulfillRequest",
             {
@@ -975,7 +1070,7 @@ async def _verify_response_stage_fetch_body_stream(state: SmokeState) -> None:
         await state.cdp.send("IO.close", {"handle": stream_handle})
         await _expect_cdp_error(
             state.cdp.send("IO.read", {"handle": stream_handle}),
-            "StreamHandleNotFound",
+            "StreamHandleNotFound" if is_moli_browser() else "Invalid stream handle",
             "Fetch response-stage stream read after close",
         )
         stream_handle = None
@@ -1142,16 +1237,17 @@ async def _verify_response_stage_fetch_binary_body_stream(state: SmokeState) -> 
         stream_handle = stream.get("stream")
         if not isinstance(stream_handle, str) or not stream_handle:
             raise SmokeError(f"missing binary Fetch.takeResponseBodyAsStream handle: {stream}")
-        chunk = await state.cdp.send("IO.read", {"handle": stream_handle})
+        chunk = await read_io_to_eof(state.cdp, stream_handle)
         assert_equal(chunk.get("base64Encoded"), True, "Fetch binary response-stage stream encoding")
         assert_equal(chunk.get("data"), "AP9h", "Fetch binary response-stage stream base64 body")
         assert_equal(chunk.get("eof"), True, "Fetch binary response-stage stream eof")
 
-        await _expect_cdp_error(
-            state.cdp.send("Fetch.continueResponse", {"requestId": request_id}),
-            BODY_TAKEN_CONTINUE_RESPONSE_ERROR,
-            "Fetch binary response-stage stream continueResponse after body taken",
-        )
+        if is_moli_browser():
+            await _expect_cdp_error(
+                state.cdp.send("Fetch.continueResponse", {"requestId": request_id}),
+                BODY_TAKEN_CONTINUE_RESPONSE_ERROR,
+                "Fetch binary response-stage stream continueResponse after body taken",
+            )
         await state.cdp.send(
             "Fetch.fulfillRequest",
             {
@@ -1613,8 +1709,12 @@ async def _verify_fetch_auth_response_stage(state: SmokeState) -> None:
         )
 
         body_result = await state.cdp.send("Fetch.getResponseBody", {"requestId": request_id})
-        assert_equal(body_result.get("base64Encoded"), False, "Fetch auth response-stage body encoding")
-        assert_equal(body_result.get("body"), "authenticated fetch", "Fetch auth response-stage paused body")
+        assert_equal(body_result.get("base64Encoded"), True, "Fetch auth response-stage body encoding")
+        assert_equal(
+            body_result.get("body"),
+            base64.b64encode(b"authenticated fetch").decode("ascii"),
+            "Fetch auth response-stage paused body",
+        )
 
         await state.cdp.send("Fetch.continueResponse", {"requestId": request_id})
         await wait_until(
@@ -1705,6 +1805,62 @@ async def _verify_parser_script_network_events(state: SmokeState) -> None:
     body = await state.cdp.send("Network.getResponseBody", {"requestId": parser_script_request_id})
     assert_equal(body.get("body"), 'globalThis.__smokeParserScriptValue = "parser script loaded";', "parser script response body")
     state.record("parser_script_network_events")
+
+
+async def _verify_intercepted_parser_script_networkidle(state: SmokeState) -> None:
+    script_body = 'globalThis.__smokeParserScriptValue = "parser script loaded";'
+    for action in ("fulfill", "continue", "abort", "fulfill_http_error"):
+        async with isolated_network_page(state) as isolated:
+            page = isolated.page
+            script_url = f"{state.fixture}/parser-script.js"
+            handled: list[Any] = []
+            finished: list[Any] = []
+            failed: list[Any] = []
+            page.on("requestfinished", lambda request: finished.append(request))
+            page.on("requestfailed", lambda request: failed.append(request))
+
+            async def handle(route: Any) -> None:
+                handled.append(route.request)
+                if action in ("fulfill", "fulfill_http_error"):
+                    await route.fulfill(status=404 if action == "fulfill_http_error" else 200,
+                                        content_type="text/javascript", body=script_body)
+                elif action == "continue":
+                    await route.continue_()
+                else:
+                    await route.abort("blockedbyclient")
+
+            await page.route("**/parser-script.js", handle)
+            event_start = len(isolated.subresource_events)
+            # No evaluation or polling command after the route resumes: the
+            # original Network request must finish autonomously so Playwright
+            # can remove it from its inflight set and observe networkidle.
+            await page.goto(f"{state.fixture}/parser-script-page", wait_until="networkidle", timeout=10_000)
+            assert_equal(len(handled), 1, f"{action} parser script route count")
+            expect_failure = action in ("abort", "fulfill_http_error")
+            terminals = failed if expect_failure else finished
+            assert_equal(terminals.count(handled[0]), 1, f"{action} original Playwright request terminal")
+            events = isolated.subresource_events[event_start:]
+            requests = [event for event in events if event["method"] == "Network.requestWillBeSent"
+                        and event["params"].get("request", {}).get("url") == script_url]
+            assert_equal(len(requests), 1, f"{action} parser script Network request count")
+            request_id = requests[0]["params"]["requestId"]
+            network_terminals = [event for event in events
+                                 if event["method"] in ("Network.loadingFinished", "Network.loadingFailed")
+                                 and event["params"].get("requestId") == request_id]
+            assert_equal(len(network_terminals), 1, f"{action} original Network request terminal count")
+            expected = "Network.loadingFailed" if expect_failure else "Network.loadingFinished"
+            assert_equal(network_terminals[0]["method"], expected, f"{action} parser script terminal")
+            if action == "fulfill_http_error":
+                responses = [event for event in events if event["method"] == "Network.responseReceived"
+                             and event["params"].get("requestId") == request_id]
+                assert_equal(len(responses), 1, "HTTP error script response count")
+                assert_equal(responses[0]["params"]["response"]["status"], 404, "HTTP error script status")
+                assert_equal(network_terminals[0]["params"]["errorText"], "net::ERR_ABORTED", "HTTP error script failure")
+                assert_equal(network_terminals[0]["params"]["canceled"], True, "HTTP error script canceled")
+            if not expect_failure:
+                body = await isolated.cdp.send("Network.getResponseBody", {"requestId": request_id})
+                assert_equal(body.get("body"), script_body, f"{action} parser script response body")
+            state.record(f"route_{action}_parser_script_networkidle")
 
 
 async def _verify_parser_stylesheet_network_events(state: SmokeState) -> None:
@@ -1821,13 +1977,15 @@ async def _verify_chromium_resource_type_network_matrix(state: SmokeState) -> No
     expected_bodies: dict[str, tuple[str, bool]] = {
         "/chromium-resource-style.css": ("main { color: rgb(31, 41, 59); }", False),
         "/chromium-resource-script.js": ("globalThis.__smokeChromiumResourceScript = true;", False),
-        "/chromium-resource-image.png": (base64.b64encode(_transparent_png_bytes()).decode("ascii"), True),
+        "/chromium-resource-image.png": (base64.b64encode(TRANSPARENT_PNG).decode("ascii"), True),
         "/chromium-resource-audio.wav": (base64.b64encode(b"\x00\xffmoli-media").decode("ascii"), True),
         "/chromium-resource-video.ogv": (base64.b64encode(b"\x00\xffmoli-media").decode("ascii"), True),
         "/chromium-resource-captions.vtt": ("WEBVTT\n\n00:00.000 --> 00:01.000\ncaption\n", False),
         "/chromium-resource-xhr.bin": (base64.b64encode(b"\x00\xffmoli-xhr").decode("ascii"), True),
     }
     for path, (expected_body, expected_base64) in expected_bodies.items():
+        if path.endswith(".vtt") and not is_moli_browser():
+            expected_body, expected_base64 = base64.b64encode(expected_body.encode()).decode(), True
         body = await state.cdp.send("Network.getResponseBody", {"requestId": request_ids[path]})
         assert_equal(body.get("base64Encoded"), expected_base64, f"{path} Network.getResponseBody encoding")
         assert_equal(body.get("body"), expected_body, f"{path} Network.getResponseBody body")
@@ -1920,29 +2078,47 @@ async def run_network_body_cache_group(state: SmokeState) -> None:
     )
 
 
-def _transparent_png_bytes() -> bytes:
-    return base64.b64decode(
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-    )
-
-
 async def _verify_blocked_websocket_events(state: SmokeState) -> None:
     page = state.page
     fixture = state.fixture
     subresource_events = state.subresource_events
-    blocked_ws_url = fixture.replace("http:", "ws:", 1) + "/ws-blocked"
+    blocked_ws_url = fixture.replace("http:", "ws:", 1) + "/ws-echo"
     blocked_ws_start = len(subresource_events)
+    socket_events = attach_cdp_event_collector(state.cdp, [
+        "Network.webSocketCreated", "Network.webSocketHandshakeResponseReceived",
+        "Network.webSocketFrameReceived", "Network.webSocketClosed",
+    ])
     await state.cdp.send("Network.setBlockedURLs", {"urls": [blocked_ws_url + "*"]})
     blocked_ws_result = await page.evaluate(
         """async url => await new Promise(resolve => {
-          const socket = new WebSocket(url);
+          const socket = new WebSocket(url, 'smoke');
           const timer = setTimeout(() => { socket.close(); resolve(`timeout:${socket.readyState}`); }, 5000);
-          socket.onopen = () => { clearTimeout(timer); resolve('open'); };
+          socket.onopen = () => { socket.close(); clearTimeout(timer); resolve('open'); };
           socket.onerror = () => { clearTimeout(timer); resolve(`error:${socket.readyState}`); };
           socket.onclose = event => { clearTimeout(timer); resolve(`close:${event.code}:${event.wasClean}`); };
         })""",
         blocked_ws_url,
     )
+    if not is_moli_browser():
+        assert_equal(blocked_ws_result, "open", "Chromium setBlockedURLs does not block WebSocket handshakes")
+        await wait_until(lambda: any(e["method"] == "Network.webSocketHandshakeResponseReceived"
+                                    and e["params"].get("response", {}).get("status") == 101
+                                    for e in socket_events), "Chromium WebSocket handshake event")
+        created = next((e for e in socket_events if e["method"] == "Network.webSocketCreated"
+                        and e["params"].get("url") == blocked_ws_url), None)
+        if created is None:
+            raise SmokeError(f"missing Chromium WebSocket identity: {socket_events}")
+        request_id = created["params"]["requestId"]
+        assert_equal(any(e["method"] == "Network.webSocketHandshakeResponseReceived"
+                         and e["params"].get("requestId") == request_id
+                         and e["params"].get("response", {}).get("status") == 101
+                         for e in socket_events), True, "Chromium WebSocket handshake succeeded")
+        assert_equal(any(e["params"].get("requestId") == request_id
+                         for e in subresource_events[blocked_ws_start:]), False,
+                     "WebSocket uses its own Network event family")
+        await state.cdp.send("Network.setBlockedURLs", {"urls": []})
+        state.record("blocked_websocket_network_events", {"policy": "chromium-websocket-exclusion"})
+        return
     if blocked_ws_result == "open" or str(blocked_ws_result).startswith("timeout:"):
         raise SmokeError(f"blocked WebSocket should fail, got {blocked_ws_result}")
 

@@ -1,5 +1,5 @@
 use super::{
-    DomHandle, JsContextHost, NavigationHistoryEntrySeed, WindowExecutionContextBinding,
+    NavigationHistoryEntrySeed, PageScriptHost, WindowExecutionContextBinding,
     WindowExecutionContextIdentity, WindowTaskTarget,
 };
 use crate::page_task_queue::{
@@ -54,6 +54,7 @@ pub(crate) struct QueuedNavigationApiTask {
 }
 
 pub(crate) struct PendingHistoryTraversal {
+    pub(crate) joint_step: Option<moli_session_history::SessionHistoryStepId>,
     pub(crate) target: WindowTaskTarget,
     pub(crate) target_index: u32,
     pub(crate) target_key: Option<String>,
@@ -63,17 +64,15 @@ pub(crate) struct PendingHistoryTraversal {
 
 pub(crate) struct PendingChildCrossDocumentTraversal {
     pub(crate) target: WindowTaskTarget,
-    pub(crate) child_handle: DomHandle,
     pub(crate) target_index: u32,
     pub(crate) target_key: Option<String>,
-    pub(crate) target_url: String,
     pub(crate) seed: NavigationHistoryEntrySeed,
     pub(crate) info: Option<v8::Global<v8::Value>>,
     pub(crate) results: Vec<PendingNavigationResult>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct NavigationResultDeclaration<'scope> {
     committed: v8::Local<'scope, v8::Promise>,
     finished: v8::Local<'scope, v8::Promise>,
@@ -117,6 +116,7 @@ impl HistoryQueueState {
     fn pending_history_traversal_target_index(&self, target: WindowTaskTarget) -> Option<u32> {
         self.pending_history_traversal_tasks
             .iter()
+            .rev()
             .find_map(|queued| match &queued.action {
                 PendingHistoryTraversalAction::SameDocument(pending)
                     if pending.target == target =>
@@ -134,26 +134,32 @@ impl HistoryQueueState {
         relevant_context: WindowExecutionContextBinding,
         target: WindowTaskTarget,
         target_index: u32,
+        joint_step: Option<moli_session_history::SessionHistoryStepId>,
         target_key: Option<String>,
         info: Option<v8::Global<v8::Value>>,
         result: Option<PendingNavigationResult>,
     ) -> Option<RendererPageHistoryTraversalTaskId> {
-        if let Some(pending) = self
-            .pending_history_traversal_tasks
-            .iter_mut()
-            .find_map(|queued| match &mut queued.action {
-                PendingHistoryTraversalAction::SameDocument(pending)
-                    if pending.target == target =>
-                {
-                    Some(pending)
-                }
-                PendingHistoryTraversalAction::SameDocument(_)
-                | PendingHistoryTraversalAction::ChildCrossDocument(_) => None,
-            })
+        // History API requests are ordered steps, including a same-document
+        // traversal followed by a cross-document traversal. Only Navigation
+        // API requests for the same destination key can share a pending task;
+        // a different destination must retain its own position in the queue.
+        if result.is_some()
+            && target_key.is_some()
+            && let Some(pending) =
+                self.pending_history_traversal_tasks
+                    .iter_mut()
+                    .find_map(|queued| match &mut queued.action {
+                        PendingHistoryTraversalAction::SameDocument(pending)
+                            if pending.target == target
+                                && pending.target_key == target_key
+                                && !pending.results.is_empty() =>
+                        {
+                            Some(pending)
+                        }
+                        PendingHistoryTraversalAction::SameDocument(_)
+                        | PendingHistoryTraversalAction::ChildCrossDocument(_) => None,
+                    })
         {
-            pending.target_index = target_index;
-            pending.target_key = target_key;
-            pending.info = info;
             if let Some(result) = result {
                 pending.results.push(result);
             }
@@ -170,6 +176,7 @@ impl HistoryQueueState {
                 execution_context,
                 relevant_context,
                 action: PendingHistoryTraversalAction::SameDocument(PendingHistoryTraversal {
+                    joint_step,
                     target,
                     target_index,
                     target_key,
@@ -324,7 +331,7 @@ impl HistoryQueueState {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn begin_navigation_lifecycle_attempt(
         &mut self,
         kind: &'static str,
@@ -387,11 +394,32 @@ impl JsContextHost {
             .pending_history_traversal_target_index(target)
     }
 
+    pub(crate) fn pending_joint_history_step(
+        &self,
+        history: &moli_session_history::JointSessionHistory,
+    ) -> Option<moli_session_history::SessionHistoryStepId> {
+        self.history_queue
+            .pending_history_traversal_tasks
+            .iter()
+            .rev()
+            .find_map(|queued| {
+                let step = match &queued.action {
+                    PendingHistoryTraversalAction::SameDocument(pending) => pending.joint_step,
+                    PendingHistoryTraversalAction::ChildCrossDocument(pending) => {
+                        pending.seed.session_history.target_step
+                    }
+                }?;
+                history.entries_at(step).map(|_| step)
+            })
+    }
+
     pub(crate) fn queue_history_traversal<'s>(
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
         target: WindowTaskTarget,
         target_index: u32,
+        joint_step: Option<moli_session_history::SessionHistoryStepId>,
+        target_key: Option<String>,
     ) -> Option<RendererPageHistoryTraversalProducer> {
         let execution_context = self.current_runtime_window_execution_context_identity(scope)?;
         let relevant_context = self.current_runtime_window_execution_context_binding(scope)?;
@@ -401,7 +429,8 @@ impl JsContextHost {
             relevant_context,
             target,
             target_index,
-            None,
+            joint_step,
+            target_key,
             None,
             None,
         )?;
@@ -499,6 +528,7 @@ impl JsContextHost {
         scope: &mut v8::PinScope<'s, '_>,
         target: WindowTaskTarget,
         target_index: u32,
+        joint_step: Option<moli_session_history::SessionHistoryStepId>,
         target_key: Option<String>,
         info: Option<v8::Local<'s, v8::Value>>,
     ) -> Option<(
@@ -506,25 +536,23 @@ impl JsContextHost {
         Option<RendererPageHistoryTraversalProducer>,
     )> {
         let execution_context = self.current_runtime_window_execution_context_identity(scope)?;
-        if let Some(existing_index) = self
-            .history_queue
-            .pending_history_traversal_tasks
-            .iter()
-            .position(|queued| {
-                matches!(
-                    &queued.action,
+        if target_key.is_some()
+            && let Some(result) = self
+                .history_queue
+                .pending_history_traversal_tasks
+                .iter()
+                .find_map(|queued| match &queued.action {
                     PendingHistoryTraversalAction::SameDocument(pending)
-                        if pending.target == target
-                            && pending.target_index == target_index
-                )
-            })
-            && let PendingHistoryTraversalAction::SameDocument(pending) =
-                &mut self.history_queue.pending_history_traversal_tasks[existing_index].action
-            && !pending.results.is_empty()
+                        if pending.target == target && pending.target_key == target_key =>
+                    {
+                        pending.results.first()
+                    }
+                    PendingHistoryTraversalAction::SameDocument(_)
+                    | PendingHistoryTraversalAction::ChildCrossDocument(_) => None,
+                })
         {
-            pending.target_key = target_key;
-            pending.info = info.map(|info| v8::Global::new(scope, info));
-            let result = &pending.results[0];
+            // Repeated requests share the original tracker, including its
+            // destination and info, even if a History task also targets it.
             let committed_resolver = v8::Local::new(scope, &result.committed_resolver);
             let finished_resolver = v8::Local::new(scope, &result.finished_resolver);
             return Some((
@@ -551,6 +579,7 @@ impl JsContextHost {
             relevant_context,
             target,
             target_index,
+            joint_step,
             target_key,
             info.map(|info| v8::Global::new(scope, info)),
             Some(PendingNavigationResult {
@@ -573,10 +602,8 @@ impl JsContextHost {
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
         target: WindowTaskTarget,
-        child_handle: DomHandle,
         target_index: u32,
         target_key: Option<String>,
-        target_url: &str,
         seed: NavigationHistoryEntrySeed,
     ) -> Option<RendererPageHistoryTraversalProducer> {
         let execution_context = self.current_runtime_window_execution_context_identity(scope)?;
@@ -587,10 +614,8 @@ impl JsContextHost {
             relevant_context,
             PendingChildCrossDocumentTraversal {
                 target,
-                child_handle,
                 target_index,
                 target_key,
-                target_url: target_url.to_owned(),
                 seed,
                 info: None,
                 results: Vec::new(),
@@ -609,10 +634,8 @@ impl JsContextHost {
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
         target: WindowTaskTarget,
-        child_handle: DomHandle,
         target_index: u32,
         target_key: Option<String>,
-        target_url: &str,
         seed: NavigationHistoryEntrySeed,
         info: Option<v8::Local<'s, v8::Value>>,
     ) -> Option<(
@@ -633,10 +656,8 @@ impl JsContextHost {
             relevant_context,
             PendingChildCrossDocumentTraversal {
                 target,
-                child_handle,
                 target_index,
                 target_key,
-                target_url: target_url.to_owned(),
                 seed,
                 info: info.map(|info| v8::Global::new(scope, info)),
                 results: vec![PendingNavigationResult {

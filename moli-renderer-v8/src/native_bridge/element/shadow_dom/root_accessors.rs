@@ -13,7 +13,7 @@ use crate::{
         install_adopted_style_sheets_array_mutation_methods,
         normalize_adopted_style_sheets_assignment,
     },
-    native_bridge::{DomHandle, set_wrapped_handle_or_null, wrapped_handle_value},
+    native_bridge::{DomHandle, set_wrapped_handle_or_null_for_receiver, wrapped_handle_value},
     util::{
         get_private_value, new_null_prototype_object, node_wrapper_from_handle, set_private_value,
         v8_string, v8str,
@@ -38,7 +38,7 @@ const CSS_MODULE_SHEET_CACHE_SLOT: &str = "__moliCssModuleSheetCache";
 const CSS_MODULE_SHEET_LOADED_SLOT: &str = "__moliCssModuleSheetLoaded";
 
 fn shadow_root_style_sheet_handles_in_tree_order(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     root: crate::document_runtime::DomHandle,
 ) -> Vec<crate::document_runtime::DomHandle> {
     let mut handles = Vec::new();
@@ -86,7 +86,7 @@ fn set_array_contents<'s>(
 fn sync_shadow_root_style_sheets<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     list: v8::Local<'s, v8::Object>,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     root: crate::document_runtime::DomHandle,
 ) {
     let mut sheets = Vec::new();
@@ -119,8 +119,8 @@ fn sync_shadow_root_style_sheets<'s>(
 fn sync_detached_shadow_root_style_sheets<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     list: v8::Local<'s, v8::Object>,
-    runtime_ptr: *mut crate::native_bridge::JsContextHost,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime_ptr: *mut crate::native_bridge::PageScriptHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     root: crate::document_runtime::DomHandle,
 ) {
     let mut sheets = Vec::new();
@@ -168,7 +168,13 @@ pub(in crate::native_bridge) fn shadow_root_host_getter_function<'s>(
         rv.set_null();
         return;
     };
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, Some(host_handle));
+    set_wrapped_handle_or_null_for_receiver(
+        scope,
+        &mut rv,
+        runtime_ptr,
+        args.this(),
+        Some(host_handle),
+    );
 }
 
 pub(crate) fn shadow_root_adopted_style_sheets_getter_function<'s>(
@@ -223,7 +229,7 @@ fn get_shadow_root_adopted_style_sheets_for_receiver<'s>(
 
 pub(crate) fn ensure_shadow_root_adopted_style_sheets_initialized<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &mut crate::native_bridge::JsContextHost,
+    runtime: &mut crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
     holder: v8::Local<'s, v8::Object>,
 ) {
@@ -261,7 +267,7 @@ pub(crate) fn ensure_shadow_root_adopted_style_sheets_initialized<'s>(
 }
 
 fn shadow_root_has_declarative_adopted_style_sheet_specifiers(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     shadow_root: crate::document_runtime::DomHandle,
 ) -> bool {
     runtime
@@ -273,7 +279,7 @@ fn shadow_root_has_declarative_adopted_style_sheet_specifiers(
 
 pub(crate) fn clear_shadow_root_adopted_style_sheets(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &mut crate::native_bridge::JsContextHost,
+    runtime: &mut crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
 ) {
     runtime.set_shadow_root_adopted_style_sheet_installations(handle, Vec::new());
@@ -309,7 +315,7 @@ pub(crate) fn clear_shadow_root_adopted_style_sheets(
 
 fn refresh_declarative_css_module_sheets<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &mut crate::native_bridge::JsContextHost,
+    runtime: &mut crate::native_bridge::PageScriptHost,
     shadow_root: crate::document_runtime::DomHandle,
 ) {
     let Some(Some(value)) = runtime
@@ -338,7 +344,7 @@ fn refresh_declarative_css_module_sheets<'s>(
 
 fn refresh_declarative_css_module_sheet<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &mut crate::native_bridge::JsContextHost,
+    runtime: &mut crate::native_bridge::PageScriptHost,
     shadow_root: crate::document_runtime::DomHandle,
     specifier: &str,
     declarative_import_map: &mut Option<HashMap<String, String>>,
@@ -356,7 +362,7 @@ fn refresh_declarative_css_module_sheet<'s>(
 
 fn populate_declarative_adopted_style_sheets<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &mut crate::native_bridge::JsContextHost,
+    runtime: &mut crate::native_bridge::PageScriptHost,
     shadow_root: crate::document_runtime::DomHandle,
     array: v8::Local<'s, v8::Array>,
 ) {
@@ -399,7 +405,7 @@ struct DeclarativeCssModule {
 
 fn declarative_css_module_sheet_for_specifier<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &mut crate::native_bridge::JsContextHost,
+    runtime: &mut crate::native_bridge::PageScriptHost,
     shadow_root: crate::document_runtime::DomHandle,
     specifier: &str,
     declarative_import_map: &mut Option<HashMap<String, String>>,
@@ -440,7 +446,7 @@ fn declarative_css_module_sheet_for_specifier<'s>(
 
 fn css_module_sheet_for_mapped_specifier<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     specifier: &str,
     base_url: &url::Url,
 ) -> Option<v8::Local<'s, v8::Object>> {
@@ -453,7 +459,7 @@ fn css_module_sheet_for_mapped_specifier<'s>(
 
 fn css_module_sheet_for_resolved_url<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     resolved_url: &url::Url,
 ) -> Option<v8::Local<'s, v8::Object>> {
     if let Some(css_text) = decoded_css_data_url_text(resolved_url)
@@ -468,7 +474,7 @@ fn css_module_sheet_for_resolved_url<'s>(
 }
 
 fn shadow_root_owner_document(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     shadow_root: crate::document_runtime::DomHandle,
 ) -> Option<crate::document_runtime::DomHandle> {
     runtime
@@ -478,7 +484,7 @@ fn shadow_root_owner_document(
 }
 
 fn collect_declarative_import_map_entries(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     document: crate::document_runtime::DomHandle,
 ) -> HashMap<String, String> {
     let mut stack = vec![document];
@@ -511,7 +517,7 @@ fn collect_declarative_import_map_entries(
 }
 
 fn collect_declarative_css_module_entries_for_document(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     document: crate::document_runtime::DomHandle,
 ) -> HashMap<String, DeclarativeCssModule> {
     let mut entries = HashMap::new();
@@ -649,6 +655,7 @@ fn set_shadow_root_adopted_style_sheets_for_receiver<'s>(
         .and_then(crate::dom::native::Node::owner_document);
     let Some(next_array) = normalize_adopted_style_sheets_assignment(
         scope,
+        receiver,
         value,
         AdoptedStyleSheetsArrayOwner::ShadowRoot(handle),
         owner_document,
@@ -674,7 +681,7 @@ fn set_shadow_root_adopted_style_sheets_for_receiver<'s>(
 }
 
 fn shadow_root_adopted_style_base_url(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
 ) -> url::Url {
     runtime
@@ -717,11 +724,17 @@ pub(in crate::native_bridge) fn shadow_root_active_element_getter_function<'s>(
         rv.set_null();
         return;
     };
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, Some(active_handle));
+    set_wrapped_handle_or_null_for_receiver(
+        scope,
+        &mut rv,
+        runtime_ptr,
+        args.this(),
+        Some(active_handle),
+    );
 }
 
 fn shadow_root_retargeted_active_element(
-    runtime: &crate::native_bridge::JsContextHost,
+    runtime: &crate::native_bridge::PageScriptHost,
     root: DomHandle,
     active: DomHandle,
 ) -> Option<DomHandle> {
@@ -1005,6 +1018,11 @@ pub(in crate::native_bridge) fn element_shadow_root_getter_function<'s>(
         rv.set_null();
         return;
     }
+    let Some(context) = args.this().get_creation_context(scope) else {
+        rv.set_null();
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, context);
     match runtime
         .native_bridge_mut()
         .wrap_handle(scope, runtime_ptr, root_handle)

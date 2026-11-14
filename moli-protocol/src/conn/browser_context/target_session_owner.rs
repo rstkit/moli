@@ -1,4 +1,10 @@
+use crate::conn::DrainedFetchRequests;
+use anyhow::Result;
+
 use super::*;
+use crate::automation::{
+    AutomationContext, DevToolsNetworkInterceptId, DevToolsNetworkResourceType,
+};
 use crate::conn::state::{
     BrowserContextPageStorageHandles, BrowserContextResourceStorageHandles, DevToolsSessionState,
     PageNavigationHistoryEntry, PageTargetHost, RendererMainDocumentCommitSeed, TargetFetchConfig,
@@ -8,19 +14,16 @@ use crate::conn::state::{
 use crate::conn::{
     BackgroundProtocolEvent, CommandOwnerScope, ConnectionNetworkRequestIdAllocator,
     DocumentStartScript, EmulatedDeviceMetrics, FetchInterceptionPattern, FetchRequestStage,
-    InitialDocumentPageInstallResult, InitialDocumentPageOwner, LoadedNavigationPageCommit,
-    LoadedNavigationRendererAttachmentCommit, NETWORK_ERROR_PAGE_URL, NetworkErrorPageNavigation,
-    PausedDocumentTransfer, PendingFetchAuthNavigation, PendingFetchNavigation,
-    PendingSubresourceFetchAuthRequest, PendingSubresourceFetchRequest,
-    PendingSubresourceFetchResponseRequest, RuntimeBindingDefinition,
+    InitialDocumentPageInstallResult, InitialDocumentPageOwner, InstalledNavigationPage,
+    LoadedNavigationPageCommit, LoadedNavigationRendererAttachmentCommit, NETWORK_ERROR_PAGE_URL,
+    NetworkErrorPageNavigation, PendingFetchNavigation, RuntimeBindingDefinition,
 };
-use crate::devtools_runtime::{DevToolsNetworkInterceptId, DevToolsNetworkResourceType};
 use moli_cookie_jar::{StoredCookieQueryReport, StoredCookieSetReport};
 #[cfg(test)]
 use moli_core::page::RendererServiceWorkerVersionStatus;
 use moli_core::page::{
     BidiPreloadChannelHandoff, Page, RendererInspectorSessionRestoreSnapshot,
-    RendererMainDocumentCommit, RendererPageCreationArtifacts, SubresourceResourceType,
+    RendererMainDocumentCommit, RendererPageCreationArtifacts, SubresourceInterceptionClasses,
 };
 use moli_core::runtime::RendererBrowserContextRuntimeOwnerAccess;
 use moli_fetch::BrowserNavigationRequestKind;
@@ -43,23 +46,46 @@ pub(super) struct TargetSessionOwnerRef<'a> {
     pub(super) session_key: DevToolsSessionKey,
 }
 
-type FetchDisableStateWithSubresourceConfig = (
-    super::fetch_owner::SessionOwnerPendingFetchState,
-    (bool, Option<SubresourceResourceType>),
-    bool,
-);
+type FetchDisableStateWithSubresourceConfig =
+    (DrainedFetchRequests, SubresourceInterceptionClasses, bool);
 
-fn empty_pending_fetch_state() -> super::fetch_owner::SessionOwnerPendingFetchState {
-    (
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-    )
+pub(crate) struct PendingPageTargetClose {
+    target: PageTargetHost,
+    closed: ClosedPageTarget,
+    collected_network_data_artifacts: Vec<crate::domains::network::CollectedNetworkDataArtifact>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CompletedPageTargetClose {
+    closed: ClosedPageTarget,
+    collected_network_data_artifacts: Vec<crate::domains::network::CollectedNetworkDataArtifact>,
+}
+
+impl PendingPageTargetClose {
+    pub(crate) fn session_cleanup_plan(
+        &self,
+        reason: Option<&str>,
+    ) -> crate::conn::TargetClosureCleanupPlan {
+        self.closed.clone().into_detach_cleanup_plan(reason)
+    }
+
+    pub(crate) async fn wait(mut self) -> CompletedPageTargetClose {
+        self.target.close_page_async().await;
+        CompletedPageTargetClose {
+            closed: self.closed,
+            collected_network_data_artifacts: self.collected_network_data_artifacts,
+        }
+    }
+}
+
+impl CompletedPageTargetClose {
+    pub(crate) fn finish(self, conn: &mut CdpConnection) -> ClosedPageTarget {
+        conn.record_collected_network_data_artifacts(self.collected_network_data_artifacts);
+        self.closed
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ClosedPageTarget {
     pub(crate) target_id: String,
     pub(crate) primary_session_id: Option<String>,
@@ -67,13 +93,6 @@ pub(crate) struct ClosedPageTarget {
 }
 
 impl ClosedPageTarget {
-    pub(crate) fn inspector_detached_session_ids(&self) -> impl Iterator<Item = &str> {
-        self.primary_session_id
-            .as_deref()
-            .into_iter()
-            .chain(self.attached_session_ids.iter().map(String::as_str))
-    }
-
     pub(crate) fn into_detach_cleanup_plan(
         self,
         reason: Option<&str>,
@@ -93,24 +112,13 @@ pub(super) struct TargetSessionStateMut<'a> {
     pub(super) tls_verify_host_override: &'a mut Option<bool>,
 }
 
-pub(crate) struct TargetLoadedNavigationCommitState {
-    pub(crate) browser_context_id: String,
-    pub(crate) runtime_frontend_enabled: bool,
-    pub(crate) renderer_runtime_inspector_session_id: Option<String>,
-    pub(crate) runtime_inspector_session_restore_snapshots:
-        Vec<RendererInspectorSessionRestoreSnapshot>,
-    pub(crate) stored_runtime_bindings: Vec<RuntimeBindingDefinition>,
-    pub(crate) session_runtime_bindings: Vec<RuntimeBindingDefinition>,
-    pub(crate) fetch_subresource_config: (bool, Option<moli_core::page::SubresourceResourceType>),
-}
-
 pub(crate) struct TargetNavigationRequestPreflight {
     pub(crate) frame_id: String,
     pub(crate) session_id: Option<String>,
     pub(crate) document_fetch_event_session_id: Option<String>,
     pub(crate) inherited_security_origin: String,
     pub(crate) inherited_secure_context_type: String,
-    pub(crate) request_headers: Vec<(String, String)>,
+    pub(crate) request_headers: moli_fetch::RequestHeaders,
     pub(crate) document_fetch_request_stage: Option<FetchRequestStage>,
     pub(crate) document_fetch_response_stage_candidate: bool,
     pub(crate) document_auth_required: bool,
@@ -145,6 +153,11 @@ impl TargetNavigationStorageHandles {
 
 #[derive(Clone)]
 pub(crate) struct TargetNavigationLoadInputs {
+    pub(crate) window_identity: moli_core::page::RendererPageWindowIdentity,
+    pub(crate) auxiliary_document_response:
+        Option<moli_core::page::RendererAuxiliaryDocumentResponse>,
+    pub(crate) redirect_chain: Vec<moli_fetch::RedirectInfo>,
+    pub(crate) redirect_headers: Option<moli_fetch::RequestHeaders>,
     pub(crate) browser_context_id: Option<String>,
     storage_handles: TargetNavigationStorageHandles,
     pub(crate) root_frame_id: Option<String>,
@@ -157,32 +170,52 @@ pub(crate) struct TargetNavigationLoadInputs {
     pub(crate) http_no_proxy_override: Option<String>,
     pub(crate) tls_verify_host_override: Option<bool>,
     pub(crate) navigation_initiator_url: Option<Url>,
+    pub(crate) navigation_request_metadata: Option<moli_fetch::SubresourceRequestMetadata>,
+    pub(crate) navigation_request_origin: Option<moli_url::WebOrigin>,
     pub(crate) browser_navigation_kind: BrowserNavigationRequestKind,
     pub(crate) infer_navigation_referrer: bool,
     pub(crate) document_start_scripts: Vec<DocumentStartScript>,
     pub(crate) runtime_bindings: Vec<RuntimeBindingDefinition>,
     pub(crate) runtime_inspector_session_restore_snapshots:
         Vec<RendererInspectorSessionRestoreSnapshot>,
-    pub(crate) extra_http_headers: Vec<(String, String)>,
-    pub(crate) locale_override: Option<String>,
-    pub(crate) timezone_override: Option<String>,
+    pub(crate) extra_http_headers: moli_fetch::RequestHeaders,
     pub(crate) script_execution_disabled: bool,
+    pub(crate) scrollbars_hidden: bool,
     pub(crate) bypass_content_security_policy: bool,
-    pub(crate) cpu_throttling_rate: f64,
     pub(crate) emulated_media: moli_core::page::EmulatedMediaOverrides,
     pub(crate) viewport_surface: Option<moli_core::page::ViewportSurface>,
+    pub(crate) document_activity: moli_page_types::DocumentActivity,
     pub(crate) network_offline: bool,
     pub(crate) navigator_overrides: moli_page_types::NavigatorOverrides,
     pub(crate) bypass_service_worker: bool,
     pub(crate) cache_disabled: bool,
     pub(crate) blocked_url_patterns: Vec<String>,
-    pub(crate) fetch_subresource_interception:
-        (bool, Option<moli_core::page::SubresourceResourceType>),
+    pub(crate) fetch_subresource_interception: moli_core::page::SubresourceInterceptionClasses,
     pub(crate) permission_overrides: Vec<moli_core::page::PermissionOverrideRegistration>,
     main_document_commit_seed: Option<RendererMainDocumentCommitSeed>,
+    session_history_position: Option<moli_session_history::SessionHistoryPosition>,
+    pub(crate) document_replacement: Option<crate::conn::CapturedPageReplacement>,
 }
 
 impl TargetNavigationLoadInputs {
+    pub(crate) fn document_settings_snapshot(
+        &self,
+        idle_override: Option<moli_page_types::EmulatedIdleOverride>,
+        debugger_enabled: bool,
+    ) -> moli_page_types::DocumentSettings {
+        moli_page_types::DocumentSettings {
+            script_execution_disabled: self.script_execution_disabled,
+            debugger_enabled,
+            scrollbars_hidden: self.scrollbars_hidden,
+            bypass_content_security_policy: self.bypass_content_security_policy,
+            emulated_media: self.emulated_media.clone(),
+            idle_override,
+            navigator_overrides: self.navigator_overrides.clone(),
+            viewport_surface: self.viewport_surface,
+            document_activity: self.document_activity,
+        }
+    }
+
     pub(crate) fn with_main_document_commit_seed(
         mut self,
         seed: RendererMainDocumentCommitSeed,
@@ -196,9 +229,11 @@ impl TargetNavigationLoadInputs {
         final_url: &Url,
         network_error_page: Option<&NetworkErrorPageNavigation>,
     ) -> Option<RendererMainDocumentCommit> {
-        self.main_document_commit_seed
-            .as_ref()
-            .map(|seed| seed.resolve(final_url, network_error_page))
+        self.main_document_commit_seed.as_ref().map(|seed| {
+            let mut commit = seed.resolve(final_url, network_error_page);
+            commit.session_history_position = self.session_history_position;
+            commit
+        })
     }
 
     pub(crate) fn page_storage_handles(&self) -> BrowserContextPageStorageHandles {
@@ -212,10 +247,16 @@ impl TargetNavigationLoadInputs {
     pub(crate) fn store_response_cookie_reports(
         &self,
         response_url: &Url,
-        response_headers: &[(String, String)],
-    ) -> Vec<StoredCookieSetReport> {
-        let mut cookie_store = self.storage_handles.page_handles.cookie_store.lock();
-        cookie_store.store_response_headers_with_reports(response_url, response_headers)
+        response_headers: &[(String, Vec<u8>)],
+    ) -> anyhow::Result<Vec<StoredCookieSetReport>> {
+        if !response_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+        {
+            return Ok(Vec::new());
+        }
+        let mut cookie_store = self.storage_handles.page_handles.cookie_store.lock()?;
+        Ok(cookie_store.store_response_headers_with_reports(response_url, response_headers))
     }
 
     pub(crate) fn request_cookie_report_for_navigation(
@@ -223,21 +264,26 @@ impl TargetNavigationLoadInputs {
         requested_url: &Url,
         request_method: &str,
         update_access_time: bool,
-    ) -> Option<StoredCookieQueryReport> {
+    ) -> anyhow::Result<Option<StoredCookieQueryReport>> {
+        if !matches!(requested_url.scheme(), "http" | "https") {
+            return Ok(None);
+        }
         let request_context = crate::domains::network::navigation_cookie_request_context(
             requested_url,
             request_method,
             None,
             self.navigation_initiator_url.as_ref(),
         );
-        let mut cookie_store = self.storage_handles.page_handles.cookie_store.lock();
+        let mut cookie_store = self.storage_handles.page_handles.cookie_store.lock()?;
         let report = if update_access_time {
             cookie_store.cookie_access_report_for_request(requested_url, request_context)
         } else {
             cookie_store.observe_cookie_access_report_for_request(requested_url, request_context)
         };
-        (!report.included_cookies.is_empty() || !report.excluded_cookies.is_empty())
-            .then_some(report)
+        Ok(
+            (!report.included_cookies.is_empty() || !report.excluded_cookies.is_empty())
+                .then_some(report),
+        )
     }
 
     fn from_browser_context_target(browser_context: &BrowserContext, target_id: &str) -> Self {
@@ -246,24 +292,28 @@ impl TargetNavigationLoadInputs {
             .expect("resolved Page target owner must remain live");
         let page_state = target;
         let mut document_start_scripts = Vec::new();
-        let generated_surface_script = if browser_context.is_active_target(target_id) {
-            browser_context.generated_surface_override_script_for_active_target()
-        } else {
-            browser_context.generated_surface_override_script_for_background_state(page_state)
-        };
-        if let Some(script) = generated_surface_script {
-            document_start_scripts.push(script);
-        }
-        document_start_scripts.extend(browser_context.default_document_start_script_descriptors());
-        document_start_scripts.extend(target.owner_state.document_start_scripts.iter().map(
-            |(identifier, script)| {
-                BrowserContext::target_document_start_script_descriptor(
-                    Some(target_id),
-                    identifier,
-                    script,
-                )
-            },
-        ));
+        document_start_scripts.extend(browser_context.context_document_start_script_descriptors());
+        document_start_scripts.extend(
+            target
+                .owner_state
+                .document_start_scripts
+                .iter()
+                .filter(|(_, script)| {
+                    !script.devtools_session.as_ref().is_some_and(|key| {
+                        target
+                            .devtools_sessions
+                            .session(key)
+                            .is_some_and(|state| state.is_closing())
+                    })
+                })
+                .map(|(identifier, script)| {
+                    BrowserContext::target_document_start_script_descriptor(
+                        Some(target_id),
+                        identifier,
+                        script,
+                    )
+                }),
+        );
 
         let effective_network_conditions = page_state
             .effective_emulation_state
@@ -276,9 +326,16 @@ impl TargetNavigationLoadInputs {
             .clone()
             .or_else(|| browser_context.default_emulated_device_metrics.clone());
         let effective_policy = page_state.effective_policy();
+        let document_activity = browser_context
+            .document_activity_for_target(target_id)
+            .expect("resolved Page target retains document activity");
 
         Self {
+            auxiliary_document_response: None,
+            redirect_chain: Vec::new(),
+            redirect_headers: None,
             browser_context_id: Some(browser_context.id.clone()),
+            window_identity: target.window_identity().clone(),
             storage_handles: TargetNavigationStorageHandles::from_page_handles(
                 browser_context
                     .page_storage_handles_for_target(target_id)
@@ -308,6 +365,8 @@ impl TargetNavigationLoadInputs {
                 target.target_url(),
                 target.loaded_page(),
             ),
+            navigation_request_metadata: None,
+            navigation_request_origin: None,
             browser_navigation_kind: BrowserNavigationRequestKind::Navigate,
             infer_navigation_referrer: true,
             document_start_scripts,
@@ -317,23 +376,16 @@ impl TargetNavigationLoadInputs {
                 .runtime_inspector_restore_snapshots(),
             extra_http_headers: browser_context
                 .merged_extra_headers_for_target_policy(effective_policy.extra_headers()),
-            locale_override: effective_policy
-                .locale_override()
-                .map(str::to_owned)
-                .or_else(|| browser_context.default_locale_override.clone()),
-            timezone_override: effective_policy
-                .timezone_override()
-                .map(str::to_owned)
-                .or_else(|| browser_context.default_timezone_override.clone()),
             script_execution_disabled: page_state
                 .effective_emulation_state
                 .script_execution_disabled,
+            scrollbars_hidden: page_state.effective_emulation_state.scrollbars_hidden,
             bypass_content_security_policy: page_state.devtools_sessions.page_bypass_csp_enabled(),
-            cpu_throttling_rate: page_state.effective_emulation_state.cpu_throttling_rate,
             emulated_media: (&page_state.effective_emulation_state.emulated_media).into(),
             viewport_surface: emulated_device_metrics
                 .as_ref()
-                .map(|metrics| metrics.viewport_surface().to_page_viewport_surface()),
+                .map(|metrics| metrics.viewport_surface()),
+            document_activity,
             network_offline: page_state.network_policy.network_offline()
                 || effective_network_conditions
                     .is_some_and(|conditions| !conditions.navigator_online()),
@@ -348,6 +400,13 @@ impl TargetNavigationLoadInputs {
                 .subresource_interception_config(),
             permission_overrides: Vec::new(),
             main_document_commit_seed: None,
+            session_history_position: Some(
+                target
+                    .owner_state
+                    .navigation_history_state
+                    .position_after_navigation(),
+            ),
+            document_replacement: None,
         }
     }
 
@@ -366,14 +425,13 @@ impl TargetNavigationLoadInputs {
             browser_context.effective_active_http_no_proxy_override_owned();
         inputs.tls_verify_host_override =
             browser_context.effective_active_tls_verify_host_override();
-        inputs.document_start_scripts = browser_context.default_document_start_script_descriptors();
+        inputs.document_start_scripts = browser_context.context_document_start_script_descriptors();
         inputs.extra_http_headers = browser_context.effective_extra_headers();
-        inputs.locale_override = browser_context.effective_active_locale_override_owned();
-        inputs.timezone_override = browser_context.effective_active_timezone_override_owned();
         inputs.viewport_surface = browser_context
             .default_emulated_device_metrics
             .as_ref()
-            .map(|metrics| metrics.viewport_surface().to_page_viewport_surface());
+            .map(|metrics| metrics.viewport_surface());
+        inputs.document_activity = browser_context.active_document_activity();
         inputs.network_offline = browser_context.effective_active_network_offline();
         inputs
     }
@@ -383,7 +441,11 @@ impl TargetNavigationLoadInputs {
         renderer_runtime: RendererBrowserContextRuntimeOwnerAccess,
     ) -> Self {
         Self {
+            auxiliary_document_response: None,
+            redirect_chain: Vec::new(),
+            redirect_headers: None,
             browser_context_id: None,
+            window_identity: Default::default(),
             storage_handles: TargetNavigationStorageHandles::from_page_handles(page_handles),
             root_frame_id: None,
             renderer_runtime,
@@ -393,27 +455,30 @@ impl TargetNavigationLoadInputs {
             http_no_proxy_override: None,
             tls_verify_host_override: None,
             navigation_initiator_url: None,
+            navigation_request_metadata: None,
+            navigation_request_origin: None,
             browser_navigation_kind: BrowserNavigationRequestKind::Navigate,
             infer_navigation_referrer: true,
             document_start_scripts: Vec::new(),
             runtime_bindings: Vec::new(),
             runtime_inspector_session_restore_snapshots: Vec::new(),
-            extra_http_headers: Vec::new(),
-            locale_override: None,
-            timezone_override: None,
+            extra_http_headers: Default::default(),
             script_execution_disabled: false,
+            scrollbars_hidden: false,
             bypass_content_security_policy: false,
-            cpu_throttling_rate: 1.0,
             emulated_media: Default::default(),
             viewport_surface: None,
+            document_activity: Default::default(),
             network_offline: false,
             navigator_overrides: Default::default(),
             bypass_service_worker: false,
             cache_disabled: false,
             blocked_url_patterns: Vec::new(),
-            fetch_subresource_interception: (false, None),
+            fetch_subresource_interception: SubresourceInterceptionClasses::NONE,
             permission_overrides: Vec::new(),
             main_document_commit_seed: None,
+            session_history_position: None,
+            document_replacement: None,
         }
     }
 
@@ -431,20 +496,20 @@ impl TargetNavigationLoadInputs {
     }
 }
 
-fn apply_referrer_header(headers: &mut Vec<(String, String)>, referrer: Option<&str>) {
+fn apply_referrer_header(headers: &mut moli_fetch::RequestHeaders, referrer: Option<&str>) {
     let Some(referrer) = referrer else {
         return;
     };
     headers.retain(|(name, _)| !name.eq_ignore_ascii_case("referer"));
-    headers.push(("Referer".to_owned(), referrer.to_owned()));
+    headers.push(("Referer".to_owned(), referrer.as_bytes().to_vec()));
 }
 
-fn apply_user_agent_header(headers: &mut Vec<(String, String)>, user_agent: &str) {
+fn apply_user_agent_header(headers: &mut moli_fetch::RequestHeaders, user_agent: &str) {
     if !headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
     {
-        headers.push(("User-Agent".to_owned(), user_agent.to_owned()));
+        headers.push(("User-Agent".to_owned(), user_agent.as_bytes().to_vec()));
     }
 }
 
@@ -460,19 +525,15 @@ fn target_navigation_initiator_url(target_url: &str, loaded_page: Option<&Page>)
     url.host_str().is_some().then_some(url)
 }
 
-fn clear_page_runtime_remote_object_tracking(state: &mut crate::conn::state::PageTargetHost) {
+fn clear_page_runtime_context_metadata(state: &mut crate::conn::state::PageTargetHost) {
     for session in state.devtools_sessions.states_mut() {
-        session.clear_runtime_remote_object_tracking();
+        session.clear_runtime_context_metadata();
     }
 }
 
 fn clear_page_loaded_document_session_state(state: &mut crate::conn::state::PageTargetHost) {
-    clear_page_runtime_remote_object_tracking(state);
-    for session in state.devtools_sessions.states_mut() {
-        session
-            .page_session_state
-            .clear_loaded_document_context_state();
-    }
+    clear_page_runtime_context_metadata(state);
+    state.clear_loaded_document_context_state();
 }
 
 fn renderer_runtime_inspector_session_id(session_key: &DevToolsSessionKey) -> Option<String> {
@@ -480,6 +541,22 @@ fn renderer_runtime_inspector_session_id(session_key: &DevToolsSessionKey) -> Op
 }
 
 impl<'a> TargetSessionOwnerRef<'a> {
+    pub(super) fn navigation_browsing_context_group(
+        &self,
+        browser_initiated: bool,
+    ) -> crate::conn::state::NavigationBrowsingContextGroup {
+        let group = self.target().window_identity().name().group();
+        let target = self.target();
+        target
+            .owner_state
+            .navigation_history_state
+            .browsing_context_group_for_navigation(
+                group,
+                target.loaded_page().map(Page::final_url),
+                browser_initiated,
+            )
+    }
+
     fn target(&self) -> &'a crate::conn::PageTargetHost {
         self.browser_context
             .page_target(&self.target_id)
@@ -506,6 +583,13 @@ impl<'a> TargetSessionOwnerRef<'a> {
 
     pub(super) fn runtime_session_state(&self) -> Option<&'a TargetRuntimeSessionState> {
         self.devtools_session_state()
+            .map(|state| &state.runtime_session_state)
+    }
+
+    pub(super) fn runtime_configuration(&self) -> Option<&'a TargetRuntimeSessionState> {
+        self.target()
+            .devtools_sessions
+            .session_for_configuration(&self.session_key)
             .map(|state| &state.runtime_session_state)
     }
 
@@ -588,7 +672,7 @@ impl<'a> TargetSessionOwnerRef<'a> {
 
     pub(super) fn frame_tree_loader_id(&self) -> Option<String> {
         self.runtime_slot()
-            .committed_document_loader_id()
+            .frame_tree_document_loader_id()
             .map(str::to_owned)
             .or_else(|| {
                 self.target_owner_state()
@@ -660,6 +744,16 @@ impl<'a> TargetSessionOwnerMut<'a> {
 
     fn page_snapshot(&self) -> Option<(String, String)> {
         let target = self.target();
+        // Native history already describes the new Document. Until adoption,
+        // the loaded Page's cached title still belongs to its predecessor.
+        if target
+            .runtime_slot()
+            .page_slot()
+            .prepared_document_output_binding()
+            .is_some()
+        {
+            return None;
+        }
         target
             .runtime_slot()
             .loaded_page()
@@ -712,12 +806,18 @@ impl<'a> TargetSessionOwnerMut<'a> {
         f(&mut self.target_mut().owner_state)
     }
 
+    pub(super) fn subresource_response_is_paused(&self, request_id: &str) -> bool {
+        self.target()
+            .fetch_owner
+            .subresource_response_is_paused(request_id)
+    }
+
     pub(super) fn configure_fetch(
         &mut self,
         command_session_id: Option<String>,
         handle_auth_requests: bool,
         patterns: Vec<FetchInterceptionPattern>,
-    ) -> (bool, Option<moli_core::page::SubresourceResourceType>) {
+    ) -> moli_core::page::SubresourceInterceptionClasses {
         let target = self.target_mut();
         target
             .fetch_owner
@@ -732,7 +832,7 @@ impl<'a> TargetSessionOwnerMut<'a> {
         handle_auth_requests: bool,
         auth_url_patterns: Vec<String>,
         patterns: Vec<FetchInterceptionPattern>,
-    ) -> (bool, Option<moli_core::page::SubresourceResourceType>) {
+    ) -> moli_core::page::SubresourceInterceptionClasses {
         let target = self.target_mut();
         target.fetch_owner.add_network_intercept(
             intercept_id,
@@ -747,7 +847,7 @@ impl<'a> TargetSessionOwnerMut<'a> {
     pub(super) fn remove_network_intercept(
         &mut self,
         intercept_id: &str,
-    ) -> Option<(bool, Option<moli_core::page::SubresourceResourceType>)> {
+    ) -> Option<moli_core::page::SubresourceInterceptionClasses> {
         let target = self.target_mut();
         target
             .fetch_owner
@@ -768,29 +868,32 @@ impl<'a> TargetSessionOwnerMut<'a> {
                 .fetch_owner
                 .drain_pending_requests_for_disable_session(session_id)
         } else {
-            empty_pending_fetch_state()
+            DrainedFetchRequests::default()
         };
         let page_update_required = removed && previous_subresource_config != subresource_config;
         (pending, subresource_config, page_update_required)
     }
 
-    pub(super) fn drain_fetch_pending_state(
+    pub(super) fn disable_target_fetch_and_drain_pending_state(
         &mut self,
-    ) -> (
-        Vec<PendingFetchNavigation>,
-        Vec<PendingFetchAuthNavigation>,
-        Vec<PausedDocumentTransfer>,
-        Vec<(String, PendingSubresourceFetchRequest)>,
-        Vec<(String, PendingSubresourceFetchAuthRequest)>,
-        Vec<(String, PendingSubresourceFetchResponseRequest)>,
-    ) {
+    ) -> FetchDisableStateWithSubresourceConfig {
+        let target = self.target_mut();
+        let previous = target.fetch_owner.subresource_interception_config();
+        target.fetch_owner.reset_config();
+        let config = target.fetch_owner.subresource_interception_config();
+        let pending = target.fetch_owner.drain_pending_requests();
+        (pending, config, previous != config)
+    }
+
+    pub(super) fn drain_fetch_pending_state(&mut self) -> DrainedFetchRequests {
         self.target_mut().fetch_owner.drain_pending_requests()
     }
 
-    pub(super) async fn mark_target_crashed_async(&mut self) -> Option<()> {
+    fn take_crashed_page(&mut self) -> Option<Page> {
         let target = self.target_mut();
         target.owner_state.target_crash_state.mark_crashed();
         target.owner_state.navigation_history_state.clear();
+        target.owner_state.navigation_history_document = None;
         target.owner_state.clear_loaded_document_context_state();
         clear_page_loaded_document_session_state(target);
         target.fetch_owner.clear_pending();
@@ -802,16 +905,10 @@ impl<'a> TargetSessionOwnerMut<'a> {
         target
             .runtime_slot
             .reset_all_target_scoped_network_artifacts();
-        if let Some(page) = previous {
-            let _ = page.close_async().await;
-        }
-        Some(())
+        previous
     }
 
-    pub(super) async fn discard_loaded_page_after_failed_navigation_async(
-        &mut self,
-        final_url: &Url,
-    ) -> Option<()> {
+    fn take_loaded_page_after_failed_navigation(&mut self, final_url: &Url) -> Option<Page> {
         let next_url = final_url.to_string();
         let security_origin = final_url.origin().ascii_serialization();
         let target = self.target_mut();
@@ -828,10 +925,7 @@ impl<'a> TargetSessionOwnerMut<'a> {
             .clear_loaded_page_with_reason(TargetPageAbsenceReason::NavigationFailed);
         target.runtime_slot.reset_subresource_cursor();
         target.runtime_slot.clear_websocket_artifacts();
-        if let Some(page) = previous {
-            let _ = page.close_async().await;
-        }
-        Some(())
+        previous
     }
 
     pub(super) fn runtime_slot_mut(&mut self) -> &mut TargetRuntimeSlot {
@@ -864,15 +958,6 @@ impl<'a> TargetSessionOwnerMut<'a> {
             .navigation_history_entry_url(page_snapshot, entry_id)
     }
 
-    pub(super) fn reset_navigation_history(&mut self) -> Option<bool> {
-        let page_snapshot = self.page_snapshot();
-        Some(
-            self.target_mut()
-                .owner_state
-                .reset_navigation_history(page_snapshot),
-        )
-    }
-
     pub(super) fn can_reset_navigation_history(&mut self) -> Option<bool> {
         let page_snapshot = self.page_snapshot();
         Some(
@@ -899,10 +984,10 @@ impl<'a> TargetSessionOwnerMut<'a> {
         Some(())
     }
 
-    pub(super) fn record_same_document_navigation(
+    pub(super) fn record_session_history_update(
         &mut self,
         url: &Url,
-        history_update: moli_core::page::SameDocumentHistoryUpdate,
+        history_update: moli_core::page::SessionHistoryUpdateKind,
     ) -> Option<String> {
         let next_url = url.to_string();
         let security_origin = url.origin().ascii_serialization();
@@ -912,7 +997,7 @@ impl<'a> TargetSessionOwnerMut<'a> {
             .map(|(_, title)| title.clone())
             .unwrap_or_default();
         let target = self.target_mut();
-        target.owner_state.record_same_document_navigation_history(
+        target.owner_state.record_session_history_update(
             page_snapshot,
             next_url.clone(),
             title,
@@ -925,8 +1010,8 @@ impl<'a> TargetSessionOwnerMut<'a> {
 
     pub(super) fn effective_extra_headers_for_target_policy(
         &self,
-        headers: Vec<(String, String)>,
-    ) -> Vec<(String, String)> {
+        headers: moli_fetch::RequestHeaders,
+    ) -> moli_fetch::RequestHeaders {
         self.browser_context
             .merged_extra_headers_for_target_policy(&headers)
     }
@@ -996,7 +1081,12 @@ impl<'a> TargetSessionOwnerMut<'a> {
                         .map(|_| FetchRequestStage::Response)
                 })
                 .or_else(|| {
-                    document_fetch_response_stage_candidate.then_some(FetchRequestStage::Response)
+                    (document_fetch_response_stage_candidate
+                        || (!is_data_url
+                            && fetch_snapshot.has_request_stage_candidate(
+                                DevToolsNetworkResourceType::Document,
+                            )))
+                    .then_some(FetchRequestStage::Response)
                 });
             let document_fetch_event_session_id = document_request_pause
                 .as_ref()
@@ -1045,35 +1135,6 @@ impl<'a> TargetSessionOwnerMut<'a> {
         }
     }
 
-    pub(super) fn prepare_loaded_navigation_commit(
-        &mut self,
-    ) -> Option<TargetLoadedNavigationCommitState> {
-        {
-            let target = self.target();
-            let page_state = target;
-            let devtools_session_state = page_state.devtools_sessions.session(&self.session_key);
-            Some(TargetLoadedNavigationCommitState {
-                browser_context_id: self.browser_context.id.clone(),
-                runtime_frontend_enabled: devtools_session_state
-                    .map(|state| state.runtime_session_state.runtime_frontend_enabled)
-                    .unwrap_or_default(),
-                renderer_runtime_inspector_session_id: renderer_runtime_inspector_session_id(
-                    &self.session_key,
-                ),
-                runtime_inspector_session_restore_snapshots: page_state
-                    .devtools_sessions
-                    .runtime_inspector_restore_snapshots(),
-                stored_runtime_bindings: page_state
-                    .devtools_sessions
-                    .runtime_bindings_for_renderer(),
-                session_runtime_bindings: devtools_session_state
-                    .map(|state| state.runtime_bindings.clone())
-                    .unwrap_or_default(),
-                fetch_subresource_config: target.fetch_owner.subresource_interception_config(),
-            })
-        }
-    }
-
     pub(super) fn commit_loaded_navigation_target_identity(
         &mut self,
         main_document_commit: &RendererMainDocumentCommit,
@@ -1083,11 +1144,59 @@ impl<'a> TargetSessionOwnerMut<'a> {
         let security_origin = main_document_commit.security_origin.clone();
         let secure_context_type = main_document_commit.secure_context_type.clone();
         let target = self.target_mut();
-        target.set_target_url(next_url);
+        let native_source = target
+            .runtime_slot
+            .page_slot()
+            .prepared_document_output_binding()
+            .map(|(page, binding)| (page, binding.renderer_document))
+            .or_else(|| {
+                Some((
+                    crate::conn::RendererPageResidenceIdentity::from_page(
+                        target.runtime_slot.loaded_page()?,
+                    ),
+                    target
+                        .runtime_slot
+                        .page_slot()
+                        .renderer_document_lifecycle_binding()?
+                        .renderer_document,
+                ))
+            });
+        if native_source.is_none()
+            || target.owner_state.navigation_history_document != native_source
+        {
+            target.set_target_url(next_url);
+        }
         target.set_target_security_origin(security_origin);
         target.set_target_secure_context_type(secure_context_type);
         target.owner_state.mark_initial_empty_document_exited();
         Some(())
+    }
+
+    pub(super) fn record_native_navigation_history(
+        &mut self,
+        renderer_page: crate::conn::RendererPageResidenceIdentity,
+        document: moli_core::RendererDocumentLifecycleIdentity,
+        url: &Url,
+    ) {
+        let group = self.target().window_identity().name().group();
+        let target = self.target_mut();
+        if target.owner_state.navigation_history_document
+            == Some((renderer_page, document.document))
+        {
+            return;
+        }
+        if let Some(previous_title) = target.owner_state.committed_document_title.take() {
+            target
+                .owner_state
+                .refresh_current_navigation_history_title(previous_title);
+        }
+        target
+            .owner_state
+            .record_loaded_page_navigation_history_with_group(
+                (url.to_string(), String::new()),
+                Some(group),
+            );
+        target.owner_state.navigation_history_document = Some((renderer_page, document.document));
     }
 
     pub(super) fn clear_pending_navigation_history_update(&mut self) -> Option<()> {
@@ -1097,29 +1206,111 @@ impl<'a> TargetSessionOwnerMut<'a> {
         Some(())
     }
 
-    pub(super) async fn commit_loaded_navigation_page_async(
+    pub(super) fn install_loaded_navigation_page(
         &mut self,
         page: Page,
         renderer_attachment_commit: LoadedNavigationRendererAttachmentCommit,
         history_url: &Url,
-    ) -> Option<anyhow::Result<LoadedNavigationPageCommit>> {
+        document: moli_core::RendererDocumentLifecycleIdentity,
+    ) -> Option<Result<InstalledNavigationPage>> {
         let browser_context_id = self.browser_context.id.clone();
+        let group = self.target().window_identity().name().group();
         Some(
             self.browser_context
                 .page_target_mut(&self.target_id)
                 .expect("resolved Page target owner must remain live")
-                .commit_loaded_navigation_page_async(
+                .install_loaded_navigation_page(
                     &browser_context_id,
                     page,
                     renderer_attachment_commit,
                     history_url,
-                )
-                .await,
+                    document,
+                    group,
+                ),
         )
     }
 }
 
 impl CdpConnection {
+    pub(crate) fn target_is_closing_for_owner(&self, owner: &CommandOwnerScope) -> bool {
+        if owner
+            .resolve_route(self)
+            .as_ref()
+            .and_then(crate::conn::CdpSessionRoute::browser_context_id)
+            .and_then(|id| self.browser_context_by_id(id))
+            .is_some_and(|context| context.closing)
+        {
+            return true;
+        }
+        if let Some(crate::conn::CdpSessionRoute::DedicatedWorkerTarget {
+            browser_context_id,
+            target_id,
+        }) = owner.resolve_route(self)
+        {
+            return self
+                .browser_context_by_id(&browser_context_id)
+                .and_then(|context| context.dedicated_worker_target(&target_id))
+                .is_some_and(|target| target.is_retiring());
+        }
+        self.target_session_owner_ref_for_owner(owner)
+            .is_some_and(|owner| owner.target().closing)
+    }
+
+    pub(crate) fn page_target_is_closing(&self, target_id: &str) -> bool {
+        self.target_session_route_for_target_id(target_id)
+            .map(CommandOwnerScope::for_route)
+            .is_some_and(|owner| self.target_is_closing_for_owner(&owner))
+    }
+
+    pub(crate) fn mark_page_target_closing(&mut self, owner: &CommandOwnerScope) {
+        let Some((_, Some(target_id))) = self.target_owner_identity_for_owner(owner) else {
+            return;
+        };
+        if let Some(mut owner) = self.target_session_owner_mut_for_owner(owner) {
+            let target = owner.target_mut();
+            target.closing = true;
+            // Attachment may already be prepared but not yet committed to
+            // the control plane. Its session state must close as well.
+            for state in target.devtools_sessions.states_mut() {
+                state.lifecycle.mark_closing();
+            }
+        }
+        let mut sessions = self.attached_sessions_for_target(&target_id);
+        if let Some(tab) = self.tab_target_id_for_page_target_id(&target_id) {
+            sessions.extend(self.attached_sessions_for_target(tab));
+        }
+        for session in sessions {
+            if let Some(route) = self.session_route(Some(&session))
+                && let Some(plan) =
+                    crate::conn::SessionDisposalPlan::for_session_route(&session, &route)
+            {
+                self.mark_session_closing(&plan);
+            }
+        }
+    }
+
+    pub(crate) fn page_target_host_identity_for_owner(
+        &self,
+        owner: &CommandOwnerScope,
+    ) -> Option<crate::conn::PageTargetHostIdentity> {
+        Some(
+            self.target_session_owner_ref_for_owner(owner)?
+                .target()
+                .host_identity(),
+        )
+    }
+
+    pub(crate) fn navigation_browsing_context_group_for_owner(
+        &self,
+        owner: &CommandOwnerScope,
+        browser_initiated: bool,
+    ) -> Option<crate::conn::state::NavigationBrowsingContextGroup> {
+        Some(
+            self.target_session_owner_ref_for_owner(owner)?
+                .navigation_browsing_context_group(browser_initiated),
+        )
+    }
+
     pub(crate) fn effective_page_bypass_csp_enabled_for_session_owner(
         &self,
         session_id: Option<&str>,
@@ -1207,34 +1398,61 @@ impl CdpConnection {
             .register_pending_fetch_navigation_request(pending)
     }
 
-    pub(crate) fn prepare_loaded_navigation_commit_for_owner(
-        &mut self,
-        owner: &crate::conn::CommandOwnerScope,
-    ) -> Option<TargetLoadedNavigationCommitState> {
-        self.target_session_owner_mut_for_owner(owner)?
-            .prepare_loaded_navigation_commit()
-    }
-
     pub(crate) fn commit_loaded_navigation_target_identity_for_owner(
         &mut self,
         owner: &crate::conn::CommandOwnerScope,
         main_document_commit: &RendererMainDocumentCommit,
         target_url: &Url,
     ) -> Option<()> {
-        self.target_session_owner_mut_for_owner(owner)?
-            .commit_loaded_navigation_target_identity(main_document_commit, target_url)
+        let prepared_source = self
+            .runtime_session_owner_slot_for_owner(owner)?
+            .page_slot()
+            .prepared_document_output_binding()
+            .map(|(page, binding)| (page, binding.renderer_document_identity()));
+        let mut target = self.target_session_owner_mut_for_owner(owner)?;
+        target.commit_loaded_navigation_target_identity(main_document_commit, target_url)?;
+        if let Some((page, document)) = prepared_source {
+            target.record_native_navigation_history(page, document, target_url);
+        }
+        Some(())
     }
 
-    pub(crate) async fn commit_loaded_navigation_page_for_owner_async(
+    pub(crate) fn install_loaded_navigation_page_for_owner(
         &mut self,
         owner: &crate::conn::CommandOwnerScope,
         page: Page,
         renderer_attachment_commit: LoadedNavigationRendererAttachmentCommit,
         history_url: &Url,
-    ) -> Option<anyhow::Result<LoadedNavigationPageCommit>> {
+        document: moli_core::RendererDocumentLifecycleIdentity,
+    ) -> Option<Result<InstalledNavigationPage>> {
         self.target_session_owner_mut_for_owner(owner)?
-            .commit_loaded_navigation_page_async(page, renderer_attachment_commit, history_url)
-            .await
+            .install_loaded_navigation_page(page, renderer_attachment_commit, history_url, document)
+    }
+
+    pub(crate) fn commit_existing_page_navigation_for_owner(
+        &mut self,
+        owner: &crate::conn::CommandOwnerScope,
+        expected: &crate::conn::StablePageNavigationCommitTarget,
+        transaction: crate::conn::CommittedRendererAgentAttachment,
+        history_url: &Url,
+        document: moli_core::RendererDocumentLifecycleIdentity,
+    ) -> Option<Result<LoadedNavigationPageCommit>> {
+        if self
+            .target_page_residence_identity_for_owner(owner)
+            .as_ref()
+            != Some(&expected.target_page)
+        {
+            return None;
+        }
+        let mut resolved = self.target_session_owner_mut_for_owner(owner)?;
+        let group = resolved.target().window_identity().name().group();
+        Some(resolved.target_mut().commit_existing_page_navigation(
+            expected,
+            transaction,
+            history_url,
+            document,
+            group,
+        ))
     }
 
     pub(crate) fn initial_document_page_owner_for_owner(
@@ -1245,27 +1463,32 @@ impl CdpConnection {
         Some(InitialDocumentPageOwner {
             browser_context_id,
             target_id: target_id?,
+            page_owner: None,
         })
     }
 
-    pub(crate) async fn install_initial_loaded_page_for_page_owner_async(
+    pub(crate) fn install_initial_loaded_page_for_page_owner(
         &mut self,
         owner: &InitialDocumentPageOwner,
         page: Page,
         page_creation_artifacts: RendererPageCreationArtifacts,
-    ) -> Result<InitialDocumentPageInstallResult, String> {
+    ) -> (Result<InitialDocumentPageInstallResult>, Option<Page>) {
         let Some(browser_context) = self.browser_context_by_id_mut(&owner.browser_context_id)
         else {
-            let _ = page.close_async().await;
-            return Ok(InitialDocumentPageInstallResult::Stale);
+            return (Ok(InitialDocumentPageInstallResult::Stale), Some(page));
         };
-        if !browser_context.can_install_current_initial_empty_document_page(&owner.target_id) {
-            let _ = page.close_async().await;
-            return Ok(InitialDocumentPageInstallResult::Stale);
+        if !browser_context.can_install_current_initial_empty_document_page(&owner.target_id)
+            || owner.page_owner.as_ref().is_some_and(|expected| {
+                browser_context
+                    .page_target(&owner.target_id)
+                    .and_then(|target| target.runtime_slot.pending_page_attachment_id())
+                    != Some(expected.page_attachment_id())
+            })
+        {
+            return (Ok(InitialDocumentPageInstallResult::Stale), Some(page));
         }
         let Some(target) = browser_context.page_target_mut(&owner.target_id) else {
-            let _ = page.close_async().await;
-            return Err("TargetNotLoaded".to_owned());
+            return (Err(crate::conn::NoDocumentLoaded.into()), Some(page));
         };
         let loader_id = target
             .owner_state
@@ -1292,12 +1515,11 @@ impl CdpConnection {
                     loader_id,
                 );
         }
-        browser_context
-            .assert_target_materialized_initial_empty_document_has_page(&owner.target_id)?;
-        if let Some(page) = previous {
-            let _ = page.close_async().await;
-        }
-        Ok(InitialDocumentPageInstallResult::Installed)
+        let result = browser_context
+            .assert_target_materialized_initial_empty_document_has_page(&owner.target_id)
+            .map(|()| InitialDocumentPageInstallResult::Installed)
+            .map_err(Into::into);
+        (result, previous)
     }
 
     pub(crate) fn clear_pending_navigation_history_update_for_owner(
@@ -1308,33 +1530,51 @@ impl CdpConnection {
             .clear_pending_navigation_history_update()
     }
 
-    pub(crate) async fn mark_target_crashed_for_owner_async(
+    pub(crate) fn take_crashed_page_for_owner(
         &mut self,
         owner: &CommandOwnerScope,
-    ) -> Option<()> {
+    ) -> Option<Page> {
         self.target_session_owner_mut_for_owner(owner)?
-            .mark_target_crashed_async()
-            .await
+            .take_crashed_page()
     }
 
-    pub(crate) async fn discard_loaded_page_after_failed_navigation_for_owner_async(
+    pub(crate) fn take_loaded_page_after_failed_navigation_for_owner(
         &mut self,
         owner: &CommandOwnerScope,
+        token: &crate::conn::DocumentNavigationToken,
+        expected: Option<&crate::conn::StablePageNavigationCommitTarget>,
         final_url: &Url,
-    ) -> Option<()> {
+    ) -> Option<Page> {
+        // A session and even a renderer Page can survive multiple Documents.
+        // Cleanup requires both the failed navigation and its captured Page.
+        if !self.accepts_pending_document_navigation_for_owner(owner, token)
+            || self
+                .target_page_residence_identity_for_owner(owner)
+                .as_ref()
+                != expected.map(|expected| &expected.target_page)
+            || self.renderer_page_residence_identity_for_owner(owner)
+                != expected.map(|expected| expected.renderer_page)
+        {
+            return None;
+        }
         self.target_session_owner_mut_for_owner(owner)?
-            .discard_loaded_page_after_failed_navigation_async(final_url)
-            .await
+            .take_loaded_page_after_failed_navigation(final_url)
     }
 
-    async fn close_page_target_for_target_close_async(
+    pub(crate) fn start_page_target_close(
         &mut self,
         target_id: &str,
         out: &mut Vec<BackgroundProtocolEvent>,
         reason: &'static str,
-    ) -> Option<ClosedPageTarget> {
+    ) -> Option<PendingPageTargetClose> {
         let primary_route = self.target_session_route_for_target_id(target_id)?;
+        let browser_context_id = primary_route.browser_context_id()?.to_owned();
+        self.browser_context_by_id(&browser_context_id)?
+            .page_target(target_id)?;
         let primary_owner = CommandOwnerScope::for_route(primary_route);
+        out.extend(
+            crate::domains::page::dismiss_javascript_dialogs_for_target_close(self, &primary_owner),
+        );
         let session_owners = self
             .page_event_session_ids_for_owner(&primary_owner)
             .into_iter()
@@ -1356,14 +1596,34 @@ impl CdpConnection {
         }
         out.extend(claimed_await_events);
 
-        let (
-            mut target,
-            primary_session_id,
-            attached_session_ids,
-            collected_network_data_artifacts,
-        ) = {
-            let browser_context = self.browser_context.as_mut()?;
-            let target = browser_context.take_page_target_for_close(target_id)?;
+        for session_id in self.attached_sessions_for_target(target_id) {
+            if let Some(route) = self.session_route(Some(&session_id))
+                && let Some(plan) =
+                    crate::conn::SessionDisposalPlan::for_session_route(&session_id, &route)
+            {
+                self.mark_session_closing(&plan);
+            }
+        }
+
+        let (target, primary_session_id, attached_session_ids, collected_network_data_artifacts) = {
+            let browser_context = self.browser_context_by_id_mut(&browser_context_id)?;
+            let mut target = browser_context.take_page_target_for_close(target_id)?;
+            // Revoke installation and release modal waits in the finite close
+            // commit, before any queued Native teardown can wait on that Page.
+            target.javascript_dialog_state.clear();
+            target.runtime_slot.retire_javascript_dialog_scope();
+            if target
+                .runtime_slot
+                .has_initial_document_page_build_in_progress()
+            {
+                target
+                    .runtime_slot
+                    .fail_initial_document_page_build(reason.to_owned());
+            }
+            // Native teardown can be queued behind this request. Cancel it
+            // while retiring the host, rather than waiting for the owned host
+            // (and its request) to be dropped after teardown has completed.
+            target.runtime_slot.clear_document_navigation_state();
             let collected_network_data_artifacts =
                 target.runtime_slot.collected_network_data_artifacts();
             let attached_session_ids = target
@@ -1379,106 +1639,15 @@ impl CdpConnection {
                 collected_network_data_artifacts,
             )
         };
-        target.close_page_async().await;
-        self.record_collected_network_data_artifacts(collected_network_data_artifacts);
-
-        Some(ClosedPageTarget {
-            target_id: target_id.to_owned(),
-            primary_session_id,
-            attached_session_ids,
+        Some(PendingPageTargetClose {
+            target,
+            closed: ClosedPageTarget {
+                target_id: target_id.to_owned(),
+                primary_session_id,
+                attached_session_ids,
+            },
+            collected_network_data_artifacts,
         })
-    }
-
-    pub(crate) async fn close_background_page_target_for_target_close_async(
-        &mut self,
-        target_id: &str,
-        out: &mut Vec<BackgroundProtocolEvent>,
-        reason: &'static str,
-    ) -> Option<ClosedPageTarget> {
-        let is_background = self
-            .browser_context
-            .as_ref()
-            .is_some_and(|browser_context| {
-                browser_context.page_target(target_id).is_some()
-                    && !browser_context.is_active_target(target_id)
-            });
-        if !is_background {
-            return None;
-        }
-        self.close_page_target_for_target_close_async(target_id, out, reason)
-            .await
-    }
-
-    pub(crate) async fn close_active_page_target_for_target_close_async(
-        &mut self,
-        out: &mut Vec<BackgroundProtocolEvent>,
-        reason: &'static str,
-    ) -> Option<ClosedPageTarget> {
-        let target_id = self.browser_context.as_ref()?.active_target_id_owned()?;
-        let closed = self
-            .close_page_target_for_target_close_async(&target_id, out, reason)
-            .await?;
-        let selected_target_id = if let Some(browser_context) = self.browser_context.as_mut() {
-            browser_context.select_last_background_target_async().await
-        } else {
-            None
-        };
-        self.refresh_active_browser_context_loader_async().await;
-        if let Some(selected_target_id) = selected_target_id {
-            self.notify_target_host_activated(&selected_target_id);
-            out.extend(
-                self.page_screencast_session_ids_for_target(&selected_target_id)
-                    .into_iter()
-                    .map(|session_id| {
-                        BackgroundProtocolEvent::page_screencast_visibility_changed(
-                            session_id.as_deref(),
-                            true,
-                        )
-                    }),
-            );
-        }
-
-        Some(closed)
-    }
-
-    pub(crate) async fn rollback_incomplete_popup_target_without_event_async(
-        &mut self,
-        browser_context_id: Option<&str>,
-        target_id: &str,
-    ) {
-        self.rollback_top_level_target_tab_sessions_without_event(target_id);
-
-        let browser_context_id = browser_context_id.map(str::to_owned).or_else(|| {
-            self.browser_contexts()
-                .find(|browser_context| {
-                    browser_context.is_active_target(target_id)
-                        || browser_context.background_target(target_id).is_some()
-                })
-                .map(|browser_context| browser_context.id.clone())
-        });
-
-        let mut page_session_ids = Vec::new();
-        if let Some(browser_context_id) = browser_context_id {
-            let target = self
-                .browser_context_by_id_mut(&browser_context_id)
-                .and_then(|browser_context| browser_context.take_page_target_for_close(target_id));
-            if let Some(mut target) = target {
-                page_session_ids.extend(
-                    target
-                        .devtools_sessions
-                        .attached_session_ids()
-                        .map(str::to_owned),
-                );
-                if let Some(session_id) = target.session_id() {
-                    page_session_ids.push(session_id.to_owned());
-                }
-                target.close_page_async().await;
-            }
-        }
-
-        for session_id in page_session_ids {
-            self.rollback_attached_session_without_event(&session_id);
-        }
     }
 
     pub(crate) fn target_session_owner_aggregate_fetch_config_for_owner(
@@ -1507,6 +1676,20 @@ impl CdpConnection {
             .page_session_state()
     }
 
+    pub(crate) fn owner_has_pending_javascript_dialog(&self, owner: &CommandOwnerScope) -> bool {
+        self.target_session_owner_ref_for_owner(owner)
+            .is_some_and(|owner| owner.target().has_pending_javascript_dialog())
+    }
+
+    /// Includes dialogs from the addressed Page's child frames and DevTools sessions.
+    pub fn has_pending_javascript_dialog_for_devtools_context(
+        &self,
+        context: &AutomationContext,
+    ) -> bool {
+        self.command_owner_scope_for_devtools_context(context)
+            .is_some_and(|owner| self.owner_has_pending_javascript_dialog(&owner))
+    }
+
     pub(crate) fn target_devtools_session_state_for_session(
         &self,
         session_id: Option<&str>,
@@ -1523,6 +1706,23 @@ impl CdpConnection {
             .devtools_session_state()
     }
 
+    pub(crate) fn with_target_javascript_dialog_state_for_owner_mut<R>(
+        &mut self,
+        owner: &CommandOwnerScope,
+        f: impl FnOnce(&mut crate::conn::TargetJavaScriptDialogState) -> R,
+    ) -> Option<R> {
+        let mut authoritative = self.target_session_owner_mut_for_owner(owner)?;
+        Some(f(&mut authoritative.target_mut().javascript_dialog_state))
+    }
+
+    pub(crate) fn target_javascript_dialog_state_for_owner(
+        &self,
+        owner: &CommandOwnerScope,
+    ) -> Option<&crate::conn::TargetJavaScriptDialogState> {
+        let authoritative = self.target_session_owner_ref_for_owner(owner)?;
+        Some(&authoritative.target().javascript_dialog_state)
+    }
+
     pub(crate) fn target_runtime_session_state_for_session(
         &self,
         session_id: Option<&str>,
@@ -1537,6 +1737,14 @@ impl CdpConnection {
     ) -> Option<&TargetRuntimeSessionState> {
         self.target_session_owner_ref_for_owner(owner)?
             .runtime_session_state()
+    }
+
+    pub(crate) fn target_runtime_configuration_for_owner(
+        &self,
+        owner: &CommandOwnerScope,
+    ) -> Option<&TargetRuntimeSessionState> {
+        self.target_session_owner_ref_for_owner(owner)?
+            .runtime_configuration()
     }
 
     pub(crate) fn target_runtime_bindings_for_renderer_owner(
@@ -1607,7 +1815,7 @@ impl CdpConnection {
         self.target_owner_identity_for_owner(owner)
             .and_then(|(browser_context_id, _)| self.browser_context_by_id(&browser_context_id))
             .is_some_and(|browser_context| {
-                browser_context.has_default_bidi_channel_preload_script()
+                browser_context.has_context_bidi_channel_preload_script()
             })
     }
 
@@ -1630,7 +1838,7 @@ impl CdpConnection {
         {
             handoffs.extend(
                 browser_context
-                    .default_document_start_scripts
+                    .context_preload_scripts
                     .iter()
                     .flat_map(|(_, script)| script.bidi_channel_handoffs.clone()),
             );
@@ -1730,8 +1938,7 @@ impl CdpConnection {
                 .map(str::to_owned)
         });
         let page_attachment_id = self
-            .runtime_session_owner_slot_for_owner(owner)
-            .ok()?
+            .runtime_session_owner_slot_for_owner(owner)?
             .page_attachment_id()?;
         Some(TargetPageResidenceIdentity::new(
             browser_context_id,
@@ -1758,8 +1965,7 @@ impl CdpConnection {
                 .map(str::to_owned)
         });
         let page_attachment_id = self
-            .runtime_session_owner_slot_for_owner(owner)
-            .ok()?
+            .runtime_session_owner_slot_for_owner(owner)?
             .pending_page_attachment_id()?;
         Some(TargetPageResidenceIdentity::new(
             browser_context_id,
@@ -1780,8 +1986,7 @@ impl CdpConnection {
                 .map(str::to_owned)
         });
         let page_attachment_id = self
-            .runtime_session_owner_slot_mut_for_owner(owner)
-            .ok()?
+            .runtime_session_owner_slot_mut_for_owner(owner)?
             .reserve_renderer_page_attachment(renderer_page);
         Some(TargetPageResidenceIdentity::new(
             browser_context_id,
@@ -1802,12 +2007,92 @@ impl CdpConnection {
             })
     }
 
+    /// Output may belong to a Native commit before the Page handle is adopted.
+    /// This grants no permission to execute Page commands during that handoff.
+    pub(crate) fn target_page_output_residence_is_current(
+        &self,
+        expected: &TargetPageResidenceIdentity,
+    ) -> bool {
+        self.browser_context_by_id(expected.browser_context_id())
+            .is_some_and(|context| context.target_page_output_residence_is_current(expected))
+    }
+
+    /// Captures a revocable native capability only after the publication's
+    /// original Page identity has been admitted. Current Page access remains
+    /// guarded separately while a navigation is awaiting adoption.
+    pub(crate) fn capture_document_output_command_target(
+        &mut self,
+        owner: &CommandOwnerScope,
+        page_owner: &crate::conn::TargetPageResidenceIdentity,
+        renderer_page: crate::conn::RendererPageResidenceIdentity,
+        document: moli_core::RendererDocumentLifecycleIdentity,
+    ) -> Result<moli_core::page::PageDocumentCommandTarget> {
+        if document.frame.page_id != renderer_page.page_id()
+            || !self
+                .runtime_session_owner_slot_for_owner(owner)
+                .is_some_and(|slot| {
+                    slot.routes_current_renderer_page_owner(
+                        renderer_page,
+                        page_owner.page_attachment_id(),
+                    )
+                })
+        {
+            return Err(crate::conn::NoDocumentLoaded.into());
+        }
+        if let Some(page) = self.loaded_page_mut_for_owner(owner)
+            && crate::conn::RendererPageResidenceIdentity::from_page(page) == renderer_page
+        {
+            return page.document_command_target(document);
+        }
+        let inputs = self.navigation_load_inputs_for_owner(owner);
+        self.navigation_engine_for_load_inputs_mut(&inputs)
+            .ok_or(crate::conn::NoDocumentLoaded)?
+            .document_command_target(renderer_page.owner_local_host_id(), document)
+    }
+
+    pub(crate) fn target_page_output_attachment_for_renderer_page(
+        &self,
+        owner: &CommandOwnerScope,
+        renderer_page: crate::conn::RendererPageResidenceIdentity,
+    ) -> Option<crate::conn::TargetPageProtocolAttachmentIdentity> {
+        let slot = self.runtime_session_owner_slot_for_owner(owner)?;
+        [
+            self.target_page_residence_identity_for_owner(owner),
+            self.pending_target_page_residence_identity_for_owner(owner),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|page| {
+            slot.routes_current_renderer_page_owner(renderer_page, page.page_attachment_id())
+                && self.target_page_output_residence_is_current(page)
+        })
+        .map(|page| {
+            crate::conn::TargetPageProtocolAttachmentIdentity::new(
+                page,
+                owner.session_id().map(str::to_owned),
+            )
+        })
+    }
+
+    pub(crate) fn target_page_output_attachment_is_current(
+        &self,
+        expected: &crate::conn::TargetPageProtocolAttachmentIdentity,
+    ) -> bool {
+        if self.target_page_protocol_attachment_identity_is_current(expected) {
+            return true;
+        }
+        let owner = CommandOwnerScope::for_page_attachment(expected);
+        self.pending_target_page_residence_identity_for_owner(&owner)
+            .as_ref()
+            == Some(expected.page_owner())
+            && self.target_page_output_residence_is_current(expected.page_owner())
+    }
+
     pub(crate) fn capture_target_page_residence_token_for_owner(
         &mut self,
         owner: &CommandOwnerScope,
     ) -> Option<crate::conn::TargetPageResidenceToken> {
-        self.runtime_session_owner_slot_mut_for_owner(owner)
-            .ok()?
+        self.runtime_session_owner_slot_mut_for_owner(owner)?
             .page_slot_mut()
             .page_residence_token()
     }
@@ -1826,7 +2111,8 @@ impl CdpConnection {
         owner: &CommandOwnerScope,
     ) -> Option<crate::conn::TargetPageProtocolAttachmentIdentity> {
         Some(crate::conn::TargetPageProtocolAttachmentIdentity::new(
-            self.target_page_residence_identity_for_owner(owner)?,
+            self.target_page_residence_identity_for_owner(owner)
+                .or_else(|| self.pending_target_page_residence_identity_for_owner(owner))?,
             owner.session_id().map(str::to_owned),
         ))
     }
@@ -1849,8 +2135,7 @@ impl CdpConnection {
         &self,
         owner: &CommandOwnerScope,
     ) -> Option<crate::conn::RendererPageResidenceIdentity> {
-        self.runtime_session_owner_slot_for_owner(owner)
-            .ok()?
+        self.runtime_session_owner_slot_for_owner(owner)?
             .loaded_page()
             .map(crate::conn::RendererPageResidenceIdentity::from_page)
     }
@@ -1865,12 +2150,12 @@ impl CdpConnection {
     /// time. Looking it up again during drain could route an old Page's
     /// response or notification through a replacement Page or an unrelated
     /// contextual command session.
-    pub(crate) fn target_page_protocol_attachment_identity_for_renderer_inspector_owner(
+    pub(crate) fn renderer_inspector_protocol_owner_for_source(
         &self,
         source_owner: &crate::conn::CommandOwnerScope,
         renderer_inspector_session_id: Option<&str>,
-    ) -> Option<crate::conn::TargetPageProtocolAttachmentIdentity> {
-        let source = self.target_page_protocol_attachment_identity_for_owner(source_owner)?;
+    ) -> Option<CommandOwnerScope> {
+        let source_target = self.target_owner_identity_for_owner(source_owner)?;
         let protocol_session_id = renderer_inspector_session_id
             .map(str::to_owned)
             .or_else(|| self.runtime_session_owner_primary_session_id_for_owner(source_owner));
@@ -1878,9 +2163,10 @@ impl CdpConnection {
             .as_deref()
             .map(CommandOwnerScope::for_session)
             .unwrap_or_else(|| source_owner.clone());
-        let attachment =
-            self.target_page_protocol_attachment_identity_for_owner(&protocol_owner)?;
-        if attachment.page_owner() != source.page_owner()
+        if self
+            .target_owner_identity_for_owner(&protocol_owner)
+            .as_ref()
+            != Some(&source_target)
             || self
                 .target_renderer_runtime_inspector_session_id_for_owner(&protocol_owner)
                 .as_deref()
@@ -1888,7 +2174,25 @@ impl CdpConnection {
         {
             return None;
         }
-        Some(attachment)
+        Some(protocol_owner)
+    }
+
+    /// Derives an installed Page capability for DOM output and owner actions.
+    /// Runtime replies can settle without it; pending Document observations
+    /// use their exact Native Page output authority instead.
+    pub(crate) fn target_page_protocol_attachment_identity_for_renderer_inspector_owner(
+        &self,
+        source_owner: &CommandOwnerScope,
+        renderer_inspector_session_id: Option<&str>,
+    ) -> Option<crate::conn::TargetPageProtocolAttachmentIdentity> {
+        let source = self.target_page_protocol_attachment_identity_for_owner(source_owner)?;
+        let protocol_owner = self.renderer_inspector_protocol_owner_for_source(
+            source_owner,
+            renderer_inspector_session_id,
+        )?;
+        let attachment =
+            self.target_page_protocol_attachment_identity_for_owner(&protocol_owner)?;
+        (attachment.page_owner() == source.page_owner()).then_some(attachment)
     }
 
     /// Checks both the target Page residence and the session that originally
@@ -1909,15 +2213,6 @@ impl CdpConnection {
     /// Binds renderer-produced child-frame activity to the Page attachment
     /// that captured it and to the exact root Document reported by the same
     /// renderer snapshot.
-    pub(crate) fn target_root_document_protocol_attachment_identity_for_session(
-        &self,
-        session_id: Option<&str>,
-        root_document: moli_core::RendererDocumentLifecycleIdentity,
-    ) -> Option<crate::conn::TargetRootDocumentProtocolAttachmentIdentity> {
-        let owner = CommandOwnerScope::capture(self, session_id);
-        self.target_root_document_protocol_attachment_identity_for_owner(&owner, root_document)
-    }
-
     pub(crate) fn target_root_document_protocol_attachment_identity_for_owner(
         &self,
         owner: &CommandOwnerScope,
@@ -1931,6 +2226,51 @@ impl CdpConnection {
             .then_some(binding)
     }
 
+    /// Captures the exact Native Document that owns concrete child output.
+    /// It can already have committed while protocol adoption is still waiting;
+    /// this route grants no authority to start work on that unbound Document.
+    pub(crate) fn target_root_document_output_identity_for_owner(
+        &self,
+        owner: &CommandOwnerScope,
+        root_document: moli_core::RendererDocumentLifecycleIdentity,
+    ) -> Option<crate::conn::TargetRootDocumentProtocolAttachmentIdentity> {
+        let prepared = self
+            .runtime_session_owner_slot_for_owner(owner)?
+            .page_slot()
+            .prepared_document_output_binding();
+        let Some((_, binding)) = prepared else {
+            return self
+                .target_root_document_protocol_attachment_identity_for_owner(owner, root_document);
+        };
+        if binding.renderer_document_identity() != root_document {
+            return None;
+        }
+        let page_owner = self
+            .pending_target_page_residence_identity_for_owner(owner)
+            .filter(|page| page.page_attachment_id() == binding.page_attachment_id)
+            .or_else(|| self.target_page_residence_identity_for_owner(owner))
+            .filter(|page| page.page_attachment_id() == binding.page_attachment_id)?;
+        Some(
+            crate::conn::TargetRootDocumentProtocolAttachmentIdentity::new(
+                crate::conn::TargetPageProtocolAttachmentIdentity::new(
+                    page_owner,
+                    owner.session_id().map(str::to_owned),
+                ),
+                root_document,
+            ),
+        )
+    }
+
+    pub(crate) fn target_root_document_output_identity_is_current(
+        &self,
+        expected: &crate::conn::TargetRootDocumentProtocolAttachmentIdentity,
+    ) -> bool {
+        let owner = CommandOwnerScope::for_page_attachment(expected.attachment());
+        self.target_root_document_output_identity_for_owner(&owner, expected.root_document())
+            .as_ref()
+            == Some(expected)
+    }
+
     /// Authorizes deferred child-frame owner actions only while both the
     /// protocol attachment and the root renderer Document remain exact.
     pub(crate) fn target_root_document_protocol_attachment_identity_is_current(
@@ -1940,8 +2280,21 @@ impl CdpConnection {
         if !self.target_page_protocol_attachment_identity_is_current(expected.attachment()) {
             return false;
         }
-        self.runtime_session_owner_slot(expected.session_id())
-            .ok()
+        // An implicit attachment may belong to an unattached background Page.
+        // Its frozen residence, not the currently selected Page for session=None,
+        // determines which renderer Document has authority over this output.
+        let residence = expected.attachment().page_owner();
+        let route = match residence.target_id() {
+            Some(target_id) => CdpSessionRoute::PageTarget {
+                browser_context_id: residence.browser_context_id().to_owned(),
+                target_id: target_id.to_owned(),
+                session_key: moli_page_types::DevToolsSessionKey::Primary,
+            },
+            None => CdpSessionRoute::BrowserContext {
+                browser_context_id: residence.browser_context_id().to_owned(),
+            },
+        };
+        self.runtime_session_owner_slot_for_owner(&CommandOwnerScope::for_route(route))
             .and_then(|slot| slot.page_slot().renderer_document_lifecycle_binding())
             .map(crate::conn::CommittedRendererDocumentBinding::renderer_document_identity)
             == Some(expected.root_document())
@@ -1951,8 +2304,7 @@ impl CdpConnection {
         &self,
         owner: &CommandOwnerScope,
     ) -> Option<moli_core::RendererDocumentLifecycleIdentity> {
-        self.runtime_session_owner_slot_for_owner(owner)
-            .ok()?
+        self.runtime_session_owner_slot_for_owner(owner)?
             .page_slot()
             .renderer_document_lifecycle_binding()
             .map(crate::conn::CommittedRendererDocumentBinding::renderer_document_identity)
@@ -1969,6 +2321,20 @@ impl CdpConnection {
         browser_context_id: &str,
         target_id: &str,
     ) -> Option<crate::conn::TargetPageProtocolAttachmentIdentity> {
+        let owner = self.target_page_output_owner_for_target(browser_context_id, target_id)?;
+        let attachment = self.target_page_protocol_attachment_identity_for_owner(&owner)?;
+        (attachment.page_owner().browser_context_id() == browser_context_id
+            && attachment.page_owner().target_id() == Some(target_id))
+        .then_some(attachment)
+    }
+
+    /// Selects a frontend destination independently of Page-handle adoption.
+    /// This resolves session configuration and output routing, not Page access.
+    pub(crate) fn target_page_output_owner_for_target(
+        &self,
+        browser_context_id: &str,
+        target_id: &str,
+    ) -> Option<CommandOwnerScope> {
         let browser_context = self.browser_context_by_id(browser_context_id)?;
         let primary_session_id = if browser_context.is_active_target(target_id) {
             browser_context.active_session_id_owned()
@@ -1994,11 +2360,21 @@ impl CdpConnection {
                         .is_some_and(|active| active.id == browser_context_id))
                 .then_some(None)
             })?;
-        let attachment =
-            self.target_page_protocol_attachment_identity_for_session(session_id.as_deref())?;
-        (attachment.page_owner().browser_context_id() == browser_context_id
-            && attachment.page_owner().target_id() == Some(target_id))
-        .then_some(attachment)
+        let owner = session_id
+            .as_deref()
+            .map(CommandOwnerScope::for_session)
+            .unwrap_or_else(|| {
+                CommandOwnerScope::for_route(CdpSessionRoute::PageTarget {
+                    browser_context_id: browser_context_id.to_owned(),
+                    target_id: target_id.to_owned(),
+                    session_key: DevToolsSessionKey::Primary,
+                })
+            });
+        self.target_owner_identity_for_owner(&owner)
+            .is_some_and(|(context, target)| {
+                context == browser_context_id && target.as_deref() == Some(target_id)
+            })
+            .then_some(owner)
     }
 
     pub(crate) fn runtime_context_owner_identity_for_session(
@@ -2025,18 +2401,10 @@ impl CdpConnection {
         self.target_owner_identity_for_session(session_id)
     }
 
-    pub(crate) fn target_devtools_attached_session_id_for_session(
-        &self,
-        session_id: Option<&str>,
-    ) -> Option<Option<String>> {
-        let owner = self.target_session_owner(session_id)?;
-        Some(owner.session_key.wire_session_id().map(str::to_owned))
-    }
-
     pub(crate) fn runtime_session_owner_slot_mut(
         &mut self,
         session_id: Option<&str>,
-    ) -> Result<&mut TargetRuntimeSlot, String> {
+    ) -> Option<&mut TargetRuntimeSlot> {
         let owner = CommandOwnerScope::capture(self, session_id);
         self.runtime_session_owner_slot_mut_for_owner(&owner)
     }
@@ -2044,23 +2412,22 @@ impl CdpConnection {
     pub(crate) fn runtime_session_owner_slot_mut_for_owner(
         &mut self,
         owner: &CommandOwnerScope,
-    ) -> Result<&mut TargetRuntimeSlot, String> {
+    ) -> Option<&mut TargetRuntimeSlot> {
         let renderer_inspector_session_id =
             self.target_renderer_runtime_inspector_session_id_for_owner(owner);
         let slot = self
-            .target_session_owner_mut_for_owner(owner)
-            .map(TargetSessionOwnerMut::into_runtime_slot_mut)
-            .ok_or_else(|| "NoDocumentLoaded".to_owned())?;
+            .target_session_owner_mut_for_owner(owner)?
+            .into_runtime_slot_mut();
         if let Some(page) = slot.loaded_page_mut() {
             page.set_renderer_devtools_command_session_id(renderer_inspector_session_id);
         }
-        Ok(slot)
+        Some(slot)
     }
 
     pub(crate) fn runtime_session_owner_slot(
         &self,
         session_id: Option<&str>,
-    ) -> Result<&TargetRuntimeSlot, String> {
+    ) -> Option<&TargetRuntimeSlot> {
         let owner = CommandOwnerScope::capture(self, session_id);
         self.runtime_session_owner_slot_for_owner(&owner)
     }
@@ -2068,10 +2435,9 @@ impl CdpConnection {
     pub(crate) fn runtime_session_owner_slot_for_owner(
         &self,
         owner: &CommandOwnerScope,
-    ) -> Result<&TargetRuntimeSlot, String> {
+    ) -> Option<&TargetRuntimeSlot> {
         self.target_session_owner_ref_for_owner(owner)
             .map(|owner| owner.runtime_slot())
-            .ok_or_else(|| "NoDocumentLoaded".to_owned())
     }
 
     pub(crate) fn runtime_session_owner_primary_session_id(
@@ -2122,14 +2488,6 @@ impl CdpConnection {
             }
         }
         session_ids
-    }
-
-    pub(crate) fn subscribed_page_event_session_ids_for_session_owner(
-        &self,
-        session_id: Option<&str>,
-    ) -> Vec<Option<String>> {
-        let owner = CommandOwnerScope::capture(self, session_id);
-        self.subscribed_page_event_session_ids_for_owner(&owner)
     }
 
     pub(crate) fn subscribed_page_event_session_ids_for_owner(
@@ -2300,14 +2658,6 @@ impl CdpConnection {
             .frame_tree_loader_id()
     }
 
-    pub(crate) fn target_session_owner_emulated_device_metrics(
-        &self,
-        session_id: Option<&str>,
-    ) -> Option<crate::conn::EmulatedDeviceMetrics> {
-        self.target_session_owner_ref(session_id)?
-            .emulated_device_metrics()
-    }
-
     pub(crate) fn target_session_owner_emulated_device_metrics_for_owner(
         &self,
         owner: &CommandOwnerScope,
@@ -2337,10 +2687,13 @@ impl CdpConnection {
         owner: &CommandOwnerScope,
         change: &moli_core::RendererDocumentTitleChanged,
     ) -> Option<bool> {
-        self.target_root_document_protocol_attachment_identity_for_owner(
-            owner,
-            change.source_document,
-        )?;
+        self.target_root_document_output_identity_for_owner(owner, change.source_document)?;
+        if let Some(slot) = self.runtime_session_owner_slot_mut_for_owner(owner) {
+            slot.stage_prepared_document_title(change);
+        }
+        // Native commit already published this Document's history entry.
+        // Update it before a subsequent pushState creates another entry;
+        // adoption only transfers the Page handle and protocol binding.
         self.target_session_owner_mut_for_owner(owner)?
             .apply_renderer_document_title(change.title.clone())
     }
@@ -2352,14 +2705,6 @@ impl CdpConnection {
     ) -> Option<String> {
         self.target_session_owner_mut(session_id)?
             .navigation_history_entry_url(entry_id)
-    }
-
-    pub(crate) fn reset_navigation_history_for_owner(
-        &mut self,
-        owner: &CommandOwnerScope,
-    ) -> Option<bool> {
-        self.target_session_owner_mut_for_owner(owner)?
-            .reset_navigation_history()
     }
 
     pub(crate) fn can_reset_navigation_history_for_session_owner(
@@ -2378,6 +2723,53 @@ impl CdpConnection {
             .mark_next_navigation_history_replace_current()
     }
 
+    pub(crate) fn mark_next_auxiliary_navigation_history_for_owner(
+        &mut self,
+        owner: &CommandOwnerScope,
+        kind: moli_core::page::RendererAuxiliaryNavigationKind,
+    ) -> Option<()> {
+        let mut target = self.target_session_owner_mut_for_owner(owner)?;
+        let state = &mut target.target_mut().owner_state;
+        if kind == moli_core::page::RendererAuxiliaryNavigationKind::Assign
+            && (state
+                .initial_empty_document_state()
+                .is_some_and(|document| document.is_on_initial_empty_document())
+                || state
+                    .navigation_history_state
+                    .has_initial_auxiliary_document_entry())
+        {
+            state
+                .navigation_history_state
+                .mark_replace_initial_empty_document("link");
+        } else {
+            state
+                .navigation_history_state
+                .mark_auxiliary_navigation(kind);
+        }
+        Some(())
+    }
+
+    pub(crate) fn mark_next_browser_navigation_from_initial_document_for_owner(
+        &mut self,
+        owner: &CommandOwnerScope,
+    ) {
+        let Some(mut target) = self.target_session_owner_mut_for_owner(owner) else {
+            return;
+        };
+        let state = &mut target.target_mut().owner_state;
+        if state
+            .navigation_history_state
+            .has_initial_auxiliary_document_entry()
+        {
+            // Fragment and History API changes leave the initial Document in
+            // place. Its placeholder must still be replaced by the first real
+            // navigation, including one initiated through DevTools.
+            state
+                .navigation_history_state
+                .mark_replace_initial_empty_document("typed");
+        }
+    }
+
     pub(crate) fn mark_next_navigation_history_traverse_to_entry_for_owner(
         &mut self,
         owner: &CommandOwnerScope,
@@ -2387,14 +2779,56 @@ impl CdpConnection {
             .mark_next_navigation_history_traverse_to_entry(entry_id)
     }
 
-    pub(crate) fn record_same_document_navigation_for_owner(
+    pub(crate) fn record_session_history_update_for_owner(
         &mut self,
         owner: &CommandOwnerScope,
-        url: &Url,
-        history_update: moli_core::page::SameDocumentHistoryUpdate,
-    ) -> Option<String> {
-        self.target_session_owner_mut_for_owner(owner)?
-            .record_same_document_navigation(url, history_update)
+        update: &moli_page_types::SessionHistoryUpdate,
+    ) {
+        let Ok(url) = Url::parse(&update.root_url) else {
+            return;
+        };
+        let Some(mut target_owner) = self.target_session_owner_mut_for_owner(owner) else {
+            return;
+        };
+        // Only a committed traversal that changes the root entry supersedes
+        // its buffered navigation. Joint steps sharing that entry merely
+        // traverse children; fragment and pushState/replaceState are not
+        // traversals at all. Queuing a native command is not a commit.
+        if let moli_core::page::SessionHistoryUpdateKind::Traverse { delta } = update.update
+            && delta != 0
+            && let Ok(source_index) =
+                usize::try_from(update.position.index() as i128 - i128::from(delta))
+            && !update.root_entry_steps.contains(&source_index)
+        {
+            target_owner
+                .runtime_slot_mut()
+                .supersede_buffered_navigation();
+        }
+        target_owner.record_session_history_update(&url, update.update);
+        target_owner
+            .target_mut()
+            .owner_state
+            .navigation_history_state
+            .synchronize_root_entry_url(&update.root_entry_steps, &update.root_url);
+        let (index, entries) = target_owner
+            .target_mut()
+            .owner_state
+            .navigation_history_state
+            .snapshot();
+        if (index, entries.len()) != (update.position.index(), update.position.length()) {
+            tracing::error!(
+                browser_index = index,
+                browser_length = entries.len(),
+                renderer_index = update.position.index(),
+                renderer_length = update.position.length(),
+                "browser and renderer joint history positions diverged"
+            );
+        }
+        debug_assert_eq!(
+            (index, entries.len()),
+            (update.position.index(), update.position.length()),
+            "browser and renderer joint history positions must agree"
+        );
     }
 
     pub(super) fn target_session_owner_mut(
@@ -2475,6 +2909,56 @@ mod tests {
     use moli_core::page::SubresourceResourceType;
     use url::Url;
 
+    #[tokio::test]
+    async fn native_commit_reusing_initial_document_keeps_navigation_history() {
+        let mut ctx = TestContext::new();
+        let mut browser = BrowserContext::new("BID-initial-history".into());
+        browser.set_active_target_id("TID-initial-history");
+        browser.attach_active_session("SID-initial-history");
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser));
+        ctx.install_navigation_fixture_for_session_owner(
+            "about:blank",
+            Some("SID-initial-history"),
+        )
+        .await;
+        ctx.with_fixture(|conn| {
+            let owner = CommandOwnerScope::for_session("SID-initial-history");
+            // An initial auxiliary Document seeds history without a navigation
+            // commit. Preserve its real Page/Document, not a fake native id.
+            conn.target_session_owner_mut_for_owner(&owner)
+                .unwrap()
+                .target_mut()
+                .owner_state
+                .navigation_history_document = None;
+            let before = conn
+                .target_session_owner_navigation_history_snapshot_for_owner(&owner)
+                .unwrap();
+            let page = conn
+                .renderer_page_residence_identity_for_owner(&owner)
+                .unwrap();
+            let document = conn
+                .target_root_document_lifecycle_identity_for_owner(&owner)
+                .unwrap();
+            conn.start_document_navigation_for_owner(&owner, "LID-reused-blank".into())
+                .unwrap();
+            // Force publication before protocol adopts a navigation result.
+            conn.target_session_owner_mut_for_owner(&owner)
+                .unwrap()
+                .record_native_navigation_history(
+                    page,
+                    document,
+                    &Url::parse("about:blank").unwrap(),
+                );
+            let after = conn
+                .target_session_owner_navigation_history_snapshot_for_owner(&owner)
+                .unwrap();
+            assert_eq!(
+                after, before,
+                "reusing the initial native Document keeps its existing entry"
+            );
+        });
+    }
+
     #[test]
     fn generated_session_id_skips_caller_supplied_live_session() {
         let mut conn = CdpConnection::default();
@@ -2493,7 +2977,7 @@ mod tests {
 
     fn pending_subresource_fetch(internal_id: u64) -> PendingSubresourceFetchRequest {
         PendingSubresourceFetchRequest {
-            residence: crate::conn::PendingSubresourceFetchResidence::InstalledPage(
+            residence: crate::conn::PendingSubresourceFetchResidence::Page(
                 crate::conn::TargetPageResidenceIdentity::new_for_test(
                     "BID-target-session-owner".to_owned(),
                     Some("TID-frame".to_owned()),
@@ -2721,7 +3205,7 @@ mod tests {
             };
             assert_eq!(
                 owner.configure_fetch(Some("SID-active".to_owned()), true, patterns.clone()),
-                (true, None)
+                SubresourceInterceptionClasses::ALL
             );
             assert!(owner.register_pending_subresource_fetch_request(
                 "FETCH-active".to_owned(),
@@ -2729,9 +3213,9 @@ mod tests {
             ));
             let (pending, subresource_config, page_update_required) =
                 owner.reset_fetch_config_for_session_and_drain_pending_state(Some("SID-active"));
-            assert_eq!(subresource_config, (false, None));
+            assert_eq!(subresource_config, SubresourceInterceptionClasses::NONE);
             assert!(page_update_required);
-            assert_eq!(pending.3.len(), 1);
+            assert_eq!(pending.subresource_requests.len(), 1);
         }
         assert!(
             !active
@@ -2757,7 +3241,7 @@ mod tests {
             };
             assert_eq!(
                 owner.configure_fetch(Some("SID-background".to_owned()), true, patterns),
-                (true, None)
+                SubresourceInterceptionClasses::ALL
             );
             assert!(owner.register_pending_subresource_fetch_request(
                 "FETCH-background".to_owned(),
@@ -2765,9 +3249,9 @@ mod tests {
             ));
             let (pending, subresource_config, page_update_required) = owner
                 .reset_fetch_config_for_session_and_drain_pending_state(Some("SID-background"));
-            assert_eq!(subresource_config, (false, None));
+            assert_eq!(subresource_config, SubresourceInterceptionClasses::NONE);
             assert!(page_update_required);
-            assert_eq!(pending.3.len(), 1);
+            assert_eq!(pending.subresource_requests.len(), 1);
         }
         assert!(
             background
@@ -2891,7 +3375,7 @@ mod tests {
         assert!(
             preflight
                 .request_headers
-                .contains(&("User-Agent".to_owned(), "Moli/Test-UA".to_owned()))
+                .contains(&("User-Agent".to_owned(), b"Moli/Test-UA".to_vec()))
         );
         assert!(!active.has_captured_response_body_for_test("REQ-old"));
     }
@@ -2938,9 +3422,6 @@ mod tests {
     #[test]
     fn target_session_owner_mut_prepares_background_navigation_request_preflight() {
         let mut background = BrowserContext::new_with_page_for_test("BID-background", "TID-active");
-        background
-            .active_page_target_mut()
-            .set_base_locale_override(Some("zh-CN".to_owned()));
         background
             .active_page_target_mut()
             .network_policy
@@ -3029,7 +3510,7 @@ mod tests {
         assert!(
             preflight
                 .request_headers
-                .contains(&("X-Owner".to_owned(), "background".to_owned()))
+                .contains(&("X-Owner".to_owned(), b"background".to_vec()))
         );
         assert!(
             preflight
@@ -3039,19 +3520,19 @@ mod tests {
         );
         assert!(preflight.request_headers.contains(&(
             "User-Agent".to_owned(),
-            "Browser-Context-Default-UA".to_owned()
+            b"Browser-Context-Default-UA".to_vec()
         )));
         assert!(
             !preflight
                 .request_headers
                 .iter()
                 .any(|(name, value)| name.eq_ignore_ascii_case("user-agent")
-                    && value == "Active-Only-UA")
+                    && value == b"Active-Only-UA")
         );
         assert!(
             preflight
                 .request_headers
-                .contains(&("Referer".to_owned(), "https://referrer.example/".to_owned()))
+                .contains(&("Referer".to_owned(), b"https://referrer.example/".to_vec()))
         );
     }
 
@@ -3105,9 +3586,6 @@ mod tests {
     #[test]
     fn target_session_owner_ref_snapshots_background_navigation_load_inputs() {
         let mut background = BrowserContext::new_with_page_for_test("BID-background", "TID-active");
-        background
-            .active_page_target_mut()
-            .set_base_locale_override(Some("zh-CN".to_owned()));
         background.insert_page_target_host(crate::conn::PageTargetHost::with_url(
             "TID-background".to_owned(),
             Some("SID-background".to_owned()),
@@ -3117,8 +3595,6 @@ mod tests {
             let state = background
                 .background_target_mut("TID-background")
                 .expect("background target must exist");
-            state.set_base_locale_override(Some("fr-FR".to_owned()));
-            state.set_base_timezone_override(Some("Europe/Paris".to_owned()));
             state.http_proxy_override = Some("http://proxy.example:8080".to_owned());
             state.http_no_proxy_override = Some("localhost,127.0.0.1".to_owned());
             state.tls_verify_host_override = Some(false);
@@ -3205,7 +3681,7 @@ mod tests {
         assert!(
             inputs
                 .extra_http_headers
-                .contains(&("X-Owner".to_owned(), "background".to_owned()))
+                .contains(&("X-Owner".to_owned(), b"background".to_vec()))
         );
         assert!(
             inputs
@@ -3213,8 +3689,6 @@ mod tests {
                 .iter()
                 .all(|(name, _)| !name.eq_ignore_ascii_case("accept-language"))
         );
-        assert_eq!(inputs.locale_override.as_deref(), Some("fr-FR"));
-        assert_eq!(inputs.timezone_override.as_deref(), Some("Europe/Paris"));
         assert_eq!(
             inputs
                 .browser_identity_override
@@ -3235,7 +3709,10 @@ mod tests {
         assert_eq!(inputs.emulated_media.media.as_deref(), Some("print"));
         assert!(inputs.network_offline);
         assert_eq!(inputs.blocked_url_patterns, vec!["*.blocked.test"]);
-        assert_eq!(inputs.fetch_subresource_interception, (true, None));
+        assert_eq!(
+            inputs.fetch_subresource_interception,
+            SubresourceInterceptionClasses::ALL
+        );
     }
 
     #[test]
@@ -3267,20 +3744,21 @@ mod tests {
             );
         }
 
-        let commit_state = {
-            let mut owner = TargetSessionOwnerMut {
-                browser_context: &mut background,
-                target_id: "TID-background".to_owned(),
-                command_session_id: None,
-                session_key: DevToolsSessionKey::Primary,
-            };
-            owner
-                .prepare_loaded_navigation_commit()
-                .expect("background navigation commit state should prepare")
-        };
-
-        assert_eq!(commit_state.browser_context_id, "BID-background");
-        assert!(commit_state.runtime_frontend_enabled);
+        let inputs = TargetSessionOwnerRef {
+            browser_context: &background,
+            target_id: "TID-background".to_owned(),
+            session_key: DevToolsSessionKey::Primary,
+        }
+        .navigation_load_inputs();
+        assert_eq!(inputs.browser_context_id.as_deref(), Some("BID-background"));
+        assert!(
+            background
+                .background_target("TID-background")
+                .unwrap()
+                .devtools_sessions[DevToolsSessionKey::Primary]
+                .runtime_session_state
+                .runtime_frontend_enabled
+        );
         assert_eq!(
             background
                 .background_target("TID-background")
@@ -3301,7 +3779,10 @@ mod tests {
             unreachable_url: None,
             security_origin: "https://nav.example".to_owned(),
             secure_context_type: "Secure".to_owned(),
+            document_referrer: None,
             timestamp: 0.0,
+            session_history_position: None,
+            browsing_context_group: None,
         };
         {
             let mut owner = TargetSessionOwnerMut {
@@ -3329,7 +3810,10 @@ mod tests {
                 .secure_context_type(),
             "Secure"
         );
-        assert_eq!(commit_state.fetch_subresource_config, (true, None));
+        assert_eq!(
+            inputs.fetch_subresource_interception,
+            SubresourceInterceptionClasses::ALL
+        );
     }
 
     #[test]
@@ -3388,11 +3872,10 @@ mod tests {
     async fn target_session_owner_mut_commits_loaded_page_to_background_owner() {
         let mut ctx = TestContext::new();
         let page = ctx
-            .conn
-            .load_page_via_runtime_async("data:text/html,<title>background commit</title>")
+            .build_fixture_page_navigation("data:text/html,<title>background commit</title>")
             .await
             .expect("page should load");
-        let page_url = page.final_url().clone();
+        let page_url = page.final_url.clone();
         let mut background = BrowserContext::new("BID-background".to_owned());
         background.insert_page_target_host(crate::conn::PageTargetHost::with_url(
             "TID-background".to_owned(),
@@ -3411,15 +3894,20 @@ mod tests {
                 command_session_id: None,
                 session_key: DevToolsSessionKey::Primary,
             };
-            owner
-                .commit_loaded_navigation_page_async(
-                    page,
+            let installed = owner
+                .install_loaded_navigation_page(
+                    page.page,
                     LoadedNavigationRendererAttachmentCommit::Prepare(None),
                     &page_url,
+                    moli_core::RendererDocumentLifecycleIdentity {
+                        frame: page.page_creation_artifacts.lifecycle_snapshot.frame,
+                        document: page.page_creation_artifacts.active_document,
+                        epoch: page.page_creation_artifacts.active_epoch,
+                    },
                 )
-                .await
                 .expect("background page owner should exist")
                 .expect("background page Inspector binding should activate");
+            installed.close_previous().await;
         }
 
         let target = background
@@ -3515,6 +4003,93 @@ mod tests {
     }
 
     #[test]
+    fn native_commit_authorizes_output_before_page_adoption_but_not_page_execution() {
+        let mut conn = CdpConnection::new();
+        let mut browser = BrowserContext::new("BID-native-output".into());
+        browser.set_active_target_id("TID-native-output");
+        browser.attach_active_session("SID-native-output");
+        conn.install_browser_context_fixture_for_test(browser);
+        let owner = CommandOwnerScope::for_session("SID-native-output");
+        let renderer_page = crate::conn::RendererPageResidenceIdentity::new(
+            moli_core::RendererOwnerLocalHostId::new_for_testing(81),
+            moli_core::PageId::new_for_testing(3),
+        );
+        let slot = conn
+            .runtime_session_owner_slot_mut_for_owner(&owner)
+            .unwrap();
+        let token =
+            slot.start_document_navigation("TID-native-output".into(), "LID-native-output".into());
+        let candidate = slot
+            .prepare_renderer_agent_candidate_token(
+                &token,
+                moli_core::page::RendererDevToolsAgentToken::allocate(),
+            )
+            .unwrap();
+        let transaction = slot
+            .commit_renderer_agent_candidate_transaction(candidate, renderer_page)
+            .unwrap();
+        let fact = std::sync::Arc::new(RendererMainDocumentCommit {
+            frame_id: token.target_id.clone(),
+            loader_id: token.loader_id.clone(),
+            url: "about:blank".into(),
+            unreachable_url: None,
+            security_origin: "null".into(),
+            secure_context_type: "InsecureScheme".into(),
+            document_referrer: None,
+            timestamp: 1.0,
+            session_history_position: None,
+            browsing_context_group: None,
+        });
+        assert!(slot.register_renderer_document_commit(
+            &token,
+            transaction.current().id(),
+            fact.clone()
+        ));
+        let pending = conn
+            .pending_target_page_residence_identity_for_owner(&owner)
+            .unwrap();
+        assert!(!conn.target_page_output_residence_is_current(&pending));
+        let source = moli_core::RendererDocumentLifecycleIdentity {
+            frame: moli_core::page::RendererFrameToken {
+                page_id: renderer_page.page_id(),
+            },
+            document: moli_core::page::RendererDocumentToken::new_for_testing(
+                renderer_page.page_id(),
+                1,
+            ),
+            epoch: moli_core::page::RendererLifecycleEpoch(1),
+        };
+        assert_eq!(
+            conn.runtime_session_owner_slot_mut_for_owner(&owner)
+                .unwrap()
+                .observe_prepared_renderer_document_commit(&fact, source),
+            Some(true)
+        );
+        let attachment = conn
+            .target_page_output_attachment_for_renderer_page(&owner, renderer_page)
+            .unwrap();
+        assert_eq!(attachment.page_owner(), &pending);
+        assert!(conn.target_page_output_attachment_is_current(&attachment));
+        assert!(!conn.target_page_residence_identity_is_current(&pending));
+        assert!(conn.loaded_page_mut_for_owner(&owner).is_none());
+        assert!(
+            conn.target_page_output_attachment_for_renderer_page(
+                &owner,
+                crate::conn::RendererPageResidenceIdentity::new(
+                    moli_core::RendererOwnerLocalHostId::new_for_testing(81),
+                    moli_core::PageId::new_for_testing(4),
+                )
+            )
+            .is_none()
+        );
+        conn.runtime_session_owner_slot_mut_for_owner(&owner)
+            .unwrap()
+            .start_document_navigation("TID-native-output".into(), "LID-replacement".into());
+        assert!(!conn.target_page_output_attachment_is_current(&attachment));
+        assert!(!conn.target_page_output_residence_is_current(&pending));
+    }
+
+    #[test]
     fn implicit_active_route_freezes_the_concrete_target_in_page_residence() {
         let mut conn = CdpConnection::default();
         let mut browser_context = BrowserContext::new("BID-implicit-page-residence".to_owned());
@@ -3572,7 +4147,7 @@ mod tests {
         })
         .expect("active target owner state should be mutable");
         conn.with_target_devtools_session_state_for_session_mut(Some("SID-background"), |state| {
-            state.register_runtime_remote_object_ids(["background-object".to_owned()]);
+            state.runtime_session_state.runtime_frontend_enabled = true;
         })
         .expect("background DevTools session state should be mutable");
 
@@ -3584,17 +4159,14 @@ mod tests {
             .target_runtime_session_state_for_session(Some("SID-background"))
             .expect("background runtime state should be readable");
         assert!(background_runtime_state.inspector_enabled);
+        assert!(background_runtime_state.runtime_frontend_enabled);
         assert!(
             conn.target_owner_state_for_session(Some("SID-active"))
                 .expect("active owner state should be readable")
                 .target_crash_state
                 .is_crashed()
         );
-        assert!(
-            conn.target_devtools_session_state_for_session(Some("SID-background"))
-                .expect("background DevTools session state should be readable")
-                .has_runtime_remote_object_id("background-object")
-        );
+
         assert!(
             conn.with_target_owner_state_for_session_mut(Some("SID-missing"), |_| ())
                 .is_none()
@@ -3628,8 +4200,10 @@ mod tests {
             .expect("target session should be mutable");
         }
         assert!(
-            conn.subscribed_page_event_session_ids_for_session_owner(Some("SID-primary"))
-                .is_empty(),
+            conn.subscribed_page_event_session_ids_for_owner(&CommandOwnerScope::for_session(
+                "SID-primary"
+            ))
+            .is_empty(),
             "Page.setLifecycleEventsEnabled must not subscribe a session to Page events"
         );
 
@@ -3639,7 +4213,9 @@ mod tests {
         )
         .expect("Page-enabled attached session should be mutable");
         assert_eq!(
-            conn.subscribed_page_event_session_ids_for_session_owner(Some("SID-primary")),
+            conn.subscribed_page_event_session_ids_for_owner(&CommandOwnerScope::for_session(
+                "SID-primary"
+            )),
             vec![Some("SID-page-enabled".to_owned())]
         );
 
@@ -3648,7 +4224,9 @@ mod tests {
         })
         .expect("primary session should be mutable");
         assert_eq!(
-            conn.subscribed_page_event_session_ids_for_session_owner(Some("SID-page-enabled")),
+            conn.subscribed_page_event_session_ids_for_owner(&CommandOwnerScope::for_session(
+                "SID-page-enabled"
+            )),
             vec![
                 Some("SID-primary".to_owned()),
                 Some("SID-page-enabled".to_owned()),
@@ -3886,7 +4464,7 @@ mod tests {
         );
         assert!(
             conn.runtime_session_owner_slot(Some("SID-missing"))
-                .is_err()
+                .is_none()
         );
     }
 
@@ -3913,9 +4491,9 @@ mod tests {
             .runtime_session_owner_slot(Some("SID-background-dialog"))
             .expect("background target should own a stable runtime slot")
             .javascript_dialog_scope_observer();
-        conn.with_target_devtools_session_state_for_session_mut(
-            Some("SID-background-dialog"),
-            |state| state.page_session_state.javascript_dialog_state.clear(),
+        conn.with_target_javascript_dialog_state_for_owner_mut(
+            &crate::conn::CommandOwnerScope::capture(&conn, Some("SID-background-dialog")),
+            |state| state.clear(),
         )
         .expect("background session state mutation should be available");
 

@@ -1,20 +1,19 @@
-use super::super::JsContextHost;
+use super::super::PageScriptHost;
 use super::document_slots::sync_child_document_window_slots;
 use crate::{
     context_bootstrap::{
-        bind_window_performance_seed, install_navigation_bootstrap_entry_for_holder,
+        bind_window_performance_seed, install_navigation_entry_view_for_holder,
         reset_window_location_history_navigation_runtime_state, set_window_origin_runtime_state,
-        sync_window_location_history_navigation_runtime_surface,
+        sync_window_location_history_navigation_runtime_surface, window_location_href,
     },
     document_runtime::DomHandle,
     native_bridge::{
         child_window_surface::bind_materialized_child_window_indexed_db_factory,
         helpers::set_object_slot,
     },
-    util::v8str,
 };
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(in crate::native_bridge::context_host) fn sync_child_window_origin_slot<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
@@ -47,6 +46,13 @@ impl JsContextHost {
         let Some(wrapper) = self.child_window_proxy_records.live_window(scope, handle) else {
             return;
         };
+        // Materializing the current wrapper also updates its parent/top slots.
+        // Those browser-owned updates must run in the Window's Realm, before
+        // the wrapper lookup can encounter cross-origin access checks.
+        let context = wrapper
+            .get_creation_context(scope)
+            .unwrap_or_else(|| scope.get_current_context());
+        let scope = &mut v8::ContextScope::new(scope, context);
         if self
             .child_window_proxy_records
             .live_window_exposed_to_top(handle)
@@ -68,6 +74,13 @@ impl JsContextHost {
         handle: DomHandle,
         wrapper: v8::Local<'s, v8::Object>,
     ) {
+        // Browser-owned updates use the target Realm. Reading its Location
+        // from the parent would apply cross-origin script checks during a
+        // legal iframe source setter and leave an exception pending.
+        let context = wrapper
+            .get_creation_context(scope)
+            .unwrap_or_else(|| scope.get_current_context());
+        let scope = &mut v8::ContextScope::new(scope, context);
         self.sync_child_browsing_context_window_parent_top_slots(scope, handle, wrapper);
         self.sync_child_window_origin_slot(scope, handle, wrapper);
         let Some(visible_state) =
@@ -75,16 +88,10 @@ impl JsContextHost {
         else {
             return;
         };
-        let should_reset_runtime_state = wrapper
-            .get(scope, v8str(scope, "location").into())
-            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-            .and_then(|location| {
-                location
-                    .get(scope, v8str(scope, "href").into())
-                    .and_then(|value| value.to_string(scope))
-                    .map(|value| value.to_rust_string_lossy(scope))
-            })
-            .is_none_or(|href| href != visible_state.href);
+        // Native synchronization reads Location state without invoking the
+        // public href getter's checks against the initiating author script.
+        let should_reset_runtime_state =
+            window_location_href(scope, wrapper).is_none_or(|href| href != visible_state.href);
         if should_reset_runtime_state {
             let _ = reset_window_location_history_navigation_runtime_state(
                 scope,
@@ -94,7 +101,7 @@ impl JsContextHost {
         } else {
             sync_window_location_history_navigation_runtime_surface(scope, wrapper);
         }
-        install_navigation_bootstrap_entry_for_holder(scope, wrapper, &visible_state.entry_seed);
+        install_navigation_entry_view_for_holder(scope, wrapper, &visible_state.entry_seed);
         let performance_navigation_type = self.child_performance_navigation_type(handle);
         let _ = bind_window_performance_seed(
             scope,
@@ -140,6 +147,10 @@ impl JsContextHost {
         let Some(wrapper) = self.child_window_proxy_records.live_window(scope, handle) else {
             return;
         };
+        let context = wrapper
+            .get_creation_context(scope)
+            .unwrap_or_else(|| scope.get_current_context());
+        let scope = &mut v8::ContextScope::new(scope, context);
         let Some(entry_seed) = self
             .child_browsing_contexts
             .get(&handle)
@@ -159,7 +170,7 @@ impl JsContextHost {
             wrapper,
             &current_entry.url,
         );
-        install_navigation_bootstrap_entry_for_holder(scope, wrapper, &entry_seed);
+        install_navigation_entry_view_for_holder(scope, wrapper, &entry_seed);
         let performance_navigation_type = self.child_performance_navigation_type(handle);
         let _ = bind_window_performance_seed(
             scope,

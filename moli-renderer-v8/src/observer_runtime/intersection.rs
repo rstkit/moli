@@ -4,7 +4,7 @@ use std::{collections::HashMap, mem};
 
 use crate::{
     dom::native::{DomHost, NativeNodeId},
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
 };
 
 use super::{
@@ -89,7 +89,7 @@ impl ObserverStore {
 }
 
 pub(super) fn compute_intersection_check_batch(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     dom_host: &DomHost,
     batch: IntersectionCheckBatch,
 ) -> Result<CompletedIntersectionCheckBatch, moli_layout::LayoutError> {
@@ -136,13 +136,17 @@ pub(super) fn compute_intersection_check_batch(
                 }
             })
             .collect();
-        let answers = crate::native_bridge::element::observable_geometry_batch(
-            runtime,
-            document,
-            moli_layout::LayoutFlushReason::ObserverDelivery,
-            &moli_layout::LayoutQueryBatch::new(queries),
-        )?;
-        for (index, answer) in indices.into_iter().zip(answers.answers) {
+        let queries = moli_layout::LayoutQueryBatch::new(queries);
+        let answers: Vec<_> = runtime
+            .with_latest_layout_tree_for_document(document, |tree| {
+                queries
+                    .queries
+                    .iter()
+                    .map(|query| tree.answer_query(query))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (index, answer) in indices.into_iter().zip(answers) {
             let moli_layout::LayoutQueryAnswer::IntersectionGeometry(geometry) = answer else {
                 return Err(moli_layout::LayoutError::source_contract(
                     "IntersectionObserver geometry",
@@ -186,7 +190,7 @@ pub(super) fn compute_intersection_check_batch(
 }
 
 fn compute_mock_intersection_check_batch(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     dom_host: &DomHost,
     mut batch: IntersectionCheckBatch,
 ) -> CompletedIntersectionCheckBatch {

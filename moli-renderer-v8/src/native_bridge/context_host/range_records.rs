@@ -70,6 +70,8 @@ pub(super) struct RangeRecord {
     end: RangeBoundaryPoint,
 }
 
+// Shared by all realms in this PageScriptHost. Creating another Window must not
+// invalidate existing wrappers; their weak finalizers retire individual records.
 pub(super) struct RangeRecordRegistry {
     lifetime_token: u64,
     active_live_records: HashSet<RangeRecordId>,
@@ -91,15 +93,6 @@ impl RangeRecordRegistry {
             by_boundary_container: HashMap::new(),
             by_boundary_child_before: HashMap::new(),
         }
-    }
-
-    pub(super) fn clear(&mut self) {
-        self.drain_finalized_live_records();
-        self.active_live_records.clear();
-        self.live_record_wrappers.clear();
-        self.records.clear();
-        self.by_boundary_container.clear();
-        self.by_boundary_child_before.clear();
     }
 
     pub(super) fn active_is_empty(&mut self) -> bool {
@@ -296,7 +289,7 @@ impl RangeRecordRegistry {
             .map(|record| record.boundary(side).container())
     }
 
-    fn boundary_point(
+    pub(super) fn boundary_point(
         &self,
         handle: RangeRecordHandle,
         side: RangeBoundarySide,
@@ -675,12 +668,12 @@ fn is_descendant_of(
     false
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn create_range_record(
         &mut self,
         owner_document: DomHandle,
     ) -> Option<RangeRecordHandle> {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.range_record_registry
             .create_record(dom_host, owner_document)
@@ -691,7 +684,7 @@ impl JsContextHost {
         handle: RangeRecordHandle,
         owner_document: DomHandle,
     ) -> bool {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.range_record_registry
             .reset_record(dom_host, handle, owner_document)
@@ -718,7 +711,7 @@ impl JsContextHost {
         handle: RangeRecordHandle,
         side: RangeBoundarySide,
     ) -> Option<u32> {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.range_record_registry
             .boundary_offset(dom_host, handle, side)
@@ -728,7 +721,7 @@ impl JsContextHost {
         &mut self,
         handle: RangeRecordHandle,
     ) -> Option<((DomHandle, u32), (DomHandle, u32))> {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.range_record_registry
             .boundary_handles(dom_host, handle)
@@ -741,7 +734,7 @@ impl JsContextHost {
         container: DomHandle,
         offset: u32,
     ) -> bool {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.range_record_registry
             .set_boundary(dom_host, handle, side, container, offset)
@@ -755,11 +748,19 @@ impl JsContextHost {
         removed_count: u32,
         inserted_count: u32,
     ) {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         let ids = self
             .range_record_registry
             .live_record_ids_for_boundary_container(scope, target);
+        if ids.is_empty() {
+            return;
+        }
+        let selection_links = self.selection_record_registry.linked_range_boundaries(
+            dom_host,
+            &self.range_record_registry,
+            true,
+        );
         self.range_record_registry.update_for_character_data_edit(
             dom_host,
             &ids,
@@ -767,6 +768,11 @@ impl JsContextHost {
             edit_offset,
             removed_count,
             inserted_count,
+        );
+        self.selection_record_registry.sync_linked_range_boundaries(
+            dom_host,
+            &self.range_record_registry,
+            selection_links,
         );
     }
 
@@ -778,11 +784,21 @@ impl JsContextHost {
         index: u32,
         previous_sibling: Option<DomHandle>,
     ) {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         let ids = self
             .range_record_registry
             .live_record_ids_for_child_removal(scope, dom_host, removed_child);
+        if ids.is_empty() {
+            return;
+        }
+        // Composed removal boundaries have their own shadow-including
+        // rescoping step. Synchronize only the observable endpoints here.
+        let selection_links = self.selection_record_registry.linked_range_boundaries(
+            dom_host,
+            &self.range_record_registry,
+            false,
+        );
         self.range_record_registry.update_for_child_removal(
             dom_host,
             &ids,
@@ -790,6 +806,11 @@ impl JsContextHost {
             removed_child,
             index,
             previous_sibling,
+        );
+        self.selection_record_registry.sync_linked_range_boundaries(
+            dom_host,
+            &self.range_record_registry,
+            selection_links,
         );
     }
 
@@ -800,17 +821,30 @@ impl JsContextHost {
         new_text: DomHandle,
         offset: u32,
     ) {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         let ids = self
             .range_record_registry
             .live_record_ids_for_text_split(scope, dom_host, original);
+        if ids.is_empty() {
+            return;
+        }
+        let selection_links = self.selection_record_registry.linked_range_boundaries(
+            dom_host,
+            &self.range_record_registry,
+            true,
+        );
         self.range_record_registry
             .update_for_text_split(dom_host, &ids, original, new_text, offset);
+        self.selection_record_registry.sync_linked_range_boundaries(
+            dom_host,
+            &self.range_record_registry,
+            selection_links,
+        );
     }
 
     pub(crate) fn range_record_is_collapsed(&mut self, handle: RangeRecordHandle) -> Option<bool> {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.range_record_registry.is_collapsed(dom_host, handle)
     }

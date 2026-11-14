@@ -1,6 +1,16 @@
 use super::*;
+
+mod json_error_identity;
+mod json_parse;
+mod module_map;
+mod specifiers;
+use crate::worker::handle::WorkerParentErrorEventKind;
 use crate::worker::{WorkerErrorPhase, WorkerScriptResourceKind};
 use moli_crypto::sha256_hex;
+
+mod response_mime;
+mod source_phase;
+mod text;
 
 const WORKER_WASM_IMPORT_PM: &[u8] = &[
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60,
@@ -180,7 +190,7 @@ async fn worker_importscripts_obeys_response_csp_script_src() {
             .into(),
             "https://app.test/worker/main.js".into(),
         )
-        .with_content_security_policies(vec!["script-src 'none'".to_owned()]),
+        .with_content_security_policies(vec!["script-src 'none'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -199,6 +209,7 @@ async fn worker_csp_violation_event_survives_mutated_event_globals() {
     let mut handle = spawn_test_worker_with_options(
         WorkerSpawnOptions::new(
             r#"
+            const getBlockedURI = Object.getOwnPropertyDescriptor(SecurityPolicyViolationEvent.prototype, "blockedURI").get;
             self.Event = null;
             Object.defineProperty(SecurityPolicyViolationEvent.prototype, "blockedURI", {
                 value: "prototype-blocked-uri",
@@ -209,7 +220,11 @@ async fn worker_csp_violation_event_survives_mutated_event_globals() {
             addEventListener("securitypolicyviolation", event => {
                 events.push({
                     type: event.type,
-                    blockedURI: event.blockedURI,
+                    blockedURI: getBlockedURI.call(event),
+                    publicBlockedURI: event.blockedURI,
+                    bubbles: event.bubbles,
+                    cancelable: event.cancelable,
+                    composed: event.composed,
                     effectiveDirective: event.effectiveDirective,
                     disposition: event.disposition,
                     instance: event instanceof SecurityPolicyViolationEvent
@@ -230,7 +245,7 @@ async fn worker_csp_violation_event_survives_mutated_event_globals() {
             .into(),
             "https://app.test/worker/main.js".into(),
         )
-        .with_content_security_policies(vec!["script-src 'none'".to_owned()]),
+        .with_content_security_policies(vec!["script-src 'none'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -239,7 +254,7 @@ async fn worker_csp_violation_event_survives_mutated_event_globals() {
         .expect("channel closed");
     assert_eq!(
         expect_post_json(msg),
-        r#"{"events":[{"type":"securitypolicyviolation","blockedURI":"data","effectiveDirective":"script-src","disposition":"enforce","instance":true}],"name":"NetworkError","ran":false}"#
+        r#"{"events":[{"type":"securitypolicyviolation","blockedURI":"data","publicBlockedURI":"prototype-blocked-uri","bubbles":true,"cancelable":false,"composed":true,"effectiveDirective":"script-src","disposition":"enforce","instance":true}],"name":"NetworkError","ran":false}"#
     );
 }
 
@@ -283,7 +298,7 @@ async fn shared_worker_importscripts_csp_block_dispatches_securitypolicyviolatio
             name: "shared".to_owned(),
             storage_key,
         })
-        .with_content_security_policies(vec!["script-src 'none'".to_owned()]),
+        .with_content_security_policies(vec!["script-src 'none'".into()]),
     );
 
     handle
@@ -330,7 +345,7 @@ async fn worker_importscripts_report_only_csp_dispatches_without_blocking() {
             .into(),
             "https://app.test/worker/main.js".into(),
         )
-        .with_content_security_report_only_policies(vec!["script-src 'none'".to_owned()]),
+        .with_content_security_report_only_policies(vec!["script-src 'none'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -380,7 +395,7 @@ async fn shared_worker_importscripts_report_only_csp_dispatches_without_blocking
             name: "shared".to_owned(),
             storage_key,
         })
-        .with_content_security_report_only_policies(vec!["script-src 'none'".to_owned()]),
+        .with_content_security_report_only_policies(vec!["script-src 'none'".into()]),
     );
 
     handle
@@ -615,7 +630,7 @@ async fn worker_trusted_types_importscripts_enforces_script_url_sink() {
             ),
             "https://app.test/worker/main.js".to_owned(),
         )
-        .with_content_security_policies(vec!["require-trusted-types-for 'script'".to_owned()]),
+        .with_content_security_policies(vec!["require-trusted-types-for 'script'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -658,7 +673,7 @@ async fn worker_trusted_types_rejects_forged_named_properties() {
             ),
             "https://app.test/worker/main.js".to_owned(),
         )
-        .with_content_security_policies(vec!["require-trusted-types-for 'script'".to_owned()]),
+        .with_content_security_policies(vec!["require-trusted-types-for 'script'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -712,7 +727,7 @@ async fn worker_trusted_types_policy_create_survives_global_constructor_override
             .to_owned(),
             "https://app.test/worker/main.js".to_owned(),
         )
-        .with_content_security_policies(vec!["require-trusted-types-for 'script'".to_owned()]),
+        .with_content_security_policies(vec!["require-trusted-types-for 'script'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -800,6 +815,174 @@ async fn worker_trusted_types_policy_callbacks_follow_webidl_contract() {
 }
 
 #[tokio::test]
+async fn worker_csp_string_compilation_keywords_preserve_source_token_boundaries() {
+    ensure_v8();
+    for keyword in ["unsafe-eval", "wasm-unsafe-eval", "none"] {
+        for (prefix, suffix, valid) in [
+            ("", "", true),
+            ("\t\n", " \r\u{000c}", true),
+            ("\u{000b}", "", false),
+            ("", "\u{000b}", false),
+        ] {
+            let policy = format!("default-src 'none'; script-src {prefix}'{keyword}'{suffix}");
+            let source = format!(
+                "postMessage(({}).slice(0, 2)); close();",
+                include_str!("../../../../tests/fixtures/csp-eval-source-tokens.js"),
+            );
+            let options =
+                WorkerSpawnOptions::new(source, "https://app.test/worker/main.js".to_owned())
+                    .with_content_security_policies(vec![policy.clone().into()]);
+            let mut handle = spawn_test_worker_with_options(options);
+            let message = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+            let expected = serde_json::json!([
+                if valid && keyword == "unsafe-eval" {
+                    "allowed"
+                } else {
+                    "EvalError"
+                },
+                if valid && keyword == "unsafe-eval" {
+                    "allowed"
+                } else {
+                    "EvalError"
+                },
+            ]);
+            assert_eq!(
+                expect_post_json(message),
+                expected.to_string(),
+                "{policy:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_string_timer_csp_blocks_and_reports_without_blocking_functions() {
+    ensure_v8();
+    for (policy, report_only, blocked, reports) in [
+        ("script-src 'self' 'report-sample'", false, true, true),
+        ("default-src 'self' 'report-sample'", false, true, true),
+        ("script-src 'self' 'report-sample'", true, false, true),
+        ("script-src 'unsafe-eval'", false, false, false),
+    ] {
+        let source = r#"
+            globalThis.ran = [];
+            const events = [];
+            const first = setTimeout("globalThis.ran.push('timeout')", 10);
+            globalThis.interval = setInterval("globalThis.ran.push('interval'); clearInterval(globalThis.interval)", 10);
+            addEventListener('securitypolicyviolation', e => events.push({
+                directive: e.effectiveDirective, blocked: e.blockedURI,
+                disposition: e.disposition, policy: e.originalPolicy,
+                source: e.sourceFile, line: e.lineNumber, sample: e.sample,
+            }));
+            const synchronousEvents = events.length;
+            setTimeout((value) => ran.push(value), 10, 'function');
+            setTimeout(() => {
+                postMessage({zeroIds: [first === 0, interval === 0], ran: ran.sort(), synchronousEvents, events});
+                close();
+            }, 80);
+        "#;
+        let options = WorkerSpawnOptions::new(
+            source.to_owned(),
+            "https://app.test/worker/main.js".to_owned(),
+        );
+        let options = if report_only {
+            options.with_content_security_report_only_policies(vec![policy.to_owned().into()])
+        } else {
+            options.with_content_security_policies(vec![policy.to_owned().into()])
+        };
+        let mut handle = spawn_test_worker_with_options(options);
+        let message = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expect_post_json(message)).unwrap();
+        assert_eq!(value["zeroIds"], serde_json::json!([blocked, blocked]));
+        assert_eq!(
+            value["ran"],
+            if blocked {
+                serde_json::json!(["function"])
+            } else {
+                serde_json::json!(["function", "interval", "timeout"])
+            }
+        );
+        assert_eq!(value["synchronousEvents"], 0);
+        let events = value["events"].as_array().unwrap();
+        assert_eq!(events.len(), if reports { 2 } else { 0 });
+        for (event, (line, sample)) in events.iter().zip([
+            (4, "globalThis.ran.push('timeout')"),
+            (5, "globalThis.ran.push('interval'); clearIn"),
+        ]) {
+            assert_eq!(
+                event,
+                &serde_json::json!({
+                    "directive": "script-src", "blocked": "eval",
+                    "disposition": if report_only { "report" } else { "enforce" },
+                    "policy": policy, "source": "https://app.test/worker/main.js", "line": line, "sample": sample,
+                })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_string_timer_csp_converts_arguments_before_policy_and_preserves_exceptions() {
+    ensure_v8();
+    let mut handle = spawn_test_worker_with_options(
+        WorkerSpawnOptions::new(r#"
+            const order = [];
+            const events = [];
+            const marker = {};
+            const errors = [];
+            for (const method of ['setTimeout', 'setInterval']) {
+                try {
+                    self[method]({toString() { order.push('handler'); throw marker; }}, {valueOf() { order.push('unexpected'); return 0; }});
+                } catch (e) { errors.push(e === marker); }
+                try {
+                    self[method]({toString() { order.push('handler'); return "postMessage('unexpected')"; }}, {valueOf() { order.push('delay'); throw marker; }});
+                } catch (e) { errors.push(e === marker); }
+            }
+            addEventListener('securitypolicyviolation', e => events.push(e.blockedURI));
+            setTimeout(() => { postMessage({order, errors, events}); close(); }, 50);
+        "#.to_owned(), "https://app.test/worker/main.js".to_owned())
+            .with_content_security_policies(vec!["script-src 'none'; require-trusted-types-for 'script'".into()]),
+    );
+    let message = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&expect_post_json(message)).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "order": ["handler", "handler", "delay", "handler", "handler", "delay"],
+            "errors": [true, true, true, true], "events": [],
+        })
+    );
+}
+
+#[tokio::test]
+async fn worker_string_timer_csp_preserves_trusted_types_relaxation_and_default_policy_order() {
+    ensure_v8();
+    let mut handle = spawn_test_worker_with_options(
+        WorkerSpawnOptions::new(r#"
+            globalThis.ran = [];
+            const order = [];
+            trustedTypes.createPolicy('default', {createScript(value, type, sink) { order.push(sink); return value; }});
+            const explicit = trustedTypes.createPolicy('explicit', {createScript: value => value});
+            const first = setTimeout({toString() { order.push('handler'); return "ran.push('default')"; }}, {valueOf() { order.push('delay'); return 10; }});
+            const trusted = explicit.createScript("ran.push('trusted')");
+            trusted.toString = () => { throw new Error('must not coerce TrustedScript'); };
+            const second = setTimeout(trusted, 10);
+            setTimeout(() => { postMessage({positiveIds: [first > 0, second > 0], ran, order}); close(); }, 50);
+        "#.to_owned(), "https://app.test/worker/main.js".to_owned())
+            .with_content_security_policies(vec!["script-src 'trusted-types-eval'; require-trusted-types-for 'script'".into()]),
+    );
+    let message = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+    let value: serde_json::Value = serde_json::from_str(&expect_post_json(message)).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "positiveIds": [true, true], "ran": ["default", "trusted"],
+            "order": ["handler", "delay", "WorkerGlobalScope setTimeout"],
+        })
+    );
+}
+
+#[tokio::test]
 async fn worker_trusted_types_timers_and_eval_use_script_sink() {
     ensure_v8();
     let mut handle = spawn_test_worker_with_options(
@@ -838,7 +1021,7 @@ async fn worker_trusted_types_timers_and_eval_use_script_sink() {
             .to_owned(),
             "https://app.test/worker/main.js".to_owned(),
         )
-        .with_content_security_policies(vec!["require-trusted-types-for 'script'".to_owned()]),
+        .with_content_security_policies(vec!["require-trusted-types-for 'script'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -870,7 +1053,7 @@ async fn worker_trusted_script_eval_is_unwrapped_with_trusted_types_eval_keyword
             "https://app.test/worker/main.js".to_owned(),
         )
         .with_content_security_policies(vec![
-            "script-src 'trusted-types-eval'; require-trusted-types-for 'script'".to_owned(),
+            "script-src 'trusted-types-eval'; require-trusted-types-for 'script'".into(),
         ]),
     );
 
@@ -966,86 +1149,45 @@ async fn worker_module_static_imports_resolve_http_dependencies_against_module_u
 #[tokio::test]
 async fn worker_module_static_sibling_dependencies_fetch_in_parallel() {
     ensure_v8();
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind worker module sibling server");
-    let addr = listener.local_addr().expect("worker module sibling addr");
-    let base_url = format!("http://{addr}");
-    let server = tokio::spawn(async move {
-        let mut first_stream = None;
-        let mut first_path = String::new();
-        let mut second_stream = None;
-        let mut second_path = String::new();
-        for _ in 0..2 {
-            let (mut stream, _) = listener
-                .accept()
-                .await
-                .expect("accept worker module sibling request");
-            let request = read_http_request_head(&mut stream)
-                .await
-                .expect("read worker module sibling request");
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .expect("worker module sibling request path")
-                .to_owned();
-            if first_stream.is_none() {
-                first_path = path;
-                first_stream = Some(stream);
-            } else {
-                second_path = path;
-                second_stream = Some(stream);
-            }
-        }
-        let mut paths = vec![first_path.clone(), second_path.clone()];
-        paths.sort();
-        assert_eq!(paths, vec!["/worker/a.js", "/worker/b.js"]);
-        for (path, stream) in [
-            (first_path, first_stream.expect("first sibling stream")),
-            (second_path, second_stream.expect("second sibling stream")),
-        ] {
-            let body = match path.as_str() {
-                "/worker/a.js" => "export const a = 'a';",
-                "/worker/b.js" => "export const b = 'b';",
-                other => panic!("unexpected worker module sibling path: {other}"),
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+    for imports in [
+        r#"import { a } from "./a.js"; import { b } from "./b.js";"#,
+        r#"import { b } from "./b.js"; import { a } from "./a.js";"#,
+    ] {
+        for reverse_responses in [false, true] {
+            let mut server = source_phase::ModuleSourceServer::start().await;
+            let mut handle = server.worker(
+                format!("{imports}\npostMessage({{ a, b }}); close();"),
+                WorkerScriptKind::Module,
             );
-            let mut stream = stream;
-            stream
-                .write_all(response.as_bytes())
+            // Withhold both responses until both requests arrive. Serial
+            // dependency loading cannot satisfy this rendezvous.
+            let (a, b) = server.request_pair("/worker/a.js", "/worker/b.js").await;
+            let mut responses = [(a, "export const a = 'a';"), (b, "export const b = 'b';")];
+            if reverse_responses {
+                responses.reverse();
+            }
+            for (stream, body) in responses {
+                source_phase::ModuleSourceServer::write(
+                    stream,
+                    "200 OK",
+                    "application/javascript",
+                    body,
+                )
+                .await;
+            }
+            let msg = timeout(TIMEOUT, handle.recv())
                 .await
-                .expect("write worker module sibling response");
+                .expect("timed out")
+                .expect("channel closed");
+            assert_eq!(
+                expect_post_json(msg),
+                r#"{"a":"a","b":"b"}"#,
+                "imports={imports}; reverse_responses={reverse_responses}",
+            );
+            handle.terminate_and_join();
+            server.assert_no_more_requests();
         }
-    });
-
-    let loader =
-        ResourceRequestClient::new(&FetchConfig::default()).expect("worker module sibling loader");
-    let mut handle = spawn_worker_with_request_client_and_kind(
-        r#"
-        import { a } from "./a.js";
-        import { b } from "./b.js";
-        postMessage({ a, b });
-        close();
-        "#
-        .into(),
-        format!("{base_url}/worker/main.js"),
-        loader,
-        WorkerScriptKind::Module,
-    );
-
-    let msg = timeout(TIMEOUT, handle.recv())
-        .await
-        .expect("timed out")
-        .expect("channel closed");
-    assert_eq!(expect_post_json(msg), r#"{"a":"a","b":"b"}"#);
-    server
-        .await
-        .expect("worker module sibling server should finish");
+    }
 }
 
 #[tokio::test]
@@ -1242,12 +1384,12 @@ async fn worker_module_same_origin_dependency_fetch_sends_cookies() {
 
     let cookie_store = moli_cookie_jar::new_shared_browser_cookie_store();
     {
-        let mut jar = cookie_store.lock();
+        let mut jar = cookie_store.lock().unwrap();
         jar.store_response_headers(
             &url::Url::parse(&format!("{base_url}/worker/main.js")).unwrap(),
             &[(
                 "set-cookie".to_owned(),
-                "wpt_worker_module_credentials=fixture; Path=/worker; SameSite=Lax".to_owned(),
+                b"wpt_worker_module_credentials=fixture; Path=/worker; SameSite=Lax".to_vec(),
             )],
         );
     }
@@ -1356,20 +1498,11 @@ async fn worker_module_redirected_http_dependency_uses_final_response_url_as_bas
 }
 
 #[tokio::test]
-async fn worker_module_redirected_http_dependency_final_url_obeys_script_src() {
+async fn worker_module_redirected_http_dependency_blocked_before_network_by_script_src() {
     ensure_v8();
-    let target_source = "postMessage('unexpected module target');";
-    let target_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        target_source.len(),
-        target_source
-    );
-    let (target_base_url, target_server) = spawn_raw_path_response_http_server(vec![(
-        "/worker/final/entry.js",
-        target_response,
-        Duration::ZERO,
-    )])
-    .await;
+    let target_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target_listener.set_nonblocking(true).unwrap();
+    let target_base_url = format!("http://{}", target_listener.local_addr().unwrap());
     let redirect_response = format!(
         "HTTP/1.1 302 Found\r\nLocation: {target_base_url}/worker/final/entry.js\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
@@ -1392,7 +1525,7 @@ async fn worker_module_redirected_http_dependency_final_url_obeys_script_src() {
         )
         .with_request_client(loader)
         .with_script_kind(WorkerScriptKind::Module)
-        .with_module_static_import_content_security_policies(vec!["script-src 'self'".to_owned()]),
+        .with_module_static_import_content_security_policies(vec!["script-src 'self'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -1412,9 +1545,11 @@ async fn worker_module_redirected_http_dependency_final_url_obeys_script_src() {
     source_server
         .await
         .expect("worker module CSP redirect source server should finish");
-    target_server
-        .await
-        .expect("worker module CSP redirect target server should finish");
+    handle.terminate_and_join();
+    match target_listener.accept() {
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        Ok(_) => panic!("CSP-blocked module redirect connected to its target"),
+    }
 }
 
 #[tokio::test]
@@ -1568,9 +1703,9 @@ async fn worker_module_static_import_uses_outside_csp_not_worker_response_csp() 
             url::Url::parse("https://app.test/page.html").unwrap(),
         )
         .with_module_static_import_content_security_policies(vec![
-            "worker-src *; script-src 'self'".to_owned(),
+            "worker-src *; script-src 'self'".into(),
         ])
-        .with_content_security_policies(vec!["script-src 'self'".to_owned()]),
+        .with_content_security_policies(vec!["script-src 'self'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -2095,9 +2230,9 @@ async fn worker_dynamic_import_uses_worker_response_csp_not_outside_static_csp()
             url::Url::parse("https://app.test/page.html").unwrap(),
         )
         .with_module_static_import_content_security_policies(vec![
-            "worker-src *; script-src 'self'".to_owned(),
+            "worker-src *; script-src 'self'".into(),
         ])
-        .with_content_security_policies(vec!["script-src 'self'".to_owned()]),
+        .with_content_security_policies(vec!["script-src-elem 'self'; script-src *".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -2106,7 +2241,7 @@ async fn worker_dynamic_import_uses_worker_response_csp_not_outside_static_csp()
         .expect("channel closed");
     assert_eq!(
         expect_post_json(msg),
-        r#"{"status":"blocked","events":[{"type":"securitypolicyviolation","effectiveDirective":"script-src","violatedDirective":"script-src","blockedURI":"http://127.0.0.1:9/worker/dynamic.js","documentURI":"https://app.test/worker/main.js","originalPolicy":"script-src 'self'","disposition":"enforce","instance":true}],"name":"TypeError","csp":true}"#
+        r#"{"status":"blocked","events":[{"type":"securitypolicyviolation","effectiveDirective":"script-src-elem","violatedDirective":"script-src-elem","blockedURI":"http://127.0.0.1:9/worker/dynamic.js","documentURI":"https://app.test/worker/main.js","originalPolicy":"script-src-elem 'self'; script-src *","disposition":"enforce","instance":true}],"name":"TypeError","csp":true}"#
     );
 }
 
@@ -2263,8 +2398,8 @@ async fn shared_worker_dynamic_import_csp_block_dispatches_securitypolicyviolati
                 let matched = false;
                 addEventListener("securitypolicyviolation", event => {
                     matched = event.type === "securitypolicyviolation" &&
-                        event.effectiveDirective === "script-src" &&
-                        event.violatedDirective === "script-src" &&
+                        event.effectiveDirective === "script-src-elem" &&
+                        event.violatedDirective === "script-src-elem" &&
                         event.blockedURI === "http://127.0.0.1:9/worker/dynamic.js" &&
                         event.documentURI === "https://app.test/shared-worker.js" &&
                         event.originalPolicy === "script-src 'self'" &&
@@ -2286,7 +2421,7 @@ async fn shared_worker_dynamic_import_csp_block_dispatches_securitypolicyviolati
             name: "shared".to_owned(),
             storage_key,
         })
-        .with_content_security_policies(vec!["script-src 'self'".to_owned()]),
+        .with_content_security_policies(vec!["script-src 'self'".into()]),
     );
 
     handle
@@ -2395,6 +2530,175 @@ async fn worker_module_no_import_source_runs_in_strict_mode() {
         expect_post_json(msg),
         r#"{"answer":42,"topLevelThisUndefined":true,"functionThisUndefined":true,"implicitGlobalError":"ReferenceError","leakedGlobal":false}"#
     );
+}
+
+fn service_worker_module_options(source: String, script_url: String) -> WorkerSpawnOptions {
+    let scope_url = url::Url::parse(&script_url).unwrap().join(".").unwrap();
+    WorkerSpawnOptions::new(source, script_url)
+        .with_script_kind(WorkerScriptKind::Module)
+        .with_global_kind(super::super::WorkerGlobalKind::Service {
+            registration_id: ServiceWorkerRegistrationId::from_u64_for_test(1),
+            version_id: ServiceWorkerVersionId::from_u64_for_test(1),
+            scope_url,
+        })
+}
+
+async fn expect_service_worker_async_module_error(handle: &mut WorkerHandle) {
+    loop {
+        match timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap() {
+            WorkerToParentMessage::ServiceWorkerImportedScriptLoaded { .. } => {}
+            WorkerToParentMessage::Error {
+                message,
+                phase,
+                event_kind,
+                ..
+            } => {
+                assert!(message.contains("TypeError"), "{message}");
+                assert!(message.contains("Top-level await"), "{message}");
+                assert_eq!(phase, WorkerErrorPhase::Bootstrap);
+                assert_eq!(event_kind, WorkerParentErrorEventKind::Event);
+                return;
+            }
+            // Console or skipWaiting would mean module evaluation had begun.
+            other => panic!("expected async module rejection before execution, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn service_worker_module_top_level_await_is_rejected_before_execution() {
+    ensure_v8();
+    for source in [
+        "await Promise.resolve();",
+        "await new Promise(() => {});",
+        "await Promise.reject(new Error('rejected'));",
+        "if (false) { await Promise.resolve(); }",
+        "for await (const item of []) {}",
+    ] {
+        let mut handle = spawn_test_worker_with_options(service_worker_module_options(
+            format!("console.log('unexpected execution'); {source} skipWaiting();"),
+            "https://example.test/worker/sw.js".into(),
+        ));
+        expect_service_worker_async_module_error(&mut handle).await;
+        handle.terminate_and_join();
+    }
+}
+
+#[tokio::test]
+async fn service_worker_module_rejects_async_dependencies_before_execution() {
+    ensure_v8();
+    for cycle in [false, true] {
+        let cycle_import = if cycle { "import './sw.js';" } else { "" };
+        let (base_url, server) = spawn_path_response_http_server(vec![
+            (
+                "/worker/middle.js",
+                "HTTP/1.1 200 OK",
+                "text/javascript",
+                "import './dep.js'; console.log('unexpected middle execution');".into(),
+                Duration::ZERO,
+            ),
+            (
+                "/worker/dep.js",
+                "HTTP/1.1 200 OK",
+                "text/javascript",
+                format!("{cycle_import} console.log('unexpected dependency execution'); await 0;"),
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+        let mut handle = spawn_test_worker_with_options(service_worker_module_options(
+            "import './middle.js'; console.log('unexpected root execution'); skipWaiting();".into(),
+            format!("{base_url}/worker/sw.js"),
+        ));
+        expect_service_worker_async_module_error(&mut handle).await;
+        handle.terminate_and_join();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn service_worker_module_checks_only_wasm_evaluation_dependencies() {
+    ensure_v8();
+    for source_only in [false, true] {
+        let mut responses = vec![(
+            "/worker/worker.wasm",
+            "HTTP/1.1 200 OK",
+            "application/wasm",
+            worker_wasm_import_pm_body(),
+            Duration::ZERO,
+        )];
+        if !source_only {
+            responses.push((
+                "/worker/worker-helper.js",
+                "HTTP/1.1 200 OK",
+                "text/javascript",
+                "console.log('unexpected helper execution'); export function pm() {} await 0;"
+                    .into(),
+                Duration::ZERO,
+            ));
+        }
+        let (base_url, server) = spawn_path_response_http_server(responses).await;
+        let source = if source_only {
+            "import source wasm from './worker.wasm'; console.log(wasm instanceof WebAssembly.Module);"
+        } else {
+            "import './worker.wasm'; console.log('unexpected root execution'); skipWaiting();"
+        };
+        let (bootstrap_tx, mut bootstrap_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handle = spawn_test_worker_with_options(
+            service_worker_module_options(source.into(), format!("{base_url}/worker/sw.js"))
+                .with_bootstrap_completion_sender(bootstrap_tx),
+        );
+        if source_only {
+            let bootstrap = timeout(TIMEOUT, bootstrap_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(bootstrap.result.is_ok(), "{:?}", bootstrap.result);
+            loop {
+                match timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap() {
+                    WorkerToParentMessage::ServiceWorkerImportedScriptLoaded { .. } => {}
+                    WorkerToParentMessage::Console(message) => {
+                        assert_eq!(message.message, "log: true");
+                        break;
+                    }
+                    other => panic!("expected source import without evaluation, got {other:?}"),
+                }
+            }
+        } else {
+            expect_service_worker_async_module_error(&mut handle).await;
+        }
+        handle.terminate_and_join();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn service_worker_module_allows_await_inside_async_functions() {
+    ensure_v8();
+    for source in [
+        "async function run() { await Promise.resolve(); }",
+        "(async () => { await Promise.resolve(); })();",
+        "const text = 'await Promise.resolve()'; /* await 0 */",
+    ] {
+        let (bootstrap_tx, mut bootstrap_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handle = spawn_test_worker_with_options(
+            service_worker_module_options(
+                format!("{source} console.log('ready');"),
+                "https://example.test/worker/sw.js".into(),
+            )
+            .with_bootstrap_completion_sender(bootstrap_tx),
+        );
+        let bootstrap = timeout(TIMEOUT, bootstrap_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(bootstrap.result.is_ok(), "{:?}", bootstrap.result);
+        match timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap() {
+            WorkerToParentMessage::Console(message) => assert_eq!(message.message, "log: ready"),
+            other => panic!("expected successful module execution, got {other:?}"),
+        }
+        handle.terminate_and_join();
+    }
 }
 
 #[tokio::test]
@@ -2523,7 +2827,7 @@ async fn worker_dynamic_import_report_only_csp_dispatches_without_blocking() {
         )
         .with_request_client(loader)
         .with_script_kind(WorkerScriptKind::Module)
-        .with_content_security_report_only_policies(vec!["script-src 'none'".to_owned()]),
+        .with_content_security_report_only_policies(vec!["script-src 'none'".into()]),
     );
 
     let msg = timeout(TIMEOUT, handle.recv())
@@ -2533,7 +2837,7 @@ async fn worker_dynamic_import_report_only_csp_dispatches_without_blocking() {
     assert_eq!(
         expect_post_json(msg),
         format!(
-            r#"{{"events":[{{"type":"securitypolicyviolation","effectiveDirective":"script-src","violatedDirective":"script-src","blockedURI":"{dep_url}","documentURI":"{script_url}","originalPolicy":"script-src 'none'","disposition":"report","instance":true}}],"value":42}}"#
+            r#"{{"events":[{{"type":"securitypolicyviolation","effectiveDirective":"script-src-elem","violatedDirective":"script-src-elem","blockedURI":"{dep_url}","documentURI":"{script_url}","originalPolicy":"script-src 'none'","disposition":"report","instance":true}}],"value":42}}"#
         )
     );
     server
@@ -3999,12 +4303,12 @@ async fn worker_module_dynamic_css_import_rejects_invalid_module_type() {
 }
 
 #[tokio::test]
-async fn worker_module_dynamic_text_import_rejects_invalid_module_type() {
+async fn worker_module_dynamic_unsupported_import_rejects_invalid_module_type() {
     ensure_v8();
     let mut handle = spawn_worker_with_request_client_and_kind(
         r#"
         try {
-            await import("data:text/plain,hello", { with: { type: "text" } });
+            await import("data:text/plain,hello", { with: { type: "unsupported" } });
             postMessage("unexpected");
         } catch (error) {
             postMessage({
@@ -4027,16 +4331,16 @@ async fn worker_module_dynamic_text_import_rejects_invalid_module_type() {
         .expect("channel closed");
     assert_eq!(
         expect_post_json(msg),
-        r#"{"name":"TypeError","type":true,"message":"module type `text` is not a valid module type for dynamic import `data:text/plain,hello`"}"#
+        r#"{"name":"TypeError","type":true,"message":"module type `unsupported` is not a valid module type for dynamic import `data:text/plain,hello`"}"#
     );
 }
 
 #[tokio::test]
-async fn worker_module_static_text_import_rejects_invalid_module_type() {
+async fn worker_module_static_unsupported_import_rejects_invalid_module_type() {
     ensure_v8();
     let mut handle = spawn_worker_with_request_client_and_kind(
         r#"
-        import text from "data:text/plain,hello" with { type: "text" };
+        import text from "data:text/plain,hello" with { type: "unsupported" };
         postMessage("unexpected");
         "#
         .into(),
@@ -4052,7 +4356,7 @@ async fn worker_module_static_text_import_rejects_invalid_module_type() {
     match msg {
         WorkerToParentMessage::Error { message, .. } => {
             assert!(
-                message.contains("module type `text` is not a valid module type"),
+                message.contains("module type `unsupported` is not a valid module type"),
                 "{message}"
             );
         }
@@ -5268,6 +5572,98 @@ async fn service_worker_module_static_json_import_reports_json_resource_kind() {
 }
 
 #[tokio::test]
+async fn service_worker_module_static_text_import_reports_text_resource_kind() {
+    ensure_v8();
+    let dep_body = "text payload";
+    let (base_url, server) = spawn_path_response_http_server(vec![(
+        "/worker/dep.bin",
+        "HTTP/1.1 200 OK",
+        "application/octet-stream; charset=windows-1252",
+        dep_body.to_owned(),
+        Duration::ZERO,
+    )])
+    .await;
+    let loader =
+        ResourceRequestClient::new(&FetchConfig::default()).expect("service worker module loader");
+    let mut handle = spawn_test_worker_with_options(
+        WorkerSpawnOptions::new(
+            r#"
+            import data from "./dep.bin" with { type: "text" };
+            if (data !== "text payload") {
+                throw new Error("missing text module dep");
+            }
+            skipWaiting();
+            "#
+            .to_owned(),
+            format!("{base_url}/worker/sw.js"),
+        )
+        .with_request_client(loader)
+        .with_script_kind(WorkerScriptKind::Module)
+        .with_global_kind(super::super::WorkerGlobalKind::Service {
+            registration_id: ServiceWorkerRegistrationId::from_u64_for_test(11),
+            version_id: ServiceWorkerVersionId::from_u64_for_test(13),
+            scope_url: url::Url::parse(&format!("{base_url}/worker/")).unwrap(),
+        }),
+    );
+
+    let expected_import_url = format!("{base_url}/worker/dep.bin");
+    let expected_hash = sha256_hex(dep_body.as_bytes());
+    let mut imported_resource = None;
+    let mut saw_skip_waiting = false;
+    while imported_resource.is_none() || !saw_skip_waiting {
+        let message = timeout(TIMEOUT, handle.recv())
+            .await
+            .expect("timed out waiting for service worker module text resource")
+            .expect("channel closed");
+        match message {
+            WorkerToParentMessage::ServiceWorkerImportedScriptLoaded {
+                registration_id,
+                version_id,
+                resource,
+            } => {
+                assert_eq!(
+                    registration_id,
+                    ServiceWorkerRegistrationId::from_u64_for_test(11)
+                );
+                assert_eq!(version_id, ServiceWorkerVersionId::from_u64_for_test(13));
+                imported_resource = Some(resource);
+            }
+            WorkerToParentMessage::ServiceWorkerSkipWaiting {
+                registration_id,
+                version_id,
+            } => {
+                assert_eq!(
+                    registration_id,
+                    ServiceWorkerRegistrationId::from_u64_for_test(11)
+                );
+                assert_eq!(version_id, ServiceWorkerVersionId::from_u64_for_test(13));
+                saw_skip_waiting = true;
+            }
+            WorkerToParentMessage::Error { message, .. } => {
+                panic!("unexpected service worker module text error: {message}");
+            }
+            _ => {}
+        }
+    }
+
+    let resource = imported_resource.expect("module static text import should report a resource");
+    assert_eq!(resource.request_url.as_str(), expected_import_url);
+    assert_eq!(resource.final_url.as_str(), expected_import_url);
+    assert_eq!(resource.kind, WorkerScriptResourceKind::TextModule);
+    assert_eq!(resource.status, 200);
+    assert_eq!(resource.body_len, dep_body.len());
+    assert_eq!(resource.body_sha256, expected_hash);
+    assert_eq!(
+        resource.mime_type.as_deref(),
+        Some("application/octet-stream; charset=windows-1252")
+    );
+    handle.terminate_and_join();
+    server
+        .await
+        .expect("service worker module text resource server should finish");
+}
+
+#[tokio::test]
 async fn service_worker_module_static_css_import_rejects_invalid_module_type() {
     ensure_v8();
     let mut handle = spawn_test_worker_with_options(
@@ -5304,12 +5700,12 @@ async fn service_worker_module_static_css_import_rejects_invalid_module_type() {
 }
 
 #[tokio::test]
-async fn service_worker_module_static_text_import_rejects_invalid_module_type() {
+async fn service_worker_module_static_unsupported_import_rejects_invalid_module_type() {
     ensure_v8();
     let mut handle = spawn_test_worker_with_options(
         WorkerSpawnOptions::new(
             r#"
-            import text from "data:text/plain,hello" with { type: "text" };
+            import text from "data:text/plain,hello" with { type: "unsupported" };
             skipWaiting();
             "#
             .to_owned(),
@@ -5330,7 +5726,7 @@ async fn service_worker_module_static_text_import_rejects_invalid_module_type() 
     match message {
         WorkerToParentMessage::Error { message, .. } => {
             assert!(
-                message.contains("module type `text` is not a valid module type"),
+                message.contains("module type `unsupported` is not a valid module type"),
                 "{message}"
             );
         }
@@ -5487,4 +5883,43 @@ async fn worker_importscripts_cross_origin_failure_reports_helper_callsite_from_
     server
         .await
         .expect("cross-origin importScripts server should finish");
+}
+
+#[tokio::test]
+async fn worker_json_imports_use_shared_response_mime_extraction() {
+    ensure_v8();
+    for (mime, accepts) in [
+        ("text/json", true),
+        ("TeXt/JsOn; charset=windows-1250", true),
+        ("text/plain, text/json", true),
+        ("text/json, text/plain", false),
+        ("text/plain, application/json", true),
+        ("application/json, invalid, */*", true),
+        ("application/json, text/plain", false),
+        (r#"text/plain; a=",application/json""#, false),
+        ("applic(ation/vnd.api+json", false),
+        ("*/*", false),
+    ] {
+        let (base_url, server) = spawn_path_response_http_server(vec![(
+            "/worker/module.json",
+            "HTTP/1.1 200 OK",
+            mime,
+            r#"{"answer":42}"#.to_owned(),
+            Duration::ZERO,
+        )])
+        .await;
+        let loader = ResourceRequestClient::new(&FetchConfig::default()).unwrap();
+        let mut handle = spawn_worker_with_request_client_and_kind(
+            "import('./module.json', {with:{type:'json'}}).then(m => postMessage(m.default.answer), e => postMessage(e.name));".into(),
+            format!("{base_url}/worker/main.js"), loader, WorkerScriptKind::Module,
+        );
+        let message = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+        assert_eq!(
+            expect_post_json(message),
+            if accepts { "42" } else { r#""TypeError""# },
+            "{mime}"
+        );
+        handle.terminate_and_join();
+        server.await.unwrap();
+    }
 }

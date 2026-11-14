@@ -318,7 +318,7 @@ fn persist_json_service_worker_resource_store(
     };
     let bytes = serde_json::to_vec_pretty(&file)
         .context("failed to serialize Service Worker resource store")?;
-    moli_browser_profile::write_file_atomically(path, &bytes, "Service Worker resource store")
+    moli_browser_profile::write_profile_file(path, &bytes, "Service Worker resource store")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -363,7 +363,8 @@ struct JsonScriptResource {
     final_url: String,
     kind: String,
     status: u16,
-    headers: Vec<(String, String)>,
+    #[serde(deserialize_with = "moli_fetch::deserialize_headers")]
+    headers: Vec<(String, Vec<u8>)>,
     body_len: usize,
     body_sha256: String,
     response_time_ms: u64,
@@ -897,7 +898,7 @@ mod tests {
             final_url: raw_url.parse().expect("final URL should parse"),
             kind,
             status: 200,
-            headers: vec![("content-type".to_owned(), "text/javascript".to_owned())],
+            headers: vec![("content-type".to_owned(), b"text/javascript".to_vec())],
             body_len: 11,
             body_sha256: "hash".to_owned(),
             response_time_ms: 7,

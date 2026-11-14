@@ -6,6 +6,7 @@ mod form_controls;
 mod geometry;
 mod image;
 mod inline_boxes;
+mod links;
 mod mask;
 mod scrollbar;
 mod table;
@@ -25,7 +26,9 @@ use mask::{CssMaskPlan, inspect_css_mask, project_css_mask};
 use scrollbar::project_scrollbars;
 use style::values::generics::image::GenericImage;
 use table::project_collapsed_table_borders;
-use text::{TextClipMaskScope, project_text, project_text_clip_mask};
+use text::{
+    InlineTextPaint, TextClipMaskScope, project_selection, project_text, project_text_clip_mask,
+};
 
 use crate::{
     LayoutBox, LayoutBoxId, LayoutClipChainId, LayoutElementCategory, LayoutFormControlKind,
@@ -128,9 +131,11 @@ enum UnavailableReplacedContentPaint {
     TransparentCanvas,
 }
 
-pub(crate) fn project_paint_snapshot<N>(
+pub(crate) fn project_paint_snapshot<N, S: crate::LayoutSource<NodeId = N>>(
     projection: &OutputProjection<'_, N>,
+    source: &S,
     capture: ResolvedPaintCapture,
+    retain_text_semantics: bool,
     embedded_frames: &mut HashMap<LayoutBoxId, PaintSnapshot>,
 ) -> PaintProjectionResult
 where
@@ -143,16 +148,24 @@ where
         (capture.base_background_color, None)
     };
     let mut snapshot = PaintSnapshot::new(projection.viewport, canvas_color);
+    snapshot.retain_text_semantics = retain_text_semantics;
     snapshot.surface = capture.surface;
     snapshot.viewport_to_surface = capture.viewport_to_surface;
     snapshot.content_size = projection.document_content_size();
     snapshot.diagnostics = projection.diagnostics.clone();
+    let links = retain_text_semantics.then(|| links::LinkProjection::new(projection, source));
     let cull_plan = PaintCullPlan::build(projection);
     let mut metrics = PaintProjectionMetrics {
         event_count: projection.paint_events.len(),
         ..PaintProjectionMetrics::default()
     };
     let mut current_cull = PaintCullRegion::for_capture(capture.viewport_rect);
+    if capture.clip_to_viewport {
+        snapshot.push_fragment(PaintFragment::PushClip {
+            shape: PaintShape::Rect(capture.viewport_rect),
+            transform: capture.viewport_to_surface,
+        });
+    }
     if let Some(background) = propagated_background {
         let transform = capture.viewport_to_surface;
         let paint_space = PaintSpace::ROOT.with_outer_transform(transform);
@@ -179,6 +192,7 @@ where
     let mut context_layers = Vec::new();
     let mut active_clips = ActivePaintClipChain::default();
     let mut event_index = 0usize;
+    let mut inline_text = HashMap::new();
     while event_index < projection.paint_events.len() {
         let event = projection.paint_events[event_index];
         if let PaintOrderEvent::PushStackingContext(_) = event {
@@ -363,6 +377,11 @@ where
                     projection.background_clips[id.index()],
                     &mut snapshot,
                 );
+                if let Some(links) = &links
+                    && let Some(fragment) = projection.direct_fragments[id.index()]
+                {
+                    links.append(projection, fragment, &mut snapshot);
+                }
                 project_box_background(
                     projection,
                     id,
@@ -380,12 +399,124 @@ where
                     projection.content_clips[id.index()],
                     &mut snapshot,
                 );
-                project_box_contents(
+                if let Some(links) = &links {
+                    for fragment in &projection.owner_paint_fragments[id.index()] {
+                        if matches!(
+                            projection.fragments[fragment.index()].kind,
+                            crate::LayoutFragmentKind::Text { .. }
+                        ) {
+                            links.append(projection, *fragment, &mut snapshot);
+                        }
+                    }
+                }
+                project_box_contents(projection, id, embedded_frames, &mut snapshot);
+            }
+            PaintOrderEvent::InlineContents(id) => {
+                active_clips.transition_to(
+                    projection,
+                    projection.content_clips[id.index()],
+                    &mut snapshot,
+                );
+                if let Some(links) = &links {
+                    for fragment in &projection.owner_paint_fragments[id.index()] {
+                        if matches!(
+                            projection.fragments[fragment.index()].kind,
+                            crate::LayoutFragmentKind::InlineBox { .. }
+                        ) {
+                            links.append(projection, *fragment, &mut snapshot);
+                        }
+                    }
+                }
+                project_inline_contents(
                     projection,
                     id,
-                    embedded_frames,
+                    None,
                     capture.include_backgrounds,
                     current_cull,
+                    &mut metrics,
+                    &mut snapshot,
+                );
+            }
+            PaintOrderEvent::BoxText(id) => {
+                active_clips.transition_to(
+                    projection,
+                    projection.content_clips[id.index()],
+                    &mut snapshot,
+                );
+                project_box_text(projection, id, current_cull, &mut metrics, &mut snapshot);
+            }
+            PaintOrderEvent::BoxCaret(id) | PaintOrderEvent::InlineSelection { owner: id, .. } => {
+                active_clips.transition_to(
+                    projection,
+                    projection.content_clips[id.index()],
+                    &mut snapshot,
+                );
+                let space = &projection.coordinate_spaces[id.index() + 1];
+                let range = match event {
+                    PaintOrderEvent::InlineSelection { start, end, .. } => Some(start..end),
+                    _ => None,
+                };
+                project_selection(
+                    &projection.world.boxes[id.index()],
+                    space
+                        .paint_space(snapshot.viewport_to_surface)
+                        .local_transform(),
+                    current_cull.local_rect(space.paint.local_transform()),
+                    &mut snapshot,
+                    range.as_ref(),
+                );
+            }
+            PaintOrderEvent::InlineBox { owner, fragment } => {
+                active_clips.transition_to(
+                    projection,
+                    projection.content_clips[owner.index()],
+                    &mut snapshot,
+                );
+                if let Some(links) = &links {
+                    links.append(
+                        projection,
+                        projection.owner_paint_fragments[owner.index()][fragment],
+                        &mut snapshot,
+                    );
+                }
+                project_inline_contents(
+                    projection,
+                    owner,
+                    Some(fragment),
+                    capture.include_backgrounds,
+                    current_cull,
+                    &mut metrics,
+                    &mut snapshot,
+                );
+            }
+            PaintOrderEvent::InlineText { owner, line, item } => {
+                let layout_box = &projection.world.boxes[owner.index()];
+                if !layout_box.style.is_visible() {
+                    event_index += 1;
+                    continue;
+                }
+                active_clips.transition_to(
+                    projection,
+                    projection.content_clips[owner.index()],
+                    &mut snapshot,
+                );
+                let space = projection.coordinate_spaces[owner.index() + 1]
+                    .paint_space(snapshot.viewport_to_surface);
+                let viewport_transform = projection.coordinate_spaces[owner.index() + 1]
+                    .paint
+                    .local_transform();
+                let text = inline_text.entry(owner).or_insert_with(|| {
+                    InlineTextPaint::new(
+                        layout_box.inline_layout.as_ref().unwrap(),
+                        snapshot.retain_text_semantics,
+                    )
+                });
+                text.project_run(
+                    layout_box,
+                    line,
+                    item,
+                    space.local_transform(),
+                    current_cull.local_rect(viewport_transform),
                     &mut metrics,
                     &mut snapshot,
                 );
@@ -466,6 +597,9 @@ where
     active_clips.clear(&mut snapshot);
     debug_assert!(context_layers.is_empty());
     debug_assert!(context_cull_regions.is_empty());
+    if capture.clip_to_viewport {
+        snapshot.push_fragment(PaintFragment::PopLayer);
+    }
     PaintProjectionResult { snapshot, metrics }
 }
 
@@ -497,11 +631,8 @@ fn push_clip_node<N>(
     N: Copy + Debug + Eq + Hash,
 {
     let node = &projection.clip_chain[id.index()];
-    let transform = snapshot.viewport_to_surface.concatenate(
-        projection.coordinate_spaces[node.coordinate_space.index()]
-            .paint
-            .local_transform(),
-    );
+    let paint_space = projection.coordinate_spaces[node.coordinate_space.index()]
+        .paint_space(snapshot.viewport_to_surface);
     let shape = node.owner.map_or(PaintShape::Rect(node.rect), |owner| {
         let layout_box = &projection.world.boxes[owner.index()];
         let border_radii = layout_box.style.border_radii(
@@ -521,6 +652,16 @@ fn push_clip_node<N>(
             ),
         )
     });
+    // Overflow edges share the box's snapped paint geometry. Fractional clips
+    // otherwise blend an edge differently when atomic paint ordering keeps a
+    // background and its text in one clip layer instead of reopening it.
+    let snapped = node
+        .owner
+        .and_then(|_| paint_space.pixel_snapped_box_shape(shape.clone()));
+    let (shape, transform) = match snapped {
+        Some(shape) => (shape, paint_space.property_transform()),
+        None => (shape, paint_space.local_transform()),
+    };
     snapshot.push_fragment(PaintFragment::PushClip { shape, transform });
 }
 
@@ -561,7 +702,10 @@ where
         return (base_background_color, None);
     }
     if style_has_canvas_background(&root_box.style) {
-        return (root_box.style.background_color(), Some(root));
+        return (
+            composite_canvas_background(root_box.style.background_color(), base_background_color),
+            Some(root),
+        );
     }
 
     let mut stack = root_box.children.iter().rev().copied().collect::<Vec<_>>();
@@ -572,13 +716,35 @@ where
             .is_some_and(|element| element.is_html_element("body"))
         {
             if style_has_canvas_background(&layout_box.style) {
-                return (layout_box.style.background_color(), Some(id));
+                return (
+                    composite_canvas_background(
+                        layout_box.style.background_color(),
+                        base_background_color,
+                    ),
+                    Some(id),
+                );
             }
             break;
         }
         stack.extend(layout_box.children.iter().rev().copied());
     }
     (base_background_color, None)
+}
+
+fn composite_canvas_background(color: PaintColor, base: PaintColor) -> PaintColor {
+    let base_alpha = base.alpha * (1.0 - color.alpha);
+    let alpha = color.alpha + base_alpha;
+    if alpha == 0.0 {
+        return PaintColor::TRANSPARENT;
+    }
+    let component =
+        |foreground, background| (foreground * color.alpha + background * base_alpha) / alpha;
+    PaintColor::new(
+        component(color.red, base.red),
+        component(color.green, base.green),
+        component(color.blue, base.blue),
+        alpha,
+    )
 }
 
 fn style_has_canvas_background(style: &crate::ResolvedLayoutStyle) -> bool {
@@ -849,9 +1015,6 @@ fn project_box_contents<N>(
     projection: &OutputProjection<'_, N>,
     id: LayoutBoxId,
     embedded_frames: &mut HashMap<LayoutBoxId, PaintSnapshot>,
-    include_backgrounds: bool,
-    cull: PaintCullRegion,
-    metrics: &mut PaintProjectionMetrics,
     snapshot: &mut PaintSnapshot,
 ) where
     N: Copy + Debug + Eq + Hash,
@@ -861,10 +1024,6 @@ fn project_box_contents<N>(
         return;
     }
     let geometry = &projection.boxes[id.index()];
-    let viewport_transform = projection.coordinate_spaces[geometry.coordinate_space.index()]
-        .paint
-        .local_transform();
-    let local_cull = cull.local_rect(viewport_transform);
     let paint_space = projection.coordinate_spaces[geometry.coordinate_space.index()]
         .paint_space(snapshot.viewport_to_surface);
     let transform = paint_space.local_transform();
@@ -880,19 +1039,69 @@ fn project_box_contents<N>(
     }
     project_replaced_image(projection, id, paint_space, snapshot);
     project_form_control_appearance(layout_box, geometry.border_box, transform, snapshot);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_inline_contents<N>(
+    projection: &OutputProjection<'_, N>,
+    id: LayoutBoxId,
+    selected_fragment: Option<usize>,
+    include_backgrounds: bool,
+    cull: PaintCullRegion,
+    metrics: &mut PaintProjectionMetrics,
+    snapshot: &mut PaintSnapshot,
+) where
+    N: Copy + Debug + Eq + Hash,
+{
+    let layout_box = &projection.world.boxes[id.index()];
+    if !layout_box.style.is_visible() {
+        return;
+    }
+    let space = &projection.coordinate_spaces[id.index() + 1];
+    let local_cull = cull.local_rect(space.paint.local_transform());
+    let paint_space = space.paint_space(snapshot.viewport_to_surface);
     let mut text_clip_mask = |scope: TextClipMaskScope, snapshot: &mut PaintSnapshot| {
         project_background_text_clip_mask(projection, id, scope, cull, metrics, snapshot);
     };
     project_inline_box_fragments(
         projection.world,
         layout_box,
+        selected_fragment,
         paint_space,
         include_backgrounds,
         snapshot,
         local_cull,
         &mut text_clip_mask,
     );
-    project_text(layout_box, transform, local_cull, metrics, snapshot);
+}
+
+fn project_box_text<N>(
+    projection: &OutputProjection<'_, N>,
+    id: LayoutBoxId,
+    cull: PaintCullRegion,
+    metrics: &mut PaintProjectionMetrics,
+    snapshot: &mut PaintSnapshot,
+) where
+    N: Copy + Debug + Eq + Hash,
+{
+    let layout_box = &projection.world.boxes[id.index()];
+    if !layout_box.style.is_visible() {
+        return;
+    }
+    let geometry = &projection.boxes[id.index()];
+    let viewport_transform = projection.coordinate_spaces[geometry.coordinate_space.index()]
+        .paint
+        .local_transform();
+    let transform = projection.coordinate_spaces[geometry.coordinate_space.index()]
+        .paint_space(snapshot.viewport_to_surface)
+        .local_transform();
+    project_text(
+        layout_box,
+        transform,
+        cull.local_rect(viewport_transform),
+        metrics,
+        snapshot,
+    );
 }
 
 fn unavailable_replaced_content_paint<N>(

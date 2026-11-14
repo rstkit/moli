@@ -1,16 +1,39 @@
-use super::super::{BridgeHandle, ComputedStyleDescriptor, DomTokenListKind, JsContextHost};
+use super::super::{BridgeHandle, ComputedStyleDescriptor, DomTokenListKind, PageScriptHost};
 use super::NativeDomBridge;
 use crate::document_runtime::DomHandle;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BridgeWrapperIdentity {
+    Canonical,
+    NewObject,
+}
 
 impl NativeDomBridge {
     pub(crate) fn install_default_world_wrapper_cache(&self, context: v8::Local<'_, v8::Context>) {
         self.identity.install_default_world_wrapper_cache(context);
     }
 
+    pub(crate) fn install_isolated_world_wrapper_cache(
+        &mut self,
+        context: v8::Local<'_, v8::Context>,
+    ) {
+        self.identity.install_isolated_world_wrapper_cache(context);
+    }
+
+    pub(crate) fn prune_collected_isolated_world_wrapper_caches(&mut self) {
+        self.identity
+            .prune_collected_isolated_world_wrapper_caches();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated_world_wrapper_cache_state_for_test(&self) -> Option<(usize, usize)> {
+        self.identity.isolated_world_wrapper_cache_state_for_test()
+    }
+
     pub(crate) fn wrap_handle<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
         self.wrap_bridge_handle(scope, host_ptr, BridgeHandle::Node(handle))
@@ -38,7 +61,7 @@ impl NativeDomBridge {
     pub(crate) fn wrap_window<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> Option<v8::Local<'s, v8::Object>> {
         self.wrap_bridge_handle(scope, host_ptr, BridgeHandle::Window)
     }
@@ -46,29 +69,55 @@ impl NativeDomBridge {
     pub(super) fn wrap_bridge_handle<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: BridgeHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
+        self.materialize_bridge_wrapper(scope, host_ptr, handle, BridgeWrapperIdentity::Canonical)
+    }
+
+    fn materialize_bridge_wrapper<'s, 'i>(
+        &mut self,
+        scope: &mut v8::PinScope<'s, 'i>,
+        host_ptr: *mut PageScriptHost,
+        handle: BridgeHandle,
+        identity: BridgeWrapperIdentity,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        let current_host =
+            crate::util::context_host_ptr_from_context_slot(scope.get_current_context())?;
+        if current_host != host_ptr {
+            // Reflector IDs are local to a DOM bridge. Related Pages share
+            // an isolate, but must never consult one another's wrapper cache.
+            let host = unsafe { &*host_ptr };
+            let dispatch_scope = crate::native_bridge::OwnerDispatchScope::Top;
+            let owner = host.current_window_execution_context_owner(dispatch_scope)?;
+            let context = host
+                .window_execution_context(scope, owner, dispatch_scope)?
+                .1;
+            let scope = &mut v8::ContextScope::new(scope, context);
+            return self.materialize_bridge_wrapper(scope, host_ptr, handle, identity);
+        }
+        // A reflector describes the native read source. NewObject declarations
+        // can share that descriptor while their JS objects remain independent.
         let reflector_id = self.identity.reflector_id(&handle);
-        if let Some(wrapper) = self.identity.cached_wrapper(scope, reflector_id) {
-            if !matches!(&handle, BridgeHandle::Window) {
-                self.bindings
-                    .sync_wrapper_owner_realm_prototype(scope, host_ptr, &handle, wrapper);
-            }
+        if identity == BridgeWrapperIdentity::Canonical
+            && let Some(wrapper) = self.identity.cached_wrapper(scope, reflector_id)
+        {
             return Some(wrapper);
         }
 
         let wrapper = self
             .bindings
             .instantiate_wrapper(scope, host_ptr, handle, reflector_id);
-        self.identity.cache_wrapper(scope, reflector_id, wrapper);
+        if identity == BridgeWrapperIdentity::Canonical {
+            self.identity.cache_wrapper(scope, reflector_id, wrapper);
+        }
         Some(wrapper)
     }
 
     pub(crate) fn wrap_handle_for_receiver<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         receiver: v8::Local<'s, v8::Object>,
         handle: DomHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
@@ -89,7 +138,7 @@ impl NativeDomBridge {
     pub(crate) fn wrap_class_list<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        runtime_ptr: *mut JsContextHost,
+        runtime_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
         self.wrap_bridge_handle(
@@ -102,7 +151,7 @@ impl NativeDomBridge {
     pub(crate) fn wrap_part_list<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        runtime_ptr: *mut JsContextHost,
+        runtime_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
         self.wrap_bridge_handle(
@@ -115,7 +164,7 @@ impl NativeDomBridge {
     pub(crate) fn wrap_rel_list<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        runtime_ptr: *mut JsContextHost,
+        runtime_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
         self.wrap_bridge_handle(
@@ -128,7 +177,7 @@ impl NativeDomBridge {
     pub(crate) fn wrap_dataset<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        runtime_ptr: *mut JsContextHost,
+        runtime_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
         self.wrap_bridge_handle(scope, runtime_ptr, BridgeHandle::Dataset(handle))
@@ -137,23 +186,24 @@ impl NativeDomBridge {
     pub(crate) fn wrap_style<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        runtime_ptr: *mut JsContextHost,
+        runtime_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> Option<v8::Local<'s, v8::Object>> {
         self.wrap_bridge_handle(scope, runtime_ptr, BridgeHandle::Style(handle))
     }
 
-    pub(crate) fn wrap_computed_style<'s, 'i>(
+    pub(crate) fn create_computed_style<'s, 'i>(
         &mut self,
         scope: &mut v8::PinScope<'s, 'i>,
-        runtime_ptr: *mut JsContextHost,
+        runtime_ptr: *mut PageScriptHost,
         handle: DomHandle,
         descriptor: ComputedStyleDescriptor,
     ) -> Option<v8::Local<'s, v8::Object>> {
-        self.wrap_bridge_handle(
+        self.materialize_bridge_wrapper(
             scope,
             runtime_ptr,
             BridgeHandle::ComputedStyle(handle, std::rc::Rc::new(descriptor)),
+            BridgeWrapperIdentity::NewObject,
         )
     }
 }

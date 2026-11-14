@@ -1,19 +1,22 @@
 use super::storage::{form_data_entries, form_data_is_object, push_form_data_entry};
 use super::*;
 use crate::custom_elements::is_form_associated_custom_element_handle;
-use crate::dom::{forms::InputType, native::Node};
+use crate::dom::{
+    forms::{InputType, apply_textarea_wrapping_transformation},
+    native::Node,
+};
 use crate::native_bridge::{
     element::{
-        element_attribute_for_object, element_internals_form_value_for_target,
+        control_has_datalist_ancestor, element_internals_form_value_for_target,
         form_control_is_effectively_disabled, form_data_control_elements, text_control_value,
     },
-    node_runtime_and_handle_from_object,
+    node_runtime_and_handle_from_object_or_detached,
 };
 use moli_encoding::is_charset_sentinel_name;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct EmptyFileOptionsDeclaration {
     #[webapi(data_property, enumerable)]
     r#type: &'static str,
@@ -21,13 +24,16 @@ struct EmptyFileOptionsDeclaration {
 
 pub(super) fn serialize_form_data_controls<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     form_handle: crate::document_runtime::DomHandle,
     submitter: Option<v8::Local<'s, v8::Object>>,
 ) -> Vec<(String, v8::Global<v8::Value>)> {
     let mut entries = Vec::new();
     let controls = form_data_control_elements(unsafe { &*runtime_ptr }, form_handle);
     for handle in controls {
+        if control_has_datalist_ancestor(unsafe { &*runtime_ptr }, handle) {
+            continue;
+        }
         let Some(control) = form_data_control_object(scope, runtime_ptr, handle) else {
             continue;
         };
@@ -38,7 +44,7 @@ pub(super) fn serialize_form_data_controls<'s>(
 
 fn form_data_control_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: crate::document_runtime::DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
     if let Some(control) = crate::native_bridge::document::paired_detached_native_object_for_handle(
@@ -79,10 +85,6 @@ fn append_form_data_entries_for_control<'s>(
     if control_is_effectively_disabled(scope, control) {
         return;
     }
-    if control_has_datalist_ancestor(scope, control) {
-        return;
-    }
-
     let tag = object_string_property_defined(scope, control, "tagName")
         .map(|tag| tag.to_ascii_lowercase())
         .unwrap_or_default();
@@ -240,19 +242,28 @@ fn append_form_data_entries_for_control<'s>(
     }
 }
 
-fn form_control_name(
-    scope: &mut v8::PinScope<'_, '_>,
-    control: v8::Local<'_, v8::Object>,
+fn form_control_name<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    control: v8::Local<'s, v8::Object>,
 ) -> String {
-    element_attribute_for_object(scope, control, "name").unwrap_or_default()
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, control)
+    else {
+        return String::new();
+    };
+    unsafe { &*runtime_ptr }
+        .dom_host()
+        .node(handle)
+        .and_then(Node::as_element)
+        .and_then(|element| element.attribute_ns("", "name"))
+        .unwrap_or_default()
+        .to_owned()
 }
 
-fn image_submitter_coordinates(
-    scope: &mut v8::PinScope<'_, '_>,
-    control: v8::Local<'_, v8::Object>,
+fn image_submitter_coordinates<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    control: v8::Local<'s, v8::Object>,
 ) -> (u32, u32) {
-    let Ok((runtime_ptr, handle)) =
-        crate::native_bridge::node_runtime_and_handle_from_object(scope, control)
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, control)
     else {
         return (0, 0);
     };
@@ -313,27 +324,19 @@ fn append_file_form_data_entries<'s>(
     control: v8::Local<'s, v8::Object>,
     name: &str,
 ) {
-    let Some(files) = object_property_as_object(scope, control, "files") else {
+    let Some(files) = crate::native_bridge::element::input_files_for_object(scope, control)
+        .and_then(|files| file_api::file_list_files_from_object(scope, files))
+    else {
         push_empty_file_form_data_entry(scope, entries, name);
         return;
     };
-    let length = object_number_property(scope, files, "length")
-        .unwrap_or(0.0)
-        .max(0.0) as u32;
-    if length == 0 {
+    if files.is_empty() {
         push_empty_file_form_data_entry(scope, entries, name);
         return;
     }
-    for index in 0..length {
-        let Some(file) = files.get_index(scope, index) else {
-            continue;
-        };
-        if v8::Local::<v8::Object>::try_from(file)
-            .ok()
-            .is_some_and(|file| blob::blob_bytes_from_object(scope, file).is_some())
-        {
-            push_form_data_entry(entries, name, v8::Global::new(scope, file));
-        }
+    for file in files {
+        let file: v8::Local<'_, v8::Value> = file.into();
+        push_form_data_entry(entries, name, v8::Global::new(scope, file));
     }
 }
 
@@ -365,7 +368,7 @@ fn form_data_entry_value_as_name_value_string<'s>(
     value: v8::Local<'s, v8::Value>,
 ) -> Option<String> {
     if let Ok(object) = v8::Local::<v8::Object>::try_from(value)
-        && blob::blob_bytes_from_object(scope, object).is_some()
+        && blob::blob_data_from_object(scope, object).is_some()
     {
         return Some(
             file_api::file_name_from_object(scope, object).unwrap_or_else(|| "blob".into()),
@@ -386,9 +389,9 @@ fn push_string_form_data_entry(
     push_form_data_entry(entries, name, v8::Global::new(scope, value));
 }
 
-fn form_control_value(
-    scope: &mut v8::PinScope<'_, '_>,
-    control: v8::Local<'_, v8::Object>,
+fn form_control_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    control: v8::Local<'s, v8::Object>,
     default: &str,
 ) -> String {
     if let Some(value) = native_form_control_value(scope, control) {
@@ -397,15 +400,23 @@ fn form_control_value(
     object_string_property_defined(scope, control, "value").unwrap_or_else(|| default.to_owned())
 }
 
-fn native_form_control_value(
-    scope: &mut v8::PinScope<'_, '_>,
-    control: v8::Local<'_, v8::Object>,
+fn native_form_control_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    control: v8::Local<'s, v8::Object>,
 ) -> Option<String> {
-    let (runtime_ptr, handle) = node_runtime_and_handle_from_object(scope, control).ok()?;
+    let (runtime_ptr, handle) =
+        node_runtime_and_handle_from_object_or_detached(scope, control).ok()?;
     let runtime = unsafe { &*runtime_ptr };
     let element = runtime.dom_host().node(handle).and_then(Node::as_element)?;
-    if element.is_html_input() || element.is_html_textarea() {
+    if element.is_html_input() {
         return Some(text_control_value(runtime, handle));
+    }
+    if element.is_html_textarea() {
+        return Some(apply_textarea_wrapping_transformation(
+            text_control_value(runtime, handle),
+            element.attribute_ns("", "wrap"),
+            element.attribute_ns("", "cols"),
+        ));
     }
     if element.is_html_option() {
         return Some(element.option_value(runtime.dom_host().dom(), handle));
@@ -425,7 +436,9 @@ fn control_is_effectively_disabled<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     control: v8::Local<'s, v8::Object>,
 ) -> bool {
-    if let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, control) {
+    if let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, control)
+    {
         return form_control_is_effectively_disabled(unsafe { &*runtime_ptr }, handle);
     }
     if object_bool_property(scope, control, "disabled").unwrap_or(false) {
@@ -451,7 +464,8 @@ fn native_form_associated_custom_element<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     control: v8::Local<'s, v8::Object>,
 ) -> bool {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, control) else {
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, control)
+    else {
         return false;
     };
     is_form_associated_custom_element_handle(unsafe { &*runtime_ptr }, handle)
@@ -482,23 +496,6 @@ fn control_is_in_first_legend<'s>(
             continue;
         }
         return dom_node_contains_internal(scope, child, control);
-    }
-    false
-}
-
-fn control_has_datalist_ancestor<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    control: v8::Local<'s, v8::Object>,
-) -> bool {
-    let mut current = object_property_as_object(scope, control, "parentElement");
-    while let Some(element) = current {
-        let tag = object_string_property_defined(scope, element, "tagName")
-            .map(|tag| tag.to_ascii_lowercase())
-            .unwrap_or_default();
-        if tag == "datalist" {
-            return true;
-        }
-        current = object_property_as_object(scope, element, "parentElement");
     }
     false
 }

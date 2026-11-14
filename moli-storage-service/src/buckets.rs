@@ -14,6 +14,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use moli_crypto::sha256_hex;
 use moli_indexeddb::IndexedDbManager;
+mod deletion;
+mod indexed_db;
+mod maintenance;
+mod metadata;
+pub use deletion::{SqlBucketDeletion, SqlBucketDeletionResult, prepare_sql_bucket_deletion};
+pub use maintenance::{
+    SqlBucketMaintenance, SqlBucketOperation, SqlBucketOperationResult, SqlBucketOperationValue,
+    prepare_sql_bucket_maintenance,
+};
 use moli_storage_key::storage_key_prefix_for_origin;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -130,16 +139,7 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct StorageBucketCachedResponse {
-    pub response_type: String,
-    pub url: String,
-    pub redirected: bool,
-    pub status: u16,
-    pub status_text: String,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
+pub use moli_fetch_types::FetchResponse as StorageBucketCachedResponse;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageBucketCachedRequest {
@@ -214,8 +214,8 @@ pub enum StorageBucketCachePutOutcome {
 struct JsonStorageBucketBackend {
     path: PathBuf,
     cache_storage_root: Option<PathBuf>,
-    indexed_db_keys_use_bucket_ids: bool,
     cache_paths_use_bucket_ids: bool,
+    metadata_publication_uncertain: bool,
     memory: MemoryStorageBucketBackend,
 }
 
@@ -359,8 +359,6 @@ struct StorageBucketsJson {
     #[serde(default = "default_next_bucket_id")]
     next_bucket_id: u64,
     #[serde(default)]
-    indexed_db_keys_use_bucket_ids: bool,
-    #[serde(default)]
     cache_paths_use_bucket_ids: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_deletions: Vec<StorageBucketIdentity>,
@@ -398,18 +396,20 @@ struct StorageBucketCacheJsonEntry {
     request_headers: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "is_zero")]
     insertion_order: u64,
-    #[serde(
-        default = "default_cached_response_type",
-        skip_serializing_if = "is_default_cached_response_type"
-    )]
-    response_type: String,
+    #[serde(default, skip_serializing_if = "is_default_cached_response_type")]
+    response_type: moli_fetch_types::FetchResponseType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timing_allow_passed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url_list: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     url: String,
     #[serde(default, skip_serializing_if = "is_false")]
     redirected: bool,
     status: u16,
     status_text: String,
-    headers: Vec<(String, String)>,
+    #[serde(deserialize_with = "moli_header_field::deserialize_headers")]
+    headers: Vec<(String, Vec<u8>)>,
     body_base64: String,
 }
 
@@ -425,12 +425,8 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
-fn default_cached_response_type() -> String {
-    "default".to_owned()
-}
-
-fn is_default_cached_response_type(value: &String) -> bool {
-    value == "default"
+fn is_default_cached_response_type(value: &moli_fetch_types::FetchResponseType) -> bool {
+    *value == moli_fetch_types::FetchResponseType::Default
 }
 
 pub fn new_shared_storage_bucket_store() -> SharedStorageBucketStore {
@@ -548,14 +544,6 @@ pub fn storage_bucket_indexed_db_storage_key(
     )
 }
 
-fn legacy_storage_bucket_indexed_db_storage_key(storage_key: &str, bucket_name: &str) -> String {
-    format!(
-        "bucket:v1:{}:{}",
-        sha256_hex(storage_key.as_bytes()),
-        sha256_hex(bucket_name.as_bytes())
-    )
-}
-
 pub fn storage_bucket_origin_allows_storage(origin: &str) -> bool {
     !moli_storage_key::serialized_storage_key_has_opaque_origin(origin)
 }
@@ -610,15 +598,14 @@ fn clear_storage_bucket_backends(
     indexed_db_manager: Option<&SharedStorageBucketIndexedDbManager>,
     identity: &StorageBucketIdentity,
 ) -> Result<()> {
+    if let Some(manager) = indexed_db_manager {
+        let sql = manager.lock().sqlite_service();
+        sql.request_clear_owner(identity.indexed_db_storage_key().into_bytes())?
+            .execute()?;
+    }
     storage_service
         .clear_opfs_bucket(&identity.locator())
         .map_err(|error| anyhow!(error))?;
-    if let Some(indexed_db_manager) = indexed_db_manager {
-        indexed_db_manager
-            .lock()
-            .clear_origin(&identity.indexed_db_storage_key())
-            .map_err(|error| anyhow!(error))?;
-    }
     Ok(())
 }
 
@@ -637,6 +624,9 @@ impl StorageBucketRegistry {
         &self,
         identity: &StorageBucketIdentity,
     ) -> Option<&StorageBucketMetadata> {
+        if self.metadata_publication_uncertain() {
+            return None;
+        }
         self.memory()
             .origins
             .get(identity.storage_key())
@@ -648,6 +638,9 @@ impl StorageBucketRegistry {
         &mut self,
         identity: &StorageBucketIdentity,
     ) -> Option<&mut StorageBucketMetadata> {
+        if self.metadata_publication_uncertain() {
+            return None;
+        }
         self.memory_mut()
             .origins
             .get_mut(identity.storage_key())
@@ -660,6 +653,9 @@ impl StorageBucketRegistry {
     }
 
     pub fn bucket_locator_is_live(&self, locator: &StorageBucketLocator) -> bool {
+        if self.metadata_publication_uncertain() {
+            return false;
+        }
         match locator {
             StorageBucketLocator::Default { .. } => true,
             StorageBucketLocator::Named {
@@ -670,14 +666,21 @@ impl StorageBucketRegistry {
                 .origins
                 .get(storage_key)
                 .is_some_and(|buckets| {
-                    buckets
-                        .values()
-                        .any(|metadata| metadata.bucket_id == Some(*bucket_id))
+                    buckets.values().any(|metadata| {
+                        metadata.bucket_id == Some(*bucket_id)
+                            && !storage_bucket_metadata_expired(
+                                metadata,
+                                storage_bucket_current_unix_ms(),
+                            )
+                    })
                 }),
         }
     }
 
     pub fn opfs_quota_for_locator(&self, locator: &StorageBucketLocator) -> Option<u64> {
+        if self.metadata_publication_uncertain() {
+            return None;
+        }
         match locator {
             StorageBucketLocator::Default { .. } => Some(DEFAULT_ORIGIN_STORAGE_QUOTA_BYTES),
             StorageBucketLocator::Named {
@@ -688,15 +691,22 @@ impl StorageBucketRegistry {
                 .origins
                 .get(storage_key)
                 .and_then(|buckets| {
-                    buckets
-                        .values()
-                        .find(|metadata| metadata.bucket_id == Some(*bucket_id))
+                    buckets.values().find(|metadata| {
+                        metadata.bucket_id == Some(*bucket_id)
+                            && !storage_bucket_metadata_expired(
+                                metadata,
+                                storage_bucket_current_unix_ms(),
+                            )
+                    })
                 })
                 .map(|metadata| metadata.quota.unwrap_or(DEFAULT_ORIGIN_STORAGE_QUOTA_BYTES)),
         }
     }
 
     fn bucket_quota_and_cache_usage(&self, locator: &StorageBucketLocator) -> Option<(u64, u64)> {
+        if self.metadata_publication_uncertain() {
+            return None;
+        }
         match locator {
             StorageBucketLocator::Default { storage_key } => {
                 let cache_usage = self
@@ -716,9 +726,13 @@ impl StorageBucketRegistry {
                 .origins
                 .get(storage_key)
                 .and_then(|buckets| {
-                    buckets
-                        .values()
-                        .find(|metadata| metadata.bucket_id == Some(*bucket_id))
+                    buckets.values().find(|metadata| {
+                        metadata.bucket_id == Some(*bucket_id)
+                            && !storage_bucket_metadata_expired(
+                                metadata,
+                                storage_bucket_current_unix_ms(),
+                            )
+                    })
                 })
                 .map(|metadata| {
                     (
@@ -743,6 +757,22 @@ impl StorageBucketRegistry {
     }
 
     pub fn open_bucket_with_options(
+        &mut self,
+        origin: &str,
+        name: &str,
+        expires: Option<f64>,
+        durability: Option<StorageBucketDurability>,
+        quota: Option<u64>,
+        persisted: Option<bool>,
+    ) -> Result<StorageBucketIdentity> {
+        self.edit_metadata(|candidate| {
+            candidate.open_bucket_with_options_in_memory(
+                origin, name, expires, durability, quota, persisted,
+            )
+        })
+    }
+
+    fn open_bucket_with_options_in_memory(
         &mut self,
         origin: &str,
         name: &str,
@@ -798,11 +828,16 @@ impl StorageBucketRegistry {
             .origins
             .get(origin)
             .map(|names| {
-                names
-                    .keys()
-                    .filter(|name| name.as_str() != IMPLICIT_DEFAULT_BUCKET_INTERNAL_NAME)
-                    .cloned()
-                    .collect()
+                // The maintenance caller reserves this exact upper bound
+                // before cloning names into its owner result.
+                let mut result = Vec::with_capacity(names.len());
+                result.extend(
+                    names
+                        .keys()
+                        .filter(|name| name.as_str() != IMPLICIT_DEFAULT_BUCKET_INTERNAL_NAME)
+                        .cloned(),
+                );
+                result
             })
             .unwrap_or_default()
     }
@@ -831,42 +866,6 @@ impl StorageBucketRegistry {
     ) -> Option<StorageBucketLocator> {
         self.metadata_for_identity(identity)
             .map(|_| identity.locator())
-    }
-
-    pub fn keys_for_origin_areas(&self, origin: &str) -> Vec<(String, Vec<String>)> {
-        let prefix = storage_key_prefix_for_origin(origin);
-        self.memory()
-            .origins
-            .iter()
-            .filter(|(storage_key, _)| storage_key.starts_with(&prefix))
-            .map(|(storage_key, buckets)| {
-                (
-                    storage_key.clone(),
-                    buckets
-                        .keys()
-                        .filter(|name| name.as_str() != IMPLICIT_DEFAULT_BUCKET_INTERNAL_NAME)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect()
-    }
-
-    pub fn bucket_identities_for_origin_areas(&self, origin: &str) -> Vec<StorageBucketIdentity> {
-        let prefix = storage_key_prefix_for_origin(origin);
-        self.memory()
-            .origins
-            .iter()
-            .filter(|(storage_key, _)| storage_key.starts_with(&prefix))
-            .flat_map(|(storage_key, buckets)| {
-                buckets.iter().filter_map(|(name, metadata)| {
-                    (name.as_str() != IMPLICIT_DEFAULT_BUCKET_INTERNAL_NAME)
-                        .then_some(metadata.bucket_id)
-                        .flatten()
-                        .map(|bucket_id| StorageBucketIdentity::new(storage_key, name, bucket_id))
-                })
-            })
-            .collect()
     }
 
     pub fn bucket_identities(&self, storage_key: &str) -> Vec<StorageBucketIdentity> {
@@ -906,6 +905,14 @@ impl StorageBucketRegistry {
     }
 
     pub fn delete_expired_buckets(
+        &mut self,
+        origin: &str,
+        now_ms: f64,
+    ) -> Result<Vec<StorageBucketIdentity>> {
+        self.edit_metadata(|candidate| candidate.delete_expired_buckets_in_memory(origin, now_ms))
+    }
+
+    fn delete_expired_buckets_in_memory(
         &mut self,
         origin: &str,
         now_ms: f64,
@@ -963,6 +970,20 @@ impl StorageBucketRegistry {
         origin: &str,
         name: &str,
     ) -> Result<Option<StorageBucketIdentity>> {
+        let identity =
+            self.edit_metadata(|candidate| candidate.delete_bucket_in_memory(origin, name))?;
+        #[cfg(test)]
+        if identity.is_some() {
+            fault_injection::crash_if_armed(fault_injection::CrashPoint::BucketTombstoneDurable);
+        }
+        Ok(identity)
+    }
+
+    fn delete_bucket_in_memory(
+        &mut self,
+        origin: &str,
+        name: &str,
+    ) -> Result<Option<StorageBucketIdentity>> {
         if let Some(pending) = self.pending_deletion(origin, name) {
             return Ok(Some(pending));
         }
@@ -985,12 +1006,14 @@ impl StorageBucketRegistry {
         let identity = StorageBucketIdentity::new(origin, name, bucket_id);
         memory.pending_deletions.push(identity.clone());
         self.flush()?;
-        #[cfg(test)]
-        fault_injection::crash_if_armed(fault_injection::CrashPoint::BucketTombstoneDurable);
         Ok(Some(identity))
     }
 
     pub fn clear_origin(&mut self, origin: &str) -> Result<Vec<StorageBucketIdentity>> {
+        self.edit_metadata(|candidate| candidate.clear_origin_in_memory(origin))
+    }
+
+    fn clear_origin_in_memory(&mut self, origin: &str) -> Result<Vec<StorageBucketIdentity>> {
         let mut cleanups: Vec<StorageBucketIdentity> = self
             .memory()
             .pending_deletions
@@ -1012,6 +1035,10 @@ impl StorageBucketRegistry {
     }
 
     pub fn clear_origin_areas(&mut self, origin: &str) -> Result<Vec<StorageBucketIdentity>> {
+        self.edit_metadata(|candidate| candidate.clear_origin_areas_in_memory(origin))
+    }
+
+    fn clear_origin_areas_in_memory(&mut self, origin: &str) -> Result<Vec<StorageBucketIdentity>> {
         let prefix = storage_key_prefix_for_origin(origin);
         let mut cleanups: Vec<StorageBucketIdentity> = self
             .memory()
@@ -1053,6 +1080,21 @@ impl StorageBucketRegistry {
     pub fn finish_bucket_deletion(&mut self, identity: &StorageBucketIdentity) -> Result<bool> {
         #[cfg(test)]
         fault_injection::crash_if_armed(fault_injection::CrashPoint::BucketCleanupComplete);
+        let removed =
+            self.edit_metadata(|candidate| candidate.finish_bucket_deletion_in_memory(identity))?;
+        #[cfg(test)]
+        if removed {
+            fault_injection::crash_if_armed(
+                fault_injection::CrashPoint::BucketTombstoneRemovedDurable,
+            );
+        }
+        Ok(removed)
+    }
+
+    fn finish_bucket_deletion_in_memory(
+        &mut self,
+        identity: &StorageBucketIdentity,
+    ) -> Result<bool> {
         let pending_deletions = &mut self.memory_mut().pending_deletions;
         let before = pending_deletions.len();
         pending_deletions.retain(|pending| pending != identity);
@@ -1063,8 +1105,6 @@ impl StorageBucketRegistry {
             self.memory_mut().pending_deletions.push(identity.clone());
             return Err(error);
         }
-        #[cfg(test)]
-        fault_injection::crash_if_armed(fault_injection::CrashPoint::BucketTombstoneRemovedDurable);
         Ok(true)
     }
 
@@ -1113,7 +1153,10 @@ impl StorageBucketRegistry {
     }
 
     pub fn bucket_identity_is_live(&self, identity: &StorageBucketIdentity) -> bool {
-        self.metadata_for_identity(identity).is_some()
+        self.metadata_for_identity(identity)
+            .is_some_and(|metadata| {
+                !storage_bucket_metadata_expired(metadata, storage_bucket_current_unix_ms())
+            })
     }
 
     pub fn bucket_expires_for_identity(
@@ -1624,23 +1667,23 @@ impl StorageBucketRegistry {
             .unwrap_or(0)
     }
 
-    pub fn cache_usage_for_origin_areas(&self, origin: &str) -> u64 {
-        let prefix = storage_key_prefix_for_origin(origin);
-        self.memory()
-            .origins
-            .iter()
-            .filter(|(storage_key, _)| storage_key.starts_with(&prefix))
-            .flat_map(|(_, buckets)| buckets.values())
-            .map(bucket_cache_storage_usage)
-            .fold(0u64, |total, usage| total.saturating_add(usage))
-    }
-
     pub fn bucket_persisted_for_identity(&self, identity: &StorageBucketIdentity) -> Option<bool> {
         self.metadata_for_identity(identity)
             .map(|metadata| metadata.persisted)
     }
 
     pub fn set_bucket_expires(&mut self, origin: &str, name: &str, expires: f64) -> Result<()> {
+        self.edit_metadata(|candidate| {
+            candidate.set_bucket_expires_in_memory(origin, name, expires)
+        })
+    }
+
+    fn set_bucket_expires_in_memory(
+        &mut self,
+        origin: &str,
+        name: &str,
+        expires: f64,
+    ) -> Result<()> {
         let Some(metadata) = self
             .memory_mut()
             .origins
@@ -1654,6 +1697,16 @@ impl StorageBucketRegistry {
     }
 
     pub fn set_bucket_expires_for_identity(
+        &mut self,
+        identity: &StorageBucketIdentity,
+        expires: Option<f64>,
+    ) -> Result<bool> {
+        self.edit_metadata(|candidate| {
+            candidate.set_bucket_expires_for_identity_in_memory(identity, expires)
+        })
+    }
+
+    fn set_bucket_expires_for_identity_in_memory(
         &mut self,
         identity: &StorageBucketIdentity,
         expires: Option<f64>,
@@ -1772,17 +1825,18 @@ fn cache_entry_matches_query(
     }
     query.ignore_vary
         || cached_response_vary_matches_request(
-            &entry.response.headers,
+            &entry.response.head.headers,
             &entry.request.headers,
             &query.headers,
         )
 }
 
 fn cached_response_vary_matches_request(
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     stored_request_headers: &[(String, String)],
     query_request_headers: &[(String, String)],
 ) -> bool {
+    let response_headers = moli_header_field::headers_to_byte_strings(response_headers);
     let vary_names = response_headers
         .iter()
         .filter(|(name, _)| name.eq_ignore_ascii_case("vary"))
@@ -1914,14 +1968,41 @@ fn remove_storage_bucket_cache_path_if_exists(path: &Path, label: &str) -> Resul
 }
 
 fn sync_storage_bucket_cache_directory(path: &Path) -> Result<()> {
-    fs::File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| {
-            format!(
-                "failed to sync StorageBucket CacheStorage directory `{}`",
-                path.display()
-            )
-        })
+    sync_storage_bucket_cache_directory_handle(path).with_context(|| {
+        format!(
+            "failed to sync StorageBucket CacheStorage directory `{}`",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(windows))]
+fn sync_storage_bucket_cache_directory_handle(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_storage_bucket_cache_directory_handle(path: &Path) -> io::Result<()> {
+    use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+
+    OpenOptions::new()
+        .access_mode(GENERIC_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(not(windows))]
+fn sync_storage_bucket_cache_file(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_storage_bucket_cache_file(path: &Path) -> io::Result<()> {
+    fs::OpenOptions::new().write(true).open(path)?.sync_all()
 }
 
 fn sync_storage_bucket_cache_parent(path: &Path) -> Result<()> {
@@ -1957,14 +2038,12 @@ fn sync_storage_bucket_cache_tree(path: &Path) -> Result<()> {
         if file_type.is_dir() {
             sync_storage_bucket_cache_tree(&entry_path)?;
         } else if file_type.is_file() {
-            fs::File::open(&entry_path)
-                .and_then(|file| file.sync_all())
-                .with_context(|| {
-                    format!(
-                        "failed to sync StorageBucket CacheStorage replacement file `{}`",
-                        entry_path.display()
-                    )
-                })?;
+            sync_storage_bucket_cache_file(&entry_path).with_context(|| {
+                format!(
+                    "failed to sync StorageBucket CacheStorage replacement file `{}`",
+                    entry_path.display()
+                )
+            })?;
         } else {
             bail!(
                 "unsupported entry in StorageBucket CacheStorage replacement `{}`",
@@ -2079,6 +2158,26 @@ fn load_storage_bucket_cache_file(
         .into_iter()
         .enumerate()
         .map(|(index, (request_key, entry))| {
+            let response_type = entry.response_type;
+            let metadata = moli_fetch_types::FetchResponseMetadata {
+                response_type,
+                timing_allow_passed: entry
+                    .timing_allow_passed
+                    .unwrap_or_else(|| response_type.default_timing_allow_passed()),
+                url_list: entry
+                    .url_list
+                    .unwrap_or_else(|| {
+                        if entry.url.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![entry.url]
+                        }
+                    })
+                    .into_iter()
+                    .map(|url| url.parse())
+                    .collect::<std::result::Result<_, _>>()?,
+                redirected: entry.redirected,
+            };
             let body = BASE64_STANDARD
                 .decode(entry.body_base64.as_bytes())
                 .with_context(|| {
@@ -2095,15 +2194,13 @@ fn load_storage_bucket_cache_file(
                         method: entry.request_method,
                         headers: entry.request_headers,
                     },
-                    response: StorageBucketCachedResponse {
-                        response_type: entry.response_type,
-                        url: entry.url,
-                        redirected: entry.redirected,
+                    response: moli_fetch_types::FetchResponseHead {
+                        metadata,
                         status: entry.status,
                         status_text: entry.status_text,
                         headers: entry.headers,
-                        body,
-                    },
+                    }
+                    .with_body(body),
                     insertion_order: if entry.insertion_order == 0 {
                         (index as u64).saturating_add(1)
                     } else {
@@ -2131,12 +2228,29 @@ fn save_storage_bucket_cache_file(
                         request_method: entry.request.method.clone(),
                         request_headers: entry.request.headers.clone(),
                         insertion_order: entry.insertion_order,
-                        response_type: entry.response.response_type.clone(),
-                        url: entry.response.url.clone(),
-                        redirected: entry.response.redirected,
-                        status: entry.response.status,
-                        status_text: entry.response.status_text.clone(),
-                        headers: entry.response.headers.clone(),
+                        response_type: entry.response.head.metadata.response_type,
+                        timing_allow_passed: Some(entry.response.head.metadata.timing_allow_passed),
+                        url_list: Some(
+                            entry
+                                .response
+                                .head
+                                .metadata
+                                .url_list
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                        ),
+                        url: entry
+                            .response
+                            .head
+                            .metadata
+                            .final_url()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                        redirected: entry.response.head.metadata.redirected,
+                        status: entry.response.head.status,
+                        status_text: entry.response.head.status_text.clone(),
+                        headers: entry.response.head.headers.clone(),
                         body_base64: BASE64_STANDARD.encode(&entry.response.body),
                     },
                 )
@@ -2145,7 +2259,7 @@ fn save_storage_bucket_cache_file(
     };
     let bytes = serde_json::to_vec_pretty(&json)
         .context("failed to serialize StorageBucket CacheStorage")?;
-    moli_browser_profile::write_file_atomically(path, &bytes, "StorageBucket CacheStorage file")
+    moli_browser_profile::write_profile_file(path, &bytes, "StorageBucket CacheStorage file")
 }
 
 impl JsonStorageBucketBackend {
@@ -2160,8 +2274,8 @@ impl JsonStorageBucketBackend {
             return Ok(Self {
                 path: path.to_path_buf(),
                 cache_storage_root,
-                indexed_db_keys_use_bucket_ids: true,
                 cache_paths_use_bucket_ids: true,
+                metadata_publication_uncertain: false,
                 memory: MemoryStorageBucketBackend::default(),
             });
         }
@@ -2169,13 +2283,7 @@ impl JsonStorageBucketBackend {
             .with_context(|| format!("failed to read storage bucket store `{}`", path.display()))?;
         let version = storage_buckets_json_version(&bytes, path)?;
         if version == 1 {
-            let mut backend = Self::open_v1(path, cache_storage_root, &bytes)?;
-            if let Some(manager) = indexed_db_manager {
-                backend.migrate_legacy_indexed_db_storage_keys(manager)?;
-                backend.indexed_db_keys_use_bucket_ids = true;
-                backend.save()?;
-            }
-            return Ok(backend);
+            return Self::open_v1(path, cache_storage_root, &bytes);
         }
         if !matches!(version, 2 | 3 | 4 | STORAGE_BUCKETS_JSON_VERSION) {
             bail!(
@@ -2197,8 +2305,8 @@ impl JsonStorageBucketBackend {
         let mut backend = Self {
             path: path.to_path_buf(),
             cache_storage_root,
-            indexed_db_keys_use_bucket_ids: version >= 5 && json.indexed_db_keys_use_bucket_ids,
             cache_paths_use_bucket_ids: version >= 5 && json.cache_paths_use_bucket_ids,
+            metadata_publication_uncertain: false,
             memory,
         };
         let cache_path_migration_pending = !backend.cache_paths_use_bucket_ids;
@@ -2211,21 +2319,22 @@ impl JsonStorageBucketBackend {
         if implicit_default_migrated {
             identity_migrated |= backend.memory.assign_missing_bucket_ids()?;
         }
-        let mut indexed_db_identity_migrated = false;
-        if !backend.indexed_db_keys_use_bucket_ids
-            && let Some(manager) = indexed_db_manager
-        {
-            backend.migrate_legacy_indexed_db_storage_keys(manager)?;
-            backend.indexed_db_keys_use_bucket_ids = true;
-            indexed_db_identity_migrated = true;
-        }
         let expired_buckets = backend.prune_expired_buckets(storage_bucket_current_unix_ms())?;
+        if expired_buckets > 0 || identity_migrated {
+            // Cleanup may remove files in another backend. Its exact identity
+            // and tombstone must be durable before any such removal begins.
+            backend.save_metadata()?;
+        }
+        if !backend.memory.pending_deletions.is_empty() {
+            // Retire cache files before removing any tombstone. A restart
+            // between SQL/OPFS cleanup and the final metadata save can retry.
+            backend.save_cache_storage()?;
+        }
         let recovered_deletions =
             backend.recover_pending_deletions(indexed_db_manager, deletion_storage_service)?;
         if version != STORAGE_BUCKETS_JSON_VERSION
             || identity_migrated
             || implicit_default_migrated
-            || indexed_db_identity_migrated
             || cache_path_migration_pending
             || expired_buckets > 0
             || recovered_deletions > 0
@@ -2253,8 +2362,8 @@ impl JsonStorageBucketBackend {
         let mut backend = Self {
             path: path.to_path_buf(),
             cache_storage_root,
-            indexed_db_keys_use_bucket_ids: false,
             cache_paths_use_bucket_ids: false,
+            metadata_publication_uncertain: false,
             memory,
         };
         backend.load_cache_storage()?;
@@ -2274,18 +2383,8 @@ impl JsonStorageBucketBackend {
         Ok(())
     }
 
-    fn save_metadata(&self) -> Result<()> {
-        let json = StorageBucketsJson {
-            version: STORAGE_BUCKETS_JSON_VERSION,
-            next_bucket_id: self.memory.next_bucket_id,
-            indexed_db_keys_use_bucket_ids: self.indexed_db_keys_use_bucket_ids,
-            cache_paths_use_bucket_ids: self.cache_paths_use_bucket_ids,
-            pending_deletions: self.memory.pending_deletions.clone(),
-            origins: self.memory.origins.clone(),
-        };
-        let bytes =
-            serde_json::to_vec_pretty(&json).context("failed to serialize storage bucket store")?;
-        moli_browser_profile::write_file_atomically(&self.path, &bytes, "storage bucket store")
+    fn save_metadata(&mut self) -> Result<()> {
+        self.publish_metadata(&self.memory.clone_metadata())
     }
 
     fn migrate_legacy_implicit_default_cache_storage(&mut self) -> bool {
@@ -2404,36 +2503,6 @@ impl JsonStorageBucketBackend {
         #[cfg(test)]
         fault_injection::crash_if_armed(fault_injection::CrashPoint::CacheNextDurable);
         replace_storage_bucket_cache_root(root, &next, &previous)?;
-        Ok(())
-    }
-
-    fn migrate_legacy_indexed_db_storage_keys(
-        &self,
-        indexed_db_manager: &SharedStorageBucketIndexedDbManager,
-    ) -> Result<()> {
-        let identities: Vec<StorageBucketIdentity> = self
-            .memory
-            .origins
-            .iter()
-            .flat_map(|(storage_key, buckets)| {
-                buckets.iter().filter_map(|(name, metadata)| {
-                    metadata
-                        .bucket_id
-                        .map(|bucket_id| StorageBucketIdentity::new(storage_key, name, bucket_id))
-                })
-            })
-            .chain(self.memory.pending_deletions.iter().cloned())
-            .collect();
-        let mut manager = indexed_db_manager.lock();
-        for identity in identities {
-            let legacy = legacy_storage_bucket_indexed_db_storage_key(
-                identity.storage_key(),
-                identity.name(),
-            );
-            manager
-                .migrate_origin(&legacy, &identity.indexed_db_storage_key())
-                .map_err(|error| anyhow!(error))?;
-        }
         Ok(())
     }
 
@@ -2615,7 +2684,7 @@ mod tests {
     };
 
     use anyhow::Result;
-    use moli_indexeddb::{IndexedDbManager, Key, ObjectStoreOptions, OpenOptions, TransactionMode};
+    use moli_indexeddb::{IndexedDbManager, Key, ObjectStoreOptions};
     use parking_lot::Mutex;
 
     use crate::{StorageBucketId, StorageBucketLocator, StorageService};
@@ -2628,8 +2697,8 @@ mod tests {
         StorageBucketUsageSnapshot, complete_storage_bucket_deletion,
         encode_storage_bucket_cache_component,
         fault_injection::{CrashPoint, arm},
-        legacy_storage_bucket_cache_bucket_dir, legacy_storage_bucket_indexed_db_storage_key,
-        new_shared_json_storage_bucket_store, new_shared_json_storage_bucket_store_with_cache_root,
+        legacy_storage_bucket_cache_bucket_dir, new_shared_json_storage_bucket_store,
+        new_shared_json_storage_bucket_store_with_cache_root,
         new_shared_json_storage_bucket_store_with_storage_service, save_storage_bucket_cache_file,
         storage_bucket_cache_bucket_dir, storage_bucket_cache_replacement_paths,
         storage_bucket_indexed_db_storage_key, storage_bucket_origin_allows_storage,
@@ -2639,20 +2708,26 @@ mod tests {
     fn new_indexed_db_manager(
         root: Option<PathBuf>,
     ) -> std::result::Result<SharedStorageBucketIndexedDbManager, String> {
-        let manager = match root {
-            Some(path) => IndexedDbManager::new(path).map_err(|error| error.to_string())?,
-            None => IndexedDbManager::new_in_memory(),
+        use moli_indexeddb::sqlite::service::{Service, ServiceConfig};
+        let config = ServiceConfig::default();
+
+        let service = match root {
+            Some(path) => Service::on_disk(path, config).map_err(|error| error.to_string())?,
+            None => Service::new(config).map_err(|error| error.to_string())?,
         };
-        Ok(Arc::new(Mutex::new(manager)))
+        Ok(Arc::new(Mutex::new(IndexedDbManager::with_sqlite_service(
+            service,
+        ))))
     }
 
     fn clear_indexed_db_origin(
         manager: &SharedStorageBucketIndexedDbManager,
         origin: &str,
     ) -> std::result::Result<(), String> {
-        manager
-            .lock()
-            .clear_origin(origin)
+        let service = manager.lock().sqlite_service();
+        service
+            .request_clear_owner(origin.as_bytes().to_vec())
+            .and_then(|clear| clear.execute())
             .map_err(|error| error.to_string())
     }
 
@@ -2688,7 +2763,7 @@ mod tests {
         }
 
         fn indexed_db_root(&self) -> PathBuf {
-            self.path.with_extension("indexed-db")
+            self.path.with_extension("idb-lite")
         }
 
         fn opfs_root(&self) -> PathBuf {
@@ -2726,25 +2801,80 @@ mod tests {
         manager: &SharedStorageBucketIndexedDbManager,
         origin: &str,
     ) -> Result<()> {
-        let mut manager = manager.lock();
-        let opened = manager.open(OpenOptions {
-            origin: origin.to_owned(),
-            name: "bucket-db".to_owned(),
-            version: None,
-        })?;
-        let upgrade = opened
-            .upgrade_transaction
-            .expect("first open should create an upgrade transaction");
-        manager.create_object_store(upgrade, "items", ObjectStoreOptions::default())?;
-        manager.commit_transaction(upgrade)?;
-        let tx = manager.begin_transaction(
-            opened.database,
-            &[String::from("items")],
-            TransactionMode::ReadWrite,
+        use moli_indexeddb::sqlite::service::{Command, CommandResult, Completion, DatabaseClient};
+        use std::{sync::mpsc, time::Duration};
+        fn receive(receiver: mpsc::Receiver<Completion>) -> Result<Completion> {
+            let reply = receiver.recv_timeout(Duration::from_secs(10))?;
+            if let Err(error) = &reply.result {
+                return Err(anyhow::anyhow!(error.clone()));
+            }
+            Ok(reply)
+        }
+        fn execute(client: &DatabaseClient, command: Command) -> Result<()> {
+            let (sender, receiver) = mpsc::channel();
+            client.submit(command, move |reply| {
+                let _ = sender.send(reply);
+            })?;
+            receive(receiver)?;
+            Ok(())
+        }
+        let service = manager.lock().sqlite_service();
+        let (sender, receiver) = mpsc::channel();
+        let client = service.resolve(
+            origin.as_bytes().to_vec(),
+            "bucket-db".into(),
+            move |reply| {
+                let _ = sender.send(reply);
+            },
         )?;
-        manager.put(tx, "items", Some(Key::from("alpha")), b"record".to_vec())?;
-        manager.commit_transaction(tx)?;
-        manager.close_database(opened.database)?;
+        receive(receiver)?;
+        let (sender, receiver) = mpsc::channel();
+        client.open_connection(Arc::new(|| {}), move |reply| {
+            let _ = sender.send(reply);
+        })?;
+        let CommandResult::Connection(connection) = receive(receiver)?.result? else {
+            return Err(anyhow::anyhow!("expected connection receipt"));
+        };
+        let transaction = client.allocate_transaction_handle()?;
+        let (sender, receiver) = mpsc::channel();
+        connection.begin_upgrade(transaction, 1, move |reply| {
+            let _ = sender.send(reply);
+        })?;
+        receive(receiver)?;
+        let sql_store_id = client.allocate_store_id().unwrap();
+        execute(
+            &client,
+            Command::CreateStore {
+                store: sql_store_id,
+                transaction,
+                name: "items".into(),
+                options: ObjectStoreOptions::default(),
+            },
+        )?;
+        execute(
+            &client,
+            Command::Write {
+                transaction,
+                store: sql_store_id,
+                key: Some(Key::from("alpha")),
+                value: b"record".to_vec().into(),
+                indexes: vec![],
+                add_only: false,
+                quota: None,
+            },
+        )?;
+        execute(
+            &client,
+            Command::Commit {
+                transaction,
+                quota: None,
+            },
+        )?;
+        let (sender, receiver) = mpsc::channel();
+        connection.close(move |result| {
+            let _ = sender.send(result);
+        })?;
+        receiver.recv_timeout(Duration::from_secs(10))??;
         Ok(())
     }
 
@@ -2761,6 +2891,7 @@ mod tests {
             let cache_root = self.cache_root();
             let _ = fs::remove_dir_all(&cache_root);
             let _ = fs::remove_dir_all(self.indexed_db_root());
+            let _ = fs::remove_dir_all(self.path.with_extension("legacy-idb"));
             let _ = fs::remove_dir_all(self.opfs_root());
             if let Ok((next, previous)) = storage_bucket_cache_replacement_paths(&cache_root) {
                 let _ = fs::remove_dir_all(next);
@@ -2825,13 +2956,22 @@ mod tests {
                 "cache",
                 "request",
                 StorageBucketCachedResponse {
-                    response_type: "default".to_owned(),
-                    url: "https://quota.test/resource".to_owned(),
-                    redirected: false,
-                    status: 200,
-                    status_text: "OK".to_owned(),
-                    headers: Vec::new(),
-                    body: b"cache".to_vec(),
+                    head: moli_fetch_types::FetchResponseHead {
+                        metadata: moli_fetch_types::FetchResponseMetadata {
+                            response_type: moli_fetch_types::FetchResponseType::Default,
+                            timing_allow_passed: true,
+                            url_list: vec![
+                                ("https://quota.test/resource".to_owned())
+                                    .parse()
+                                    .expect("valid response URL")
+                            ],
+                            redirected: false
+                        },
+                        status: 200,
+                        status_text: "OK".to_owned(),
+                        headers: Vec::new()
+                    },
+                    body: b"cache".to_vec()
                 },
                 cache_usage,
                 0,
@@ -2902,13 +3042,22 @@ mod tests {
                 "cache",
                 "request",
                 StorageBucketCachedResponse {
-                    response_type: "default".to_owned(),
-                    url: "https://default-quota.test/resource".to_owned(),
-                    redirected: false,
-                    status: 200,
-                    status_text: "OK".to_owned(),
-                    headers: Vec::new(),
-                    body: b"cache".to_vec(),
+                    head: moli_fetch_types::FetchResponseHead {
+                        metadata: moli_fetch_types::FetchResponseMetadata {
+                            response_type: moli_fetch_types::FetchResponseType::Default,
+                            timing_allow_passed: true,
+                            url_list: vec![
+                                ("https://default-quota.test/resource".to_owned())
+                                    .parse()
+                                    .expect("valid response URL")
+                            ],
+                            redirected: false
+                        },
+                        status: 200,
+                        status_text: "OK".to_owned(),
+                        headers: Vec::new()
+                    },
+                    body: b"cache".to_vec()
                 },
                 cache_usage,
                 0,
@@ -3078,12 +3227,15 @@ mod tests {
     #[test]
     fn memory_storage_bucket_store_prunes_expired_buckets() -> Result<()> {
         let mut store = StorageBucketRegistry::default();
+        let now = super::storage_bucket_current_unix_ms();
 
-        let expired = store.open_bucket_with_expires("https://a.test", "expired", Some(1_000.0))?;
-        let live = store.open_bucket_with_expires("https://a.test", "live", Some(3_000.0))?;
-        store.open_bucket_with_expires("https://b.test", "expired", Some(1_000.0))?;
+        let expired =
+            store.open_bucket_with_expires("https://a.test", "expired", Some(now - 1_000.0))?;
+        let live =
+            store.open_bucket_with_expires("https://a.test", "live", Some(now + 60_000.0))?;
+        store.open_bucket_with_expires("https://b.test", "expired", Some(now - 1_000.0))?;
 
-        let cleanups = store.delete_expired_buckets("https://a.test", 2_000.0)?;
+        let cleanups = store.delete_expired_buckets("https://a.test", now)?;
         assert_eq!(
             cleanups
                 .iter()
@@ -3105,18 +3257,21 @@ mod tests {
     #[test]
     fn memory_storage_bucket_store_deletes_one_expired_bucket() -> Result<()> {
         let mut store = StorageBucketRegistry::default();
+        let now = super::storage_bucket_current_unix_ms();
 
-        let expired = store.open_bucket_with_expires("https://a.test", "expired", Some(1_000.0))?;
-        let live = store.open_bucket_with_expires("https://a.test", "live", Some(3_000.0))?;
+        let expired =
+            store.open_bucket_with_expires("https://a.test", "expired", Some(now - 1_000.0))?;
+        let live =
+            store.open_bucket_with_expires("https://a.test", "live", Some(now + 60_000.0))?;
 
         assert!(
             store
-                .delete_bucket_if_expired("https://a.test", "live", 2_000.0)?
+                .delete_bucket_if_expired("https://a.test", "live", now)?
                 .is_none()
         );
         assert!(
             store
-                .delete_bucket_if_expired("https://a.test", "expired", 2_000.0)?
+                .delete_bucket_if_expired("https://a.test", "expired", now)?
                 .is_some()
         );
         assert_eq!(store.keys("https://a.test"), vec!["live"]);
@@ -3131,12 +3286,17 @@ mod tests {
         let identity = store.open_bucket("https://a.test", "bucket")?;
         assert!(store.open_cache_for_identity(&identity, "cache")?);
         let response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 201,
-            status_text: "Created".to_owned(),
-            headers: vec![("x-cache".to_owned(), "hit".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 201,
+                status_text: "Created".to_owned(),
+                headers: vec![("x-cache".to_owned(), b"hit".to_vec())],
+            },
             body: b"cached body".to_vec(),
         };
 
@@ -3156,9 +3316,9 @@ mod tests {
             .match_cache_entry_for_identity(&identity, "cache", "/receipt")
             .flatten()
             .expect("cache entry should match");
-        assert_eq!(matched.status, response.status);
-        assert_eq!(matched.status_text, response.status_text);
-        assert_eq!(matched.headers, response.headers);
+        assert_eq!(matched.head.status, response.head.status);
+        assert_eq!(matched.head.status_text, response.head.status_text);
+        assert_eq!(matched.head.headers, response.head.headers);
         assert_eq!(matched.body, response.body);
         assert_eq!(store.cache_usage_for_identity(&identity), Some(42));
         assert_eq!(store.cache_usage_for_origin("https://a.test"), 42);
@@ -3176,12 +3336,17 @@ mod tests {
         let identity = store.open_bucket("https://a.test", "bucket")?;
         assert!(store.open_cache_for_identity(&identity, "cache")?);
         let first_response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: Vec::new(),
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: Vec::new(),
+            },
             body: b"first".to_vec(),
         };
 
@@ -3232,12 +3397,17 @@ mod tests {
         );
 
         let replacement_response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 201,
-            status_text: "Created".to_owned(),
-            headers: Vec::new(),
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 201,
+                status_text: "Created".to_owned(),
+                headers: Vec::new(),
+            },
             body: b"replacement".to_vec(),
         };
         assert_eq!(
@@ -3285,13 +3455,18 @@ mod tests {
         let mut store = StorageBucketRegistry::default();
         let identity = store.open_bucket("https://a.test", "bucket")?;
         assert!(store.open_cache_for_identity(&identity, "cache")?);
-        let response = |body: &str, headers: Vec<(String, String)>| StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers,
+        let response = |body: &str, headers: Vec<(String, Vec<u8>)>| StorageBucketCachedResponse {
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers,
+            },
             body: body.as_bytes().to_vec(),
         };
         for (request_url, request, response) in [
@@ -3311,7 +3486,7 @@ mod tests {
                     method: "GET".to_owned(),
                     headers: vec![("x-mode".to_owned(), "alpha".to_owned())],
                 },
-                response("vary-alpha", vec![("vary".to_owned(), "X-Mode".to_owned())]),
+                response("vary-alpha", vec![("vary".to_owned(), b"X-Mode".to_vec())]),
             ),
         ] {
             assert_eq!(
@@ -3378,12 +3553,17 @@ mod tests {
             .open_cache_handle_for_identity(&identity, "cache")?
             .expect("bucket should remain current");
         let response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: Vec::new(),
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: Vec::new(),
+            },
             body: b"before-delete".to_vec(),
         };
         assert_eq!(
@@ -3442,21 +3622,31 @@ mod tests {
         )?;
         assert!(store.open_cache_for_identity(&identity, "cache")?);
         let original = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: Vec::new(),
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: Vec::new(),
+            },
             body: b"small".to_vec(),
         };
         let oversized = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: Vec::new(),
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: Vec::new(),
+            },
             body: b"oversized".to_vec(),
         };
 
@@ -3522,6 +3712,97 @@ mod tests {
     }
 
     #[test]
+    fn cache_file_preserves_timing_authorization_without_tao_headers() -> Result<()> {
+        let temp = TempStorePath::new("cache-timing");
+        let entries: BTreeMap<_, _> = [
+            ("default", true),
+            ("basic", false),
+            ("cors", true),
+            ("cors", false),
+            ("opaque", true),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (response_type, timing_allow_passed))| {
+            (
+                format!("https://cross.test/{index}"),
+                StorageBucketCacheEntry {
+                    usage_bytes: 4,
+                    request: StorageBucketCachedRequest::default(),
+                    response: StorageBucketCachedResponse {
+                        head: moli_fetch_types::FetchResponseHead {
+                            metadata: moli_fetch_types::FetchResponseMetadata {
+                                response_type: (response_type.to_owned())
+                                    .parse()
+                                    .expect("valid response type"),
+                                timing_allow_passed,
+                                url_list: vec![
+                                    format!("https://first.test/{index}").parse().unwrap(),
+                                    format!("https://cross.test/{index}").parse().unwrap(),
+                                ],
+                                redirected: true,
+                            },
+                            status: if response_type == "opaque" { 0 } else { 200 },
+                            status_text: String::new(),
+                            headers: Vec::new(),
+                        },
+                        body: b"body".to_vec(),
+                    },
+                    insertion_order: index as u64 + 1,
+                },
+            )
+        })
+        .collect();
+        save_storage_bucket_cache_file(&temp.path, &entries)?;
+        let reopened = super::load_storage_bucket_cache_file(&temp.path)?;
+        for (key, expected) in entries {
+            assert_eq!(reopened[&key].response, expected.response, "{key}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cache_file_without_timing_flag_preserves_response_type_defaults() -> Result<()> {
+        let temp = TempStorePath::new("cache-unmarked-timing");
+        let entries: serde_json::Map<_, _> = ["default", "basic", "cors", "opaque"]
+            .into_iter()
+            .map(|response_type| {
+                (
+                    response_type.to_owned(),
+                    serde_json::json!({
+                        "usageBytes":4, "responseType":response_type,
+                        "status":200, "statusText":"", "headers":[], "bodyBase64":"Ym9keQ=="
+                    }),
+                )
+            })
+            .collect();
+        fs::write(
+            &temp.path,
+            serde_json::to_vec(&serde_json::json!({
+                "version":super::STORAGE_BUCKET_CACHE_JSON_VERSION, "entries":entries
+            }))?,
+        )?;
+        let reopened = super::load_storage_bucket_cache_file(&temp.path)?;
+        for (response_type, allowed) in [
+            ("default", true),
+            ("basic", true),
+            ("cors", false),
+            ("opaque", false),
+        ] {
+            assert_eq!(
+                reopened[response_type]
+                    .response
+                    .head
+                    .metadata
+                    .timing_allow_passed,
+                allowed,
+                "{response_type}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn json_storage_bucket_store_persists_names_by_origin() -> Result<()> {
         let temp = TempStorePath::new("persist");
         let bucket_a_id;
@@ -3560,13 +3841,22 @@ mod tests {
                     "global-cache",
                     "/entry",
                     StorageBucketCachedResponse {
-                        response_type: "default".to_owned(),
-                        url: "https://a.test/entry".to_owned(),
-                        redirected: false,
-                        status: 200,
-                        status_text: "OK".to_owned(),
-                        headers: Vec::new(),
-                        body: b"legacy".to_vec(),
+                        head: moli_fetch_types::FetchResponseHead {
+                            metadata: moli_fetch_types::FetchResponseMetadata {
+                                response_type: moli_fetch_types::FetchResponseType::Default,
+                                timing_allow_passed: true,
+                                url_list: vec![
+                                    ("https://a.test/entry".to_owned())
+                                        .parse()
+                                        .expect("valid response URL")
+                                ],
+                                redirected: false
+                            },
+                            status: 200,
+                            status_text: "OK".to_owned(),
+                            headers: Vec::new()
+                        },
+                        body: b"legacy".to_vec()
                     },
                     6,
                     0,
@@ -3798,13 +4088,18 @@ mod tests {
                         "cache",
                         "/cached.txt",
                         StorageBucketCachedResponse {
-                            response_type: "default".to_owned(),
-                            url: String::new(),
-                            redirected: false,
-                            status: 200,
-                            status_text: "OK".to_owned(),
-                            headers: Vec::new(),
-                            body: b"old cache".to_vec(),
+                            head: moli_fetch_types::FetchResponseHead {
+                                metadata: moli_fetch_types::FetchResponseMetadata {
+                                    response_type: moli_fetch_types::FetchResponseType::Default,
+                                    timing_allow_passed: true,
+                                    url_list: Vec::new(),
+                                    redirected: false
+                                },
+                                status: 200,
+                                status_text: "OK".to_owned(),
+                                headers: Vec::new()
+                            },
+                            body: b"old cache".to_vec()
                         },
                         32,
                         0,
@@ -3890,12 +4185,22 @@ mod tests {
         let temp = TempStorePath::new("cache-persist");
         let cache_root = temp.cache_root();
         let response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 202,
-            status_text: "Accepted".to_owned(),
-            headers: vec![("x-cache".to_owned(), "persisted".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 202,
+                status_text: "Accepted".to_owned(),
+                headers: vec![
+                    ("x-cache".to_owned(), b"persisted".to_vec()),
+                    ("x-bytes".to_owned(), b"\xff\x80\xa0".to_vec()),
+                    ("x-bytes".to_owned(), b"\xc3\xbf".to_vec()),
+                    ("x-empty".to_owned(), Vec::new()),
+                ],
+            },
             body: b"profile cache body".to_vec(),
         };
         {
@@ -3962,21 +4267,31 @@ mod tests {
     #[test]
     fn json_storage_bucket_cache_crash_points_recover_one_committed_root() -> Result<()> {
         let old_response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: vec![("x-cache".to_owned(), "old".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: vec![("x-cache".to_owned(), b"old".to_vec())],
+            },
             body: b"old committed cache body".to_vec(),
         };
         let new_response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 201,
-            status_text: "Created".to_owned(),
-            headers: vec![("x-cache".to_owned(), "new".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 201,
+                status_text: "Created".to_owned(),
+                headers: vec![("x-cache".to_owned(), b"new".to_vec())],
+            },
             body: b"new committed cache body".to_vec(),
         };
 
@@ -4055,12 +4370,17 @@ mod tests {
         let temp = TempStorePath::new("cache-promote-next");
         let cache_root = temp.cache_root();
         let response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 206,
-            status_text: "Partial Content".to_owned(),
-            headers: vec![("x-cache".to_owned(), "next".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 206,
+                status_text: "Partial Content".to_owned(),
+                headers: vec![("x-cache".to_owned(), b"next".to_vec())],
+            },
             body: b"replacement cache body".to_vec(),
         };
         {
@@ -4107,12 +4427,17 @@ mod tests {
         let temp = TempStorePath::new("cache-restore-previous");
         let cache_root = temp.cache_root();
         let response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: vec![("x-cache".to_owned(), "previous".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: vec![("x-cache".to_owned(), b"previous".to_vec())],
+            },
             body: b"previous cache body".to_vec(),
         };
         {
@@ -4162,12 +4487,17 @@ mod tests {
         let indexed_db_manager = new_indexed_db_manager(None).map_err(anyhow::Error::msg)?;
         let storage_service = StorageService::on_disk(temp.opfs_root())?;
         let response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: String::new(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: Vec::new(),
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: Vec::new(),
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: Vec::new(),
+            },
             body: b"expired cache body".to_vec(),
         };
         let (expired_indexed_db_key, live_indexed_db_key) = {
@@ -4435,56 +4765,56 @@ mod tests {
     }
 
     #[test]
-    fn json_v4_migrates_bucket_indexed_db_from_name_to_persistent_id() -> Result<()> {
-        let temp = TempStorePath::new("v4-indexed-db-identity");
-        let cache_root = temp.cache_root();
-        let indexed_db_manager =
+    fn json_v4_keeps_bucket_identity_without_reading_legacy_indexed_db() -> Result<()> {
+        let temp = TempStorePath::new("v4-no-idb-import");
+        let legacy = temp.path.with_extension("legacy-idb");
+        fs::create_dir_all(&legacy)?;
+        fs::write(legacy.join("broken.json"), b"invalid old IndexedDB JSON")?;
+        let manager =
             new_indexed_db_manager(Some(temp.indexed_db_root())).map_err(anyhow::Error::msg)?;
-        let storage_service = StorageService::on_disk(temp.opfs_root())?;
-        let storage_key = "https://a.test";
-        let legacy_key = legacy_storage_bucket_indexed_db_storage_key(storage_key, "bucket");
-        seed_indexed_db_record(&indexed_db_manager, &legacy_key)?;
-        let legacy_usage = indexed_db_usage(&indexed_db_manager, &legacy_key)?;
-        fs::write(
-            &temp.path,
-            br#"{"version":4,"nextBucketId":18,"origins":{"https://a.test":{"bucket":{"bucketId":17}}}}"#,
-        )?;
-
+        fs::write(&temp.path, br#"{"version":4,"nextBucketId":18,"origins":{"https://a.test":{"bucket":{"bucketId":17}}}}"#)?;
         let store = new_shared_json_storage_bucket_store_with_storage_service(
             &temp.path,
-            &cache_root,
-            &indexed_db_manager,
-            storage_service,
+            temp.cache_root(),
+            &manager,
+            StorageService::on_disk(temp.opfs_root())?,
         )?;
-        let store = store.lock();
         let identity = store
-            .bucket_identity(storage_key, "bucket")
-            .expect("migrated bucket should have identity");
+            .lock()
+            .bucket_identity("https://a.test", "bucket")
+            .unwrap();
         assert_eq!(identity.bucket_id().get(), 17);
-        assert_eq!(indexed_db_usage(&indexed_db_manager, &legacy_key)?, 0);
         assert_eq!(
-            indexed_db_usage(&indexed_db_manager, &identity.indexed_db_storage_key())?,
-            legacy_usage
+            indexed_db_usage(&manager, &identity.indexed_db_storage_key())?,
+            0
         );
-        drop(store);
-
+        assert_eq!(
+            fs::read(legacy.join("broken.json"))?,
+            b"invalid old IndexedDB JSON"
+        );
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&temp.path)?)?;
         assert_eq!(json["version"], serde_json::json!(5));
+        assert_eq!(json["nextBucketId"], serde_json::json!(18));
+        assert!(json.get("indexedDbKeysUseBucketIds").is_none());
         Ok(())
     }
 
     #[test]
-    fn json_v5_pending_deletion_migrates_legacy_idb_before_recovery() -> Result<()> {
-        let temp = TempStorePath::new("v5-pending-legacy-indexed-db");
-        let cache_root = temp.cache_root();
-        let indexed_db_manager =
+    fn json_v5_pending_deletion_recovers_sql_without_touching_legacy_idb() -> Result<()> {
+        let temp = TempStorePath::new("v5-pending-no-idb-import");
+        let manager =
             new_indexed_db_manager(Some(temp.indexed_db_root())).map_err(anyhow::Error::msg)?;
         let storage_service = StorageService::on_disk(temp.opfs_root())?;
-        let storage_key = "https://a.test";
-        let identity =
-            StorageBucketIdentity::new(storage_key, "bucket", StorageBucketId::new(17).unwrap());
-        let legacy_key = legacy_storage_bucket_indexed_db_storage_key(storage_key, "bucket");
-        seed_indexed_db_record(&indexed_db_manager, &legacy_key)?;
+        let identity = StorageBucketIdentity::new(
+            "https://a.test",
+            "bucket",
+            StorageBucketId::new(17).unwrap(),
+        );
+        seed_indexed_db_record(&manager, &identity.indexed_db_storage_key())?;
+        assert!(indexed_db_usage(&manager, &identity.indexed_db_storage_key())? > 0);
+        let legacy = temp.path.with_extension("legacy-idb");
+        fs::create_dir_all(&legacy)?;
+        fs::write(legacy.join("broken.json"), b"untouched old IDB")?;
         let locator = identity.locator();
         let bucket_key = StorageService::opfs_bucket_key(&locator)?;
         let root = storage_service.ensure_opfs_root(&locator)?;
@@ -4492,27 +4822,24 @@ mod tests {
             storage_service.with_opfs(|opfs| opfs.get_file(&bucket_key, &root, "old.txt", true))?;
         storage_service
             .with_opfs(|opfs| opfs.write_file(&bucket_key, &file, b"old bucket", None))?;
-        fs::write(
-            &temp.path,
-            br#"{"version":5,"nextBucketId":18,"indexedDbKeysUseBucketIds":false,"cachePathsUseBucketIds":true,"pendingDeletions":[{"storageKey":"https://a.test","name":"bucket","bucketId":17}],"origins":{}}"#,
-        )?;
-
+        fs::write(&temp.path,br#"{"version":5,"nextBucketId":18,"indexedDbKeysUseBucketIds":false,"cachePathsUseBucketIds":true,"pendingDeletions":[{"storageKey":"https://a.test","name":"bucket","bucketId":17}],"origins":{}}"#)?;
         let store = new_shared_json_storage_bucket_store_with_storage_service(
             &temp.path,
-            &cache_root,
-            &indexed_db_manager,
+            temp.cache_root(),
+            &manager,
             storage_service.clone(),
         )?;
         assert!(store.lock().pending_deletions().is_empty());
-        assert_eq!(indexed_db_usage(&indexed_db_manager, &legacy_key)?, 0);
         assert_eq!(
-            indexed_db_usage(&indexed_db_manager, &identity.indexed_db_storage_key())?,
+            indexed_db_usage(&manager, &identity.indexed_db_storage_key())?,
             0
         );
         assert_eq!(storage_service.opfs_usage(&locator)?, 0);
+        assert_eq!(fs::read(legacy.join("broken.json"))?, b"untouched old IDB");
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&temp.path)?)?;
-        assert_eq!(json["indexedDbKeysUseBucketIds"], serde_json::json!(true));
+        assert!(json.get("indexedDbKeysUseBucketIds").is_none());
         assert!(json.get("pendingDeletions").is_none());
+        assert_eq!(json["nextBucketId"], serde_json::json!(18));
         Ok(())
     }
 
@@ -4524,12 +4851,21 @@ mod tests {
         let bucket_name = "bucket";
         let bucket_id = StorageBucketId::new(17).unwrap();
         let response = StorageBucketCachedResponse {
-            response_type: "default".to_owned(),
-            url: "https://a.test/cached".to_owned(),
-            redirected: false,
-            status: 200,
-            status_text: "OK".to_owned(),
-            headers: vec![("x-cache".to_owned(), "legacy-path".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: vec![
+                        ("https://a.test/cached".to_owned())
+                            .parse()
+                            .expect("valid response URL"),
+                    ],
+                    redirected: false,
+                },
+                status: 200,
+                status_text: "OK".to_owned(),
+                headers: vec![("x-cache".to_owned(), b"legacy-path".to_vec())],
+            },
             body: b"legacy cache path".to_vec(),
         };
         let entries = BTreeMap::from([(

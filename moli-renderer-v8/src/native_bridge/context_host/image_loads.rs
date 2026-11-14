@@ -1,5 +1,5 @@
 use super::{
-    ImageLoadEventId, JsContextHost, PendingImageLoadEvent, PendingImageLoadEventOwner,
+    ImageLoadEventId, PageScriptHost, PendingImageLoadEvent, PendingImageLoadEventOwner,
     PendingImageLoadNetworkState, PendingImageLoadTerminalSource,
 };
 use crate::{
@@ -18,7 +18,7 @@ enum PendingImageLoadDelaySettlement {
     Child(FrameDocumentImageLoadEventBinding),
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     #[cfg(test)]
     pub(crate) fn has_pending_image_network_requests(&self) -> bool {
         self.pending_image_load_events
@@ -204,7 +204,7 @@ impl JsContextHost {
             return None;
         }
         pending.network_state =
-            PendingImageLoadNetworkState::Ready(PendingImageLoadTerminalSource::Local);
+            PendingImageLoadNetworkState::Ready(PendingImageLoadTerminalSource::Reused);
         tracing::debug!(
             image = image_handle.index(),
             sequence = id.get(),
@@ -321,7 +321,7 @@ impl JsContextHost {
     pub(crate) fn apply_authorized_image_load_event(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         task_id: RendererPageImageLoadEventTaskId,
         target: WindowDocumentTaskTarget,
         kind: RendererPageImageLoadEventKind,

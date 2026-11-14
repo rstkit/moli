@@ -3,6 +3,7 @@ use crate::util::{
     call_script_visible_function, get_private_object,
     materialize_hidden_function_template_prototype,
 };
+use crate::web_api_interfaces;
 use crate::webidl_iterator::webidl_collection_reflect_apply_intrinsic;
 
 const HIGHLIGHT_ITERATOR_RECORDS_SLOT: &str = "__moliHighlightIteratorRecords";
@@ -12,7 +13,7 @@ const HIGHLIGHT_ITERATOR_PROTOTYPE_SLOT: &str = "__moliHighlightIteratorPrototyp
 const HIGHLIGHT_REGISTRY_ITERATOR_PROTOTYPE_SLOT: &str = "__moliHighlightRegistryIteratorPrototype";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct HighlightIteratorObjectDeclaration<'s> {
     #[webapi(slot = HIGHLIGHT_ITERATOR_RECORDS_SLOT)]
     records: v8::Local<'s, v8::Array>,
@@ -23,7 +24,7 @@ struct HighlightIteratorObjectDeclaration<'s> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct HighlightIteratorResultDeclaration<'s> {
     value: v8::Local<'s, v8::Value>,
     done: bool,
@@ -31,7 +32,7 @@ struct HighlightIteratorResultDeclaration<'s> {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "Highlight Iterator",
+    interface = web_api_interfaces::HighlightIterator,
     intrinsic_prototype_parent = v8::Intrinsic::SetIteratorPrototype,
     prototype_to_string_tag = "Highlight Iterator",
     readonly_prototype,
@@ -44,7 +45,7 @@ struct HighlightIteratorPrototypeDeclaration {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "HighlightRegistry Iterator",
+    interface = web_api_interfaces::HighlightRegistryIterator,
     intrinsic_prototype_parent = v8::Intrinsic::MapIteratorPrototype,
     prototype_to_string_tag = "HighlightRegistry Iterator",
     readonly_prototype,
@@ -95,8 +96,7 @@ pub(super) fn build_highlight_runtime_state<'s>(
     let Some(script) = v8::Script::compile(scope, source, None) else {
         return Err(anyhow!("failed to compile Highlight runtime source"));
     };
-    let Some(initializer) = script
-        .run(scope)
+    let Some(initializer) = crate::script_execution::execute_compiled_script(scope, script)
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
     else {
         return Err(anyhow!("failed to run Highlight runtime source"));
@@ -120,6 +120,8 @@ pub(super) fn build_highlight_runtime_state<'s>(
             "failed to create the Highlight callback callability predicate"
         ));
     };
+    let initialize_identity = v8::Function::new(scope, initialize_highlight_identity_callback)
+        .ok_or_else(|| anyhow!("failed to create Highlight identity initializer"))?;
     let Some(value) = initializer.call(
         scope,
         v8::undefined(scope).into(),
@@ -127,12 +129,14 @@ pub(super) fn build_highlight_runtime_state<'s>(
             iterator_factory.into(),
             call_callback.into(),
             callback_is_callable.into(),
+            initialize_identity.into(),
         ],
     ) else {
         return Err(anyhow!("failed to initialize Highlight runtime"));
     };
     let registry = v8::Local::<v8::Object>::try_from(value)
         .map_err(|_| anyhow!("Highlight runtime did not return a registry object"))?;
+    web_api_interfaces::HighlightRegistry::DESCRIPTOR.initialize(scope, registry)?;
     let highlight_constructor = highlight_constructor(scope, registry)?;
     let registry_constructor = highlight_registry_constructor(scope, registry)?;
     Ok(HighlightRuntimeState {
@@ -140,6 +144,19 @@ pub(super) fn build_highlight_runtime_state<'s>(
         highlight_constructor,
         registry_constructor,
     })
+}
+
+fn initialize_highlight_identity_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(object) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return;
+    };
+    if let Err(error) = web_api_interfaces::Highlight::DESCRIPTOR.initialize(scope, object) {
+        throw_type_error(scope, &error.to_string());
+    }
 }
 
 fn highlight_iterator_factory_callback<'s>(
@@ -174,6 +191,13 @@ fn highlight_iterator_factory_callback<'s>(
     };
     if iterator.set_prototype(scope, prototype.into()) != Some(true) {
         throw_type_error(scope, "Failed to bind Highlight iterator prototype");
+        return;
+    }
+    let interface = match kind {
+        HighlightIteratorKind::Highlight => "Highlight Iterator",
+        HighlightIteratorKind::Registry => "HighlightRegistry Iterator",
+    };
+    if web_api_interfaces::initialize(scope, iterator, interface).is_err() {
         return;
     }
     rv.set(iterator.into());
@@ -292,7 +316,7 @@ fn highlight_registry_constructor<'s>(
 }
 
 const HIGHLIGHT_RUNTIME_SOURCE: &str = r#"
-((createIterator, callCallback, callbackIsCallable) => {
+((createIterator, callCallback, callbackIsCallable, initializeIdentity) => {
   // Generated maplike/setlike forEach performs an ordinary Call. The caller
   // supplies the Reflect.apply intrinsic captured during Window bootstrap;
   // reading callback.call would instead invoke a page-observable property.
@@ -331,6 +355,7 @@ const HIGHLIGHT_RUNTIME_SOURCE: &str = r#"
 
   class Highlight {
     constructor(...ranges) {
+      initializeIdentity(this);
       this[rangeSlot] = [];
       this[typeSlot] = 'highlight';
       this.priority = 0;

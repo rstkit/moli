@@ -13,7 +13,8 @@ pub(super) fn cache_metadata_for_response_parts(
     request_url: &Url,
     final_url: &Url,
     status: u16,
-    headers: &[(String, String)],
+    status_text: Option<&str>,
+    headers: &[(String, Vec<u8>)],
     redirected: bool,
 ) -> Option<HttpCacheEntryMetadata> {
     let cache_request_url = normalized_cache_url(request_url);
@@ -26,7 +27,7 @@ pub(super) fn cache_metadata_for_response_parts(
         redirected,
     )?;
     let vary_headers = vary_headers_for_response(config, request, request_url, headers)?;
-    Some(HttpCacheEntryMetadata::new(
+    let mut metadata = HttpCacheEntryMetadata::new(
         cache_request_url.to_string(),
         cache_final_url.to_string(),
         status,
@@ -34,9 +35,11 @@ pub(super) fn cache_metadata_for_response_parts(
         unix_now_ms(),
         policy.expires_at_unix_ms,
         vary_headers,
-    ))
+    );
+    metadata.status_text = status_text.map(str::to_owned);
+    Some(metadata)
 }
 
-pub(crate) fn response_headers_forbid_cache_storage(headers: &[(String, String)]) -> bool {
+pub(crate) fn response_headers_forbid_cache_storage(headers: &[(String, Vec<u8>)]) -> bool {
     !response_cache_policy(headers).store
 }

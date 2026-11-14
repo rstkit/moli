@@ -1,5 +1,6 @@
 use super::history_runtime::{
     cancel_pending_precommit_history_traversal, pending_history_traversal_target_index,
+    require_fully_active_history_owner,
 };
 use super::location_navigation::{
     LocationNavigationKind, navigate_location_object,
@@ -11,16 +12,13 @@ use super::navigation_callbacks::{
     cancel_pending_precommit_same_document_navigation,
     queue_pending_precommit_same_document_navigation, settle_intercepted_same_document_navigation,
 };
-use super::navigation_entry::{
-    history_entries, history_index, navigation_current_entry, navigation_entries_share_document,
-};
+use super::navigation_entry::{history_entries, history_index, navigation_current_entry};
 use super::navigation_entry_state::{
     clone_navigation_entry_state, clone_navigation_state_arg_for_result,
 };
 use super::navigation_events::cancel_active_navigation_event;
 use super::navigation_events::{
     dispatch_navigation_currententrychange, dispatch_navigation_navigate_event_with_outcome,
-    run_navigation_precommit_deferred_handlers,
 };
 use super::navigation_lifecycle::finish_navigation_error_events;
 use super::navigation_projection::visible_navigation_entries_len;
@@ -31,17 +29,15 @@ use super::navigation_result::{
     navigation_rejected_dom_exception_result, navigation_rejected_invalid_state_result,
     navigation_rejected_value_result, navigation_result_with_pending_commit,
 };
-use super::navigation_traversal_execution::{
-    queue_history_traversal_without_result, queue_navigation_traversal_with_result,
-};
+use super::navigation_traversal_execution::queue_navigation_traversal_with_result;
 use super::navigation_traversal_plan::{
-    NavigationTraversalPlan, history_delta_traversal_target, navigation_delta_traversal_plan,
+    NavigationTraversalPlan, history_delta_traversal_plan, navigation_delta_traversal_plan,
     navigation_index_traversal_plan,
 };
 use super::navigation_window::{
     navigation_document_can_update_current_entry, navigation_document_is_active,
-    navigation_unload_event_active, runtime_window_is_global, runtime_window_owner,
-    window_history_for_holder, window_location_for_holder, window_navigation_for_holder,
+    navigation_unload_event_active, runtime_window_owner, window_history_for_holder,
+    window_location_for_holder, window_navigation_for_holder,
 };
 use super::*;
 use crate::webidl;
@@ -69,14 +65,43 @@ pub(super) fn history_go_callback<'s>(
         );
         return;
     }
-    let delta = if args.length() == 0 {
+    let action = if args.length() == 0 {
         Some(HistoryGoAction::Reload)
     } else {
         coerce_history_go_delta(scope, args.get(0))
     };
-    match delta {
-        Some(HistoryGoAction::Reload) => {
-            let owner = runtime_window_owner(scope, args.this());
+    let Some(action) = action else {
+        return;
+    };
+    history_go_with_action(scope, args.this(), action);
+}
+
+pub(super) fn history_back_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    history_go_with_action(scope, args.this(), HistoryGoAction::Traverse(-1));
+}
+
+pub(super) fn history_forward_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    history_go_with_action(scope, args.this(), HistoryGoAction::Traverse(1));
+}
+
+fn history_go_with_action<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    history: v8::Local<'s, v8::Object>,
+    action: HistoryGoAction,
+) {
+    let Some(owner) = require_fully_active_history_owner(scope, history) else {
+        return;
+    };
+    match action {
+        HistoryGoAction::Reload => {
             let Some(location) = window_location_for_holder(scope, owner) else {
                 return;
             };
@@ -87,26 +112,9 @@ pub(super) fn history_go_callback<'s>(
                 None,
             );
         }
-        Some(HistoryGoAction::Traverse(delta)) => history_traverse(scope, args.this(), delta),
-        Some(HistoryGoAction::Noop) => {}
-        None => {}
+        HistoryGoAction::Traverse(delta) => history_traverse(scope, history, delta),
+        HistoryGoAction::Noop => {}
     }
-}
-
-pub(super) fn history_back_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    history_traverse(scope, args.this(), -1);
-}
-
-pub(super) fn history_forward_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    history_traverse(scope, args.this(), 1);
 }
 
 pub(super) fn navigation_back_callback<'s>(
@@ -185,17 +193,10 @@ pub(super) fn navigation_traverse_to_callback<'s>(
         rv.set(v8::undefined(scope).into());
         return;
     };
-    let target_index = (0..entries.length()).find(|index| {
-        entries
-            .get_index(scope, *index)
-            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-            .and_then(|entry| {
-                get_own_static_property(scope, entry, "key")
-                    .and_then(|value| value.to_string(scope))
-                    .map(|value| value.to_rust_string_lossy(scope))
-            })
-            .is_some_and(|key| key == target_key)
-    });
+    let target_index = entries
+        .iter()
+        .position(|entry| entry.borrow().key.as_str() == target_key)
+        .map(|index| index as u32);
     let Some(target_index) = target_index else {
         rv.set(navigation_rejected_invalid_state_result(scope, "Invalid key").into());
         return;
@@ -253,10 +254,10 @@ pub(super) fn navigation_reload_callback<'s>(
     }
     if matches!(
         navigation_reload_admission(scope, owner),
-        NavigationReloadAdmission::NoCommittedHistoryItem
+        NavigationReloadAdmission::PendingInitialAttributeNavigation
     ) {
-        // Navigation API methods on an initial-empty Document return a
-        // correctly-shaped result whose promises intentionally never settle.
+        // Reloading the initial empty Document must not replace a deferred
+        // iframe attribute navigation. Its result promises remain pending.
         rv.set(navigation_pending_result(scope).into());
         return;
     }
@@ -270,7 +271,7 @@ pub(super) fn navigation_reload_callback<'s>(
         let current_href = super::location_runtime::location_href_slot(scope, location)
             .unwrap_or_else(|| "about:blank".to_owned());
         let destination_state = reload_destination_state(scope, owner, cloned_navigation_state);
-        let mut outcome = dispatch_navigation_navigate_event_with_outcome(
+        let outcome = dispatch_navigation_navigate_event_with_outcome(
             scope,
             navigation,
             &current_href,
@@ -350,12 +351,6 @@ pub(super) fn navigation_reload_callback<'s>(
             if let Some(state) = cloned_navigation_state {
                 set_reload_current_entry_state(scope, owner, state);
             }
-            if let Some(precommit_event) = outcome.precommit_event {
-                let (intercept_error, intercept_result) =
-                    run_navigation_precommit_deferred_handlers(scope, precommit_event);
-                outcome.intercept_error = intercept_error;
-                outcome.intercept_result = intercept_result.or(outcome.intercept_result);
-            }
             let Some(pending) = navigation_current_entry_result_with_pending_finished(scope, owner)
             else {
                 rv.set(navigation_immediate_current_entry_result(scope, owner).into());
@@ -366,8 +361,8 @@ pub(super) fn navigation_reload_callback<'s>(
                 navigation,
                 outcome,
                 Some(pending.committed_resolve),
-                pending.finished_resolve,
-                pending.finished_reject,
+                Some(pending.finished_resolve),
+                Some(pending.finished_reject),
                 transition_resolver,
                 pending.resolved_value,
                 &current_href,
@@ -388,10 +383,8 @@ fn reload_canceled_after_dispatch_result<'s>(
 ) -> v8::Local<'s, v8::Object> {
     let error = navigation_dom_exception(scope, "Navigation was canceled", "AbortError");
     super::navigation_events::mark_navigation_outcome_default_prevented(scope, outcome);
-    if let Some(signal) = outcome.signal
-        && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
-    {
-        unsafe { &mut *host_ptr }.abort_signal(scope, signal, error);
+    if let Some(signal) = outcome.signal {
+        crate::native_bridge::abort::abort_signal(scope, signal, error);
     }
     finish_navigation_error_events(scope, navigation, error, href);
     navigation_rejected_value_result(scope, error)
@@ -417,23 +410,6 @@ fn set_reload_current_entry_state<'s>(
         return;
     };
     super::navigation_entry_state::set_navigation_entry_state(scope, current_entry, state);
-    let Some(history) = window_history_for_holder(scope, owner) else {
-        return;
-    };
-    let Some(entries) = history_entries(scope, history) else {
-        return;
-    };
-    let current_index = history_index(scope, history);
-    let Some(history_entry) = entries
-        .get_index(scope, current_index)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-    else {
-        return;
-    };
-    if history_entry.strict_equals(current_entry.into()) {
-        return;
-    }
-    super::navigation_entry_state::set_navigation_entry_state(scope, history_entry, state);
 }
 
 fn navigation_traverse_result<'s>(
@@ -524,11 +500,27 @@ fn history_traverse<'s>(
     history: v8::Local<'s, v8::Object>,
     delta: i64,
 ) {
-    let Some(target) = history_delta_traversal_target(scope, history, delta) else {
+    let Some(plan) = history_delta_traversal_plan(scope, history, delta) else {
         queue_browser_owned_top_level_history_traversal(scope, history, delta);
         return;
     };
-    queue_history_traversal_without_result(scope, target);
+    let source_owner = runtime_window_owner(scope, history);
+    if let Some(source_handle) =
+        super::navigation_window::child_browsing_context_handle_for_runtime_owner(
+            scope,
+            source_owner,
+        )
+        && plan.targets.iter().any(|target| {
+            super::location_navigation::sandbox_blocks_ancestor_or_top_navigation_from_source(
+                scope,
+                source_handle,
+                target.owner,
+            )
+        })
+    {
+        return;
+    }
+    super::navigation_traversal_coordinator::queue_plan(scope, plan);
 }
 
 fn queue_browser_owned_top_level_history_traversal<'s>(
@@ -537,13 +529,35 @@ fn queue_browser_owned_top_level_history_traversal<'s>(
     delta: i64,
 ) {
     let owner = runtime_window_owner(scope, history);
-    if !runtime_window_is_global(scope, owner) {
-        return;
-    }
     let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
         return;
     };
-    unsafe { &mut *host_ptr }.record_pending_top_level_history_traversal(delta);
+    let host = unsafe { &mut *host_ptr };
+    let binding = super::session_history::binding(scope, host, owner);
+    if binding.popup.is_some() {
+        return;
+    }
+    // Failure to project a browser-owned entry and an out-of-range delta
+    // both reach this fallback. Only the former may supersede a navigation.
+    let model = host.session_histories.get_mut(binding.popup).clone();
+    let source = host
+        .pending_joint_history_step(&model)
+        .unwrap_or_else(|| model.current_step());
+    if model.step_by_delta_from(source, delta).is_none() {
+        return;
+    }
+    let top_owner = super::navigation_window::runtime_top_window_owner(scope, owner);
+    if let Some(source_handle) =
+        super::navigation_window::child_browsing_context_handle_for_runtime_owner(scope, owner)
+        && super::location_navigation::sandbox_blocks_ancestor_or_top_navigation_from_source(
+            scope,
+            source_handle,
+            top_owner,
+        )
+    {
+        return;
+    }
+    host.record_pending_top_level_history_traversal(delta);
 }
 
 pub(crate) fn queue_top_level_history_traversal_by_delta(
@@ -554,28 +568,13 @@ pub(crate) fn queue_top_level_history_traversal_by_delta(
     let Some(history) = window_history_for_holder(scope, global) else {
         return false;
     };
-    let Some(target) = history_delta_traversal_target(scope, history, delta) else {
+    let Some(plan) = history_delta_traversal_plan(scope, history, delta) else {
         return false;
     };
-    let Some(entries) = history_entries(scope, history) else {
-        return false;
-    };
-    let Some(current_entry) = entries
-        .get_index(scope, target.current_index)
-        .and_then(|entry| v8::Local::<v8::Object>::try_from(entry).ok())
-    else {
-        return false;
-    };
-    let Some(target_entry) = entries
-        .get_index(scope, target.target_index)
-        .and_then(|entry| v8::Local::<v8::Object>::try_from(entry).ok())
-    else {
-        return false;
-    };
-    if !navigation_entries_share_document(scope, current_entry, target_entry) {
+    if plan.has_cross_document_root(scope) {
         return false;
     }
-    queue_history_traversal_without_result(scope, target);
+    super::navigation_traversal_coordinator::queue_plan(scope, plan);
     true
 }
 
@@ -594,15 +593,16 @@ fn history_entry_navigation_index<'s>(
     history: v8::Local<'s, v8::Object>,
     history_index: u32,
 ) -> Option<u32> {
-    history_entries(scope, history)?
-        .get_index(scope, history_index)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-        .and_then(|entry| {
-            get_own_static_property(scope, entry, "index")
-                .and_then(|value| value.integer_value(scope))
-        })
-        .filter(|value| *value >= 0)
-        .map(|value| value as u32)
+    let owner = runtime_window_owner(scope, history);
+    let entries = history_entries(scope, history)?;
+    let entry = entries.get(history_index as usize)?;
+    let current_entry = navigation_current_entry(scope, owner);
+    super::navigation_projection::visible_navigation_index_for_entry(
+        scope,
+        &entries,
+        current_entry,
+        entry,
+    )
 }
 
 pub(super) fn navigation_entries_len<'s>(
@@ -612,6 +612,6 @@ pub(super) fn navigation_entries_len<'s>(
     let owner = runtime_window_owner(scope, history);
     let current_entry = navigation_current_entry(scope, owner);
     history_entries(scope, history)
-        .map(|entries| visible_navigation_entries_len(scope, entries, current_entry))
+        .map(|entries| visible_navigation_entries_len(scope, &entries, current_entry))
         .unwrap_or(0)
 }

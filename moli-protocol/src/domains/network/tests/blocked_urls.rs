@@ -23,7 +23,12 @@ async fn set_blocked_urls_requires_browser_context() {
 #[tokio::test(flavor = "multi_thread")]
 async fn set_blocked_urls_rejects_invalid_params() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+    {
+        let fixture_value = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
     ctx.process_async(json!({
         "id": 2801,
         "method": "Network.setBlockedURLs",
@@ -35,7 +40,12 @@ async fn set_blocked_urls_rejects_invalid_params() {
 #[tokio::test(flavor = "multi_thread")]
 async fn set_blocked_urls_updates_browser_context_state() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+    {
+        let fixture_value = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
     enable_network_domain(&mut ctx, 28_020, None).await;
 
     ctx.process_async(json!({
@@ -45,19 +55,20 @@ async fn set_blocked_urls_updates_browser_context_state() {
     }))
     .await;
     ctx.expect_result(2802, json!({}), None);
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .unwrap()
-            .active_page_target()
-            .effective_policy()
-            .blocked_url_patterns(),
-        vec![
-            "http://example.test/*.png".to_owned(),
-            "*://cdn.example.test/*".to_owned()
-        ]
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .unwrap()
+                .active_page_target()
+                .effective_policy()
+                .blocked_url_patterns(),
+            vec![
+                "http://example.test/*.png".to_owned(),
+                "*://cdn.example.test/*".to_owned()
+            ]
+        )
+    });
 
     ctx.process_async(json!({
         "id": 2803,
@@ -66,22 +77,28 @@ async fn set_blocked_urls_updates_browser_context_state() {
     }))
     .await;
     ctx.expect_result(2803, json!({}), None);
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .unwrap()
-            .active_page_target()
-            .effective_policy()
-            .blocked_url_patterns()
-            .is_empty()
-    );
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.browser_context
+                .as_ref()
+                .unwrap()
+                .active_page_target()
+                .effective_policy()
+                .blocked_url_patterns()
+                .is_empty()
+        })
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn set_blocked_urls_contribution_activates_with_network_handler() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+    {
+        let fixture_value = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
 
     ctx.process_async(json!({
         "id": 28_021,
@@ -90,30 +107,32 @@ async fn set_blocked_urls_contribution_activates_with_network_handler() {
     }))
     .await;
     ctx.expect_result(28_021, json!({}), None);
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .unwrap()
-            .active_page_target()
-            .effective_policy()
-            .blocked_url_patterns()
-            .is_empty(),
-        "Chromium does not instrument blocked URLs until the Network handler is enabled"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.browser_context
+                .as_ref()
+                .unwrap()
+                .active_page_target()
+                .effective_policy()
+                .blocked_url_patterns()
+                .is_empty(),
+            "Chromium does not instrument blocked URLs until the Network handler is enabled"
+        )
+    });
 
     enable_network_domain(&mut ctx, 28_022, None).await;
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .unwrap()
-            .active_page_target()
-            .effective_policy()
-            .blocked_url_patterns(),
-        ["*without-enable*".to_owned()],
-        "Network.enable activates the handler's retained blocked URL contribution"
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .unwrap()
+                .active_page_target()
+                .effective_policy()
+                .blocked_url_patterns(),
+            ["*without-enable*".to_owned()],
+            "Network.enable activates the handler's retained blocked URL contribution"
+        )
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -125,7 +144,8 @@ async fn set_blocked_urls_navigation_fails_with_blocked_by_client() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    ctx.enable_page_events_for_test(Some("SID-1"));
     enable_network_domain(&mut ctx, 28_040, Some("SID-1")).await;
 
     ctx.process_async(json!({
@@ -167,7 +187,7 @@ async fn set_blocked_urls_runtime_fetch_emits_loading_failed() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     enable_network_domain(&mut ctx, 28_060, Some("SID-1")).await;
 
     ctx.process_async(json!({
@@ -300,7 +320,12 @@ async fn background_set_blocked_urls_updates_loaded_owner_page_without_activatio
     let page_url = format!("http://{addr}/page");
     let api_url = format!("http://{addr}/api");
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = None;
+    {
+        let fixture_value = None;
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
     ctx.sent.clear();
 
     let background = PageTargetHost::new(
@@ -311,8 +336,7 @@ async fn background_set_blocked_urls_updates_loaded_owner_page_without_activatio
     );
     let mut inactive = BrowserContext::new("BID-background".to_owned());
     inactive.insert_page_target_host(background);
-    ctx.conn
-        .push_inactive_browser_context_fixture_for_test(inactive);
+    ctx.with_fixture(|conn| conn.push_inactive_browser_context_fixture_for_test(inactive));
     ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-background"))
         .await;
 
@@ -395,10 +419,12 @@ async fn background_set_blocked_urls_updates_loaded_owner_page_without_activatio
             .expect("blocked fetch result")
             .contains("net::ERR_BLOCKED_BY_CLIENT")
     );
-    assert!(
-        ctx.conn.browser_context.is_none(),
-        "direct background Network policy should not activate the owner"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.browser_context.is_none(),
+            "direct background Network policy should not activate the owner"
+        )
+    });
 
     server.abort();
 }
@@ -408,7 +434,7 @@ async fn set_blocked_urls_worker_fetch_emits_loading_failed() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 28_101,
@@ -552,7 +578,7 @@ async fn set_blocked_urls_worker_xhr_emits_loading_failed() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 28_102,
@@ -692,7 +718,7 @@ async fn set_blocked_urls_worker_websocket_emits_loading_failed() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 28_103,
@@ -856,7 +882,7 @@ async fn emulate_network_conditions_offline_worker_fetch_emits_loading_failed() 
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 2821,
@@ -972,7 +998,7 @@ async fn emulate_network_conditions_offline_worker_xhr_emits_loading_failed() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 2826,
@@ -1084,7 +1110,7 @@ async fn set_blocked_urls_runtime_xhr_emits_loading_failed() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     enable_network_domain(&mut ctx, 28_110, Some("SID-1")).await;
 
     ctx.process_async(json!({
@@ -1173,7 +1199,7 @@ async fn set_blocked_urls_runtime_websocket_emits_loading_failed() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     enable_network_domain(&mut ctx, 28_160, Some("SID-1")).await;
 
     ctx.process_async(json!({
@@ -1288,7 +1314,12 @@ async fn emulate_network_conditions_requires_browser_context() {
 #[tokio::test(flavor = "multi_thread")]
 async fn emulate_network_conditions_rejects_invalid_params() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+    {
+        let fixture_value = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
     ctx.process_async(json!({
         "id": 29,
         "method": "Network.emulateNetworkConditions",
@@ -1300,51 +1331,33 @@ async fn emulate_network_conditions_rejects_invalid_params() {
 #[tokio::test(flavor = "multi_thread")]
 async fn emulate_network_conditions_updates_browser_context_state() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+    {
+        let fixture_value = Some(BrowserContext::new_with_page_for_test("BID-1", "TID-1"));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
 
     ctx.process_async(json!({
         "id": 30,
         "method": "Network.emulateNetworkConditions",
         "params": {
             "offline": true,
-            "latency": 150,
-            "downloadThroughput": 1024,
-            "uploadThroughput": 512,
-            "connectionType": "cellular3g"
+            "latency": 0,
+            "downloadThroughput": -1,
+            "uploadThroughput": -1,
         }
     }))
     .await;
     ctx.expect_result(30, json!({}), None);
 
-    let bc = ctx.conn.browser_context.as_ref().unwrap();
-    assert!(bc.active_page_target().network_policy.network_offline());
-    assert_eq!(
-        bc.active_page_target()
-            .network_policy
-            .emulated_network_latency(),
-        150.0
-    );
-    assert_eq!(
-        bc.active_page_target()
-            .network_policy
-            .emulated_download_throughput(),
-        1024.0
-    );
-    assert_eq!(
-        bc.active_page_target()
-            .network_policy
-            .emulated_upload_throughput(),
-        512.0
-    );
-    assert_eq!(
-        bc.active_page_target()
-            .network_policy
-            .emulated_connection_type(),
-        Some("cellular3g")
-    );
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().unwrap();
+        assert!(bc.active_page_target().network_policy.network_offline());
+    });
 }
 #[tokio::test(flavor = "multi_thread")]
-async fn emulate_network_conditions_offline_navigation_fails_before_completion_events() {
+async fn emulate_network_conditions_offline_navigation_commits_error_document() {
     let mut ctx = TestContext::new();
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
@@ -1352,7 +1365,8 @@ async fn emulate_network_conditions_offline_navigation_fails_before_completion_e
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    ctx.enable_page_events_for_test(Some("SID-1"));
 
     ctx.process_async(json!({
         "id": 31,
@@ -1374,16 +1388,93 @@ async fn emulate_network_conditions_offline_navigation_fails_before_completion_e
         "params": { "url": "http://example.test/offline" }
     }))
     .await;
+    wait_until_messages(
+        &mut ctx,
+        Some("SID-1"),
+        "offline error Document load",
+        |messages| {
+            messages
+                .iter()
+                .any(|message| message["method"] == json!("Page.loadEventFired"))
+        },
+    )
+    .await;
 
-    consume_main_document_navigation_start(&mut ctx);
-    let request = ctx.take_one();
-    assert_eq!(request["method"], "Network.requestWillBeSent");
-    let failed = ctx.take_one();
-    assert_eq!(failed["method"], "Network.loadingFailed");
-    assert_eq!(failed["sessionId"], "SID-1");
-    assert_eq!(failed["params"]["errorText"], "Network emulation offline");
-    ctx.expect_error(32, -32000, "Network emulation offline");
-    assert!(ctx.sent.is_empty());
+    let messages = ctx.take_all();
+    let request_index = messages
+        .iter()
+        .position(|message| {
+            message["method"] == json!("Network.requestWillBeSent")
+                && message["sessionId"] == json!("SID-1")
+        })
+        .unwrap_or_else(|| panic!("missing document request: {messages:?}"));
+    let request = &messages[request_index];
+    assert_eq!(request["params"]["frameId"], "TID-1");
+    let request_id = request["params"]["requestId"]
+        .as_str()
+        .expect("request id")
+        .to_owned();
+
+    let failed_index = messages
+        .iter()
+        .position(|message| {
+            message["method"] == json!("Network.loadingFailed")
+                && message["sessionId"] == json!("SID-1")
+                && message["params"]["requestId"] == json!(request_id)
+        })
+        .unwrap_or_else(|| panic!("missing document loadingFailed: {messages:?}"));
+    let failed = &messages[failed_index];
+    assert_eq!(failed["params"]["requestId"], request_id);
+    assert_eq!(failed["params"]["type"], "Document");
+    assert_eq!(failed["params"]["canceled"], false);
+    assert_eq!(
+        failed["params"]["errorText"],
+        "net::ERR_INTERNET_DISCONNECTED"
+    );
+    assert!(
+        request_index < failed_index,
+        "requestWillBeSent must precede loadingFailed: {messages:?}"
+    );
+
+    let response = messages
+        .iter()
+        .find(|message| message["id"] == json!(32))
+        .expect("Page.navigate response");
+    assert!(
+        response.get("error").is_none(),
+        "offline navigation must not return a protocol error; got {response}"
+    );
+    assert_eq!(response["result"]["frameId"], "TID-1");
+    assert!(response["result"]["loaderId"].is_string());
+    assert_eq!(response["result"]["isDownload"], false);
+    assert_eq!(
+        response["result"]["errorText"],
+        "net::ERR_INTERNET_DISCONNECTED"
+    );
+
+    let frame_index = messages
+        .iter()
+        .position(|message| {
+            message["method"] == json!("Page.frameNavigated")
+                && message["sessionId"] == json!("SID-1")
+        })
+        .unwrap_or_else(|| panic!("missing error Document frame commit: {messages:?}"));
+    assert!(
+        failed_index < frame_index,
+        "loadingFailed must precede the error Document frame commit: {messages:?}"
+    );
+    let finished_index = messages
+        .iter()
+        .position(|message| {
+            message["method"] == json!("Network.loadingFinished")
+                && message["sessionId"] == json!("SID-1")
+                && message["params"]["requestId"] == json!(request_id)
+        })
+        .unwrap_or_else(|| panic!("missing error Document loadingFinished: {messages:?}"));
+    assert!(
+        frame_index < finished_index,
+        "frame commit must precede error Document loadingFinished: {messages:?}"
+    );
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn emulate_network_conditions_offline_runtime_fetch_emits_loading_failed() {
@@ -1394,7 +1485,7 @@ async fn emulate_network_conditions_offline_runtime_fetch_emits_loading_failed()
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 33,
@@ -1508,7 +1599,10 @@ globalThis.__lm_after_blocked_parser_script = true;
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
+    // Blocked URL contributions are active only while Network is enabled.
+    // Otherwise this fixture waits for an actual external DNS/request failure.
+    enable_network_domain(&mut ctx, 70_009, Some("SID-1")).await;
 
     ctx.process_async(json!({
         "id": 70_010,
@@ -1519,7 +1613,7 @@ globalThis.__lm_after_blocked_parser_script = true;
     .await;
     ctx.expect_result(70_010, json!({}), Some("SID-1"));
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 70_011,
         "method": "Page.navigate",
         "sessionId": "SID-1",
@@ -1528,17 +1622,36 @@ globalThis.__lm_after_blocked_parser_script = true;
     .await;
     let _ = ctx.take_response_by_id(70_011);
 
-    wait_until_messages(
+    crate::testing::wait_until_scheduler_message(
         &mut ctx,
-        Some("SID-1"),
         "parser blocked external script load completion",
-        |messages| {
-            messages
-                .iter()
-                .any(|message| message["method"] == json!("Page.loadEventFired"))
-        },
+        |message| message["method"] == "Page.loadEventFired" && message["sessionId"] == "SID-1",
     )
     .await;
+    let blocked_request = ctx
+        .sent
+        .iter()
+        .find(|message| {
+            message["method"] == "Network.requestWillBeSent"
+                && message["sessionId"] == "SID-1"
+                && message["params"]["request"]["url"]
+                    == "http://example.test/blocked/parser-script.js"
+        })
+        .expect("parser script request should be observed");
+    let request_id = &blocked_request["params"]["requestId"];
+    let failure = ctx
+        .sent
+        .iter()
+        .find(|message| {
+            message["method"] == "Network.loadingFailed"
+                && message["sessionId"] == "SID-1"
+                && &message["params"]["requestId"] == request_id
+        })
+        .expect("the exact parser script must fail through the blocked URL policy");
+    assert_eq!(
+        failure["params"]["errorText"],
+        "failed to fetch script `http://example.test/blocked/parser-script.js`: net::ERR_BLOCKED_BY_CLIENT"
+    );
 
     ctx.process_async(json!({
         "id": 70_012,

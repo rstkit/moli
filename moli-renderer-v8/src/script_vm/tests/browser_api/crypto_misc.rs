@@ -328,7 +328,7 @@ fn crypto_secure_context_exposure_matches_wpt_historical_and_idl() {
 }
 #[test]
 fn crypto_secure_context_inherited_child_frames_use_creator_origin() {
-    let mut vm = new_storage_test_vm("https://example.com/");
+    let mut vm = new_storage_html_test_vm("https://example.com/");
 
     let result = vm
         .eval(
@@ -810,19 +810,21 @@ fn child_initial_about_blank_executes_dynamic_inline_script_from_parent_document
                 crypto.subtle.digest(algorithm, new Uint8Array());
                 top.__childDynamicScriptEvents.push("after-call");
               `;
-              frame.contentDocument.body.appendChild(script);
+              const child = frame.contentDocument;
+              child.body.appendChild(script);
+              __childDynamicScriptEvents.push("returned");
               return [
-                String(frame.contentDocument.body !== null),
-                String(frame.contentDocument.getElementsByTagName("script").length)
+                String(child.body !== null),
+                String(child.getElementsByTagName("script").length),
+                JSON.stringify(__childDynamicScriptEvents)
               ].join("|");
             })()
         "#,
         )
         .expect("dynamic child script setup should evaluate");
-    assert_eq!(setup, "true|1");
-    assert!(
-        vm.has_pending_child_frame_realm_materialization(),
-        "the script must wait behind its typed child-realm prerequisite"
+    assert_eq!(
+        setup, r#"true|1|["start:true","getter","after-call","returned"]"#,
+        "the child script must execute before appendChild returns, even when it removes the frame"
     );
 
     vm.drain_pending_child_frame_work_for_test();
@@ -831,5 +833,5 @@ fn child_initial_about_blank_executes_dynamic_inline_script_from_parent_document
         .eval("JSON.stringify(globalThis.__childDynamicScriptEvents)")
         .expect("dynamic child script events should be readable");
 
-    assert_eq!(result, r#"["start:true","getter","after-call"]"#);
+    assert_eq!(result, r#"["start:true","getter","after-call","returned"]"#);
 }

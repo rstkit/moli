@@ -1,19 +1,15 @@
-#[cfg(test)]
-use std::path::PathBuf;
-use std::{
-    net::SocketAddr,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{future::IntoFuture, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use anyhow::{Context, anyhow};
 use axum::{
     Router,
     body::Body,
+    extract::State,
     http::{HeaderValue, Request, header},
     middleware::{self, Next},
-    response::Response,
-    routing::{any, get, post, put},
+    response::{IntoResponse, Response},
+    routing::{MethodRouter, any, get, post, put},
     serve::ListenerExt,
 };
 use moli_cookie_jar::StoredCookie;
@@ -22,42 +18,44 @@ use moli_core::{
     runtime::{NavigationRuntimeConfig, storage_partition::StoragePartitionState},
 };
 use moli_fetch::FetchConfig;
-#[cfg(test)]
-use moli_protocol::DEFAULT_CDP_TAB_TARGET_ID;
-use moli_protocol::{CdpInitialStoragePartition, DEFAULT_CDP_PAGE_TARGET_ID};
-#[cfg(test)]
-use parking_lot::Mutex;
+use moli_protocol::CdpInitialStoragePartition;
 use tokio::net::TcpListener;
+use tower::Layer;
 use tracing::info;
-
-#[cfg(test)]
-use moli_cookie_cache as cookie_cache;
+use uuid::Uuid;
 
 pub use crate::config::ServerConfig;
+pub use instance_control::{BrowserInstanceControl, InstanceCommand};
 
+#[cfg(feature = "ace-protocol")]
+pub mod browser_runtime;
 mod cdp;
 mod cdp_agent_host;
 mod cdp_owner;
 mod cdp_socket;
+mod instance_control;
+mod instance_shutdown;
 mod protocol_local_executor;
+mod request_guard;
 mod tcp_options;
+mod trailing_slash;
 mod webdriver_bidi;
 mod webdriver_classic;
 mod webdriver_files;
 
 use cdp_agent_host::SharedCdpAgentHostDirectory;
 use cdp_owner::SharedCdpOwnerRegistry;
+use request_guard::RequestGuard;
 use webdriver_bidi::SharedBidiSessionRegistry;
 use webdriver_classic::SharedClassicSessionRegistry;
 
-const DEFAULT_BROWSER_ID: &str = "moli-browser";
-const DEFAULT_TARGET_ID: &str = DEFAULT_CDP_PAGE_TARGET_ID;
-#[cfg(test)]
-const DEFAULT_TAB_TARGET_ID: &str = DEFAULT_CDP_TAB_TARGET_ID;
 const DEFAULT_TARGET_URL: &str = "about:blank";
+const JSON_DISCOVERY_PATH: &str = "/json";
 
 #[derive(Debug, Clone)]
 pub struct ProtocolServer {
+    #[cfg(feature = "ace-protocol")]
+    runtime_ready: Option<browser_runtime::RuntimeReadyCallback>,
     config: ServerConfig,
     storage_partition: Arc<StoragePartitionState>,
     navigation_runtime_config: NavigationRuntimeConfig,
@@ -73,11 +71,11 @@ impl ProtocolServer {
         initial_cookies: Vec<StoredCookie>,
     ) -> Self {
         let storage_partition = Arc::new(
-            StoragePartitionState::open(None).expect("in-memory storage partition should open"),
+            StoragePartitionState::open(None).expect("temporary storage partition should open"),
         );
         storage_partition
             .import_cookies(initial_cookies)
-            .expect("in-memory cookie import should succeed");
+            .expect("initial cookie import should succeed");
         Self::new_with_storage_partition(config, storage_partition)
     }
 
@@ -129,6 +127,8 @@ impl ProtocolServer {
                 .set_http_cache_dir(Some(http_cache_root.display().to_string()));
         }
         Self {
+            #[cfg(feature = "ace-protocol")]
+            runtime_ready: None,
             config,
             storage_partition,
             navigation_runtime_config,
@@ -136,6 +136,12 @@ impl ProtocolServer {
     }
 
     pub async fn serve(&self) -> Result<()> {
+        self.serve_with_control(BrowserInstanceControl::new()).await
+    }
+
+    /// Serve one instance with a protocol-independent lifecycle control handle.
+    /// Use a fresh handle for each instance; shutdown requests are persistent.
+    pub async fn serve_with_control(&self, control: BrowserInstanceControl) -> Result<()> {
         let listener = TcpListener::bind(self.config.bind_target())
             .await
             .with_context(|| {
@@ -151,533 +157,337 @@ impl ProtocolServer {
 
         info!(%addr, "protocol server listening");
 
-        let app_state = AppState::new_with_storage_partition_and_runtime_config(
+        let mut app_state = AppState::new_with_storage_partition_and_runtime_config(
             addr,
             self.storage_partition.clone(),
             self.navigation_runtime_config.clone(),
+            self.config.screencast_interval_ms,
+            control,
         )?;
+        app_state.remote_allow_origins = self.config.remote_allow_origins.clone();
 
-        let cdp_owner_registry = app_state.cdp_owner_registry.clone();
-        let app = build_router(app_state);
-
-        let listener = listener.tap_io(|tcp_stream| {
-            tcp_options::configure_accepted_protocol_stream(tcp_stream);
-        });
-        let result = axum::serve(listener, app).await;
-        cdp_owner_registry.shutdown().await;
-        result.context("protocol server failed")
+        #[cfg(feature = "ace-protocol")]
+        self.notify_runtime_ready(&app_state);
+        serve_listener(listener, app_state).await
     }
 }
 
-fn build_router(app_state: AppState) -> Router {
-    Router::new()
-        .route("/status", get(webdriver_classic::webdriver_classic_status))
-        .route("/status/", get(webdriver_classic::webdriver_classic_status))
-        .route("/json", any(cdp::json_list))
-        .route("/json/list", any(cdp::json_list))
-        .route("/json/list/", any(cdp::json_list))
-        .route("/json/version", get(cdp::json_version))
-        .route("/json/version/", get(cdp::json_version))
-        .route("/json/protocol", get(cdp::json_protocol))
-        .route("/json/protocol/", get(cdp::json_protocol))
-        .route("/json/new", put(cdp::json_new_target))
-        .route("/json/new/", put(cdp::json_new_target))
-        .route("/json/activate/{target_id}", get(cdp::json_activate_target))
-        .route(
-            "/json/activate/{target_id}/",
-            get(cdp::json_activate_target),
-        )
-        .route("/json/close/{target_id}", get(cdp::json_close_target))
-        .route("/json/close/{target_id}/", get(cdp::json_close_target))
-        .route(
-            "/devtools/browser/{browser_id}",
-            get(cdp::ws_browser_upgrade_handler),
-        )
-        .route(
-            "/devtools/browser/{browser_id}/",
-            get(cdp::ws_browser_upgrade_handler),
-        )
-        .route(
+/// Shared by the executable and instance-lifecycle integration tests.
+async fn serve_listener(listener: TcpListener, app_state: AppState) -> Result<()> {
+    const SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
+    let control = app_state.control.clone();
+    let cdp_owner_registry = app_state.cdp_owner_registry.clone();
+    let classic_session_registry = app_state.classic_session_registry.clone();
+    let storage_partition = app_state.storage_partition.clone();
+    let listener =
+        listener.tap_io(|stream| tcp_options::configure_accepted_protocol_stream(stream));
+    let stop_accepting = control.clone();
+    let service = axum::ServiceExt::<Request<Body>>::into_make_service(build_router(app_state));
+    let serving = axum::serve(listener, service)
+        .with_graceful_shutdown(async move { stop_accepting.shutdown_requested().await })
+        .into_future();
+    tokio::pin!(serving);
+    let completed = tokio::select! {
+        result = &mut serving => Some(result),
+        _ = control.shutdown_requested() => None,
+    };
+    control.request(InstanceCommand::Shutdown);
+    tokio::time::timeout(SHUTDOWN_BUDGET, async {
+        let (_, result) = tokio::join!(cdp_owner_registry.shutdown(), async {
+            // Drain in-flight HTTP requests before taking the final Classic
+            // session set. New requests and upgraded sockets are rejected.
+            match completed {
+                Some(result) => result,
+                None => (&mut serving).await,
+            }
+            .context("protocol server failed")?;
+            classic_session_registry.shutdown().await?;
+            control.drained().await;
+            tokio::task::spawn_blocking(move || storage_partition.shutdown())
+                .await
+                .context("storage shutdown worker stopped")??;
+            Ok(())
+        });
+        result
+    })
+    .await
+    .context("protocol server shutdown timed out; storage may be incomplete")?
+}
+
+// Matchit accepts an empty final parameter when a literal slash follows it.
+// Keep that legacy match without duplicating endpoint declarations.
+trait ProtocolRoutes {
+    fn protocol_route(self, path: &str, route: MethodRouter<AppState>) -> Self;
+}
+
+impl ProtocolRoutes for Router<AppState> {
+    #[inline(never)]
+    fn protocol_route(self, path: &str, route: MethodRouter<AppState>) -> Self {
+        if path.ends_with('}') {
+            self.route(path, route.clone())
+                .route(&format!("{path}/"), route)
+        } else {
+            self.route(path, route)
+        }
+    }
+}
+
+type ProtocolRouter = RequestGuard<trailing_slash::TrailingSlash<Router>>;
+
+fn build_router(app_state: AppState) -> ProtocolRouter {
+    let addr = app_state.addr;
+    let control = app_state.control.clone();
+    let remote_allow_origins = app_state.remote_allow_origins.clone();
+    let browser_ws_path = format!("/devtools/browser/{}", app_state.browser_id);
+    let router = Router::new()
+        .protocol_route("/status", get(webdriver_classic::webdriver_classic_status))
+        .protocol_route(JSON_DISCOVERY_PATH, any(cdp::json_list))
+        .protocol_route("/json/list", any(cdp::json_list))
+        .protocol_route("/json/version", get(cdp::json_version))
+        .protocol_route("/json/protocol", get(cdp::json_protocol))
+        .protocol_route("/json/new", put(cdp::json_new_target))
+        .protocol_route("/json/activate/{target_id}", get(cdp::json_activate_target))
+        .protocol_route("/json/close/{target_id}", get(cdp::json_close_target))
+        .protocol_route(&browser_ws_path, get(cdp::ws_browser_upgrade_handler))
+        .protocol_route(
             "/devtools/page/{target_id}",
             get(cdp::ws_target_upgrade_handler),
         )
-        .route(
-            "/devtools/page/{target_id}/",
-            get(cdp::ws_target_upgrade_handler),
-        )
-        .route(
+        .protocol_route(
             "/session",
             get(webdriver_bidi::ws_bidi_session_upgrade_handler)
                 .post(webdriver_classic::webdriver_classic_new_session),
         )
-        .route(
-            "/session/",
-            get(webdriver_bidi::ws_bidi_session_upgrade_handler)
-                .post(webdriver_classic::webdriver_classic_new_session),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}",
             get(webdriver_bidi::ws_bidi_existing_session_upgrade_handler)
                 .delete(webdriver_classic::webdriver_classic_delete_session),
         )
-        .route(
-            "/session/{session_id}/",
-            get(webdriver_bidi::ws_bidi_existing_session_upgrade_handler)
-                .delete(webdriver_classic::webdriver_classic_delete_session),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/url",
             get(webdriver_classic::webdriver_classic_get_url)
                 .post(webdriver_classic::webdriver_classic_navigate),
         )
-        .route(
-            "/session/{session_id}/url/",
-            get(webdriver_classic::webdriver_classic_get_url)
-                .post(webdriver_classic::webdriver_classic_navigate),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/title",
             get(webdriver_classic::webdriver_classic_get_title),
         )
-        .route(
-            "/session/{session_id}/title/",
-            get(webdriver_classic::webdriver_classic_get_title),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/timeouts",
             get(webdriver_classic::webdriver_classic_get_timeouts)
                 .post(webdriver_classic::webdriver_classic_set_timeouts),
         )
-        .route(
-            "/session/{session_id}/timeouts/",
-            get(webdriver_classic::webdriver_classic_get_timeouts)
-                .post(webdriver_classic::webdriver_classic_set_timeouts),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/source",
             get(webdriver_classic::webdriver_classic_get_source),
         )
-        .route(
-            "/session/{session_id}/source/",
-            get(webdriver_classic::webdriver_classic_get_source),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/screenshot",
             get(webdriver_classic::webdriver_classic_take_screenshot),
         )
-        .route(
-            "/session/{session_id}/screenshot/",
-            get(webdriver_classic::webdriver_classic_take_screenshot),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/print",
             post(webdriver_classic::webdriver_classic_print_page),
         )
-        .route(
-            "/session/{session_id}/print/",
-            post(webdriver_classic::webdriver_classic_print_page),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/file",
             post(webdriver_classic::webdriver_classic_upload_file),
         )
-        .route(
-            "/session/{session_id}/file/",
-            post(webdriver_classic::webdriver_classic_upload_file),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/se/file",
             post(webdriver_classic::webdriver_classic_upload_file),
         )
-        .route(
-            "/session/{session_id}/se/file/",
-            post(webdriver_classic::webdriver_classic_upload_file),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/se/files",
             get(webdriver_classic::webdriver_classic_get_downloadable_files)
                 .post(webdriver_classic::webdriver_classic_download_file)
                 .delete(webdriver_classic::webdriver_classic_delete_downloadable_files),
         )
-        .route(
-            "/session/{session_id}/se/files/",
-            get(webdriver_classic::webdriver_classic_get_downloadable_files)
-                .post(webdriver_classic::webdriver_classic_download_file)
-                .delete(webdriver_classic::webdriver_classic_delete_downloadable_files),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/moli/service-workers",
             get(webdriver_classic::webdriver_classic_get_service_workers),
         )
-        .route(
-            "/session/{session_id}/moli/service-workers/",
-            get(webdriver_classic::webdriver_classic_get_service_workers),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/window",
             get(webdriver_classic::webdriver_classic_get_window)
                 .post(webdriver_classic::webdriver_classic_switch_window)
                 .delete(webdriver_classic::webdriver_classic_close_window),
         )
-        .route(
-            "/session/{session_id}/window/",
-            get(webdriver_classic::webdriver_classic_get_window)
-                .post(webdriver_classic::webdriver_classic_switch_window)
-                .delete(webdriver_classic::webdriver_classic_close_window),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/window/handles",
             get(webdriver_classic::webdriver_classic_get_window_handles),
         )
-        .route(
-            "/session/{session_id}/window/handles/",
-            get(webdriver_classic::webdriver_classic_get_window_handles),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/window/rect",
             get(webdriver_classic::webdriver_classic_get_window_rect)
                 .post(webdriver_classic::webdriver_classic_set_window_rect),
         )
-        .route(
-            "/session/{session_id}/window/rect/",
-            get(webdriver_classic::webdriver_classic_get_window_rect)
-                .post(webdriver_classic::webdriver_classic_set_window_rect),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/window/maximize",
             post(webdriver_classic::webdriver_classic_maximize_window),
         )
-        .route(
-            "/session/{session_id}/window/maximize/",
-            post(webdriver_classic::webdriver_classic_maximize_window),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/window/minimize",
             post(webdriver_classic::webdriver_classic_minimize_window),
         )
-        .route(
-            "/session/{session_id}/window/minimize/",
-            post(webdriver_classic::webdriver_classic_minimize_window),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/window/fullscreen",
             post(webdriver_classic::webdriver_classic_fullscreen_window),
         )
-        .route(
-            "/session/{session_id}/window/fullscreen/",
-            post(webdriver_classic::webdriver_classic_fullscreen_window),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/window/new",
             post(webdriver_classic::webdriver_classic_new_window),
         )
-        .route(
-            "/session/{session_id}/window/new/",
-            post(webdriver_classic::webdriver_classic_new_window),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/frame",
             post(webdriver_classic::webdriver_classic_switch_frame),
         )
-        .route(
-            "/session/{session_id}/frame/",
-            post(webdriver_classic::webdriver_classic_switch_frame),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/frame/parent",
             post(webdriver_classic::webdriver_classic_switch_parent_frame),
         )
-        .route(
-            "/session/{session_id}/frame/parent/",
-            post(webdriver_classic::webdriver_classic_switch_parent_frame),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/alert/text",
             get(webdriver_classic::webdriver_classic_get_alert_text)
                 .post(webdriver_classic::webdriver_classic_send_alert_text),
         )
-        .route(
-            "/session/{session_id}/alert/text/",
-            get(webdriver_classic::webdriver_classic_get_alert_text)
-                .post(webdriver_classic::webdriver_classic_send_alert_text),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/alert/accept",
             post(webdriver_classic::webdriver_classic_accept_alert),
         )
-        .route(
-            "/session/{session_id}/alert/accept/",
-            post(webdriver_classic::webdriver_classic_accept_alert),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/alert/dismiss",
             post(webdriver_classic::webdriver_classic_dismiss_alert),
         )
-        .route(
-            "/session/{session_id}/alert/dismiss/",
-            post(webdriver_classic::webdriver_classic_dismiss_alert),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/refresh",
             post(webdriver_classic::webdriver_classic_refresh),
         )
-        .route(
-            "/session/{session_id}/refresh/",
-            post(webdriver_classic::webdriver_classic_refresh),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/back",
             post(webdriver_classic::webdriver_classic_back),
         )
-        .route(
-            "/session/{session_id}/back/",
-            post(webdriver_classic::webdriver_classic_back),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/forward",
             post(webdriver_classic::webdriver_classic_forward),
         )
-        .route(
-            "/session/{session_id}/forward/",
-            post(webdriver_classic::webdriver_classic_forward),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/execute/sync",
             post(webdriver_classic::webdriver_classic_execute_sync),
         )
-        .route(
-            "/session/{session_id}/execute/sync/",
-            post(webdriver_classic::webdriver_classic_execute_sync),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/execute/async",
             post(webdriver_classic::webdriver_classic_execute_async),
         )
-        .route(
-            "/session/{session_id}/execute/async/",
-            post(webdriver_classic::webdriver_classic_execute_async),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element",
             post(webdriver_classic::webdriver_classic_find_element),
         )
-        .route(
-            "/session/{session_id}/element/",
-            post(webdriver_classic::webdriver_classic_find_element),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/elements",
             post(webdriver_classic::webdriver_classic_find_elements),
         )
-        .route(
-            "/session/{session_id}/elements/",
-            post(webdriver_classic::webdriver_classic_find_elements),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/active",
             get(webdriver_classic::webdriver_classic_get_active_element),
         )
-        .route(
-            "/session/{session_id}/element/active/",
-            get(webdriver_classic::webdriver_classic_get_active_element),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/element",
             post(webdriver_classic::webdriver_classic_find_child_element),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/element/",
-            post(webdriver_classic::webdriver_classic_find_child_element),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/elements",
             post(webdriver_classic::webdriver_classic_find_child_elements),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/elements/",
-            post(webdriver_classic::webdriver_classic_find_child_elements),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/shadow",
             get(webdriver_classic::webdriver_classic_get_element_shadow_root),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/shadow/",
-            get(webdriver_classic::webdriver_classic_get_element_shadow_root),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/shadow/{shadow_root_id}/element",
             post(webdriver_classic::webdriver_classic_find_shadow_element),
         )
-        .route(
-            "/session/{session_id}/shadow/{shadow_root_id}/element/",
-            post(webdriver_classic::webdriver_classic_find_shadow_element),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/shadow/{shadow_root_id}/elements",
             post(webdriver_classic::webdriver_classic_find_shadow_elements),
         )
-        .route(
-            "/session/{session_id}/shadow/{shadow_root_id}/elements/",
-            post(webdriver_classic::webdriver_classic_find_shadow_elements),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/attribute/{name}",
             get(webdriver_classic::webdriver_classic_get_element_attribute),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/attribute/{name}/",
-            get(webdriver_classic::webdriver_classic_get_element_attribute),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/text",
             get(webdriver_classic::webdriver_classic_get_element_text),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/text/",
-            get(webdriver_classic::webdriver_classic_get_element_text),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/name",
             get(webdriver_classic::webdriver_classic_get_element_tag_name),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/name/",
-            get(webdriver_classic::webdriver_classic_get_element_tag_name),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/equals/{other_element_id}",
             get(webdriver_classic::webdriver_classic_element_equals),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/equals/{other_element_id}/",
-            get(webdriver_classic::webdriver_classic_element_equals),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/enabled",
             get(webdriver_classic::webdriver_classic_is_element_enabled),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/enabled/",
-            get(webdriver_classic::webdriver_classic_is_element_enabled),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/displayed",
             get(webdriver_classic::webdriver_classic_is_element_displayed),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/displayed/",
-            get(webdriver_classic::webdriver_classic_is_element_displayed),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/selected",
             get(webdriver_classic::webdriver_classic_is_element_selected),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/selected/",
-            get(webdriver_classic::webdriver_classic_is_element_selected),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/rect",
             get(webdriver_classic::webdriver_classic_get_element_rect),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/rect/",
-            get(webdriver_classic::webdriver_classic_get_element_rect),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/screenshot",
             get(webdriver_classic::webdriver_classic_take_element_screenshot),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/screenshot/",
-            get(webdriver_classic::webdriver_classic_take_element_screenshot),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/css/{property_name}",
             get(webdriver_classic::webdriver_classic_get_element_css_value),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/css/{property_name}/",
-            get(webdriver_classic::webdriver_classic_get_element_css_value),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/computedlabel",
             get(webdriver_classic::webdriver_classic_get_element_computed_label),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/computedlabel/",
-            get(webdriver_classic::webdriver_classic_get_element_computed_label),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/computedrole",
             get(webdriver_classic::webdriver_classic_get_element_computed_role),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/computedrole/",
-            get(webdriver_classic::webdriver_classic_get_element_computed_role),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/property/{name}",
             get(webdriver_classic::webdriver_classic_get_element_property),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/property/{name}/",
-            get(webdriver_classic::webdriver_classic_get_element_property),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/clear",
             post(webdriver_classic::webdriver_classic_clear_element),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/clear/",
-            post(webdriver_classic::webdriver_classic_clear_element),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/click",
             post(webdriver_classic::webdriver_classic_click_element),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/click/",
-            post(webdriver_classic::webdriver_classic_click_element),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/element/{element_id}/value",
             post(webdriver_classic::webdriver_classic_send_keys_to_element),
         )
-        .route(
-            "/session/{session_id}/element/{element_id}/value/",
-            post(webdriver_classic::webdriver_classic_send_keys_to_element),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/actions",
             post(webdriver_classic::webdriver_classic_perform_actions)
                 .delete(webdriver_classic::webdriver_classic_release_actions),
         )
-        .route(
-            "/session/{session_id}/actions/",
-            post(webdriver_classic::webdriver_classic_perform_actions)
-                .delete(webdriver_classic::webdriver_classic_release_actions),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/cookie",
             get(webdriver_classic::webdriver_classic_get_cookies)
                 .post(webdriver_classic::webdriver_classic_add_cookie)
                 .delete(webdriver_classic::webdriver_classic_delete_all_cookies),
         )
-        .route(
-            "/session/{session_id}/cookie/",
-            get(webdriver_classic::webdriver_classic_get_cookies)
-                .post(webdriver_classic::webdriver_classic_add_cookie)
-                .delete(webdriver_classic::webdriver_classic_delete_all_cookies),
-        )
-        .route(
+        .protocol_route(
             "/session/{session_id}/cookie/{name}",
-            get(webdriver_classic::webdriver_classic_get_named_cookie)
-                .delete(webdriver_classic::webdriver_classic_delete_cookie),
-        )
-        .route(
-            "/session/{session_id}/cookie/{name}/",
             get(webdriver_classic::webdriver_classic_get_named_cookie)
                 .delete(webdriver_classic::webdriver_classic_delete_cookie),
         )
@@ -685,6 +495,22 @@ fn build_router(app_state: AppState) -> Router {
         .layer(middleware::from_fn(
             classic_webdriver_response_headers_middleware,
         ))
+        .layer(middleware::from_fn_with_state(control, instance_admission));
+    // The outer make-service wrapper bypasses Router's own eager finalization.
+    let router = router.with_state(());
+    let router = trailing_slash::TrailingSlashLayer::new(&[JSON_DISCOVERY_PATH]).layer(router);
+    RequestGuard::new(router, addr, &remote_allow_origins)
+}
+
+async fn instance_admission(
+    State(control): State<BrowserInstanceControl>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(_connection) = control.connection() else {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    next.run(request).await
 }
 
 async fn classic_webdriver_response_headers_middleware(
@@ -736,20 +562,18 @@ fn is_websocket_upgrade_request(request: &Request<Body>) -> bool {
 
 #[derive(Clone)]
 struct AppState {
+    addr: SocketAddr,
+    control: BrowserInstanceControl,
+    remote_allow_origins: Vec<String>,
+    browser_id: Uuid,
+    navigation_runtime_config: NavigationRuntimeConfig,
     browser_ws_url: String,
-    page_ws_url: String,
     bidi_ws_url: String,
     bidi_session_registry: SharedBidiSessionRegistry,
     classic_session_registry: SharedClassicSessionRegistry,
     cdp_agent_host_directory: SharedCdpAgentHostDirectory,
     cdp_owner_registry: SharedCdpOwnerRegistry,
-    devtools_frontend_url: String,
-    cookie_profile: SharedCookieProfile,
     storage_partition: Arc<StoragePartitionState>,
-    fetch_config: FetchConfig,
-    optional_resource_fetch_mask: OptionalResourceFetchMask,
-    subframe_loading_enabled: bool,
-    layout_policy: LayoutPolicy,
 }
 
 impl AppState {
@@ -770,6 +594,8 @@ impl AppState {
                 subframe_loading_enabled,
                 LayoutPolicy::default(),
             ),
+            crate::config::DEFAULT_SCREENCAST_INTERVAL_MS,
+            BrowserInstanceControl::new(),
         )
     }
 
@@ -777,231 +603,37 @@ impl AppState {
         addr: SocketAddr,
         storage_partition: Arc<StoragePartitionState>,
         navigation_runtime_config: NavigationRuntimeConfig,
+        screencast_interval_ms: u32,
+        control: BrowserInstanceControl,
     ) -> anyhow::Result<Self> {
-        Ok(Self::from_parts(
-            addr,
-            SharedCookieProfile::from_storage_partition(storage_partition.clone()),
-            storage_partition,
-            navigation_runtime_config,
-        ))
-    }
-
-    fn from_parts(
-        addr: SocketAddr,
-        cookie_profile: SharedCookieProfile,
-        storage_partition: Arc<StoragePartitionState>,
-        navigation_runtime_config: NavigationRuntimeConfig,
-    ) -> Self {
+        let browser_id = Uuid::new_v4();
         let cdp_agent_host_directory = SharedCdpAgentHostDirectory::default();
-        let cdp_target_id_allocator = Arc::new(AtomicU64::new(0));
-        let cdp_tab_target_id_allocator = Arc::new(AtomicU64::new(0));
         let cdp_owner_registry = SharedCdpOwnerRegistry::new(
             cdp_agent_host_directory.clone(),
-            cdp_target_id_allocator,
-            cdp_tab_target_id_allocator,
-            cookie_profile.clone(),
             storage_partition.clone(),
             navigation_runtime_config.clone(),
+            screencast_interval_ms,
+            control.clone(),
         );
-        Self {
-            browser_ws_url: format!("ws://{addr}/devtools/browser/{DEFAULT_BROWSER_ID}"),
-            page_ws_url: format!("ws://{addr}/devtools/page/{DEFAULT_TARGET_ID}"),
+        Ok(Self {
+            addr,
+            control,
+            remote_allow_origins: Vec::new(),
+            browser_id,
+            browser_ws_url: format!("ws://{addr}/devtools/browser/{browser_id}"),
             bidi_ws_url: format!("ws://{addr}/session"),
             bidi_session_registry: SharedBidiSessionRegistry::default(),
             classic_session_registry: SharedClassicSessionRegistry::default(),
             cdp_agent_host_directory,
             cdp_owner_registry,
-            devtools_frontend_url: format!(
-                "/devtools/inspector.html?ws={addr}/devtools/page/{DEFAULT_TARGET_ID}"
-            ),
-            cookie_profile,
             storage_partition,
-            fetch_config: navigation_runtime_config.fetch_config().clone(),
-            optional_resource_fetch_mask: navigation_runtime_config.optional_resource_fetch_mask(),
-            subframe_loading_enabled: navigation_runtime_config.subframe_loading_enabled(),
-            layout_policy: navigation_runtime_config.layout_policy(),
-        }
+            navigation_runtime_config,
+        })
     }
 
-    fn initial_storage_partition(
-        &self,
-        initial_cookies: Vec<StoredCookie>,
-    ) -> CdpInitialStoragePartition {
-        CdpInitialStoragePartition::from_storage_partition(
-            initial_cookies,
-            self.storage_partition.as_ref(),
-        )
+    fn initial_storage_partition(&self) -> CdpInitialStoragePartition {
+        CdpInitialStoragePartition::from_storage_partition(&self.storage_partition)
     }
-}
-
-#[derive(Debug, Clone)]
-struct SharedCookieProfile {
-    backing: SharedCookieProfileBacking,
-}
-
-#[derive(Debug, Clone)]
-enum SharedCookieProfileBacking {
-    #[cfg(test)]
-    Legacy(Arc<Mutex<CookieProfile>>),
-    StoragePartition(Arc<StoragePartitionState>),
-}
-
-#[derive(Debug, Clone, Default)]
-struct CookieProfileCommit {
-    initial_cookies: Vec<StoredCookie>,
-    final_cookies: Option<Vec<StoredCookie>>,
-}
-
-impl CookieProfileCommit {
-    fn new(initial_cookies: Vec<StoredCookie>, final_cookies: Vec<StoredCookie>) -> Self {
-        Self {
-            initial_cookies,
-            final_cookies: Some(final_cookies),
-        }
-    }
-
-    fn unchanged() -> Self {
-        Self {
-            initial_cookies: Vec::new(),
-            final_cookies: None,
-        }
-    }
-
-    fn from_optional_profile_backed_snapshot(
-        initial_cookies: Vec<StoredCookie>,
-        final_cookies: Option<Vec<StoredCookie>>,
-    ) -> Self {
-        match final_cookies {
-            Some(final_cookies) => Self::new(initial_cookies, final_cookies),
-            None => Self::unchanged(),
-        }
-    }
-
-    fn is_unchanged(&self) -> bool {
-        self.final_cookies.is_none()
-    }
-}
-
-impl SharedCookieProfile {
-    #[cfg(test)]
-    fn new(initial_cookies: Vec<StoredCookie>, cache_paths: Vec<PathBuf>) -> Self {
-        Self {
-            backing: SharedCookieProfileBacking::Legacy(Arc::new(Mutex::new(CookieProfile {
-                cookies: initial_cookies,
-                cache_paths,
-            }))),
-        }
-    }
-
-    fn from_storage_partition(storage_partition: Arc<StoragePartitionState>) -> Self {
-        Self {
-            backing: SharedCookieProfileBacking::StoragePartition(storage_partition),
-        }
-    }
-
-    fn snapshot(&self) -> Vec<StoredCookie> {
-        match &self.backing {
-            #[cfg(test)]
-            SharedCookieProfileBacking::Legacy(inner) => inner.lock().cookies.clone(),
-            SharedCookieProfileBacking::StoragePartition(storage_partition) => storage_partition
-                .cookies()
-                .expect("storage partition cookie snapshot should succeed"),
-        }
-    }
-
-    fn commit_and_save(&self, commit: CookieProfileCommit) -> Result<()> {
-        if commit.is_unchanged() {
-            return Ok(());
-        }
-
-        match &self.backing {
-            #[cfg(test)]
-            SharedCookieProfileBacking::Legacy(inner) => {
-                let (cookies, cache_paths) = {
-                    let mut profile = inner.lock();
-                    commit_cookie_profile(&mut profile.cookies, commit);
-                    (profile.cookies.clone(), profile.cache_paths.clone())
-                };
-
-                for path in cache_paths {
-                    cookie_cache::save_cookie_cache(&path, cookies.clone()).with_context(|| {
-                        anyhow!("failed to save cookie cache `{}`", path.display())
-                    })?;
-                }
-                Ok(())
-            }
-            SharedCookieProfileBacking::StoragePartition(storage_partition) => {
-                storage_partition.commit_cookie_delta(&commit.initial_cookies, commit.final_cookies)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn merge_and_save(&self, cookies: Vec<StoredCookie>) -> Result<()> {
-        self.commit_and_save(CookieProfileCommit::new(Vec::new(), cookies))
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct CookieProfile {
-    cookies: Vec<StoredCookie>,
-    cache_paths: Vec<PathBuf>,
-}
-
-#[cfg(test)]
-fn merge_cookie_profiles(base: &mut Vec<StoredCookie>, updates: Vec<StoredCookie>) {
-    for cookie in updates.into_iter().filter(|cookie| !cookie.is_expired()) {
-        if let Some(existing) = base
-            .iter_mut()
-            .find(|existing| same_cookie_key(existing, &cookie))
-        {
-            *existing = cookie;
-        } else {
-            base.push(cookie);
-        }
-    }
-    base.retain(|cookie| !cookie.is_expired());
-}
-
-#[cfg(test)]
-fn commit_cookie_profile(base: &mut Vec<StoredCookie>, commit: CookieProfileCommit) {
-    let Some(final_cookies) = commit.final_cookies else {
-        return;
-    };
-    let final_cookies = final_cookies
-        .into_iter()
-        .filter(|cookie| !cookie.is_expired())
-        .collect::<Vec<_>>();
-
-    for initial in commit
-        .initial_cookies
-        .iter()
-        .filter(|cookie| !cookie.is_expired())
-    {
-        let cookie_still_exists_in_session = final_cookies
-            .iter()
-            .any(|cookie| same_cookie_key(cookie, initial));
-        if cookie_still_exists_in_session {
-            continue;
-        }
-        if let Some(position) = base
-            .iter()
-            .position(|cookie| same_cookie_key(cookie, initial) && cookie == initial)
-        {
-            base.remove(position);
-        }
-    }
-
-    merge_cookie_profiles(base, final_cookies);
-}
-
-#[cfg(test)]
-fn same_cookie_key(left: &StoredCookie, right: &StoredCookie) -> bool {
-    left.name == right.name
-        && left.domain == right.domain
-        && left.path == right.path
-        && left.partition_key == right.partition_key
 }
 
 #[cfg(test)]

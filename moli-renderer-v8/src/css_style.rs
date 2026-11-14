@@ -1,8 +1,6 @@
 use crate::webidl;
 
-use cssparser::{
-    ParseError, Parser, ParserInput, SourcePosition, ToCss, Token, TokenSerializationType,
-};
+use cssparser::{ParseError, Parser, SourcePosition, ToCss, Token, TokenSerializationType};
 use moli_css_parse::{
     CssDeclaration, CssFontFace, DeclarationParseOptions, parse_declaration_list, parse_font_faces,
 };
@@ -12,6 +10,22 @@ pub(crate) use moli_css_parse::{
     canonical_style_property_name, escape_top_level_semicolons, serialize_style_property_name,
 };
 
+/// Filter Stylo's names to the public CSS property surface. Accessor installation
+/// and computed declaration enumeration must use the same exposure policy.
+pub(crate) fn stylo_property_is_chromium_exposed(name: &str) -> bool {
+    !name.starts_with("-moz-")
+        && !name.starts_with("-x-")
+        && !matches!(name, "mask-position-x" | "mask-position-y")
+}
+
+pub(crate) fn parse_css_style_shell_keyword(value: &str) -> Option<&'static str> {
+    let input = value;
+    let mut parser = Parser::new(input);
+    let keyword = style::properties::CSSWideKeyword::parse(&mut parser).ok()?;
+    parser.expect_exhausted().ok()?;
+    Some(keyword.to_str())
+}
+
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "CSSStyleDeclaration.item")]
 pub(crate) struct CssStyleDeclarationItemArgs {
@@ -20,6 +34,36 @@ pub(crate) struct CssStyleDeclarationItemArgs {
         missing_message = "Failed to execute 'item' on 'CSSStyleDeclaration'"
     )]
     pub(crate) index: u32,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "CSSStyleDeclaration.cssText")]
+pub(crate) struct CssStyleDeclarationCssTextArgs {
+    // An attribute setter converts undefined even when called with no argument.
+    #[webidl(default = "undefined", treat_null_as_empty_string)]
+    pub(crate) value: String,
+}
+
+/// Named interceptors receive a value rather than function arguments. Use the
+/// same WebIDL string conversion as the declaration's generated arguments.
+pub(crate) fn css_style_declaration_property_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<String> {
+    match webidl::convert_with_options::<webidl::DomString>(
+        scope,
+        value,
+        webidl::Context::argument("CSSStyleDeclaration", 1),
+        &webidl::StringOptions {
+            treat_null_as_empty_string: true,
+        },
+    ) {
+        Ok(value) => Some(value.0),
+        Err(error) => {
+            webidl::throw_error(scope, &error);
+            None
+        }
+    }
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -83,28 +127,6 @@ impl CssInlineStyleDeclarationState {
             return entries;
         }
         self.entries.clone()
-    }
-
-    /// Returns the winning value for an already-canonicalized longhand without
-    /// cloning the declaration list or canonicalizing every stored name.
-    ///
-    /// This intentionally does not expand shorthands. It is for renderer-only
-    /// typed facts whose declarations are stored in the side projection
-    /// because the Servo-flavored Stylo build does not expose that longhand.
-    pub(crate) fn canonical_longhand_value(&self, property: &str) -> Option<&str> {
-        let mut normal = None;
-        let mut important = None;
-        for entry in &self.entries {
-            if entry.name != property {
-                continue;
-            }
-            if entry.priority {
-                important = Some(entry.value.as_str());
-            } else {
-                normal = Some(entry.value.as_str());
-            }
-        }
-        important.or(normal)
     }
 
     pub(crate) fn property_names(&self) -> Vec<String> {
@@ -616,7 +638,9 @@ fn normalized_pdb_entries_for_style_entry(entry: &CssStyleEntry) -> Option<Vec<C
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn pdb_mutation_value_for_style_entry(entry: &CssStyleEntry) -> std::borrow::Cow<'_, str> {
+pub(crate) fn pdb_mutation_value_for_style_entry(
+    entry: &CssStyleEntry,
+) -> std::borrow::Cow<'_, str> {
     if entry.value.is_empty()
         && moli_css_parse::is_cssom_custom_property_name(&canonical_style_property_name(
             &entry.name,
@@ -792,7 +816,7 @@ fn cssom_declaration_value_is_unitless_zero(value: &str) -> bool {
     moli_css_parse::normalize_cssom_component_value_serialization(value).as_deref() == Some("0")
 }
 
-pub(crate) fn normalize_cssom_flex_basis_value(value: &str) -> Option<String> {
+pub(crate) fn normalize_cssom_flex_component_value(value: &str) -> Option<String> {
     let serialized = moli_css_parse::normalize_cssom_component_value_serialization(value)?;
     if serialized == "0" {
         Some("0px".to_owned())
@@ -801,20 +825,15 @@ pub(crate) fn normalize_cssom_flex_basis_value(value: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn normalize_cssom_flex_shorthand_value(value: &str) -> Option<String> {
-    let serialized = moli_css_parse::normalize_cssom_component_value_serialization(value)?;
-    if serialized == "0" {
-        Some("0px".to_owned())
-    } else {
-        Some(serialized)
-    }
-}
+pub(crate) use self::normalize_cssom_flex_component_value as normalize_cssom_flex_basis_value;
+
+pub(crate) use self::normalize_cssom_flex_component_value as normalize_cssom_flex_shorthand_value;
 
 /// Splits top-level component values for box-like CSSOM reconstruction. Validity
 /// for the shorthand or its longhands must come from Stylo/PDB.
 pub(crate) fn box_shorthand_value_components(value: &str) -> Option<Vec<String>> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     let mut components = Vec::new();
     let mut component_start: Option<SourcePosition> = None;
     let mut component_end: Option<SourcePosition> = None;
@@ -837,9 +856,9 @@ pub(crate) fn box_shorthand_value_components(value: &str) -> Option<Vec<String>>
 
         component_start.get_or_insert(token_start);
         if css_component_token_starts_nested_block(&token) {
-            let nested: Result<(), ParseError<'_, ()>> = input.parse_nested_block(|input| {
+            let nested: Result<(), ParseError<()>> = input.parse_nested_block(|input| {
                 consume_nested_css_component(input)
-                    .ok_or_else(|| input.new_custom_error::<(), ()>(()))
+                    .ok_or_else(|| cssparser::ParseError::<()>::custom(()))
             });
             nested.ok()?;
         }
@@ -853,8 +872,8 @@ pub(crate) fn box_shorthand_value_components(value: &str) -> Option<Vec<String>>
 /// Splits only top-level comma layers while preserving nested component text.
 /// The caller is responsible for using this only after grammar validation.
 pub(crate) fn top_level_comma_separated_component_values(value: &str) -> Option<Vec<String>> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     let mut layers = Vec::new();
     let mut layer_start: Option<SourcePosition> = None;
     let mut layer_end: Option<SourcePosition> = None;
@@ -876,9 +895,9 @@ pub(crate) fn top_level_comma_separated_component_values(value: &str) -> Option<
 
         layer_start.get_or_insert(token_start);
         if css_component_token_starts_nested_block(&token) {
-            let nested: Result<(), ParseError<'_, ()>> = input.parse_nested_block(|input| {
+            let nested: Result<(), ParseError<()>> = input.parse_nested_block(|input| {
                 consume_nested_css_component(input)
-                    .ok_or_else(|| input.new_custom_error::<(), ()>(()))
+                    .ok_or_else(|| cssparser::ParseError::<()>::custom(()))
             });
             nested.ok()?;
         }
@@ -892,8 +911,8 @@ pub(crate) fn top_level_comma_separated_component_values(value: &str) -> Option<
 pub(crate) fn normalize_cssom_component_value_serialization_with_spaced_slash(
     value: &str,
 ) -> Option<String> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     let mut parts = Vec::new();
     let mut part_start: Option<SourcePosition> = None;
     let mut part_end: Option<SourcePosition> = None;
@@ -916,9 +935,9 @@ pub(crate) fn normalize_cssom_component_value_serialization_with_spaced_slash(
 
         part_start.get_or_insert(token_start);
         if css_component_token_starts_nested_block(&token) {
-            let nested: Result<(), ParseError<'_, ()>> = input.parse_nested_block(|input| {
+            let nested: Result<(), ParseError<()>> = input.parse_nested_block(|input| {
                 consume_nested_css_component(input)
-                    .ok_or_else(|| input.new_custom_error::<(), ()>(()))
+                    .ok_or_else(|| cssparser::ParseError::<()>::custom(()))
             });
             nested.ok()?;
         }
@@ -933,7 +952,7 @@ pub(crate) fn normalize_cssom_component_value_serialization_with_spaced_slash(
 }
 
 fn push_top_level_slash_component(
-    input: &Parser<'_, '_>,
+    input: &Parser<'_>,
     parts: &mut Vec<String>,
     part_start: &mut Option<SourcePosition>,
     part_end: Option<SourcePosition>,
@@ -948,7 +967,7 @@ fn push_top_level_slash_component(
 }
 
 fn push_top_level_comma_component(
-    input: &Parser<'_, '_>,
+    input: &Parser<'_>,
     layers: &mut Vec<String>,
     layer_start: &mut Option<SourcePosition>,
     layer_end: Option<SourcePosition>,
@@ -960,7 +979,7 @@ fn push_top_level_comma_component(
 }
 
 fn push_box_shorthand_component(
-    input: &Parser<'_, '_>,
+    input: &Parser<'_>,
     components: &mut Vec<String>,
     component_start: &mut Option<SourcePosition>,
     component_end: Option<SourcePosition>,
@@ -983,12 +1002,12 @@ fn css_component_token_starts_nested_block(token: &Token<'_>) -> bool {
     )
 }
 
-fn consume_nested_css_component(input: &mut Parser<'_, '_>) -> Option<()> {
+fn consume_nested_css_component(input: &mut Parser<'_>) -> Option<()> {
     while let Ok(token) = input.next_including_whitespace_and_comments().cloned() {
         if css_component_token_starts_nested_block(&token) {
-            let nested: Result<(), ParseError<'_, ()>> = input.parse_nested_block(|input| {
+            let nested: Result<(), ParseError<()>> = input.parse_nested_block(|input| {
                 consume_nested_css_component(input)
-                    .ok_or_else(|| input.new_custom_error::<(), ()>(()))
+                    .ok_or_else(|| cssparser::ParseError::<()>::custom(()))
             });
             nested.ok()?;
         }
@@ -997,8 +1016,8 @@ fn consume_nested_css_component(input: &mut Parser<'_, '_>) -> Option<()> {
 }
 
 pub(crate) fn background_shorthand_color(value: &str) -> Option<String> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     while let Ok(token) = input.next_including_whitespace_and_comments().cloned() {
         match token {
             Token::WhiteSpace(_) | Token::Comment(_) => {}
@@ -1018,8 +1037,8 @@ pub(crate) fn background_shorthand_color(value: &str) -> Option<String> {
 }
 
 pub(crate) fn border_shorthand_width(value: &str) -> Option<String> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     while let Ok(token) = input.next_including_whitespace_and_comments().cloned() {
         match token {
             Token::WhiteSpace(_) | Token::Comment(_) => {}
@@ -1054,8 +1073,8 @@ pub(crate) fn border_shorthand_width(value: &str) -> Option<String> {
 }
 
 pub(crate) fn border_shorthand_color(value: &str) -> Option<String> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     while let Ok(token) = input.next_including_whitespace_and_comments().cloned() {
         match token {
             Token::WhiteSpace(_) | Token::Comment(_) => {}
@@ -1077,8 +1096,8 @@ pub(crate) fn border_shorthand_color(value: &str) -> Option<String> {
 }
 
 pub(crate) fn border_shorthand_style(value: &str) -> Option<String> {
-    let mut input = ParserInput::new(value);
-    let mut input = Parser::new(&mut input);
+    let input = value;
+    let mut input = Parser::new(input);
     while let Ok(token) = input.next_including_whitespace_and_comments().cloned() {
         match token {
             Token::WhiteSpace(_) | Token::Comment(_) => {}
@@ -1126,7 +1145,7 @@ pub(crate) fn system_color_rgb(value: &str) -> Option<(u8, u8, u8)> {
     moli_css_parse::css_system_color_srgb(value)
 }
 
-fn shorthand_component_function_text(input: &mut Parser<'_, '_>, name: &str) -> Option<String> {
+fn shorthand_component_function_text(input: &mut Parser<'_>, name: &str) -> Option<String> {
     let mut css_text = String::new();
     css_text.push_str(name);
     css_text.push('(');
@@ -1138,15 +1157,15 @@ fn shorthand_component_function_text(input: &mut Parser<'_, '_>, name: &str) -> 
                 TokenSerializationType::Nothing,
             )
             .map(|_| ())
-            .ok_or_else(|| nested.new_custom_error::<(), ()>(()))
+            .ok_or_else(|| cssparser::ParseError::<()>::custom(()))
         })
         .ok()?;
     css_text.push(')');
     Some(css_text)
 }
 
-fn serialize_shorthand_component_values<'i, 't>(
-    input: &mut Parser<'i, 't>,
+fn serialize_shorthand_component_values<'i>(
+    input: &mut Parser<'i>,
     css_text: &mut String,
     mut previous_token: TokenSerializationType,
 ) -> Option<TokenSerializationType> {
@@ -1175,10 +1194,10 @@ fn serialize_shorthand_component_values<'i, 't>(
             _ => None,
         };
         if let Some(closing_token) = closing_token {
-            let nested: Result<TokenSerializationType, ParseError<'_, ()>> = input
-                .parse_nested_block(|input| {
+            let nested: Result<TokenSerializationType, ParseError<()>> =
+                input.parse_nested_block(|input| {
                     serialize_shorthand_component_values(input, css_text, previous_token)
-                        .ok_or_else(|| input.new_custom_error::<(), ()>(()))
+                        .ok_or_else(|| cssparser::ParseError::<()>::custom(()))
                 });
             nested.ok()?;
             closing_token.to_css(css_text).ok()?;
@@ -1212,8 +1231,7 @@ pub(crate) fn parse_css_declaration_list(style_text: &str) -> Vec<CssStyleEntry>
 }
 
 /// Returns the winning declaration for one property inside a declaration
-/// list. This is also usable for valid properties that the Servo flavor of
-/// Stylo does not expose, such as `content-visibility`.
+/// list, without requiring a computed style.
 pub(crate) fn css_declaration_list_property_value(
     style_text: &str,
     property: &str,
@@ -1233,64 +1251,6 @@ pub(crate) fn css_declaration_list_property_value(
         winner = Some(entry);
     }
     winner.map(|entry| entry.value)
-}
-
-/// Returns one exact, already-canonicalized longhand from raw declaration text
-/// without routing through the general CSSOM property-name canonicalizer.
-///
-/// `cssparser` has already decoded the declaration name, so an ASCII
-/// case-insensitive comparison covers CSS property-name matching, including
-/// escaped identifiers. This is the uncached fallback for renderer-only typed
-/// facts; live elements normally use `CssInlineStyleDeclarationState`.
-pub(crate) fn css_declaration_list_canonical_longhand_value(
-    style_text: &str,
-    property: &str,
-) -> Option<String> {
-    let mut normal = None;
-    let mut important = None;
-    for declaration in parse_declaration_list(
-        style_text,
-        DeclarationParseOptions {
-            canonicalize_property_name: false,
-            unescape_value_semicolons: true,
-            preserve_empty_values: true,
-        },
-    ) {
-        if !declaration.name.eq_ignore_ascii_case(property) {
-            continue;
-        }
-        if declaration.important {
-            important = Some(declaration.value);
-        } else {
-            normal = Some(declaration.value);
-        }
-    }
-    important.or(normal)
-}
-
-pub(crate) fn resolve_css_url_function(value: &str, base_url: &url::Url) -> String {
-    let value = value.trim();
-    let Some(raw_url) = value
-        .strip_prefix("url(")
-        .and_then(|value| value.strip_suffix(')'))
-        .map(str::trim)
-    else {
-        return value.to_owned();
-    };
-    let raw_url = raw_url
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .or_else(|| {
-            raw_url
-                .strip_prefix('\'')
-                .and_then(|value| value.strip_suffix('\''))
-        })
-        .unwrap_or(raw_url);
-    base_url
-        .join(raw_url)
-        .or_else(|_| url::Url::parse(raw_url))
-        .map(|url| format!("url(\"{}\")", url.as_str()))
-        .unwrap_or_else(|_| value.to_owned())
 }
 
 pub(crate) fn parse_css_font_faces(css_text: &str) -> Vec<CssFontFaceEntry> {
@@ -1498,7 +1458,7 @@ fn overriding_later_flex_longhands<'a>(
         .collect()
 }
 
-fn css_wide_keyword(value: &str) -> Option<String> {
+pub(crate) fn css_wide_keyword(value: &str) -> Option<String> {
     let lowered = value.trim().to_ascii_lowercase();
     matches!(
         lowered.as_str(),
@@ -1771,7 +1731,7 @@ fn collect_box_shorthand_entry(
     ))
 }
 
-fn compress_box_components(values: &[String]) -> Option<String> {
+pub(crate) fn compress_box_components(values: &[String]) -> Option<String> {
     match values {
         [start, end] if start == end => Some(start.clone()),
         [start, end] => Some(format!("{start} {end}")),
@@ -2485,7 +2445,7 @@ fn serialize_text_decoration_shorthand_entries(entries: &[CssStyleEntry]) -> Vec
     )
 }
 
-fn serialize_text_decoration_shorthand_value(
+pub(crate) fn serialize_text_decoration_shorthand_value(
     line: &str,
     thickness: &str,
     style: &str,
@@ -2665,39 +2625,6 @@ mod tests {
         assert_eq!(entries[0].name, "display");
         assert_eq!(entries[0].value, "block");
         assert!(entries[0].priority);
-    }
-
-    #[test]
-    fn canonical_longhand_fast_path_preserves_css_priority_and_identifier_matching() {
-        let raw = r#"
-            CONTENT-VISIBILITY: auto !important;
-            content\2d visibility: visible;
-            content-visibility: hidden;
-        "#;
-        assert_eq!(
-            css_declaration_list_canonical_longhand_value(raw, "content-visibility").as_deref(),
-            Some("auto")
-        );
-
-        let state = CssInlineStyleDeclarationState {
-            entries: vec![
-                CssStyleEntry {
-                    name: "content-visibility".to_owned(),
-                    value: "hidden".to_owned(),
-                    priority: true,
-                },
-                CssStyleEntry {
-                    name: "content-visibility".to_owned(),
-                    value: "visible".to_owned(),
-                    priority: false,
-                },
-            ],
-            ..Default::default()
-        };
-        assert_eq!(
-            state.canonical_longhand_value("content-visibility"),
-            Some("hidden")
-        );
     }
 
     #[test]

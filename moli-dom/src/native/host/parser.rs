@@ -25,18 +25,8 @@ impl DomHost {
         }
     }
 
-    pub fn create_parser_element(
-        &mut self,
-        local_name: String,
-        namespace: String,
-        prefix: Option<String>,
-        attributes: Vec<crate::dom::native::Attribute>,
-    ) -> DomHandle {
-        let node_id = self.create_parser_element_without_attributes(local_name, namespace, prefix);
-        self.add_attrs_if_missing_for_parser(node_id, attributes);
-        node_id
-    }
-
+    /// Allocate parser provenance without starting child construction. Active
+    /// parsers allocate through `ParserConstruction` instead.
     pub fn create_parser_element_without_attributes(
         &mut self,
         local_name: String,
@@ -51,6 +41,8 @@ impl DomHost {
         )
     }
 
+    /// Allocate an element with parser provenance only. An active parser must
+    /// use `ParserConstruction::create_element` to also own child completion.
     pub fn create_parser_element_without_attributes_for_document(
         &mut self,
         document_handle: DomHandle,
@@ -58,44 +50,13 @@ impl DomHost {
         namespace: String,
         prefix: Option<String>,
     ) -> DomHandle {
-        let is_template = namespace == "http://www.w3.org/1999/xhtml" && local_name == "template";
-        let is_child_browsing_context_host_candidate =
-            is_html_frame_owner_candidate(&local_name, &namespace);
-        let node_id = self.dom.create_node(
-            NodeData::Element(Element::new_parser_created(
-                local_name,
-                namespace,
-                prefix,
-                Vec::new(),
-            )),
-            Some(document_handle),
-            false,
-            false,
-        );
-        if let Some(node) = self.node_mut(node_id) {
-            node.set_parser_created(true);
-        }
-        self.record_element_query_index_candidate(node_id);
-        if is_child_browsing_context_host_candidate {
-            let mut candidates = self.child_browsing_context_host_candidates.borrow_mut();
-            if !candidates.contains(&node_id) {
-                candidates.push(node_id);
-            }
-        }
+        self.allocate_element_for_document(document_handle, local_name, namespace, prefix, true)
+    }
 
-        if is_template {
-            let template_contents = self
-                .dom
-                .create_template_contents_fragment_for_document(document_handle);
-            if let Some(element) = self
-                .node_mut(node_id)
-                .and_then(|node| node.data_mut().as_element_mut())
-            {
-                element.set_template_contents(Some(template_contents));
-            }
-        }
-
-        node_id
+    pub(in crate::native) fn begin_parsing_children(&mut self, node: DomHandle) -> bool {
+        self.node_mut(node)
+            .and_then(|node| node.data_mut().as_element_mut())
+            .is_some_and(Element::begin_parsing_children)
     }
 
     pub fn parser_template_contents_handle(&self, node_id: DomHandle) -> Option<DomHandle> {
@@ -114,12 +75,7 @@ impl DomHost {
         else {
             return false;
         };
-        if element.namespace() != "http://www.w3.org/1999/xhtml"
-            || !matches!(
-                element.local_name(),
-                "button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea"
-            )
-        {
+        if !is_parser_form_association_candidate(element) {
             return false;
         }
         element.set_parser_associated_form_owner(Some(form))
@@ -232,6 +188,7 @@ impl DomHost {
         let mut changed = false;
         let mut named_index_changed = false;
         let mut base_state_changed = false;
+        let mut referrer_attribute_changed = false;
         for attribute in attrs {
             let already_exists = element.attributes().iter().any(|existing| {
                 existing.namespace() == attribute.namespace()
@@ -252,9 +209,13 @@ impl DomHost {
                     && is_base_element
                     && attribute.namespace().is_empty()
                     && matches!(attribute.local_name(), "href" | "target");
+                referrer_attribute_changed |= attribute_changed
+                    && attribute.namespace().is_empty()
+                    && matches!(attribute.local_name(), "name" | "content");
                 changed |= attribute_changed;
             }
         }
+        changed |= element.resanitize_input_value_after_parser_attributes();
         changed |= element.mark_undefined_custom_element_candidate_from_identity();
 
         if changed {
@@ -265,6 +226,9 @@ impl DomHost {
             }
             if base_state_changed {
                 self.dom.process_base_element_for_node(node_id);
+            }
+            if referrer_attribute_changed {
+                self.dom.process_meta_referrer(node_id);
             }
             self.record_mutation(MutationScope::QueryState);
         }
@@ -310,6 +274,72 @@ mod tests {
         );
 
         assert_eq!(host.get_attribute(element, "id").as_deref(), Some("card"));
+    }
+
+    #[test]
+    fn parser_input_default_values_do_not_depend_on_attribute_order() {
+        for kind in ["hidden", "button", "submit", "reset", "checkbox", "radio"] {
+            for value_first in [true, false] {
+                let mut host = test_host();
+                let input = host.create_parser_element_without_attributes(
+                    "input".to_owned(),
+                    "http://www.w3.org/1999/xhtml".to_owned(),
+                    None,
+                );
+                let mut attrs = vec![
+                    Attribute::new(
+                        "value".to_owned(),
+                        String::new(),
+                        None,
+                        " first\nsecond ".to_owned(),
+                    ),
+                    Attribute::new("type".to_owned(), String::new(), None, kind.to_owned()),
+                ];
+                if !value_first {
+                    attrs.reverse();
+                }
+                host.add_attrs_if_missing_for_parser(input, attrs);
+                let element = host.node(input).and_then(Node::as_element).unwrap();
+                assert_eq!(
+                    element.input_value(),
+                    " first\nsecond ",
+                    "{kind}, value_first={value_first}"
+                );
+                assert!(!element.input_value_dirty());
+                assert_eq!(element.attribute("value"), Some(" first\nsecond "));
+            }
+        }
+    }
+
+    #[test]
+    fn parser_input_value_sanitization_observes_the_complete_token_attribute_set() {
+        let mut host = test_host();
+        let input = host.create_parser_element_without_attributes(
+            "input".to_owned(),
+            "http://www.w3.org/1999/xhtml".to_owned(),
+            None,
+        );
+        let attribute = |name: &str, value: &str| {
+            Attribute::new(name.to_owned(), String::new(), None, value.to_owned())
+        };
+
+        host.add_attrs_if_missing_for_parser(
+            input,
+            vec![
+                attribute("type", "range"),
+                attribute("id", "range"),
+                attribute("min", "2"),
+                attribute("max", "6"),
+            ],
+        );
+
+        assert_eq!(
+            host.node(input)
+                .and_then(Node::as_element)
+                .map(Element::input_value)
+                .as_deref(),
+            Some("4")
+        );
     }
 
     #[test]

@@ -170,3 +170,75 @@ fn details_name_groups_enforce_exclusivity_within_each_tree_root() {
         r#"{"parserStates":[1,0],"directOpenStates":[0,1],"insertionStates":[0,0,1],"renameStates":[1,0],"nestedInsertionStates":[1,0],"treeScopeStates":[1,0,1],"emptyNameStates":[1,1],"detachedParserStates":[1,0]}"#
     );
 }
+
+#[test]
+fn fragment_navigation_reveals_closed_details_ancestors_but_not_their_summary() {
+    let mut vm = new_parsed_test_vm(
+        "https://details-fragment-reveal.test/",
+        r##"
+        <!doctype html>
+        <html>
+          <body>
+            <a id="reveal-link" href="#target"></a>
+            <details id="outer">
+              <summary>Outer summary</summary>
+              <details id="inner">
+                <summary id="inner-summary">Inner summary</summary>
+                <div id="target">Target</div>
+              </details>
+            </details>
+          </body>
+        </html>
+        "##,
+    );
+
+    let result = vm
+        .eval(
+            r##"
+(() => {
+  const outer = document.getElementById("outer");
+  const inner = document.getElementById("inner");
+  document.getElementById("reveal-link").click();
+  const targetState = [outer.open, inner.open, location.hash];
+
+  outer.open = false;
+  inner.open = false;
+  location.hash = "";
+  const summaryLink = document.createElement("a");
+  summaryLink.href = "#inner-summary";
+  document.body.appendChild(summaryLink);
+  summaryLink.click();
+
+  return JSON.stringify({
+    targetState,
+    summaryState: [outer.open, inner.open, location.hash]
+  });
+})()
+"##,
+        )
+        .expect("details fragment ancestor reveal should evaluate");
+
+    assert_eq!(
+        result,
+        r##"{"targetState":[true,true,"#target"],"summaryState":[true,false,"#inner-summary"]}"##
+    );
+}
+
+#[test]
+fn canceled_fragment_hyperlink_does_not_reveal_closed_details() {
+    let mut vm = new_parsed_test_vm(
+        "https://details-canceled-fragment.test/",
+        r##"<!doctype html><a id="link" href="#target">Go</a>
+        <details id="closed"><summary>Summary</summary><div id="target">Target</div></details>"##,
+    );
+    let result = vm
+        .eval(
+            r#"(() => {
+        navigation.onnavigate = event => event.preventDefault();
+        document.getElementById('link').click();
+        return JSON.stringify([document.getElementById('closed').open, location.hash]);
+    })()"#,
+        )
+        .expect("canceled fragment activation");
+    assert_eq!(result, r#"[false,""]"#);
+}

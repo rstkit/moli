@@ -18,7 +18,7 @@ async fn browser_context_document_cookie_facade_overrides_apply_to_new_loaded_pa
         .build_loaded_navigation_from_buffered_response_async(
             Url::parse("https://example.com/app").unwrap(),
             "GET".into(),
-            vec![],
+            vec![].into(),
             200,
             vec![],
             "<!doctype html><html><body>ok</body></html>".into(),
@@ -70,7 +70,7 @@ async fn browser_context_document_cookie_facade_overrides_update_live_page() {
         .build_loaded_navigation_from_buffered_response_async(
             Url::parse("https://example.com/app").unwrap(),
             "GET".into(),
-            vec![],
+            vec![].into(),
             200,
             vec![],
             "<!doctype html><html><body>ok</body></html>".into(),
@@ -139,7 +139,7 @@ async fn browser_context_document_cookie_browser_context_overrides_update_live_p
         .build_loaded_navigation_from_buffered_response_async(
             Url::parse("https://example.com/app").unwrap(),
             "GET".into(),
-            vec![],
+            vec![].into(),
             200,
             vec![],
             "<!doctype html><html><body>ok</body></html>".into(),
@@ -173,15 +173,15 @@ async fn browser_context_document_cookie_browser_context_overrides_update_live_p
         .evaluate_runtime_expression_with_await_async("navigator.cookieEnabled", false)
         .await
         .expect("expression should evaluate");
-    assert_eq!(after_apply["value"], json!(false));
-    let blocked_snapshot = conn
+    assert_eq!(after_apply["value"], json!(true));
+    let context_snapshot = conn
         .browser_context
         .as_mut()
         .unwrap()
         .document_cookie_facade_snapshot_async()
         .await;
     assert_eq!(
-        blocked_snapshot
+        context_snapshot
             .capability_surface
             .manager_surface
             .policy
@@ -191,12 +191,12 @@ async fn browser_context_document_cookie_browser_context_overrides_update_live_p
             .with_top_frame_origin_url(&cross_site)
     );
     assert_eq!(
-        blocked_snapshot.freshness.cookie_get_freshness_status,
-        BrowserContextCookieGetFreshnessStatus::PolicyBlocked
+        context_snapshot.freshness.cookie_get_freshness_status,
+        BrowserContextCookieGetFreshnessStatus::NoEntry
     );
     assert_eq!(
-        blocked_snapshot.freshness.cookie_set_readiness_status,
-        BrowserContextCookieSetReadinessStatus::PolicyBlocked
+        context_snapshot.freshness.cookie_set_readiness_status,
+        BrowserContextCookieSetReadinessStatus::ReadyWillInvalidateCache
     );
 
     conn.browser_context
@@ -321,7 +321,7 @@ async fn browser_context_document_cookie_capability_and_freshness_snapshots_proj
         .build_loaded_navigation_from_buffered_response_async(
             Url::parse("https://example.com/app").unwrap(),
             "GET".into(),
-            vec![],
+            vec![].into(),
             200,
             vec![],
             "<!doctype html><html><body>ok</body></html>".into(),
@@ -740,7 +740,7 @@ async fn browser_context_cookie_manager_surface_projects_document_capability_and
         .build_loaded_navigation_from_buffered_response_async(
             Url::parse("https://example.com/app").unwrap(),
             "GET".into(),
-            vec![],
+            vec![].into(),
             200,
             vec![],
             "<!doctype html><html><body>ok</body></html>".into(),

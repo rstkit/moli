@@ -113,7 +113,7 @@ impl ActiveStorageContext {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn child_browsing_context_current_url(&self, handle: DomHandle) -> Option<Url> {
         self.frame_owner_store
             .current_child_owner_snapshot(handle)
@@ -126,10 +126,15 @@ impl JsContextHost {
     ) -> Option<Url> {
         let mut current = Some(handle);
         let mut depth = 0;
+        let mut secure_url = None;
         while let Some(current_handle) = current {
             let entry = self.child_browsing_contexts.get(&current_handle)?;
             if !entry.security_origin_inherited() {
-                return entry.current_document_url();
+                let url = entry.current_document_url()?;
+                if !moli_url::is_potentially_trustworthy_url(&url) {
+                    return Some(url);
+                }
+                secure_url.get_or_insert(url);
             }
             depth += 1;
             if depth > self.child_browsing_contexts.len() {
@@ -137,26 +142,23 @@ impl JsContextHost {
             }
             current = self.child_browsing_context_parent_handle(current_handle);
         }
-        // Initial about:blank and srcdoc retain the creator origin's potential
-        // trustworthiness even when sandboxing derives an opaque origin.
-        Some(self.document_url().clone())
+        let top_url = self
+            .current_main_document_resource_loader()
+            .and_then(|loader| Url::parse(loader.fetch_context().origin()).ok())
+            .unwrap_or_else(|| self.document_url().clone());
+        // about:blank/srcdoc inherit their creator's trustworthiness, but a
+        // trustworthy descendant cannot override an insecure ancestor.
+        if moli_url::is_potentially_trustworthy_url(&top_url) {
+            Some(secure_url.unwrap_or(top_url))
+        } else {
+            Some(top_url)
+        }
     }
 
-    pub(crate) fn child_browsing_context_request_scope(
-        &self,
-        handle: DomHandle,
-    ) -> Option<(String, Url)> {
-        let entry = self.child_browsing_contexts.get(&handle)?;
-        let document_url = self.child_browsing_context_base_url(handle)?;
-        Some((entry.frame_id().to_owned(), document_url))
-    }
-
-    pub(crate) fn active_child_subresource_request_scope(
-        &self,
-    ) -> Option<(DomHandle, String, Url)> {
+    pub(crate) fn active_child_subresource_request_handle(&self) -> Option<DomHandle> {
         let handle = *self.active_child_subresource_request_scopes.last()?;
-        let (frame_id, document_url) = self.child_browsing_context_request_scope(handle)?;
-        Some((handle, frame_id, document_url))
+        self.frame_owner_frame_id_for_child_handle(handle)?;
+        Some(handle)
     }
 
     pub(crate) fn child_browsing_context_base_url(&self, handle: DomHandle) -> Option<Url> {
@@ -262,6 +264,19 @@ impl JsContextHost {
         self.child_browsing_context_window_origin(handle)
     }
 
+    pub(crate) fn child_browsing_context_request_initiator_url(
+        &self,
+        handle: DomHandle,
+    ) -> Option<Url> {
+        let owner = self
+            .frame_owner_store
+            .current_child_owner_snapshot(handle)?;
+        let base_url = self
+            .child_browsing_context_base_url(handle)
+            .unwrap_or(owner.document_base_url);
+        Some(owner.settings.request_initiator_url(&base_url))
+    }
+
     pub(crate) fn child_browsing_context_web_storage_scope(
         &mut self,
         handle: DomHandle,
@@ -364,9 +379,9 @@ impl JsContextHost {
             return Some("null".to_owned());
         }
         if bootstrap.security_origin_inherited() {
-            return Some(self.child_browsing_context_creator_network_partition_origin(handle));
+            return Some(self.child_browsing_context_creator_origin(handle));
         }
-        let parent_origin = self.child_browsing_context_creator_network_partition_origin(handle);
+        let parent_origin = self.child_browsing_context_creator_origin(handle);
         let url = Self::child_browsing_context_bootstrap_url(bootstrap)?;
         Some(
             moli_url::origin_ascii_serialization_with_about_blank_inheritance(&url, &parent_origin),
@@ -391,19 +406,28 @@ impl JsContextHost {
             return Some("null".to_owned());
         }
         if entry.security_origin_inherited() {
-            return Some(self.child_browsing_context_creator_network_partition_origin(handle));
+            return Some(self.child_browsing_context_creator_origin(handle));
         }
-        let parent_origin = self.child_browsing_context_creator_network_partition_origin(handle);
+        let parent_origin = self.child_browsing_context_creator_origin(handle);
         Some(moli_url::origin_ascii_serialization_with_about_blank_inheritance(url, &parent_origin))
     }
 
-    pub(in crate::native_bridge::context_host) fn child_browsing_context_creator_network_partition_origin(
+    pub(in crate::native_bridge::context_host) fn child_browsing_context_creator_origin(
         &self,
         handle: DomHandle,
     ) -> String {
-        self.child_browsing_context_parent_handle(handle)
-            .and_then(|parent| self.child_browsing_context_network_partition_origin(parent))
-            .unwrap_or_else(|| moli_url::origin_ascii_serialization(self.document_url()))
+        // The creator is the iframe element's owning Document, which may be
+        // a popup root. Read its committed native origin rather than a URL or
+        // the host page's identity; about documents can inherit either a
+        // tuple origin or an opaque origin.
+        self.dom_host()
+            .node(handle)
+            .and_then(crate::dom::native::Node::owner_document)
+            .map(|document| {
+                self.document_security_origin(document)
+                    .ascii_serialization()
+            })
+            .unwrap_or_else(|| "null".to_owned())
     }
 
     pub(crate) fn active_storage_context(
@@ -672,7 +696,7 @@ impl JsContextHost {
     pub(in crate::native_bridge::context_host) fn ensure_top_document_credentialless_storage_nonce(
         &mut self,
     ) -> OpaqueOriginNonce {
-        unsafe { &mut *self.runtime }
+        unsafe { &mut *self.document_runtime }
             .ensure_credentialless_storage_nonce(&self.browser_context_runtime)
     }
 
@@ -688,27 +712,66 @@ impl JsContextHost {
         handle: DomHandle,
         bootstrap: &ChildBrowsingContextBootstrap,
     ) -> crate::permissions_policy::DocumentPermissionsPolicy {
+        self.child_browsing_context_permissions_policy_for_document(
+            handle,
+            bootstrap,
+            self.child_browsing_context_sandbox_policy_from_owner(handle),
+            &crate::permissions_policy::DocumentPermissionsPolicy::default(),
+        )
+    }
+
+    pub(in crate::native_bridge::context_host) fn child_browsing_context_permissions_policy_for_document(
+        &self,
+        handle: DomHandle,
+        bootstrap: &ChildBrowsingContextBootstrap,
+        sandbox: crate::document_runtime::DocumentSandboxPolicy,
+        response_policy: &crate::permissions_policy::DocumentPermissionsPolicy,
+    ) -> crate::permissions_policy::DocumentPermissionsPolicy {
         let parent_document = self
             .dom_host()
             .node(handle)
             .and_then(crate::dom::native::Node::owner_document)
             .unwrap_or_else(|| self.document_handle());
-        let parent_url = self.document_url_for_handle(parent_document);
+        let parent_origin = self.document_security_origin(parent_document);
         let parent_policy = self
             .document_permissions_policy_for_document_handle(parent_document)
-            .unwrap_or_else(|| self.document_policy_container().permissions_policy);
-        let child_url = Self::child_browsing_context_bootstrap_url(bootstrap)
-            .unwrap_or_else(|| parent_url.clone());
+            .unwrap_or_else(|| self.document_policy_container().permissions_policy.clone());
+        let child_origin = if sandbox.forces_opaque_origin {
+            url::Origin::new_opaque()
+        } else if bootstrap.security_origin_inherited() {
+            parent_origin.clone()
+        } else {
+            Self::child_browsing_context_bootstrap_url(bootstrap)
+                .map_or_else(url::Origin::new_opaque, |url| url.origin())
+        };
+        // The container's 'src' allowlist remains bound to its declared source,
+        // while inheritance and default 'self' use the final Document origin.
+        let source = self
+            .child_browsing_context_bootstrap_for_handle(handle)
+            .unwrap_or_else(|| bootstrap.clone());
+        let source_origin = if self
+            .child_browsing_context_sandbox_policy_from_owner(handle)
+            .forces_opaque_origin
+        {
+            child_origin.clone()
+        } else if source.security_origin_inherited() {
+            parent_origin.clone()
+        } else {
+            Self::child_browsing_context_bootstrap_url(&source)
+                .map_or_else(url::Origin::new_opaque, |url| url.origin())
+        };
         let is_iframe = self.dom_host().is_html_element_named(handle, "iframe");
         let allow = is_iframe
             .then(|| self.dom_host().get_attribute(handle, "allow"))
             .flatten();
-        parent_policy.delegated_to_child(
-            &parent_url,
-            &child_url,
-            bootstrap.security_origin_inherited(),
-            allow.as_deref(),
-        )
+        parent_policy
+            .delegated_to_child(
+                &parent_origin,
+                &child_origin,
+                &source_origin,
+                allow.as_deref(),
+            )
+            .intersect(&response_policy.for_document_origin(&child_origin))
     }
 
     pub(crate) fn child_browsing_context_is_same_origin_with_top(&self, handle: DomHandle) -> bool {
@@ -834,9 +897,9 @@ impl JsContextHost {
     }
 
     pub(crate) fn child_browsing_context_allows_top_navigation(&self, handle: DomHandle) -> bool {
-        self.dom_host()
-            .get_attribute(handle, "sandbox")
-            .is_none_or(|sandbox| sandbox_attribute_allows_top_navigation(&sandbox))
+        self.child_browsing_contexts
+            .get(&handle)
+            .is_some_and(|entry| entry.document_sandbox_policy().allows_top_navigation)
     }
 }
 
@@ -908,6 +971,7 @@ pub(in crate::native_bridge::context_host) fn document_sandbox_policy_from_attri
         forces_opaque_origin: sandbox_attribute_forces_opaque_origin(value),
         allows_scripts: sandbox_attribute_allows_scripts(value),
         allows_modals: sandbox_attribute_allows_modals(value),
+        allows_top_navigation: sandbox_attribute_allows_top_navigation(value),
         allows_popups_to_escape: sandbox_attribute_allows_popups_to_escape(value),
         sandboxes_document_domain: sandbox_attribute_sets_document_domain_flag(value),
     }
@@ -1013,14 +1077,41 @@ mod tests {
     }
 
     #[test]
+    fn iframe_and_response_sandboxes_must_both_allow_top_navigation() {
+        for (attribute, owner_allows) in [
+            (None, true),
+            (Some("allow-scripts"), false),
+            (Some("ALLOW-TOP-NAVIGATION"), true),
+        ] {
+            for (policies, response_allows) in [
+                (vec!["script-src 'self'"], true),
+                (vec!["sandbox allow-scripts"], false),
+                (vec!["sandbox allow-top-navigation"], true),
+                (vec!["sandbox allow-top-navigation", "sandbox"], false),
+            ] {
+                let response = crate::document_runtime::DocumentSandboxPolicy::from_response_content_security_policies(
+                    &policies.iter().map(|policy| (*policy).into()).collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    document_sandbox_policy_from_attribute(attribute)
+                        .with_response_content_security_policy(response)
+                        .allows_top_navigation,
+                    owner_allows && response_allows,
+                    "attribute={attribute:?}, response={policies:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn iframe_and_response_sandboxes_must_both_allow_modals() {
         let response_without_modals =
             crate::document_runtime::DocumentSandboxPolicy::from_response_content_security_policies(
-                &["sandbox allow-scripts".to_owned()],
+                &["sandbox allow-scripts".into()],
             );
         let response_with_modals =
             crate::document_runtime::DocumentSandboxPolicy::from_response_content_security_policies(
-                &["sandbox allow-scripts allow-modals".to_owned()],
+                &["sandbox allow-scripts allow-modals".into()],
             );
 
         assert!(

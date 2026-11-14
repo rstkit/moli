@@ -1,8 +1,22 @@
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use moli_cookie_jar::{StoredCookieQueryReport, StoredCookieSetReport};
 use url::Url;
 
 use crate::{StreamingHtmlResponse, StreamingRawResponse};
+
+/// Fetch's response cache state, retained separately from the legacy
+/// `from_cache` flag so Resource Timing can distinguish a 304 validation from
+/// a response served without a network request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResponseCacheState {
+    #[default]
+    None,
+    Local,
+    Validated,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegotiatedHttpVersion {
@@ -41,13 +55,179 @@ impl NegotiatedHttpVersion {
 pub struct ResponseHead {
     pub final_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    /// The received HTTP status message. `Some("")` is an explicitly empty
+    /// message, including HTTP/2 and HTTP/3 responses. `None` permits synthetic
+    /// responses without a supplied message to use the canonical phrase.
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirected: bool,
     pub redirect_chain: Vec<RedirectInfo>,
     pub from_cache: bool,
+    pub cache_state: crate::ResponseCacheState,
     pub negotiated_http_version: Option<NegotiatedHttpVersion>,
+}
+
+impl ResponseHead {
+    /// Records one response-driven redirect. The caller supplies its source
+    /// and whether this hop has observable network metadata; request/response
+    /// ExtraInfo and the dispatched destination request are attached later by
+    /// their observation owners.
+    pub fn into_redirect(
+        self,
+        to_url: Url,
+        source: RedirectSource,
+        network_extra_info_available: bool,
+    ) -> RedirectInfo {
+        RedirectInfo {
+            source,
+            from_url: self.final_url,
+            to_url,
+            status: self.status,
+            headers: self.headers,
+            network_extra_info_available,
+            request_extra_info: None,
+            dispatched_request: None,
+            response_extra_info: None,
+            redirect_has_extra_info: network_extra_info_available,
+            request_cookie_report: self.request_cookie_report,
+            cookie_set_reports: self.cookie_set_reports,
+            from_cache: self.from_cache,
+            negotiated_http_version: self.negotiated_http_version,
+        }
+    }
+
+    pub fn url_list(&self) -> crate::FetchUrlList<'_> {
+        crate::FetchUrlList::new(&self.final_url, &self.redirect_chain)
+    }
+
+    /// Capture Fetch's response state before CORS/opaque header filtering.
+    /// Consumers of an existing Response must carry this result, not repeat
+    /// these checks against a filtered header list or just the final URL.
+    pub fn fetch_metadata(
+        &self,
+        origin: &moli_url::WebOrigin,
+        mode: crate::RequestMode,
+    ) -> crate::FetchResponseMetadata {
+        crate::FetchResponseMetadata {
+            response_type: self.fetch_response_type(origin, mode),
+            url_list: self.url_list().to_vec(),
+            timing_allow_passed: self.timing_allow_passed(origin),
+            redirected: self.redirected,
+        }
+    }
+
+    pub fn fetch_response_type(
+        &self,
+        origin: &moli_url::WebOrigin,
+        mode: crate::RequestMode,
+    ) -> crate::FetchResponseType {
+        use crate::FetchResponseType;
+        if matches!(self.status, 301 | 302 | 303 | 307 | 308)
+            && self
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("location"))
+        {
+            FetchResponseType::OpaqueRedirect
+        } else if self.final_url.scheme() == "data" || !self.url_list().has_cross_origin_url(origin)
+        {
+            FetchResponseType::Basic
+        } else if mode == crate::RequestMode::NoCors {
+            FetchResponseType::Opaque
+        } else {
+            FetchResponseType::Cors
+        }
+    }
+
+    /// A failed redirect TAO check is sticky, including redirects back to the
+    /// initiating origin. This is independent of CORS response readability.
+    pub fn timing_allow_passed(&self, origin: &moli_url::WebOrigin) -> bool {
+        let mut cross_origin = false;
+        for (index, redirect) in self.redirect_chain.iter().enumerate() {
+            cross_origin |= !origin.same_origin_url(&redirect.from_url);
+            let urls = crate::FetchUrlList::new(&redirect.from_url, &self.redirect_chain[..index]);
+            if cross_origin
+                && !headers_allow_timing(&redirect.headers, &urls.serialized_origin(origin))
+            {
+                return false;
+            }
+        }
+        cross_origin |= !origin.same_origin_url(&self.final_url);
+        !cross_origin
+            || headers_allow_timing(&self.headers, &self.url_list().serialized_origin(origin))
+    }
+    pub fn status_text(&self) -> &str {
+        self.status_text.as_deref().unwrap_or_else(|| {
+            if matches!(
+                self.negotiated_http_version,
+                Some(NegotiatedHttpVersion::Http2 | NegotiatedHttpVersion::Http3)
+            ) {
+                ""
+            } else {
+                http::StatusCode::from_u16(self.status)
+                    .ok()
+                    .and_then(|status| status.canonical_reason())
+                    .unwrap_or("")
+            }
+        })
+    }
+}
+
+fn headers_allow_timing(headers: &[(String, Vec<u8>)], origin: &str) -> bool {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("timing-allow-origin"))
+        .filter_map(|(_, value)| std::str::from_utf8(value).ok())
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim_matches(|ch: char| ch.is_ascii_whitespace()))
+        .any(|value| value == "*" || value == origin)
+}
+
+pub(crate) struct HttpResponseStatusLine {
+    pub status: u16,
+    pub status_text: String,
+    pub version: Option<NegotiatedHttpVersion>,
+}
+
+pub(crate) fn parse_http_response_status_line(data: &[u8]) -> Option<HttpResponseStatusLine> {
+    if !data.starts_with(b"HTTP/") {
+        return None;
+    }
+    let line = data.strip_suffix(b"\n").unwrap_or(data);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let boundary = line.iter().position(u8::is_ascii_whitespace)?;
+    let version = std::str::from_utf8(&line[..boundary])
+        .ok()
+        .and_then(NegotiatedHttpVersion::from_status_line);
+    let rest = line[boundary..].trim_ascii_start();
+    let code_end = rest
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let status = std::str::from_utf8(&rest[..code_end]).ok()?.parse().ok()?;
+    let status_text = if matches!(
+        version,
+        Some(NegotiatedHttpVersion::Http2 | NegotiatedHttpVersion::Http3)
+    ) {
+        String::new()
+    } else {
+        // Status messages are ByteStrings. Preserve obs-text as Latin-1 and
+        // internal whitespace; Chromium only strips surrounding SP bytes.
+        rest[code_end..]
+            .iter()
+            .copied()
+            .map(char::from)
+            .collect::<String>()
+            .trim_matches(' ')
+            .to_owned()
+    };
+    Some(HttpResponseStatusLine {
+        status,
+        status_text,
+        version,
+    })
 }
 
 #[derive(Debug)]
@@ -249,13 +429,15 @@ impl ResponseBody {
 pub struct Response {
     pub final_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     body: ResponseBody,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirected: bool,
     pub redirect_chain: Vec<RedirectInfo>,
     pub from_cache: bool,
+    pub cache_state: crate::ResponseCacheState,
     pub negotiated_http_version: Option<NegotiatedHttpVersion>,
     network_request_extra_info: Option<NetworkRequestExtraInfo>,
 }
@@ -265,6 +447,7 @@ impl Clone for Response {
         Self {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             body: self
                 .body
@@ -275,6 +458,7 @@ impl Clone for Response {
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.clone(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
             network_request_extra_info: self.network_request_extra_info.clone(),
         }
@@ -322,12 +506,14 @@ impl Response {
         ResponseHead {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             request_cookie_report: self.request_cookie_report.clone(),
             cookie_set_reports: self.cookie_set_reports.clone(),
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.clone(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         }
     }
@@ -358,6 +544,7 @@ impl Response {
         Ok(Self {
             final_url: head.final_url,
             status: head.status,
+            status_text: head.status_text,
             headers: head.headers,
             body,
             request_cookie_report: head.request_cookie_report,
@@ -365,6 +552,7 @@ impl Response {
             redirected: head.redirected,
             redirect_chain: head.redirect_chain,
             from_cache: head.from_cache,
+            cache_state: head.cache_state,
             negotiated_http_version: head.negotiated_http_version,
             network_request_extra_info: None,
         })
@@ -375,6 +563,7 @@ impl Response {
         Ok(Self {
             final_url: head.final_url,
             status: head.status,
+            status_text: head.status_text,
             headers: head.headers,
             body,
             request_cookie_report: head.request_cookie_report,
@@ -382,6 +571,7 @@ impl Response {
             redirected: head.redirected,
             redirect_chain: head.redirect_chain,
             from_cache: head.from_cache,
+            cache_state: head.cache_state,
             negotiated_http_version: head.negotiated_http_version,
             network_request_extra_info: None,
         })
@@ -391,12 +581,14 @@ impl Response {
         let head = ResponseHead {
             final_url: self.final_url,
             status: self.status,
+            status_text: self.status_text,
             headers: self.headers,
             request_cookie_report: self.request_cookie_report,
             cookie_set_reports: self.cookie_set_reports,
             redirected: self.redirected,
             redirect_chain: self.redirect_chain,
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         };
         let (body, body_bytes) = self
@@ -413,16 +605,28 @@ impl Response {
         (head, body)
     }
 
+    /// Consumes a materialized response and transfers its exact byte payload
+    /// without retaining the text view or copying UTF-8 text storage.
+    pub fn into_byte_parts(self) -> (ResponseHead, Vec<u8>) {
+        let (head, body) = self.into_body();
+        let bytes = body
+            .try_into_materialized_bytes()
+            .expect("Response body should remain materialized");
+        (head, bytes)
+    }
+
     pub fn into_body(self) -> (ResponseHead, ResponseBody) {
         let head = ResponseHead {
             final_url: self.final_url,
             status: self.status,
+            status_text: self.status_text,
             headers: self.headers,
             request_cookie_report: self.request_cookie_report,
             cookie_set_reports: self.cookie_set_reports,
             redirected: self.redirected,
             redirect_chain: self.redirect_chain,
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         };
         (head, self.body)
@@ -441,13 +645,15 @@ impl Response {
 pub struct RawResponse {
     pub final_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     body: ResponseBody,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirected: bool,
     pub redirect_chain: Vec<RedirectInfo>,
     pub from_cache: bool,
+    pub cache_state: crate::ResponseCacheState,
     pub negotiated_http_version: Option<NegotiatedHttpVersion>,
     network_request_extra_info: Option<NetworkRequestExtraInfo>,
 }
@@ -457,6 +663,7 @@ impl Clone for RawResponse {
         Self {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             body: self
                 .body
@@ -467,6 +674,7 @@ impl Clone for RawResponse {
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.clone(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
             network_request_extra_info: self.network_request_extra_info.clone(),
         }
@@ -508,12 +716,14 @@ impl RawResponse {
         ResponseHead {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             request_cookie_report: self.request_cookie_report.clone(),
             cookie_set_reports: self.cookie_set_reports.clone(),
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.clone(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         }
     }
@@ -530,6 +740,7 @@ impl RawResponse {
         Ok(Self {
             final_url: head.final_url,
             status: head.status,
+            status_text: head.status_text,
             headers: head.headers,
             body: ResponseBody::materialized_bytes(body),
             request_cookie_report: head.request_cookie_report,
@@ -537,6 +748,7 @@ impl RawResponse {
             redirected: head.redirected,
             redirect_chain: head.redirect_chain,
             from_cache: head.from_cache,
+            cache_state: head.cache_state,
             negotiated_http_version: head.negotiated_http_version,
             network_request_extra_info: None,
         })
@@ -547,6 +759,7 @@ impl RawResponse {
         Ok(Self {
             final_url: head.final_url,
             status: head.status,
+            status_text: head.status_text,
             headers: head.headers,
             body: ResponseBody::materialized_bytes(body),
             request_cookie_report: head.request_cookie_report,
@@ -554,6 +767,7 @@ impl RawResponse {
             redirected: head.redirected,
             redirect_chain: head.redirect_chain,
             from_cache: head.from_cache,
+            cache_state: head.cache_state,
             negotiated_http_version: head.negotiated_http_version,
             network_request_extra_info: None,
         })
@@ -563,12 +777,14 @@ impl RawResponse {
         let head = ResponseHead {
             final_url: self.final_url,
             status: self.status,
+            status_text: self.status_text,
             headers: self.headers,
             request_cookie_report: self.request_cookie_report,
             cookie_set_reports: self.cookie_set_reports,
             redirected: self.redirected,
             redirect_chain: self.redirect_chain,
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         };
         (head, self.body)
@@ -593,26 +809,64 @@ pub struct NetworkRequestExtraInfo {
     pub cookie_report: StoredCookieQueryReport,
 }
 
+/// One effective request accepted by a fetch destination. Independent of HTTP
+/// ExtraInfo: cache and service-worker destinations also have request metadata.
+/// Redirect records share this snapshot and its immutable upload bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchedRequest {
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<bytes::Bytes>,
+    /// Serializer-provided protocol view, shared independently of upload bytes.
+    pub body_text: Option<Arc<str>>,
+}
+
+impl DispatchedRequest {
+    pub fn body_text(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.body.as_deref().map(|body| {
+            self.body_text
+                .as_deref()
+                .map_or_else(|| String::from_utf8_lossy(body), std::borrow::Cow::Borrowed)
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkResponseExtraInfo {
     pub request_extra_info: NetworkRequestExtraInfo,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
+}
+
+/// The producer of a redirect response, independent of cache and network
+/// observation metadata. Only network responses are subject to a CORS check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectSource {
+    /// An HTTP response, including one reused from the HTTP cache.
+    Network,
+    /// A response returned by a service worker's FetchEvent.respondWith().
+    ServiceWorker,
+    /// A browser-generated redirect such as an HTTPS upgrade or client hint retry.
+    Internal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirectInfo {
+    pub source: RedirectSource,
     pub from_url: Url,
     pub to_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Vec<u8>)>,
     /// Whether this redirect came from an observable HTTP response header block.
     ///
     /// Cached and browser-internal redirects do not have Network ExtraInfo even
     /// though they still participate in the public redirect chain.
     pub network_extra_info_available: bool,
     pub request_extra_info: Option<NetworkRequestExtraInfo>,
+    /// The request to `to_url`, captured after redirect/interception changes.
+    /// None until a destination accepts this hop; HTTP observations are separate.
+    pub dispatched_request: Option<Arc<DispatchedRequest>>,
     pub response_extra_info: Option<NetworkResponseExtraInfo>,
     pub redirect_has_extra_info: bool,
     pub request_cookie_report: Option<StoredCookieQueryReport>,

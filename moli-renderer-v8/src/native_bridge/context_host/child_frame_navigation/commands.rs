@@ -1,11 +1,11 @@
 use super::super::{
-    ChildBrowsingContextBootstrap, ChildBrowsingContextNavigationRequest, JsContextHost,
-    NavigationHistoryEntrySeed,
+    ChildBrowsingContextBootstrap, ChildBrowsingContextNavigationRequest,
+    NavigationHistoryEntrySeed, PageScriptHost,
 };
 use crate::document_runtime::DomHandle;
 use url::Url;
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn navigate_child_browsing_context_to_url(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
@@ -22,8 +22,13 @@ impl JsContextHost {
             handle,
             "The navigation was canceled.".to_owned(),
         );
+        let replace_initial_empty_document = self.child_current_document_is_initial_empty(handle);
         if let Some(entry) = self.child_browsing_contexts.get_mut(&handle) {
-            entry.apply_navigation_to_entry_seed(&url);
+            if replace_initial_empty_document {
+                entry.replace_navigation_in_entry_seed(&url);
+            } else {
+                entry.apply_navigation_to_entry_seed(&url);
+            }
         }
         self.sync_existing_child_browsing_context_runtime_surface_from_seed(scope, handle);
         self.queue_child_browsing_context_navigation_to_url(handle, &url)
@@ -38,8 +43,13 @@ impl JsContextHost {
         if !self.child_browsing_contexts.contains_key(&handle) {
             return false;
         }
+        let replace_initial_empty_document = self.child_current_document_is_initial_empty(handle);
         if let Some(entry) = self.child_browsing_contexts.get_mut(&handle) {
-            entry.apply_navigation_to_entry_seed(&request.url);
+            if replace_initial_empty_document {
+                entry.replace_navigation_in_entry_seed(&request.url);
+            } else {
+                entry.apply_navigation_to_entry_seed(&request.url);
+            }
         }
         self.sync_existing_child_browsing_context_runtime_surface_from_seed(scope, handle);
         self.queue_child_browsing_context_navigation_request(handle, request)
@@ -94,7 +104,7 @@ impl JsContextHost {
             return false;
         };
         if let Some(entry) = self.child_browsing_contexts.get_mut(&handle) {
-            entry.replace_navigation_entry_seed_and_clear_pending_history_increment(entry_seed);
+            entry.replace_navigation_entry_seed(entry_seed);
         }
         if self
             .set_child_browsing_context_pending_navigation(
@@ -107,6 +117,25 @@ impl JsContextHost {
             return false;
         }
         self.queue_child_browsing_context_navigation_commit(handle)
+    }
+
+    pub(crate) fn cancel_joint_child_history_navigation(
+        &mut self,
+        handle: DomHandle,
+        step: moli_session_history::SessionHistoryStepId,
+    ) {
+        if self
+            .child_browsing_contexts
+            .get(&handle)
+            .is_some_and(|entry| {
+                entry.navigation_entry_seed().session_history.target_step == Some(step)
+            })
+        {
+            self.clear_child_browsing_context_pending_navigation(handle);
+            if let Some(entry) = self.child_browsing_contexts.get_mut(&handle) {
+                entry.restore_navigation_entry_seed_from_committed();
+            }
+        }
     }
 
     pub(crate) fn queue_deferred_child_browsing_context_navigation_to_url(
@@ -162,15 +191,6 @@ impl JsContextHost {
             return false;
         }
         self.queue_child_browsing_context_navigation_commit(handle)
-    }
-
-    pub(crate) fn mark_child_browsing_context_top_level_history_increment(
-        &mut self,
-        handle: DomHandle,
-    ) {
-        if let Some(entry) = self.child_browsing_contexts.get_mut(&handle) {
-            entry.mark_pending_top_level_history_length_increment();
-        }
     }
 
     pub(crate) fn queue_child_browsing_context_reload_from_existing_seed(

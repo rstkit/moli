@@ -1,4 +1,4 @@
-use super::JsContextHost;
+use super::PageScriptHost;
 use crate::page_task_queue::RendererTopLevelNavigationHandoff;
 use crate::runtime::{
     RendererBrowserContextRuntime, RendererDocumentLifecycleIdentity,
@@ -7,7 +7,7 @@ use crate::runtime::{
 };
 use crate::service_worker_runtime::{ServiceWorkerClientId, ServiceWorkerClientNavigateError};
 use moli_fetch::BrowserNavigationRequestKind;
-use moli_page_types::{NavigationHistoryEntrySeed, SameDocumentHistoryUpdate};
+use moli_page_types::NavigationHistoryEntrySeed;
 use url::Url;
 
 pub(crate) struct PendingReservedServiceWorkerClient {
@@ -60,13 +60,17 @@ pub(crate) struct PendingLocationNavigation {
     /// form POST callers retain raw bytes and their generated Content-Type.
     pub(crate) url: Url,
     pub(crate) request_method: String,
-    pub(crate) request_body: Option<Vec<u8>>,
+    pub(crate) request_body: Option<bytes::Bytes>,
     pub(crate) request_headers: Vec<(String, String)>,
     pub(crate) browser_navigation_kind: BrowserNavigationRequestKind,
+    pub(crate) navigation_initiator: Option<crate::runtime::RendererNavigationInitiator>,
+    pub(crate) initial_document_environment:
+        Option<crate::runtime::RendererCapturedDocumentEnvironment>,
     pub(crate) entry_seed: Option<NavigationHistoryEntrySeed>,
     pub(crate) reserved_service_worker_client: Option<PendingReservedServiceWorkerClient>,
     pub(crate) service_worker_client_navigate:
         Option<crate::types::ServiceWorkerClientNavigateContinuation>,
+    pub(crate) web_mcp_invocation: Option<moli_page_types::RendererWebMcpNavigation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +95,26 @@ pub(crate) enum PendingTopLevelNavigation {
     HistoryTraversal(RendererPendingTopLevelHistoryTraversal),
 }
 
-impl JsContextHost {
+impl PageScriptHost {
+    pub(crate) fn record_session_history_update(
+        &mut self,
+        update: moli_page_types::SessionHistoryUpdate,
+    ) {
+        let Some(source_document) = self
+            .root_document_lifecycle
+            .as_ref()
+            .map(RendererDocumentLifecycleJournalHandle::identity)
+        else {
+            return;
+        };
+        self.append_live_turn_owner_action(
+            crate::runtime::RendererOwnerAction::SessionHistoryUpdate {
+                source_document,
+                update,
+            },
+        );
+    }
+
     /// Replace the dynamically scoped Runtime command cause and return the
     /// previous scope for exact restoration after V8 dispatch.
     ///
@@ -141,7 +164,7 @@ impl JsContextHost {
         &mut self,
         url: Url,
         request_method: String,
-        request_body: Option<Vec<u8>>,
+        request_body: Option<bytes::Bytes>,
         request_headers: Vec<(String, String)>,
         entry_seed: Option<NavigationHistoryEntrySeed>,
         browser_navigation_kind: BrowserNavigationRequestKind,
@@ -163,9 +186,12 @@ impl JsContextHost {
                 request_body,
                 request_headers,
                 browser_navigation_kind,
+                navigation_initiator: None,
+                initial_document_environment: None,
                 entry_seed,
                 reserved_service_worker_client,
                 service_worker_client_navigate: None,
+                web_mcp_invocation: None,
             },
         )));
         self.handoff_ordinary_page_turn_navigation(handoff);
@@ -193,12 +219,28 @@ impl JsContextHost {
                 request_body: None,
                 request_headers: Vec::new(),
                 browser_navigation_kind: BrowserNavigationRequestKind::Navigate,
+                navigation_initiator: None,
+                initial_document_environment: None,
                 entry_seed: None,
                 reserved_service_worker_client,
                 service_worker_client_navigate: Some(continuation),
+                web_mcp_invocation: None,
             },
         )));
         self.handoff_ordinary_page_turn_navigation(handoff);
+    }
+
+    pub(crate) fn set_pending_location_navigation_source(
+        &mut self,
+        initiator: crate::runtime::RendererNavigationInitiator,
+        environment: Option<crate::runtime::RendererCapturedDocumentEnvironment>,
+    ) {
+        if let Some(PendingTopLevelNavigation::Location(pending)) =
+            self.pending_top_level_navigation.as_mut()
+        {
+            pending.navigation_initiator = Some(initiator);
+            pending.initial_document_environment = environment;
+        }
     }
 
     pub(crate) fn has_pending_location_navigation(&self) -> bool {
@@ -206,6 +248,32 @@ impl JsContextHost {
             self.pending_top_level_navigation.as_ref(),
             Some(PendingTopLevelNavigation::Location(_))
         )
+    }
+
+    pub(crate) fn bind_pending_web_mcp_navigation(
+        &mut self,
+        id: moli_page_types::RendererWebMcpNavigation,
+    ) -> bool {
+        let Some(PendingTopLevelNavigation::Location(pending)) =
+            self.pending_top_level_navigation.as_mut()
+        else {
+            return false;
+        };
+        if pending.kind() != PendingLocationNavigationKind::Document {
+            return false;
+        }
+        pending.web_mcp_invocation = Some(id);
+        true
+    }
+
+    pub(crate) fn pending_location_navigation_source_document(
+        &self,
+    ) -> Option<crate::runtime::RendererDocumentLifecycleIdentity> {
+        match self.pending_top_level_navigation.as_ref()? {
+            PendingTopLevelNavigation::Location(pending) => pending.source_document,
+            #[cfg(test)]
+            PendingTopLevelNavigation::HistoryTraversal(_) => None,
+        }
     }
 
     pub(crate) fn pending_location_navigation_kind(&self) -> Option<PendingLocationNavigationKind> {
@@ -307,6 +375,9 @@ impl JsContextHost {
             return;
         };
         let pending = *pending;
+        if let Some(id) = pending.web_mcp_invocation {
+            crate::context_bootstrap::web_mcp::fail_navigation(self, id);
+        }
         let Some(continuation) = pending.service_worker_client_navigate else {
             return;
         };
@@ -337,12 +408,7 @@ impl JsContextHost {
             })
     }
 
-    pub(crate) fn record_same_document_navigation(
-        &mut self,
-        url: &Url,
-        navigation_type: &str,
-        history_update: SameDocumentHistoryUpdate,
-    ) {
+    pub(crate) fn record_same_document_navigation(&mut self, url: &Url, navigation_type: &str) {
         let Some(source_document) = self
             .root_document_lifecycle
             .as_ref()
@@ -364,7 +430,6 @@ impl JsContextHost {
             crate::runtime::RendererPendingSameDocumentNavigation {
                 url: url.to_string(),
                 navigation_type: navigation_type.to_owned(),
-                history_update,
             },
         );
         if !self.append_live_turn_owner_action(

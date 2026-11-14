@@ -5,65 +5,114 @@ use std::{fmt::Debug, hash::Hash, sync::Arc};
 use taffy::Size;
 
 use crate::{
-    LayoutAnonymousReason, LayoutBoxId, LayoutBoxKind, LayoutDisplay, LayoutElementCategory,
-    LayoutElementSemantics, LayoutError, LayoutFormControlKind, LayoutInputControlKind,
-    LayoutWorld, ResolvedLayoutStyle, replaced::ReplacedContext,
+    LayoutAnonymousReason, LayoutAnonymousStyleContext, LayoutBoxId, LayoutBoxKind, LayoutDisplay,
+    LayoutElementCategory, LayoutElementSemantics, LayoutError, LayoutFormControlKind,
+    LayoutInputControlKind, LayoutStyleResolver, LayoutWorld, ResolvedLayoutStyle,
+    replaced::ReplacedContext,
 };
 
-pub(crate) fn prepare_form_controls<N>(world: &mut LayoutWorld<N>) -> Result<(), LayoutError>
+pub(crate) fn prepare_form_controls<N, R>(
+    world: &mut LayoutWorld<N>,
+    styles: &mut R,
+) -> Result<(), LayoutError>
 where
     N: Copy + Debug + Eq + Hash,
+    R: LayoutStyleResolver<N>,
 {
     let controls = (0..world.boxes.len())
         .map(LayoutBoxId::from_index)
         .filter_map(|id| {
-            form_control_text(&world.boxes[id.index()].element_semantics).map(|text| (id, text))
+            form_control_texts(&world.boxes[id.index()].element_semantics)
+                .map(|(texts, placeholder)| (id, texts, placeholder))
         })
-        .filter(|(_, text)| !text.is_empty())
+        .filter(|(id, texts, _)| {
+            !texts.is_empty() || world.boxes[id.index()].text_selection.is_some()
+        })
         .collect::<Vec<_>>();
-    for (control, text) in controls {
+    for (control, mut texts, placeholder) in controls {
         let Some(owner) = world.boxes[control.index()].source else {
             continue;
         };
+        if world.boxes[control.index()]
+            .element_semantics
+            .as_ref()
+            .is_some_and(LayoutElementSemantics::is_select_listbox)
+        {
+            world.boxes[control.index()]
+                .style
+                .clip_form_control_contents();
+        }
         let owner_label = world.boxes[control.index()].source_label.clone();
-        let wrapper_style = ResolvedLayoutStyle::anonymous_from(
-            &world.boxes[control.index()].style,
+        let placeholder_style = if placeholder {
+            styles.placeholder_style(owner)?.map(|style| {
+                let mut style = style.into_style();
+                style.force_layout_display(LayoutDisplay::Block);
+                style
+            })
+        } else {
+            None
+        };
+        let editor_style = styles.anonymous_style(
+            LayoutAnonymousStyleContext::from_parent(&world.boxes[control.index()])
+                .expect("form control has a source owner"),
             LayoutDisplay::Block,
-        );
-        let text_style = ResolvedLayoutStyle::text_leaf_from(&wrapper_style);
-        let mut wrapper = LayoutWorld::new_box(
-            None,
-            Some(owner),
-            None,
-            format!("form-content({owner_label})"),
-            Some(owner_label.clone()),
-            None,
-            Some(LayoutAnonymousReason::FormControlContent),
-            LayoutBoxKind::AnonymousBlock,
-            wrapper_style,
-            None,
-        );
-        wrapper.inline_formatting_context = true;
-        let wrapper_id = world.allocate(wrapper);
-        let text_id = world.allocate(LayoutWorld::new_box(
-            None,
-            Some(owner),
-            None,
-            format!("form-content({owner_label})::text"),
-            Some(owner_label),
-            None,
-            Some(LayoutAnonymousReason::FormControlContent),
-            LayoutBoxKind::Text,
-            text_style,
-            Some(Arc::from(text)),
-        ));
-        world.append_synthesized_child(wrapper_id, text_id)?;
-        world.append_synthesized_child(control, wrapper_id)?;
+        )?;
+        let selection = world.boxes[control.index()].text_selection;
+        if texts.is_empty() && selection.is_some() {
+            texts.push(Arc::from(""));
+        }
+        // Blink keeps the placeholder and inner editor as siblings. The
+        // placeholder precedes the empty editor, which retains its own
+        // font metrics and selection outside the placeholder's effect layers.
+        // Both remain descendants of the control's effects and clipping.
+        let contents = texts
+            .into_iter()
+            .map(|text| (text, placeholder))
+            .chain(placeholder.then(|| (Arc::from(""), false)));
+        for (row, (text, is_placeholder)) in contents.enumerate() {
+            let wrapper_style = if is_placeholder {
+                placeholder_style.as_ref().unwrap_or(&editor_style)
+            } else {
+                &editor_style
+            };
+            let text_style = ResolvedLayoutStyle::text_leaf_from(wrapper_style);
+            let selection = if is_placeholder { None } else { selection };
+            let mut wrapper = LayoutWorld::new_box(
+                None,
+                Some(owner),
+                None,
+                format!("form-content({owner_label})[{row}]"),
+                Some(owner_label.clone()),
+                None,
+                Some(LayoutAnonymousReason::FormControlContent),
+                LayoutBoxKind::AnonymousBlock,
+                wrapper_style.clone(),
+                None,
+            );
+            wrapper.inline_formatting_context = true;
+            wrapper.text_selection = selection;
+            let wrapper_id = world.allocate(wrapper);
+            let text_id = world.allocate(LayoutWorld::new_box(
+                None,
+                Some(owner),
+                None,
+                format!("form-content({owner_label})[{row}]::text"),
+                Some(owner_label.clone()),
+                None,
+                Some(LayoutAnonymousReason::FormControlContent),
+                LayoutBoxKind::Text,
+                text_style.clone(),
+                Some(text),
+            ));
+            world.boxes[text_id.index()].text_selection = selection;
+            world.append_synthesized_child(wrapper_id, text_id)?;
+            world.append_synthesized_child(control, wrapper_id)?;
+        }
     }
     Ok(())
 }
 
-fn form_control_text(semantics: &Option<LayoutElementSemantics>) -> Option<String> {
+fn form_control_texts(semantics: &Option<LayoutElementSemantics>) -> Option<(Vec<Arc<str>>, bool)> {
     let semantics = semantics.as_ref()?;
     let LayoutElementCategory::FormControl(kind) = semantics.category else {
         return None;
@@ -77,28 +126,82 @@ fn form_control_text(semantics: &Option<LayoutElementSemantics>) -> Option<Strin
         .as_ref()
         .cloned()
         .unwrap_or_default();
+    if kind == LayoutFormControlKind::Select {
+        return Some((select_control_texts(&data), false));
+    }
+    let (text, placeholder) = form_control_text(kind, &data.value, &data.placeholder);
+    Some((
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![text.into()]
+        },
+        placeholder,
+    ))
+}
+
+/// Text rows actually displayed by a select, independently of option DOM text.
+pub fn select_control_texts(data: &crate::LayoutFormControlData) -> Vec<Arc<str>> {
+    if data.select_rows() > 1 {
+        data.option_labels.clone()
+    } else {
+        let (text, _) = form_control_text(
+            LayoutFormControlKind::Select,
+            &data.value,
+            &data.placeholder,
+        );
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![text.into()]
+        }
+    }
+}
+
+/// Visible text and placeholder selection shared by resource discovery and
+/// control rendering. This projection performs no layout or font loading.
+pub fn form_control_text(
+    kind: LayoutFormControlKind,
+    value: &str,
+    placeholder_text: &str,
+) -> (String, bool) {
+    let placeholder = value.is_empty()
+        && !placeholder_text.is_empty()
+        && matches!(
+            kind,
+            LayoutFormControlKind::TextArea
+                | LayoutFormControlKind::Input(
+                    LayoutInputControlKind::Text
+                        | LayoutInputControlKind::Search
+                        | LayoutInputControlKind::Email
+                        | LayoutInputControlKind::Telephone
+                        | LayoutInputControlKind::Password
+                        | LayoutInputControlKind::Url
+                        | LayoutInputControlKind::Number
+                )
+        );
     let text = match kind {
         LayoutFormControlKind::Input(input) => match input {
-            LayoutInputControlKind::Button => data.value.to_string(),
+            LayoutInputControlKind::Button => value.to_string(),
             LayoutInputControlKind::Reset => {
-                if data.value.is_empty() {
+                if value.is_empty() {
                     "Reset".to_owned()
                 } else {
-                    data.value.to_string()
+                    value.to_string()
                 }
             }
             LayoutInputControlKind::Submit => {
-                if data.value.is_empty() {
+                if value.is_empty() {
                     "Submit".to_owned()
                 } else {
-                    data.value.to_string()
+                    value.to_string()
                 }
             }
             LayoutInputControlKind::File => {
-                if data.value.is_empty() {
+                if value.is_empty() {
                     "Choose File".to_owned()
                 } else {
-                    data.value.to_string()
+                    value.to_string()
                 }
             }
             LayoutInputControlKind::Checkbox
@@ -119,18 +222,18 @@ fn form_control_text(semantics: &Option<LayoutElementSemantics>) -> Option<Strin
             | LayoutInputControlKind::Time
             | LayoutInputControlKind::Url
             | LayoutInputControlKind::Week => {
-                if data.value.is_empty() {
-                    data.placeholder.to_string()
+                if value.is_empty() {
+                    placeholder_text.to_string()
                 } else {
-                    data.value.to_string()
+                    value.to_string()
                 }
             }
         },
         LayoutFormControlKind::TextArea | LayoutFormControlKind::Select => {
-            if data.value.is_empty() {
-                data.placeholder.to_string()
+            if value.is_empty() {
+                placeholder_text.to_string()
             } else {
-                data.value.to_string()
+                value.to_string()
             }
         }
         LayoutFormControlKind::Button
@@ -142,7 +245,11 @@ fn form_control_text(semantics: &Option<LayoutElementSemantics>) -> Option<Strin
         | LayoutFormControlKind::Progress
         | LayoutFormControlKind::Meter => String::new(),
     };
-    Some(text)
+    (text, placeholder)
+}
+
+pub(crate) fn select_row_height(font_size: f32, line_height: f32) -> f32 {
+    line_height.max(font_size) + 5.0
 }
 
 pub(crate) fn form_control_context(
@@ -229,11 +336,8 @@ pub(crate) fn form_control_context(
             height: f32::from(data.rows) * line_height.max(font_size),
         },
         LayoutFormControlKind::Select => {
-            let rows = data
-                .size
-                .unwrap_or(if data.multiple { 4 } else { 1 })
-                .max(1);
-            let listbox = data.multiple || rows > 1;
+            let rows = data.select_rows();
+            let listbox = rows > 1;
             let characters = data
                 .maximum_option_characters
                 .max(u16::try_from(data.value.chars().count()).unwrap_or(u16::MAX))
@@ -241,7 +345,11 @@ pub(crate) fn form_control_context(
             Size {
                 width: text_width(usize::from(characters)) + if listbox { 4.0 } else { 18.0 },
                 height: f32::from(rows)
-                    * (line_height.max(font_size) + if listbox { 5.0 } else { 0.0 }),
+                    * if listbox {
+                        select_row_height(font_size, line_height)
+                    } else {
+                        single_line_height
+                    },
             }
         }
         LayoutFormControlKind::Progress | LayoutFormControlKind::Meter => Size {

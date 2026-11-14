@@ -1,7 +1,12 @@
 use super::Attribute;
-use crate::forms::{input_type_has_value_sanitization, sanitize_input_value_for_type};
+use crate::forms::{
+    InputValueSanitizationContext, input_type_has_value_sanitization,
+    sanitize_input_value_for_type_with_context,
+};
+use crate::native::NativeNodeId;
 use indexmap::IndexSet;
 use moli_html_input_type::InputType;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectedFile {
@@ -124,6 +129,11 @@ impl ScriptElementState {
 }
 
 #[derive(Debug, Clone, Default)]
+struct ExplicitElementReferenceState {
+    references_by_attribute: HashMap<String, Vec<NativeNodeId>>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct ElementControlState {
     input_value: Option<String>,
     input_value_dirty: bool,
@@ -140,12 +150,14 @@ pub struct ElementControlState {
     select_explicit_none: bool,
     indeterminate: bool,
     script: Option<Box<ScriptElementState>>,
+    style_children_parsing: bool,
     link_created_by_parser: bool,
     link_explicitly_enabled: bool,
     selection_start: Option<u32>,
     selection_end: Option<u32>,
     selection_direction: Option<SelectionDirection>,
     media_paused: Option<bool>,
+    media_audio_source_created: bool,
     media_volume: Option<f64>,
     media_muted: Option<bool>,
     media_seeking: Option<bool>,
@@ -161,12 +173,59 @@ pub struct ElementControlState {
     scroll_left: Option<f64>,
     custom_validation_message: String,
     popover_open: bool,
+    web_mcp_form_active: bool,
+    web_mcp_submit_active: bool,
     dialog_modal: bool,
+    dialog_modal_generation: u64,
     dialog_return_value: String,
     custom_states: IndexSet<String>,
+    explicit_element_references: Option<Box<ExplicitElementReferenceState>>,
 }
 
 impl ElementControlState {
+    pub fn web_mcp_form_active(&self) -> bool {
+        self.web_mcp_form_active
+    }
+
+    pub fn web_mcp_submit_active(&self) -> bool {
+        self.web_mcp_submit_active
+    }
+
+    pub fn set_web_mcp_activity(&mut self, form: bool, submit: bool) -> bool {
+        let changed = self.web_mcp_form_active != form || self.web_mcp_submit_active != submit;
+        self.web_mcp_form_active = form;
+        self.web_mcp_submit_active = submit;
+        changed
+    }
+    pub fn explicit_element_references(&self, attribute: &str) -> Option<&[NativeNodeId]> {
+        self.explicit_element_references
+            .as_deref()?
+            .references_by_attribute
+            .get(attribute)
+            .map(Vec::as_slice)
+    }
+
+    pub fn set_explicit_element_references(
+        &mut self,
+        attribute: &str,
+        references: Vec<NativeNodeId>,
+    ) {
+        self.explicit_element_references
+            .get_or_insert_with(Default::default)
+            .references_by_attribute
+            .insert(attribute.to_owned(), references);
+    }
+
+    pub fn clear_explicit_element_references(&mut self, attribute: &str) {
+        let Some(references) = self.explicit_element_references.as_mut() else {
+            return;
+        };
+        references.references_by_attribute.remove(attribute);
+        if references.references_by_attribute.is_empty() {
+            self.explicit_element_references = None;
+        }
+    }
+
     pub fn from_element_parts(
         namespace: &str,
         local_name: &str,
@@ -208,9 +267,16 @@ impl ElementControlState {
 
         if local_name == "input" {
             let input_type = InputType::from_attribute_value(attribute("type"));
-            state.input_value = Some(sanitize_input_value_for_type(
+            state.input_value = Some(sanitize_input_value_for_type_with_context(
                 input_type,
                 attribute("value").unwrap_or_default(),
+                InputValueSanitizationContext {
+                    multiple: attribute("multiple").is_some(),
+                    min: attribute("min"),
+                    max: attribute("max"),
+                    step: attribute("step"),
+                    value_attribute: attribute("value"),
+                },
             ));
             state.checked = Some(attribute("checked").is_some());
             state.selection_start = Some(0);
@@ -225,7 +291,9 @@ impl ElementControlState {
         } else if local_name == "audio" || local_name == "video" {
             state.media_paused = Some(true);
             state.media_volume = Some(1.0);
-            state.media_muted = Some(false);
+            // None is the default muted state: the content attribute applies
+            // until the IDL setter records an explicit boolean preference.
+            state.media_muted = None;
             state.media_seeking = Some(false);
             state.media_playback_rate = Some(1.0);
             state.media_current_time = Some(0.0);
@@ -344,6 +412,14 @@ impl ElementControlState {
         self.media_paused
     }
 
+    pub fn media_audio_source_created(&self) -> bool {
+        self.media_audio_source_created
+    }
+
+    pub fn mark_media_audio_source_created(&mut self) {
+        self.media_audio_source_created = true;
+    }
+
     pub fn media_volume(&self) -> Option<f64> {
         self.media_volume
     }
@@ -406,6 +482,14 @@ impl ElementControlState {
 
     pub fn dialog_modal(&self) -> bool {
         self.dialog_modal
+    }
+
+    pub fn dialog_modal_generation(&self) -> u64 {
+        self.dialog_modal_generation
+    }
+
+    pub(super) fn invalidate_dialog_modal_opening(&mut self) {
+        self.dialog_modal_generation = self.dialog_modal_generation.wrapping_add(1);
     }
 
     pub fn dialog_return_value(&self) -> &str {
@@ -584,12 +668,24 @@ impl ElementControlState {
             .is_some_and(ScriptElementState::note_parser_created)
     }
 
-    pub fn note_parser_created_link(&mut self) -> bool {
+    pub fn begin_parsing_link_children(&mut self) -> bool {
         if self.link_created_by_parser {
             return false;
         }
         self.link_created_by_parser = true;
         true
+    }
+
+    pub fn style_children_parsing(&self) -> bool {
+        self.style_children_parsing
+    }
+
+    pub fn begin_parsing_style_children(&mut self) {
+        self.style_children_parsing = true;
+    }
+
+    pub fn finish_parsing_style_children(&mut self) -> bool {
+        std::mem::take(&mut self.style_children_parsing)
     }
 
     pub fn finish_parsing_link_children(&mut self) -> bool {
@@ -792,6 +888,9 @@ impl ElementControlState {
             return false;
         }
         self.dialog_modal = modal;
+        if modal {
+            self.invalidate_dialog_modal_opening();
+        }
         true
     }
 
@@ -824,6 +923,7 @@ impl ElementControlState {
         namespace: &str,
         local_name: &str,
         input_type: InputType,
+        input_context: InputValueSanitizationContext<'_>,
         attribute_name: &str,
         attribute_value: Option<&str>,
     ) {
@@ -836,17 +936,42 @@ impl ElementControlState {
         match (local_name, attribute_name) {
             ("input", "value") => {
                 if !self.input_value_dirty {
-                    self.input_value = Some(sanitize_input_value_for_type(
+                    self.input_value = Some(sanitize_input_value_for_type_with_context(
                         input_type,
                         attribute_value.unwrap_or_default(),
+                        input_context,
                     ));
                 }
             }
             ("input", "type") => {
-                if input_type_has_value_sanitization(input_type) {
+                if input_type_has_value_sanitization(input_type)
+                    || matches!(input_type, InputType::Range | InputType::Email)
+                {
                     let current = self.input_value.as_deref().unwrap_or_default();
-                    self.input_value = Some(sanitize_input_value_for_type(input_type, current));
+                    self.input_value = Some(sanitize_input_value_for_type_with_context(
+                        input_type,
+                        current,
+                        input_context,
+                    ));
                 }
+            }
+            ("input", "multiple") if input_type == InputType::Email => {
+                let current = self.input_value.as_deref().unwrap_or_default();
+                self.input_value = Some(sanitize_input_value_for_type_with_context(
+                    input_type,
+                    current,
+                    input_context,
+                ));
+                self.input_bad_input = false;
+            }
+            ("input", "min" | "max" | "step") if input_type == InputType::Range => {
+                let source = self.input_value.as_deref().unwrap_or_default();
+                self.input_value = Some(sanitize_input_value_for_type_with_context(
+                    input_type,
+                    source,
+                    input_context,
+                ));
+                self.input_bad_input = false;
             }
             ("input", "checked") => {
                 if !self.checked_dirty {

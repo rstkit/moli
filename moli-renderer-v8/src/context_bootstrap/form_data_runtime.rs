@@ -1,4 +1,4 @@
-use super::url_form::{callback_value_string, object_prototype_matches};
+use super::url_form::callback_value_string;
 use super::*;
 
 mod callbacks;
@@ -11,12 +11,19 @@ mod template;
 
 pub(crate) use callbacks::construct_form_data_entries_for_form;
 pub(crate) use multipart_parse::form_data_object_from_multipart_bytes;
-pub(crate) use request_body::{
-    form_data_entries_multipart_body_with_prefix, form_data_request_body,
-};
+pub(crate) use request_body::{form_data_entries_multipart_body, form_data_request_body};
 pub(crate) use serialize::form_data_entries_to_string_pairs;
-pub(in crate::context_bootstrap) use storage::{form_data_entries, form_data_is_object};
+pub(in crate::context_bootstrap) use storage::form_data_is_object;
 pub(super) use template::build_form_data_constructor_template;
+
+pub(super) fn new_world_wrapper<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let constructor =
+        super::exposed_interfaces::ensure_intrinsic_interface_constructor(scope, "FormData")
+            .ok()?;
+    constructor.new_instance(scope, &[])
+}
 
 pub(crate) fn form_data_object_from_entries<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -27,6 +34,22 @@ pub(crate) fn form_data_object_from_entries<'s>(
         .get(scope, v8str(scope, "FormData").into())
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
     let form_data = constructor.new_instance(scope, &[])?;
+    storage::set_form_data_entries(scope, form_data, entries);
+    Some(form_data.into())
+}
+
+pub(crate) fn form_data_object_from_entries_for_window<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    window: v8::Local<'s, v8::Object>,
+    entries: &[(String, v8::Global<v8::Value>)],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let context = super::navigation_window::window_navigation_for_holder(scope, window)
+        .and_then(|navigation| navigation.get_creation_context(scope))
+        .or_else(|| window.get_creation_context(scope))?;
+    let scope = &mut v8::ContextScope::new(scope, context);
+    // Navigation FormData belongs to the target Navigation's relevant realm.
+    // Use its intrinsic constructor even if page code replaced global.FormData.
+    let form_data = new_world_wrapper(scope)?;
     storage::set_form_data_entries(scope, form_data, entries);
     Some(form_data.into())
 }

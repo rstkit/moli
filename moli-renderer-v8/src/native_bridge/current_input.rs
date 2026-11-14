@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use super::JsContextHost;
+use super::PageScriptHost;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InputModifiers(u8);
@@ -35,12 +35,13 @@ impl InputModifiers {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CurrentInputEventKind {
     MouseUp { button: i32 },
+    Mouse,
     EnterKey,
     Other,
 }
 
-/// The navigation-relevant subset of the real platform input currently being
-/// handled. DOM events are deliberately not stored here: synthetic events may
+/// The native default-action context of the real platform input currently
+/// being handled. DOM events are deliberately not stored here: synthetic events may
 /// describe modifiers, but cannot manufacture the corresponding user intent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CurrentInputEvent {
@@ -54,7 +55,7 @@ impl CurrentInputEvent {
             kind: if event_name == "mouseup" {
                 CurrentInputEventKind::MouseUp { button }
             } else {
-                CurrentInputEventKind::Other
+                CurrentInputEventKind::Mouse
             },
             modifiers: InputModifiers::from_bits(modifiers),
         }
@@ -75,14 +76,15 @@ impl CurrentInputEvent {
         let button = match self.kind {
             CurrentInputEventKind::MouseUp { button } => button,
             CurrentInputEventKind::EnterKey => 0,
-            CurrentInputEventKind::Other => return InputNavigationPolicy::Current,
+            CurrentInputEventKind::Mouse | CurrentInputEventKind::Other => {
+                return InputNavigationPolicy::Current;
+            }
         };
         navigation_policy_from_modifiers(button, self.modifiers)
     }
 }
 
-/// Chromium-shaped navigation intent before Moli folds window and tab chrome
-/// into its foreground/background surface model.
+/// Chromium navigation intent from a real platform input event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputNavigationPolicy {
     Current,
@@ -148,14 +150,14 @@ fn navigation_policy_from_modifiers(
 /// nested input dispatch, and unwinding.
 #[must_use = "dropping the scope immediately would discard the current input event"]
 pub(crate) struct CurrentInputEventScope {
-    context_host: Rc<RefCell<JsContextHost>>,
+    context_host: Rc<RefCell<PageScriptHost>>,
     previous: Option<CurrentInputEvent>,
     installed: CurrentInputEvent,
 }
 
 impl CurrentInputEventScope {
     pub(crate) fn enter(
-        context_host: Rc<RefCell<JsContextHost>>,
+        context_host: Rc<RefCell<PageScriptHost>>,
         event: CurrentInputEvent,
     ) -> Self {
         let previous = context_host

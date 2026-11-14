@@ -1,3 +1,5 @@
+use crate::runtime::WorkerInspectorError;
+use anyhow::{Context as _, Result};
 use std::sync::Arc;
 
 use moli_storage_key::MoliStorageKey;
@@ -139,7 +141,7 @@ impl RendererServiceWorkerHost {
         inspector_session_id: Option<String>,
         raw_json: String,
         deferred_response: Option<crate::runtime::RendererRuntimeInspectorResponseSender>,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let dispatched = {
             let state = self.state.lock();
@@ -147,7 +149,7 @@ impl RendererServiceWorkerHost {
                 handle: Some(handle),
             } = &*state
             else {
-                return Err("ServiceWorkerRuntimeUnavailable".to_owned());
+                return Err(WorkerInspectorError::ServiceUnavailable.into());
             };
             handle.dispatch_runtime_protocol_message(
                 inspector_session_id,
@@ -157,11 +159,11 @@ impl RendererServiceWorkerHost {
             )
         };
         if !dispatched {
-            return Err("ServiceWorkerRuntimeUnavailable".to_owned());
+            return Err(WorkerInspectorError::ServiceUnavailable.into());
         }
         response_rx
             .await
-            .map_err(|_| "ServiceWorkerRuntimeUnavailable".to_owned())?
+            .context(WorkerInspectorError::ServiceUnavailable)?
     }
 
     pub(super) async fn dispatch_worker_runtime_protocol_message_with_deferred_response(
@@ -169,7 +171,7 @@ impl RendererServiceWorkerHost {
         inspector_session_id: Option<String>,
         raw_json: String,
         deferred_response: crate::runtime::RendererRuntimeInspectorResponseSender,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         self.dispatch_worker_runtime_protocol_message(
             inspector_session_id,
             raw_json,
@@ -182,7 +184,7 @@ impl RendererServiceWorkerHost {
         &self,
         inspector_session_id: Option<String>,
         raw_json: String,
-    ) -> Result<Vec<RendererRuntimeInspectorMessage>, String> {
+    ) -> Result<Vec<RendererRuntimeInspectorMessage>> {
         self.dispatch_worker_runtime_protocol_message(inspector_session_id, raw_json, None)
             .await
     }
@@ -190,15 +192,15 @@ impl RendererServiceWorkerHost {
     pub(super) fn detach_worker_runtime_inspector_session(
         &self,
         inspector_session_id: Option<String>,
-    ) -> bool {
+    ) -> Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>> {
         let state = self.state.lock();
         let RendererServiceWorkerHostState::Running {
             handle: Some(handle),
         } = &*state
         else {
-            return false;
+            return None;
         };
-        handle.detach_runtime_inspector_session(inspector_session_id)
+        Some(handle.detach_runtime_inspector_session(inspector_session_id))
     }
 
     pub(super) fn run_if_waiting_for_debugger_for_devtools(&self) -> bool {
@@ -964,7 +966,7 @@ fn spawn_service_worker(
 
 fn service_worker_script_policy_context(
     final_url: &url::Url,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> SubresourcePolicyContext {
     SubresourcePolicyContext {
         cross_origin_embedder_policy:
@@ -1001,18 +1003,18 @@ mod tests {
     fn service_worker_script_policy_context_uses_response_headers() {
         let final_url = url::Url::parse("https://worker.test/service-worker.js")
             .expect("valid service worker url");
-        let headers = vec![
+        let headers: Vec<(String, Vec<u8>)> = vec![
             (
                 "Cross-Origin-Embedder-Policy".to_owned(),
-                "require-corp".to_owned(),
+                b"require-corp".to_vec(),
             ),
             (
                 "Cross-Origin-Opener-Policy".to_owned(),
-                "same-origin".to_owned(),
+                b"same-origin".to_vec(),
             ),
             (
                 "Document-Isolation-Policy".to_owned(),
-                "isolate-and-credentialless".to_owned(),
+                b"isolate-and-credentialless".to_vec(),
             ),
         ];
 
@@ -1033,18 +1035,18 @@ mod tests {
     fn service_worker_script_policy_context_requires_trustworthy_url_for_capability() {
         let final_url = url::Url::parse("http://worker.test/service-worker.js")
             .expect("valid service worker url");
-        let headers = vec![
+        let headers: Vec<(String, Vec<u8>)> = vec![
             (
                 "Cross-Origin-Embedder-Policy".to_owned(),
-                "require-corp".to_owned(),
+                b"require-corp".to_vec(),
             ),
             (
                 "Cross-Origin-Opener-Policy".to_owned(),
-                "same-origin".to_owned(),
+                b"same-origin".to_vec(),
             ),
             (
                 "Document-Isolation-Policy".to_owned(),
-                "isolate-and-require-corp".to_owned(),
+                b"isolate-and-require-corp".to_vec(),
             ),
         ];
 

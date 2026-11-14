@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 use crate::native_bridge::node_runtime_and_handle_from_object;
@@ -26,14 +27,14 @@ const KEYFRAME_EFFECT_TARGET_SLOT: &str = "__moliKeyframeEffectTarget";
 const KEYFRAME_EFFECT_KEYFRAMES_SLOT: &str = "__moliKeyframeEffectKeyframes";
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct AnimationPromiseEntryDeclaration {
     #[webapi(slot = ANIMATION_PROMISE_RESOLVE_SLOT, init = "undefined")]
     resolve: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Animation", enumerable)]
+#[webapi(interface = web_api_interfaces::Animation, enumerable)]
 struct AnimationPrototypeMethodsDeclaration {
     #[webapi(
         accessor_property,
@@ -56,7 +57,7 @@ struct AnimationPrototypeMethodsDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Animation")]
+#[webapi(interface = web_api_interfaces::Animation)]
 struct AnimationObjectDeclaration<'s> {
     #[webapi(slot = ANIMATION_ID_SLOT, constructor_default = "")]
     id: &'static str,
@@ -130,7 +131,7 @@ fn animation_id_setter_callback<'s>(
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "KeyframeEffect")]
+#[webapi(interface = web_api_interfaces::KeyframeEffect)]
 struct KeyframeEffectObjectDeclaration<'s> {
     #[webapi(slot = KEYFRAME_EFFECT_TARGET_SLOT)]
     target: v8::Local<'s, v8::Value>,
@@ -139,14 +140,14 @@ struct KeyframeEffectObjectDeclaration<'s> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "KeyframeEffect", enumerable)]
+#[webapi(interface = web_api_interfaces::KeyframeEffect, enumerable)]
 struct KeyframeEffectPrototypeDeclaration {
     #[webapi(method, length = 1, callback = keyframe_effect_set_keyframes_callback)]
     set_keyframes: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Element", enumerable)]
+#[webapi(interface = web_api_interfaces::Element, enumerable, receiver)]
 struct ElementAnimationPrototypeDeclaration {
     #[webapi(method, length = 0, callback = element_animate_callback)]
     animate: (),
@@ -155,7 +156,7 @@ struct ElementAnimationPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct AnimationFinishMicrotaskPayloadDeclaration<'s> {
     #[webapi(slot = ANIMATION_MICROTASK_ANIMATION_SLOT)]
     animation: v8::Local<'s, v8::Object>,
@@ -164,7 +165,7 @@ struct AnimationFinishMicrotaskPayloadDeclaration<'s> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct AnimationPromiseResolverDeclaration<'s> {
     #[webapi(slot = ANIMATION_PROMISE_RESOLVE_SLOT)]
     resolve: v8::Local<'s, v8::Value>,
@@ -274,7 +275,7 @@ fn require_animation_receiver<'s>(
     receiver: v8::Local<'s, v8::Object>,
     member: &str,
 ) -> bool {
-    if get_private_value(scope, receiver, ANIMATION_PLAY_STATE_SLOT).is_some() {
+    if web_api_interfaces::Animation::is_instance(scope, receiver) {
         return true;
     }
     throw_type_error(
@@ -993,17 +994,7 @@ fn bump_animation_finish_token<'s>(
     next
 }
 
-fn private_string<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-    slot: &'static str,
-) -> Option<String> {
-    get_private_value(scope, object, slot).and_then(|value| {
-        value
-            .to_string(scope)
-            .map(|value| value.to_rust_string_lossy(scope))
-    })
-}
+use crate::util::private_string_property as private_string;
 
 fn private_number<'s>(
     scope: &mut v8::PinScope<'s, '_>,

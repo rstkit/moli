@@ -1,15 +1,16 @@
 use super::*;
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::CSSFontFeatureValuesMap)]
 struct CssFontFeatureValuesMapObjectDeclaration<'s> {
     #[webapi(slot = CSS_FONT_FEATURE_VALUES_MAP_BACKING_SLOT)]
     backing: v8::Local<'s, v8::Map>,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSFontFeatureValuesMap", enumerable)]
+#[webapi(interface = web_api_interfaces::CSSFontFeatureValuesMap, enumerable, receiver)]
 struct CssFontFeatureValuesMapPrototypeDeclaration {
     #[webapi(accessor_property, getter = css_font_feature_values_map_size_getter_callback)]
     size: (),
@@ -139,6 +140,11 @@ pub(in crate::context_bootstrap) fn install_css_stylesheet_template_bindings<'s>
                 scope, prototype,
             );
         }
+        "CSSFontPaletteValuesRule" => {
+            font_palette_values::CssFontPaletteValuesRulePrototypeDeclaration::initialize_prototype_template(
+                scope, prototype,
+            );
+        }
         "CSSPropertyRule" => {
             CssPropertyRulePrototypeDeclaration::initialize_prototype_template(scope, prototype);
         }
@@ -185,7 +191,6 @@ pub(crate) fn install_css_rule_list_surface<'s>(
     list: v8::Local<'s, v8::Object>,
 ) {
     CssRuleListDeclaration {
-        brand: (),
         length: css_rule_list_length(scope, list),
     }
     .bind_into(scope, list)

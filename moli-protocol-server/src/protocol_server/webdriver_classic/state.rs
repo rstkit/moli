@@ -7,22 +7,20 @@ use std::{
 };
 
 use axum::extract::ws::WebSocket;
-use moli_cookie_jar::StoredCookie;
 use moli_core::{page::RendererDocumentLifecycleMilestone, runtime::NavigationRuntimeConfig};
 use moli_protocol::{
-    CdpInitialStoragePartition, DevToolsPageResidenceIdentity,
-    devtools_runtime::{
-        DevToolsCommand, DevToolsCommandContext, DevToolsCommandResult, DevToolsDomNodeReference,
+    CdpInitialStoragePartition, DevToolsDocumentResidenceIdentity,
+    automation::{
+        AutomationCommand, AutomationContext, AutomationResult, DevToolsDomNodeReference,
         DevToolsError, DevToolsErrorKind, DevToolsFrameId, DevToolsGetFrameOwnerCommand,
-        DevToolsGetFrameOwnerResult, DevToolsGetFrameTreeCommand, DevToolsProtocol,
-        DevToolsSessionId, DevToolsTargetId, DevToolsTerminateExecutionCommand,
+        DevToolsGetFrameOwnerResult, DevToolsGetFrameTreeCommand, DevToolsSessionId,
+        DevToolsTargetId, DevToolsTerminateExecutionCommand, FrontendProtocol,
     },
 };
 use moli_protocol_webdriver_classic::{
     ClassicActionTick, ClassicDevToolsCommandContext, ClassicElementOriginViewportPoints,
     ClassicError, ClassicErrorCode, ClassicPageLoadStrategy, ClassicSessionRegistry,
     ClassicTimeouts, ClassicUnhandledPromptBehavior, ClassicViewportBounds, ClassicWindowPosition,
-    cdp_node_id_from_classic_element_id, cdp_node_id_from_classic_shadow_root_id,
     perform_actions_ticks_with_state_and_viewport,
     release_actions_commands as build_release_actions_commands,
 };
@@ -30,14 +28,16 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::cdp_scheduler::{
-    CdpScheduler, CdpSchedulerEventReceivers, DevToolsCommandExecution,
-    DevToolsPageCommandExecution, ProtocolAdapterScheduler,
+    AutomationDocumentExecution, AutomationExecution, CdpScheduler, CdpSchedulerEventReceivers,
+    ProtocolAdapterScheduler,
 };
 
 use super::super::webdriver_bidi::{
     BidiSocketActor, BidiSocketActorInput, SharedBidiSessionRegistry,
 };
-use super::super::{CookieProfileCommit, protocol_local_executor::spawn_protocol_local_task};
+use super::super::{
+    instance_shutdown::InstanceConnection, protocol_local_executor::spawn_protocol_local_task,
+};
 
 const CLASSIC_SCRIPT_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -47,6 +47,32 @@ pub(in crate::protocol_server) struct SharedClassicSessionRegistry {
 }
 
 impl SharedClassicSessionRegistry {
+    pub(in crate::protocol_server) async fn shutdown(&self) -> anyhow::Result<()> {
+        let runtimes = {
+            let mut manager = self.inner.lock();
+            let session_ids = manager.runtimes.keys().cloned().collect::<Vec<_>>();
+            session_ids
+                .iter()
+                .filter_map(|id| manager.release_session(id))
+                .collect::<Vec<_>>()
+        };
+        let completions = futures_util::future::join_all(
+            runtimes
+                .into_iter()
+                .map(ClassicSessionRuntimeHandle::shutdown_and_join),
+        )
+        .await;
+        let mut result = Ok(());
+        for completion in completions {
+            if let Err(error) = completion
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+
     pub(super) fn lock(&self) -> parking_lot::MutexGuard<'_, ClassicSessionManager> {
         self.inner.lock()
     }
@@ -55,13 +81,11 @@ impl SharedClassicSessionRegistry {
         self.inner.lock().has_session(session_id)
     }
 
-    pub(in crate::protocol_server) fn file_prompt_handler_for_bidi_script_commands(
+    pub(in crate::protocol_server) fn unhandled_prompt_behavior(
         &self,
         session_id: &str,
-    ) -> Option<&'static str> {
-        self.inner
-            .lock()
-            .file_prompt_handler_for_bidi_script_commands(session_id)
+    ) -> Option<ClassicUnhandledPromptBehavior> {
+        self.inner.lock().unhandled_prompt_behavior(session_id)
     }
 
     pub(in crate::protocol_server) fn runtime_handle(
@@ -76,35 +100,14 @@ impl SharedClassicSessionRegistry {
 pub(super) struct ClassicSessionManager {
     registry: ClassicSessionRegistry,
     runtimes: BTreeMap<String, ClassicSessionRuntimeHandle>,
-    next_element_id: u64,
-    next_shadow_root_id: u64,
-    element_owners: BTreeMap<(String, String), ClassicElementOwner>,
-    element_ids_by_owner: BTreeMap<(String, ClassicElementOwner), String>,
-    shadow_root_owners: BTreeMap<(String, String), ClassicShadowRootOwner>,
     window_positions: BTreeMap<(String, String), ClassicWindowPosition>,
     uploaded_files: BTreeMap<String, Vec<PathBuf>>,
     download_directories: BTreeMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ClassicElementOwner {
-    node_id: u32,
-    reference: ClassicPageBoundDomReference,
-    target_id: String,
-    browsing_context_target_id: String,
-}
-
-#[derive(Debug, Clone)]
-struct ClassicShadowRootOwner {
-    node_id: u32,
-    reference: ClassicPageBoundDomReference,
-    target_id: String,
-    browsing_context_target_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct ClassicPageBoundDomReference {
-    pub(super) page_residence: DevToolsPageResidenceIdentity,
+    pub(super) page_residence: DevToolsDocumentResidenceIdentity,
     pub(super) reference: DevToolsDomNodeReference,
 }
 
@@ -126,13 +129,11 @@ impl ClassicSessionManager {
         self.registry.session_count()
     }
 
-    pub(super) fn file_prompt_handler_for_bidi_script_commands(
+    pub(super) fn unhandled_prompt_behavior(
         &self,
         session_id: &str,
-    ) -> Option<&'static str> {
-        self.registry
-            .unhandled_prompt_behavior(session_id)?
-            .file_prompt_handler_for_bidi_script_commands()
+    ) -> Option<ClassicUnhandledPromptBehavior> {
+        self.registry.unhandled_prompt_behavior(session_id)
     }
 
     pub(super) fn bind_runtime(
@@ -223,140 +224,6 @@ impl ClassicSessionManager {
         self.download_directories.get(session_id).cloned()
     }
 
-    pub(super) fn register_element_reference(
-        &mut self,
-        binding: &ClassicSessionBinding,
-        node_id: u32,
-        reference: ClassicPageBoundDomReference,
-    ) -> String {
-        let owner = ClassicElementOwner {
-            node_id,
-            reference,
-            target_id: binding.target_id.clone(),
-            browsing_context_target_id: binding.browsing_context_target_id().to_owned(),
-        };
-        let owner_key = (binding.session_id.clone(), owner.clone());
-        if let Some(element_id) = self.element_ids_by_owner.get(&owner_key) {
-            return element_id.clone();
-        }
-
-        self.next_element_id += 1;
-        let element_id = format!("moli-node-{node_id}-element-{}", self.next_element_id);
-        self.element_owners
-            .insert((binding.session_id.clone(), element_id.clone()), owner);
-        self.element_ids_by_owner
-            .insert(owner_key, element_id.clone());
-        element_id
-    }
-
-    pub(super) fn register_shadow_root_reference(
-        &mut self,
-        binding: &ClassicSessionBinding,
-        node_id: u32,
-        reference: ClassicPageBoundDomReference,
-    ) -> String {
-        if let Some(((_, shadow_root_id), _)) =
-            self.shadow_root_owners
-                .iter()
-                .find(|((session_id, _), owner)| {
-                    session_id == &binding.session_id
-                        && owner.node_id == node_id
-                        && owner.reference == reference
-                        && owner.target_id == binding.target_id
-                        && owner.browsing_context_target_id == binding.browsing_context_target_id()
-                })
-        {
-            return shadow_root_id.clone();
-        }
-
-        self.next_shadow_root_id += 1;
-        let shadow_root_id = format!("moli-shadow-{node_id}-shadow-{}", self.next_shadow_root_id);
-        self.shadow_root_owners.insert(
-            (binding.session_id.clone(), shadow_root_id.clone()),
-            ClassicShadowRootOwner {
-                node_id,
-                reference,
-                target_id: binding.target_id.clone(),
-                browsing_context_target_id: binding.browsing_context_target_id().to_owned(),
-            },
-        );
-        shadow_root_id
-    }
-
-    pub(super) fn resolve_element_reference(
-        &self,
-        binding: &ClassicSessionBinding,
-        element_id: &str,
-    ) -> Result<ClassicPageBoundDomReference, ClassicError> {
-        Ok(self
-            .resolve_element_owner(binding, element_id)?
-            .reference
-            .clone())
-    }
-
-    fn resolve_element_owner(
-        &self,
-        binding: &ClassicSessionBinding,
-        element_id: &str,
-    ) -> Result<&ClassicElementOwner, ClassicError> {
-        cdp_node_id_from_classic_element_id(element_id)?;
-        let Some(owner) = self
-            .element_owners
-            .get(&(binding.session_id.clone(), element_id.to_owned()))
-        else {
-            return Err(ClassicError::new(
-                ClassicErrorCode::NoSuchElement,
-                "element not found",
-            ));
-        };
-        if owner.target_id != binding.target_id
-            || owner.browsing_context_target_id != binding.browsing_context_target_id()
-        {
-            return Err(ClassicError::new(
-                ClassicErrorCode::NoSuchElement,
-                "element not found in the current browsing context",
-            ));
-        }
-        Ok(owner)
-    }
-
-    pub(super) fn resolve_shadow_root_reference(
-        &self,
-        binding: &ClassicSessionBinding,
-        shadow_root_id: &str,
-    ) -> Result<ClassicPageBoundDomReference, ClassicError> {
-        Ok(self
-            .resolve_shadow_root_owner(binding, shadow_root_id)?
-            .reference
-            .clone())
-    }
-
-    fn resolve_shadow_root_owner(
-        &self,
-        binding: &ClassicSessionBinding,
-        shadow_root_id: &str,
-    ) -> Result<&ClassicShadowRootOwner, ClassicError> {
-        cdp_node_id_from_classic_shadow_root_id(shadow_root_id)?;
-        let Some(owner) = self
-            .shadow_root_owners
-            .get(&(binding.session_id.clone(), shadow_root_id.to_owned()))
-        else {
-            return Err(ClassicError::new(
-                ClassicErrorCode::NoSuchShadowRoot,
-                "shadow root not found",
-            ));
-        };
-        if owner.target_id != binding.target_id
-            || owner.browsing_context_target_id != binding.browsing_context_target_id()
-        {
-            return Err(ClassicError::new(
-                ClassicErrorCode::NoSuchShadowRoot,
-                "shadow root not found",
-            ));
-        }
-        Ok(owner)
-    }
-
     pub(super) fn timeouts(&self, session_id: &str) -> Option<ClassicTimeouts> {
         self.registry.timeouts(session_id)
     }
@@ -392,7 +259,7 @@ impl ClassicSessionManager {
         &mut self,
         session_id: &str,
         context: &ClassicDevToolsCommandContext,
-    ) -> Result<Vec<DevToolsCommand>, ClassicError> {
+    ) -> Result<Vec<AutomationCommand>, ClassicError> {
         let Some(action_state) = self.registry.action_state_mut(session_id) else {
             return Err(ClassicError::new(
                 ClassicErrorCode::InvalidSessionId,
@@ -430,12 +297,6 @@ impl ClassicSessionManager {
         if !self.registry.release_session(session_id) {
             return None;
         }
-        self.element_owners
-            .retain(|(owner_session_id, _), _| owner_session_id != session_id);
-        self.element_ids_by_owner
-            .retain(|(owner_session_id, _), _| owner_session_id != session_id);
-        self.shadow_root_owners
-            .retain(|(owner_session_id, _), _| owner_session_id != session_id);
         self.window_positions
             .retain(|(owner_session_id, _), _| owner_session_id != session_id);
         if let Some(paths) = self.uploaded_files.remove(session_id) {
@@ -473,73 +334,85 @@ impl ClassicSessionBinding {
 #[derive(Debug, Clone)]
 pub(in crate::protocol_server) struct ClassicSessionRuntimeHandle {
     tx: mpsc::UnboundedSender<ClassicSessionRuntimeRequest>,
+    completion: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<()>>>>,
 }
 
 impl ClassicSessionRuntimeHandle {
     pub(super) fn spawn(
-        initial_cookie_snapshot: Vec<StoredCookie>,
         initial_storage_partition: CdpInitialStoragePartition,
         navigation_runtime_config: NavigationRuntimeConfig,
+        instance_connection: InstanceConnection,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let _runtime_finished_rx = spawn_protocol_local_task("classic-session", move || {
-            classic_session_runtime_loop(
-                rx,
-                initial_cookie_snapshot,
-                initial_storage_partition,
-                navigation_runtime_config,
-            )
-        });
-        Self { tx }
+        let runtime_finished_rx =
+            spawn_protocol_local_task("classic-session", move || async move {
+                let _instance_connection = instance_connection;
+                classic_session_runtime_loop(
+                    rx,
+                    initial_storage_partition,
+                    navigation_runtime_config,
+                )
+                .await
+            });
+        Self {
+            tx,
+            completion: Arc::new(tokio::sync::Mutex::new(Some(runtime_finished_rx))),
+        }
     }
 
     pub(super) async fn execute(
         &self,
-        command: DevToolsCommand,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
+        command: AutomationCommand,
+    ) -> Result<AutomationResult, DevToolsError> {
         self.execute_inner(command, None).await
+    }
+
+    pub(super) async fn webdriver_node_reference(
+        &self,
+        context: AutomationContext,
+        shared_id: String,
+        kind: moli_protocol::automation::WebDriverNodeKind,
+    ) -> Result<Option<moli_protocol::WebDriverNodeReference>, DevToolsError> {
+        let (response_tx, response_rx) = oneshot::channel();
+        let closed = || {
+            DevToolsError::new(
+                DevToolsErrorKind::NoSuchSession,
+                "Classic session runtime is closed",
+            )
+        };
+        self.tx
+            .send(ClassicSessionRuntimeRequest::WebDriverNodeReference {
+                context,
+                shared_id,
+                kind,
+                response_tx,
+            })
+            .map_err(|_| closed())?;
+        response_rx.await.map_err(|_| closed())?
     }
 
     pub(super) async fn execute_inner(
         &self,
-        command: DevToolsCommand,
+        command: AutomationCommand,
         timeout: Option<Duration>,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
+    ) -> Result<AutomationResult, DevToolsError> {
         self.execute_with_options(command, timeout, None, false)
             .await
     }
 
     pub(super) async fn execute_with_pending_navigation_wait(
         &self,
-        command: DevToolsCommand,
+        command: AutomationCommand,
         timeout: Option<Duration>,
         pending_navigation_timeout: Option<Duration>,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
+    ) -> Result<AutomationResult, DevToolsError> {
         self.execute_with_options(command, timeout, pending_navigation_timeout, false)
             .await
     }
 
-    pub(super) async fn execute_with_pending_navigation_wait_on_page(
-        &self,
-        command: DevToolsCommand,
-        timeout: Option<Duration>,
-        pending_navigation_timeout: Option<Duration>,
-        expected_page: DevToolsPageResidenceIdentity,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
-        self.execute_request(
-            command,
-            timeout,
-            pending_navigation_timeout,
-            false,
-            Some(expected_page),
-        )
-        .await
-        .result
-    }
-
     pub(super) async fn wait_for_document_lifecycle(
         &self,
-        context: DevToolsCommandContext,
+        context: AutomationContext,
         milestone: RendererDocumentLifecycleMilestone,
         timeout: Option<Duration>,
     ) -> Result<(), DevToolsError> {
@@ -567,11 +440,11 @@ impl ClassicSessionRuntimeHandle {
 
     async fn execute_with_options(
         &self,
-        command: DevToolsCommand,
+        command: AutomationCommand,
         timeout: Option<Duration>,
         pending_navigation_timeout: Option<Duration>,
         terminate_execution_on_timeout: bool,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
+    ) -> Result<AutomationResult, DevToolsError> {
         self.execute_request(
             command,
             timeout,
@@ -585,8 +458,8 @@ impl ClassicSessionRuntimeHandle {
 
     pub(super) async fn execute_with_page_residence(
         &self,
-        command: DevToolsCommand,
-    ) -> Result<(DevToolsCommandResult, DevToolsPageResidenceIdentity), DevToolsError> {
+        command: AutomationCommand,
+    ) -> Result<(AutomationResult, DevToolsDocumentResidenceIdentity), DevToolsError> {
         let execution = self.execute_request(command, None, None, false, None).await;
         let result = execution.result?;
         let page_residence = execution.page_residence.ok_or_else(|| {
@@ -600,9 +473,9 @@ impl ClassicSessionRuntimeHandle {
 
     pub(super) async fn execute_script_with_page_residence(
         &self,
-        command: DevToolsCommand,
+        command: AutomationCommand,
         timeout: Option<Duration>,
-    ) -> Result<(DevToolsCommandResult, DevToolsPageResidenceIdentity), DevToolsError> {
+    ) -> Result<(AutomationResult, DevToolsDocumentResidenceIdentity), DevToolsError> {
         let execution = self
             .execute_request(command, timeout, None, true, None)
             .await;
@@ -618,9 +491,9 @@ impl ClassicSessionRuntimeHandle {
 
     pub(super) async fn execute_on_page(
         &self,
-        command: DevToolsCommand,
-        expected_page: DevToolsPageResidenceIdentity,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
+        command: AutomationCommand,
+        expected_page: DevToolsDocumentResidenceIdentity,
+    ) -> Result<AutomationResult, DevToolsError> {
         self.execute_request(command, None, None, false, Some(expected_page))
             .await
             .result
@@ -628,22 +501,30 @@ impl ClassicSessionRuntimeHandle {
 
     pub(super) async fn execute_script_on_page(
         &self,
-        command: DevToolsCommand,
+        command: AutomationCommand,
         timeout: Option<Duration>,
-        expected_page: DevToolsPageResidenceIdentity,
-    ) -> Result<DevToolsCommandResult, DevToolsError> {
-        self.execute_request(command, timeout, None, true, Some(expected_page))
-            .await
-            .result
+        expected_page: DevToolsDocumentResidenceIdentity,
+    ) -> Result<(AutomationResult, DevToolsDocumentResidenceIdentity), DevToolsError> {
+        let execution = self
+            .execute_request(command, timeout, None, true, Some(expected_page))
+            .await;
+        let result = execution.result?;
+        let document = execution.page_residence.ok_or_else(|| {
+            DevToolsError::new(
+                DevToolsErrorKind::NoSuchTarget,
+                "Classic script did not address a live Document",
+            )
+        })?;
+        Ok((result, document))
     }
 
     async fn execute_request(
         &self,
-        command: DevToolsCommand,
+        command: AutomationCommand,
         timeout: Option<Duration>,
         pending_navigation_timeout: Option<Duration>,
         terminate_execution_on_timeout: bool,
-        expected_page: Option<DevToolsPageResidenceIdentity>,
+        expected_page: Option<DevToolsDocumentResidenceIdentity>,
     ) -> ClassicSessionRuntimeCommandExecution {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
@@ -781,18 +662,10 @@ impl ClassicSessionRuntimeHandle {
         })?
     }
 
-    pub(super) async fn set_javascript_dialog_handler_enabled(
-        &self,
-        enabled: bool,
-    ) -> Result<(), DevToolsError> {
+    pub(super) async fn register_javascript_dialog_handler(&self) -> Result<(), DevToolsError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
-            .send(
-                ClassicSessionRuntimeRequest::SetJavaScriptDialogHandlerEnabled {
-                    enabled,
-                    response_tx,
-                },
-            )
+            .send(ClassicSessionRuntimeRequest::RegisterJavaScriptDialogHandler { response_tx })
             .map_err(|_| {
                 DevToolsError::new(
                     DevToolsErrorKind::NoSuchSession,
@@ -807,18 +680,29 @@ impl ClassicSessionRuntimeHandle {
         })?
     }
 
-    pub(super) async fn shutdown(self) -> CookieProfileCommit {
+    pub(super) async fn shutdown(self) {
         let (response_tx, response_rx) = oneshot::channel();
         if self
             .tx
             .send(ClassicSessionRuntimeRequest::Shutdown { response_tx })
             .is_err()
         {
-            return CookieProfileCommit::unchanged();
+            return;
         }
-        response_rx
+        let _ = response_rx.await;
+    }
+
+    pub(super) async fn shutdown_and_join(self) -> anyhow::Result<()> {
+        let completion = self.completion.clone();
+        let _ = self.shutdown().await;
+        let receiver = completion
+            .lock()
             .await
-            .unwrap_or_else(|_| CookieProfileCommit::unchanged())
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Classic runtime completion already consumed"))?;
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("Classic runtime stopped before shutdown completion"))
     }
 
     pub(in crate::protocol_server) async fn attach_bidi_socket(
@@ -826,7 +710,7 @@ impl ClassicSessionRuntimeHandle {
         socket: WebSocket,
         web_socket_url: String,
         session_id: String,
-        file_prompt_handler: Option<String>,
+        unhandled_prompt_behavior: ClassicUnhandledPromptBehavior,
         session_registry: SharedBidiSessionRegistry,
     ) -> bool {
         let (response_tx, response_rx) = oneshot::channel();
@@ -836,7 +720,7 @@ impl ClassicSessionRuntimeHandle {
                 socket: Box::new(socket),
                 web_socket_url,
                 session_id,
-                file_prompt_handler,
+                unhandled_prompt_behavior,
                 session_registry,
                 response_tx,
             })
@@ -849,8 +733,8 @@ impl ClassicSessionRuntimeHandle {
 }
 
 struct ClassicSessionRuntimeCommandExecution {
-    result: Result<DevToolsCommandResult, DevToolsError>,
-    page_residence: Option<DevToolsPageResidenceIdentity>,
+    result: Result<AutomationResult, DevToolsError>,
+    page_residence: Option<DevToolsDocumentResidenceIdentity>,
 }
 
 impl ClassicSessionRuntimeCommandExecution {
@@ -863,16 +747,23 @@ impl ClassicSessionRuntimeCommandExecution {
 }
 
 enum ClassicSessionRuntimeRequest {
+    WebDriverNodeReference {
+        context: AutomationContext,
+        shared_id: String,
+        kind: moli_protocol::automation::WebDriverNodeKind,
+        response_tx:
+            oneshot::Sender<Result<Option<moli_protocol::WebDriverNodeReference>, DevToolsError>>,
+    },
     Execute {
-        command: Box<DevToolsCommand>,
+        command: Box<AutomationCommand>,
         timeout: Option<Duration>,
         pending_navigation_timeout: Option<Duration>,
         terminate_execution_on_timeout: bool,
-        expected_page: Option<DevToolsPageResidenceIdentity>,
+        expected_page: Option<DevToolsDocumentResidenceIdentity>,
         response_tx: oneshot::Sender<ClassicSessionRuntimeCommandExecution>,
     },
     WaitForDocumentLifecycle {
-        context: DevToolsCommandContext,
+        context: AutomationContext,
         milestone: RendererDocumentLifecycleMilestone,
         timeout: Option<Duration>,
         response_tx: oneshot::Sender<Result<(), DevToolsError>>,
@@ -881,7 +772,7 @@ enum ClassicSessionRuntimeRequest {
         socket: Box<WebSocket>,
         web_socket_url: String,
         session_id: String,
-        file_prompt_handler: Option<String>,
+        unhandled_prompt_behavior: ClassicUnhandledPromptBehavior,
         session_registry: SharedBidiSessionRegistry,
         response_tx: oneshot::Sender<bool>,
     },
@@ -896,7 +787,7 @@ enum ClassicSessionRuntimeRequest {
         session_id: String,
         target_id: String,
         current_frame_id: Option<String>,
-        expected_page: DevToolsPageResidenceIdentity,
+        expected_page: DevToolsDocumentResidenceIdentity,
         element_reference: DevToolsDomNodeReference,
         response_tx: oneshot::Sender<Result<String, DevToolsError>>,
     },
@@ -912,12 +803,11 @@ enum ClassicSessionRuntimeRequest {
         frame_id: Option<String>,
         response_tx: oneshot::Sender<Result<bool, DevToolsError>>,
     },
-    SetJavaScriptDialogHandlerEnabled {
-        enabled: bool,
+    RegisterJavaScriptDialogHandler {
         response_tx: oneshot::Sender<Result<(), DevToolsError>>,
     },
     Shutdown {
-        response_tx: oneshot::Sender<CookieProfileCommit>,
+        response_tx: oneshot::Sender<()>,
     },
 }
 
@@ -942,17 +832,26 @@ enum ClassicSessionRuntimeRequestOutcome {
     Continue,
     AttachedBidi(Box<ClassicAttachedBidiSocket>),
     DetachBidi,
-    Shutdown(CookieProfileCommit),
+    Shutdown,
 }
 
 async fn handle_classic_session_runtime_request(
     scheduler: &mut CdpScheduler,
     receivers: &mut CdpSchedulerEventReceivers,
-    initial_cookie_snapshot: &[StoredCookie],
     request: ClassicSessionRuntimeRequest,
     mut attached_bidi: Option<&mut ClassicAttachedBidiSocket>,
 ) -> ClassicSessionRuntimeRequestOutcome {
     match request {
+        ClassicSessionRuntimeRequest::WebDriverNodeReference {
+            context,
+            shared_id,
+            kind,
+            response_tx,
+        } => {
+            let _ =
+                response_tx.send(scheduler.webdriver_node_reference(&context, &shared_id, kind));
+            ClassicSessionRuntimeRequestOutcome::Continue
+        }
         ClassicSessionRuntimeRequest::Execute {
             command,
             timeout,
@@ -962,19 +861,19 @@ async fn handle_classic_session_runtime_request(
             response_tx,
         } => {
             if expected_page.as_ref().is_some_and(|expected| {
-                scheduler.page_residence_identity_for_devtools_context(command.context())
+                scheduler.document_residence_identity_for_devtools_context(command.context())
                     != Some(expected.clone())
             }) {
                 let _ = response_tx.send(ClassicSessionRuntimeCommandExecution::error(
                     DevToolsError::new(
                         DevToolsErrorKind::NoSuchNode,
-                        "DOM reference belongs to a replaced Page",
+                        "DOM reference belongs to a replaced Document",
                     ),
                 ));
                 return ClassicSessionRuntimeRequestOutcome::Continue;
             }
             let termination_context = command.context().clone();
-            let mut execution = execute_classic_devtools_command_with_pending_navigation_retry(
+            let mut execution = execute_classic_automation_command_with_pending_navigation_retry(
                 scheduler,
                 receivers,
                 *command,
@@ -992,10 +891,10 @@ async fn handle_classic_session_runtime_request(
                 // Finish the IO-side termination before the HTTP handler
                 // releases argument handles or admits the next Classic
                 // command on this session.
-                let termination = execute_classic_devtools_command_once(
+                let termination = execute_classic_automation_command_once(
                     scheduler,
                     receivers,
-                    DevToolsCommand::TerminateExecution(DevToolsTerminateExecutionCommand {
+                    AutomationCommand::TerminateExecution(DevToolsTerminateExecutionCommand {
                         context: termination_context,
                     }),
                     Some(CLASSIC_SCRIPT_TERMINATION_TIMEOUT),
@@ -1073,7 +972,7 @@ async fn handle_classic_session_runtime_request(
             socket,
             web_socket_url,
             session_id,
-            file_prompt_handler,
+            unhandled_prompt_behavior,
             session_registry,
             response_tx,
         } => {
@@ -1090,8 +989,15 @@ async fn handle_classic_session_runtime_request(
                 let _ = response_tx.send(false);
                 return ClassicSessionRuntimeRequestOutcome::Continue;
             }
+            if actor
+                .configure_existing_session_prompt_handlers(scheduler, &unhandled_prompt_behavior)
+                .is_err()
+            {
+                actor.release_session(&mut session_registry.lock());
+                let _ = response_tx.send(false);
+                return ClassicSessionRuntimeRequestOutcome::Continue;
+            }
             actor.install_runtime_response_ready_sender(scheduler);
-            actor.set_file_prompt_handler_for_script_commands(file_prompt_handler.as_deref());
             let _ = response_tx.send(true);
             ClassicSessionRuntimeRequestOutcome::AttachedBidi(Box::new(ClassicAttachedBidiSocket {
                 actor,
@@ -1172,42 +1078,30 @@ async fn handle_classic_session_runtime_request(
             let _ = response_tx.send(result);
             ClassicSessionRuntimeRequestOutcome::Continue
         }
-        ClassicSessionRuntimeRequest::SetJavaScriptDialogHandlerEnabled {
-            enabled,
-            response_tx,
-        } => {
-            let result = scheduler
-                .set_automation_javascript_dialog_handler_enabled(enabled)
-                .then_some(())
-                .ok_or_else(|| {
-                    DevToolsError::new(
-                        DevToolsErrorKind::NoSuchTarget,
-                        "Classic session has no browser context",
-                    )
-                });
-            let _ = response_tx.send(result);
+        ClassicSessionRuntimeRequest::RegisterJavaScriptDialogHandler { response_tx } => {
+            scheduler.register_automation_javascript_dialog_handler(
+                FrontendProtocol::WebDriverClassic,
+                true,
+            );
+            let _ = response_tx.send(Ok(()));
             ClassicSessionRuntimeRequestOutcome::Continue
         }
         ClassicSessionRuntimeRequest::Shutdown { response_tx } => {
-            let cookie_commit = CookieProfileCommit::from_optional_profile_backed_snapshot(
-                initial_cookie_snapshot.to_vec(),
-                scheduler.snapshot_profile_backed_cookies(),
-            );
-            let _ = response_tx.send(cookie_commit.clone());
-            ClassicSessionRuntimeRequestOutcome::Shutdown(cookie_commit)
+            let _ = response_tx.send(());
+            ClassicSessionRuntimeRequestOutcome::Shutdown
         }
     }
 }
 
-async fn execute_classic_devtools_command_with_pending_navigation_retry(
+async fn execute_classic_automation_command_with_pending_navigation_retry(
     scheduler: &mut CdpScheduler,
     receivers: &mut CdpSchedulerEventReceivers,
-    command: DevToolsCommand,
+    command: AutomationCommand,
     timeout: Option<Duration>,
     pending_navigation_timeout: Option<Duration>,
-    expected_page: Option<&DevToolsPageResidenceIdentity>,
+    expected_page: Option<&DevToolsDocumentResidenceIdentity>,
 ) -> ClassicDevToolsCommandExecution {
-    let mut execution = execute_classic_devtools_command_once(
+    let mut execution = execute_classic_automation_command_once(
         scheduler,
         receivers,
         command.clone(),
@@ -1228,9 +1122,7 @@ async fn execute_classic_devtools_command_with_pending_navigation_retry(
             execution.execution.result = Err(classic_pending_navigation_timeout_error());
             return execution;
         };
-        let mut progress = scheduler
-            .complete_ready_protocol_residences_for_external_load_wait()
-            .await;
+        let mut progress = scheduler.complete_ready_protocol_residences_for_external_load_wait();
         if progress.is_empty() {
             let input = match tokio::time::timeout(remaining, receivers.recv_interleaved_input())
                 .await
@@ -1278,7 +1170,7 @@ async fn execute_classic_devtools_command_with_pending_navigation_retry(
             }
             None => None,
         };
-        let retry = execute_classic_devtools_command_once(
+        let retry = execute_classic_automation_command_once(
             scheduler,
             receivers,
             command.clone(),
@@ -1295,18 +1187,18 @@ async fn execute_classic_devtools_command_with_pending_navigation_retry(
     }
 }
 
-async fn execute_classic_devtools_command_once(
+async fn execute_classic_automation_command_once(
     scheduler: &mut CdpScheduler,
     receivers: &mut CdpSchedulerEventReceivers,
-    command: DevToolsCommand,
+    command: AutomationCommand,
     timeout: Option<Duration>,
-    expected_page: Option<&DevToolsPageResidenceIdentity>,
+    expected_page: Option<&DevToolsDocumentResidenceIdentity>,
 ) -> ClassicDevToolsCommandExecution {
-    let DevToolsPageCommandExecution {
+    let AutomationDocumentExecution {
         execution,
         page_residence,
     } = scheduler
-        .execute_devtools_command_with_external_load_wait_and_page_residence(
+        .execute_automation_command_with_external_load_wait_and_document_residence(
             receivers,
             command,
             timeout,
@@ -1320,12 +1212,12 @@ async fn execute_classic_devtools_command_once(
 }
 
 struct ClassicDevToolsCommandExecution {
-    execution: DevToolsCommandExecution,
-    page_residence: Option<DevToolsPageResidenceIdentity>,
+    execution: AutomationExecution,
+    page_residence: Option<DevToolsDocumentResidenceIdentity>,
 }
 
 fn classic_runtime_result_is_navigation_changing_document(
-    result: &Result<DevToolsCommandResult, DevToolsError>,
+    result: &Result<AutomationResult, DevToolsError>,
 ) -> bool {
     matches!(
         result,
@@ -1339,10 +1231,9 @@ fn classic_pending_navigation_timeout_error() -> DevToolsError {
 
 async fn classic_session_runtime_loop(
     mut rx: mpsc::UnboundedReceiver<ClassicSessionRuntimeRequest>,
-    initial_cookie_snapshot: Vec<StoredCookie>,
     initial_storage_partition: CdpInitialStoragePartition,
     navigation_runtime_config: NavigationRuntimeConfig,
-) -> CookieProfileCommit {
+) {
     let (mut scheduler, mut receivers) = CdpScheduler::new_with_initial_state_runtime_config(
         initial_storage_partition,
         navigation_runtime_config,
@@ -1355,13 +1246,24 @@ async fn classic_session_runtime_loop(
         }
         if attached_bidi.is_some() {
             let mut detach_bidi = false;
-            let mut shutdown_cookies = None;
+            let mut shutdown_requested = false;
             {
                 let attached = attached_bidi.as_mut().expect("attached BiDi socket");
-                let page_javascript_blocked = scheduler.has_pending_javascript_dialog();
-                adapter_scheduler.schedule_turn_if_needed(&scheduler, page_javascript_blocked);
+                adapter_scheduler.schedule_turn_if_needed(&scheduler, false);
                 tokio::select! {
                     biased;
+                    completion = receivers.protocol_work_completion_rx.recv() => {
+                        let Some(completion) = completion else { break; };
+                        if !attached.actor.handle_protocol_work_completion(&mut scheduler, &mut receivers, completion).await {
+                            detach_bidi = true;
+                        }
+                    }
+                    _ = receivers.state_events_ready.notified() => {
+                        scheduler.apply_protocol_state_events();
+                        if !attached.actor.advance_pending_commands(&mut scheduler, &mut receivers).await {
+                            detach_bidi = true;
+                        }
+                    }
                     completion = receivers.background_navigation_completion_rx.recv() => {
                         let Some(completion) = completion else {
                             break;
@@ -1390,7 +1292,7 @@ async fn classic_session_runtime_loop(
                             detach_bidi = true;
                         }
                     }
-                    publication = receivers.renderer_publication_rx.recv(), if !page_javascript_blocked => {
+                    publication = receivers.renderer_publication_rx.recv() => {
                         let Some(publication) = publication else {
                             break;
                         };
@@ -1406,7 +1308,6 @@ async fn classic_session_runtime_loop(
                     }
                     actor_input = attached.actor.recv_attached_input(
                         &mut adapter_scheduler,
-                        page_javascript_blocked,
                     ) => {
                         match actor_input {
                             BidiSocketActorInput::Socket(Some(message)) => {
@@ -1419,6 +1320,9 @@ async fn classic_session_runtime_loop(
                                 {
                                     detach_bidi = true;
                                 }
+                            }
+                            BidiSocketActorInput::InputDeadline => {
+                                if !attached.actor.advance_pending_commands(&mut scheduler, &mut receivers).await { detach_bidi = true; }
                             }
                             BidiSocketActorInput::Socket(None) => {
                                 detach_bidi = true;
@@ -1447,6 +1351,10 @@ async fn classic_session_runtime_loop(
                                     detach_bidi = true;
                                 }
                             }
+                            BidiSocketActorInput::AutomationWorkflowReady(Some(ready)) => {
+                                if !attached.actor.handle_automation_workflow_ready(&mut scheduler, &mut receivers, *ready).await { detach_bidi = true; }
+                            }
+                            BidiSocketActorInput::AutomationWorkflowReady(None) => { detach_bidi = true; }
                             BidiSocketActorInput::RuntimeResponseReady(None) => {
                                 detach_bidi = true;
                             }
@@ -1459,7 +1367,6 @@ async fn classic_session_runtime_loop(
                         match handle_classic_session_runtime_request(
                             &mut scheduler,
                             &mut receivers,
-                            &initial_cookie_snapshot,
                             request,
                             Some(attached),
                         )
@@ -1474,18 +1381,15 @@ async fn classic_session_runtime_loop(
                             ClassicSessionRuntimeRequestOutcome::DetachBidi => {
                                 detach_bidi = true;
                             }
-                            ClassicSessionRuntimeRequestOutcome::Shutdown(cookies) => {
-                                attached
-                                    .release_session(&mut scheduler, &mut receivers)
-                                    .await;
-                                shutdown_cookies = Some(cookies);
+                            ClassicSessionRuntimeRequestOutcome::Shutdown => {
+                                shutdown_requested = true;
                             }
                         }
                     }
                 }
             }
-            if let Some(cookies) = shutdown_cookies {
-                return cookies;
+            if shutdown_requested {
+                break;
             }
             if detach_bidi && let Some(mut attached) = attached_bidi.take() {
                 attached
@@ -1493,10 +1397,16 @@ async fn classic_session_runtime_loop(
                     .await;
             }
         } else {
-            let page_javascript_blocked = scheduler.has_pending_javascript_dialog();
-            adapter_scheduler.schedule_turn_if_needed(&scheduler, page_javascript_blocked);
+            adapter_scheduler.schedule_turn_if_needed(&scheduler, false);
             tokio::select! {
                 biased;
+                completion = receivers.protocol_work_completion_rx.recv() => {
+                    let Some(completion) = completion else { break; };
+                    if scheduler.complete_protocol_work(completion).is_err() { break; }
+                }
+                _ = receivers.state_events_ready.notified() => {
+                    scheduler.apply_protocol_state_events();
+                }
                 completion = receivers.background_navigation_completion_rx.recv() => {
                     let Some(completion) = completion else {
                         break;
@@ -1522,18 +1432,16 @@ async fn classic_session_runtime_loop(
                     };
                     let _ = scheduler.route_background_event_around_inflight_navigation(event);
                 }
-                publication = receivers.renderer_publication_rx.recv(), if !page_javascript_blocked => {
+                publication = receivers.renderer_publication_rx.recv() => {
                     let Some(publication) = publication else {
                         break;
                     };
                     let _ = adapter_scheduler
-                        .ingest_renderer_publication(&mut scheduler, publication)
-                        .await;
+                        .ingest_renderer_publication(&mut scheduler, publication);
                 }
-                input = adapter_scheduler.recv_input(), if !page_javascript_blocked => {
+                input = adapter_scheduler.recv_input() => {
                     let _ = adapter_scheduler
-                        .advance_input(&mut scheduler, input)
-                        .await;
+                        .advance_input(&mut scheduler, input);
                 }
                 request = rx.recv() => {
                     let Some(request) = request else {
@@ -1542,7 +1450,6 @@ async fn classic_session_runtime_loop(
                     match handle_classic_session_runtime_request(
                         &mut scheduler,
                         &mut receivers,
-                        &initial_cookie_snapshot,
                         request,
                         None,
                     )
@@ -1553,7 +1460,7 @@ async fn classic_session_runtime_loop(
                             attached_bidi = Some(*attached);
                         }
                         ClassicSessionRuntimeRequestOutcome::DetachBidi => {}
-                        ClassicSessionRuntimeRequestOutcome::Shutdown(cookies) => return cookies,
+                        ClassicSessionRuntimeRequestOutcome::Shutdown => break,
                     }
                     if attached_bidi.is_none() {
                         classic_session_ingest_ready_renderer_publications(
@@ -1567,10 +1474,13 @@ async fn classic_session_runtime_loop(
             }
         }
     }
-    CookieProfileCommit::from_optional_profile_backed_snapshot(
-        initial_cookie_snapshot,
-        scheduler.snapshot_profile_backed_cookies(),
-    )
+    let _ = scheduler
+        .unregister_automation_javascript_dialog_handler(FrontendProtocol::WebDriverClassic);
+    if let Some(mut attached) = attached_bidi {
+        attached
+            .release_session(&mut scheduler, &mut receivers)
+            .await;
+    }
 }
 
 async fn resolve_classic_frame_id_for_index(
@@ -1606,7 +1516,7 @@ async fn resolve_classic_frame_id_for_element(
     session_id: &str,
     target_id: &str,
     current_frame_id: Option<&str>,
-    expected_page: &DevToolsPageResidenceIdentity,
+    expected_page: &DevToolsDocumentResidenceIdentity,
     element_reference: DevToolsDomNodeReference,
 ) -> Result<String, DevToolsError> {
     let frame_tree =
@@ -1652,26 +1562,26 @@ async fn classic_frame_owner_reference_on_page(
     session_id: &str,
     target_id: &str,
     frame_id: &str,
-    expected_page: &DevToolsPageResidenceIdentity,
+    expected_page: &DevToolsDocumentResidenceIdentity,
 ) -> Result<DevToolsGetFrameOwnerResult, DevToolsError> {
-    let context = DevToolsCommandContext {
-        protocol: DevToolsProtocol::WebDriverClassic,
+    let context = AutomationContext {
+        protocol: FrontendProtocol::WebDriverClassic,
         session_id: Some(DevToolsSessionId::from(session_id)),
         target_id: Some(DevToolsTargetId::from(target_id)),
         browser_context_id: None,
     };
     ensure_classic_command_page_is_current(scheduler, &context, expected_page)?;
     match scheduler
-        .execute_devtools_command_with_external_load_wait(
+        .execute_automation_command_with_external_load_wait(
             receivers,
-            DevToolsCommand::GetFrameOwner(DevToolsGetFrameOwnerCommand {
+            AutomationCommand::GetFrameOwner(DevToolsGetFrameOwnerCommand {
                 context,
                 frame_id: DevToolsFrameId::new(frame_id),
             }),
         )
         .await
     {
-        Ok(DevToolsCommandResult::GetFrameOwner(owner)) => Ok(owner),
+        Ok(AutomationResult::GetFrameOwner(owner)) => Ok(owner),
         Ok(_) => Err(DevToolsError::new(
             DevToolsErrorKind::Internal,
             "UnexpectedFrameOwnerResult",
@@ -1728,23 +1638,23 @@ async fn classic_frame_tree(
     session_id: &str,
     target_id: &str,
 ) -> Result<serde_json::Value, DevToolsError> {
-    let context = DevToolsCommandContext {
-        protocol: DevToolsProtocol::WebDriverClassic,
+    let context = AutomationContext {
+        protocol: FrontendProtocol::WebDriverClassic,
         session_id: Some(DevToolsSessionId::from(session_id)),
         target_id: Some(DevToolsTargetId::from(target_id)),
         browser_context_id: None,
     };
     match scheduler
-        .execute_devtools_command_with_external_load_wait(
+        .execute_automation_command_with_external_load_wait(
             receivers,
-            DevToolsCommand::GetFrameTree(DevToolsGetFrameTreeCommand {
+            AutomationCommand::GetFrameTree(DevToolsGetFrameTreeCommand {
                 context,
                 max_depth: None,
             }),
         )
         .await
     {
-        Ok(DevToolsCommandResult::GetFrameTree(result)) => Ok(result.frame_tree),
+        Ok(AutomationResult::GetFrameTree(result)) => Ok(result.frame_tree),
         Ok(_) => Err(DevToolsError::new(
             DevToolsErrorKind::Internal,
             "UnexpectedFrameTreeResult",
@@ -1758,26 +1668,26 @@ async fn classic_frame_tree_on_page(
     receivers: &mut CdpSchedulerEventReceivers,
     session_id: &str,
     target_id: &str,
-    expected_page: &DevToolsPageResidenceIdentity,
+    expected_page: &DevToolsDocumentResidenceIdentity,
 ) -> Result<serde_json::Value, DevToolsError> {
-    let context = DevToolsCommandContext {
-        protocol: DevToolsProtocol::WebDriverClassic,
+    let context = AutomationContext {
+        protocol: FrontendProtocol::WebDriverClassic,
         session_id: Some(DevToolsSessionId::from(session_id)),
         target_id: Some(DevToolsTargetId::from(target_id)),
         browser_context_id: None,
     };
     ensure_classic_command_page_is_current(scheduler, &context, expected_page)?;
     match scheduler
-        .execute_devtools_command_with_external_load_wait(
+        .execute_automation_command_with_external_load_wait(
             receivers,
-            DevToolsCommand::GetFrameTree(DevToolsGetFrameTreeCommand {
+            AutomationCommand::GetFrameTree(DevToolsGetFrameTreeCommand {
                 context,
                 max_depth: None,
             }),
         )
         .await
     {
-        Ok(DevToolsCommandResult::GetFrameTree(result)) => Ok(result.frame_tree),
+        Ok(AutomationResult::GetFrameTree(result)) => Ok(result.frame_tree),
         Ok(_) => Err(DevToolsError::new(
             DevToolsErrorKind::Internal,
             "UnexpectedFrameTreeResult",
@@ -1788,17 +1698,17 @@ async fn classic_frame_tree_on_page(
 
 fn ensure_classic_command_page_is_current(
     scheduler: &mut CdpScheduler,
-    context: &DevToolsCommandContext,
-    expected_page: &DevToolsPageResidenceIdentity,
+    context: &AutomationContext,
+    expected_page: &DevToolsDocumentResidenceIdentity,
 ) -> Result<(), DevToolsError> {
-    if scheduler.page_residence_identity_for_devtools_context(context)
+    if scheduler.document_residence_identity_for_devtools_context(context)
         == Some(expected_page.clone())
     {
         Ok(())
     } else {
         Err(DevToolsError::new(
             DevToolsErrorKind::NoSuchNode,
-            "DOM reference belongs to a replaced Page",
+            "DOM reference belongs to a replaced Document",
         ))
     }
 }
@@ -1879,9 +1789,7 @@ async fn classic_session_ingest_ready_renderer_publications(
     receivers: &mut CdpSchedulerEventReceivers,
 ) {
     while let Ok(publication) = receivers.renderer_publication_rx.try_recv() {
-        let _ = adapter_scheduler
-            .ingest_renderer_publication(scheduler, publication)
-            .await;
+        let _ = adapter_scheduler.ingest_renderer_publication(scheduler, publication);
     }
 }
 #[cfg(test)]

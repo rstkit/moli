@@ -45,6 +45,36 @@ pub(crate) struct FrameOwnerStore {
     pending_parent_document_descendant_completions: VecDeque<FrameDocumentDescendantLoadCompletion>,
 }
 
+// A view into the authoritative owner indexes. Validation is shared with
+// snapshots, but synchronous readers need not clone settings or URLs.
+struct CurrentFrameOwner<'a> {
+    frame_id: &'a FrameId,
+    frame: &'a FrameRecord,
+    local_window: &'a LocalWindowRecord,
+    document: &'a DocumentRecord,
+}
+
+impl CurrentFrameOwner<'_> {
+    fn snapshot(&self) -> FrameOwnerSnapshot {
+        FrameOwnerSnapshot {
+            frame_id: self.frame_id.clone(),
+            kind: self.frame.kind,
+            parent_frame_id: self.frame.parent_frame_id.clone(),
+            owner_element_handle: self.frame.owner_element_handle,
+            #[cfg(test)]
+            window_proxy_id: self.frame.window_proxy_id,
+            scheduler_lane_id: self.frame.scheduler_lane_id,
+            local_window_id: self.local_window.id,
+            document_id: self.document.id,
+            document_handle: self.document.document_handle,
+            document_url: self.document.url.clone(),
+            document_base_url: self.document.base_url.clone(),
+            realm_id: self.local_window.realm_id,
+            settings: self.local_window.settings.clone(),
+        }
+    }
+}
+
 impl FrameOwnerStore {
     fn new_loading_document_lifecycle(
         &mut self,
@@ -142,6 +172,8 @@ impl FrameOwnerStore {
                 document_id,
                 realm_id: Some(realm_id),
                 settings,
+                inherited_opaque_origin: None,
+                import_map_registry: Default::default(),
                 lifecycle: LocalWindowLifecycleState::Current,
             },
         );
@@ -159,7 +191,6 @@ impl FrameOwnerStore {
                 lifecycle: DocumentLifecycleState::Current,
                 lifecycle_progress,
                 active_requests: BTreeMap::new(),
-                import_map_registry: Default::default(),
             },
         );
         self.realms.insert(
@@ -298,12 +329,86 @@ impl FrameOwnerStore {
         url: Url,
         base_url: Url,
     ) -> Option<MainDocumentOwnerTransition> {
+        let transition = self.prepare_main_document_owner_transition(
+            DocumentInspectorBindingTransition::Preserved,
+        )?;
+        self.commit_main_document_owner_transition(
+            transition,
+            document_handle,
+            url,
+            base_url,
+            DocumentCreationKind::DocumentOpen,
+        )?;
+        self.pending_main_document_owner_transitions
+            .push_back(transition);
+        Some(transition)
+    }
+
+    pub(crate) fn prepare_initial_main_document_owner_transition(
+        &mut self,
+    ) -> Option<MainDocumentOwnerTransition> {
+        self.prepare_main_document_owner_transition(DocumentInspectorBindingTransition::Replaced)
+    }
+
+    fn prepare_main_document_owner_transition(
+        &mut self,
+        inspector_binding: DocumentInspectorBindingTransition,
+    ) -> Option<MainDocumentOwnerTransition> {
+        let snapshot = self.current_main_owner_snapshot()?;
+        Some(MainDocumentOwnerTransition::new(
+            FrameDocumentTaskOwner::new(
+                snapshot.scheduler_lane_id,
+                snapshot.local_window_id,
+                snapshot.document_id,
+            ),
+            FrameDocumentTaskOwner::new(
+                snapshot.scheduler_lane_id,
+                snapshot.local_window_id,
+                self.ids.document(),
+            ),
+            inspector_binding,
+        ))
+    }
+
+    pub(crate) fn replace_initial_main_document(
+        &mut self,
+        transition: MainDocumentOwnerTransition,
+        document_handle: DomHandle,
+        url: Url,
+        base_url: Url,
+    ) -> Option<MainDocumentOwnerTransition> {
+        assert_eq!(
+            transition.context_transition().inspector_binding(),
+            DocumentInspectorBindingTransition::Replaced,
+        );
+        // Navigation transitions are executed synchronously by ScriptVm, not
+        // replayed after runtime replacement by the document.open() journal.
+        self.commit_main_document_owner_transition(
+            transition,
+            document_handle,
+            url,
+            base_url,
+            DocumentCreationKind::Navigation,
+        )
+    }
+
+    fn commit_main_document_owner_transition(
+        &mut self,
+        transition: MainDocumentOwnerTransition,
+        document_handle: DomHandle,
+        url: Url,
+        base_url: Url,
+        creation_kind: DocumentCreationKind,
+    ) -> Option<MainDocumentOwnerTransition> {
         let snapshot = self.current_main_owner_snapshot()?;
         let retired_owner = FrameDocumentTaskOwner::new(
             snapshot.scheduler_lane_id,
             snapshot.local_window_id,
             snapshot.document_id,
         );
+        if retired_owner != transition.retired_owner() {
+            return None;
+        }
 
         let retired_document = self
             .documents
@@ -316,11 +421,15 @@ impl FrameOwnerStore {
         retired_document.lifecycle_progress.retire();
         retired_document.active_requests.clear();
 
-        let document_id = self.ids.document();
-        let lifecycle_progress = self.new_loading_document_lifecycle_for_document_open(
-            DocumentLoadDeliveryKind::Main,
-            load_continuation,
-        );
+        let document_id = transition.current_owner().document_id;
+        let lifecycle_progress = if creation_kind == DocumentCreationKind::DocumentOpen {
+            self.new_loading_document_lifecycle_for_document_open(
+                DocumentLoadDeliveryKind::Main,
+                load_continuation,
+            )
+        } else {
+            self.new_loading_document_lifecycle(DocumentLoadDeliveryKind::Main)
+        };
         self.documents.insert(
             document_id,
             DocumentRecord {
@@ -329,11 +438,10 @@ impl FrameOwnerStore {
                 document_handle,
                 url,
                 base_url: base_url.clone(),
-                creation_kind: DocumentCreationKind::DocumentOpen,
+                creation_kind,
                 lifecycle: DocumentLifecycleState::Current,
                 lifecycle_progress,
                 active_requests: BTreeMap::new(),
-                import_map_registry: Default::default(),
             },
         );
 
@@ -356,21 +464,11 @@ impl FrameOwnerStore {
                 .document_id = document_id;
         }
 
-        let transition = MainDocumentOwnerTransition::new(
-            retired_owner,
-            FrameDocumentTaskOwner::new(
-                snapshot.scheduler_lane_id,
-                snapshot.local_window_id,
-                document_id,
-            ),
-        );
         tracing::debug!(
             ?retired_owner,
             current_owner = ?transition.current_owner(),
-            "committed and journaled main document owner replacement"
+            "committed main document owner replacement"
         );
-        self.pending_main_document_owner_transitions
-            .push_back(transition);
         Some(transition)
     }
 
@@ -483,6 +581,8 @@ impl FrameOwnerStore {
                 document_id,
                 realm_id: None,
                 settings,
+                inherited_opaque_origin: None,
+                import_map_registry: Default::default(),
                 lifecycle: LocalWindowLifecycleState::Current,
             },
         );
@@ -502,7 +602,6 @@ impl FrameOwnerStore {
                     domcontentloaded_transition_token,
                 ),
                 active_requests: BTreeMap::new(),
-                import_map_registry: Default::default(),
             },
         );
         let frame = self
@@ -708,15 +807,12 @@ impl FrameOwnerStore {
             return FrameDocumentLocalWindowTransition::ReplaceLocalWindow;
         };
         let old_policy = &snapshot.settings.document_policy_container;
-        if document.creation_kind.is_initial_empty()
-            && old_policy.credentialless == new_document_policy.credentialless
-            && old_policy.sandbox.forces_opaque_origin
-                == new_document_policy.sandbox.forces_opaque_origin
-        {
-            FrameDocumentLocalWindowTransition::ReuseInitialEmptyLocalWindow
-        } else {
-            FrameDocumentLocalWindowTransition::ReplaceLocalWindow
-        }
+        FrameDocumentLocalWindowTransition::for_document_commit(
+            document.creation_kind.is_initial_empty(),
+            security_origin_allows_reuse,
+            old_policy,
+            new_document_policy,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -762,7 +858,6 @@ impl FrameOwnerStore {
             lifecycle: DocumentLifecycleState::Current,
             lifecycle_progress,
             active_requests: BTreeMap::new(),
-            import_map_registry: Default::default(),
         };
 
         let retired_document = self
@@ -906,7 +1001,6 @@ impl FrameOwnerStore {
                 lifecycle: DocumentLifecycleState::Current,
                 lifecycle_progress,
                 active_requests: BTreeMap::new(),
-                import_map_registry: Default::default(),
             },
         );
 
@@ -1580,10 +1674,17 @@ impl FrameOwnerStore {
             .main_load_completion_state()
     }
 
+    // Share owned snapshot assembly across callers; HTML export uses the borrowed view.
+    #[inline(never)]
     pub(crate) fn current_frame_owner_snapshot(
         &self,
         frame_id: &FrameId,
     ) -> Option<FrameOwnerSnapshot> {
+        self.current_frame_owner(frame_id)
+            .map(|owner| owner.snapshot())
+    }
+
+    fn current_frame_owner<'a>(&'a self, frame_id: &'a FrameId) -> Option<CurrentFrameOwner<'a>> {
         let frame = self.frames.get(frame_id)?;
         if frame.lifecycle != FrameLifecycleState::Attached {
             return None;
@@ -1636,46 +1737,21 @@ impl FrameOwnerStore {
             }
         }
 
-        Some(FrameOwnerSnapshot {
-            frame_id: frame_id.clone(),
-            kind: frame.kind,
-            parent_frame_id: frame.parent_frame_id.clone(),
-            owner_element_handle: frame.owner_element_handle,
-            #[cfg(test)]
-            window_proxy_id: frame.window_proxy_id,
-            scheduler_lane_id: frame.scheduler_lane_id,
-            local_window_id,
-            document_id,
-            document_handle: document.document_handle,
-            document_url: document.url.clone(),
-            document_base_url: document.base_url.clone(),
-            realm_id: local_window.realm_id,
-            settings: local_window.settings.clone(),
+        Some(CurrentFrameOwner {
+            frame_id,
+            frame,
+            local_window,
+            document,
         })
     }
 
+    // Share owned snapshot assembly across callers; HTML export uses the borrowed view.
+    #[inline(never)]
     pub(crate) fn current_child_owner_snapshot(
         &self,
         child_handle: DomHandle,
     ) -> Option<ChildFrameOwnerSnapshot> {
-        let frame_id = self.frame_ids_by_child_handle.get(&child_handle)?.clone();
-        let owner_element = self.frame_owner_elements.get(&child_handle)?;
-        if owner_element.owner_handle != child_handle
-            || owner_element.content_frame_id.as_ref() != Some(&frame_id)
-            || owner_element.lifecycle != FrameOwnerElementLifecycleState::Attached
-        {
-            return None;
-        }
-
-        let owner = self.current_frame_owner_snapshot(&frame_id)?;
-        if owner.kind != FrameKind::ChildIframe
-            || owner.owner_element_handle != Some(child_handle)
-            || owner.frame_id != frame_id
-            || owner_element.parent_frame_id != owner.parent_frame_id
-        {
-            return None;
-        }
-
+        let owner = self.current_child_owner(child_handle)?.snapshot();
         Some(ChildFrameOwnerSnapshot {
             owner_handle: child_handle,
             frame_id: owner.frame_id,
@@ -1689,6 +1765,36 @@ impl FrameOwnerStore {
             realm_id: owner.realm_id,
             settings: owner.settings,
         })
+    }
+
+    fn current_child_owner(&self, child_handle: DomHandle) -> Option<CurrentFrameOwner<'_>> {
+        let frame_id = self.frame_ids_by_child_handle.get(&child_handle)?;
+        let owner_element = self.frame_owner_elements.get(&child_handle)?;
+        if owner_element.owner_handle != child_handle
+            || owner_element.content_frame_id.as_ref() != Some(frame_id)
+            || owner_element.lifecycle != FrameOwnerElementLifecycleState::Attached
+        {
+            return None;
+        }
+
+        let owner = self.current_frame_owner(frame_id)?;
+        if owner.frame.kind != FrameKind::ChildIframe
+            || owner.frame.owner_element_handle != Some(child_handle)
+            || owner.frame_id != frame_id
+            || owner_element.parent_frame_id != owner.frame.parent_frame_id
+        {
+            return None;
+        }
+
+        Some(owner)
+    }
+
+    pub(crate) fn current_child_document(
+        &self,
+        child_handle: DomHandle,
+    ) -> Option<(DomHandle, &Url)> {
+        let owner = self.current_child_owner(child_handle)?;
+        Some((owner.document.document_handle, &owner.document.url))
     }
 
     pub(crate) fn current_child_document_owner(
@@ -2018,6 +2124,18 @@ impl FrameOwnerStore {
                 .documents
                 .get(&owner.document_id)
                 .is_some_and(|document| document.lifecycle_progress.load_delivery_is_ready())
+    }
+
+    pub(crate) fn current_child_document_owner_load_is_complete(
+        &self,
+        child_handle: DomHandle,
+        owner: FrameDocumentTaskOwner,
+    ) -> bool {
+        self.child_document_task_owner_is_current(child_handle, owner)
+            && self
+                .documents
+                .get(&owner.document_id)
+                .is_some_and(|document| document.lifecycle_progress.child_owner_load_is_complete())
     }
 
     pub(crate) fn reserve_current_child_document_load_delivery_task(
@@ -2704,7 +2822,7 @@ impl FrameOwnerStore {
         ))
     }
 
-    pub(crate) fn accept_current_main_modulepreload_event_owner(
+    pub(crate) fn accept_current_main_link_event_owner(
         &self,
         owner: FrameDocumentTaskOwner,
         element: DomHandle,
@@ -3218,7 +3336,7 @@ impl FrameOwnerStore {
             .ok_or_else(|| "child import map has no current Document owner".to_owned())?;
         let document = self
             .documents
-            .get_mut(&owner.document_id)
+            .get(&owner.document_id)
             .filter(|document| {
                 document.local_window_id == owner.local_window_id
                     && document.lifecycle == DocumentLifecycleState::Current
@@ -3227,9 +3345,40 @@ impl FrameOwnerStore {
             .ok_or_else(|| {
                 "child import map no longer belongs to the current Document".to_owned()
             })?;
-        document
+        self.local_windows
+            .get_mut(&document.local_window_id)
+            .ok_or_else(|| "child import map Window settings are unavailable".to_owned())?
             .import_map_registry
             .register_import_map(source, base_url)
+    }
+
+    pub(crate) fn resolve_current_child_document_module_integrity(
+        &self,
+        child_handle: DomHandle,
+        owner: FrameDocumentTaskOwner,
+        url: &Url,
+    ) -> Option<String> {
+        if !self.child_document_task_owner_is_current(child_handle, owner) {
+            return None;
+        }
+        self.local_windows
+            .get(&owner.local_window_id)
+            .and_then(|window| window.import_map_registry.resolve_module_integrity(url))
+    }
+
+    /// Pure settings lookup: retained module resolvers outlive their Window's
+    /// execution authority. This does not authorize a task or network request.
+    pub(crate) fn resolve_local_window_module_specifier(
+        &mut self,
+        local_window_id: LocalWindowId,
+        specifier: &str,
+        base_url: &Url,
+    ) -> Result<Url, String> {
+        self.local_windows
+            .get_mut(&local_window_id)
+            .ok_or_else(|| "module Window settings are unavailable".to_owned())?
+            .import_map_registry
+            .resolve_module_specifier(specifier, base_url)
     }
 
     pub(crate) fn resolve_frame_document_module_specifier(
@@ -3247,12 +3396,7 @@ impl FrameOwnerStore {
                 "child module specifier `{specifier}` lost its current Document/realm owner"
             ));
         }
-        self.documents
-            .get_mut(&owner.document_id)
-            .filter(|document| document.local_window_id == owner.local_window_id)
-            .ok_or_else(|| "child module settings object is unavailable".to_owned())?
-            .import_map_registry
-            .resolve_module_specifier(specifier, base_url)
+        self.resolve_local_window_module_specifier(owner.local_window_id, specifier, base_url)
     }
 
     pub(crate) fn resolve_frame_document_module_integrity(
@@ -3267,10 +3411,9 @@ impl FrameOwnerStore {
         ) {
             return None;
         }
-        self.documents
-            .get(&owner.document_id)
-            .filter(|document| document.local_window_id == owner.local_window_id)
-            .and_then(|document| document.import_map_registry.resolve_module_integrity(url))
+        self.local_windows
+            .get(&owner.local_window_id)
+            .and_then(|window| window.import_map_registry.resolve_module_integrity(url))
     }
 
     pub(crate) fn document_task_owner_is_current(&self, owner: FrameDocumentTaskOwner) -> bool {

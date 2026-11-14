@@ -1,11 +1,11 @@
 use crate::dom::native::Node;
 use crate::util::throw_type_error;
-use crate::webidl;
+use crate::{web_api_interfaces, webidl};
 
 use super::super::super::{
     node::{
         node_is_element, node_or_foreign_arg_handle_allow_detached,
-        node_runtime_and_handle_from_args_or_detached, set_wrapped_node_or_null,
+        node_runtime_and_handle_from_args_or_detached,
     },
     throw_dom_exception,
 };
@@ -23,8 +23,8 @@ use super::{
 struct InsertAdjacentElementArgs<'s> {
     #[webidl(required)]
     position: String,
-    #[webidl(required)]
-    element: v8::Local<'s, v8::Value>,
+    #[webidl(required, interface = web_api_interfaces::Element)]
+    element: v8::Local<'s, v8::Object>,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -78,12 +78,7 @@ pub(in crate::native_bridge) fn node_insert_adjacent_element_callback<'s>(
         rv.set_null();
         return;
     };
-    let receiver_is_detached = crate::native_bridge::document::detached_native_handle_for_runtime(
-        scope,
-        runtime_ptr,
-        args.this(),
-    )
-    .is_some();
+
     let Some(parsed) = webidl::parse_args::<InsertAdjacentElementArgs>(scope, &args) else {
         return;
     };
@@ -122,7 +117,7 @@ pub(in crate::native_bridge) fn node_insert_adjacent_element_callback<'s>(
         scope,
         runtime_ptr,
         document_handle,
-        parsed.element,
+        parsed.element.into(),
     ) else {
         throw_insert_adjacent_element_type_error(scope);
         return;
@@ -135,18 +130,9 @@ pub(in crate::native_bridge) fn node_insert_adjacent_element_callback<'s>(
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
         return;
     }
-    if receiver_is_detached {
-        match crate::native_bridge::document::detached_native_object_for_handle(
-            scope,
-            runtime_ptr,
-            handle,
-        ) {
-            Some(node) => rv.set(node.into()),
-            None => rv.set_null(),
-        }
-        return;
-    }
-    set_wrapped_node_or_null(scope, &mut rv, runtime_ptr, Some(handle));
+    // Return the original interface argument, including registered native
+    // aliases, rather than allocating another wrapper for its native handle.
+    rv.set(parsed.element.into());
 }
 
 pub(in crate::native_bridge) fn node_insert_adjacent_text_callback<'s>(

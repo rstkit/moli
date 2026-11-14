@@ -253,7 +253,6 @@ fn child_dynamic_import_owner_module_fetch_completion_followup_returns_fetch_com
         .inflight;
     let source = Ok(ModuleGraphFetchedSource::new(
         source_url.clone(),
-        false,
         ModuleSource::text("export const value = 1;".to_owned()),
     ));
 
@@ -875,7 +874,7 @@ fn dynamic_import_graph_evaluated_mark_stays_in_owner_store() {
         disposition.entry_id()
     };
 
-    assert!(store.mark_dynamic_module_graph_evaluated(owner, realm_id, entry_id));
+    assert!(store.mark_module_graph_evaluated(owner, realm_id, entry_id));
     let current_entry = store
         .current_document_modulator_entry(owner, realm_id)
         .expect("current document modulator entry should exist");
@@ -885,7 +884,7 @@ fn dynamic_import_graph_evaluated_mark_stays_in_owner_store() {
             .module_entry_state(entry_id),
         crate::document_module_graph::ModuleMapEntryState::Evaluated
     );
-    assert!(!store.mark_dynamic_module_graph_evaluated(owner, stale_realm_id, entry_id));
+    assert!(!store.mark_module_graph_evaluated(owner, stale_realm_id, entry_id));
     let current_entry_after_stale = store
         .current_document_modulator_entry(owner, realm_id)
         .expect("current document modulator entry should still exist");

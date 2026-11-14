@@ -2,15 +2,18 @@ use super::*;
 use crate::util::{get_private_value, set_private_value};
 
 mod entries;
+mod fetch_timing;
+pub(crate) use fetch_timing::FetchResourceTiming;
 mod install;
 mod lazy_subobjects;
 mod marks_measures;
 mod memory;
+mod name;
+pub(in crate::context_bootstrap) use name::PerformanceEntryName;
 mod resource_buffer;
 mod window_state;
 
 const DEFAULT_RESOURCE_TIMING_BUFFER_SIZE: u32 = 250;
-const PERFORMANCE_EVENT_LISTENERS_SLOT: &str = "__moliPerformanceEventListeners";
 const PERFORMANCE_RESOURCE_TIMING_BUFFER_ID_SLOT: &str = "__moliPerformanceResourceTimingBufferId";
 const PERFORMANCE_ON_RESOURCE_TIMING_BUFFER_FULL_SLOT: &str =
     "__moliPerformanceOnResourceTimingBufferFull";
@@ -25,16 +28,21 @@ pub(in crate::context_bootstrap) const PERFORMANCE_NAVIGATION_REDIRECT_COUNT_SLO
     "__moliPerformanceNavigationRedirectCount";
 pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_NAME_SLOT: &str =
     "__moliPerformanceEntryName";
+pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_ID_SLOT: &str = "__moliPerformanceEntryId";
 pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_TYPE_SLOT: &str =
     "__moliPerformanceEntryType";
 pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_START_TIME_SLOT: &str =
     "__moliPerformanceEntryStartTime";
 pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_DURATION_SLOT: &str =
     "__moliPerformanceEntryDuration";
+pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_NAVIGATION_ID_SLOT: &str =
+    "__moliPerformanceEntryNavigationId";
 pub(in crate::context_bootstrap) const PERFORMANCE_ENTRY_DETAIL_SLOT: &str =
     "__moliPerformanceEntryDetail";
 pub(in crate::context_bootstrap) const PERFORMANCE_RESOURCE_INITIATOR_TYPE_SLOT: &str =
     "__moliPerformanceResourceInitiatorType";
+pub(in crate::context_bootstrap) const PERFORMANCE_RESOURCE_INITIATOR_URL_SLOT: &str =
+    "__moliResourceInitiatorUrl";
 pub(in crate::context_bootstrap) const PERFORMANCE_RESOURCE_NEXT_HOP_PROTOCOL_SLOT: &str =
     "__moliPerformanceResourceNextHopProtocol";
 pub(in crate::context_bootstrap) const PERFORMANCE_RESOURCE_WORKER_START_SLOT: &str =
@@ -78,6 +86,7 @@ pub(in crate::context_bootstrap) const PERFORMANCE_EVENT_COUNTS_SLOT: &str =
 pub(in crate::context_bootstrap) const PERFORMANCE_EVENT_COUNTS_VALUES_SLOT: &str =
     "__moliPerformanceEventCountsValues";
 pub(super) const PERFORMANCE_NAVIGATION_ENTRY_SLOT: &str = "__moliPerformanceNavigationEntry";
+pub(super) const PERFORMANCE_LAST_ENTRY_ID_SLOT: &str = "__moliPerformanceLastEntryId";
 pub(super) const PERFORMANCE_NAVIGATION_TYPE_SEED_SLOT: &str =
     "__moliPerformanceNavigationTypeSeed";
 pub(super) const PERFORMANCE_NAVIGATION_NAME_SEED_SLOT: &str =
@@ -86,8 +95,17 @@ pub(super) const PERFORMANCE_LIFECYCLE_TIMESTAMPS_SLOT: &str =
     "__moliPerformanceLifecycleTimestamps";
 pub(super) const PERFORMANCE_PENDING_EVENT_COUNTS_SLOT: &str =
     "__moliPerformancePendingEventCounts";
-pub(in crate::context_bootstrap) const PERFORMANCE_OBSERVER_SUPPORTED_ENTRY_TYPES: &[&str] =
-    &["mark", "measure", "navigation", "resource"];
+pub(in crate::context_bootstrap) const WINDOW_PERFORMANCE_OBSERVER_SUPPORTED_ENTRY_TYPES:
+    &[&str] = &[
+    "event",
+    "first-input",
+    "mark",
+    "measure",
+    "navigation",
+    "resource",
+];
+pub(in crate::context_bootstrap) const WORKER_PERFORMANCE_OBSERVER_SUPPORTED_ENTRY_TYPES:
+    &[&str] = &["mark", "measure", "resource"];
 
 pub(super) use super::performance_observer_runtime::{
     performance_entry_list_get_entries_by_name_callback,
@@ -108,24 +126,34 @@ pub(in crate::context_bootstrap) use entries::{
     performance_entry_slot_number, performance_entry_slot_string, performance_entry_slot_value,
     set_performance_entry_slot_number,
 };
-pub(crate) use install::finalize_performance_observer_realm_bindings;
 pub(crate) use install::increment_performance_event_count;
-pub(super) use install::install_performance_template_bindings;
+pub(crate) use install::project_document_lifecycle_timing;
 pub(crate) use install::{
-    record_performance_dom_content_loaded_event_end,
-    record_performance_dom_content_loaded_event_start, record_performance_load_event_end,
-    record_performance_load_event_start,
+    finalize_performance_observer_realm_bindings, finalize_window_performance_realm_bindings,
+};
+pub(super) use install::{
+    install_performance_template_bindings, install_worker_performance_runtime_state,
 };
 pub(super) use marks_measures::{
     performance_clear_marks_callback, performance_clear_measures_callback,
     performance_mark_callback, performance_mark_constructor_callback, performance_measure_callback,
 };
+pub(super) use resource_buffer::resource_timing_dropped_entries_count;
 pub(crate) use resource_buffer::run_resource_timing_buffer_full_task;
-pub(crate) use window_state::bind_window_performance_seed;
+pub(crate) use window_state::{bind_document_performance, bind_window_performance_seed};
 pub(super) use window_state::{
     build_window_performance_for_receiver, ensure_current_window_performance,
     finish_window_performance_materialization, install_default_window_performance_seed,
 };
+
+pub(in crate::context_bootstrap) fn performance_now<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    performance: v8::Local<'s, v8::Object>,
+) -> f64 {
+    let time_origin = performance_slot_number(scope, performance, PERFORMANCE_TIME_ORIGIN_SLOT)
+        .expect("branded Performance receiver should retain its time origin");
+    dom_time_since_origin_millis(time_origin)
+}
 
 pub(super) fn ensure_current_performance_for_api<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -176,7 +204,7 @@ pub(in crate::context_bootstrap) fn current_window_navigation_timing_snapshot(
 pub(in crate::context_bootstrap) fn ensure_navigation_performance_entry_for_api<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     performance: v8::Local<'s, v8::Object>,
-) -> v8::Local<'s, v8::Object> {
+) {
     install::ensure_navigation_performance_entry(scope, performance)
 }
 
@@ -197,6 +225,7 @@ pub(crate) fn current_performance_time_origin(scope: &mut v8::PinScope<'_, '_>) 
 pub(crate) struct ResourcePerformanceEntry {
     name: String,
     initiator_type: String,
+    initiator_url: String,
     start_unix_millis: Option<f64>,
     transfer_size: f64,
     encoded_body_size: f64,
@@ -227,26 +256,104 @@ impl ResourcePerformanceEntry {
         start_unix_millis: Option<f64>,
         response: &crate::protocol_types::NavigationResponse,
     ) -> Self {
-        let body_size = response.body_bytes().len() as f64;
-        let header_size = response
-            .headers
-            .iter()
-            .map(|(name, value)| name.len() + value.len() + 4)
-            .sum::<usize>() as f64;
-        let content_type = moli_web_mime::response_content_type(&response.headers)
+        Self::from_network_response_with_body_size(
+            name,
+            initiator_type,
+            start_unix_millis,
+            response,
+            response.body_bytes().len(),
+        )
+    }
+
+    pub(crate) fn from_network_response_with_body_size(
+        name: impl Into<String>,
+        initiator_type: &'static str,
+        start_unix_millis: Option<f64>,
+        response: &crate::protocol_types::NavigationResponse,
+        body_size: usize,
+    ) -> Self {
+        Self::from_response_parts(
+            name,
+            initiator_type,
+            start_unix_millis,
+            response.status,
+            &response.headers,
+            body_size as f64,
+            response.cache_state,
+        )
+    }
+
+    pub(crate) fn from_streaming_network_response(
+        name: impl Into<String>,
+        initiator_type: &'static str,
+        start_unix_millis: Option<f64>,
+        response: &moli_fetch::ResponseHead,
+        body_size: usize,
+    ) -> Self {
+        Self::from_response_parts(
+            name,
+            initiator_type,
+            start_unix_millis,
+            response.status,
+            &response.headers,
+            body_size as f64,
+            response.cache_state,
+        )
+    }
+
+    pub(crate) fn from_fetch_response(
+        name: impl Into<String>,
+        initiator_type: &'static str,
+        start_unix_millis: Option<f64>,
+        response: &moli_fetch::Response,
+    ) -> Self {
+        Self::from_response_parts(
+            name,
+            initiator_type,
+            start_unix_millis,
+            response.status,
+            &response.headers,
+            response.body_bytes().len() as f64,
+            response.cache_state,
+        )
+    }
+
+    pub(crate) fn with_initiator_url(mut self, initiator_url: String) -> Self {
+        self.initiator_url = initiator_url;
+        self
+    }
+
+    fn from_response_parts(
+        name: impl Into<String>,
+        initiator_type: &'static str,
+        start_unix_millis: Option<f64>,
+        response_status: u16,
+        response_headers: &[(String, Vec<u8>)],
+        body_size: f64,
+        cache_state: moli_fetch::ResponseCacheState,
+    ) -> Self {
+        // Resource Timing deliberately uses a fixed overhead rather than
+        // exposing response-header sizes, which could reveal cookies.
+        let transfer_size = match cache_state {
+            moli_fetch::ResponseCacheState::None => body_size + 300.0,
+            moli_fetch::ResponseCacheState::Local => 0.0,
+            moli_fetch::ResponseCacheState::Validated => 300.0,
+        };
+        let content_type = moli_web_mime::response_content_type(response_headers)
             .and_then(|value| moli_web_mime::mime_essence(&value))
             .unwrap_or_default();
         Self {
             name: name.into(),
             initiator_type: initiator_type.to_owned(),
+            initiator_url: String::new(),
             start_unix_millis,
-            transfer_size: (body_size + header_size).max(1.0),
+            transfer_size,
             encoded_body_size: body_size,
             decoded_body_size: body_size,
             // The fetch lifecycle does not yet retain render-blocking metadata.
             // Avoid claiming that a resource blocked rendering until it does.
             render_blocking_status: "non-blocking".to_owned(),
-            response_status: f64::from(response.status),
+            response_status: f64::from(response_status),
             content_type,
         }
     }
@@ -257,26 +364,15 @@ impl ResourcePerformanceEntry {
         start_unix_millis: Option<f64>,
         network: &crate::protocol_types::ChildFrameDocumentNetworkSnapshot,
     ) -> Self {
-        let body_size = network.encoded_data_length as f64;
-        let header_size = network
-            .response_headers
-            .iter()
-            .map(|(name, value)| name.len() + value.len() + 4)
-            .sum::<usize>() as f64;
-        let content_type = moli_web_mime::response_content_type(&network.response_headers)
-            .and_then(|value| moli_web_mime::mime_essence(&value))
-            .unwrap_or_default();
-        Self {
-            name: name.into(),
-            initiator_type: initiator_type.to_owned(),
+        Self::from_response_parts(
+            name,
+            initiator_type,
             start_unix_millis,
-            transfer_size: (body_size + header_size).max(1.0),
-            encoded_body_size: body_size,
-            decoded_body_size: body_size,
-            render_blocking_status: "non-blocking".to_owned(),
-            response_status: f64::from(network.status),
-            content_type,
-        }
+            network.status,
+            &network.response_headers,
+            network.encoded_data_length as f64,
+            network.cache_state,
+        )
     }
 
     pub(crate) fn from_network_failure(
@@ -295,6 +391,7 @@ impl ResourcePerformanceEntry {
         Self {
             name: name.into(),
             initiator_type: initiator_type.to_owned(),
+            initiator_url: String::new(),
             start_unix_millis,
             transfer_size: 0.0,
             encoded_body_size: 0.0,
@@ -327,8 +424,15 @@ fn append_resource_performance_entry<'s>(
 ) {
     let start_time = entry.start_unix_millis.unwrap_or_else(unix_epoch_millis)
         - performance_slot_number(scope, performance, PERFORMANCE_TIME_ORIGIN_SLOT).unwrap_or(0.0);
-    let resource =
-        entries::create_performance_entry(scope, "resource", &entry.name, start_time, 0.0, None);
+    let resource = entries::create_performance_entry(
+        scope,
+        performance,
+        "resource",
+        entry.name.into(),
+        start_time,
+        0.0,
+        None,
+    );
     initialize_resource_timing_slots(
         scope,
         resource,
@@ -340,6 +444,14 @@ fn append_resource_performance_entry<'s>(
         entry.response_status,
         &entry.content_type,
     );
+    if let Some(value) = v8_string(scope, &entry.initiator_url) {
+        set_private_value(
+            scope,
+            resource,
+            PERFORMANCE_RESOURCE_INITIATOR_URL_SLOT,
+            value.into(),
+        );
+    }
     push_performance_entry(scope, performance, resource);
 }
 

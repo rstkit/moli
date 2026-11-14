@@ -12,6 +12,7 @@ pub(super) struct CapturedHttpRequest {
     pub(super) host: Option<String>,
     pub(super) target: String,
     pub(super) headers: Vec<(String, String)>,
+    pub(super) body: Vec<u8>,
 }
 
 impl CapturedHttpRequest {
@@ -36,6 +37,33 @@ pub(super) struct StaticHttpServer {
 
 impl StaticHttpServer {
     pub(super) async fn spawn(expected_requests: usize) -> Self {
+        const BODY: &str = "<!doctype html><body>child fixture</body>";
+        Self::spawn_with_bodies(vec![BODY.to_owned(); expected_requests]).await
+    }
+
+    pub(super) async fn spawn_with_bodies(response_bodies: Vec<String>) -> Self {
+        Self::spawn_with_responder(
+            response_bodies.len(),
+            "Content-Type: text/html; charset=utf-8\r\n",
+            move |index, _| response_bodies[index].clone(),
+        )
+        .await
+    }
+
+    pub(super) async fn spawn_echo(expected_requests: usize) -> Self {
+        Self::spawn_with_responder(
+            expected_requests,
+            "Content-Type: application/json\r\nCache-Control: no-store\r\n",
+            |_, request| serde_json::json!({ "headers": request.headers }).to_string(),
+        )
+        .await
+    }
+
+    pub(super) async fn spawn_with_responder(
+        expected_requests: usize,
+        response_headers: &'static str,
+        response_body: impl Fn(usize, &CapturedHttpRequest) -> String + Send + 'static,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind static HTTP test server");
@@ -44,7 +72,7 @@ impl StaticHttpServer {
             .expect("read static HTTP test server address");
         let task = tokio::spawn(async move {
             let mut requests = Vec::with_capacity(expected_requests);
-            for _ in 0..expected_requests {
+            for index in 0..expected_requests {
                 let (mut socket, _) = listener
                     .accept()
                     .await
@@ -112,19 +140,21 @@ impl StaticHttpServer {
                     .iter()
                     .find(|(name, _)| name.eq_ignore_ascii_case("host"))
                     .map(|(_, value)| value.clone());
-                requests.push(CapturedHttpRequest {
+                let captured = CapturedHttpRequest {
                     method,
                     host,
                     target,
                     headers,
-                });
+                    body: request[header_end..header_end + content_length].to_vec(),
+                };
+                let body = response_body(index, &captured);
+                requests.push(captured);
 
-                const BODY: &str = "<!doctype html><body>child fixture</body>";
                 socket
                     .write_all(
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
-                            BODY.len()
+                            "HTTP/1.1 200 OK\r\n{response_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
                         )
                         .as_bytes(),
                     )

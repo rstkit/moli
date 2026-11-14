@@ -1,34 +1,30 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::{
-    text_codec::TextDecodeError,
     util::{callback_data_index_value, callback_data_item, get_private_value},
     webidl,
 };
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
+use webidl::WebIdlDictionarySerialize;
 
 const TEXT_ENCODER_ENCODING_SLOT: &str = "__lmTextEncoderEncoding";
-const TEXT_ENCODER_BRAND_SLOT: &str = "__lmTextEncoderBrand";
 const TEXT_DECODER_ENCODING_SLOT: &str = "__lmTextDecoderEncoding";
 const TEXT_DECODER_FATAL_SLOT: &str = "__lmTextDecoderFatal";
 const TEXT_DECODER_IGNORE_BOM_SLOT: &str = "__lmTextDecoderIgnoreBOM";
-const TEXT_DECODER_BRAND_SLOT: &str = "__lmTextDecoderBrand";
 const TEXT_ENCODER_ENCODING_SLOT_INDEX: usize = 0;
 const TEXT_DECODER_ENCODING_SLOT_INDEX: usize = 1;
 const TEXT_DECODER_FATAL_SLOT_INDEX: usize = 2;
 const TEXT_DECODER_IGNORE_BOM_SLOT_INDEX: usize = 3;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextEncoder")]
+#[webapi(interface = web_api_interfaces::TextEncoder)]
 struct TextEncoderObjectDeclaration {
-    #[webapi(slot = TEXT_ENCODER_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = TEXT_ENCODER_ENCODING_SLOT)]
     encoding: &'static str,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextEncoder", enumerable)]
+#[webapi(interface = web_api_interfaces::TextEncoder, enumerable, receiver)]
 struct TextEncoderPrototypeDeclaration {
     #[webapi(method, length = 0, callback = text_encoder_encode_callback)]
     encode: (),
@@ -44,21 +40,14 @@ struct TextEncoderPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextDecoder")]
+#[webapi(interface = web_api_interfaces::TextDecoder)]
 struct TextDecoderObjectDeclaration {
-    #[webapi(slot = TEXT_DECODER_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = TEXT_DECODER_ENCODING_SLOT)]
     encoding: String,
-    #[webapi(slot = TEXT_DECODER_FATAL_SLOT)]
-    fatal: bool,
-    #[webapi(slot = TEXT_DECODER_IGNORE_BOM_SLOT)]
-    ignore_bom: bool,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextDecoder", enumerable)]
+#[webapi(interface = web_api_interfaces::TextDecoder, enumerable, receiver)]
 struct TextDecoderPrototypeDeclaration {
     #[webapi(method, length = 0, callback = text_decoder_decode_callback)]
     decode: (),
@@ -86,7 +75,7 @@ struct TextDecoderPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct TextEncoderEncodeIntoResultDeclaration {
     read: usize,
     written: usize,
@@ -106,6 +95,7 @@ struct TextEncoderEncodeIntoArgs<'s> {
     input: String,
     #[webidl(
         required,
+        allow_shared,
         missing_message = "Failed to execute 'encodeInto' on 'TextEncoder': parameter 2 is not of type 'Uint8Array'."
     )]
     dest: v8::Local<'s, v8::Uint8Array>,
@@ -116,25 +106,27 @@ struct TextEncoderEncodeIntoArgs<'s> {
 struct TextDecoderConstructorArgs {
     #[webidl(default = "utf-8")]
     label: String,
-    #[webidl(index = 1, with = parse_text_decoder_options_arg)]
+    #[webidl(index = 1, dictionary)]
     options: TextDecoderOptions,
 }
 
 #[derive(Default, webidl::WebIdlDictionary)]
-#[webidl(prefix = "TextDecoderOptions")]
+#[webidl(prefix = "TextDecoderOptions", snapshot)]
 struct TextDecoderOptions {
     #[webidl(default = false)]
+    #[webidl(snapshot_slot = TEXT_DECODER_FATAL_SLOT)]
     fatal: bool,
     #[webidl(name = "ignoreBOM", default = false)]
+    #[webidl(snapshot_slot = TEXT_DECODER_IGNORE_BOM_SLOT)]
     ignore_bom: bool,
 }
 
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "TextDecoder.decode")]
-struct TextDecoderDecodeArgs {
-    #[webidl(converter = "buffer_source")]
-    input: Option<webidl::BufferSource>,
-    #[webidl(index = 1, with = parse_text_decode_options_arg)]
+struct TextDecoderDecodeArgs<'s> {
+    #[webidl(converter = "raw")]
+    input: Option<webidl::AllowSharedBufferSource<'s>>,
+    #[webidl(index = 1, dictionary)]
     options: TextDecodeOptions,
 }
 
@@ -171,10 +163,6 @@ fn text_codec_string_attribute_getter_callback<'s>(
         rv.set_empty_string();
         return;
     };
-    if !text_codec_receiver_branded_for_slot(scope, args.this(), slot) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let value = get_private_value(scope, args.this(), slot)
         .and_then(|value| value.to_string(scope))
         .map(|value| value.to_rust_string_lossy(scope))
@@ -195,10 +183,6 @@ fn text_codec_bool_attribute_getter_callback<'s>(
         rv.set_bool(false);
         return;
     };
-    if !text_codec_receiver_branded_for_slot(scope, args.this(), slot) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     rv.set_bool(
         get_private_value(scope, args.this(), slot)
             .is_some_and(|value| value.is_boolean() && value.boolean_value(scope)),
@@ -232,10 +216,6 @@ fn text_encoder_encode_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !text_encoder_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(parsed) = webidl::parse_args::<TextEncoderEncodeArgs>(scope, &args) else {
         rv.set_undefined();
         return;
@@ -253,26 +233,10 @@ fn text_encoder_encode_into_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !text_encoder_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(parsed) = webidl::parse_args::<TextEncoderEncodeIntoArgs>(scope, &args) else {
         rv.set_undefined();
         return;
     };
-    if parsed
-        .dest
-        .get_backing_store()
-        .is_some_and(|backing_store| backing_store.is_resizable_by_user_javascript())
-    {
-        throw_type_error(
-            scope,
-            "TextEncoder.encodeInto does not accept a resizable or growable destination buffer.",
-        );
-        return;
-    }
-
     let dest_len = parsed.dest.byte_length();
     let encoded = parsed.input.as_bytes();
     let mut read_chars: usize = 0;
@@ -283,24 +247,16 @@ fn text_encoder_encode_into_callback<'s>(
             break;
         }
         written += ch_len;
-        read_chars += 1;
+        read_chars += ch.len_utf16();
     }
 
     if written > 0 {
         let bytes = &encoded[..written];
-        let mut buf = vec![0u8; parsed.dest.byte_length()];
-        parsed.dest.copy_contents(&mut buf);
-        buf[..written].copy_from_slice(bytes);
-        if let Some(backing_store) = parsed.dest.buffer(scope) {
-            let byte_offset = parsed.dest.byte_offset();
-            let data = backing_store.data();
-            if let Some(ptr) = data {
-                let ptr = ptr.as_ptr() as *mut u8;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(byte_offset), written);
-                }
-            }
-        }
+        let destination = webidl::AllowSharedBufferSource::View(parsed.dest.into());
+        assert!(
+            destination.write_bytes(scope, bytes),
+            "encoded bytes fit the converted view"
+        );
     }
 
     let result = TextEncoderEncodeIntoResultDeclaration {
@@ -326,7 +282,7 @@ pub(in crate::context_bootstrap) fn text_decoder_constructor_callback<'s>(
         rv.set_undefined();
         return;
     };
-    let label = parsed.label.trim().to_ascii_lowercase();
+    let label = parsed.label;
     let Some(encoding) = text_decoder_encoding_for_label(&label) else {
         throw_range_error(
             scope,
@@ -339,34 +295,14 @@ pub(in crate::context_bootstrap) fn text_decoder_constructor_callback<'s>(
     let fatal = parsed.options.fatal;
     let ignore_bom = parsed.options.ignore_bom;
     init_text_decoder_state(scope, args.this(), encoding, fatal, ignore_bom);
-    TextDecoderObjectDeclaration::new(encoding_name, fatal, ignore_bom)
+    parsed
+        .options
+        .initialize_snapshot(scope, args.this())
+        .expect("TextDecoder options");
+    TextDecoderObjectDeclaration::new(encoding_name)
         .initialize(scope, args.this())
         .expect("TextDecoder declaration should initialize object");
     rv.set(args.this().into());
-}
-
-fn parse_text_decoder_options_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<TextDecoderOptions, webidl::WebIdlError> {
-    let context = webidl::Context::argument("TextDecoder", (index + 1) as usize);
-    webidl::dictionary_arg(args, index, context)?
-        .map(|object| webidl::parse_dictionary_object(scope, object))
-        .transpose()
-        .map(|options| options.unwrap_or_default())
-}
-
-fn parse_text_decode_options_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<TextDecodeOptions, webidl::WebIdlError> {
-    let context = webidl::Context::argument("TextDecoder.decode", (index + 1) as usize);
-    webidl::dictionary_arg(args, index, context)?
-        .map(|object| webidl::parse_dictionary_object(scope, object))
-        .transpose()
-        .map(|options| options.unwrap_or_default())
 }
 
 fn text_decoder_decode_callback<'s>(
@@ -374,11 +310,7 @@ fn text_decoder_decode_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !text_decoder_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
-    let Some(parsed) = webidl::parse_args::<TextDecoderDecodeArgs>(scope, &args) else {
+    let Some(parsed) = webidl::parse_args::<TextDecoderDecodeArgs<'s>>(scope, &args) else {
         rv.set_undefined();
         return;
     };
@@ -390,7 +322,7 @@ fn text_decoder_decode_callback<'s>(
     let stream = parsed.options.stream;
     let bytes = parsed
         .input
-        .map(webidl::BufferSource::into_bytes)
+        .map(|input| input.to_vec(scope))
         .unwrap_or_default();
 
     let Some(decode_result) = decode_text_decoder_state(scope, decoder_id, &bytes, stream) else {
@@ -409,76 +341,4 @@ fn text_decoder_decode_callback<'s>(
             throw_type_error(scope, error.message());
         }
     }
-}
-
-fn text_codec_receiver_branded_for_slot<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-    slot: &str,
-) -> bool {
-    match slot {
-        TEXT_ENCODER_ENCODING_SLOT => text_encoder_receiver_branded(scope, receiver),
-        TEXT_DECODER_ENCODING_SLOT | TEXT_DECODER_FATAL_SLOT | TEXT_DECODER_IGNORE_BOM_SLOT => {
-            text_decoder_receiver_branded(scope, receiver)
-        }
-        _ => false,
-    }
-}
-
-fn text_encoder_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, TEXT_ENCODER_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-}
-
-fn text_decoder_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, TEXT_DECODER_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-}
-
-fn init_text_decoder_state(
-    scope: &mut v8::PinScope<'_, '_>,
-    decoder: v8::Local<'_, v8::Object>,
-    encoding: &'static encoding_rs::Encoding,
-    fatal: bool,
-    ignore_bom: bool,
-) {
-    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
-        unsafe { &mut *host_ptr }
-            .text_codecs_mut()
-            .init_decoder(scope, decoder, encoding, fatal, ignore_bom);
-        return;
-    }
-    if let Some(worker_state) = crate::worker::get_worker_state(scope) {
-        worker_state
-            .borrow_mut()
-            .text_codecs
-            .init_decoder(scope, decoder, encoding, fatal, ignore_bom);
-    }
-}
-
-fn decode_text_decoder_state(
-    scope: &mut v8::PinScope<'_, '_>,
-    decoder_id: u32,
-    bytes: &[u8],
-    stream: bool,
-) -> Option<Result<String, TextDecodeError>> {
-    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
-        return Some(
-            unsafe { &mut *host_ptr }
-                .text_codecs_mut()
-                .decode(decoder_id, bytes, stream),
-        );
-    }
-    crate::worker::get_worker_state(scope).map(|worker_state| {
-        worker_state
-            .borrow_mut()
-            .text_codecs
-            .decode(decoder_id, bytes, stream)
-    })
 }

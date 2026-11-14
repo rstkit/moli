@@ -2,6 +2,31 @@ use super::*;
 use moli_url::origin_ascii_serialization;
 
 #[test]
+fn indexed_db_first_use_ignores_public_constructor_overrides() {
+    let fixture = include_str!("../../../tests/fixtures/indexeddb-first-use.js");
+    for mode in ["number", "function", "getter", "delete"] {
+        let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-first-use.test/");
+        assert_eq!(
+            vm.lazy_constructor_materialization_count_for_test("IDBFactory")
+                .expect("initial IDBFactory materialization count"),
+            0,
+            "{mode}: IDBFactory must remain lazy before the probe"
+        );
+        assert_eq!(
+            vm.eval(&format!("({fixture})({mode:?})"))
+                .unwrap_or_else(|error| panic!("{mode}: first IndexedDB access failed: {error}")),
+            "ok"
+        );
+        assert_eq!(
+            vm.lazy_constructor_materialization_count_for_test("IDBFactory")
+                .expect("final IDBFactory materialization count"),
+            1,
+            "{mode}: first IndexedDB access must materialize the intrinsic exactly once"
+        );
+    }
+}
+
+#[test]
 fn indexed_db_runtime_state_is_created_on_first_use_without_window_slots() {
     let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-lazy-runtime.test/");
 
@@ -156,18 +181,14 @@ async fn indexed_db_databases_returns_committed_name_version_snapshot() {
     )
     .expect("indexedDB databases list workflow should schedule");
 
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__indexedDbDatabasesResult !== 'pending')")
-            .expect("IndexedDB databases list state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("IndexedDB databases list should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbDatabasesResult !== 'pending')",
+        "true",
+        "IndexedDB databases list should advance",
+    )
+    .await;
 
     let result = vm
         .eval("String(globalThis.__indexedDbDatabasesResult)")
@@ -392,7 +413,7 @@ fn indexed_db_request_declared_properties_preserve_own_enumerable_surface() {
 
     assert_eq!(
         result,
-        r#"{"openKeys":["error","onblocked","onerror","onsuccess","onupgradeneeded","readyState","result","source","transaction"],"openHandlers":[true,true],"databaseKeys":["name","objectStoreNames","onabort","onclose","onerror","onversionchange","version"],"databaseHandlers":[true,true,true,true],"databaseVersion":1,"databaseStores":true,"transactionKeys":["db","error","mode","objectStoreNames","onabort","oncomplete","onerror"],"transactionHandlers":[true,true,true],"transactionMode":"readonly","transactionStores":true,"requestKeys":["error","onerror","onsuccess","readyState","result","source","transaction"],"requestHandlers":[false,false],"openSourceIsNull":true,"openTransactionIsNull":true,"initialReadyState":"pending"}"#
+        r#"{"openKeys":["onblocked","onerror","onsuccess","onupgradeneeded"],"openHandlers":[true,true],"databaseKeys":["onabort","onclose","onerror","onversionchange"],"databaseHandlers":[true,true,true,true],"databaseVersion":1,"databaseStores":true,"transactionKeys":["objectStoreNames","onabort","oncomplete","onerror"],"transactionHandlers":[true,true,true],"transactionMode":"readonly","transactionStores":true,"requestKeys":["onerror","onsuccess"],"requestHandlers":[false,false],"openSourceIsNull":true,"openTransactionIsNull":true,"initialReadyState":"pending"}"#
     );
 }
 
@@ -927,8 +948,10 @@ fn indexed_db_can_roundtrip_a_record() {
 #[tokio::test]
 async fn indexed_db_can_roundtrip_crypto_key_internal_slots() {
     let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).expect("loader");
-    let mut vm =
-        new_page_task_executor_test_vm_with_loader("https://indexeddb-cryptokey.test/", &loader);
+    let mut vm = new_storage_page_task_executor_test_vm_with_loader(
+        "https://indexeddb-cryptokey.test/",
+        &loader,
+    );
 
     vm.eval(
         r#"
@@ -994,8 +1017,8 @@ async fn indexed_db_can_roundtrip_crypto_key_internal_slots() {
       );
       x25519Private.extraProperty = "hi";
       const writeTx = db.transaction("kv", "readwrite");
-      writeTx.onerror = () => {
-        globalThis.__indexedDbCryptoKeyResult = `write-error:${writeTx.error && writeTx.error.name}`;
+      writeTx.onerror = event => {
+        globalThis.__indexedDbCryptoKeyResult = `write-error:${event.target.error && event.target.error.name}:${event.target.error && event.target.error.message}`;
       };
       const writeStore = writeTx.objectStore("kv");
       writeStore.put(hmacKey, "hmac");
@@ -1059,35 +1082,14 @@ async fn indexed_db_can_roundtrip_crypto_key_internal_slots() {
     )
     .expect("indexeddb CryptoKey workflow should schedule");
 
-    for _ in 0..64 {
-        while vm
-            .run_one_webcrypto_task_executor_turn(&loader)
-            .await
-            .expect("WebCrypto production task should apply")
-        {}
-        if vm
-            .eval("String(globalThis.__indexedDbCryptoKeyResult !== 'pending')")
-            .expect("indexeddb CryptoKey state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("indexeddb CryptoKey workflow should advance");
-        if vm
-            .eval("String(globalThis.__indexedDbCryptoKeyResult !== 'pending')")
-            .expect("indexeddb CryptoKey state should evaluate after one task")
-            == "true"
-        {
-            break;
-        }
-        // Re-enter the loop before waiting: the task-end checkpoint above may
-        // already have made WebCrypto runnable while its coalesced owner wake
-        // was consumed by the selected Page turn. The production dispatcher
-        // always checks stable sources before blocking; this fixture must do
-        // the same instead of treating another wake as required progress.
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbCryptoKeyResult !== 'pending')",
+        "true",
+        "IndexedDB CryptoKey roundtrip",
+    )
+    .await;
 
     let result = vm
         .eval("String(globalThis.__indexedDbCryptoKeyResult)")
@@ -1179,9 +1181,13 @@ fn indexed_db_roundtrips_blob_file_and_array_buffer_values() {
     );
 }
 
-#[test]
-fn indexed_db_roundtrips_opfs_handles_with_durable_external_objects() {
-    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-opfs-handle.test/");
+#[tokio::test]
+async fn indexed_db_roundtrips_opfs_handles_with_durable_external_objects() {
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).expect("loader");
+    let mut vm = new_storage_page_task_executor_test_vm_with_loader(
+        "https://indexeddb-opfs-handle.test/",
+        &loader,
+    );
 
     vm.eval(
         r#"
@@ -1245,8 +1251,17 @@ globalThis.__indexedDbOpfsHandleResult = "pending";
     )
     .expect("IndexedDB OPFS handle workflow should schedule");
 
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbOpfsHandleResult !== 'pending')",
+        "true",
+        "IndexedDB OPFS handles and Blob body should finish reading",
+    )
+    .await;
+
     let result = vm
-        .eval_after_selected_page_tasks("String(globalThis.__indexedDbOpfsHandleResult)")
+        .eval("String(globalThis.__indexedDbOpfsHandleResult)")
         .expect("IndexedDB OPFS handle result should be readable");
     assert_eq!(
         result,
@@ -1465,6 +1480,9 @@ fn indexed_db_uses_injected_storage_manager() {
     let manager_a = crate::new_indexed_db_manager(Some(root_a.clone()))
         .expect("page-local indexedDB manager should initialize");
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager_a)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager_a),
+    );
 
     vm.eval(
         r#"
@@ -1497,12 +1515,27 @@ fn indexed_db_uses_injected_storage_manager() {
         None,
     )
     .serialized_storage_key();
-    assert!(
-        indexed_db_origin_file(&root_a, &storage_key).exists(),
-        "page-local manager should receive the IndexedDB origin file"
+    assert_eq!(
+        manager_a
+            .lock()
+            .sqlite_service()
+            .database_version(storage_key.as_bytes(), "app")
+            .unwrap(),
+        Some(1)
     );
-
-    let _ = std::fs::remove_dir_all(root_a);
+    drop(vm);
+    drop(manager_a);
+    let reopened = crate::new_indexed_db_manager(Some(root_a.clone())).unwrap();
+    assert_eq!(
+        reopened
+            .lock()
+            .sqlite_service()
+            .database_version(storage_key.as_bytes(), "app")
+            .unwrap(),
+        Some(1)
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(root_a).unwrap();
 }
 
 #[tokio::test]
@@ -1528,6 +1561,9 @@ async fn indexed_db_databases_in_cross_origin_child_excludes_top_origin_names() 
         .expect("page-local indexedDB manager should initialize");
     let mut vm = new_storage_page_task_executor_test_vm_with_loader(&top_url, &loader);
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     let db_name = "top-origin-db";
     let db_name_literal = serde_json::to_string(db_name).expect("db name should serialize");
@@ -1553,18 +1589,14 @@ async fn indexed_db_databases_in_cross_origin_child_excludes_top_origin_names() 
         ))
         .expect("top origin database setup should evaluate");
     assert_eq!(setup, "scheduled");
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__topDatabaseReady)")
-            .expect("top database state should evaluate")
-            == "ok"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("top database open should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__topDatabaseReady)",
+        "ok",
+        "top database open should advance",
+    )
+    .await;
     assert_eq!(
         vm.eval("String(globalThis.__topDatabaseReady)")
             .expect("top database final state should evaluate"),
@@ -1620,18 +1652,14 @@ async fn indexed_db_databases_in_cross_origin_child_excludes_top_origin_names() 
         "__indexedDbDatabasesChildFrame.contentWindow.postMessage({{action: 'delete', name: {db_name_literal}}}, {child_origin_literal})"
     ))
     .expect("delete message to cross-origin child should evaluate");
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__childDatabaseNames !== 'pending')")
-            .expect("child delete response state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("child delete response should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__childDatabaseNames !== 'pending')",
+        "true",
+        "child delete response should advance",
+    )
+    .await;
     let result = vm
         .eval("String(globalThis.__childDatabaseNames)")
         .expect("child delete response should evaluate");
@@ -1645,18 +1673,14 @@ async fn indexed_db_databases_in_cross_origin_child_excludes_top_origin_names() 
         "globalThis.__childDatabaseNames = 'pending'; __indexedDbDatabasesChildFrame.contentWindow.postMessage({{action: 'get'}}, {child_origin_literal})"
     ))
     .expect("message to cross-origin child should evaluate");
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__childDatabaseNames !== 'pending')")
-            .expect("child database response state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("child database response should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__childDatabaseNames !== 'pending')",
+        "true",
+        "child database response should advance",
+    )
+    .await;
 
     let result = vm
         .eval("String(globalThis.__childDatabaseNames)")
@@ -1690,6 +1714,9 @@ async fn indexed_db_top_factory_ignores_stale_active_child_scope() {
         .expect("page-local indexedDB manager should initialize");
     let mut vm = new_storage_page_task_executor_test_vm_with_loader(&top_url, &loader);
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     let child_url_literal = serde_json::to_string(&child_url).expect("child url should serialize");
     let setup = vm
@@ -1783,6 +1810,9 @@ async fn indexed_db_blocked_upgrade_result_database_keeps_opener_owner() {
         &loader,
     );
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     vm.eval(
         r#"
@@ -1804,10 +1834,12 @@ async fn indexed_db_blocked_upgrade_result_database_keeps_opener_owner() {
   request.onsuccess = () => {
     globalThis.__blockedUpgradeOwnerTopDb = request.result;
     globalThis.__blockedUpgradeOwnerTopDb.onversionchange = () => {
-      const sender = new BroadcastChannel("blocked-upgrade-top-versionchange-owner");
-      sender.postMessage("top-versionchange");
-      globalThis.__blockedUpgradeOwnerTopVersionChange = "closed";
-      globalThis.__blockedUpgradeOwnerTopDb.close();
+      Promise.resolve().then(() => {
+        const sender = new BroadcastChannel("blocked-upgrade-top-versionchange-owner");
+        sender.postMessage("top-versionchange");
+        globalThis.__blockedUpgradeOwnerTopVersionChange = "closed";
+        globalThis.__blockedUpgradeOwnerTopDb.close();
+      });
     };
     globalThis.__blockedUpgradeOwnerTopReady = "ok";
   };
@@ -1816,18 +1848,14 @@ async fn indexed_db_blocked_upgrade_result_database_keeps_opener_owner() {
 "#,
     )
     .expect("blocked-upgrade owner top setup should schedule");
-    for _ in 0..16 {
-        if vm
-            .eval("String(globalThis.__blockedUpgradeOwnerTopReady)")
-            .expect("top blocked-upgrade owner state should evaluate")
-            == "ok"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("top blocked-upgrade owner setup should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__blockedUpgradeOwnerTopReady)",
+        "ok",
+        "top blocked-upgrade owner setup should advance",
+    )
+    .await;
     assert_eq!(
         vm.eval("String(globalThis.__blockedUpgradeOwnerTopReady)")
             .expect("top blocked-upgrade owner final state should evaluate"),
@@ -1880,20 +1908,9 @@ parent.postMessage({ kind: "child-ready" }, "*");
     )
     .expect("blocked-upgrade owner child setup should schedule");
 
-    for _ in 0..8 {
-        if vm
-            .eval(
-                "String(globalThis.__blockedUpgradeOwnerMessages.some(message => message.kind === 'child-ready'))",
-            )
-            .expect("child-ready state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("blocked-upgrade owner child setup should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm, &loader, "String(globalThis.__blockedUpgradeOwnerMessages.some(message => message.kind === 'child-ready'))", "true", "blocked-upgrade owner child setup should advance",
+    ).await;
 
     vm.eval(
         r#"
@@ -1901,20 +1918,9 @@ globalThis.__blockedUpgradeOwnerFrame.contentWindow.postMessage({ action: "open-
 "#,
     )
     .expect("child blocked-upgrade open should post");
-    for _ in 0..24 {
-        if vm
-            .eval(
-                "String(globalThis.__blockedUpgradeOwnerMessages.some(message => message.kind === 'child-open-v2-success'))",
-            )
-            .expect("child open-v2 state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("child open-v2 should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm, &loader, "String(globalThis.__blockedUpgradeOwnerMessages.some(message => message.kind === 'child-open-v2-success'))", "true", "child open-v2 should advance",
+    ).await;
     assert_eq!(
         vm.eval("String(globalThis.__blockedUpgradeOwnerTopVersionChange)")
             .expect("top versionchange state should evaluate"),
@@ -1957,20 +1963,9 @@ globalThis.__blockedUpgradeOwnerFrame.contentWindow.postMessage({ action: "open-
 "#,
     )
     .expect("top v3 open should schedule");
-    for _ in 0..24 {
-        if vm
-            .eval(
-                "String(globalThis.__blockedUpgradeOwnerTopV3 !== 'pending' && globalThis.__blockedUpgradeOwnerMessages.some(message => message.kind === 'child-db-versionchange'))",
-            )
-            .expect("top v3 and child versionchange state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("top v3 open should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm, &loader, "String(globalThis.__blockedUpgradeOwnerTopV3 !== 'pending' && globalThis.__blockedUpgradeOwnerMessages.some(message => message.kind === 'child-db-versionchange'))", "true", "top v3 open should advance",
+    ).await;
 
     assert_eq!(
         vm.eval("String(globalThis.__blockedUpgradeOwnerTopV3)")
@@ -2015,6 +2010,9 @@ async fn indexed_db_continuations_preserve_lightweight_popup_sender() {
         &loader,
     );
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     let setup = vm
         .eval(
@@ -2057,18 +2055,14 @@ async fn indexed_db_continuations_preserve_lightweight_popup_sender() {
         .expect("popup IndexedDB owner workflow should schedule");
     assert_eq!(setup, "scheduled");
 
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__popupIndexedDbMessages.length)")
-            .expect("popup delete response length should evaluate")
-            == "1"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("wait driver should drain popup delete response");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__popupIndexedDbMessages.length)",
+        "1",
+        "wait driver should drain popup delete response",
+    )
+    .await;
     assert_eq!(
         vm.eval("String(globalThis.__popupIndexedDbMessages[0])")
             .expect("popup delete response should evaluate"),
@@ -2082,18 +2076,14 @@ globalThis.__indexedDbPopup.postMessage({ action: "get" }, "*");
 "#,
     )
     .expect("popup databases message should evaluate");
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__popupIndexedDbMessages.length)")
-            .expect("popup databases response length should evaluate")
-            == "1"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("wait driver should drain popup databases response");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__popupIndexedDbMessages.length)",
+        "1",
+        "wait driver should drain popup databases response",
+    )
+    .await;
     assert_eq!(
         vm.eval("String(globalThis.__popupIndexedDbMessages[0])")
             .expect("popup databases response should evaluate"),
@@ -2114,6 +2104,9 @@ async fn indexed_db_continuation_broadcast_channel_stays_in_lightweight_popup_ow
         &loader,
     );
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     let setup = vm
         .eval(
@@ -2191,6 +2184,9 @@ async fn message_port_handler_indexed_db_uses_lightweight_popup_owner() {
         &loader,
     );
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     let setup = vm
         .eval(
@@ -2260,18 +2256,14 @@ async fn message_port_handler_indexed_db_uses_lightweight_popup_owner() {
         .expect("popup MessagePort IndexedDB owner workflow should schedule");
     assert_eq!(setup, "scheduled");
 
-    for _ in 0..16 {
-        if vm
-            .eval("String(globalThis.__messagePortPopupIndexedDbMessages.length)")
-            .expect("popup MessagePort IndexedDB response length should evaluate")
-            == "1"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("popup MessagePort IndexedDB workflow should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__messagePortPopupIndexedDbMessages.length)",
+        "1",
+        "popup MessagePort IndexedDB workflow should advance",
+    )
+    .await;
 
     assert_eq!(
         vm.eval("String(globalThis.__messagePortPopupIndexedDbMessages[0])")
@@ -2295,6 +2287,9 @@ async fn indexed_db_same_origin_popup_databases_share_top_level_owner() {
         .expect("page-local indexedDB manager should initialize");
     let mut vm = new_storage_page_task_executor_test_vm_with_loader(top_url.as_str(), &loader);
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     vm.eval(
         r#"
@@ -2322,18 +2317,14 @@ async fn indexed_db_same_origin_popup_databases_share_top_level_owner() {
 "#,
     )
     .expect("same-origin popup IndexedDB setup should schedule");
-    for _ in 0..16 {
-        if vm
-            .eval("String(globalThis.__indexedDbSameOriginDatabaseReady)")
-            .expect("same-origin popup database setup state should evaluate")
-            == "ready"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("same-origin popup database setup should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbSameOriginDatabaseReady)",
+        "ready",
+        "same-origin popup database setup should advance",
+    )
+    .await;
     assert_eq!(
         vm.eval("String(globalThis.__indexedDbSameOriginDatabaseReady)")
             .expect("same-origin popup database setup result should evaluate"),
@@ -2413,6 +2404,9 @@ async fn indexed_db_child_reply_does_not_leak_child_scope_to_top_continuation() 
         &loader,
     );
     vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    vm.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
 
     let setup = vm
         .eval(
@@ -2746,7 +2740,7 @@ fn navigator_storage_estimate_usage_tracks_current_origin_storage() {
 
     assert_eq!(
         result,
-        "0||7||true|number|true|true|true|true|true|true|indexedDB,caches,fileSystem|1073741824"
+        "0||0||true|number|true|true|true|true|true|true|indexedDB,caches,fileSystem|1073741824"
     );
 
     let other_page_url = format!("https://storage-estimate-other-{nonce}.test/");
@@ -2765,6 +2759,214 @@ navigator.storage.estimate().then((estimate) => {
         .eval_after_selected_page_tasks("String(globalThis.__storageEstimateOtherOriginResult)")
         .expect("other origin storage estimate should be readable");
     assert_eq!(other_result, "0");
+}
+
+#[test]
+fn indexed_db_storage_clear_aborts_started_and_pending_requests_before_close() {
+    let page_url = "https://indexeddb-clear-lifecycle.test/";
+    let manager = crate::new_indexed_db_manager(None).unwrap();
+    let mut page = new_storage_page_task_executor_test_vm(page_url);
+    page.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+    page.set_storage_bucket_store(
+        crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+    );
+    page.eval(
+        r#"
+globalThis.dbReady = false;
+const opening = indexedDB.open("clear-lifecycle", 1);
+opening.onupgradeneeded = () => {
+  opening.result.createObjectStore("a");
+  opening.result.createObjectStore("b");
+};
+opening.onsuccess = () => { globalThis.db = opening.result; dbReady = true; };
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        page.eval_after_selected_page_tasks("String(dbReady)")
+            .unwrap(),
+        "true"
+    );
+    page.eval(r#"
+globalThis.trace = [];
+globalThis.requests = [];
+globalThis.result = "pending";
+for (const store of ["a", "b", "a"]) {
+  const tx = db.transaction(store, "readwrite");
+  const request = tx.objectStore(store).put("uncommitted", 1);
+  requests.push(request);
+  request.onsuccess = () => trace.push("unexpected-success");
+  request.onerror = event => { event.preventDefault(); trace.push("request:" + request.error.name); };
+  tx.oncomplete = () => trace.push("unexpected-complete");
+  tx.onabort = () => trace.push("abort:" + tx.error.name);
+}
+db.onclose = () => {
+  trace.push("close");
+  let rejected;
+  try { db.transaction("a"); } catch (error) { rejected = error.name; }
+  result = JSON.stringify({
+    errors: trace.filter(x => x === "request:AbortError").length,
+    aborts: trace.filter(x => x === "abort:AbortError").length,
+    unexpected: trace.filter(x => x.startsWith("unexpected")).length,
+    closeLast: trace.at(-1) === "close" && trace.length === 7,
+    done: requests.every(request => request.readyState === "done"), rejected
+  });
+};
+"#).unwrap();
+    assert_eq!(
+        page.eval("String(requests.every(request => request.readyState === 'pending'))")
+            .unwrap(),
+        "true"
+    );
+    let storage_key = moli_storage_key::MoliStorageKey::first_party_from_url(
+        &Url::parse(page_url).unwrap(),
+        None,
+    )
+    .serialized_storage_key();
+    crate::clear_indexed_db_origin(&manager, &storage_key).unwrap();
+    assert_eq!(
+        page.eval_after_selected_page_tasks("String(result)")
+            .unwrap(),
+        r#"{"errors":3,"aborts":3,"unexpected":0,"closeLast":true,"done":true,"rejected":"InvalidStateError"}"#
+    );
+}
+
+#[test]
+fn indexed_db_serialized_writer_rechecks_quota_after_preceding_commit() {
+    let page_url = "https://indexeddb-commit-quota-race.test/";
+    let manager = crate::new_indexed_db_manager(None).expect("private IndexedDB manager");
+    let buckets = crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager);
+    let mut first = new_storage_page_task_executor_test_vm(page_url);
+    let mut second = new_storage_page_task_executor_test_vm(page_url);
+    for page in [&mut first, &mut second] {
+        page.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+        page.set_storage_bucket_store(buckets.clone());
+        page.eval(
+            r#"
+globalThis.dbReady = false;
+const opening = indexedDB.open("quota-race", 1);
+opening.onupgradeneeded = () => {
+  opening.result.createObjectStore("a");
+  opening.result.createObjectStore("b");
+};
+opening.onsuccess = () => { globalThis.db = opening.result; dbReady = true; };
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            page.eval_after_selected_page_tasks("String(dbReady)")
+                .unwrap(),
+            "true"
+        );
+    }
+    let storage_key = moli_storage_key::MoliStorageKey::first_party_from_url(
+        &Url::parse(page_url).unwrap(),
+        None,
+    )
+    .serialized_storage_key();
+    let initial_usage = manager.lock().origin_usage_bytes(&storage_key).unwrap();
+    let cache_usage =
+        moli_storage_service::DEFAULT_ORIGIN_STORAGE_QUOTA_BYTES - initial_usage - 1600;
+    {
+        let mut store = buckets.lock();
+        let identity = store
+            .open_bucket(
+                &storage_key,
+                moli_storage_service::IMPLICIT_DEFAULT_BUCKET_INTERNAL_NAME,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .put_cache_entry_for_identity(
+                    &identity,
+                    "reservation",
+                    "/reserved",
+                    moli_storage_service::StorageBucketCachedResponse {
+                        head: moli_fetch_types::FetchResponseHead {
+                            metadata: moli_fetch_types::FetchResponseMetadata {
+                                response_type: moli_fetch_types::FetchResponseType::Default,
+                                timing_allow_passed: true,
+                                url_list: vec![
+                                    (format!("{page_url}reserved"))
+                                        .parse()
+                                        .expect("valid response URL")
+                                ],
+                                redirected: false
+                            },
+                            status: 200,
+                            status_text: "OK".into(),
+                            headers: Vec::new()
+                        },
+                        body: vec![0]
+                    },
+                    cache_usage,
+                    0,
+                )
+                .unwrap(),
+            moli_storage_service::StorageBucketCachePutOutcome::Stored
+        );
+    }
+    // A single SQL connection starts one transaction at a time, including
+    // disjoint scopes. The second request must see the first committed usage;
+    // cross-database COMMIT races have separate SQL factory coverage.
+    for (page, store) in [(&mut first, "a"), (&mut second, "b")] {
+        page.eval(&format!(
+            r#"
+globalThis.trace = [];
+globalThis.writer = db.transaction({store:?}, "readwrite");
+globalThis.write = writer.objectStore({store:?}).put("x".repeat(1024), 1);
+write.onsuccess = () => trace.push("request-success");
+write.onerror = () => trace.push("request-error");
+writer.onerror = () => trace.push("transaction-error");
+writer.onabort = () => trace.push("abort:" + writer.error.name);
+writer.oncomplete = () => trace.push("complete");
+"#
+        ))
+        .unwrap();
+        assert_eq!(page.eval("write.readyState").unwrap(), "pending");
+    }
+    second
+        .eval(
+            r#"
+globalThis.successorTrace = [];
+const successor = db.transaction("b", "readwrite");
+successor.objectStore("b").put("ok", 2).onsuccess = () => successorTrace.push("success");
+successor.oncomplete = () => successorTrace.push("complete");
+successor.onabort = () => successorTrace.push("abort");
+"#,
+        )
+        .unwrap();
+    assert_eq!(
+        first
+            .eval_after_selected_page_tasks("JSON.stringify(trace)")
+            .unwrap(),
+        r#"["request-success","complete"]"#
+    );
+    assert_eq!(
+        second
+            .eval_after_selected_page_tasks(
+                "JSON.stringify({trace, successorTrace, error: writer.error.name})"
+            )
+            .unwrap(),
+        r#"{"trace":["request-error","transaction-error","abort:QuotaExceededError"],"successorTrace":["success","complete"],"error":"QuotaExceededError"}"#
+    );
+    first
+        .eval(
+            r#"
+globalThis.rows = [];
+const read = db.transaction(["a", "b"]);
+read.objectStore("a").get(1).onsuccess = e => rows.push(e.target.result.length);
+read.objectStore("b").get(1).onsuccess = e => rows.push(e.target.result === undefined);
+read.objectStore("b").get(2).onsuccess = e => rows.push(e.target.result);
+"#,
+        )
+        .unwrap();
+    assert_eq!(
+        first
+            .eval_after_selected_page_tasks("JSON.stringify(rows)")
+            .unwrap(),
+        r#"[1024,true,"ok"]"#
+    );
 }
 
 #[test]
@@ -2794,13 +2996,22 @@ fn default_bucket_quota_is_shared_by_cache_indexed_db_and_opfs() {
                     "fixture",
                     "/reserved",
                     moli_storage_service::StorageBucketCachedResponse {
-                        response_type: "default".to_owned(),
-                        url: format!("{page_url}reserved"),
-                        redirected: false,
-                        status: 200,
-                        status_text: "OK".to_owned(),
-                        headers: Vec::new(),
-                        body: b"small materialized fixture".to_vec(),
+                        head: moli_fetch_types::FetchResponseHead {
+                            metadata: moli_fetch_types::FetchResponseMetadata {
+                                response_type: moli_fetch_types::FetchResponseType::Default,
+                                timing_allow_passed: true,
+                                url_list: vec![
+                                    (format!("{page_url}reserved"))
+                                        .parse()
+                                        .expect("valid response URL")
+                                ],
+                                redirected: false
+                            },
+                            status: 200,
+                            status_text: "OK".to_owned(),
+                            headers: Vec::new()
+                        },
+                        body: b"small materialized fixture".to_vec()
                     },
                     cache_usage,
                     0,
@@ -3190,6 +3401,88 @@ fn indexed_db_put_function_throws_data_clone_error() {
 }
 
 #[test]
+fn indexed_db_put_rejects_performance_entries_without_rejecting_plain_objects() {
+    let mut vm =
+        new_storage_page_task_executor_test_vm("https://indexeddb-performance-clone.test/");
+
+    vm.eval(
+        r#"
+(() => {
+  globalThis.__indexedDbPerformanceClone = "pending";
+  const open = indexedDB.open(`app-${Math.random()}`, 1);
+  open.onupgradeneeded = () => {
+    const store = open.result.createObjectStore("entries");
+    let key = 0;
+    const probe = value => {
+      try {
+        store.put(value, ++key);
+        return "ok";
+      } catch (error) {
+        return error && error.name;
+      }
+    };
+    const navigation = performance.getEntriesByType("navigation")[0];
+    const mark = performance.mark("stored-mark");
+    const measure = performance.measure("stored-measure");
+    const constructed = new PerformanceMark("stored-constructor");
+    const inherited = Object.create(mark);
+    inherited.value = 7;
+    const fake = Object.create(PerformanceEntry.prototype);
+    fake.value = 8;
+
+    globalThis.__indexedDbPerformanceClone = JSON.stringify({
+      navigation: probe(navigation),
+      mark: probe(mark),
+      measure: probe(measure),
+      constructed: probe(constructed),
+      nested: probe({ entry: mark }),
+      plain: probe(mark.toJSON()),
+      inherited: probe(inherited),
+      fake: probe(fake),
+      forged: probe({ __moliWebApiType: true })
+    });
+  };
+  return "scheduled";
+})()
+"#,
+    )
+    .expect("indexeddb PerformanceEntry clone workflow should schedule");
+
+    let result = vm
+        .eval_after_selected_page_tasks("String(globalThis.__indexedDbPerformanceClone)")
+        .expect("indexeddb PerformanceEntry clone result should be readable");
+
+    assert_eq!(
+        result,
+        r#"{"navigation":"DataCloneError","mark":"DataCloneError","measure":"DataCloneError","constructed":"DataCloneError","nested":"DataCloneError","plain":"ok","inherited":"ok","fake":"ok","forged":"ok"}"#
+    );
+}
+
+#[test]
+fn indexed_db_rejects_shared_buffers_at_any_depth() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-shared-buffer.test/");
+    vm.eval(
+        r#"
+      globalThis.sharedStored = 'pending';
+      const open = indexedDB.open('shared-buffers', 1);
+      open.onupgradeneeded = () => {
+        const store = open.result.createObjectStore('values');
+        const shared = new SharedArrayBuffer(8);
+        sharedStored = [shared, {nested: shared}].map((value, key) => {
+          try { store.put(value, key); return 'accepted'; }
+          catch (error) { return error.name; }
+        }).join('|');
+      };
+    "#,
+    )
+    .expect("schedule SharedArrayBuffer storage checks");
+    assert_eq!(
+        vm.eval_after_selected_page_tasks("sharedStored").unwrap(),
+        "DataCloneError|DataCloneError"
+    );
+}
+
+#[test]
 fn indexed_db_put_webassembly_module_throws_data_clone_error_for_storage() {
     let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-wasm-dataclone.test/");
 
@@ -3341,38 +3634,40 @@ fn indexed_db_out_of_line_store_missing_key_throws_data_error() {
 }
 
 #[test]
-fn indexed_db_rejects_out_of_range_integer_keys() {
-    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-out-of-range-key.test/");
+fn indexed_db_roundtrips_explicit_number_keys_beyond_safe_integer_range() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-large-number-key.test/");
 
     vm.eval(
         r#"
-(() => {
-  globalThis.__indexedDbOutOfRangeKeyError = "pending";
-  const dbName = `app-${Math.random()}`;
-  const open = indexedDB.open(dbName, 1);
-  open.onupgradeneeded = () => open.result.createObjectStore("outline");
-  open.onsuccess = () => {
-    try {
-      open.result
-        .transaction("outline", "readwrite")
-        .objectStore("outline")
-        .put({ value: 1 }, Number.MAX_SAFE_INTEGER + 1);
-      globalThis.__indexedDbOutOfRangeKeyError = "no-error";
-    } catch (error) {
-      globalThis.__indexedDbOutOfRangeKeyError = error.name;
-    }
+const key = Number.MAX_SAFE_INTEGER + 1;
+globalThis.largeNumberKeyResult = "pending";
+const open = indexedDB.open(`large-number-${Math.random()}`, 1);
+open.onupgradeneeded = () => open.result.createObjectStore("outline");
+open.onsuccess = () => {
+  const db = open.result;
+  const tx = db.transaction("outline", "readwrite");
+  const store = tx.objectStore("outline");
+  let savedKey, savedValue;
+  tx.onabort = () => { largeNumberKeyResult = `abort:${tx.error.name}`; };
+  tx.oncomplete = () => {
+    largeNumberKeyResult = JSON.stringify([savedKey, savedValue]);
+    db.close();
   };
-  return "scheduled";
-})()
+  const put = store.put({value: 1}, key);
+  put.onsuccess = () => {
+    savedKey = put.result;
+    const get = store.get(savedKey);
+    get.onsuccess = () => { savedValue = get.result.value; };
+  };
+};
 "#,
     )
-    .expect("indexeddb out-of-range key workflow should schedule");
+    .expect("large number key workflow should schedule");
 
     let result = vm
-        .eval_after_selected_page_tasks("String(globalThis.__indexedDbOutOfRangeKeyError)")
-        .expect("indexeddb out-of-range key result should be readable");
-
-    assert_eq!(result, "TypeError");
+        .eval_after_selected_page_tasks("String(globalThis.largeNumberKeyResult)")
+        .expect("large number key requests and commit should finish");
+    assert_eq!(result, "[9007199254740992,1]");
 }
 
 #[test]
@@ -3469,7 +3764,7 @@ fn indexed_db_object_store_index_metadata_is_available() {
 
     assert_eq!(
         result,
-        "autoIncrement,db,indexNames,keyPath,name,transaction|true|true|false|keyPath,multiEntry,name,objectStore,unique|true|true|by-id|id|true|false|by-id|kv"
+        "|false|false|false||false|true|by-id|id|true|false|by-id|kv"
     );
 }
 
@@ -3609,10 +3904,8 @@ fn indexed_db_index_queries_and_key_ranges_work() {
         .eval_after_selected_page_tasks("String(globalThis.__indexedDbIndexQueryResult)")
         .expect("indexeddb index query result should be readable");
 
-    assert_eq!(
-        result,
-        "lower,lowerOpen,upper,upperOpen|true|news|news|false|false|a|a|a,c|a,c|2"
-    );
+    // Range attributes are inherited readonly accessors, not own properties.
+    assert_eq!(result, "|true|news|news|false|false|a|a|a,c|a,c|2");
 }
 
 #[test]
@@ -3743,11 +4036,11 @@ fn indexed_db_object_store_range_count_zero_and_open_bounds_work() {
         .eval_after_selected_page_tasks("String(globalThis.__indexedDbStoreRangeOpenResult)")
         .expect("indexeddb object store open range result should be readable");
 
-    assert_eq!(result, "false|true|false|0|b|1");
+    assert_eq!(result, "false|true|false|1|b|1");
 }
 
 #[test]
-fn indexed_db_get_all_object_wrapped_query_values_stay_queries() {
+fn indexed_db_get_all_boxed_primitives_are_options_and_dates_are_keys() {
     let mut vm =
         new_storage_page_task_executor_test_vm("https://indexeddb-getall-wrapper-query.test/");
 
@@ -3763,12 +4056,14 @@ fn indexed_db_get_all_object_wrapped_query_values_stay_queries() {
     const store = writeTx.objectStore("kv");
     store.put("five", 5);
     store.put("string", "x");
-    store.put("date", 1000);
+    store.put("date", new Date(1000));
     writeTx.oncomplete = () => {
       const readStore = db.transaction("kv").objectStore("kv");
-      const numberReq = readStore.getAll(new Number(5));
+      const numberOptions = Object.assign(new Number(5), {query: "x"});
+      const numberReq = readStore.getAll(numberOptions);
       numberReq.onsuccess = () => {
-        const stringReq = readStore.getAllKeys(new String("x"));
+        const stringOptions = Object.assign(new String("x"), {query: 5});
+        const stringReq = readStore.getAllKeys(stringOptions);
         stringReq.onsuccess = () => {
           const dateReq = readStore.getAll(new Date(1000));
           dateReq.onsuccess = () => {
@@ -3792,7 +4087,7 @@ fn indexed_db_get_all_object_wrapped_query_values_stay_queries() {
         .eval_after_selected_page_tasks("String(globalThis.__indexedDbGetAllWrapperQueryResult)")
         .expect("indexeddb wrapper query result should be readable");
 
-    assert_eq!(result, "five|x|date");
+    assert_eq!(result, "string|5|date");
 }
 
 #[tokio::test]
@@ -3834,18 +4129,14 @@ async fn indexed_db_get_all_options_rejects_detached_typed_array_query() {
     )
     .expect("indexeddb detached query workflow should schedule");
 
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__indexedDbDetachedQueryResult !== 'pending')")
-            .expect("indexeddb detached query state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("indexeddb detached query should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbDetachedQueryResult !== 'pending')",
+        "true",
+        "indexeddb detached query should advance",
+    )
+    .await;
 
     let result = vm
         .eval("String(globalThis.__indexedDbDetachedQueryResult)")
@@ -3933,18 +4224,14 @@ async fn indexed_db_detached_realm_methods_keep_receiver_realm_state() {
     )
     .expect("cross-realm IndexedDB method workflow should schedule");
 
-    for _ in 0..32 {
-        if vm
-            .eval("String(globalThis.__indexedDbCrossRealmMethodResult !== 'pending')")
-            .expect("cross-realm IndexedDB method state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("cross-realm IndexedDB method workflow should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbCrossRealmMethodResult !== 'pending')",
+        "true",
+        "cross-realm IndexedDB method workflow should advance",
+    )
+    .await;
 
     assert_eq!(
         vm.eval("String(globalThis.__indexedDbCrossRealmMethodResult)")
@@ -4072,10 +4359,7 @@ fn indexed_db_object_store_cursors_can_iterate() {
         .eval_after_selected_page_tasks("String(globalThis.__indexedDbStoreCursorResult)")
         .expect("indexeddb object store cursor result should be readable");
 
-    assert_eq!(
-        result,
-        "a:one,c:three|direction,key,primaryKey,request,source,value|b|b|direction,key,primaryKey,request,source"
-    );
+    assert_eq!(result, "a:one,c:three||b|b|");
 }
 
 #[tokio::test]
@@ -4130,18 +4414,14 @@ async fn indexed_db_open_key_cursor_transaction_completes_after_iteration() {
     )
     .expect("indexeddb openKeyCursor completion workflow should schedule");
 
-    for _ in 0..32 {
-        if vm
-            .eval("String(globalThis.__indexedDbOpenKeyCursorComplete !== 'pending')")
-            .expect("indexeddb openKeyCursor completion state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("indexeddb openKeyCursor completion should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbOpenKeyCursorComplete !== 'pending')",
+        "true",
+        "indexeddb openKeyCursor completion should advance",
+    )
+    .await;
 
     assert_eq!(
         vm.eval("String(globalThis.__indexedDbOpenKeyCursorComplete)")
@@ -4312,18 +4592,14 @@ async fn indexed_db_transaction_stays_active_through_creation_task_microtasks() 
     )
     .expect("IndexedDB creation-task microtask workflow should schedule");
 
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__indexedDbCreationMicrotasksResult !== 'pending')")
-            .expect("IndexedDB creation-task microtask state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("IndexedDB creation-task microtask workflow should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbCreationMicrotasksResult !== 'pending')",
+        "true",
+        "IndexedDB creation-task microtask workflow should advance",
+    )
+    .await;
 
     let result = vm
         .eval("String(globalThis.__indexedDbCreationMicrotasksResult)")
@@ -4367,18 +4643,14 @@ async fn indexed_db_object_store_open_key_cursor_rejects_after_transaction_inact
     )
     .expect("indexeddb inactive openKeyCursor workflow should schedule");
 
-    for _ in 0..8 {
-        if vm
-            .eval("String(globalThis.__indexedDbInactiveOpenKeyCursorResult !== 'pending')")
-            .expect("indexeddb inactive openKeyCursor state should evaluate")
-            == "true"
-        {
-            break;
-        }
-        wait_for_one_selected_page_task_executor_test_turn(&mut vm, &loader)
-            .await
-            .expect("indexeddb inactive openKeyCursor should advance");
-    }
+    advance_page_task_executor_until_eval_equals(
+        &mut vm,
+        &loader,
+        "String(globalThis.__indexedDbInactiveOpenKeyCursorResult !== 'pending')",
+        "true",
+        "indexeddb inactive openKeyCursor should advance",
+    )
+    .await;
 
     let result = vm
         .eval("String(globalThis.__indexedDbInactiveOpenKeyCursorResult)")
@@ -4779,7 +5051,7 @@ fn indexed_db_cursors_support_prev_directions() {
         .eval_after_selected_page_tasks("String(globalThis.__indexedDbCursorPrevResult)")
         .expect("indexeddb cursor prev result should be readable");
 
-    assert_eq!(result, "c,b,a|tech:c,news:b");
+    assert_eq!(result, "c,b,a|tech:c,news:a");
 }
 
 #[test]
@@ -4869,48 +5141,54 @@ fn indexed_db_cursor_continue_primary_key_validates_target_position() {
 }
 
 #[test]
-fn indexed_db_cursor_update_and_delete_fail_in_readonly_transactions() {
+fn indexed_db_cursor_mutations_reject_readonly_synchronously_without_admitting_requests() {
     let mut vm =
         new_storage_page_task_executor_test_vm("https://indexeddb-cursor-readonly-error.test/");
 
     vm.eval(
         r#"
-(() => {
-  globalThis.__indexedDbCursorReadonlyError = "pending";
-  const open = indexedDB.open("app", 1);
-  open.onupgradeneeded = () => open.result.createObjectStore("kv");
-  open.onsuccess = () => {
-    const db = open.result;
-    const tx = db.transaction("kv", "readwrite");
-    tx.objectStore("kv").put({ value: 1 }, "a");
+globalThis.cursorReadonlyResult = "pending";
+const open = indexedDB.open("app", 1);
+open.onupgradeneeded = () => open.result.createObjectStore("kv");
+open.onsuccess = () => {
+  const db = open.result;
+  const seed = db.transaction("kv", "readwrite");
+  seed.objectStore("kv").put({value: 1}, "a");
+  seed.oncomplete = () => {
+    const tx = db.transaction("kv");
+    const store = tx.objectStore("kv");
+    const errors = [];
+    let conversions = 0, stored;
+    tx.onabort = () => { cursorReadonlyResult = "unexpected-abort"; };
     tx.oncomplete = () => {
-      const req = db.transaction("kv").objectStore("kv").openCursor();
-      req.onsuccess = () => {
-        const cursor = req.result;
-        const updateReq = cursor.update({ value: 2 });
-        updateReq.onerror = () => {
-          const deleteReq = cursor.delete();
-          deleteReq.onerror = () => {
-            globalThis.__indexedDbCursorReadonlyError = [
-              updateReq.error && updateReq.error.name,
-              deleteReq.error && deleteReq.error.name
-            ].join("|");
-          };
-        };
-      };
+      cursorReadonlyResult = JSON.stringify([errors, conversions, stored, "complete"]);
+      db.close();
+    };
+    const request = store.openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      try {
+        cursor.update({get value() { conversions++; return 2; }});
+        errors.push("update-accepted");
+      } catch (error) { errors.push(error.name); }
+      try { cursor.delete(); errors.push("delete-accepted"); }
+      catch (error) { errors.push(error.name); }
+      const read = store.get("a");
+      read.onsuccess = () => { stored = read.result.value; };
     };
   };
-  return "scheduled";
-})()
+};
 "#,
     )
-    .expect("indexeddb cursor readonly error workflow should schedule");
+    .expect("readonly cursor workflow should schedule");
 
     let result = vm
-        .eval_after_selected_page_tasks("String(globalThis.__indexedDbCursorReadonlyError)")
-        .expect("indexeddb cursor readonly error result should be readable");
-
-    assert_eq!(result, "ReadOnlyError|ReadOnlyError");
+        .eval_after_selected_page_tasks("String(globalThis.cursorReadonlyResult)")
+        .expect("rejected cursor writes must leave the transaction able to complete");
+    assert_eq!(
+        result,
+        r#"[["ReadOnlyError","ReadOnlyError"],0,1,"complete"]"#
+    );
 }
 
 #[test]
@@ -4939,7 +5217,7 @@ fn indexed_db_abort_converts_pending_request_into_abort_error_and_rolls_back() {
       readReq.onsuccess = () => {
         globalThis.__indexedDbAbortResult = [
           requestError,
-          tx.error && tx.error.name,
+          tx.error === null,
           String(readReq.result)
         ].join("|");
       };
@@ -4956,7 +5234,7 @@ fn indexed_db_abort_converts_pending_request_into_abort_error_and_rolls_back() {
         .eval_after_selected_page_tasks("String(globalThis.__indexedDbAbortResult)")
         .expect("indexeddb abort result should be readable");
 
-    assert_eq!(result, "AbortError|AbortError|undefined");
+    assert_eq!(result, "AbortError|true|undefined");
 }
 
 #[test]
@@ -5036,6 +5314,249 @@ fn indexed_db_aborted_upgrade_closes_provisional_connection_before_reopen_and_de
         .expect("indexeddb aborted upgrade cleanup result should be readable");
 
     assert_eq!(result, "AbortError|1|records|deleted");
+}
+
+#[test]
+fn indexed_db_failed_upgrade_closes_connection_before_abort_listeners() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-abort-connection.test/");
+    vm.eval(
+        r#"
+globalThis.abortedConnections = [];
+function attempt(operation) {
+  try { operation(); return 'accepted'; } catch (error) { return error.name; }
+}
+function upgrade(name, oldVersion, next) {
+  const request = indexedDB.open(name, oldVersion + 1);
+  let db, tx;
+  request.onupgradeneeded = () => {
+    db = request.result;
+    tx = request.transaction;
+    if (!oldVersion) db.createObjectStore('s');
+    tx.onabort = () => abortedConnections.push([
+      'abort', db.version, request.transaction === tx, request.result === db,
+      attempt(() => db.transaction('s')),
+      attempt(() => db.transaction('s', 'readwrite')),
+      attempt(() => db.transaction('missing'))
+    ]);
+    tx.abort();
+  };
+  request.onerror = () => {
+    abortedConnections.push(['error', request.error.name,
+      request.transaction === null, request.result === undefined]);
+    next();
+  };
+}
+upgrade('initial', 0, () => {
+  const seed = indexedDB.open('existing', 1);
+  seed.onupgradeneeded = () => seed.result.createObjectStore('s');
+  seed.onsuccess = () => {
+    seed.result.close();
+    upgrade('existing', 1, () => abortedConnections.push('done'));
+  };
+});
+"#,
+    )
+    .expect("aborted upgrade connection probe should schedule");
+    let result = vm
+        .eval_after_selected_page_tasks("JSON.stringify(abortedConnections)")
+        .expect("aborted upgrade connection probe should finish");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+        serde_json::json!([
+            [
+                "abort",
+                0,
+                true,
+                true,
+                "InvalidStateError",
+                "InvalidStateError",
+                "InvalidStateError"
+            ],
+            ["error", "AbortError", true, true],
+            [
+                "abort",
+                1,
+                true,
+                true,
+                "InvalidStateError",
+                "InvalidStateError",
+                "InvalidStateError"
+            ],
+            ["error", "AbortError", true, true],
+            "done"
+        ])
+    );
+}
+
+#[test]
+fn indexed_db_initial_upgrade_abort_restores_metadata_synchronously() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-initial-rollback.test/");
+    vm.eval(r#"
+globalThis.rollback = [];
+const open = indexedDB.open('initial-rollback', 7);
+let db, tx, store, index;
+function snapshot() {
+  return [db.version, Array.from(db.objectStoreNames),
+          Array.from(tx.objectStoreNames), Array.from(store.indexNames)];
+}
+open.onupgradeneeded = () => {
+  db = open.result;
+  tx = open.transaction;
+  store = db.createObjectStore('records');
+  index = store.createIndex('by-value', 'value');
+  for (const name of ['\uE000', '\u{10000}', 'z', 'a']) {
+    db.createObjectStore(name);
+    store.createIndex(name, 'value');
+  }
+  rollback.push(snapshot());
+  tx.onabort = () => rollback.push(['abort', open.transaction === tx, snapshot()]);
+  Object.defineProperty(tx, 'db', {get() { throw new Error('author db getter'); }});
+  tx.abort();
+  rollback.push(snapshot());
+  for (const source of [store, index]) {
+    for (const method of ['get', 'getKey', 'getAll', 'getAllKeys', 'count', 'openCursor', 'openKeyCursor']) {
+      try { source[method](1); rollback.push(method + ':accepted'); }
+      catch (error) { rollback.push(error.name); }
+    }
+  }
+  for (const method of ['add', 'put', 'delete', 'clear']) {
+    try { store[method](1, 1); rollback.push(method + ':accepted'); }
+    catch (error) { rollback.push(error.name); }
+  }
+};
+open.onerror = () => rollback.push(['error', open.error.name, open.result === undefined,
+                                  open.transaction === null, snapshot()]);
+"#).expect("initial upgrade rollback should schedule");
+    let result = vm
+        .eval_after_selected_page_tasks("JSON.stringify(rollback)")
+        .expect("initial upgrade rollback should run");
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let entries = result.as_array().unwrap();
+    assert_eq!(
+        entries[0],
+        serde_json::json!([
+            7,
+            ["a", "records", "z", "\u{10000}", "\u{e000}"],
+            ["a", "records", "z", "\u{10000}", "\u{e000}"],
+            ["a", "by-value", "z", "\u{10000}", "\u{e000}"]
+        ])
+    );
+    assert_eq!(entries[1], serde_json::json!([0, [], [], []]));
+    assert_eq!(
+        &entries[2..20],
+        vec![serde_json::json!("InvalidStateError"); 18]
+    );
+    assert!(entries.contains(&serde_json::json!([
+        "error",
+        "AbortError",
+        true,
+        true,
+        [0, [], [], []]
+    ])));
+    assert_eq!(
+        entries[20],
+        serde_json::json!(["abort", true, [0, [], [], []]])
+    );
+    assert_eq!(entries[21][0], "error");
+    assert_eq!(entries.len(), 22);
+}
+
+#[test]
+fn indexed_db_upgrade_abort_restores_existing_handles_without_reviving_replacements() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-upgrade-rollback.test/");
+    vm.eval(r#"
+globalThis.rollback = [];
+const initial = indexedDB.open('upgrade-rollback', 9);
+initial.onupgradeneeded = () => {
+  const store = initial.result.createObjectStore('records');
+  store.createIndex('by-value', 'value');
+  store.put({value: 'original'}, 1);
+};
+function failure(operation) {
+  try { operation(); return 'accepted'; } catch (error) { return error.name; }
+}
+initial.onsuccess = () => {
+  initial.result.close();
+  const open = indexedDB.open('upgrade-rollback', 10);
+  let db, tx, store, alias, index, replacement, replacementIndex;
+  function snapshot() {
+    return [db.version, Array.from(db.objectStoreNames), Array.from(tx.objectStoreNames),
+            Array.from(store.indexNames), Array.from(alias.indexNames), Array.from(replacement.indexNames),
+            failure(() => store.get(1)), failure(() => index.get(1)),
+            failure(() => replacement.get(1)), failure(() => replacementIndex.get(1))];
+  }
+  open.onupgradeneeded = () => {
+    db = open.result;
+    tx = open.transaction;
+    store = tx.objectStore('records');
+    alias = tx.objectStore('records');
+    index = store.index('by-value');
+    store.put({value: 'changed'}, 1);
+    store.createIndex('aa-transient', 'value');
+    rollback.push([db.version, Array.from(alias.indexNames)]);
+    store.deleteIndex('by-value');
+    const newIndex = alias.createIndex('by-value', 'other');
+    rollback.push(failure(() => index.get(1)));
+    db.deleteObjectStore('records');
+    rollback.push([Array.from(store.indexNames), Array.from(alias.indexNames), failure(() => store.get(1))]);
+    replacement = db.createObjectStore('records', {keyPath: 'id', autoIncrement: true});
+    replacementIndex = replacement.createIndex('by-value', 'other');
+    db.createObjectStore('temporary');
+    tx.abort();
+    rollback.push(snapshot());
+    rollback.push(failure(() => newIndex.get(1)));
+    tx.onabort = () => rollback.push(['abort', snapshot()]);
+  };
+  open.onerror = () => {
+    rollback.push(['error', snapshot()]);
+    const reopen = indexedDB.open('upgrade-rollback');
+    reopen.onsuccess = () => {
+      const reopened = reopen.result;
+      const st = reopened.transaction('records').objectStore('records');
+      rollback.push([reopened.version, Array.from(reopened.objectStoreNames), st.keyPath,
+                     st.autoIncrement, Array.from(st.indexNames)]);
+      const get = st.get(1);
+      get.onsuccess = () => { rollback.push(get.result); reopened.close(); };
+    };
+  };
+};
+"#).expect("upgrade rollback should schedule");
+    let result = vm
+        .eval_after_selected_page_tasks("JSON.stringify(rollback)")
+        .expect("upgrade rollback should run");
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let entries = result.as_array().unwrap();
+    let restored = serde_json::json!([
+        9,
+        ["records"],
+        ["records"],
+        ["by-value"],
+        ["by-value"],
+        [],
+        "TransactionInactiveError",
+        "TransactionInactiveError",
+        "InvalidStateError",
+        "InvalidStateError"
+    ]);
+    assert_eq!(
+        entries[0],
+        serde_json::json!([10, ["aa-transient", "by-value"]])
+    );
+    assert_eq!(entries[1], "InvalidStateError");
+    assert_eq!(entries[2], serde_json::json!([[], [], "InvalidStateError"]));
+    assert_eq!(entries[3], restored);
+    assert_eq!(entries[4], "InvalidStateError");
+    assert!(entries.contains(&serde_json::json!(["error", restored])));
+    assert!(entries.contains(&serde_json::json!(["abort", restored])));
+    assert!(entries.contains(&serde_json::json!([
+        9,
+        ["records"],
+        null,
+        false,
+        ["by-value"]
+    ])));
+    assert!(entries.contains(&serde_json::json!({"value": "original"})));
+    assert_eq!(entries.len(), 9);
 }
 
 #[test]
@@ -5624,4 +6145,916 @@ async fn read_indexed_db_databases_child_request_head(
         }
     }
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+#[test]
+fn indexed_db_put_rejects_non_serializable_platform_objects() {
+    let mut vm =
+        new_storage_page_task_executor_test_vm("https://indexeddb-platform-object-dataclone.test/");
+
+    vm.eval(
+        r#"
+(() => {
+  globalThis.__indexedDbPlatformCloneErrors = "pending";
+  const dbName = `platform-object-${Math.random()}`;
+  const open = indexedDB.open(dbName, 1);
+  open.onupgradeneeded = () => open.result.createObjectStore("values");
+  open.onsuccess = () => {
+    const store = open.result.transaction("values", "readwrite").objectStore("values");
+    const probe = (value, key) => {
+      try {
+        store.put(value, key);
+        return "ok";
+      } catch (error) {
+        return error && error.name;
+      }
+    };
+    globalThis.__indexedDbPlatformCloneErrors = [
+      probe(new Event("event"), "event"),
+      probe(new MessageChannel(), "channel"),
+      probe(new Response(), "response")
+    ].join("|");
+  };
+  return "scheduled";
+})()
+"#,
+    )
+    .expect("indexeddb platform object dataclone workflow should schedule");
+
+    let result = vm
+        .eval_after_selected_page_tasks("String(globalThis.__indexedDbPlatformCloneErrors)")
+        .expect("indexeddb platform object dataclone result should be readable");
+
+    assert_eq!(result, "DataCloneError|DataCloneError|DataCloneError");
+}
+
+#[test]
+fn indexed_db_key_path_reads_iterator_once() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://key-path-iterator.test/");
+    vm.eval(
+        r#"
+      globalThis.keyPathResult = 'pending';
+      const open = indexedDB.open('key-path-iterator', 1);
+      open.onupgradeneeded = () => {
+        try {
+          let reads = 0;
+          const keyPath = {
+            get [Symbol.iterator]() {
+              if (++reads > 1) throw new Error('iterator read twice');
+              return function* () { yield 'id'; };
+            }
+          };
+          const store = open.result.createObjectStore('values', {keyPath});
+          if (reads !== 1 || String(store.keyPath) !== 'id') throw new Error('store key path');
+          reads = 0;
+          const index = store.createIndex('by-id', keyPath);
+          if (reads !== 1 || String(index.keyPath) !== 'id') throw new Error('index key path');
+          const sentinel = {};
+          const throwing = {get [Symbol.iterator]() { throw sentinel; }};
+          try { store.createIndex('throws', throwing); throw new Error('missing exception'); }
+          catch (error) { if (error !== sentinel) throw error; }
+          globalThis.keyPathResult = 'pass';
+        } catch (error) { globalThis.keyPathResult = String(error); }
+      };
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.eval_after_selected_page_tasks("keyPathResult").unwrap(),
+        "pass"
+    );
+}
+
+#[test]
+fn indexed_db_roundtrips_image_data_with_graph_identity() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-image-data.test/");
+    vm.eval(
+        r#"
+(() => {
+  globalThis.imageDataStorageResult = 'pending';
+  const open = indexedDB.open(`image-data-${Math.random()}`, 1);
+  const fail = event => { imageDataStorageResult = 'error:' + event.target.error?.name; };
+  open.onerror = fail;
+  open.onupgradeneeded = () => open.result.createObjectStore('values');
+  open.onsuccess = () => {
+    const image = new ImageData(new Uint8ClampedArray([1,2,3,4,5,6,7,8]), 2, 1,
+                               {colorSpace: 'display-p3'});
+    image.expando = 'do not serialize';
+    const write = open.result.transaction('values', 'readwrite');
+    write.onerror = fail;
+    write.objectStore('values').put({image, alias: image}, 'value');
+    image.data[0] = 99;
+    write.oncomplete = () => {
+      const read = open.result.transaction('values').objectStore('values').get('value');
+      read.onerror = fail;
+      read.onsuccess = () => {
+        const row = read.result;
+        imageDataStorageResult = JSON.stringify([
+          Object.getPrototypeOf(row.image) === ImageData.prototype,
+          row.image !== image, row.image === row.alias,
+          row.image.width, row.image.height, row.image.colorSpace,
+          Array.from(row.image.data), row.image.data !== image.data,
+          row.image.expando === undefined
+        ]);
+        open.result.close();
+      };
+    };
+  };
+})()
+"#,
+    )
+    .expect("ImageData storage should schedule");
+    let result = vm
+        .eval_after_selected_page_tasks("String(imageDataStorageResult)")
+        .expect("ImageData storage result should be readable");
+    assert_eq!(
+        result,
+        r#"[true,true,true,2,1,"display-p3",[1,2,3,4,5,6,7,8],true,true]"#
+    );
+}
+
+#[test]
+fn indexed_db_versionchange_waits_for_connection_microtasks_before_blocked() {
+    for operation in ["upgrade", "delete"] {
+        let mut vm =
+            new_storage_page_task_executor_test_vm("https://indexeddb-notification-tasks.test/");
+        vm.eval(&format!("globalThis.operation = {operation:?};"))
+            .expect("connection operation should be set");
+        vm.eval(r#"
+globalThis.notificationEvents = [];
+const first = indexedDB.open(`notifications-${operation}`, 1);
+first.onupgradeneeded = () => first.result.createObjectStore('records');
+first.onsuccess = () => {
+  const db1 = first.result;
+  const second = indexedDB.open(db1.name);
+  second.onsuccess = () => {
+    const db2 = second.result;
+    const request = operation === 'upgrade' ? indexedDB.open(db1.name, 2) : indexedDB.deleteDatabase(db1.name);
+    db1.onversionchange = event => {
+      notificationEvents.push(`first:${event.oldVersion}:${event.newVersion}`);
+      Promise.resolve().then(() => {
+        notificationEvents.push('first-microtask');
+        request.onblocked = () => {
+          notificationEvents.push('blocked');
+          db1.close();
+          db2.close();
+        };
+      });
+    };
+    db2.onversionchange = () => {
+      notificationEvents.push('second');
+      queueMicrotask(() => notificationEvents.push('second-microtask'));
+    };
+    request.onupgradeneeded = () => notificationEvents.push('upgrade');
+    request.onerror = () => notificationEvents.push(`error:${request.error.name}`);
+    request.onsuccess = () => {
+      notificationEvents.push('success');
+      if (operation === 'upgrade') request.result.close();
+    };
+  };
+};
+"#).expect("connection notifications should be scheduled");
+        let result = vm
+            .eval_after_selected_page_tasks("JSON.stringify(notificationEvents)")
+            .expect("connection notification tasks should finish");
+        let expected = if operation == "upgrade" {
+            r#"["first:1:2","first-microtask","second","second-microtask","blocked","upgrade","success"]"#
+        } else {
+            r#"["first:1:null","first-microtask","second","second-microtask","blocked","success"]"#
+        };
+        assert_eq!(result, expected, "{operation} notification order");
+    }
+}
+
+#[test]
+fn indexed_db_versionchange_skips_connections_closed_by_an_earlier_microtask() {
+    for operation in ["upgrade", "delete"] {
+        let mut vm =
+            new_storage_page_task_executor_test_vm("https://indexeddb-notification-close.test/");
+        vm.eval(&format!("globalThis.operation = {operation:?};"))
+            .expect("connection operation should be set");
+        vm.eval(r#"
+globalThis.notificationEvents = [];
+const first = indexedDB.open(`notifications-close-${operation}`, 1);
+first.onupgradeneeded = () => first.result.createObjectStore('records');
+first.onsuccess = () => {
+  const db1 = first.result;
+  const second = indexedDB.open(db1.name);
+  second.onsuccess = () => {
+    const db2 = second.result;
+    db1.onversionchange = () => {
+      notificationEvents.push('first');
+      Promise.resolve().then(() => {
+        notificationEvents.push('close-microtask');
+        db1.close();
+        db2.close();
+      });
+    };
+    db2.onversionchange = () => notificationEvents.push('unexpected-second');
+    const request = operation === 'upgrade' ? indexedDB.open(db1.name, 2) : indexedDB.deleteDatabase(db1.name);
+    request.onblocked = () => notificationEvents.push('unexpected-blocked');
+    request.onupgradeneeded = () => notificationEvents.push('upgrade');
+    request.onerror = () => notificationEvents.push(`error:${request.error.name}`);
+    request.onsuccess = () => {
+      notificationEvents.push('success');
+      if (operation === 'upgrade') request.result.close();
+    };
+  };
+};
+"#).expect("closing notification should be scheduled");
+        let result = vm
+            .eval_after_selected_page_tasks("JSON.stringify(notificationEvents)")
+            .expect("closing notification tasks should finish");
+        let expected = if operation == "upgrade" {
+            r#"["first","close-microtask","upgrade","success"]"#
+        } else {
+            r#"["first","close-microtask","success"]"#
+        };
+        assert_eq!(result, expected, "{operation} must skip closed connections");
+    }
+}
+
+#[test]
+fn indexed_db_upgrade_waits_for_requests_and_callback_microtasks() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-upgrade-lifetime.test/");
+    vm.eval(
+        r#"
+globalThis.upgradeEvents = [];
+globalThis.authorGetterReads = 0;
+const open = indexedDB.open('upgrade-lifetime', 1);
+open.onerror = () => upgradeEvents.push(`open-error:${open.error.name}`);
+open.onupgradeneeded = () => {
+  const db = open.result;
+  const tx = open.transaction;
+  const store = db.createObjectStore('records');
+  Object.defineProperty(tx, 'db', {get() { authorGetterReads++; throw new Error('author db getter'); }});
+  upgradeEvents.push('upgrade');
+  store.add('one', 1).onsuccess = () => {
+    upgradeEvents.push('one');
+    Promise.resolve().then(() => {
+      upgradeEvents.push('one-microtask');
+      store.add('three', 3).onsuccess = () => upgradeEvents.push('three');
+    });
+  };
+  Promise.resolve().then(() => {
+    upgradeEvents.push('upgrade-microtask');
+    store.add('two', 2).onsuccess = () => upgradeEvents.push('two');
+  });
+  tx.oncomplete = () => {
+    upgradeEvents.push(`complete:${open.transaction === tx}`);
+    Promise.resolve().then(() => upgradeEvents.push('complete-microtask'));
+  };
+};
+open.onsuccess = () => {
+  upgradeEvents.push(`open-success:${open.transaction === null}`);
+  const db = open.result;
+  const count = db.transaction('records').objectStore('records').count();
+  count.onsuccess = () => {
+    upgradeEvents.push(`count:${count.result}`);
+    db.close();
+  };
+};
+"#,
+    )
+    .expect("upgrade requests should be scheduled");
+    let result = vm
+        .eval_after_selected_page_tasks("JSON.stringify(upgradeEvents)")
+        .expect("upgrade tasks should finish");
+    assert_eq!(vm.eval("String(authorGetterReads)").unwrap(), "0");
+    assert_eq!(
+        result,
+        r#"["upgrade","upgrade-microtask","one","one-microtask","two","three","complete:true","complete-microtask","open-success:true","count:3"]"#
+    );
+}
+
+#[test]
+fn indexed_db_upgrade_can_abort_from_a_request_callback() {
+    let mut vm =
+        new_storage_page_task_executor_test_vm("https://indexeddb-upgrade-callback-abort.test/");
+    vm.eval(r#"
+globalThis.upgradeEvents = [];
+globalThis.authorGetterReads = 0;
+const open = indexedDB.open('upgrade-callback-abort', 1);
+open.onupgradeneeded = () => {
+  const db = open.result;
+  const tx = open.transaction;
+  const store = db.createObjectStore('records');
+  store.add('one', 1).onsuccess = () => {
+    upgradeEvents.push('one');
+    tx.abort();
+    upgradeEvents.push(`restored:${db.version}:${db.objectStoreNames.length}`);
+  };
+  const second = store.add('two', 2);
+  second.onsuccess = () => upgradeEvents.push('unexpected-second-success');
+  second.onerror = event => {
+    event.preventDefault();
+    upgradeEvents.push(`two:${second.error.name}`);
+  };
+  tx.onabort = () => upgradeEvents.push(`abort:${open.transaction === tx}`);
+  tx.oncomplete = () => upgradeEvents.push('unexpected-complete');
+  Object.defineProperty(open, 'result', {get() { authorGetterReads++; throw new Error('author result getter'); }});
+};
+open.onsuccess = () => upgradeEvents.push('unexpected-open-success');
+open.onerror = event => {
+  event.preventDefault();
+  upgradeEvents.push(`open-error:${open.error.name}:${open.transaction === null}`);
+  const retry = indexedDB.open('upgrade-callback-abort', 1);
+  retry.onupgradeneeded = event => upgradeEvents.push(`retry:${event.oldVersion}:${retry.result.objectStoreNames.length}`);
+  retry.onsuccess = () => retry.result.close();
+};
+"#).expect("upgrade abort should be scheduled");
+    let result = vm
+        .eval_after_selected_page_tasks("JSON.stringify(upgradeEvents)")
+        .expect("upgrade abort tasks should finish");
+    assert_eq!(vm.eval("String(authorGetterReads)").unwrap(), "0");
+    assert_eq!(
+        result,
+        r#"["one","restored:0:0","two:AbortError","abort:true","open-error:AbortError:true","retry:0:0"]"#
+    );
+}
+
+#[test]
+fn indexed_db_closed_upgrade_commits_before_open_error() {
+    for close_at in ["upgrade", "request", "complete-microtask"] {
+        let mut vm =
+            new_storage_page_task_executor_test_vm("https://indexeddb-upgrade-close.test/");
+        vm.eval(&format!("globalThis.closeAt = {close_at:?};"))
+            .expect("close phase should be set");
+        vm.eval(
+            r#"
+globalThis.upgradeEvents = [];
+const open = indexedDB.open(`upgrade-close-${closeAt}`, 1);
+open.onupgradeneeded = () => {
+  const db = open.result;
+  const tx = open.transaction;
+  const store = db.createObjectStore('records');
+  store.add('saved', 1).onsuccess = () => {
+    upgradeEvents.push('request');
+    if (closeAt === 'request') db.close();
+  };
+  if (closeAt === 'upgrade') db.close();
+  tx.oncomplete = () => {
+    upgradeEvents.push('complete');
+    if (closeAt === 'complete-microtask') Promise.resolve().then(() => db.close());
+  };
+  tx.onabort = () => upgradeEvents.push('unexpected-abort');
+};
+open.onsuccess = () => upgradeEvents.push('unexpected-open-success');
+open.onerror = event => {
+  event.preventDefault();
+  upgradeEvents.push(`open-error:${open.error.name}:${open.transaction === null}`);
+  const retry = indexedDB.open(`upgrade-close-${closeAt}`);
+  retry.onupgradeneeded = () => upgradeEvents.push('unexpected-upgrade');
+  retry.onsuccess = () => {
+    const db = retry.result;
+    const request = db.transaction('records').objectStore('records').get(1);
+    request.onsuccess = () => {
+      upgradeEvents.push(`reopen:${db.version}:${request.result}`);
+      db.close();
+    };
+  };
+};
+"#,
+        )
+        .expect("closing upgrade should be scheduled");
+        let result = vm
+            .eval_after_selected_page_tasks("JSON.stringify(upgradeEvents)")
+            .expect("closing upgrade tasks should finish");
+        assert_eq!(
+            result, r#"["request","complete","open-error:AbortError:true","reopen:1:saved"]"#,
+            "close during {close_at}"
+        );
+    }
+}
+
+#[test]
+fn indexed_db_upgrade_commit_failure_aborts_and_restores_metadata() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-upgrade-quota.test/");
+    vm.eval(r#"
+globalThis.upgradeEvents = [];
+navigator.storageBuckets.open('limited', {quota: 16}).then(bucket => {
+  const open = bucket.indexedDB.open('commit-failure', 1);
+  open.onupgradeneeded = () => {
+    const db = open.result;
+    const tx = open.transaction;
+    db.createObjectStore('large-schema-name'.repeat(64));
+    tx.oncomplete = () => upgradeEvents.push('unexpected-complete');
+    tx.onerror = () => upgradeEvents.push('unexpected-transaction-error');
+    tx.onabort = () => upgradeEvents.push(
+      `abort:${tx.error.name}:${db.version}:${db.objectStoreNames.length}:${open.transaction === tx}`);
+  };
+  open.onsuccess = () => upgradeEvents.push('unexpected-success');
+  open.onerror = event => {
+    event.preventDefault();
+    upgradeEvents.push(`open-error:${open.error.name}:${open.transaction === null}`);
+    const deletion = bucket.indexedDB.deleteDatabase('commit-failure');
+    deletion.onblocked = () => upgradeEvents.push('unexpected-blocked');
+    deletion.onsuccess = () => upgradeEvents.push('deleted');
+  };
+});
+"#).expect("upgrade commit failure should be scheduled");
+    let result = vm
+        .eval_after_selected_page_tasks("JSON.stringify(upgradeEvents)")
+        .expect("failed upgrade should finish aborting");
+    assert_eq!(
+        result,
+        r#"["abort:QuotaExceededError:0:0:true","open-error:AbortError:true","deleted"]"#
+    );
+}
+
+#[test]
+fn indexed_db_roundtrips_native_exception_data_without_author_access() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-exception-data.test/");
+    vm.eval(&format!(
+        "{}\nglobalThis.exceptionPayloadResult = 'pending'; indexedDBExceptionPayloadProbe(globalThis).then(result => {{ exceptionPayloadResult = JSON.stringify(result); }}, error => {{ exceptionPayloadResult = JSON.stringify({{error: error.name + ':' + error.message}}); }});",
+        include_str!("../../../tests/fixtures/indexeddb-exception-payloads.js"),
+    ))
+    .expect("IndexedDB exception data probe should schedule");
+    let result = vm
+        .eval_after_selected_page_tasks("String(exceptionPayloadResult)")
+        .expect("IndexedDB exception data probe should complete");
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["failures"], serde_json::json!([]), "{result}");
+    assert_eq!(result["rows"].as_array().unwrap().len(), 225, "{result}");
+}
+
+#[test]
+fn indexed_db_native_exception_data_survives_profile_restart() {
+    let root = indexed_db_test_root("exception-data-profile-restart");
+    let page_url = "https://indexeddb-exception-profile.test/";
+    for phase in ["write", "read"] {
+        let manager = crate::new_indexed_db_manager(Some(root.clone()))
+            .expect("durable IndexedDB manager should initialize");
+        let mut vm = new_storage_page_task_executor_test_vm(page_url);
+        vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+        vm.set_storage_bucket_store(
+            crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+        );
+        vm.eval(&format!("globalThis.exceptionPayloadPhase = {phase:?};"))
+            .unwrap();
+        vm.eval(
+            r#"
+globalThis.exceptionPayloadRestart = 'pending';
+(async () => {
+  const request = value => new Promise((resolve, reject) => {
+    value.onsuccess = () => resolve(value.result);
+    value.onerror = () => reject(value.error);
+  });
+  const done = tx => new Promise((resolve, reject) => {
+    tx.oncomplete = resolve; tx.onabort = () => reject(tx.error);
+  });
+  const open = indexedDB.open('durable-exceptions', 1);
+  open.onupgradeneeded = () => open.result.createObjectStore('values');
+  const db = await request(open);
+  try {
+    if (exceptionPayloadPhase === 'write') {
+      const error = new DOMException('stored\u0000\ud83d\ude00', 'AbortError');
+      const quota = new QuotaExceededError('full', {quota:0, requested:12.5});
+      const value = {error, alias:error, quota}; value.self = value;
+      const tx = db.transaction('values','readwrite'), complete = done(tx);
+      tx.objectStore('values').put(value, 'record'); await complete;
+      exceptionPayloadRestart = 'stored';
+    } else {
+      const tx = db.transaction('values'), complete = done(tx);
+      const value = await request(tx.objectStore('values').get('record'));
+      await complete;
+      exceptionPayloadRestart = JSON.stringify([
+        value.self === value, value.error === value.alias,
+        Object.getPrototypeOf(value.error) === DOMException.prototype,
+        value.error.name, value.error.message, value.error.code,
+        Object.getPrototypeOf(value.quota) === QuotaExceededError.prototype,
+        value.quota.name, value.quota.message, value.quota.code,
+        value.quota.quota, value.quota.requested,
+        !Object.hasOwn(value.error,'stack'), !Object.hasOwn(value.quota,'stack')
+      ]);
+    }
+  } finally { db.close(); }
+})().catch(error => { exceptionPayloadRestart = error.name+':'+error.message; });
+"#,
+        )
+        .expect("durable exception data workflow should schedule");
+        let result = vm
+            .eval_after_selected_page_tasks("String(exceptionPayloadRestart)")
+            .expect("durable exception data workflow should complete");
+        if phase == "write" {
+            assert_eq!(result, "stored");
+        } else {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+                serde_json::json!([
+                    true,
+                    true,
+                    true,
+                    "AbortError",
+                    "stored\0😀",
+                    20,
+                    true,
+                    "QuotaExceededError",
+                    "full",
+                    22,
+                    0,
+                    12.5,
+                    true,
+                    true
+                ])
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn indexed_db_roundtrips_image_data_and_geometry_objects() {
+    let mut vm =
+        new_storage_page_task_executor_test_vm("https://indexeddb-image-data-geometry.test/");
+
+    vm.eval(
+        r#"
+(() => {
+  globalThis.__indexedDbGeometryResult = "pending";
+  const dbName = `image-data-geometry-${Math.random()}`;
+  const open = indexedDB.open(dbName, 1);
+  open.onerror = () => {
+    globalThis.__indexedDbGeometryResult = `open-error:${open.error && open.error.name}`;
+  };
+  open.onupgradeneeded = () => open.result.createObjectStore("values");
+  open.onsuccess = () => {
+    const image = new ImageData(
+      new Uint8ClampedArray([1, 2, 3, 4, 5, 6, 7, 8]),
+      2,
+      1,
+      { colorSpace: "display-p3" }
+    );
+    const pointReadOnly = new DOMPointReadOnly(1, -0, Infinity, NaN);
+    const point = new DOMPoint(2, 3, 4, 5);
+    const rectReadOnly = new DOMRectReadOnly(6, 7, 8, 9);
+    const rect = new DOMRect(10, 11, 12, 13);
+    const quad = new DOMQuad(
+      { x: 1, y: 2, z: 3, w: 4 },
+      { x: 5, y: 6, z: 7, w: 8 },
+      { x: 9, y: 10, z: 11, w: 12 },
+      { x: 13, y: 14, z: 15, w: 16 }
+    );
+    const matrixReadOnly = new DOMMatrixReadOnly([1, 2, 3, 4, 5, 6]);
+    const matrix = new DOMMatrix([
+      11, 12, 13, 14,
+      21, 22, 23, 24,
+      31, 32, 33, 34,
+      41, 42, 43, 44
+    ]);
+    for (const value of [
+      image,
+      pointReadOnly,
+      point,
+      rectReadOnly,
+      rect,
+      quad,
+      matrixReadOnly,
+      matrix
+    ]) {
+      value.expando = "not serialized";
+    }
+
+    const write = open.result.transaction("values", "readwrite");
+    write.objectStore("values").put({
+      image,
+      imageAlias: image,
+      pointReadOnly,
+      point,
+      rectReadOnly,
+      rect,
+      quad,
+      matrixReadOnly,
+      matrix
+    }, "value");
+    write.oncomplete = () => {
+      const read = open.result.transaction("values").objectStore("values").get("value");
+      read.onerror = () => {
+        globalThis.__indexedDbGeometryResult =
+          `read-error:${read.error && read.error.name}`;
+      };
+      read.onsuccess = () => {
+        const row = read.result;
+        const exactBrand = (value, name) =>
+          Object.getPrototypeOf(value) === self[name].prototype;
+        const sameValues = (value, names, expected) =>
+          names.every((name, index) => Object.is(value[name], expected[index]));
+        globalThis.__indexedDbGeometryResult = JSON.stringify({
+          image: [
+            exactBrand(row.image, "ImageData"),
+            row.image !== image,
+            row.image === row.imageAlias,
+            row.image.width,
+            row.image.height,
+            row.image.colorSpace,
+            Array.from(row.image.data).join(","),
+            row.image.data !== image.data
+          ],
+          pointReadOnly:
+            exactBrand(row.pointReadOnly, "DOMPointReadOnly") &&
+            sameValues(row.pointReadOnly, ["x", "y", "z", "w"], [1, -0, Infinity, NaN]),
+          point:
+            exactBrand(row.point, "DOMPoint") &&
+            sameValues(row.point, ["x", "y", "z", "w"], [2, 3, 4, 5]),
+          rectReadOnly:
+            exactBrand(row.rectReadOnly, "DOMRectReadOnly") &&
+            sameValues(row.rectReadOnly, ["x", "y", "width", "height"], [6, 7, 8, 9]),
+          rect:
+            exactBrand(row.rect, "DOMRect") &&
+            sameValues(row.rect, ["x", "y", "width", "height"], [10, 11, 12, 13]),
+          quad:
+            exactBrand(row.quad, "DOMQuad") &&
+            [row.quad.p1, row.quad.p2, row.quad.p3, row.quad.p4]
+              .every((pointValue, index) =>
+                sameValues(
+                  pointValue,
+                  ["x", "y", "z", "w"],
+                  [1 + index * 4, 2 + index * 4, 3 + index * 4, 4 + index * 4]
+                )),
+          matrixReadOnly:
+            exactBrand(row.matrixReadOnly, "DOMMatrixReadOnly") &&
+            sameValues(row.matrixReadOnly, ["a", "b", "c", "d", "e", "f", "is2D"],
+              [1, 2, 3, 4, 5, 6, true]),
+          matrix:
+            exactBrand(row.matrix, "DOMMatrix") &&
+            sameValues(row.matrix, ["m11", "m12", "m13", "m14", "m41", "m42", "m43", "m44", "is2D"],
+              [11, 12, 13, 14, 41, 42, 43, 44, false]),
+          expandosExcluded: [
+            row.image,
+            row.pointReadOnly,
+            row.point,
+            row.rectReadOnly,
+            row.rect,
+            row.quad,
+            row.matrixReadOnly,
+            row.matrix
+          ].every(value => value.expando === undefined)
+        });
+      };
+    };
+  };
+  return "scheduled";
+})()
+"#,
+    )
+    .expect("indexeddb ImageData/Geometry workflow should schedule");
+
+    let result = vm
+        .eval_after_selected_page_tasks("String(globalThis.__indexedDbGeometryResult)")
+        .expect("indexeddb ImageData/Geometry result should be readable");
+
+    assert_eq!(
+        result,
+        r#"{"image":[true,true,true,2,1,"display-p3","1,2,3,4,5,6,7,8",true],"pointReadOnly":true,"point":true,"rectReadOnly":true,"rect":true,"quad":true,"matrixReadOnly":true,"matrix":true,"expandosExcluded":true}"#
+    );
+}
+
+#[test]
+fn indexed_db_utf16_database_names_survive_sqlite_profile_restart() {
+    let root = indexed_db_test_root("database-names-profile-restart");
+    let units: Vec<Vec<u16>> = vec![
+        vec![],
+        vec![0],
+        vec![0xd800],
+        vec![0xd801],
+        vec![0xdfff],
+        vec![0xfffd],
+        vec![0xd800, 0xdc00],
+        vec![0xdc00, 0xd800],
+        vec![0xd800, 0],
+        vec![0x64, 0x38, 0x30, 0x30],
+    ];
+    for write in [true, false] {
+        let manager = crate::new_indexed_db_manager(Some(root.clone())).unwrap();
+        let mut vm = new_storage_page_task_executor_test_vm(
+            "https://indexeddb-database-names-profile.test/",
+        );
+        vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+        vm.set_storage_bucket_store(
+            crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+        );
+        vm.eval(&format!(
+            "globalThis.writeNames={write}; globalThis.nameUnits={};",
+            serde_json::to_string(&units).unwrap()
+        ))
+        .unwrap();
+        vm.eval(r#"
+globalThis.databaseNameProfile = 'pending';
+(async () => {
+  const result = request => new Promise((resolve,reject) => {
+    request.onsuccess=()=>resolve(request.result); request.onerror=()=>reject(request.error);
+  });
+  const complete = transaction => new Promise((resolve,reject) => {
+    transaction.oncomplete=resolve; transaction.onabort=()=>reject(transaction.error);
+  });
+  const records=[];
+  for (let i=0;i<nameUnits.length;i++) {
+    const name=String.fromCharCode(...nameUnits[i]);
+    const open=indexedDB.open(name,1);
+    open.onupgradeneeded=()=>open.result.createObjectStore('s');
+    const db=await result(open);
+    if(db.name!==name) throw Error('database name identity');
+    if(writeNames) {
+      const transaction=db.transaction('s','readwrite');const done=complete(transaction);
+      transaction.objectStore('s').put(i,'key');await done;
+    }
+    const transaction=db.transaction('s');const done=complete(transaction);
+    records.push(await result(transaction.objectStore('s').get('key')));await done;db.close();
+  }
+  const listed=(await indexedDB.databases()).map(info=>Array.from({length:info.name.length},(_,i)=>info.name.charCodeAt(i)));
+  return {records,listed};
+})().then(result=>databaseNameProfile=JSON.stringify(result),error=>databaseNameProfile=String(error));
+"#).unwrap();
+        let actual = vm
+            .eval_after_selected_page_tasks("databaseNameProfile")
+            .unwrap();
+        let mut ordered = units.clone();
+        ordered.sort();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&actual).unwrap(),
+            serde_json::json!({"records":(0..units.len()).collect::<Vec<_>>(),"listed":ordered}),
+            "profile write: {write}"
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn indexed_db_request_getters_preserve_native_proxy_identity_and_reject_author_wrappers() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-request-proxy.test/");
+    vm.eval(
+        r#"document.body.innerHTML='<iframe></iframe>';
+      globalThis.childWindow=document.querySelector('iframe').contentWindow;
+      globalThis.nativeRequest=indexedDB.open('native-proxy',1);
+      nativeRequest.onupgradeneeded=()=>nativeRequest.result.createObjectStore('s');"#,
+    )
+    .unwrap();
+    let context_ptr = &vm.current_main_world().unwrap().context as *const _;
+    vm.with_context_scope_by_ptr_and_checkpoint_for_test(context_ptr, |scope, _| {
+        let global = scope.get_current_context().global(scope);
+        let key = crate::util::v8str(scope, "nativeRequest");
+        let request =
+            v8::Local::<v8::Object>::try_from(global.get(scope, key.into()).unwrap()).unwrap();
+        let handler = crate::util::new_null_prototype_object(scope);
+        let proxy = v8::Proxy::new(scope, request, handler).unwrap();
+        moli_webapi_declare::register_web_api_proxy(scope, proxy).unwrap();
+        assert!(crate::web_api_interfaces::IDBRequest::is_instance(
+            scope,
+            proxy.into()
+        ));
+        let key = crate::util::v8str(scope, "nativeRequestProxy");
+        assert_eq!(
+            global.create_data_property(scope, key.into(), proxy.into()),
+            Some(true)
+        );
+        Ok(())
+    })
+    .unwrap();
+    vm.eval(r#"globalThis.checkRequestProxy=()=>{
+      for(const realm of [window,childWindow]) for(const name of ['result','error','source','transaction','readyState']) {
+        const getter=Object.getOwnPropertyDescriptor(realm.IDBRequest.prototype,name).get;
+        let expected,expectedError;
+        try { expected=getter.call(nativeRequest); } catch(error) { expectedError=error; }
+        let actual,actualError;
+        try { actual=getter.call(nativeRequestProxy); } catch(error) { actualError=error; }
+        if(expectedError) {
+          if(Object.getPrototypeOf(expectedError)!==realm.DOMException.prototype ||
+             Object.getPrototypeOf(actualError)!==realm.DOMException.prototype ||
+             expectedError.name!==actualError.name) throw Error('native pending exception realm');
+        } else if(actualError || actual!==expected) throw Error('native request value identity');
+        let traps=0;
+        const author=new Proxy(nativeRequestProxy,{get(){traps++;throw 42;},getPrototypeOf(){traps++;throw 43;}});
+        const revoked=Proxy.revocable(nativeRequestProxy,{});revoked.revoke();
+        for(const receiver of [author,revoked.proxy,Object.create(nativeRequest)]) {
+          let error;try {getter.call(receiver);} catch(caught) {error=caught;}
+          if(Object.getPrototypeOf(error)!==realm.TypeError.prototype || traps) throw Error('author receiver rejection');
+        }
+      }
+      return true;
+    };checkRequestProxy()"#).unwrap();
+    assert_eq!(
+        vm.eval_after_selected_page_tasks(
+            "checkRequestProxy() && nativeRequestProxy.readyState==='done'"
+        )
+        .unwrap(),
+        "true"
+    );
+    vm.eval("nativeRequest.result.close()").unwrap();
+}
+
+#[test]
+fn indexed_db_roundtrips_web_transport_error_native_payloads_without_author_access() {
+    let mut vm = new_storage_page_task_executor_test_vm("https://indexeddb-transport-error.test/");
+    vm.eval(r#"(() => {
+      globalThis.transportErrorStorageResult='pending';
+      const WT=WebTransportError,message='m\u0000\ud800\udfff';
+      const originals=[];
+      for(const source of ['stream','session'])for(const streamErrorCode of [null,0,42,4294967295]) {
+        const error=new WT(message,{source,streamErrorCode});
+        Object.setPrototypeOf(error,null);
+        for(const name of ['message','source','streamErrorCode','stack'])Object.defineProperty(error,name,{enumerable:true,get(){throw 42;}});
+        originals.push({error,alias:error,source,streamErrorCode});
+      }
+      const value={rows:originals};value.self=value;
+      const open=indexedDB.open('transport-errors-'+Math.random(),1);
+      const fail=event=>{transportErrorStorageResult='error:'+event.target.error?.name;};
+      open.onerror=fail;open.onupgradeneeded=()=>open.result.createObjectStore('values');
+      open.onsuccess=()=>{
+        const db=open.result,write=db.transaction('values','readwrite');
+        write.onerror=fail;write.objectStore('values').put(value,'value');
+        write.oncomplete=()=>{
+          const descriptor=Object.getOwnPropertyDescriptor(window,'WebTransportError');
+          Object.defineProperty(window,'WebTransportError',{configurable:true,get(){throw 43;}});
+          const read=db.transaction('values').objectStore('values').get('value');read.onerror=fail;
+          read.onsuccess=()=>{
+            try {
+              const clone=read.result;
+              const valid=clone.self===clone&&clone.rows.length===8&&clone.rows.every((row,index)=>
+                Object.getPrototypeOf(row.error)===WT.prototype&&row.error!==originals[index].error&&row.error===row.alias&&
+                row.error.name==='WebTransportError'&&row.error.message===message&&row.error.source===row.source&&
+                row.error.streamErrorCode===row.streamErrorCode&&row.error.code===0&&!Object.hasOwn(row.error,'message'));
+              transportErrorStorageResult=String(valid);
+            } finally {Object.defineProperty(window,'WebTransportError',descriptor);db.close();}
+          };
+        };
+      };
+    })()"#).expect("WebTransportError IndexedDB round trip should schedule");
+    assert_eq!(
+        vm.eval_after_selected_page_tasks("String(transportErrorStorageResult)")
+            .unwrap(),
+        "true"
+    );
+}
+
+#[test]
+fn indexed_db_web_transport_error_preserves_native_data_across_profile_restart() {
+    let root = indexed_db_test_root("transport-error-profile-restart");
+    for phase in ["write", "read"] {
+        let manager = crate::new_indexed_db_manager(Some(root.clone())).unwrap();
+        let mut vm =
+            new_storage_page_task_executor_test_vm("https://transport-error-profile.test/");
+        vm.set_indexed_db_manager(Some(crate::downgrade_indexed_db_manager(&manager)));
+        vm.set_storage_bucket_store(
+            crate::new_shared_storage_bucket_store_with_indexed_db_manager(&manager),
+        );
+        vm.eval(&format!("globalThis.transportPhase = {phase:?};"))
+            .unwrap();
+        vm.eval(r#"
+globalThis.transportProfileResult = 'pending';
+(async () => {
+  const result = request => new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  const done = tx => new Promise((resolve, reject) => {
+    tx.oncomplete = resolve; tx.onabort = () => reject(tx.error);
+  });
+  const opening = indexedDB.open('native-transport-error', 1);
+  opening.onupgradeneeded = () => opening.result.createObjectStore('s');
+  const db = await result(opening);
+  const NativeError = WebTransportError;
+  try {
+    if (transportPhase === 'write') {
+      const error = new NativeError('m\ud800\u0000\udfff', {source:'session', streamErrorCode:4294967295});
+      const value = {error, alias:error}; value.self = value;
+      const tx = db.transaction('s','readwrite'), complete = done(tx);
+      tx.objectStore('s').put(value, 1); await complete;
+      transportProfileResult = 'stored';
+    } else {
+      Object.defineProperty(globalThis,'WebTransportError',{configurable:true,get(){throw new Error('author constructor getter');}});
+      const tx = db.transaction('s'), complete = done(tx);
+      const value = await result(tx.objectStore('s').get(1)); await complete;
+      const message = value.error.message;
+      transportProfileResult = JSON.stringify([
+        value.self === value, value.error === value.alias,
+        Object.getPrototypeOf(value.error) === NativeError.prototype,
+        value.error.name, Array.from({length:message.length},(_,i)=>message.charCodeAt(i)),
+        value.error.code, value.error.source, value.error.streamErrorCode,
+      ]);
+    }
+  } finally { db.close(); }
+})().catch(error => { transportProfileResult = error.name+':'+error.message; });
+"#).unwrap();
+        let result = vm
+            .eval_after_selected_page_tasks("String(transportProfileResult)")
+            .unwrap();
+        if phase == "write" {
+            assert_eq!(result, "stored");
+        } else {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+                serde_json::json!([
+                    true,
+                    true,
+                    true,
+                    "WebTransportError",
+                    [109, 55296, 0, 57343],
+                    0,
+                    "session",
+                    4294967295_u64
+                ])
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(root);
 }

@@ -43,7 +43,7 @@ fn load_shared_worker_target(ctx: &mut TestContext, session_id: &str) {
     );
     target.attach_session(session_id.to_owned());
     bc.insert_shared_worker_target(target);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 }
 fn load_dedicated_worker_target(ctx: &mut TestContext, session_id: &str) {
     let browser_context_id = "BID-dedicated".to_owned();
@@ -58,17 +58,18 @@ fn load_dedicated_worker_target(ctx: &mut TestContext, session_id: &str) {
     );
     target.attach_session(session_id.to_owned());
     bc.insert_dedicated_worker_target(target);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 }
 fn record_shared_worker_console(ctx: &mut TestContext, session_id: &str, message: &str) {
-    ctx.conn
-        .shared_worker_target_for_session_mut(Some(session_id))
-        .expect("shared worker target session should exist")
-        .record_console_message(RendererSharedWorkerConsoleMessage {
-            message: message.to_owned(),
-            args: Vec::new(),
-            stack: None,
-        });
+    ctx.with_fixture(|conn| {
+        conn.shared_worker_target_for_session_mut(Some(session_id))
+            .expect("shared worker target session should exist")
+            .record_console_message(RendererSharedWorkerConsoleMessage {
+                message: message.to_owned(),
+                args: Vec::new(),
+                stack: None,
+            })
+    });
 }
 async fn start_attached_shared_worker_session(
     ctx: &mut TestContext,
@@ -140,25 +141,20 @@ async fn push_loaded_runtime_frontend_enabled_background_context_async(
     session_id: &str,
     html: &str,
 ) {
-    let page = ctx
-        .conn
-        .load_page_via_runtime_async(&format!("data:text/html,{html}"))
-        .await
-        .expect("test background page should load");
     let mut background_context = crate::conn::BrowserContext::new(browser_context_id.to_owned());
     background_context.set_active_target_id(target_id.to_owned());
-    let _ = background_context
-        .active_page_target_mut()
-        .runtime_slot
-        .replace_loaded_page(Some(page));
     background_context.attach_active_session(session_id.to_owned());
-    background_context
-        .active_page_target_mut()
-        .devtools_sessions[moli_page_types::DevToolsSessionKey::Primary]
-        .runtime_session_state
-        .runtime_frontend_enabled = true;
-    ctx.conn
-        .push_inactive_browser_context_fixture_for_test(background_context);
+    ctx.with_fixture(|conn| {
+        conn.push_inactive_browser_context_fixture_for_test(background_context)
+    });
+    ctx.install_navigation_fixture_for_session_owner(
+        &format!("data:text/html,{html}"),
+        Some(session_id),
+    )
+    .await;
+    ctx.process_async(json!({"id": 999_001, "method": "Runtime.enable", "sessionId": session_id}))
+        .await;
+    assert_eq!(take_response_by_id(ctx, 999_001)["result"], json!({}));
 }
 async fn with_loaded_runtime_frontend_enabled_background_target_async(
     ctx: &mut TestContext,
@@ -186,13 +182,33 @@ async fn with_loaded_runtime_frontend_enabled_background_target_async(
             .runtime_session_state
             .runtime_frontend_enabled = true;
     }
-    ctx.conn
-        .install_browser_context_fixture_for_test(browser_context);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser_context));
     ctx.install_navigation_fixture_for_session_owner(
         &format!("data:text/html,{html}"),
         Some(background_session_id),
     )
     .await;
+}
+
+async fn assert_native_objects_released(
+    ctx: &mut TestContext,
+    session: Option<&str>,
+    ids: &[String],
+) {
+    for (index, id) in ids.iter().enumerate() {
+        let command_id = 998_000 + index as u64;
+        let mut command = json!({"id":command_id,"method":"Runtime.getProperties","params":{"objectId":id,"ownProperties":true}});
+        if let Some(session) = session {
+            command["sessionId"] = json!(session);
+        }
+        ctx.process_async(command).await;
+        let response = take_response_by_id(ctx, command_id);
+        assert_eq!(
+            response["error"]["code"],
+            json!(-32000),
+            "released native reference must not remain callable: {response:?}"
+        );
+    }
 }
 
 mod bindings;
@@ -203,3 +219,5 @@ mod navigation;
 mod objects;
 mod service_worker;
 mod shared_worker;
+
+mod worker_emulation;

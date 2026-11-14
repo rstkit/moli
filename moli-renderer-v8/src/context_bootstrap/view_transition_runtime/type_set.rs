@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::{
     util::{get_private_value, global_constructor_prototype, set_private_value},
     webidl,
@@ -8,7 +9,6 @@ use crate::{
     },
 };
 
-const VIEW_TRANSITION_TYPE_SET_BRAND_SLOT: &str = "__lmViewTransitionTypeSetBrand";
 const VIEW_TRANSITION_TYPE_SET_BACKING_SLOT: &str = "__lmViewTransitionTypeSetBacking";
 
 pub(super) fn new_view_transition_type_set<'s>(
@@ -25,12 +25,9 @@ pub(super) fn new_view_transition_type_set<'s>(
     if object.set_prototype(scope, prototype.into()) != Some(true) {
         return None;
     }
-    set_private_value(
-        scope,
-        object,
-        VIEW_TRANSITION_TYPE_SET_BRAND_SLOT,
-        v8::Boolean::new(scope, true).into(),
-    );
+    web_api_interfaces::ViewTransitionTypeSet::DESCRIPTOR
+        .initialize(scope, object)
+        .ok()?;
     set_private_value(
         scope,
         object,
@@ -45,8 +42,7 @@ fn require_view_transition_type_set_receiver<'s>(
     receiver: v8::Local<'s, v8::Object>,
     member: &str,
 ) -> Option<v8::Local<'s, v8::Set>> {
-    let branded = get_private_value(scope, receiver, VIEW_TRANSITION_TYPE_SET_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope));
+    let branded = web_api_interfaces::ViewTransitionTypeSet::is_instance(scope, receiver);
     let backing = get_private_value(scope, receiver, VIEW_TRANSITION_TYPE_SET_BACKING_SLOT)
         .and_then(|value| v8::Local::<v8::Set>::try_from(value).ok());
     if branded && backing.is_some() {

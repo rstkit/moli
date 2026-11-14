@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::webidl_iterator::{
     MaplikeWebIdlIteratorMethod, call_maplike_webidl_for_each, new_maplike_webidl_iterator,
 };
@@ -278,7 +279,6 @@ pub(crate) fn build_css_margin_rule_object_from_stylo_view<'s>(
     parent_rule: Option<v8::Local<'s, v8::Object>>,
 ) -> v8::Local<'s, v8::Object> {
     CssMarginRuleDeclaration {
-        brand: true,
         css_text: view.css_text,
         name: view.name,
         style_text: view.style_text,
@@ -296,7 +296,6 @@ pub(crate) fn build_css_font_face_rule_object_from_stylo_view<'s>(
     parent_rule: Option<v8::Local<'s, v8::Object>>,
 ) -> v8::Local<'s, v8::Object> {
     let object = CssAtRuleDeclaration {
-        brand: true,
         css_text: view.css_text,
         rule_type: CSS_RULE_FONT_FACE_RULE_TYPE,
         parent_rule,
@@ -304,6 +303,9 @@ pub(crate) fn build_css_font_face_rule_object_from_stylo_view<'s>(
     }
     .bind(scope)
     .expect("CSSFontFaceRule declaration should bind");
+    web_api_interfaces::CSSFontFaceRule::DESCRIPTOR
+        .initialize(scope, object)
+        .expect("CSS rule interface identity should initialize");
     if let Some(prototype) = global_constructor_prototype(scope, "CSSFontFaceRule") {
         let _ = object.set_prototype(scope, prototype.into());
     }
@@ -318,7 +320,6 @@ pub(crate) fn build_css_keyframe_rule_object<'s>(
 ) -> v8::Local<'s, v8::Object> {
     let style_text = parsed.style_text.clone();
     let rule = CssKeyframeRuleDeclaration {
-        brand: true,
         css_text: parsed.css_text,
         key_text: parsed.selector_text,
         style_text: parsed.style_text,
@@ -343,7 +344,6 @@ pub(crate) fn build_css_font_feature_values_rule_object_from_stylo_view<'s>(
     parent_rule: Option<v8::Local<'s, v8::Object>>,
 ) -> v8::Local<'s, v8::Object> {
     let object = CssFontFeatureValuesRuleDeclaration {
-        brand: true,
         css_text: view.css_text,
         font_family: view.font_family,
         parent_rule,
@@ -419,7 +419,6 @@ pub(crate) fn bind_css_property_rule_object<'s>(
     parent_rule: Option<v8::Local<'s, v8::Object>>,
 ) -> v8::Local<'s, v8::Object> {
     CssPropertyRuleDeclaration {
-        brand: true,
         css_text,
         rule_type: CSS_RULE_UNKNOWN_RULE_TYPE,
         name,
@@ -485,7 +484,7 @@ pub(crate) fn serialize_page_rule_text(selector: &str, block: &str) -> String {
 }
 
 fn raw_page_rule_text(selector: &str, block: &str) -> String {
-    let selector = selector.trim();
+    // A serialized page name can end in an escaped space.
     let block = block.trim();
     match (selector.is_empty(), block.is_empty()) {
         (true, true) => "@page { }".to_owned(),
@@ -556,7 +555,6 @@ fn bind_css_style_rule_object<'s>(
     parent_rule: Option<v8::Local<'s, v8::Object>>,
 ) -> v8::Local<'s, v8::Object> {
     CssStyleRuleDeclaration {
-        brand: true,
         css_text: parsed.css_text,
         selector_text: parsed.selector_text,
         style_text: parsed.style_text,
@@ -574,7 +572,6 @@ pub(crate) fn build_css_nested_declarations_rule_object<'s>(
     parent_rule: v8::Local<'s, v8::Object>,
 ) -> v8::Local<'s, v8::Object> {
     let rule = CssNestedDeclarationsRuleDeclaration {
-        brand: true,
         css_text: style_text.to_owned(),
         style_text: style_text.to_owned(),
         parent_rule,
@@ -2187,8 +2184,9 @@ pub(crate) fn css_keyframe_rule_key_text_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let key_text = css_rule_attached_native_keyframe_selector_text(scope, args.this())
-        .unwrap_or_else(|| private_string(scope, args.this(), CSS_KEYFRAME_RULE_KEY_TEXT_SLOT));
+    let this = css_rule_receiver(scope, &args);
+    let key_text = css_rule_attached_native_keyframe_selector_text(scope, this)
+        .unwrap_or_else(|| private_string(scope, this, CSS_KEYFRAME_RULE_KEY_TEXT_SLOT));
     rv.set(v8_dynamic_string_value(scope, &key_text));
 }
 
@@ -2197,25 +2195,23 @@ pub(crate) fn css_keyframe_rule_key_text_setter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Some(parsed) = webidl::parse_args::<CssKeyframeRuleKeyTextArgs>(scope, &args) else {
+    let Some(key_text) =
+        cssom_dom_string_property_value(scope, args.get(0), "CSSKeyframeRule", "keyText")
+    else {
         return;
     };
-    let Some(key_text) = normalize_keyframe_selector_text_with_stylo(&parsed.key_text) else {
-        rv.set_undefined();
+    let Some(key_text) = normalize_keyframe_selector_text_with_stylo(&key_text) else {
+        throw_dom_exception_value(scope, "Invalid keyframe selector.", "SyntaxError");
         return;
     };
-    if apply_live_stylesheet_keyframe_rule_selector_mutation(scope, args.this(), &key_text) {
+    let this = css_rule_receiver(scope, &args);
+    if apply_live_stylesheet_keyframe_rule_selector_mutation(scope, this, &key_text) {
         rv.set_undefined();
         return;
     }
-    set_private_string(
-        scope,
-        args.this(),
-        CSS_KEYFRAME_RULE_KEY_TEXT_SLOT,
-        &key_text,
-    );
-    sync_css_keyframe_rule_css_text_from_parts(scope, args.this());
-    sync_parent_rule_from_child_change(scope, args.this());
+    set_private_string(scope, this, CSS_KEYFRAME_RULE_KEY_TEXT_SLOT, &key_text);
+    sync_css_keyframe_rule_css_text_from_parts(scope, this);
+    sync_parent_rule_from_child_change(scope, this);
     rv.set_undefined();
 }
 
@@ -2224,7 +2220,8 @@ pub(crate) fn css_keyframe_rule_style_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let style = css_keyframe_rule_style_object(scope, args.this());
+    let this = css_rule_receiver(scope, &args);
+    let style = css_keyframe_rule_style_object(scope, this);
     rv.set(style.into());
 }
 
@@ -2238,7 +2235,8 @@ pub(crate) fn css_keyframe_rule_style_setter_callback<'s>(
     else {
         return;
     };
-    let style = css_keyframe_rule_style_object(scope, args.this());
+    let this = css_rule_receiver(scope, &args);
+    let style = css_keyframe_rule_style_object(scope, this);
     set_style_object_css_text(scope, style, &css_text);
 }
 
@@ -2249,6 +2247,24 @@ pub(crate) fn css_keyframe_rule_style_object<'s>(
     if let Some(style) = get_private_object(scope, rule, CSS_KEYFRAME_RULE_STYLE_OBJECT_SLOT) {
         return style;
     }
+    let creation_context = rule
+        .get_creation_context(scope)
+        .expect("CSSKeyframeRule has a creation context");
+    if creation_context == scope.get_current_context() {
+        return css_keyframe_rule_style_object_in_current_context(scope, rule);
+    }
+    let style = {
+        let target_scope = &mut v8::ContextScope::new(scope, creation_context);
+        let style = css_keyframe_rule_style_object_in_current_context(target_scope, rule);
+        v8::Global::new(target_scope, style)
+    };
+    v8::Local::new(scope, &style)
+}
+
+fn css_keyframe_rule_style_object_in_current_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    rule: v8::Local<'s, v8::Object>,
+) -> v8::Local<'s, v8::Object> {
     let style = build_lightweight_css_keyframe_style_declaration(scope);
     let style_text = private_string(scope, rule, CSS_KEYFRAME_RULE_STYLE_TEXT_SLOT);
     attach_css_rule_stylo_declaration_block_to_style(scope, rule, style);

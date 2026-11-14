@@ -244,6 +244,212 @@ fn assert_close(actual: f32, expected: f32) {
 }
 
 #[test]
+fn grid_wrapped_max_content_item_contributes_its_constrained_height() {
+    assert_grid_intrinsic_item_contributes_constrained_height(Dimension::auto());
+}
+
+#[test]
+fn grid_intrinsic_minimum_and_percentage_maximum_contribute_constrained_height() {
+    assert_grid_intrinsic_item_contributes_constrained_height(Dimension::min_content());
+}
+
+#[test]
+fn padded_intrinsic_items_measure_wrapping_in_content_box_space() {
+    for display in [LayoutDisplay::Grid, LayoutDisplay::Flex] {
+        let source = Source(vec![
+            Node::element(
+                "root",
+                "div",
+                LayoutElementCategory::Generic,
+                None,
+                vec![1, 8],
+            ),
+            Node::element(
+                "parent",
+                "div",
+                LayoutElementCategory::Generic,
+                None,
+                vec![2],
+            ),
+            Node::element(
+                "item",
+                "span",
+                LayoutElementCategory::Generic,
+                None,
+                vec![3, 4, 5, 6, 7],
+            ),
+            Node::element(
+                "first",
+                "span",
+                LayoutElementCategory::Generic,
+                None,
+                Vec::new(),
+            ),
+            Node::text("break", "\u{200b}"),
+            Node::element(
+                "second",
+                "span",
+                LayoutElementCategory::Generic,
+                None,
+                Vec::new(),
+            ),
+            Node::text("break", "\u{200b}"),
+            Node::element(
+                "third",
+                "span",
+                LayoutElementCategory::Generic,
+                None,
+                Vec::new(),
+            ),
+            Node::element(
+                "following",
+                "div",
+                LayoutElementCategory::Generic,
+                None,
+                Vec::new(),
+            ),
+        ]);
+        let mut styles = Styles::default();
+        styles
+            .primary
+            .insert(0, style(LayoutDisplay::Block, PaintColor::TRANSPARENT));
+        styles.primary.insert(
+            1,
+            style(display, GREEN).tap_taffy(|taffy| {
+                taffy.display = if display == LayoutDisplay::Grid {
+                    taffy::Display::Grid
+                } else {
+                    taffy::Display::Flex
+                };
+                taffy.size.width = Dimension::length(150.0);
+                taffy.grid_template_columns = vec![taffy::style_helpers::minmax(
+                    taffy::style_helpers::length(0.0),
+                    taffy::style_helpers::fr(1.0),
+                )];
+            }),
+        );
+        let item_style = |padding| {
+            style(LayoutDisplay::Block, YELLOW)
+                .tap_taffy(|taffy| {
+                    taffy.size.width = Dimension::max_content();
+                    taffy.min_size.width = Dimension::min_content().into();
+                    taffy.max_size.width = Dimension::percent(1.0).into();
+                    taffy.box_sizing = BoxSizing::ContentBox;
+                    taffy.justify_self = Some(taffy::AlignSelf::START);
+                    taffy.flex_shrink = 0.0;
+                    taffy.padding = Rect::length(padding);
+                })
+                .with_text_metrics(10.0, 10.0)
+        };
+        styles.primary.insert(2, item_style(0.0));
+        for node in [3, 5, 7] {
+            styles
+                .primary
+                .insert(node, sized(LayoutDisplay::InlineBlock, 80.0, 10.0, RED));
+        }
+        styles
+            .primary
+            .insert(8, sized(LayoutDisplay::Block, 150.0, 4.0, BLUE));
+        let control = render(&source, &mut styles, 400, 300);
+        let control_item = rect(&control, YELLOW);
+        styles.primary.insert(2, item_style(10.0));
+        let padded = render(&source, &mut styles, 400, 300);
+        let padded_item = rect(&padded, YELLOW);
+        let parent = rect(&padded, GREEN);
+        let following = rect(&padded, BLUE);
+        assert_close(control_item.width, 150.0);
+        assert_close(padded_item.width, 170.0);
+        assert_close(padded_item.height, control_item.height + 20.0);
+        assert_close(parent.height, padded_item.height);
+        assert_close(following.y, padded_item.bottom());
+    }
+}
+
+fn assert_grid_intrinsic_item_contributes_constrained_height(min_width: Dimension) {
+    // Blink's GridLayoutAlgorithm::ContributionSizeForGridItem measures the
+    // block contribution against the resolved inline grid area, including
+    // max-width, rather than using the unconstrained max-content line height.
+    let source = Source(vec![
+        Node::element(
+            "root",
+            "div",
+            LayoutElementCategory::Generic,
+            None,
+            vec![1, 5],
+        ),
+        Node::element("grid", "div", LayoutElementCategory::Generic, None, vec![2]),
+        Node::element(
+            "measure",
+            "span",
+            LayoutElementCategory::Generic,
+            None,
+            vec![3, 4],
+        ),
+        Node::text("text", "sorts your email "),
+        Node::element(
+            "icon",
+            "span",
+            LayoutElementCategory::Generic,
+            None,
+            Vec::new(),
+        ),
+        Node::element(
+            "following",
+            "div",
+            LayoutElementCategory::Generic,
+            None,
+            Vec::new(),
+        ),
+    ]);
+    let mut styles = Styles::default();
+    styles
+        .primary
+        .insert(0, style(LayoutDisplay::Block, PaintColor::TRANSPARENT));
+    styles.primary.insert(
+        1,
+        style(LayoutDisplay::Grid, GREEN).tap_taffy(|taffy| {
+            taffy.display = taffy::Display::Grid;
+            taffy.size.width = Dimension::length(350.0);
+            taffy.grid_template_columns = vec![taffy::style_helpers::minmax(
+                taffy::style_helpers::length(0.0),
+                taffy::style_helpers::fr(1.0),
+            )];
+        }),
+    );
+    styles.primary.insert(
+        2,
+        style(LayoutDisplay::Block, PaintColor::TRANSPARENT)
+            .tap_taffy(|taffy| {
+                taffy.size.width = Dimension::max_content();
+                taffy.min_size.width = min_width.into();
+                taffy.max_size.width = Dimension::percent(1.0).into();
+                taffy.justify_self = Some(taffy::AlignSelf::CENTER);
+            })
+            .with_text_metrics(47.0, 52.0),
+    );
+    styles
+        .primary
+        .insert(4, sized(LayoutDisplay::InlineBlock, 60.0, 47.0, RED));
+    styles
+        .primary
+        .insert(5, sized(LayoutDisplay::Block, 350.0, 20.0, BLUE));
+
+    let snapshot = render(&source, &mut styles, 400, 300);
+    let grid = rect(&snapshot, GREEN);
+    let icon = rect(&snapshot, RED);
+    let following = rect(&snapshot, BLUE);
+    assert!(
+        grid.height >= 104.0,
+        "the auto row must include both wrapped lines: {grid:?}"
+    );
+    assert!(
+        icon.bottom() <= following.y,
+        "the next block must follow the wrapped icon"
+    );
+    assert_eq!(following.y, grid.bottom());
+}
+
+#[test]
 fn table_caption_tracks_rows_cells_and_common_spans_share_one_wrapper_geometry() {
     use LayoutElementCategory::Table;
     use LayoutTableRole::{BodyGroup, Caption, Cell, Row, Table as Root};
@@ -325,6 +531,77 @@ fn table_caption_tracks_rows_cells_and_common_spans_share_one_wrapper_geometry()
     assert_close(span.x, 0.0);
     assert_close(span.y, 50.0);
     assert_close(span.width, 300.0);
+}
+
+#[test]
+fn zero_row_span_reaches_the_end_of_its_row_group() {
+    use LayoutElementCategory::Table;
+    use LayoutTableRole::{BodyGroup, Cell, Row, Table as Root};
+
+    let cell = |label, row_span| {
+        Node::element(label, "td", Table(Cell), None, Vec::new()).with_metadata(
+            LayoutElementMetadata {
+                table: Some(LayoutTableData {
+                    row_span,
+                    ..LayoutTableData::default()
+                }),
+                ..LayoutElementMetadata::default()
+            },
+        )
+    };
+    let source = Source(vec![
+        Node::element("root", "div", LayoutElementCategory::Generic, None, vec![1]),
+        Node::element("table", "table", Table(Root), None, vec![2, 8]),
+        Node::element("first-body", "tbody", Table(BodyGroup), None, vec![3, 6]),
+        Node::element("first-row", "tr", Table(Row), None, vec![4, 5]),
+        cell("zero-span", 0),
+        cell("first-reference", 1),
+        Node::element("second-row", "tr", Table(Row), None, vec![7]),
+        cell("second-reference", 1),
+        Node::element("second-body", "tbody", Table(BodyGroup), None, vec![9]),
+        Node::element("third-row", "tr", Table(Row), None, vec![10]),
+        cell("next-group", 1),
+    ]);
+    let mut styles = Styles::default();
+    styles.primary.insert(
+        0,
+        sized(LayoutDisplay::Block, 200.0, 100.0, PaintColor::TRANSPARENT),
+    );
+    styles.primary.insert(
+        1,
+        sized(LayoutDisplay::Table, 100.0, 60.0, PaintColor::TRANSPARENT),
+    );
+    for id in [2, 8] {
+        styles.primary.insert(
+            id,
+            style(LayoutDisplay::TableRowGroup, PaintColor::TRANSPARENT),
+        );
+    }
+    for id in [3, 6, 9] {
+        styles
+            .primary
+            .insert(id, style(LayoutDisplay::TableRow, PaintColor::TRANSPARENT));
+    }
+    styles
+        .primary
+        .insert(4, sized(LayoutDisplay::TableCell, 50.0, 20.0, RED));
+    styles
+        .primary
+        .insert(5, sized(LayoutDisplay::TableCell, 50.0, 20.0, GREEN));
+    styles
+        .primary
+        .insert(7, sized(LayoutDisplay::TableCell, 50.0, 20.0, BLUE));
+    styles
+        .primary
+        .insert(10, sized(LayoutDisplay::TableCell, 100.0, 20.0, YELLOW));
+
+    let snapshot = render(&source, &mut styles, 200, 100);
+    let zero_span = rect(&snapshot, RED);
+    let first_reference = rect(&snapshot, GREEN);
+    let next_group = rect(&snapshot, YELLOW);
+    assert_close(zero_span.height, 40.0);
+    assert_close(first_reference.height, 20.0);
+    assert_close(next_group.y, 40.0);
 }
 
 #[test]
@@ -591,6 +868,176 @@ fn left_float_restricts_inline_slots_and_clear_moves_the_next_block_below_it() {
 }
 
 #[test]
+fn atomic_inline_content_moves_to_the_first_float_slot_that_fits() {
+    // Chromium oracle: a full-width inline button in a normal-flow form
+    // following a full-width float belongs below that float. Smaller buttons
+    // can stay alongside it, or move only as far as the first wider segment.
+    for (left, right, atom_width, expected_x, expected_y) in [
+        (Some((200.0, 80.0)), None, 200.0, 0.0, 80.0),
+        (None, Some((200.0, 80.0)), 200.0, 0.0, 80.0),
+        (Some((120.0, 80.0)), None, 120.0, 0.0, 80.0),
+        (Some((60.0, 80.0)), None, 100.0, 60.0, 0.0),
+        (None, Some((60.0, 80.0)), 100.0, 0.0, 0.0),
+        (Some((120.0, 40.0)), Some((60.0, 80.0)), 80.0, 0.0, 40.0),
+        (Some((120.0, 40.0)), Some((60.0, 80.0)), 160.0, 0.0, 80.0),
+        (Some((60.0, 80.0)), Some((120.0, 40.0)), 80.0, 60.0, 40.0),
+        (Some((60.0, 80.0)), None, 240.0, 0.0, 80.0),
+        (None, None, 240.0, 0.0, 0.0),
+    ] {
+        let source = Source(vec![
+            Node::element("root", "div", LayoutElementCategory::Generic, None, vec![1]),
+            Node::element(
+                "container",
+                "div",
+                LayoutElementCategory::Generic,
+                None,
+                vec![2, 3, 4],
+            ),
+            Node::element("left", "div", LayoutElementCategory::Generic, None, vec![]),
+            Node::element("right", "div", LayoutElementCategory::Generic, None, vec![]),
+            Node::element(
+                "form",
+                "form",
+                LayoutElementCategory::Generic,
+                None,
+                vec![5, 7, 6],
+            ),
+            Node::element(
+                "loading-hint",
+                "span",
+                LayoutElementCategory::Generic,
+                None,
+                vec![8],
+            ),
+            Node::element("atom", "span", LayoutElementCategory::Generic, None, vec![]),
+            Node::text("space", " "),
+            Node::element(
+                "screenreader-hint",
+                "span",
+                LayoutElementCategory::Generic,
+                None,
+                vec![9],
+            ),
+            Node::text("loading", "Loading"),
+        ]);
+        let mut styles = Styles::default();
+        styles.primary.insert(
+            0,
+            sized(LayoutDisplay::Block, 400.0, 200.0, PaintColor::TRANSPARENT),
+        );
+        for (id, color) in [(1, YELLOW), (4, GREEN)] {
+            styles.primary.insert(
+                id,
+                style(LayoutDisplay::Block, color)
+                    .tap_taffy(|s| s.size.width = Dimension::length(200.0))
+                    .with_text_metrics(16.0, 20.0),
+            );
+        }
+        for (id, size, direction) in [(2, left, Float::Left), (3, right, Float::Right)] {
+            styles.primary.insert(
+                id,
+                size.map_or_else(
+                    || style(LayoutDisplay::None, PaintColor::TRANSPARENT),
+                    |(width, height)| {
+                        sized(LayoutDisplay::Block, width, height, BLUE)
+                            .with_float(direction, Clear::None)
+                    },
+                ),
+            );
+        }
+        styles
+            .primary
+            .insert(5, style(LayoutDisplay::Inline, PaintColor::TRANSPARENT));
+        styles.primary.insert(
+            6,
+            sized(LayoutDisplay::InlineBlock, atom_width, 24.0, RED)
+                .with_inline_alignment(moli_layout::LayoutInlineAlignment::Top),
+        );
+        styles.primary.insert(
+            8,
+            sized(LayoutDisplay::Block, 1.0, 1.0, PaintColor::TRANSPARENT)
+                .with_position(LayoutPosition::Absolute),
+        );
+        let snapshot = render(&source, &mut styles, 400, 200);
+        let atom = rect(&snapshot, RED);
+        assert_close(atom.x, expected_x);
+        assert_close(atom.y, expected_y);
+        assert_close(atom.width, atom_width);
+        assert_close(rect(&snapshot, GREEN).height, expected_y + 24.0);
+        assert_close(rect(&snapshot, YELLOW).height, expected_y + 24.0);
+    }
+}
+
+#[test]
+fn intrinsic_inline_probes_clamp_widths_consumed_by_margins_beside_floats() {
+    // A grid/flex intrinsic probe can give the paragraph a known width of
+    // `container_width - 40px`. Parley's float-aware breaker must still get
+    // a nonnegative paragraph width when the margin consumes all the space.
+    let source = Source(vec![
+        Node::element("root", "div", LayoutElementCategory::Generic, None, vec![1]),
+        Node::element(
+            "container",
+            "div",
+            LayoutElementCategory::Generic,
+            None,
+            vec![2, 3],
+        ),
+        Node::element("float", "div", LayoutElementCategory::Generic, None, vec![]),
+        Node::element(
+            "paragraph",
+            "p",
+            LayoutElementCategory::Generic,
+            None,
+            vec![4],
+        ),
+        Node::text("text", "text"),
+    ]);
+    for display in [LayoutDisplay::Grid, LayoutDisplay::Flex] {
+        for container_width in [0.0, 20.0, 40.0, 100.0] {
+            let mut styles = Styles::default();
+            styles
+                .primary
+                .insert(0, sized(display, 200.0, 100.0, PaintColor::TRANSPARENT));
+            styles.primary.insert(
+                1,
+                style(LayoutDisplay::Block, PaintColor::TRANSPARENT).tap_taffy(|taffy| {
+                    taffy.size.width = Dimension::length(container_width);
+                }),
+            );
+            styles.primary.insert(
+                2,
+                sized(LayoutDisplay::Block, 10.0, 10.0, BLUE).with_float(Float::Left, Clear::None),
+            );
+            styles.primary.insert(
+                3,
+                style(LayoutDisplay::Block, PaintColor::TRANSPARENT).tap_taffy(|taffy| {
+                    taffy.margin.left = taffy::LengthPercentageAuto::length(40.0);
+                }),
+            );
+
+            let snapshot = render(&source, &mut styles, 200, 100);
+            assert_close(rect(&snapshot, BLUE).x, 0.0);
+            let glyphs = snapshot
+                .fragments
+                .iter()
+                .filter_map(|fragment| match fragment {
+                    PaintFragment::GlyphRun(run) => Some(run.glyphs_in_surface()),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            assert!(!glyphs.is_empty(), "text must survive the intrinsic probe");
+            assert_close(glyphs[0].x, 40.0);
+            assert!(
+                glyphs
+                    .iter()
+                    .all(|glyph| glyph.x.is_finite() && glyph.y.is_finite())
+            );
+        }
+    }
+}
+
+#[test]
 fn float_descendant_of_structural_inline_rounds_with_its_ifc_owner() {
     let source = Source(vec![
         Node::element("root", "div", LayoutElementCategory::Generic, None, vec![1]),
@@ -687,7 +1134,7 @@ fn block_content_alignment_moves_the_inline_float_fragment_group() {
                 width: Dimension::length(200.0),
                 height: Dimension::length(100.0),
             };
-            taffy.align_content = Some(taffy::AlignContent::SAFE_CENTER);
+            taffy.align_content = taffy::AlignContent::SAFE_CENTER;
         }),
     );
     styles.primary.insert(
@@ -1323,9 +1770,41 @@ fn inline_blocks_use_their_internal_last_line_baseline_and_overflow_fallback() {
         .primary
         .insert(5, nav_item_style(BLUE, 19.0, Overflow::Hidden));
     let fallback = render(&source, &mut styles, 300, 100);
-    assert_close(rect(&fallback, RED).y, 45.0);
-    assert_close(rect(&fallback, GREEN).y, 45.0);
-    assert_close(rect(&fallback, BLUE).y, 19.0);
+    let more = rect(&fallback, BLUE);
+    assert_close(more.y, 19.0);
+    assert_close(more.height, 42.0);
+    assert_close(rect(&fallback, RED).y, rect(&fallback, GREEN).y);
+    // A clipped inline-block uses its bottom margin edge as the baseline.
+    // Check the adjacent text's actual baselines: its box top depends on the
+    // platform font's ascent, even with an explicit font size and line height.
+    let baselines = fallback
+        .fragments
+        .iter()
+        .filter_map(|fragment| match fragment {
+            PaintFragment::GlyphRun(run) => run.glyphs_in_surface().first().map(|glyph| glyph.y),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        baselines.len(),
+        3,
+        "each nav item should paint one text run"
+    );
+    assert_close(baselines[0], more.y + more.height);
+    assert_close(baselines[1], more.y + more.height);
+
+    // Extra block-end padding moves the text-backed peers by the same amount
+    // while leaving the clipped inline-block's top edge fixed.
+    let fallback_news = rect(&fallback, RED);
+    let fallback_hao = rect(&fallback, GREEN);
+    styles
+        .primary
+        .insert(5, nav_item_style(BLUE, 29.0, Overflow::Hidden));
+    let deeper_fallback = render(&source, &mut styles, 300, 100);
+    assert_close(rect(&deeper_fallback, RED).y, fallback_news.y + 10.0);
+    assert_close(rect(&deeper_fallback, GREEN).y, fallback_hao.y + 10.0);
+    assert_close(rect(&deeper_fallback, BLUE).y, more.y);
+    assert_close(rect(&deeper_fallback, BLUE).height, more.height + 10.0);
 }
 
 #[test]
@@ -2317,7 +2796,7 @@ fn single_row_textarea_does_not_expand_its_flex_search_bar() {
         style(LayoutDisplay::Flex, PaintColor::TRANSPARENT).tap_taffy(|taffy| {
             taffy.display = taffy::Display::Flex;
             taffy.size.width = Dimension::length(300.0);
-            taffy.min_size.height = Dimension::length(50.0);
+            taffy.min_size.height = Dimension::length(50.0).into();
         }),
     );
     styles.primary.insert(

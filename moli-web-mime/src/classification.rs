@@ -13,6 +13,14 @@ pub fn is_dom_parser_xml_mime(input: &str) -> bool {
     })
 }
 
+/// XML navigation responses, including registered and custom `+xml` subtypes.
+/// DOMParser's Web API accepts a narrower, separately classified set of types.
+pub fn is_xml_document_mime(input: &str) -> bool {
+    mime_essence(input).is_some_and(|mime| {
+        matches!(mime.as_str(), "text/xml" | "application/xml") || mime.ends_with("+xml")
+    })
+}
+
 pub fn is_javascript_mime(input: &str) -> bool {
     mime_essence(input).is_some_and(|mime| is_javascript_mime_essence(&mime))
 }
@@ -49,6 +57,14 @@ pub fn is_text_mime(input: &str) -> bool {
 
 pub fn is_text_mime_essence(input: &str) -> bool {
     input.starts_with("text/")
+}
+
+/// Navigation responses rendered as literal text rather than HTML or XML.
+/// This also includes JSON and JavaScript resources opened as documents.
+pub fn is_text_document_mime(input: &str) -> bool {
+    !is_html_document_mime(input)
+        && !is_xml_document_mime(input)
+        && (is_text_mime(input) || is_json_mime(input) || is_javascript_mime(input))
 }
 
 /// Whether a `style` element's raw `type` attribute selects classic CSS.
@@ -115,6 +131,16 @@ pub fn is_font_mime(input: &str) -> bool {
 
 pub fn is_font_mime_essence(input: &str) -> bool {
     input.starts_with("font/")
+        || matches!(
+            input,
+            "application/font-cff"
+                | "application/font-otf"
+                | "application/font-sfnt"
+                | "application/font-ttf"
+                | "application/font-woff"
+                | "application/vnd.ms-fontobject"
+                | "application/vnd.ms-opentype"
+        )
 }
 
 pub fn is_form_urlencoded_mime(input: &str) -> bool {
@@ -131,12 +157,53 @@ pub fn multipart_form_data_boundary(input: &str) -> Option<String> {
         .flatten()
 }
 
-pub fn is_json_module_mime(input: &str) -> bool {
-    mime_essence(input).is_some_and(|mime| mime == "application/json" || mime.ends_with("+json"))
+/// The JSON MIME type group shared by JSON modules and documents.
+pub fn is_json_mime(input: &str) -> bool {
+    mime_essence(input).is_some_and(|mime| is_json_mime_essence(&mime))
+}
+
+pub fn is_json_mime_essence(input: &str) -> bool {
+    matches!(input, "application/json" | "text/json") || input.ends_with("+json")
 }
 
 pub fn is_webassembly_mime(input: &str) -> bool {
     mime_essence(input).is_some_and(|mime| mime == "application/wasm")
+}
+
+pub(crate) fn is_office_document_mime_essence(input: &str) -> bool {
+    matches!(
+        input,
+        "application/msexcel"
+            | "application/mspowerpoint"
+            | "application/msword"
+            | "application/msword-template"
+            | "application/vnd.ms-excel"
+            | "application/vnd.ms-excel.addin.macroenabled.12"
+            | "application/vnd.ms-excel.sheet.binary.macroenabled.12"
+            | "application/vnd.ms-excel.sheet.macroenabled.12"
+            | "application/vnd.ms-excel.template.macroenabled.12"
+            | "application/vnd.ms-powerpoint"
+            | "application/vnd.ms-powerpoint.addin.macroenabled.12"
+            | "application/vnd.ms-powerpoint.presentation.macroenabled.12"
+            | "application/vnd.ms-powerpoint.slideshow.macroenabled.12"
+            | "application/vnd.ms-powerpoint.template.macroenabled.12"
+            | "application/vnd.ms-word"
+            | "application/vnd.ms-word.document.12"
+            | "application/vnd.ms-word.document.macroenabled.12"
+            | "application/vnd.ms-word.template.macroenabled.12"
+            | "application/vnd.msword"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.openxmlformats-officedocument.presentationml.slideshow"
+            | "application/vnd.openxmlformats-officedocument.presentationml.template"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.template"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+            | "application/vnd.presentation-openxml"
+            | "application/vnd.presentation-openxmlm"
+            | "application/vnd.spreadsheet-openxml"
+            | "application/vnd.wordprocessing-openxml"
+    )
 }
 
 /// Returns whether a navigation response can be represented by Moli's
@@ -152,8 +219,7 @@ pub fn is_supported_document_mime_type(input: &str) -> bool {
         || is_audio_mime_essence(&essence)
         || is_video_mime_essence(&essence)
         || is_javascript_mime_essence(&essence)
-        || essence == "application/json"
-        || essence.ends_with("+json")
+        || is_json_mime_essence(&essence)
         || matches!(
             essence.as_str(),
             "application/xml"
@@ -172,6 +238,7 @@ pub fn is_binary_document_mime_type(input: &str) -> bool {
         || is_font_mime_essence(&essence)
         || is_image_mime_essence(&essence)
         || is_video_mime_essence(&essence)
+        || is_office_document_mime_essence(&essence)
         || matches!(
             essence.as_str(),
             "application/gzip"
@@ -184,5 +251,6 @@ pub fn is_binary_document_mime_type(input: &str) -> bool {
                 | "application/x-rar-compressed"
                 | "application/x-tar"
                 | "application/zip"
+                | "application/wasm"
         )
 }

@@ -1,12 +1,10 @@
 #[cfg(test)]
 use serde_json::Value;
 
-use crate::devtools_runtime::{AutomationEvent, DevToolsTargetId, DevToolsTargetInfo};
+use crate::automation::{AutomationEvent, DevToolsTargetId, DevToolsTargetInfo};
 #[cfg(test)]
-use crate::devtools_runtime::{DevToolsSessionId, TargetAttachmentEvent, TargetDetachmentEvent};
+use crate::automation::{DevToolsSessionId, TargetAttachmentEvent, TargetDetachmentEvent};
 use crate::domains::command_output::CommandOutputPlan;
-
-use super::*;
 
 pub(super) trait CdpTargetAutomationEventSink {
     fn push_target_background_event(&mut self, event: crate::conn::BackgroundProtocolEvent);
@@ -28,14 +26,6 @@ impl TargetProtocolSideEffects {
         &mut self,
     ) -> &mut Vec<crate::conn::BackgroundProtocolEvent> {
         &mut self.events
-    }
-
-    pub(super) fn into_plan(self) -> CommandOutputPlan {
-        let mut plan = CommandOutputPlan::default();
-        for event in self.events {
-            plan.push_background_event(event);
-        }
-        plan
     }
 
     pub(super) fn into_background_events(self) -> Vec<crate::conn::BackgroundProtocolEvent> {
@@ -128,7 +118,7 @@ fn emit_attached_to_target_with_waiting_from_cdp_value(
     );
 }
 
-pub(super) fn target_created_automation_event(target_info: DevToolsTargetInfo) -> AutomationEvent {
+pub(crate) fn target_created_automation_event(target_info: DevToolsTargetInfo) -> AutomationEvent {
     let target_id = target_info
         .target_id
         .clone()
@@ -136,7 +126,7 @@ pub(super) fn target_created_automation_event(target_info: DevToolsTargetInfo) -
     let kind = target_info.kind;
     let browser_context_id = target_info.browser_context_id.clone();
     let url = target_info.url.clone();
-    AutomationEvent::TargetCreated(crate::devtools_runtime::TargetLifecycleEvent {
+    AutomationEvent::TargetCreated(crate::automation::TargetLifecycleEvent {
         target_id,
         browser_context_id,
         kind,
@@ -168,7 +158,7 @@ fn devtools_target_info_from_cdp_value_lossy(value: Value) -> DevToolsTargetInfo
             .get("targetId")
             .and_then(Value::as_str)
             .map(DevToolsTargetId::from),
-        kind: crate::devtools_runtime::DevToolsTargetKind::from_cdp_type(
+        kind: crate::automation::DevToolsTargetKind::from_cdp_type(
             value.get("type").and_then(Value::as_str),
         ),
         title: value
@@ -192,7 +182,7 @@ fn devtools_target_info_from_cdp_value_lossy(value: Value) -> DevToolsTargetInfo
         opener_frame_id: value
             .get("openerFrameId")
             .and_then(Value::as_str)
-            .map(crate::devtools_runtime::DevToolsFrameId::from),
+            .map(crate::automation::DevToolsFrameId::from),
         can_access_opener: value
             .get("canAccessOpener")
             .and_then(Value::as_bool)
@@ -200,7 +190,7 @@ fn devtools_target_info_from_cdp_value_lossy(value: Value) -> DevToolsTargetInfo
         browser_context_id: value
             .get("browserContextId")
             .and_then(Value::as_str)
-            .map(crate::devtools_runtime::DevToolsBrowserContextId::from),
+            .map(crate::automation::DevToolsBrowserContextId::from),
         moli_popup_id: None,
     }
 }
@@ -209,10 +199,10 @@ fn devtools_target_info_from_cdp_value_lossy(value: Value) -> DevToolsTargetInfo
 pub(super) fn emit_target_destroyed(out: &mut impl CdpTargetAutomationEventSink, target_id: &str) {
     emit_cdp_target_automation_event(
         out,
-        AutomationEvent::TargetDestroyed(crate::devtools_runtime::TargetLifecycleEvent {
+        AutomationEvent::TargetDestroyed(crate::automation::TargetLifecycleEvent {
             target_id: DevToolsTargetId::from(target_id),
             browser_context_id: None,
-            kind: crate::devtools_runtime::DevToolsTargetKind::Other,
+            kind: crate::automation::DevToolsTargetKind::Other,
             url: String::new(),
             target_info: None,
         }),
@@ -278,44 +268,13 @@ fn emit_cdp_target_automation_event(
     }
 }
 
-pub(super) async fn fail_pending_fetch_state_for_target_background_events_async(
-    conn: &mut CdpConnection,
-    out: &mut Vec<crate::conn::BackgroundProtocolEvent>,
-    session_id: Option<&str>,
-    reason: &str,
-) -> Option<moli_core::RendererOutputFence> {
-    let (
-        pending_navigations,
-        pending_auth_navigations,
-        pending_response_navigations,
-        pending_subresource_fetches,
-        pending_subresource_auths,
-        pending_subresource_responses,
-    ) = page::take_pending_fetch_state(conn, session_id);
-
-    page::fail_pending_fetch_state_background_events_async(
-        conn,
-        out,
-        session_id,
-        reason,
-        reason,
-        pending_navigations,
-        pending_auth_navigations,
-        pending_response_navigations,
-        pending_subresource_fetches,
-        pending_subresource_auths,
-        pending_subresource_responses,
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::conn::BackgroundProtocolEvent;
-    use crate::devtools_runtime::{
+    use crate::automation::{
         AutomationEvent, DevToolsSessionId, DevToolsTargetId, DevToolsTargetKind,
         TargetDetachmentEvent, TargetLifecycleEvent,
     };
+    use crate::conn::BackgroundProtocolEvent;
     use serde_json::json;
 
     fn pop_protocol_message(out: &mut Vec<BackgroundProtocolEvent>) -> serde_json::Value {

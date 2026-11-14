@@ -1,4 +1,4 @@
-use super::{JsContextHost, OwnerDispatchScope, WindowDocumentOwner, WorkerOwnerScope};
+use super::{OwnerDispatchScope, PageScriptHost, WindowDocumentOwner, WorkerOwnerScope};
 use crate::frame_owner_model::FrameDocumentTaskOwner;
 use crate::runtime::ServiceWorkerControlState;
 use crate::service_worker_runtime::ServiceWorkerNotificationAction;
@@ -11,7 +11,7 @@ use crate::service_worker_runtime::{
     ServiceWorkerUnregisterStart, ServiceWorkerUpdateViaCache, ServiceWorkerVersionId,
 };
 use crate::structured_clone::V8StructuredClonePayload;
-use crate::worker::{WorkerNetworkPolicy, WorkerScriptKind, worker_secure_context_for_script_url};
+use crate::worker::{WorkerNetworkPolicy, WorkerScriptKind, WorkerSecureContextPolicy};
 use moli_storage_key::MoliStorageKey;
 use url::Url;
 
@@ -102,7 +102,66 @@ pub(crate) struct PendingServiceWorkerClientsOpenWindowPopup {
     document_owner: crate::native_bridge::LightweightPopupDocumentOwner,
 }
 
-impl JsContextHost {
+impl PageScriptHost {
+    pub(in crate::native_bridge::context_host) fn register_main_service_worker_client(
+        browser_context_runtime: &crate::runtime::RendererBrowserContextRuntime,
+        document_url: Url,
+        storage_key: String,
+        document_owner: FrameDocumentTaskOwner,
+        completion_tx: crate::page_task_queue::RendererPageServiceWorkerTaskSender,
+        reserved_client_id: Option<ServiceWorkerClientId>,
+    ) -> ServiceWorkerClientId {
+        reserved_client_id
+            .filter(|client_id| {
+                browser_context_runtime.update_service_worker_client_document_and_page_endpoint(
+                    *client_id,
+                    document_url.clone(),
+                    storage_key.clone(),
+                    ServiceWorkerClientFrameType::TopLevel,
+                    Some(WindowDocumentOwner::Frame(document_owner)),
+                    completion_tx.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                browser_context_runtime.register_service_worker_client(
+                    document_url,
+                    storage_key,
+                    ServiceWorkerClientFrameType::TopLevel,
+                    Some(WindowDocumentOwner::Frame(document_owner)),
+                    completion_tx,
+                )
+            })
+    }
+
+    pub(crate) fn adopt_initial_document_service_worker_client(
+        &mut self,
+        transition: crate::frame_owner_model::MainDocumentOwnerTransition,
+        reserved_client_id: Option<ServiceWorkerClientId>,
+    ) {
+        let document_url = self.document_url().clone();
+        let storage_key = self.service_worker_document_storage_key();
+        let client_id = Self::register_main_service_worker_client(
+            &self.browser_context_runtime,
+            document_url,
+            storage_key,
+            transition.current_owner(),
+            self.service_worker_task_sender(),
+            reserved_client_id,
+        );
+        let retired_client_id = std::mem::replace(&mut self.service_worker_client_id, client_id);
+        if retired_client_id != client_id {
+            self.browser_context_runtime
+                .unregister_service_worker_client(retired_client_id);
+        }
+        self.service_worker_control = None;
+        assert!(
+            self.frame_owner_store
+                .set_current_main_service_worker_client_id(Some(client_id)),
+            "initial Document commit requires a current service worker client owner"
+        );
+        self.apply_main_service_worker_document_owner_transition(transition);
+    }
+
     fn allocate_service_worker_request_id(&mut self) -> u64 {
         let request_id = self.next_service_worker_request_id;
         self.next_service_worker_request_id = request_id
@@ -214,6 +273,16 @@ impl JsContextHost {
         &mut self,
         dispatch_scope: OwnerDispatchScope,
     ) -> Option<ServiceWorkerWindowRequestContext> {
+        // close() marks the Window closed before its queued document cleanup.
+        // New requests would lose their resolvers when that cleanup runs.
+        if self.browsing_context_is_closed() {
+            return None;
+        }
+        if let OwnerDispatchScope::LightweightPopup(popup_id) = dispatch_scope
+            && !self.lightweight_popup_is_open(popup_id)
+        {
+            return None;
+        }
         let owner = self.service_worker_window_owner_for_dispatch_scope(dispatch_scope)?;
         let (document_url, storage_key) = match dispatch_scope {
             OwnerDispatchScope::Top => (
@@ -307,6 +376,7 @@ impl JsContextHost {
         &mut self,
         retired_owner: WindowDocumentOwner,
     ) {
+        self.retire_web_mcp_document(retired_owner);
         let register_count = self.pending_service_worker_registers.len();
         self.pending_service_worker_registers
             .retain(|_, pending| pending.owner.window_document_owner() != retired_owner);
@@ -338,6 +408,7 @@ impl JsContextHost {
         transition: crate::frame_owner_model::MainDocumentOwnerTransition,
     ) {
         let retired_owner = transition.retired_owner();
+        self.retire_web_mcp_document(WindowDocumentOwner::Frame(retired_owner));
         let register_count = self.pending_service_worker_registers.len();
         self.pending_service_worker_registers
             .retain(|_, pending| pending.owner.document_owner() != Some(retired_owner));
@@ -631,19 +702,15 @@ impl JsContextHost {
         self.ensure_service_worker_client_for_request_context(request_context);
         let creator_secure_context =
             moli_url::is_potentially_trustworthy_url(request_context.document_url());
+        let secure_context =
+            WorkerSecureContextPolicy::Inherited(creator_secure_context).resolve(&script_url);
         let network_policy = WorkerNetworkPolicy {
-            secure_context: worker_secure_context_for_script_url(
-                &script_url,
-                creator_secure_context,
-            ),
+            secure_context: WorkerSecureContextPolicy::Inherited(secure_context),
             permission_overrides: self.permission_overrides().to_vec(),
-            extra_http_headers: self.extra_http_headers().to_vec(),
+            extra_http_headers: self.extra_http_headers().clone(),
             network_offline: self.network_offline(),
             blocked_url_patterns: self.blocked_url_patterns().to_vec(),
             network_partition_key: None,
-            fetch_subresource_interception_enabled: self.fetch_subresource_interception_enabled(),
-            fetch_subresource_interception_resource_type: self
-                .fetch_subresource_interception_resource_type(),
         };
         let document_url = request_context.document_url().clone();
         let storage_key = request_context.serialized_storage_key();
@@ -1606,6 +1673,25 @@ impl JsContextHost {
             );
     }
 
+    pub(crate) fn service_worker_get_registration_url(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        request_context: &ServiceWorkerWindowRequestContext,
+        client_url: &str,
+    ) -> Result<Url, crate::service_worker_runtime::ServiceWorkerClientUrlError> {
+        let owner = request_context.owner().dispatch_scope();
+        // URL resolution follows the receiver Window's current API base URL.
+        // Its authority stays with the native environment origin, including
+        // an inherited about:blank origin and a cross-origin <base> element.
+        let base = crate::network_host::subresource_api_base_url(scope, self, owner)
+            .ok_or(crate::service_worker_runtime::ServiceWorkerClientUrlError::Invalid)?;
+        let origin = self
+            .window_document_origin(owner)
+            .map(|origin| moli_url::WebOrigin::from_serialized(&origin))
+            .unwrap_or(moli_url::WebOrigin::Opaque);
+        crate::service_worker_runtime::service_worker_client_url(&base, &origin, client_url)
+    }
+
     pub(crate) fn service_worker_registration_for_client(
         &mut self,
         request_context: &ServiceWorkerWindowRequestContext,
@@ -1693,8 +1779,8 @@ impl JsContextHost {
         client_id: ServiceWorkerClientId,
         url: Url,
         method: String,
-        headers: Vec<(String, String)>,
-        body: Option<Vec<u8>>,
+        headers: impl Into<moli_fetch::RequestHeaders>,
+        body: Option<bytes::Bytes>,
         destination: ServiceWorkerRequestDestination,
         request_mode: moli_fetch::RequestMode,
         credentials_mode: moli_fetch::RequestCredentialsMode,
@@ -1707,7 +1793,7 @@ impl JsContextHost {
             resulting_client_id: None,
             url,
             method,
-            headers,
+            headers: headers.into().to_byte_strings(),
             body,
             destination,
             request_mode,

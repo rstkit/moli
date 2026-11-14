@@ -1,20 +1,18 @@
 use super::*;
 use crate::dom::native::DomHost;
 use crate::util::context_host_ptr_from_global_bridge;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 use url::Url;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", scope_lifetime = 'scope)]
+#[webapi(plain, scope_lifetime = 'scope)]
 struct DetachedDocumentObjectDeclaration<'scope, 'tag> {
     #[webapi(prototype)]
     prototype: v8::Local<'scope, v8::Object>,
 
     #[webapi(to_string_tag)]
     to_string_tag: Option<&'tag str>,
-
-    #[webapi(data_property, readonly)]
-    location: v8::Local<'scope, v8::Value>,
 }
 
 fn detached_document_bridge_prototype_name(kind: &str) -> &'static str {
@@ -46,9 +44,14 @@ fn new_detached_document_object<'s>(
         .or_else(|| {
         bridge_prototype_object(scope, detached_document_bridge_prototype_name(kind))
     })?;
-    DetachedDocumentObjectDeclaration::new(prototype, to_string_tag, v8::null(scope).into())
+    let document = DetachedDocumentObjectDeclaration::new(prototype, to_string_tag)
         .bind(scope)
-        .ok()
+        .ok()?;
+    web_api_interfaces::initialize(scope, document, detached_document_constructor_name(kind))
+        .ok()?;
+    crate::context_bootstrap::install_constructed_document_location_runtime_state(scope, document)
+        .ok()?;
+    Some(document)
 }
 
 fn create_native_detached_document_handle_with_url(
@@ -58,11 +61,14 @@ fn create_native_detached_document_handle_with_url(
 ) -> Option<DomHandle> {
     let runtime_ptr = context_host_ptr_from_global_bridge(scope)?;
     let runtime = unsafe { &mut *runtime_ptr };
-    Some(if kind == "html" {
+    let source = runtime.current_realm_document_execution_context(scope);
+    let handle = if kind == "html" {
         runtime.create_detached_html_document_with_url(url)
     } else {
         runtime.create_detached_xml_document_with_url(url)
-    })
+    };
+    runtime.set_inert_document_execution_context(handle, source);
+    Some(handle)
 }
 
 fn detached_document_url(parsed: &DomHost) -> Url {
@@ -73,21 +79,10 @@ fn detached_document_url(parsed: &DomHost) -> Url {
         .unwrap_or_else(|| Url::parse("about:blank").expect("static about:blank parses"))
 }
 
-fn set_detached_document_url_state<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    state: v8::Local<'s, v8::Object>,
-    url: &Url,
-) -> Option<()> {
-    let url = v8_string(scope, url.as_str())?;
-    let _ = state.set(scope, v8str(scope, "url").into(), url.into());
-    let _ = state.set(scope, v8str(scope, "documentURI").into(), url.into());
-    let _ = state.set(scope, v8str(scope, "baseURI").into(), url.into());
-    Some(())
-}
-
 fn new_detached_document_shell<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     kind: &str,
+    content_type: &str,
     url: Url,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let to_string_tag = if kind == "html" {
@@ -109,11 +104,10 @@ fn new_detached_document_shell<'s>(
         v8str(scope, "readyState").into(),
         v8_string(scope, "complete")?.into(),
     );
-    set_detached_document_url_state(scope, state, &url)?;
     define_detached_state(scope, document, state);
-    if let Some(handle) = create_native_detached_document_handle_with_url(scope, kind, url) {
-        define_detached_native_handle(scope, document, handle);
-    }
+    let handle = create_native_detached_document_handle_with_url(scope, kind, url)?;
+    define_detached_native_handle(scope, document, handle);
+    set_detached_document_content_type(scope, document, content_type)?;
     install_detached_document_instance_properties(scope, document, kind);
     let _ = ensure_detached_document_implementation(scope, document);
     Some(document)
@@ -174,8 +168,7 @@ fn import_detached_document_children_from_host_with_reaction_policy<'s>(
             adopt_attached_imported_node_as_detached(scope, document, imported_object, document)?;
         }
     }
-    unsafe { &mut *runtime_ptr }
-        .sync_owner_style_sheet_texts_for_document_tree_scopes(document_handle);
+    unsafe { &mut *runtime_ptr }.initialize_style_element_sources_for_document(document_handle);
     Some(())
 }
 
@@ -195,23 +188,30 @@ pub(crate) fn build_detached_document_object_from_dom_host_with_content_type<'s>
     character_set: Option<&str>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let url = detached_document_url(&parsed);
-    let document = new_detached_document_shell(scope, kind, url)?;
+    let quirks_mode = parsed.dom().document()?.quirks_mode();
+    let compat_mode = if quirks_mode == selectors::matching::QuirksMode::Quirks {
+        "BackCompat"
+    } else {
+        "CSS1Compat"
+    };
+    let content_type = content_type.unwrap_or(parsed.dom().document()?.content_type());
+    let character_set = character_set.unwrap_or(parsed.dom().document()?.character_set());
+    let document = new_detached_document_shell(scope, kind, content_type, url)?;
     if let Some(state) = detached_state_object(scope, document) {
-        if let Some(content_type) = content_type {
-            let _ = state.set(
-                scope,
-                v8str(scope, "contentType").into(),
-                v8_string(scope, content_type)?.into(),
-            );
-        }
-        if let Some(character_set) = character_set {
-            let _ = state.set(
-                scope,
-                v8str(scope, "characterSet").into(),
-                v8_string(scope, character_set)?.into(),
-            );
-        }
+        let _ = state.set(
+            scope,
+            v8str(scope, "compatMode").into(),
+            v8_string(scope, compat_mode)?.into(),
+        );
     }
+    if let Some(document_handle) = detached_native_handle(scope, document)
+        && let Some(runtime_ptr) = context_host_ptr_from_global_bridge(scope)
+    {
+        let _ = unsafe { &mut *runtime_ptr }
+            .dom_host_mut()
+            .set_document_quirks_mode_for_handle(document_handle, quirks_mode);
+    }
+    set_detached_document_character_set(scope, document, character_set)?;
     import_detached_document_children_from_host(scope, document, &parsed)?;
     Some(document)
 }
@@ -225,7 +225,7 @@ fn insert_detached_document_child<'s>(
 }
 
 fn create_native_html_shell_element(
-    runtime: &mut JsContextHost,
+    runtime: &mut PageScriptHost,
     document_handle: DomHandle,
     local_name: &str,
     registry_association: custom_elements::CustomElementRegistryAssociation,
@@ -304,6 +304,7 @@ pub(in crate::native_bridge::document) fn build_detached_html_document_object<'s
     let document = new_detached_document_shell(
         scope,
         "html",
+        "text/html",
         Url::parse("about:blank").expect("static about:blank parses"),
     )?;
     populate_native_html_document_shell(scope, document, title)?;
@@ -320,22 +321,17 @@ pub(in crate::native_bridge::document) fn build_detached_document_object<'s>(
     if kind == "html" {
         return build_detached_html_document_object(scope, None);
     }
+    let content_type = match namespace_uri.as_deref() {
+        Some(XHTML_NS) => "application/xhtml+xml",
+        Some(SVG_NS) => "image/svg+xml",
+        _ => "application/xml",
+    };
     let document = new_detached_document_shell(
         scope,
         kind,
+        content_type,
         Url::parse("about:blank").expect("static about:blank parses"),
     )?;
-    if kind == "xml"
-        && let Some(namespace_uri) = namespace_uri.as_deref()
-        && let Some(state) = detached_state_object(scope, document)
-    {
-        let _ = state.set(
-            scope,
-            v8str(scope, "creationNamespace").into(),
-            v8_string(scope, namespace_uri)?.into(),
-        );
-    }
-
     if let Some(doctype) = doctype {
         let doctype = if detached_is_node(scope, doctype) {
             doctype

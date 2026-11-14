@@ -1,8 +1,9 @@
 //! Runtime-independent `TransformStream` coordination.
 //!
 //! The renderer owns JavaScript chunks, reasons, callbacks, promises, and the
-//! controller's finish promise/resolver pair. This module owns the decisions
-//! that coordinate the readable and writable sides around those values.
+//! controller's finish promise/resolver pair. This module coordinates start,
+//! write, backpressure, and admission to a shared finish operation. The renderer
+//! applies cancel/abort/flush settlement in the corresponding promise reaction.
 
 use crate::readable::ReadableState;
 use crate::strategy::StrategySnapshot;
@@ -41,8 +42,9 @@ impl TransformMode {
     pub const fn flush_algorithm(self) -> TransformFlushAlgorithm {
         match self {
             Self::Callback => TransformFlushAlgorithm::Callback,
+            Self::TextEncoder => TransformFlushAlgorithm::TextEncoder,
             Self::TextDecoder => TransformFlushAlgorithm::TextDecoder,
-            Self::Identity | Self::TextEncoder => TransformFlushAlgorithm::None,
+            Self::Identity => TransformFlushAlgorithm::None,
         }
     }
 
@@ -69,6 +71,7 @@ pub enum TransformWriteAlgorithm {
 pub enum TransformFlushAlgorithm {
     None,
     Callback,
+    TextEncoder,
     TextDecoder,
 }
 
@@ -314,46 +317,6 @@ impl TransformSnapshot {
     }
 
     #[must_use]
-    pub const fn plan_finish_settlement(
-        self,
-        operation: FinishOperation,
-        outcome: AlgorithmOutcome,
-    ) -> FinishSettlementPlan {
-        match (operation, outcome) {
-            (FinishOperation::ReadableCancel, AlgorithmOutcome::Fulfilled) => {
-                if matches!(self.writable_state, WritableState::Errored) {
-                    FinishSettlementPlan::RejectWithWritableStoredError
-                } else {
-                    FinishSettlementPlan::ErrorWritableWithOriginalReasonAndResolve
-                }
-            }
-            (FinishOperation::ReadableCancel, AlgorithmOutcome::Rejected) => {
-                FinishSettlementPlan::ErrorWritableWithCallbackErrorAndReject
-            }
-            (FinishOperation::WritableAbort, AlgorithmOutcome::Fulfilled) => {
-                if matches!(self.readable.state, ReadableState::Errored) {
-                    FinishSettlementPlan::RejectWithReadableStoredError
-                } else {
-                    FinishSettlementPlan::ErrorReadableWithOriginalReasonAndResolve
-                }
-            }
-            (FinishOperation::WritableAbort, AlgorithmOutcome::Rejected) => {
-                FinishSettlementPlan::ErrorReadableWithCallbackErrorAndReject
-            }
-            (FinishOperation::WritableClose, AlgorithmOutcome::Fulfilled) => {
-                match self.readable.state {
-                    ReadableState::Errored => FinishSettlementPlan::RejectWithReadableStoredError,
-                    ReadableState::Readable => FinishSettlementPlan::CloseReadableAndResolve,
-                    ReadableState::Closed => FinishSettlementPlan::Resolve,
-                }
-            }
-            (FinishOperation::WritableClose, AlgorithmOutcome::Rejected) => {
-                FinishSettlementPlan::ErrorReadableWithCallbackErrorAndReject
-            }
-        }
-    }
-
-    #[must_use]
     pub const fn plan_finish_setup_failure(
         self,
         operation: FinishOperation,
@@ -505,18 +468,6 @@ impl TerminatePlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FinishSettlementPlan {
-    Resolve,
-    CloseReadableAndResolve,
-    ErrorWritableWithOriginalReasonAndResolve,
-    ErrorReadableWithOriginalReasonAndResolve,
-    ErrorWritableWithCallbackErrorAndReject,
-    ErrorReadableWithCallbackErrorAndReject,
-    RejectWithWritableStoredError,
-    RejectWithReadableStoredError,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FinishSetupFailurePlan {
     ErrorWritableWithOriginalReasonAndReject,
     ErrorReadableWithOriginalReasonAndReject,
@@ -612,7 +563,7 @@ mod tests {
                 true,
                 TransformMode::TextEncoder,
                 TransformWriteAlgorithm::TextEncoder,
-                TransformFlushAlgorithm::None,
+                TransformFlushAlgorithm::TextEncoder,
                 TransformCancelAlgorithm::None,
             ),
             (
@@ -754,82 +705,6 @@ mod tests {
         .plan_error();
         assert_eq!(plan.reason(), ErrorReasonSource::Provided);
         assert_eq!(plan.readable(), ReadableErrorAction::Error);
-    }
-
-    #[test]
-    fn terminal_settlements_cover_both_sides_and_all_outcomes() {
-        let readable_snapshot = readable(ReadableState::Readable, 0, false, 1.0, 0.0);
-        let writable = snapshot(
-            readable_snapshot,
-            WritableState::Writable,
-            TransformMode::Callback,
-        );
-        assert_eq!(
-            writable.plan_finish_settlement(
-                FinishOperation::ReadableCancel,
-                AlgorithmOutcome::Fulfilled,
-            ),
-            FinishSettlementPlan::ErrorWritableWithOriginalReasonAndResolve
-        );
-        assert_eq!(
-            writable.plan_finish_settlement(
-                FinishOperation::ReadableCancel,
-                AlgorithmOutcome::Rejected,
-            ),
-            FinishSettlementPlan::ErrorWritableWithCallbackErrorAndReject
-        );
-        assert_eq!(
-            writable.plan_finish_settlement(
-                FinishOperation::WritableAbort,
-                AlgorithmOutcome::Fulfilled,
-            ),
-            FinishSettlementPlan::ErrorReadableWithOriginalReasonAndResolve
-        );
-        assert_eq!(
-            writable.plan_finish_settlement(
-                FinishOperation::WritableClose,
-                AlgorithmOutcome::Fulfilled,
-            ),
-            FinishSettlementPlan::CloseReadableAndResolve
-        );
-
-        let readable_error = snapshot(
-            readable(ReadableState::Errored, 0, false, 1.0, 0.0),
-            WritableState::Writable,
-            TransformMode::Callback,
-        );
-        assert_eq!(
-            readable_error.plan_finish_settlement(
-                FinishOperation::WritableClose,
-                AlgorithmOutcome::Fulfilled,
-            ),
-            FinishSettlementPlan::RejectWithReadableStoredError
-        );
-        let writable_error = snapshot(
-            readable_snapshot,
-            WritableState::Errored,
-            TransformMode::Callback,
-        );
-        assert_eq!(
-            writable_error.plan_finish_settlement(
-                FinishOperation::ReadableCancel,
-                AlgorithmOutcome::Fulfilled,
-            ),
-            FinishSettlementPlan::RejectWithWritableStoredError
-        );
-
-        let writable_erroring = snapshot(
-            readable_snapshot,
-            WritableState::Erroring,
-            TransformMode::Callback,
-        );
-        assert_eq!(
-            writable_erroring.plan_finish_settlement(
-                FinishOperation::ReadableCancel,
-                AlgorithmOutcome::Fulfilled,
-            ),
-            FinishSettlementPlan::ErrorWritableWithOriginalReasonAndResolve
-        );
     }
 
     #[test]

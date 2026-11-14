@@ -8,14 +8,14 @@ use crate::{
     custom_elements,
     document_runtime::{DocumentRuntime, DomHandle},
     mutation_coordinator::{ConnectedScriptMutationPolicy, RuntimeMutationOptions},
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
 };
 
 impl DocumentRuntime {
     pub(super) fn dispatch_tree_insertion_side_effects_after_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: &TreeInsertionPlan<'_>,
         profile: TreeMutationSourceProfile,
     ) {
@@ -54,13 +54,10 @@ impl DocumentRuntime {
     pub(super) fn dispatch_tree_insertion_pre_reaction_followups_after_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: &TreeInsertionPlan<'_>,
     ) {
         self.reset_non_dirty_textarea_selection_after_child_list_change(insertion_plan.parent);
-        if let Some((x, y)) = insertion_plan.scroll_anchor_adjustment {
-            crate::window_host::scroll_window_to(scope, host_ptr, x, y);
-        }
         if let Some(live_range_plan) = insertion_plan.live_range_plan.as_ref() {
             self.apply_live_range_pre_insert_plan(scope, host_ptr, live_range_plan);
             apply_live_ranges_child_insertion(
@@ -75,7 +72,7 @@ impl DocumentRuntime {
     pub(super) fn dispatch_tree_insertion_immediate_side_effects_after_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: &TreeInsertionPlan<'_>,
         profile: TreeMutationSourceProfile,
     ) {
@@ -118,7 +115,7 @@ impl DocumentRuntime {
     fn dispatch_tree_insertion_custom_element_reactions(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: &TreeInsertionPlan<'_>,
         profile: TreeMutationSourceProfile,
     ) {
@@ -129,7 +126,7 @@ impl DocumentRuntime {
                         scope,
                         host_ptr,
                         insertion_plan,
-                        profile.sync_upgrade_connected_subtrees,
+                        profile.upgrade_connected_subtrees,
                     );
                 });
             }
@@ -138,7 +135,7 @@ impl DocumentRuntime {
                     scope,
                     host_ptr,
                     insertion_plan,
-                    profile.sync_upgrade_connected_subtrees,
+                    profile.upgrade_connected_subtrees,
                 );
             }
         }
@@ -147,9 +144,9 @@ impl DocumentRuntime {
     fn enqueue_tree_insertion_custom_element_reactions(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: &TreeInsertionPlan<'_>,
-        sync_upgrade_connected_subtrees: bool,
+        upgrade_connected_subtrees: bool,
     ) {
         let was_connected = insertion_plan.was_lifecycle_connected_before_insert();
         let adopted_across_documents = insertion_plan.adoption.crosses_documents();
@@ -181,7 +178,7 @@ impl DocumentRuntime {
             host_ptr,
             insertion_plan.insertion_roots,
             was_connected && !adopted_across_documents,
-            sync_upgrade_connected_subtrees,
+            upgrade_connected_subtrees,
         );
         let is_lifecycle_connected = insertion_plan
             .insertion_roots
@@ -223,7 +220,7 @@ impl DocumentRuntime {
     pub(super) fn hide_inserted_nonce_content_attributes(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         roots: &[DomHandle],
         reaction_policy: TreeReactionDispatchPolicy,
     ) {

@@ -5,6 +5,7 @@ use crate::util::{
 
 pub(in crate::context_bootstrap) fn create_contextual_fragment_internal<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
     context_node: v8::Local<'s, v8::Object>,
     html: &str,
 ) -> Option<v8::Local<'s, v8::Object>> {
@@ -24,7 +25,7 @@ pub(in crate::context_bootstrap) fn create_contextual_fragment_internal<'s>(
     )?;
     runtime
         .native_bridge_mut()
-        .wrap_handle(scope, host_ptr, fragment)
+        .wrap_handle_for_receiver(scope, host_ptr, receiver, fragment)
 }
 
 fn create_detached_contextual_fragment<'s>(
@@ -175,6 +176,7 @@ pub(in crate::context_bootstrap::range_algorithms) fn node_handle_for_range_inse
     document_handle: Option<DomHandle>,
     node: v8::Local<'s, v8::Object>,
 ) -> Option<DomHandle> {
+    let node = moli_webapi_declare::web_api_object_target(scope, node)?;
     let host_ptr = context_host_ptr_from_global_bridge(scope)?;
     crate::native_bridge::node_or_foreign_arg_handle_allow_detached(
         scope,
@@ -415,15 +417,16 @@ pub(in crate::context_bootstrap::range_algorithms) fn remove_child_internal_hand
 
 fn range_tree_op_node_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     node: v8::Local<'s, v8::Object>,
 ) -> Option<DomHandle> {
+    let node = moli_webapi_declare::web_api_object_target(scope, node)?;
     native_bridge::current_or_live_delegate_node_arg_handle(scope, host_ptr, node.into())
 }
 
 fn clone_node_internal_handle_with_host(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: DomHandle,
     deep: bool,
 ) -> Option<DomHandle> {
@@ -432,7 +435,7 @@ fn clone_node_internal_handle_with_host(
 
 fn append_child_internal_handle_with_host(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
 ) -> Option<()> {
@@ -443,7 +446,7 @@ fn append_child_internal_handle_with_host(
 
 fn insert_before_internal_handle_with_host(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
     reference_child: Option<DomHandle>,
@@ -455,7 +458,7 @@ fn insert_before_internal_handle_with_host(
 
 fn remove_child_internal_handle_with_host(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
 ) -> Option<()> {

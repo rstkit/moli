@@ -1,5 +1,21 @@
 use super::*;
 
+fn navigation_preload_version_id(
+    state: &ServiceWorkerRuntimeState,
+    registration: &ServiceWorkerRegistration,
+) -> Option<ServiceWorkerVersionId> {
+    registration.active_version_id.or_else(|| {
+        // The runtime retains an activating version in the waiting slot until
+        // its activate event settles. NavigationPreloadManager must already
+        // be usable inside that event, including promises passed to waitUntil.
+        registration.waiting_version_id.filter(|version_id| {
+            state.versions.get(version_id).is_some_and(|version| {
+                version.lifecycle_state == ServiceWorkerVersionLifecycleState::Activating
+            })
+        })
+    })
+}
+
 impl ServiceWorkerRuntimeService {
     #[cfg(test)]
     pub(crate) fn watch_ready_registration(
@@ -120,7 +136,7 @@ impl ServiceWorkerRuntimeService {
             .find(|registration| {
                 registration.scope_url == *scope_url
                     && !registration.pending_unregistration
-                    && registration.active_version_id.is_some()
+                    && navigation_preload_version_id(&state, registration).is_some()
             })
             .map(|registration| registration.navigation_preload_state.clone())
     }
@@ -161,16 +177,20 @@ impl ServiceWorkerRuntimeService {
         else {
             return Err(ServiceWorkerNavigationPreloadStateError::InvalidState);
         };
-        let (version_id, previous_state) = {
+        let Some(version_id) = state
+            .registrations
+            .get(&registration_id)
+            .and_then(|registration| navigation_preload_version_id(&state, registration))
+        else {
+            return Err(ServiceWorkerNavigationPreloadStateError::InvalidState);
+        };
+        let previous_state = {
             let Some(registration) = state.registrations.get_mut(&registration_id) else {
-                return Err(ServiceWorkerNavigationPreloadStateError::InvalidState);
-            };
-            let Some(version_id) = registration.active_version_id else {
                 return Err(ServiceWorkerNavigationPreloadStateError::InvalidState);
             };
             let previous_state = registration.navigation_preload_state.clone();
             update(&mut registration.navigation_preload_state);
-            (version_id, previous_state)
+            previous_state
         };
         if self
             .store_registration_resources_locked(&state, registration_id, version_id)
@@ -379,7 +399,6 @@ pub(super) fn select_controller_for_new_client_locked(
         .registrations
         .values()
         .filter(|registration| !registration.pending_unregistration)
-        .filter(|registration| registration.active_version_id.is_some())
         .filter(|registration| {
             service_worker_registration_matches_url(registration, document_url, storage_key)
         })
@@ -387,9 +406,10 @@ pub(super) fn select_controller_for_new_client_locked(
         .map(|registration| registration.id);
     if let Some(registration_id) = registration_id
         && let Some(registration) = state.registrations.get_mut(&registration_id)
+        && let Some(version_id) = registration.active_version_id
         && registration.controlled_client_ids.insert(client_id)
     {
-        return registration.active_version_id;
+        return Some(version_id);
     }
     None
 }

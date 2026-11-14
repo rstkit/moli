@@ -1,10 +1,10 @@
 use super::type_set::new_view_transition_type_set;
 use super::*;
+use crate::web_api_interfaces;
 use crate::{
     util::{get_private_value, set_private_value},
-    window_webidl_callback::{
-        PreparedWindowWebIdlCallbackFunction, PreparedWindowWebIdlCallbackFunctionOutcome,
-    },
+    webidl_callback_execution::WebIdlCallbackExecutionOutcome,
+    window_webidl_callback::WindowWebIdlCallbackFunction,
 };
 use moli_webapi_declare::WebApiObject;
 
@@ -28,7 +28,7 @@ const CALLBACK_SUCCEEDED: &str = "succeeded";
 const CALLBACK_FAILED: &str = "failed";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ViewTransition")]
+#[webapi(interface = web_api_interfaces::ViewTransition)]
 struct ViewTransitionObjectDeclaration<'s> {
     #[webapi(slot = VIEW_TRANSITION_DOCUMENT_SLOT)]
     document: v8::Local<'s, v8::Object>,
@@ -242,7 +242,7 @@ fn require_view_transition_receiver<'s>(
     receiver: v8::Local<'s, v8::Object>,
     member: &str,
 ) -> bool {
-    if get_private_value(scope, receiver, VIEW_TRANSITION_CALLBACK_STATE_SLOT).is_some() {
+    if web_api_interfaces::ViewTransition::is_instance(scope, receiver) {
         return true;
     }
     throw_type_error(
@@ -275,9 +275,9 @@ pub(super) fn skip_view_transition<'s>(
 
 pub(crate) fn run_view_transition_update_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut crate::native_bridge::JsContextHost,
+    host_ptr: *mut crate::native_bridge::PageScriptHost,
     transition: v8::Local<'s, v8::Object>,
-    callback: Option<&PreparedWindowWebIdlCallbackFunction>,
+    callback: Option<&WindowWebIdlCallbackFunction>,
 ) {
     if callback_state(scope, transition).as_deref() != Some(CALLBACK_PENDING) {
         return;
@@ -290,11 +290,17 @@ pub(crate) fn run_view_transition_update_callback<'s>(
     );
 
     let installed_reactions = if let Some(callback) = callback {
+        // An absent callback succeeds with undefined; a supplied callback
+        // whose Realm has retired must instead reject the transition.
+        let Some(callback) = callback.prepare_execution(scope, host_ptr, None) else {
+            let error = new_dom_exception_value(scope, "Transition was skipped", "AbortError");
+            reject_view_transition(scope, transition, error);
+            return;
+        };
         let receiver = v8::undefined(scope).into();
         let arguments = [];
-        match callback.invoke(
+        match callback.invoke_with(
             scope,
-            unsafe { &*host_ptr },
             receiver,
             &arguments,
             |scope, callback, receiver, arguments| {
@@ -312,8 +318,8 @@ pub(crate) fn run_view_transition_update_callback<'s>(
                     .ok_or(ViewTransitionUpdateInvocationFailure::PromiseNormalizationFailed)
             },
         ) {
-            PreparedWindowWebIdlCallbackFunctionOutcome::Returned(()) => true,
-            PreparedWindowWebIdlCallbackFunctionOutcome::Failed(
+            WebIdlCallbackExecutionOutcome::Returned(()) => true,
+            WebIdlCallbackExecutionOutcome::Failed(
                 ViewTransitionUpdateInvocationFailure::CallbackThrew(error),
             ) => {
                 let error = error
@@ -323,10 +329,10 @@ pub(crate) fn run_view_transition_update_callback<'s>(
                 reject_view_transition(scope, transition, error);
                 return;
             }
-            PreparedWindowWebIdlCallbackFunctionOutcome::Failed(
+            WebIdlCallbackExecutionOutcome::Failed(
                 ViewTransitionUpdateInvocationFailure::PromiseNormalizationFailed,
             ) => false,
-            PreparedWindowWebIdlCallbackFunctionOutcome::Retired => {
+            WebIdlCallbackExecutionOutcome::Unavailable => {
                 let error = new_dom_exception_value(scope, "Transition was skipped", "AbortError");
                 reject_view_transition(scope, transition, error);
                 return;

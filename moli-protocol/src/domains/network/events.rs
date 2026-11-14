@@ -1,4 +1,4 @@
-use crate::devtools_runtime::{
+use crate::automation::{
     AutomationEvent, DevToolsFetchRequestId, DevToolsFrameId, DevToolsLoaderId,
     DevToolsNetworkInterceptId, DevToolsNetworkResourceType, DevToolsRequestId, DevToolsTargetId,
     NetworkRedirectResponseEvent, NetworkRequestEvent,
@@ -7,12 +7,13 @@ use moli_cookie_jar::StoredCookieSetReport;
 use moli_core::page::{
     SubresourceRequestInitiatorType, WebSocketFrameDirection, WebSocketFrameOpcode,
 };
+use moli_protocol_cdp_defs::LocalCdpEvent;
 use moli_web_mime::response_header_value;
 use serde_json::{Value, json};
 use url::Url;
 
 use super::*;
-use crate::conn::{BackgroundProtocolEvent, build_event};
+use crate::conn::BackgroundProtocolEvent;
 
 pub(crate) use moli_fetch::NET_ERR_ABORTED_ERROR_TEXT;
 
@@ -75,7 +76,7 @@ pub(crate) trait CdpNetworkAutomationEventSink {
 
     fn push_network_automation_event(
         &mut self,
-        method: &str,
+        method: LocalCdpEvent,
         params: Value,
         session_id: Option<&str>,
         event: AutomationEvent,
@@ -193,15 +194,14 @@ impl CdpNetworkAutomationEventSink for Vec<BackgroundProtocolEvent> {
 
     fn push_network_automation_event(
         &mut self,
-        method: &str,
+        method: LocalCdpEvent,
         mut params: Value,
         session_id: Option<&str>,
         event: AutomationEvent,
     ) {
         apply_blocked_intercepts_marker(&mut params, &event);
         self.push(BackgroundProtocolEvent::immediate_automation_event(
-            build_event(method, params, session_id),
-            event,
+            method, params, session_id, event,
         ));
     }
 }
@@ -272,7 +272,7 @@ pub(crate) fn emit_request_will_be_sent(
     redirect_response: Option<(
         &Url,
         u16,
-        &[(String, String)],
+        &[(String, Vec<u8>)],
         bool,
         Option<moli_fetch::NegotiatedHttpVersion>,
     )>,
@@ -379,7 +379,19 @@ pub(crate) fn fetch_subresource_initial_request_network_events(
             SubresourceRequestInitiatorType::Script,
         )
         .map(str::to_owned),
-        redirect_response: None,
+        redirect_response: output
+            .redirect()
+            .map(|redirect| NetworkRedirectResponseEvent {
+                url: redirect.from_url.as_str().to_owned(),
+                status: redirect.status,
+                status_text: None,
+                response_headers: redirect.headers.clone(),
+                encoded_data_length: 0,
+                from_cache: redirect.from_cache,
+                response_protocol: redirect
+                    .negotiated_http_version
+                    .map(|version| version.protocol_name().to_owned()),
+            }),
         redirect_has_extra_info: false,
         request_cookie_report: output.request_cookie_report().cloned(),
         resource_type: Some(resource_type),
@@ -413,7 +425,7 @@ pub(crate) fn emit_response_received_extra_info(
     out: &mut impl CdpNetworkAutomationEventSink,
     session_id: Option<&str>,
     request_id: &str,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     status: u16,
     cookie_set_reports: &[StoredCookieSetReport],
 ) {
@@ -434,7 +446,7 @@ pub(crate) fn emit_redirect_response_received_extra_info(
     out: &mut impl CdpNetworkAutomationEventSink,
     session_id: Option<&str>,
     request_id: &str,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     status: u16,
     cookie_set_reports: &[StoredCookieSetReport],
 ) {
@@ -461,7 +473,7 @@ pub(crate) fn emit_response_received(
     final_url: &Url,
     status: u16,
     status_text: Option<&str>,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     cookie_set_reports: &[StoredCookieSetReport],
     encoded_data_length: usize,
     from_cache: bool,
@@ -505,7 +517,7 @@ pub(crate) fn emit_response_received_without_extra_info_event(
     final_url: &Url,
     status: u16,
     status_text: Option<&str>,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     encoded_data_length: usize,
     from_cache: bool,
     negotiated_http_version: Option<moli_fetch::NegotiatedHttpVersion>,
@@ -546,7 +558,7 @@ fn emit_response_received_with_extra_info_delivery(
     final_url: &Url,
     status: u16,
     status_text: Option<&str>,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     cookie_set_reports: &[StoredCookieSetReport],
     encoded_data_length: usize,
     from_cache: bool,
@@ -701,8 +713,8 @@ pub(crate) fn emit_event_source_message_received(
     event_id: &str,
     data: &str,
 ) {
-    out.push_protocol_event(BackgroundProtocolEvent::immediate(build_event(
-        "Network.eventSourceMessageReceived",
+    out.push_protocol_event(BackgroundProtocolEvent::immediate_event(
+        LocalCdpEvent::NetworkEventSourceMessageReceived,
         json!({
             "requestId": request_id,
             "timestamp": timestamp,
@@ -711,7 +723,7 @@ pub(crate) fn emit_event_source_message_received(
             "data": data,
         }),
         session_id,
-    )));
+    ));
 }
 
 pub(crate) fn emit_request_served_from_cache(
@@ -719,11 +731,11 @@ pub(crate) fn emit_request_served_from_cache(
     session_id: Option<&str>,
     request_id: &str,
 ) {
-    out.push_protocol_event(BackgroundProtocolEvent::immediate(build_event(
-        "Network.requestServedFromCache",
+    out.push_protocol_event(BackgroundProtocolEvent::immediate_event(
+        LocalCdpEvent::NetworkRequestServedFromCache,
         json!({ "requestId": request_id }),
         session_id,
-    )));
+    ));
 }
 
 pub(crate) fn emit_data_received(
@@ -737,8 +749,8 @@ pub(crate) fn emit_data_received(
     if data_length == 0 && encoded_data_length == 0 {
         return;
     }
-    out.push_protocol_event(BackgroundProtocolEvent::immediate(build_event(
-        "Network.dataReceived",
+    out.push_protocol_event(BackgroundProtocolEvent::immediate_event(
+        LocalCdpEvent::NetworkDataReceived,
         json!({
             "requestId": request_id,
             "timestamp": timestamp,
@@ -746,7 +758,7 @@ pub(crate) fn emit_data_received(
             "encodedDataLength": encoded_data_length,
         }),
         session_id,
-    )));
+    ));
 }
 
 pub(crate) fn emit_loading_failed(
@@ -857,7 +869,7 @@ pub(crate) fn emit_cdp_network_automation_event(
                 params
             };
             out.push_network_automation_event(
-                "Network.responseReceived",
+                LocalCdpEvent::NetworkResponseReceived,
                 params,
                 session_id,
                 AutomationEvent::NetworkResponseStarted(network_event),
@@ -870,7 +882,7 @@ pub(crate) fn emit_cdp_network_automation_event(
                 "encodedDataLength": network_event.encoded_data_length.unwrap_or_default(),
             });
             out.push_network_automation_event(
-                "Network.loadingFinished",
+                LocalCdpEvent::NetworkLoadingFinished,
                 params,
                 session_id,
                 AutomationEvent::NetworkResponseCompleted(network_event),
@@ -888,7 +900,7 @@ pub(crate) fn emit_cdp_network_automation_event(
                 "canceled": network_event.loading_failed_canceled,
             });
             out.push_network_automation_event(
-                "Network.loadingFailed",
+                LocalCdpEvent::NetworkLoadingFailed,
                 params,
                 session_id,
                 AutomationEvent::NetworkFetchError(network_event),
@@ -897,7 +909,7 @@ pub(crate) fn emit_cdp_network_automation_event(
         AutomationEvent::NetworkAuthRequired(network_event) => {
             let params = fetch_auth_required_params(&network_event);
             out.push_network_automation_event(
-                "Fetch.authRequired",
+                LocalCdpEvent::FetchAuthRequired,
                 params,
                 session_id,
                 AutomationEvent::NetworkAuthRequired(network_event),
@@ -906,7 +918,7 @@ pub(crate) fn emit_cdp_network_automation_event(
         AutomationEvent::RequestPaused(network_event) => {
             let params = fetch_request_paused_params(&network_event);
             out.push_network_automation_event(
-                "Fetch.requestPaused",
+                LocalCdpEvent::FetchRequestPaused,
                 params,
                 session_id,
                 AutomationEvent::RequestPaused(network_event),
@@ -970,7 +982,7 @@ fn emit_network_before_request_sent(
         params["__moliFetchRequestId"] = json!(fetch_request_id.as_str());
     }
     out.push_network_automation_event(
-        "Network.requestWillBeSent",
+        LocalCdpEvent::NetworkRequestWillBeSent,
         params,
         session_id,
         AutomationEvent::NetworkBeforeRequestSent(network_event),
@@ -1009,7 +1021,7 @@ pub fn fetch_request_paused_params(network_event: &NetworkRequestEvent) -> Value
             network_event
                 .response_headers
                 .iter()
-                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .map(|(name, value)| json!({ "name": name, "value": moli_fetch::decode_header_value(value) }))
                 .collect(),
         );
         if let Some(status_text) = network_event.status_text.as_ref() {
@@ -1081,7 +1093,7 @@ pub(crate) fn emit_websocket_will_send_handshake_request(
         session_id,
         request_id,
         timestamp,
-        headers_as_json_object(request_headers),
+        request_headers_as_json_object(request_headers, None),
     );
 }
 
@@ -1091,7 +1103,7 @@ pub(crate) fn emit_websocket_handshake_response_received(
     request_id: &str,
     timestamp: f64,
     status: u16,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
 ) {
     out.push_websocket_handshake_response_received(
         session_id,
@@ -1129,15 +1141,15 @@ pub(crate) fn emit_websocket_frame_error(
     timestamp: f64,
     error_message: &str,
 ) {
-    out.push_protocol_event(BackgroundProtocolEvent::immediate(build_event(
-        "Network.webSocketFrameError",
+    out.push_protocol_event(BackgroundProtocolEvent::immediate_event(
+        LocalCdpEvent::NetworkWebSocketFrameError,
         json!({
             "requestId": request_id,
             "timestamp": timestamp,
             "errorMessage": error_message,
         }),
         session_id,
-    )));
+    ));
 }
 
 pub(crate) fn emit_websocket_closed(
@@ -1146,22 +1158,22 @@ pub(crate) fn emit_websocket_closed(
     request_id: &str,
     timestamp: f64,
 ) {
-    out.push_protocol_event(BackgroundProtocolEvent::immediate(build_event(
-        "Network.webSocketClosed",
+    out.push_protocol_event(BackgroundProtocolEvent::immediate_event(
+        LocalCdpEvent::NetworkWebSocketClosed,
         json!({
             "requestId": request_id,
             "timestamp": timestamp,
         }),
         session_id,
-    )));
+    ));
 }
 
 pub(crate) fn headers_as_json_object(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> serde_json::Map<String, Value> {
     headers
         .iter()
-        .map(|(name, value)| (name.clone(), json!(value)))
+        .map(|(name, value)| (name.clone(), json!(moli_fetch::decode_header_value(value))))
         .collect()
 }
 
@@ -1204,7 +1216,7 @@ pub(crate) fn request_headers_as_json_object(
 pub(crate) fn build_response_payload(
     url: &Url,
     status: u16,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     encoded_data_length: usize,
 ) -> Value {
     build_response_payload_with_status_text(
@@ -1221,7 +1233,7 @@ pub(crate) fn build_response_payload_with_status_text(
     url: &Url,
     status: u16,
     status_text: Option<&str>,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     encoded_data_length: usize,
     from_cache: bool,
 ) -> Value {
@@ -1293,7 +1305,7 @@ mod tests {
     use serde_json::{Value, json};
     use url::Url;
 
-    use crate::devtools_runtime::{
+    use crate::automation::{
         AutomationEvent, DevToolsFrameId, DevToolsLoaderId, DevToolsNetworkInterceptId,
         DevToolsNetworkResourceType, DevToolsRequestId, DevToolsTargetId, NetworkRequestEvent,
     };
@@ -1310,7 +1322,7 @@ mod tests {
     ) -> Vec<Value> {
         events
             .into_iter()
-            .map(crate::conn::BackgroundProtocolEvent::into_protocol_message)
+            .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
             .collect()
     }
 
@@ -1320,8 +1332,8 @@ mod tests {
             &Url::parse("https://example.test/").unwrap(),
             200,
             &[
-                ("Content-Type".to_owned(), "text/html".to_owned()),
-                ("Bad Header".to_owned(), "ignored".to_owned()),
+                ("Content-Type".to_owned(), b"text/html".to_vec()),
+                ("Bad Header".to_owned(), b"ignored".to_vec()),
             ],
             0,
         );
@@ -1358,9 +1370,9 @@ mod tests {
             url: Url::parse("https://example.test/api").unwrap(),
             websocket_socket_id: None,
             method: "POST".to_owned(),
-            request_headers: vec![("x-test".to_owned(), "1".to_owned())],
+            request_headers: vec![("x-test".to_owned(), "1".to_owned())].into(),
             request_body: Some("body".to_owned()),
-            request_body_bytes: Some(b"body".to_vec()),
+            request_body_bytes: Some(bytes::Bytes::from_static(b"body")),
             resource_type: SubresourceResourceType::Fetch,
             request_cookie_report: None,
         };
@@ -1417,8 +1429,8 @@ mod tests {
             201,
             None,
             &[
-                ("content-type".to_owned(), "application/json".to_owned()),
-                ("x-test".to_owned(), "1".to_owned()),
+                ("content-type".to_owned(), b"application/json".to_vec()),
+                ("x-test".to_owned(), b"1".to_vec()),
             ],
             &[],
             128,

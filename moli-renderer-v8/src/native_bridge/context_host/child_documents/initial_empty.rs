@@ -1,7 +1,8 @@
-use super::super::JsContextHost;
+use super::super::PageScriptHost;
 use crate::{
     document_runtime::{DocumentPolicyContainer, DomHandle},
     frame_owner_model::{FrameDocumentLoadDeliveryTask, FrameLocalWindowOwnerTransition},
+    native_bridge::OwnerDispatchScope,
 };
 use url::Url;
 
@@ -23,19 +24,25 @@ pub(in crate::native_bridge::context_host) struct ChildInitialEmptyDocumentIniti
         FrameDocumentLoadDeliveryTask,
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(in crate::native_bridge::context_host) fn initial_child_about_blank_policy_container_from_parent(
         &self,
         handle: DomHandle,
     ) -> DocumentPolicyContainer {
-        let mut policy_container = self
-            .child_browsing_context_parent_handle(handle)
-            .and_then(|parent| {
-                self.child_browsing_contexts
-                    .get(&parent)
-                    .map(|entry| entry.document_policy_container_snapshot())
-            })
-            .unwrap_or_else(|| self.document_policy_container().clone());
+        let inherited_policy = match self.owner_dispatch_scope_for_node(handle) {
+            Some(OwnerDispatchScope::Child(parent)) => {
+                self.child_browsing_context_policy_container_snapshot(parent)
+            }
+            Some(OwnerDispatchScope::LightweightPopup(popup_id)) => {
+                self.lightweight_popup_policy_container(popup_id).cloned()
+            }
+            Some(OwnerDispatchScope::Top) | None => None,
+        };
+        // Auxiliary-page handoff and popup retirement can refresh iframe
+        // records while their creator Document has no dispatch mapping.
+        // Preserve the initial-policy fallback only at this setup boundary.
+        let mut policy_container =
+            inherited_policy.unwrap_or_else(|| self.document_policy_container().clone());
         if let Some(parent_document) = self
             .dom_host()
             .node(handle)
@@ -62,7 +69,7 @@ impl JsContextHost {
         let inherited_origin = if policy_container.sandbox.forces_opaque_origin {
             "null".to_owned()
         } else {
-            self.child_browsing_context_creator_network_partition_origin(handle)
+            self.child_browsing_context_creator_origin(handle)
         };
         ChildInitialEmptyDocumentInit {
             creator_base_url: self.document_base_url_for_child_context(handle),
@@ -186,7 +193,7 @@ impl JsContextHost {
                 .create_document_type_for_document(document_handle, "html", "", "");
         let html = self
             .dom_host_mut()
-            .create_parser_element_without_attributes_for_document(
+            .create_element_without_attributes_for_document(
                 document_handle,
                 "html".to_owned(),
                 "http://www.w3.org/1999/xhtml".to_owned(),
@@ -194,7 +201,7 @@ impl JsContextHost {
             );
         let head = self
             .dom_host_mut()
-            .create_parser_element_without_attributes_for_document(
+            .create_element_without_attributes_for_document(
                 document_handle,
                 "head".to_owned(),
                 "http://www.w3.org/1999/xhtml".to_owned(),
@@ -202,7 +209,7 @@ impl JsContextHost {
             );
         let body = self
             .dom_host_mut()
-            .create_parser_element_without_attributes_for_document(
+            .create_element_without_attributes_for_document(
                 document_handle,
                 "body".to_owned(),
                 "http://www.w3.org/1999/xhtml".to_owned(),

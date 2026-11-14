@@ -222,6 +222,29 @@ impl ConnectedStyleOwnerKind {
 }
 
 impl DocumentRuntime {
+    /// Parser discovery may need an inline import before the initial scan.
+    /// Reuse connected-owner admission without visiting unrelated DOM nodes.
+    pub(crate) fn prepare_parser_style_import_loads(
+        &mut self,
+        inputs: &[crate::stylesheet_blocking::DocumentOwnedStylesheetDiscoveryInput],
+    ) -> Vec<PreparedConnectedStyleLoad> {
+        let handles = inputs
+            .iter()
+            .filter(|input| {
+                matches!(
+                    input.signature(),
+                    DocumentBlockingStylesheetSignature::ParserCreatedStyleImport { .. }
+                )
+            })
+            .map(|input| DomHandle::new(input.node_id().index()))
+            .collect::<Vec<_>>();
+        let mut prepared = self.prepare_connected_style_load_handles(&handles, true);
+        for load in &mut prepared {
+            load.remember_before_initial_scan = !self.initial_connected_style_loads_queued;
+        }
+        prepared
+    }
+
     pub(crate) fn prepare_initial_connected_style_loads(
         &mut self,
     ) -> Vec<PreparedConnectedStyleLoad> {
@@ -386,10 +409,8 @@ impl DocumentRuntime {
                 if !csp_blocked && !kind.uses_connected_load_lifecycle() {
                     return None;
                 }
-                let event_plan = if !csp_blocked
-                    && self.connected_owner_uses_non_blocking_modulepreload_identity(handle)
-                {
-                    ConnectedStyleLoadEventPlan::non_blocking_modulepreload(handle)
+                let event_plan = if self.connected_owner_uses_non_blocking_link_identity(handle) {
+                    ConnectedStyleLoadEventPlan::non_blocking_link(handle)
                 } else {
                     ConnectedStyleLoadEventPlan::load_delaying(handle)
                 };
@@ -414,7 +435,7 @@ impl DocumentRuntime {
         prepared: PreparedConnectedStyleLoad,
         inline_source: Option<Arc<crate::style_engine::OwnerStyleSheetSource>>,
         event_admission: ConnectedStyleLoadEventAdmission,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> ConnectedStyleLoadPrimeResult {
         assert!(
             event_admission.matches_plan(prepared.event_plan),
@@ -455,8 +476,8 @@ impl DocumentRuntime {
                         ),
                     )
                 }
-                ConnectedStyleLoadEventPlan::NonBlockingModulepreload { element } => {
-                    ConnectedStyleLoadEventAdmission::NonBlockingModulepreload(
+                ConnectedStyleLoadEventPlan::NonBlockingLink { element } => {
+                    ConnectedStyleLoadEventAdmission::NonBlockingLink(
                         crate::frame_owner_model::DocumentLinkEventOwner::unowned_for_document_runtime_test(
                             element,
                         ),
@@ -511,11 +532,11 @@ impl DocumentRuntime {
     /// Choose the load-event lifecycle from the link relation, independently
     /// of whether the current request is valid or fetchable.
     ///
-    /// HTML requires every `modulepreload` processing outcome to be
+    /// HTML requires every `preload` and `modulepreload` processing outcome to be
     /// non-load-delaying. Invalid `as`, non-matching media and malformed URLs
     /// therefore retain only exact Document/element identity for any terminal
     /// event. A stylesheet relation takes precedence when both tokens occur.
-    fn connected_owner_uses_non_blocking_modulepreload_identity(&self, handle: DomHandle) -> bool {
+    fn connected_owner_uses_non_blocking_link_identity(&self, handle: DomHandle) -> bool {
         let node_id = NodeId::new(handle.index());
         if stylesheet_link_disposition(&self.dom_host, node_id).is_some() {
             return false;
@@ -525,15 +546,16 @@ impl DocumentRuntime {
             .and_then(Node::as_element)
             .is_some_and(|element| {
                 element.is_html_element("link")
-                    && element
-                        .attribute("rel")
-                        .is_some_and(|rel| link_rel_includes_token(rel, "modulepreload"))
+                    && element.attribute("rel").is_some_and(|rel| {
+                        link_rel_includes_token(rel, "preload")
+                            || link_rel_includes_token(rel, "modulepreload")
+                    })
             })
     }
 
     fn settle_connected_style_load_binding(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         binding: Option<MainDocumentStyleLoadEventBinding>,
         reason: &'static str,
     ) -> bool {
@@ -559,7 +581,7 @@ impl DocumentRuntime {
 
     fn settle_connected_style_load_admission(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         admission: Option<ConnectedStyleLoadEventAdmission>,
         reason: &'static str,
     ) -> bool {
@@ -642,7 +664,7 @@ impl DocumentRuntime {
         &mut self,
         handle: DomHandle,
         inline_source: Option<Arc<crate::style_engine::OwnerStyleSheetSource>>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         event_admission: Option<ConnectedStyleLoadEventAdmission>,
     ) -> ConnectedStyleLoadPrimeResult {
         if self.current_document_resource_loader().is_some()
@@ -693,7 +715,7 @@ impl DocumentRuntime {
 
     pub(in crate::document_runtime) fn prime_pending_connected_style_loads_for_owner(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> ConnectedStyleLoadPrimeResult {
         let pending_loads = std::mem::take(&mut self.stylesheet_lifecycle.pending_connected_loads);
         let mut result = std::mem::take(&mut self.pending_connected_style_load_prime_result);
@@ -717,7 +739,7 @@ impl DocumentRuntime {
         &mut self,
         handle: DomHandle,
         inline_source: Option<Arc<crate::style_engine::OwnerStyleSheetSource>>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         event_admission: Option<ConnectedStyleLoadEventAdmission>,
     ) -> ConnectedStyleLoadPrimeResult {
         let mut result = ConnectedStyleLoadPrimeResult::default();
@@ -730,15 +752,29 @@ impl DocumentRuntime {
             self.invalidate_stylesheet_owner_operations(handle);
             return result;
         }
+        if self
+            .dom_host
+            .node(handle)
+            .and_then(Node::as_element)
+            .is_some_and(|element| {
+                element.is_html_element("link") && !link_rel_starts_resource_load(element)
+            })
+        {
+            self.settle_connected_style_load_admission(
+                host_ptr,
+                event_admission,
+                "link no longer has a supported resource destination",
+            );
+            self.invalidate_stylesheet_owner_operations(handle);
+            return result;
+        }
         if let Some(admission) = event_admission {
-            let expects_modulepreload_identity =
-                self.connected_owner_uses_non_blocking_modulepreload_identity(handle);
+            let expects_non_blocking_identity =
+                self.connected_owner_uses_non_blocking_link_identity(handle);
             let admission_matches_current_processing = matches!(
-                (expects_modulepreload_identity, admission),
-                (
-                    true,
-                    ConnectedStyleLoadEventAdmission::NonBlockingModulepreload(_)
-                ) | (false, ConnectedStyleLoadEventAdmission::LoadDelaying(_))
+                (expects_non_blocking_identity, admission),
+                (true, ConnectedStyleLoadEventAdmission::NonBlockingLink(_))
+                    | (false, ConnectedStyleLoadEventAdmission::LoadDelaying(_))
             );
             if !admission_matches_current_processing {
                 self.settle_connected_style_load_admission(
@@ -749,7 +785,7 @@ impl DocumentRuntime {
                 self.invalidate_stylesheet_owner_operations(handle);
                 tracing::debug!(
                     ?handle,
-                    expects_modulepreload_identity,
+                    expects_non_blocking_identity,
                     "discarded stale connected-style lifecycle commit"
                 );
                 return result;
@@ -760,13 +796,12 @@ impl DocumentRuntime {
         if let Some(disposition) = stylesheet_link_disposition(&self.dom_host, node_id) {
             let load_event_binding =
                 Self::load_event_binding_for_connected_admission(event_admission);
-            let stylesheet_fetcher = self.stylesheet_fetcher();
-            let document_url = self
-                .dom_host
-                .node(self.dom_host.document_handle())
-                .and_then(Node::as_document)
-                .map(|document| document.url().clone())
-                .expect("live dom host must retain a document url");
+            let stylesheet_fetcher = self.stylesheet_fetcher_for_owner(handle, host_ptr);
+            let document_url = stylesheet_fetcher
+                .resource_loader()
+                .fetch_context()
+                .document_url()
+                .clone();
             if disposition.is_blocking() {
                 self.note_discovered_live_blocking_stylesheets();
             }
@@ -832,8 +867,9 @@ impl DocumentRuntime {
             let resource_type = element
                 .map(preload_like_link_resource_type)
                 .unwrap_or(SubresourceResourceType::Fetch);
-            let is_modulepreload =
-                self.connected_owner_uses_non_blocking_modulepreload_identity(handle);
+            let is_modulepreload = element
+                .and_then(|element| element.attribute("rel"))
+                .is_some_and(|rel| link_rel_includes_token(rel, "modulepreload"));
             if !self.document_scripting_enabled()
                 && (is_modulepreload || resource_type == SubresourceResourceType::Script)
             {
@@ -866,9 +902,7 @@ impl DocumentRuntime {
                 }
                 let main_document_event_owner =
                     event_admission.and_then(|admission| match admission {
-                        ConnectedStyleLoadEventAdmission::NonBlockingModulepreload(owner) => {
-                            Some(owner)
-                        }
+                        ConnectedStyleLoadEventAdmission::NonBlockingLink(owner) => Some(owner),
                         ConnectedStyleLoadEventAdmission::LoadDelaying(_) => None,
                     });
                 let Some(main_document_event_owner) = main_document_event_owner else {
@@ -946,20 +980,20 @@ impl DocumentRuntime {
                         )
                     })
                     .unwrap_or(RequestResourceType::CssStyleSheet);
-                let Ok(fetch) = self.preload_stylesheet_with_request_metadata(
+                let fetcher = self
+                    .stylesheet_fetcher_for_owner(handle, host_ptr)
+                    .with_preload_metadata(request_resource_type, true);
+                let document_url = fetcher
+                    .resource_loader()
+                    .fetch_context()
+                    .document_url()
+                    .clone();
+                let fetch = self.stylesheet_lifecycle.fetches.preload_stylesheet(
+                    &fetcher,
+                    document_url,
                     request.url().clone(),
                     request.options().clone(),
-                    request_resource_type,
-                    true,
-                ) else {
-                    self.complete_immediate_owner_processing(
-                        handle,
-                        element_kind,
-                        false,
-                        load_event_binding,
-                    );
-                    return result;
-                };
+                );
                 let load = StylesheetLinkClient::new_preload_with_load_event_binding(
                     handle,
                     request.url().clone(),
@@ -1016,9 +1050,8 @@ impl DocumentRuntime {
             self.stylesheet_lifecycle
                 .owner_states
                 .install_pending_operation(Arc::clone(&operation));
-            let resource_loader = self
-                .current_document_resource_loader()
-                .expect("connected preload-like link requires its Document authority");
+            let stylesheet_fetcher = self.stylesheet_fetcher_for_owner(handle, host_ptr);
+            let resource_loader = stylesheet_fetcher.resource_loader().clone();
             let loader = resource_loader.request_client().clone();
             if !loader.optional_resource_fetch_enabled(resource_type) {
                 let _ = self
@@ -1035,23 +1068,29 @@ impl DocumentRuntime {
                 .task_producer
                 .clone()
                 .expect("connected stylesheet fetch requires a bound Page task producer");
-            let service_worker_context = self
-                .stylesheet_lifecycle
-                .service_worker_connected_link_context
-                .clone();
-            let document_url = self
-                .dom_host
-                .node(self.dom_host.document_handle())
-                .and_then(Node::as_document)
-                .map(|document| document.url().clone())
-                .expect("live dom host must retain a document url")
-                .clone();
+            let service_worker_context = if host_ptr.is_null() {
+                self.stylesheet_lifecycle
+                    .service_worker_connected_link_context
+                    .clone()
+            } else {
+                let host = unsafe { &*host_ptr };
+                let scope = host
+                    .owner_dispatch_scope_for_node(handle)
+                    .expect("link owner scope");
+                Some(ServiceWorkerConnectedLinkContext {
+                    browser_context_runtime: host.browser_context_runtime(),
+                    client_id: host.service_worker_client_id_for_subresource_owner(scope),
+                })
+            };
+            let document_url = resource_loader.fetch_context().document_url().clone();
             let start_unix_millis = moli_time::unix_epoch_millis();
             let resource_task_runner = resource_loader.task_runner();
+            let request_origin = resource_loader.fetch_context().request_origin();
             resource_loader.spawn_resource_task(async move {
                 let result = fetch_connected_link_readiness_with_service_worker(
                     loader,
                     resource_task_runner,
+                    request_origin,
                     document_url.clone(),
                     url.clone(),
                     fetch_options,
@@ -1161,7 +1200,7 @@ impl DocumentRuntime {
         source: InlineStyleImportSource,
         urls: Vec<Url>,
         load_event_binding: Option<MainDocumentStyleLoadEventBinding>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) {
         let handle = source.owner();
         let roots = self.connected_style_import_roots(&source, host_ptr);
@@ -1169,15 +1208,10 @@ impl DocumentRuntime {
             ConnectedStyleImportReadiness::Ready(mut successful) => {
                 if !host_ptr.is_null() {
                     for root in &roots {
-                        if let Some(graph_successful) = unsafe { &*host_ptr }
-                            .install_live_stylesheet_import_graph(root.clone(), &[])
+                        if let Some(graph_successful) = unsafe { &mut *host_ptr }
+                            .install_and_refresh_live_stylesheet_import_graph(root.clone(), &[])
                         {
                             successful &= graph_successful;
-                            let _ = unsafe { &mut *host_ptr }
-                                .refresh_live_stylesheet_after_import_graph(
-                                    root.owner,
-                                    root.stylesheet_id,
-                                );
                         }
                     }
                 }
@@ -1243,17 +1277,13 @@ impl DocumentRuntime {
             .task_producer
             .clone()
             .expect("connected stylesheet import requires a bound Page task producer");
-        let stylesheet_fetcher = self.stylesheet_fetcher();
-        let document_url = self
-            .dom_host
-            .node(self.dom_host.document_handle())
-            .and_then(Node::as_document)
-            .map(|document| document.url().clone())
-            .expect("live dom host must retain a document url")
+        let stylesheet_fetcher = self.stylesheet_fetcher_for_owner(handle, host_ptr);
+        let document_url = stylesheet_fetcher
+            .resource_loader()
+            .fetch_context()
+            .document_url()
             .clone();
-        let resource_loader = self
-            .current_document_resource_loader()
-            .expect("connected stylesheet import requires its Document authority");
+        let resource_loader = stylesheet_fetcher.resource_loader().clone();
         resource_loader.spawn_resource_task(async move {
             let (graph, network_results) = fetch_observed_stylesheet_import_graph(
                 stylesheet_fetcher,
@@ -1274,7 +1304,7 @@ impl DocumentRuntime {
     fn connected_style_import_roots(
         &self,
         source: &InlineStyleImportSource,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> Vec<ConnectedStyleImportRoot> {
         if host_ptr.is_null() {
             return Vec::new();
@@ -1282,7 +1312,7 @@ impl DocumentRuntime {
         let owner = source.owner();
         unsafe { &*host_ptr }
             .owner_live_stylesheet(owner)
-            .map(|stylesheet| ConnectedStyleImportRoot::new(owner, &stylesheet, false))
+            .map(|stylesheet| ConnectedStyleImportRoot::new(owner, &stylesheet, None))
             .into_iter()
             .collect()
     }
@@ -1292,7 +1322,7 @@ impl DocumentRuntime {
         owner: DomHandle,
         stylesheet: crate::live_stylesheet::LiveStylesheetRef,
         root_is_external_resource: bool,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) {
         let urls = stylesheet
             .pending_import_requests_in_graph()
@@ -1302,16 +1332,19 @@ impl DocumentRuntime {
         if urls.is_empty() {
             return;
         }
-        let root = ConnectedStyleImportRoot::new(owner, &stylesheet, root_is_external_resource);
+        let root_resource_url = root_is_external_resource.then(|| {
+            unsafe { &*host_ptr }
+                .linked_stylesheet_source_for_owner(owner)
+                .map_or_else(
+                    || stylesheet.base_url().clone(),
+                    |source| source.sheet_url().clone(),
+                )
+        });
+        let root = ConnectedStyleImportRoot::new(owner, &stylesheet, root_resource_url);
         let urls = match connected_style_import_readiness(urls) {
             ConnectedStyleImportReadiness::Ready(_) => {
-                if unsafe { &*host_ptr }
-                    .install_live_stylesheet_import_graph(root.clone(), &[])
-                    .is_some()
-                {
-                    let _ = unsafe { &mut *host_ptr }
-                        .refresh_live_stylesheet_after_import_graph(owner, stylesheet.id());
-                }
+                let _ = unsafe { &mut *host_ptr }
+                    .install_and_refresh_live_stylesheet_import_graph(root, &[]);
                 return;
             }
             ConnectedStyleImportReadiness::Pending(urls) => urls,
@@ -1321,16 +1354,13 @@ impl DocumentRuntime {
             .task_producer
             .clone()
             .expect("live stylesheet import requires a bound Page task producer");
-        let stylesheet_fetcher = self.stylesheet_fetcher();
-        let document_url = self
-            .dom_host
-            .node(self.dom_host.document_handle())
-            .and_then(Node::as_document)
-            .map(|document| document.url().clone())
-            .expect("live dom host must retain a document url");
-        let resource_loader = self
-            .current_document_resource_loader()
-            .expect("live stylesheet import requires its Document authority");
+        let stylesheet_fetcher = self.stylesheet_fetcher_for_owner(owner, host_ptr);
+        let document_url = stylesheet_fetcher
+            .resource_loader()
+            .fetch_context()
+            .document_url()
+            .clone();
+        let resource_loader = stylesheet_fetcher.resource_loader().clone();
         resource_loader.spawn_resource_task(async move {
             let (_, mut network_results) = fetch_observed_stylesheet_import_graph(
                 stylesheet_fetcher,
@@ -1350,7 +1380,7 @@ impl DocumentRuntime {
 
     pub(crate) fn prime_document_lifecycle_processing_for_owner(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> ConnectedStyleLoadPrimeResult {
         self.prime_pending_connected_style_loads_for_owner(host_ptr)
     }
@@ -1369,6 +1399,7 @@ impl DocumentRuntime {
             let should_queue = match change.kind() {
                 DomStylesheetOwnerChangeKind::Registered
                 | DomStylesheetOwnerChangeKind::Contents
+                | DomStylesheetOwnerChangeKind::ParsingFinished
                 | DomStylesheetOwnerChangeKind::OwnerDocumentChanged
                 | DomStylesheetOwnerChangeKind::TreeConnectionChanged { connected: true } => true,
                 DomStylesheetOwnerChangeKind::Unregistered
@@ -1428,7 +1459,7 @@ impl DocumentRuntime {
 
     pub(crate) fn apply_inline_cssom_source_change_after_invalidation(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         owner: DomHandle,
     ) {
         self.queue_stylesheet_source_css_projection(owner);
@@ -1439,7 +1470,7 @@ impl DocumentRuntime {
 
     pub(crate) fn apply_linked_cssom_source_change(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         owner: DomHandle,
     ) {
         self.queue_stylesheet_source_css_projection(owner);
@@ -1461,7 +1492,7 @@ impl DocumentRuntime {
     pub(crate) fn apply_pending_stylesheet_source_css_projections(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) {
         let owners = std::mem::take(&mut self.pending_stylesheet_source_css_projection_owners);
         for owner in owners {
@@ -1526,11 +1557,22 @@ impl DocumentRuntime {
     pub(crate) fn dispatch_pending_style_load(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         ready: ReadyConnectedStyleLoad,
     ) -> bool {
         self.apply_pending_stylesheet_source_css_projections(scope, host_ptr);
         let handle = ready.owner();
+        let load_succeeded = self.consume_pending_style_load(host_ptr, &ready);
+        self.dispatch_style_or_link_load_event(scope, host_ptr, handle, load_succeeded);
+        true
+    }
+
+    /// Complete native load bookkeeping even when no script realm or event listener exists.
+    pub(crate) fn consume_pending_style_load(
+        &mut self,
+        host_ptr: *mut PageScriptHost,
+        ready: &ReadyConnectedStyleLoad,
+    ) -> bool {
         let native_modulepreload = match ready.operation() {
             ReadyConnectedStyleLoadOperation::Connected(operation) => {
                 self.stylesheet_lifecycle
@@ -1551,17 +1593,15 @@ impl DocumentRuntime {
                 Some(client)
             }
         };
-        let load_succeeded = native_modulepreload
+        native_modulepreload
             .and_then(|client| self.native_modulepreload_style_result(host_ptr, client))
-            .unwrap_or_else(|| ready.successful());
-        self.dispatch_style_or_link_load_event(scope, host_ptr, handle, load_succeeded);
-        true
+            .unwrap_or_else(|| ready.successful())
     }
 
     pub(crate) fn dispatch_preload_like_link_error_event(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) {
         self.dispatch_style_or_link_load_event(scope, host_ptr, handle, false);
@@ -1570,7 +1610,7 @@ impl DocumentRuntime {
     fn dispatch_style_or_link_load_event(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         load_succeeded: bool,
     ) {
@@ -1601,7 +1641,7 @@ impl DocumentRuntime {
 
     fn native_modulepreload_style_result(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         client: &Arc<NativeModulepreloadLinkClient>,
     ) -> Option<bool> {
         if client.key().kind() != crate::module_runtime::ModuleKind::Css {
@@ -1840,6 +1880,9 @@ fn connected_style_owner_kind(
     element: &crate::dom::native::Element,
 ) -> Option<ConnectedStyleOwnerKind> {
     if super::is_inline_style_element(element) {
+        if element.style_children_parsing() {
+            return None;
+        }
         return if is_declarative_css_module_style_element(element) {
             Some(ConnectedStyleOwnerKind::DeclarativeCssModule)
         } else if crate::style_engine::stylesheet_owner_type_is_supported(element) {
@@ -1852,18 +1895,23 @@ fn connected_style_owner_kind(
         return None;
     }
     match (element.attribute("rel"), element.attribute("href")) {
-        (Some(rel), Some(href))
-            if !href.trim().is_empty()
-                && (link_rel_includes_token(rel, "stylesheet")
-                    || link_rel_includes_token(rel, "preload")
-                    || link_rel_includes_token(rel, "modulepreload")
-                    || link_rel_includes_token(rel, "prefetch")
-                    || link_rel_includes_token(rel, "compression-dictionary")) =>
+        (Some(_), Some(href))
+            if !href.trim().is_empty() && link_rel_starts_resource_load(element) =>
         {
             Some(ConnectedStyleOwnerKind::Link)
         }
         _ => None,
     }
+}
+
+fn link_rel_starts_resource_load(element: &crate::dom::native::Element) -> bool {
+    let rel = element.attribute("rel").unwrap_or_default();
+    link_rel_includes_token(rel, "stylesheet")
+        || link_rel_includes_token(rel, "modulepreload")
+        || link_rel_includes_token(rel, "prefetch")
+        || link_rel_includes_token(rel, "compression-dictionary")
+        || (link_rel_includes_token(rel, "preload")
+            && link_as_destination(element.attribute("as")).is_preload_destination())
 }
 
 fn preload_like_link_resource_type(
@@ -2082,19 +2130,21 @@ async fn fetch_connected_link_readiness(
     url: Url,
     options: ConnectedLinkReadinessFetchOptions,
 ) -> Result<crate::protocol_types::NavigationResponse, String> {
-    let request = connected_link_readiness_request(&document_url, &url, &options);
+    let request_origin = moli_url::WebOrigin::from_url(&document_url);
+    let request = connected_link_readiness_request(&document_url, &request_origin, &url, &options);
     fetch_connected_link_readiness_with_request(loader, url, options, request).await
 }
 
 async fn fetch_connected_link_readiness_with_service_worker(
     loader: ResourceRequestClient,
     resource_task_runner: crate::network::RendererResourceTaskRunner,
+    request_origin: moli_url::WebOrigin,
     document_url: Url,
     url: Url,
     options: ConnectedLinkReadinessFetchOptions,
     service_worker_context: Option<ServiceWorkerConnectedLinkContext>,
 ) -> Result<ConnectedLinkReadinessFetchResponse, String> {
-    let request = connected_link_readiness_request(&document_url, &url, &options);
+    let request = connected_link_readiness_request(&document_url, &request_origin, &url, &options);
     if let (Some(context), Some(destination)) = (
         service_worker_context,
         ServiceWorkerRequestDestination::for_subresource_resource_type(options.resource_type),
@@ -2115,7 +2165,7 @@ async fn fetch_connected_link_readiness_with_service_worker(
             Ok(Some(response)) => {
                 let response_filter = response.response_filter;
                 let origin_clean =
-                    connected_link_origin_clean_from_service_worker_filter(response_filter);
+                    connected_link_origin_clean_from_service_worker_filter(response_filter.clone());
                 let response = *response.response;
                 let load_event_successful =
                     connected_link_load_event_successful(&response, response_filter);
@@ -2133,17 +2183,24 @@ async fn fetch_connected_link_readiness_with_service_worker(
             }
         }
     }
+    let request_mode = options.request_mode;
     fetch_connected_link_readiness_with_request(loader, url, options, request)
         .await
         .map(|response| {
             let load_event_successful = connected_link_load_event_successful(&response, None);
-            let origin_clean = moli_url::same_origin(&document_url, &response.final_url);
+            let origin_clean = crate::network_host::network_response_filter(
+                &request_origin,
+                &response.head(),
+                request_mode,
+            )
+            .is_none_or(|filter| filter.is_readable());
             ConnectedLinkReadinessFetchResponse::new(response, origin_clean, load_event_successful)
         })
 }
 
 fn connected_link_readiness_request(
     document_url: &Url,
+    request_origin: &moli_url::WebOrigin,
     url: &Url,
     options: &ConnectedLinkReadinessFetchOptions,
 ) -> moli_fetch::Request {
@@ -2155,7 +2212,8 @@ fn connected_link_readiness_request(
     let request = moli_fetch::Request::new("GET", url.as_str(), None, vec![])
         .expect("preload-like link url should already be parsed")
         .with_page_network_policy()
-        .with_initiator_url(document_url);
+        .with_initiator_url(document_url)
+        .with_request_origin(request_origin.clone());
     let mut request = request
         .with_request_mode(options.request_mode)
         .with_credentials_mode(options.credentials_mode);
@@ -2169,6 +2227,7 @@ fn connected_link_readiness_request(
         request = request.with_resource_type(resource_type);
     }
     if let Some(metadata) = options.script_fetch_metadata.as_ref() {
+        request = request.with_browser_request_metadata(moli_fetch::BrowserRequestMetadata::Script);
         request = request.with_script_fetch_metadata(moli_fetch::ScriptFetchRequestMetadata {
             cross_origin: metadata.cross_origin.clone(),
             referrer_policy: metadata.referrer_policy.clone(),
@@ -2196,11 +2255,9 @@ fn connected_link_readiness_request(
 fn connected_link_origin_clean_from_service_worker_filter(
     response_filter: Option<AsyncSubresourceFetchResponseFilter>,
 ) -> bool {
-    match response_filter {
-        Some(AsyncSubresourceFetchResponseFilter::Opaque)
-        | Some(AsyncSubresourceFetchResponseFilter::OpaqueRedirect) => false,
-        None => true,
-    }
+    response_filter
+        .as_ref()
+        .is_none_or(|filter| filter.is_readable())
 }
 
 fn link_crossorigin_credentials_mode(cross_origin: Option<&str>) -> RequestCredentialsMode {
@@ -2218,11 +2275,10 @@ fn connected_link_load_event_successful(
     response: &crate::protocol_types::NavigationResponse,
     response_filter: Option<AsyncSubresourceFetchResponseFilter>,
 ) -> bool {
-    match response_filter {
-        Some(AsyncSubresourceFetchResponseFilter::Opaque)
-        | Some(AsyncSubresourceFetchResponseFilter::OpaqueRedirect) => true,
-        None => (200..=299).contains(&response.status),
-    }
+    response_filter
+        .as_ref()
+        .is_some_and(|filter| !filter.is_readable())
+        || (200..=299).contains(&response.status)
 }
 
 async fn fetch_connected_link_readiness_with_request(
@@ -2302,12 +2358,12 @@ mod tests {
             .expect("link handle")
     }
 
-    fn parse_document_with_blocking_stylesheet_inputs(
+    fn parse_document_with_stylesheet_inputs(
         final_url: Url,
         html: impl Into<String>,
     ) -> (
         crate::dom::native::NativeDom,
-        Vec<crate::DocumentOwnedBlockingStylesheetDiscoveryInput>,
+        Vec<crate::DocumentOwnedStylesheetDiscoveryInput>,
     ) {
         let (document, _, inputs) =
             crate::parse_html_test_fixture_with_parser_outputs(final_url, html.into());
@@ -3428,6 +3484,56 @@ mod tests {
     }
 
     #[test]
+    fn preload_destinations_are_checked_before_load_event_admission() {
+        let parser = HtmlParser::SCRIPTING_ENABLED;
+        let document = parser.parse(
+            Url::parse("https://example.test/page").unwrap(),
+            concat!(
+                "<!doctype html><html><head>",
+                "<link rel=preload href='/missing.js'>",
+                "<link rel=preload as='' href='/empty.js'>",
+                "<link rel=preload as=garbage href='/unknown.js'>",
+                "<link rel=preload as=video href='/video'>",
+                "<link rel=preload as=worker href='/worker.js'>",
+                "<link rel=preload as=' style ' href='/padded.css'>",
+                "</head><body></body></html>"
+            )
+            .to_owned(),
+        );
+        let link = first_link_handle(&document);
+        let mut runtime = DocumentRuntime::new(&document);
+        assert!(runtime.prepare_initial_connected_style_loads().is_empty());
+        assert!(!runtime.has_pending_style_loads());
+        assert!(runtime.pop_ready_connected_style_load().is_none());
+
+        assert!(runtime.dom_host_mut().set_attribute(link, "as", "FETCH"));
+        let prepared = runtime.prepare_connected_style_loads(link, false);
+        assert_eq!(
+            prepared.len(),
+            1,
+            "a rejected link can become a valid preload"
+        );
+        assert_eq!(prepared[0].owner(), link);
+    }
+
+    #[test]
+    fn preload_destination_is_rechecked_after_owner_admission() {
+        let parser = HtmlParser::SCRIPTING_ENABLED;
+        let document = parser.parse(
+            Url::parse("https://example.test/page").unwrap(),
+            "<!doctype html><link rel=preload as=fetch href='data:text/plain,preload'>".to_owned(),
+        );
+        let link = first_link_handle(&document);
+        let mut runtime = DocumentRuntime::new(&document);
+        runtime.queue_initial_connected_style_loads();
+        assert!(runtime.has_pending_style_loads());
+        assert!(runtime.dom_host_mut().set_attribute(link, "as", "video"));
+        runtime.prime_pending_connected_style_loads();
+        assert!(!runtime.has_pending_style_loads());
+        assert!(runtime.pop_ready_connected_style_load().is_none());
+    }
+
+    #[test]
     fn modulepreload_link_readiness_uses_module_script_credentials() {
         let parser = HtmlParser::SCRIPTING_ENABLED;
         let document = parser.parse(
@@ -3504,8 +3610,22 @@ mod tests {
         let loader = loader_owner.handle();
         let fetcher =
             crate::stylesheet_blocking::RendererStylesheetFetcher::for_speculative_preload(
-                loader,
-                crate::network::RendererResourceTaskRunner::from_current_tokio()?,
+                crate::network::context::DocumentResourceLoader::new(
+                    loader,
+                    crate::network::RendererResourceTaskRunner::from_current_tokio()?,
+                    crate::network::context::DocumentFetchContext::new(
+                        crate::native_bridge::WindowDocumentOwner::Frame(
+                            crate::frame_owner_model::FrameDocumentTaskOwner::new(
+                                crate::frame_owner_model::FrameSchedulerLaneId(1),
+                                crate::frame_owner_model::LocalWindowId(1),
+                                crate::frame_owner_model::DocumentId(1),
+                            ),
+                        ),
+                        document_url.clone(),
+                        document_url.clone(),
+                        moli_url::origin_ascii_serialization(&document_url),
+                    ),
+                ),
                 None,
                 RequestResourceType::CssStyleSheet,
                 true,
@@ -3658,98 +3778,103 @@ mod tests {
 
     #[tokio::test]
     async fn stylesheet_and_modulepreload_switches_drop_stale_event_bindings() -> Result<()> {
-        let parser = HtmlParser::SCRIPTING_ENABLED;
-        let document = parser.parse(
-            Url::parse("https://example.test/page").unwrap(),
-            "<!doctype html><html><head><link rel=preload as=style href='http://127.0.0.1:9/shared'></head><body></body></html>"
-                .to_owned(),
-        );
-        let link = first_link_handle(&document);
-        let loader = ResourceRequestClient::new(&FetchConfig::default())?;
-        let mut runtime = DocumentRuntime::new_networked(&document, &loader);
+        for style_rel in ["stylesheet", "preload"] {
+            let parser = HtmlParser::SCRIPTING_ENABLED;
+            let document = parser.parse(
+                Url::parse("https://example.test/page").unwrap(),
+                format!(
+                    "<!doctype html><html><head><link rel={style_rel} as=style \
+                     href='http://127.0.0.1:9/shared'></head><body></body></html>"
+                ),
+            );
+            let link = first_link_handle(&document);
+            let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+            let mut runtime = DocumentRuntime::new_networked(&document, &loader);
 
-        runtime.queue_connected_style_loads(link);
-        let first_style_client = runtime
-            .active_stylesheet_link_client_for_test(link)
-            .expect("initial stylesheet preload client");
-        assert_eq!(
-            runtime
-                .stylesheet_lifecycle
-                .owner_states
-                .cancelable_load_event_bindings(link)
-                .len(),
-            1
-        );
-
-        assert!(runtime.dom_host.set_attribute(link, "rel", "modulepreload"));
-        drop(runtime.invalidate_style_related_state(link));
-        assert!(
-            runtime
-                .stylesheet_lifecycle
-                .owner_states
-                .cancelable_load_event_bindings(link)
-                .is_empty(),
-            "stylesheet invalidation must remove its event binding"
-        );
-        runtime.queue_connected_style_loads(link);
-        let (modulepreload_starts, warnings) =
-            runtime.prime_pending_connected_style_loads().into_parts();
-        assert!(warnings.is_empty(), "runtime warnings: {warnings:?}");
-        assert_eq!(modulepreload_starts.len(), 1);
-        assert!(
-            runtime
+            runtime.queue_initial_connected_style_loads();
+            let first_style_client = runtime
                 .active_stylesheet_link_client_for_test(link)
-                .is_none()
-        );
-        assert!(
-            runtime
-                .stylesheet_lifecycle
-                .owner_states
-                .cancelable_load_event_bindings(link)
-                .is_empty(),
-            "an in-flight modulepreload must retain identity without a load-delay binding"
-        );
+                .expect("initial stylesheet resource client");
+            assert_eq!(
+                runtime
+                    .stylesheet_lifecycle
+                    .owner_states
+                    .cancelable_load_event_bindings(link)
+                    .len(),
+                usize::from(style_rel == "stylesheet"),
+                "only stylesheet consumers carry load-delay bindings"
+            );
 
-        assert!(runtime.dom_host.set_attribute(link, "rel", "preload"));
-        drop(runtime.invalidate_style_related_state(link));
-        assert!(
-            runtime
-                .stylesheet_lifecycle
-                .owner_states
-                .cancelable_load_event_bindings(link)
-                .is_empty(),
-            "modulepreload invalidation must remove its event binding"
-        );
-        runtime.queue_connected_style_loads(link);
-        let second_style_client = runtime
-            .active_stylesheet_link_client_for_test(link)
-            .expect("replacement stylesheet preload client");
+            assert!(runtime.dom_host.set_attribute(link, "rel", "modulepreload"));
+            drop(runtime.invalidate_style_related_state(link));
+            assert!(
+                runtime
+                    .stylesheet_lifecycle
+                    .owner_states
+                    .cancelable_load_event_bindings(link)
+                    .is_empty(),
+                "stylesheet invalidation must remove its event binding"
+            );
+            runtime.queue_connected_style_loads(link);
+            let (modulepreload_starts, warnings) =
+                runtime.prime_pending_connected_style_loads().into_parts();
+            assert!(warnings.is_empty(), "runtime warnings: {warnings:?}");
+            assert_eq!(modulepreload_starts.len(), 1);
+            assert!(
+                runtime
+                    .active_stylesheet_link_client_for_test(link)
+                    .is_none()
+            );
+            assert!(
+                runtime
+                    .stylesheet_lifecycle
+                    .owner_states
+                    .cancelable_load_event_bindings(link)
+                    .is_empty(),
+                "an in-flight modulepreload must retain identity without a load-delay binding"
+            );
 
-        assert!(!StylesheetLinkClient::ptr_eq(
-            &first_style_client,
-            &second_style_client
-        ));
-        assert!(
-            !runtime
-                .stylesheet_lifecycle
-                .owner_states
-                .accepts_stylesheet_link_client(&first_style_client)
-        );
-        assert!(
-            runtime
-                .stylesheet_lifecycle
-                .owner_states
-                .accepts_stylesheet_link_client(&second_style_client)
-        );
-        assert_eq!(
-            runtime
-                .stylesheet_lifecycle
-                .owner_states
-                .cancelable_load_event_bindings(link)
-                .len(),
-            1,
-            "only the replacement stylesheet processing may retain a binding"
-        );
+            assert!(runtime.dom_host.set_attribute(link, "rel", style_rel));
+            drop(runtime.invalidate_style_related_state(link));
+            assert!(
+                runtime
+                    .stylesheet_lifecycle
+                    .owner_states
+                    .cancelable_load_event_bindings(link)
+                    .is_empty(),
+                "modulepreload invalidation must remove its event binding"
+            );
+            runtime.queue_connected_style_loads(link);
+            let second_style_client = runtime
+                .active_stylesheet_link_client_for_test(link)
+                .expect("replacement stylesheet resource client");
+
+            assert!(!StylesheetLinkClient::ptr_eq(
+                &first_style_client,
+                &second_style_client
+            ));
+            assert!(
+                !runtime
+                    .stylesheet_lifecycle
+                    .owner_states
+                    .accepts_stylesheet_link_client(&first_style_client)
+            );
+            assert!(
+                runtime
+                    .stylesheet_lifecycle
+                    .owner_states
+                    .accepts_stylesheet_link_client(&second_style_client)
+            );
+            assert_eq!(
+                runtime
+                    .stylesheet_lifecycle
+                    .owner_states
+                    .cancelable_load_event_bindings(link)
+                    .len(),
+                usize::from(style_rel == "stylesheet"),
+                "only the replacement stylesheet consumer may retain a binding"
+            );
+        }
         Ok(())
     }
 
@@ -3996,7 +4121,7 @@ mod tests {
     #[tokio::test]
     async fn queued_connected_admission_reuses_parser_bound_terminal_client() {
         let stylesheet_url = Url::parse("data:text/css,body{}").unwrap();
-        let (document, blocking_stylesheet_inputs) = parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) = parse_document_with_stylesheet_inputs(
             Url::parse("https://example.test/page").unwrap(),
             format!(
                 "<!doctype html><html><head><link rel=\"stylesheet\" href=\"{stylesheet_url}\"></head><body></body></html>"
@@ -4020,9 +4145,8 @@ mod tests {
         assert!(runtime.apply_next_stylesheet_networking_task_for_test());
         assert!(speculative.terminal().is_some());
 
-        let completed_clients = runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        let completed_clients =
+            runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
         assert_eq!(completed_clients.len(), 1);
         assert_eq!(completed_clients[0].load().owner(), link);
         let parser_client = runtime
@@ -4153,7 +4277,7 @@ mod tests {
 
         let document_url = Url::parse(&format!("http://{addr}/page.html")).unwrap();
         let stylesheet_url = document_url.join("/missing.css").unwrap();
-        let (document, blocking_stylesheet_inputs) = parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) = parse_document_with_stylesheet_inputs(
             document_url,
             "<!doctype html><html><head>\
              <link rel=\"stylesheet\" href=\"/missing.css\">\
@@ -4180,12 +4304,11 @@ mod tests {
                 .is_some_and(|terminal| !terminal.is_ready())
         );
 
-        let completed_clients = runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        let completed_clients =
+            runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
         assert_eq!(completed_clients.len(), 1);
         assert_eq!(completed_clients[0].load().owner(), link);
-        let signatures = blocking_stylesheet_inputs
+        let signatures = stylesheet_inputs
             .iter()
             .map(|input| input.signature().clone())
             .collect::<Vec<_>>();
@@ -4793,6 +4916,7 @@ mod tests {
         let script_request = moli_fetch::Request::new("GET", script_url.as_str(), None, vec![])?
             .with_page_network_policy()
             .with_initiator_url(&document_url)
+            .with_request_origin(moli_url::WebOrigin::from_url(&document_url))
             .with_credentials_mode(module_script_credentials_mode(
                 metadata.cross_origin.as_deref(),
             ))

@@ -35,6 +35,19 @@ pub struct FetchClient {
 }
 
 impl FetchClientHandle {
+    /// Prepare resource-dependent request headers before interception or
+    /// network admission, after the caller has selected the resource kind.
+    pub fn prepare_request(&self, request: &mut Request) {
+        request.prepare_accept_header(&self.config);
+    }
+
+    /// Creates native WebSockets on this client's HTTP owner and Multi. The
+    /// capability does not keep the FetchClient owner alive; shutdown closes
+    /// its WebSockets and makes future connection attempts fail.
+    pub fn websocket_connector(&self) -> crate::CurlWebSocketConnector {
+        self.runtime.websocket_connector()
+    }
+
     /// Materialized text compatibility API.
     ///
     /// Non-auth requests enter the streaming raw transport first and only
@@ -52,6 +65,15 @@ impl FetchClientHandle {
     /// materialize at this API boundary. Auth challenge-response still uses the
     /// buffered libcurl path so intermediate 401/407 bodies are hidden.
     pub async fn fetch_raw(&self, request: Request) -> Result<RawResponse> {
+        self.fetch_raw_with_cancel(request, FetchCancelHandle::new())
+            .await
+    }
+
+    pub async fn fetch_raw_with_cancel(
+        &self,
+        request: Request,
+        cancel_handle: FetchCancelHandle,
+    ) -> Result<RawResponse> {
         if request.auth_requires_buffered_transport() {
             // Digest auth retries are still completed inside libcurl on the
             // buffered path. Keep auth requests there until the raw streaming
@@ -59,13 +81,13 @@ impl FetchClientHandle {
             // surfacing them as final responses.
             return self
                 .runtime
-                .submit_auth_raw(request)?
+                .submit_auth_raw(request, cancel_handle)?
                 .await
                 .context("fetch runtime task dropped raw response channel")?;
         }
 
         let response = self
-            .fetch_raw_stream_with_cancel(request, FetchCancelHandle::new())
+            .fetch_raw_stream_with_cancel(request, cancel_handle)
             .await?;
         response.into_materialized_raw_response().await
     }
@@ -74,9 +96,21 @@ impl FetchClientHandle {
         &self,
         request: Request,
     ) -> Result<NetworkFetchResult<RawResponse>> {
+        self.fetch_raw_with_cancel_and_network_metadata(request, FetchCancelHandle::new())
+            .await
+    }
+
+    pub async fn fetch_raw_with_cancel_and_network_metadata(
+        &self,
+        request: Request,
+        cancel_handle: FetchCancelHandle,
+    ) -> Result<NetworkFetchResult<RawResponse>> {
         let recorder = NetworkObservationRecorder::default();
         let request = request.with_network_observation_recorder(recorder.clone());
-        network_fetch_result_from_result(self.fetch_raw(request).await, recorder)
+        network_fetch_result_from_result(
+            self.fetch_raw_with_cancel(request, cancel_handle).await,
+            recorder,
+        )
     }
 
     pub async fn fetch_raw_stream_with_cancel(
@@ -109,7 +143,7 @@ impl FetchClientHandle {
         request: Request,
         cancel_handle: FetchCancelHandle,
     ) -> Result<Response> {
-        if request.auth_requires_buffered_transport() || !request.follow_redirects {
+        if request.auth_requires_buffered_transport() || !request.transport_follows_redirects() {
             // Auth retries still need the buffered libcurl path so
             // intermediate 401/407 challenge bodies are not exposed as final
             // streaming responses. Manual redirect callers also need the
@@ -175,6 +209,10 @@ impl FetchClientHandle {
         self.config.http_proxy()
     }
 
+    pub fn http_host_resolve(&self) -> &[String] {
+        self.config.http_host_resolve()
+    }
+
     pub fn http_no_proxy(&self) -> Option<&str> {
         self.config.http_no_proxy()
     }
@@ -185,6 +223,10 @@ impl FetchClientHandle {
 
     pub fn tls_verify_host(&self) -> bool {
         self.config.tls_verify_host()
+    }
+
+    pub fn tls_config(&self) -> &moli_curl::CurlTlsConfig {
+        self.config.tls_config()
     }
 
     pub fn request_timeout_ms(&self) -> u64 {

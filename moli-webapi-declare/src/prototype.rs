@@ -1,13 +1,6 @@
-use moli_v8_util::{
-    define_static_symbol_to_string_tag, get_private_value, global_constructor_prototype,
-    set_private_value,
-};
+use moli_v8_util::{define_static_symbol_to_string_tag, global_constructor_prototype};
 
-use crate::{__private, BindError, WebApiValue, v8};
-
-/// Native-only marker copied from `EventTarget.prototype` to Web API objects
-/// while their declared interface prototype is installed.
-pub const EVENT_TARGET_INTERFACE_BRAND_SLOT: &str = "__moliEventTargetInterfaceBrand";
+use crate::{BindError, WebApiValue, v8};
 
 pub fn set_interface_prototype<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -18,13 +11,9 @@ pub fn set_interface_prototype<'s>(
         return true;
     }
     if let Some(prototype) = global_constructor_prototype(scope, interface) {
-        let installed = object
+        object
             .set_prototype(scope, prototype.into())
-            .unwrap_or(false);
-        if installed {
-            copy_event_target_interface_brand(scope, object, prototype);
-        }
-        installed
+            .unwrap_or(false)
     } else {
         false
     }
@@ -48,39 +37,7 @@ pub fn set_required_interface_prototype<'s>(
             "failed to set `{interface}` prototype"
         )));
     }
-    copy_event_target_interface_brand(scope, object, prototype);
     Ok(())
-}
-
-fn copy_event_target_interface_brand<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-    prototype: v8::Local<'s, v8::Object>,
-) {
-    let mut current = Some(prototype);
-    for _ in 0..64 {
-        let Some(candidate) = current else {
-            return;
-        };
-        if get_private_value(scope, candidate, EVENT_TARGET_INTERFACE_BRAND_SLOT)
-            .is_some_and(|value| value.is_true())
-        {
-            set_private_value(
-                scope,
-                object,
-                EVENT_TARGET_INTERFACE_BRAND_SLOT,
-                v8::Boolean::new(scope, true).into(),
-            );
-            return;
-        }
-        let Some(parent) = candidate.get_prototype(scope) else {
-            return;
-        };
-        if parent.is_null_or_undefined() {
-            return;
-        }
-        current = v8::Local::<v8::Object>::try_from(parent).ok();
-    }
 }
 
 pub fn define_to_string_tag(
@@ -111,15 +68,15 @@ where
     let prototype = prototype
         .to_v8_value(scope)
         .ok_or_else(|| BindError::new("failed to convert declared prototype"))?;
-    let prototype = v8::Local::<v8::Object>::try_from(prototype)
-        .map_err(|_| BindError::new("declared prototype must be an object"))?;
-    let installed = object
-        .set_prototype(scope, prototype.into())
-        .unwrap_or(false);
+    if !prototype.is_object() && !prototype.is_null() {
+        return Err(BindError::new(
+            "declared prototype must be an object or null",
+        ));
+    }
+    let installed = object.set_prototype(scope, prototype).unwrap_or(false);
     if !installed {
         return Err(BindError::new("failed to set declared prototype"));
     }
-    copy_event_target_interface_brand(scope, object, prototype);
     Ok(())
 }
 
@@ -164,42 +121,4 @@ where
         .unwrap_or(false)
         .then_some(())
         .ok_or_else(|| BindError::new("failed to define declared toStringTag"))
-}
-
-pub fn define_interface_prototype_property(
-    scope: &mut v8::PinScope<'_, '_>,
-    constructor: v8::Local<'_, v8::Function>,
-    prototype: v8::Local<'_, v8::Object>,
-) -> Result<(), BindError> {
-    let mut descriptor = v8::PropertyDescriptor::new_from_value_writable(prototype.into(), false);
-    descriptor.set_configurable(false);
-    descriptor.set_enumerable(false);
-    constructor
-        .define_property(
-            scope,
-            __private::v8str(scope, "prototype").into(),
-            &descriptor,
-        )
-        .unwrap_or(false)
-        .then_some(())
-        .ok_or_else(|| BindError::new("failed to define interface prototype property"))
-}
-
-pub fn define_interface_constructor_property(
-    scope: &mut v8::PinScope<'_, '_>,
-    prototype: v8::Local<'_, v8::Object>,
-    constructor: v8::Local<'_, v8::Function>,
-) -> Result<(), BindError> {
-    let mut descriptor = v8::PropertyDescriptor::new_from_value_writable(constructor.into(), true);
-    descriptor.set_configurable(true);
-    descriptor.set_enumerable(false);
-    prototype
-        .define_property(
-            scope,
-            __private::v8str(scope, "constructor").into(),
-            &descriptor,
-        )
-        .unwrap_or(false)
-        .then_some(())
-        .ok_or_else(|| BindError::new("failed to define interface constructor property"))
 }

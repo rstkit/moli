@@ -1,4 +1,44 @@
 use super::*;
+
+#[test]
+fn output_limit_stops_before_shadow_queries_or_embedded_document_validation() {
+    struct Filter;
+    impl HtmlSerializationPolicy for Filter {}
+    struct InvalidDocument(NativeNodeId);
+    impl HtmlEmbeddedDocumentProvider for InvalidDocument {
+        fn embedded_document(&self, owner: NativeNodeId) -> Option<HtmlEmbeddedDocument<'_>> {
+            Some(HtmlEmbeddedDocument {
+                document: owner,
+                url: Cow::Borrowed("about:blank"),
+            })
+        }
+        fn sole_owner(&self) -> Option<NativeNodeId> {
+            Some(self.0)
+        }
+    }
+    let mut dom = NativeDom::new_html(url::Url::parse("https://export.test/").unwrap());
+    let owner = dom.create_element("iframe");
+    assert!(dom.set_attribute(owner, "title", &"x".repeat(128)));
+    assert!(dom.set_attribute(owner, "data-after", "kept"));
+    let shadow = |_| -> Option<HtmlSerializedShadowRoot<'_>> {
+        panic!("output already exceeded the limit before reaching this host's shadow tree")
+    };
+    let documents = InvalidDocument(owner);
+    let scripting = |_| true;
+    for embedded in [false, true] {
+        let options = HtmlSerializationOptions {
+            shadow_root_provider: Some(&shadow),
+            policy: Some(&Filter),
+            embedded_documents: embedded.then_some(&documents as &dyn HtmlEmbeddedDocumentProvider),
+            max_bytes: Some(20),
+            ..HtmlSerializationOptions::new(HtmlSerializationTarget::IncludeNode, &scripting)
+        };
+        assert_eq!(
+            serialize_html_with_options(&dom, owner, options),
+            Err(HtmlSerializationError::OutputLimitExceeded { max_bytes: 20 }),
+        );
+    }
+}
 use crate::native::DomHost;
 
 fn test_url() -> url::Url {
@@ -7,6 +47,90 @@ fn test_url() -> url::Url {
 
 fn scripting_enabled(_: NativeNodeId) -> bool {
     true
+}
+
+#[test]
+fn template_contents_require_the_exact_html_element_identity() {
+    for (namespace, name, is_template) in [
+        (None, "template", false),
+        (Some(""), "template", false),
+        (Some("http://www.w3.org/2000/svg"), "template", false),
+        (
+            Some("http://www.w3.org/1998/Math/MathML"),
+            "template",
+            false,
+        ),
+        (Some("urn:template-test"), "template", false),
+        (Some("http://www.w3.org/1999/xhtml"), "TEMPLATE", false),
+        (Some("http://www.w3.org/1999/xhtml"), "TeMpLaTe", false),
+        (Some("http://www.w3.org/1999/xhtml"), "template", true),
+        (Some("http://www.w3.org/1999/xhtml"), "h:template", true),
+    ] {
+        let mut dom = NativeDom::new_html(test_url());
+        let native = dom.create_element_ns(namespace, name).unwrap();
+        let mut host = DomHost::from_dom(dom);
+        let document = host.document_handle();
+        let (prefix, local_name) = name
+            .split_once(':')
+            .map_or((None, name), |(prefix, local)| {
+                (Some(prefix.to_owned()), local)
+            });
+        let allocated = host.create_element_without_attributes_for_document(
+            document,
+            local_name.into(),
+            namespace.unwrap_or_default().into(),
+            prefix.clone(),
+        );
+        let parsed = host.create_parser_element_without_attributes_for_document(
+            document,
+            local_name.into(),
+            namespace.unwrap_or_default().into(),
+            prefix,
+        );
+        for element in [native, allocated, parsed] {
+            let contents = host
+                .node(element)
+                .and_then(|node| node.as_element())
+                .unwrap()
+                .template_contents();
+            assert_eq!(
+                contents.is_some(),
+                is_template,
+                "namespace={namespace:?}, name={name}"
+            );
+            let child = host.create_element("probe");
+            let root = if is_template {
+                contents.unwrap()
+            } else {
+                element
+            };
+            assert!(host.append_child(root, child));
+            assert_eq!(
+                host.dom()
+                    .html_serialization_child_ids_reversed(element)
+                    .collect::<Vec<_>>(),
+                vec![child]
+            );
+            assert_eq!(
+                host.dom().inner_html(element).as_deref(),
+                Some("<probe></probe>")
+            );
+            let clone = host.clone_node(element, true).unwrap();
+            assert_eq!(
+                host.dom().inner_html(clone).as_deref(),
+                Some("<probe></probe>")
+            );
+        }
+    }
+    let mut dom = NativeDom::new_html(test_url());
+    let normalized = dom.create_element("TEMPLATE");
+    assert_eq!(dom.element(normalized).unwrap().local_name(), "template");
+    assert!(
+        dom.element(normalized)
+            .unwrap()
+            .template_contents()
+            .is_some()
+    );
 }
 
 #[test]
@@ -22,6 +146,10 @@ fn html_serializers_share_the_complete_void_element_set() {
         let element = dom.create_element(local_name);
         let ignored_child = dom.create_element("span");
         assert!(dom.append_child(element, ignored_child));
+        assert_eq!(
+            dom.html_serialization_child_ids_reversed(element).count(),
+            0
+        );
         assert_eq!(dom.outer_html(element), Some(format!("<{local_name}>")));
         assert_eq!(dom.inner_html(element).as_deref(), Some(""));
         assert!(dom.append_child(container, element));
@@ -56,6 +184,33 @@ fn html_serializers_share_the_complete_void_element_set() {
             Some("")
         );
     }
+}
+
+#[test]
+fn serialized_template_children_keep_document_order_including_nested_contents() {
+    let mut dom = NativeDom::new_html(test_url());
+    let outer = dom.create_element("template");
+    let inner = dom.create_element("template");
+    let before = dom.create_element("span");
+    let after = dom.create_element("strong");
+    let nested = dom.create_element("b");
+    let outer_contents = dom.element(outer).unwrap().template_contents().unwrap();
+    let inner_contents = dom.element(inner).unwrap().template_contents().unwrap();
+    assert!(dom.append_child(outer_contents, before));
+    assert!(dom.append_child(outer_contents, inner));
+    assert!(dom.append_child(outer_contents, after));
+    assert!(dom.append_child(inner_contents, nested));
+    let mut stack = vec![outer];
+    let mut elements = Vec::new();
+    while let Some(node) = stack.pop() {
+        elements.push(node);
+        stack.extend(dom.html_serialization_child_ids_reversed(node));
+    }
+    assert_eq!(elements, vec![outer, before, inner, nested, after]);
+    assert_eq!(
+        dom.outer_html(outer).unwrap(),
+        "<template><span></span><template><b></b></template><strong></strong></template>"
+    );
 }
 
 #[test]
@@ -134,6 +289,7 @@ fn html_text_serialization_uses_the_actual_parent_and_scripting_mode() {
                     element,
                     &scripting_enabled_for_node,
                     crate::native::ShadowRootInclusion::None,
+                    crate::native::ShadowRootMarkupProfile::WebApi,
                     None,
                 ),
                 Some(format!("<{local_name}>{contents}</{local_name}>")),
@@ -177,6 +333,7 @@ fn html_serialization_queries_scripting_state_for_each_noscript_text_node() {
             container,
             &scripting_enabled_for_node,
             crate::native::ShadowRootInclusion::None,
+            crate::native::ShadowRootMarkupProfile::WebApi,
             None,
         ),
         Some(format!("<main>{expected}</main>"))

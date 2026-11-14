@@ -18,6 +18,7 @@ fn event_attribute_handlers_use_html_scope_chain_and_report_compile_errors() {
                 <table><tbody><tr><td id="cell"><img id="cell-inner"></td></tr></tbody></table>
                 <form id="owner" onsubmit="return false">
                   <button id="button" type="button"><q id="button-inner"></q></button>
+                  <img id="form-image" alt="form image">
                 </form>
                 <a id="error-inner"></a>
               `;
@@ -63,6 +64,14 @@ fn event_attribute_handlers_use_html_scope_chain_and_report_compile_errors() {
               `);
               buttonInner.click();
 
+              const formImage = document.getElementById("form-image");
+              globalThis.elements = "global-elements";
+              formImage.setAttribute(
+                "onclick",
+                `globalThis.__imageFormScope = elements;`
+              );
+              formImage.click();
+
               globalThis.__windowScope = null;
               globalThis.__compileErrorEvents = 0;
               document.body.bodyOwn = true;
@@ -84,6 +93,8 @@ fn event_attribute_handlers_use_html_scope_chain_and_report_compile_errors() {
               return JSON.stringify({
                 cell: globalThis.__cellScope,
                 form: globalThis.__formScope,
+                imageForm: globalThis.__imageFormScope === form.elements,
+                imageIsNotListed: !Array.from(form.elements).includes(formImage),
                 window: globalThis.__windowScope,
                 errors: globalThis.__compileErrorEvents,
               });
@@ -94,7 +105,7 @@ fn event_attribute_handlers_use_html_scope_chain_and_report_compile_errors() {
 
     assert_eq!(
         result,
-        r#"{"cell":["number","string","function","boolean","undefined","object","updated"],"form":["boolean","object","string","string","boolean","boolean","undefined","object"],"window":["undefined","function","undefined","string"],"errors":1}"#,
+        r#"{"cell":["number","string","function","boolean","undefined","object","updated"],"form":["boolean","object","string","string","boolean","boolean","undefined","object"],"imageForm":true,"imageIsNotListed":true,"window":["undefined","function","undefined","string"],"errors":1}"#,
     );
 }
 
@@ -188,4 +199,54 @@ fn parser_inserted_frameset_window_event_handlers_reflect_on_window() {
         result,
         r#"{"beforeInvocation":["function","function",true,true],"loadResult":true,"errorResult":"message|source|3|4|error"}"#,
     );
+}
+
+mod node_compilation;
+
+mod document_replacement;
+
+#[test]
+fn added_window_and_dom_handler_properties_share_native_registration() {
+    let mut vm = new_parsed_test_vm(
+        "https://native-handler-surface.test/",
+        "<body><iframe id=child></iframe></body>",
+    );
+    assert_eq!(
+        vm.eval(include_str!("event_handlers/native_surface_split.js"))
+            .unwrap(),
+        "true"
+    );
+}
+
+#[test]
+fn device_window_handler_properties_follow_secure_context_exposure() {
+    for url in [
+        "https://native-device-handler.test/",
+        "http://native-device-handler.test/",
+    ] {
+        let mut vm = new_parsed_test_vm(url, "<body><iframe id=child></iframe></body>");
+        assert_eq!(
+            vm.eval(include_str!("event_handlers/native_secure_split.js"))
+                .unwrap(),
+            "true",
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn pointer_raw_update_handler_properties_follow_secure_context_exposure() {
+    for (url, secure_context) in [
+        ("http://native-pointer-raw-update.test/", false),
+        ("https://native-pointer-raw-update.test/", true),
+        ("http://localhost/pointer-raw-update", true),
+        ("http://127.0.0.1/pointer-raw-update", true),
+    ] {
+        let mut vm = new_parsed_test_vm(url, "<body><iframe id=child></iframe></body>");
+        let script = format!(
+            "{}({secure_context})",
+            include_str!("event_handlers/pointer_raw_update_secure_split.js")
+        );
+        assert_eq!(vm.eval(&script).unwrap(), "true", "{url}");
+    }
 }

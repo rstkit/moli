@@ -40,12 +40,13 @@ use crate::page_task_queue::{
 };
 use crate::script_vm::{
     DocumentInspectorBinding, PendingRuntimeEvaluateCall, RendererDocumentIsolateBootstrap,
-    RendererDocumentIsolateHandle, RendererDocumentIsolateReservationAccounting,
+    RendererDocumentIsolateReservationAccounting, RendererIsolateHandle,
     RendererPageScriptEnvironment, RuntimeEvaluateResultMode,
 };
 use crate::{RendererNavigationReplyPolicy, RendererTopLevelNavigationDispatch};
 use tokio::sync::oneshot;
 
+mod auxiliary_pages;
 mod bound;
 mod entry;
 mod navigation_follow;
@@ -61,7 +62,7 @@ pub(in crate::runtime) use entry::{
 };
 pub(in crate::runtime) use navigation_follow::{
     LivePageNavigationFollowEntryAdvance, LivePageNavigationFollowOutcome,
-    LivePageNavigationFollowTurn,
+    LivePageNavigationFollowTurn, commit_prepared_document_response_on_entry_via_local_task,
     follow_pending_location_navigation_one_turn_on_entry_via_local_task,
 };
 pub(in crate::runtime) use phase_one::{
@@ -314,9 +315,17 @@ impl RendererPageCreationCommit {
 
 pub(super) type NavigationReplyPolicy = RendererNavigationReplyPolicy;
 
+pub(super) enum NavigationInitiatorMetadata {
+    Preserve,
+    Replace(Option<Url>),
+}
+
 pub(super) enum LivePagePendingNavigationCompletion {
     Background,
     PublishedPageCreation {
+        navigation_reply_policy: NavigationReplyPolicy,
+    },
+    CompletePageReplacement {
         navigation_reply_policy: NavigationReplyPolicy,
     },
     CompletePageCreation {
@@ -361,6 +370,7 @@ impl LivePagePendingNavigationCompletion {
                 "running background navigation"
             }
             Self::CompletePageCreation { .. } => "creating page",
+            Self::CompletePageReplacement { .. } => "replacing page Document",
             Self::ReplyWithSnapshot { .. } => "refreshing page",
             Self::ContinueNetworkIdle { .. } => "waiting for networkidle",
             Self::ContinueDomStable { .. } => "waiting for domstable",
@@ -369,7 +379,10 @@ impl LivePagePendingNavigationCompletion {
     }
 
     pub(super) fn retires_page_on_navigation_failure(&self) -> bool {
-        matches!(self, Self::CompletePageCreation { .. })
+        matches!(
+            self,
+            Self::CompletePageCreation { .. } | Self::CompletePageReplacement { .. }
+        )
     }
 
     pub(super) fn failure_recipient(&self) -> LivePageNavigationFailureRecipient {
@@ -377,6 +390,7 @@ impl LivePagePendingNavigationCompletion {
             Self::Background => LivePageNavigationFailureRecipient::PageCreationObserver,
             Self::PublishedPageCreation { .. } => LivePageNavigationFailureRecipient::Background,
             Self::CompletePageCreation { .. }
+            | Self::CompletePageReplacement { .. }
             | Self::ReplyWithSnapshot { .. }
             | Self::ContinueNetworkIdle { .. }
             | Self::ContinueDomStable { .. }
@@ -394,6 +408,9 @@ impl LivePagePendingNavigationCompletion {
             | Self::CompletePageCreation {
                 navigation_reply_policy,
                 ..
+            }
+            | Self::CompletePageReplacement {
+                navigation_reply_policy,
             } => navigation_reply_policy.returns_with_pending_navigation(),
             Self::Background
             | Self::ReplyWithSnapshot { .. }
@@ -406,6 +423,17 @@ impl LivePagePendingNavigationCompletion {
     pub(super) fn detach_command_observer(self) -> (Self, bool) {
         match self {
             Self::CompletePageCreation { .. } => (self, false),
+            Self::CompletePageReplacement {
+                navigation_reply_policy,
+            } => (
+                // The existing Page still has its original close owner after
+                // this observer is cancelled. Keep the committed Document's
+                // parser and lifecycle work on that Page.
+                Self::PublishedPageCreation {
+                    navigation_reply_policy,
+                },
+                true,
+            ),
             Self::Background
             | Self::PublishedPageCreation { .. }
             | Self::ReplyWithSnapshot { .. }
@@ -440,6 +468,10 @@ impl Clone for RendererOwnerLocalContext {
 pub(super) struct RendererOwnerLocalStore {
     page_hosts: HashMap<RendererOwnerLocalHostId, RendererOwnerLocalPageHost>,
     prepared_documents: HashMap<RendererPageReservationToken, RendererPreparedDocumentResidence>,
+    staged_auxiliary_pages: HashMap<RendererPageReservationToken, PageVm>,
+    captured_document_environments:
+        HashMap<u64, crate::script_vm::ScriptVmCapturedDocumentEnvironment>,
+    page_replacement_reservations: HashMap<RendererPageToken, RendererPageReservationToken>,
     page_task_deadline_index: OwnerDeadlineIndex<RendererPageToken>,
     owner_maintenance_deadline_index: OwnerDeadlineIndex<RendererPageToken>,
     next_host_instance_key: usize,
@@ -595,16 +627,7 @@ impl RendererOwnerLocalPageSlot {
     }
 }
 
-fn earliest_deadline(
-    left: Option<std::time::Instant>,
-    right: Option<std::time::Instant>,
-) -> Option<std::time::Instant> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
-    }
-}
+use super::earliest_deadline;
 
 impl Drop for RendererOwnerLocalPageSlot {
     fn drop(&mut self) {
@@ -622,12 +645,13 @@ impl Drop for RendererOwnerLocalPageSlot {
 #[derive(Debug)]
 struct RendererDocumentIsolateReservationEntry {
     id: u64,
-    handle: RendererDocumentIsolateHandle,
+    handle: RendererIsolateHandle,
     /// The stream opens together with the isolate reservation, before that
     /// isolate is attached to a stable Page slot. Until attachment transfers
     /// lifetime ownership to `RendererPageScriptEnvironmentPin`, this entry
     /// must close the stream on every cancellation/failure path.
     output_journal: RendererTurnOutputJournal,
+    retire_output_journal_on_drop: bool,
     /// Initial page creation owns the not-yet-attached consumer set here.
     /// A same-Page replacement reservation reuses the live slot's producer
     /// routes and therefore must not manufacture a second consumer set.
@@ -660,6 +684,7 @@ impl RendererDocumentIsolateAllocator {
     pub(crate) fn reserve_renderer_document_isolate(
         &self,
         page_runtime_task_source: crate::page_task_queue::PageRuntimeTaskSource,
+        window_identity: super::RendererPageWindowIdentity,
     ) -> Result<(
         RendererDocumentIsolateBootstrap,
         RendererDocumentIsolateReservation,
@@ -668,6 +693,7 @@ impl RendererDocumentIsolateAllocator {
             &self.owner,
             self.page_id,
             page_runtime_task_source,
+            window_identity,
         )
     }
 }
@@ -718,6 +744,7 @@ impl RendererOwnerLocalStoreSession<'_> {
         owner: &RendererOwnerLocalContext,
         page_id: PageId,
         page_runtime_task_source: crate::page_task_queue::PageRuntimeTaskSource,
+        window_identity: super::RendererPageWindowIdentity,
     ) -> Result<(
         RendererDocumentIsolateBootstrap,
         RendererDocumentIsolateReservation,
@@ -726,6 +753,7 @@ impl RendererOwnerLocalStoreSession<'_> {
             owner,
             page_id,
             page_runtime_task_source,
+            window_identity,
         )
     }
 
@@ -746,7 +774,7 @@ impl RendererOwnerLocalStoreSession<'_> {
         navigation_redirected: bool,
         navigation_redirect_count: usize,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         vm: PageVm,
         pending_download: Option<RendererPendingDownloadActivation>,
         lifecycle_gate: Option<PageVmInitStage>,
@@ -773,7 +801,7 @@ impl RendererOwnerLocalStoreSession<'_> {
         navigation_redirected: bool,
         navigation_redirect_count: usize,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         pending_navigation: PageVmPendingPhaseOneNavigation,
         lifecycle_gate: Option<PageVmInitStage>,
     ) -> Result<RendererPendingPageCreation> {
@@ -860,11 +888,43 @@ impl RendererOwnerLocalStoreSession<'_> {
 }
 
 impl RendererOwnerLocalStore {
+    pub(super) fn reserve_live_page_replacement(
+        &mut self,
+        token: RendererPageToken,
+        reservation_nonce: u64,
+    ) -> Result<RendererPageReservationToken> {
+        let page = self
+            .page_hosts
+            .get(&token.local_host_id)
+            .and_then(|host| host.pages.get(&token.page_id))
+            .ok_or_else(|| anyhow!("replacement Page no longer exists"))?;
+        let current = page.owner_slot.entry();
+        ensure!(current.is_active(), "replacement Page is retired");
+        let reservation = RendererPageReservationToken::for_replacement(
+            token,
+            current.vm_creation_id(),
+            reservation_nonce,
+        );
+        if let Some(previous) = self
+            .page_replacement_reservations
+            .insert(token, reservation)
+        {
+            self.cancel_prepared_document(previous);
+        }
+        Ok(reservation)
+    }
+
     pub(super) fn store_prepared_document(
         &mut self,
         token: RendererPageReservationToken,
         residence: RendererPreparedDocumentResidence,
     ) -> Result<()> {
+        if token.replacement.is_some()
+            && let Err(error) = self.validate_live_page_replacement_reservation(token)
+        {
+            self.drop_prepared_document_residence(residence);
+            return Err(error);
+        }
         match self.prepared_documents.entry(token) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(residence);
@@ -881,6 +941,10 @@ impl RendererOwnerLocalStore {
         &mut self,
         token: RendererPageReservationToken,
     ) -> Result<RendererPreparedDocumentResidence> {
+        if token.replacement.is_some() {
+            let page = self.validate_live_page_replacement_reservation(token)?;
+            self.page_replacement_reservations.remove(&page);
+        }
         self.prepared_documents.remove(&token).ok_or_else(|| {
             anyhow!(
                 "renderer owner no longer tracks prepared document for page {}",
@@ -903,6 +967,7 @@ impl RendererOwnerLocalStore {
         macro_rules! apply_configuration {
             ($request:expr) => {{
                 let request = $request;
+                request.web_mcp_invocation = configuration.web_mcp_invocation;
                 request.document_start_scripts = configuration.document_start_scripts;
                 request.runtime_bindings = configuration.runtime_bindings;
                 request.runtime_inspector_session_restore_snapshots =
@@ -910,16 +975,7 @@ impl RendererOwnerLocalStore {
                 request.runtime_isolated_worlds = configuration.runtime_isolated_worlds;
                 request.permission_overrides = configuration.permission_overrides;
                 request.extra_http_headers = configuration.extra_http_headers;
-                request.locale_override = configuration.locale_override;
-                request.timezone_override = configuration.timezone_override;
-                request.script_execution_disabled = configuration.script_execution_disabled;
-                request.bypass_content_security_policy =
-                    configuration.bypass_content_security_policy;
-                request.cpu_throttling_rate = configuration.cpu_throttling_rate;
-                request.emulated_media = configuration.emulated_media;
-                request.idle_override = configuration.idle_override;
-                request.navigator_overrides = configuration.navigator_overrides;
-                request.viewport_surface = configuration.viewport_surface;
+                request.document_settings = configuration.document_settings;
                 request
                     .loader
                     .replace_browser_resource_runtime(configuration.browser_resource_runtime);
@@ -932,20 +988,72 @@ impl RendererOwnerLocalStore {
                     .loader
                     .set_cache_disabled(configuration.cache_disabled);
                 request.blocked_url_patterns = configuration.blocked_url_patterns;
-                request.fetch_subresource_interception_enabled =
-                    configuration.fetch_subresource_interception_enabled;
-                request.fetch_subresource_interception_resource_type =
-                    configuration.fetch_subresource_interception_resource_type;
+                request.fetch_subresource_interception_classes =
+                    configuration.fetch_subresource_interception_classes;
             }};
         }
         apply_configuration!(&mut residence.request);
         Ok(())
     }
 
+    pub(super) fn cancel_live_page_replacement_reservation(
+        &mut self,
+        token: RendererPageToken,
+        reservation_nonce: u64,
+    ) {
+        let current = self
+            .page_replacement_reservations
+            .get(&token)
+            .copied()
+            .filter(|reservation| {
+                reservation
+                    .replacement
+                    .is_some_and(|admission| admission.reservation_nonce == reservation_nonce)
+            });
+        if let Some(current) = current {
+            self.cancel_prepared_document(current);
+        }
+    }
+
     pub(super) fn cancel_prepared_document(&mut self, token: RendererPageReservationToken) {
+        self.page_replacement_reservations
+            .retain(|_, current| *current != token);
         if let Some(residence) = self.prepared_documents.remove(&token) {
             self.drop_prepared_document_residence(residence);
         }
+    }
+
+    pub(super) fn validate_live_page_replacement_reservation(
+        &self,
+        reservation: RendererPageReservationToken,
+    ) -> Result<RendererPageToken> {
+        let admission = reservation
+            .replacement
+            .ok_or_else(|| anyhow!("an initial Page reservation cannot replace a Document"))?;
+        let token = RendererPageToken {
+            local_host_id: reservation.local_host_id,
+            page_id: reservation.page_id,
+            #[cfg(debug_assertions)]
+            local_thread_id: std::thread::current().id(),
+        };
+        ensure!(
+            self.page_replacement_reservations.get(&token) == Some(&reservation),
+            "Page Document replacement reservation has been superseded or canceled"
+        );
+        let page = self
+            .page_hosts
+            .get(&token.local_host_id)
+            .and_then(|host| host.pages.get(&token.page_id))
+            .ok_or_else(|| anyhow!("replacement Page no longer exists"))?;
+        let current = page.owner_slot.entry();
+        ensure!(current.is_active(), "replacement Page is retired");
+        ensure!(
+            current.vm_creation_id() == admission.expected_vm_creation_id,
+            "stale prepared replacement expected PageVm {}, current PageVm {}",
+            admission.expected_vm_creation_id,
+            current.vm_creation_id()
+        );
+        Ok(token)
     }
 
     fn drop_prepared_document_residence(&mut self, residence: RendererPreparedDocumentResidence) {
@@ -1012,9 +1120,14 @@ impl RendererOwnerLocalStore {
         // `FollowBeforeReply` must observe that navigation before publishing
         // the old Document; generic lifecycle observers still treat the
         // milestone itself as reached.
-        let observation = bound::reconcile_page_creation_lifecycle_observation(
+        let observation = bound::reconcile_navigation_follow_lifecycle_observation(
             observation,
             entry.page_vm().vm().has_pending_location_navigation(),
+            entry
+                .page_vm()
+                .vm()
+                .pending_location_navigation_source_document()
+                == Some(document),
         );
         match observation {
             DocumentLifecycleObserverOutcome::Reached => {
@@ -1094,6 +1207,7 @@ impl RendererOwnerLocalStore {
         owner: &RendererOwnerLocalContext,
         page_id: PageId,
         page_runtime_task_source: crate::page_task_queue::PageRuntimeTaskSource,
+        window_identity: super::RendererPageWindowIdentity,
     ) -> Result<(
         RendererDocumentIsolateBootstrap,
         RendererDocumentIsolateReservation,
@@ -1105,6 +1219,40 @@ impl RendererOwnerLocalStore {
         let token = renderer_page_token_for_owner_context(owner, page_id);
         #[cfg(debug_assertions)]
         Self::ensure_token_thread(&token)?;
+        if let Some(environment) = self
+            .page_hosts
+            .get(&owner.local_host_id)
+            .and_then(|host| host.pages.get(&page_id))
+            .map(|page| page.script_environment_pin.environment.clone())
+        {
+            let bootstrap = environment.bootstrap_replacement_document_isolate()?;
+            let reservation_id = self.next_renderer_document_isolate_reservation_id;
+            self.next_renderer_document_isolate_reservation_id = reservation_id
+                .checked_add(1)
+                .expect("renderer Document reservation identities must not wrap");
+            self.host_for_id(owner.local_host_id)
+                .reserved_renderer_document_isolates
+                .entry(page_id)
+                .or_default()
+                .push(RendererDocumentIsolateReservationEntry {
+                    id: reservation_id,
+                    handle: bootstrap.clone_renderer_document_isolate_handle_for_owner_retention(),
+                    output_journal: environment.output_journal(),
+                    retire_output_journal_on_drop: false,
+                    initial_task_sources: None,
+                    _accounting: RendererDocumentIsolateReservationAccounting::new(),
+                });
+            return Ok((
+                bootstrap,
+                RendererDocumentIsolateReservation {
+                    inner: Rc::new(RendererDocumentIsolateReservationState {
+                        token,
+                        reservation_id,
+                        active: std::cell::Cell::new(true),
+                    }),
+                },
+            ));
+        }
         let existing_page_routes = self
             .page_hosts
             .get(&owner.local_host_id)
@@ -1125,9 +1273,10 @@ impl RendererOwnerLocalStore {
         let v8_foreground_task_sender = page_runtime_task_source
             .v8_foreground_task_sender()
             .ok_or_else(|| anyhow!("owner-reserved Page is missing its V8 foreground source"))?;
-        let bootstrap = RendererDocumentIsolateHandle::new_owner_reserved_page(
+        let bootstrap = RendererIsolateHandle::new_owner_reserved_page(
             v8_foreground_task_sender,
             &owner.owner_state.devtools_target_shutdown_registry,
+            owner.owner_state.inspector_io_wake_tx.clone(),
         )?;
         let host_handle = bootstrap.clone_renderer_document_isolate_handle_for_owner_retention();
         let reservation_id = self.next_renderer_document_isolate_reservation_id;
@@ -1155,9 +1304,13 @@ impl RendererOwnerLocalStore {
         let page_script_environment = RendererPageScriptEnvironment::new(
             page_id.as_u64(),
             host_handle.clone(),
+            bootstrap.inspector_isolate_backend_handle(),
             page_runtime_task_source,
             output_journal.clone(),
+            window_identity,
         );
+        page_script_environment
+            .bind_auxiliary_allocator(RendererAuxiliaryPageAllocator::new(owner.clone(), page_id));
         let host = self.host_for_id(owner.local_host_id);
         host.reserved_renderer_document_isolates
             .entry(page_id)
@@ -1166,6 +1319,7 @@ impl RendererOwnerLocalStore {
                 id: reservation_id,
                 handle: host_handle,
                 output_journal,
+                retire_output_journal_on_drop: true,
                 initial_task_sources,
                 _accounting: RendererDocumentIsolateReservationAccounting::new(),
             });
@@ -1240,27 +1394,33 @@ impl RendererOwnerLocalStore {
         reservations: impl IntoIterator<Item = RendererDocumentIsolateReservationEntry>,
     ) {
         for reservation in reservations {
-            reservation
-                .output_journal
-                .retire(RendererOutputStreamCloseReason::ResidenceRetired);
+            if reservation.retire_output_journal_on_drop {
+                reservation
+                    .output_journal
+                    .retire(RendererOutputStreamCloseReason::ResidenceRetired);
+            }
         }
     }
 
     fn take_entry_for_command(&mut self, token: RendererPageToken) -> Result<LivePageEntry> {
         match self.checkout_entry_for_owner_turn(token) {
             Ok(entry) => Ok(entry),
-            Err(LivePageEntryCheckoutError::Busy) => Err(anyhow!(
-                "renderer local host page {} is already running an owner turn",
-                token.page_id.as_u64()
-            )),
-            Err(LivePageEntryCheckoutError::Retired) => Err(anyhow!(
-                "renderer local host page {} is retiring",
-                token.page_id.as_u64()
-            )),
-            Err(LivePageEntryCheckoutError::Missing) => Err(anyhow!(
-                "renderer local host no longer tracks page {}",
-                token.page_id.as_u64()
-            )),
+            Err(LivePageEntryCheckoutError::Busy) => Err(super::RendererPageAccessError::Busy {
+                page_id: token.page_id,
+            }
+            .into()),
+            Err(LivePageEntryCheckoutError::Retired) => {
+                Err(super::RendererPageAccessError::Retiring {
+                    page_id: token.page_id,
+                }
+                .into())
+            }
+            Err(LivePageEntryCheckoutError::Missing) => {
+                Err(super::RendererPageAccessError::Missing {
+                    page_id: token.page_id,
+                }
+                .into())
+            }
         }
     }
 
@@ -1481,16 +1641,11 @@ impl RendererOwnerLocalStore {
                 .expect("phase-one admission requires a resident continuation");
             pending.phase_one_restore_requirement()
         };
-        let streaming_input_ready = entry.pending_phase_one_navigation_has_ready_streaming_input();
         let page_turn_is_runnable = !bound::page_ready_descriptor_snapshot(entry, task_sources)
             .eligible
             .is_empty();
 
-        PhaseOneResidenceAdmission::after_stable_restore(
-            restore_requirement,
-            page_turn_is_runnable,
-            streaming_input_ready,
-        )
+        PhaseOneResidenceAdmission::after_stable_restore(restore_requirement, page_turn_is_runnable)
     }
 
     fn page_turn_readiness_after_restore(
@@ -1604,7 +1759,7 @@ impl RendererOwnerLocalStore {
         navigation_redirected: bool,
         navigation_redirect_count: usize,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         mut vm: PageVm,
         pending_download: Option<RendererPendingDownloadActivation>,
         lifecycle_gate: Option<PageVmInitStage>,
@@ -1651,7 +1806,7 @@ impl RendererOwnerLocalStore {
         navigation_redirected: bool,
         navigation_redirect_count: usize,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         mut pending_navigation: PageVmPendingPhaseOneNavigation,
         lifecycle_gate: Option<PageVmInitStage>,
     ) -> Result<RendererPendingPageCreation> {
@@ -1846,6 +2001,7 @@ impl RendererOwnerLocalStore {
             .page_vm()
             .renderer_output_tail_cursor()
             .map(|cursor| entry.page_vm().declare_renderer_output_fence(cursor));
+        let vm_creation_id = entry.page_vm().creation_id;
         self.restore_entry_after_command(token, entry);
         let finalized = result.map(
             |(
@@ -1860,6 +2016,7 @@ impl RendererOwnerLocalStore {
                 creation_diagnostics.renderer_output_predecessor = renderer_output_fence;
                 RendererFinalizedPageCreation {
                     attached_page: RendererAttachedPage {
+                        vm_creation_id,
                         token,
                         devtools_agent_token,
                         page_context_cancel_tx,
@@ -1894,6 +2051,9 @@ impl RendererOwnerLocalStore {
                 return;
             }
         }
+        if let Some(reservation) = self.page_replacement_reservations.remove(&token) {
+            self.cancel_prepared_document(reservation);
+        }
         self.page_task_deadline_index.remove(token);
         self.owner_maintenance_deadline_index.remove(token);
         let should_remove_host = if let Ok(host) = self.host_by_id_mut(token.local_host_id) {
@@ -1901,6 +2061,10 @@ impl RendererOwnerLocalStore {
                 .reserved_renderer_document_isolates
                 .remove(&token.page_id);
             let resident_entry = host.pages.get_mut(&token.page_id).and_then(|page_slot| {
+                page_slot
+                    .script_environment_pin
+                    .environment
+                    .close_browsing_context();
                 page_slot.owner_slot.remove_from_owner();
                 page_slot.owner_maintenance.retire();
                 page_slot.turn_scheduler.request_retirement()
@@ -2260,6 +2424,7 @@ impl RendererOwnerLocalStore {
             initial_task_sources,
             handle: _,
             output_journal: _,
+            retire_output_journal_on_drop: _,
             id: _,
             _accounting: _,
         } = reserved_isolate;
@@ -2426,6 +2591,7 @@ impl RendererOwnerLocalStore {
             initial_task_sources,
             handle: _,
             output_journal: _,
+            retire_output_journal_on_drop: _,
             id: _,
             _accounting: _,
         } = reserved_isolate;
@@ -2503,6 +2669,29 @@ impl RendererOwnerLocalStore {
         Self::commit_next_page_state_on_entry(entry, entry.page_vm().creation_id, page_state)
     }
 
+    fn commit_replacement_vm_page_state_on_entry(
+        entry: &mut LivePageEntry,
+        navigation_initiator_url: Option<Url>,
+    ) -> Result<Arc<RendererPageState>> {
+        let current = entry.slot.active_page_state()?;
+        let state_capture = entry
+            .page_vm_mut()
+            .capture_page_state_on_named_owner_lane_with_policy(
+                super::RendererPageStateCapturePolicy::FullReport,
+            )?;
+        let page_state = RendererPageState::from_vm_state_capture(
+            current.requested_url.clone(),
+            navigation_initiator_url,
+            current.navigation_redirected,
+            current.navigation_redirect_count,
+            current.status,
+            current.headers.clone(),
+            state_capture,
+        );
+        Self::commit_next_page_state_on_entry(entry, entry.page_vm().creation_id, page_state)?;
+        entry.slot.active_page_state()
+    }
+
     fn commit_active_vm_page_state_on_entry(
         entry: &mut LivePageEntry,
     ) -> Result<Arc<RendererPageState>> {
@@ -2571,7 +2760,7 @@ impl RendererOwnerLocalStore {
         let command_epoch = Self::advance_command_epoch(entry);
         let slot = entry.slot.clone();
         let _nested_main_page = super::nested_main::bind_active_nested_main_page(entry);
-        let reply = slot
+        let mut reply = slot
             .dispatch_async_owned(command_epoch, entry.page_vm_mut(), command)
             .await;
         let replacement_lifecycle = {
@@ -2597,12 +2786,22 @@ impl RendererOwnerLocalStore {
         } else {
             Ok(())
         };
+        // Input handlers and their completed microtask checkpoint may request
+        // navigation without running a click default action (pointerdown,
+        // mousemove, focus, etc.). Publish that real pending navigation at this
+        // input task's completion, not as a side effect of a later Runtime
+        // command. Preserve the action-specific download/file-chooser result.
+        if let Ok(reply) = &mut reply {
+            let pending_navigation = entry.page_vm().vm().has_pending_location_navigation();
+            for outcome in reply.input_dispatch_outcomes_mut() {
+                outcome.triggered_top_level_navigation |= pending_navigation;
+            }
+        }
         let input_triggered_top_level_navigation = reply.as_ref().is_ok_and(|reply| {
-            matches!(
-                reply,
-                RendererPageReply::InputDispatchOutcome(outcome)
-                    if outcome.triggered_top_level_navigation
-            )
+            reply
+                .input_dispatch_outcomes()
+                .iter()
+                .any(|outcome| outcome.triggered_top_level_navigation)
         });
         let should_delegate_location_navigation = replacement_lifecycle.is_ok()
             && runtime_command_completion.is_ok()
@@ -2627,7 +2826,7 @@ impl RendererOwnerLocalStore {
         } else {
             Ok(())
         };
-        let turn_records = entry
+        let command_output_cursor = entry
             .page_vm_mut()
             .finish_command_turn_output_scope(command_turn_output_scope);
         let replacement_lifecycle = replacement_lifecycle?;
@@ -2636,7 +2835,7 @@ impl RendererOwnerLocalStore {
         Ok(RendererPageCommandDispatch {
             reply: reply?,
             replacement_lifecycle,
-            turn_records,
+            command_output_cursor,
         })
     }
 
@@ -2821,6 +3020,7 @@ impl RendererOwnerLocalStore {
 
 impl Drop for RendererOwnerLocalStore {
     fn drop(&mut self) {
+        self.retire_staged_auxiliary_pages();
         let prepared_documents = std::mem::take(&mut self.prepared_documents);
         for (_, residence) in prepared_documents {
             self.drop_prepared_document_residence(residence);

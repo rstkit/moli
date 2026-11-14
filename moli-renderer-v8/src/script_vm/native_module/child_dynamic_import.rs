@@ -562,12 +562,9 @@ impl ScriptVm {
             ));
             return Ok(FrameDocumentModuleTerminalQueueFollowup::terminal_warning_recorded());
         };
+        self.dispatch_module_fetch_csp_violations(child_inflight.inflight.csp_context());
         let source = match result {
-            Ok(fetched_source) => self.module_graph_fetched_source_or_csp_error(
-                load_id,
-                fetched_source,
-                child_inflight.inflight.fetch_metadata(),
-            ),
+            Ok(fetched_source) => Ok(fetched_source),
             Err(error) => Err(ModuleLoadError::new(
                 ModuleLoadStage::Fetch,
                 format!("native dynamic import fetch completion {load_id} failed: {error}"),
@@ -1054,7 +1051,8 @@ impl ScriptVm {
                 let mut scope = try_catch.init();
 
                 let root_module = v8::Local::new(&scope, &root_module);
-                let Some(value) = root_module.evaluate(&scope) else {
+                let Some(value) = crate::script_execution::evaluate_module(&mut scope, root_module)
+                else {
                     let error = scope
                         .exception()
                         .map(|exception| {
@@ -1174,7 +1172,7 @@ impl ScriptVm {
     ) {
         if !self
             .child_document_modulator_store
-            .mark_dynamic_module_graph_evaluated(owner, realm_id, root_entry)
+            .mark_module_graph_evaluated(owner, realm_id, root_entry)
         {
             self.record_runtime_warning(format_args!(
                 "failed to mark child dynamic module evaluated: owner {:?} realm {:?} had no current document modulator",

@@ -14,10 +14,10 @@ use crate::{
         FrameDocumentClassicScriptReadyTarget, FrameDocumentClassicScriptSourceFailureTarget,
         FrameDocumentClassicSourceFailureReportApplication, FrameDocumentJavascriptUrlCompletion,
         FrameDocumentJavascriptUrlPostExecutionApplication, FrameDocumentScriptElementEventKind,
-        FrameDocumentTaskOwner, FrameRealmId, FrameScriptJob, PendingChildDynamicDocumentScript,
+        FrameDocumentTaskOwner, FrameRealmId, FrameScriptJob,
         PendingChildExternalClassicDocumentScript, PendingChildJavascriptUrlDocumentScript,
     },
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
 };
 
 use super::{
@@ -42,7 +42,7 @@ pub(in crate::script_vm) struct ChildDocumentScriptOwnerHooks<'vm> {
 }
 
 pub(in crate::script_vm) struct ChildParserScriptNestingScope {
-    context_host: Rc<RefCell<JsContextHost>>,
+    context_host: Rc<RefCell<PageScriptHost>>,
     child_handle: DomHandle,
     owner: FrameDocumentTaskOwner,
 }
@@ -259,17 +259,6 @@ impl<'vm> ChildDocumentScriptOwnerHooks<'vm> {
             .notify_parser_classic_next_owner_action(work)
     }
 
-    pub(in crate::script_vm) fn child_dynamic_classic_script_execution_action_for_owner(
-        &mut self,
-        work: &PendingChildDynamicDocumentScript,
-        realm_id: FrameRealmId,
-    ) -> Option<crate::frame_owner_model::FrameDocumentDynamicClassicScriptExecutionAction> {
-        self.vm
-            ._context_host
-            .borrow()
-            .child_dynamic_classic_script_execution_action_for_owner(work, realm_id)
-    }
-
     pub(in crate::script_vm) fn child_external_classic_script_execution_action_for_owner(
         &mut self,
         work: &PendingChildExternalClassicDocumentScript,
@@ -310,21 +299,6 @@ impl<'vm> ChildDocumentScriptOwnerHooks<'vm> {
         let attempted_script_job = action.attempted_script_job();
         let failed_script_job = action.failed_script_job();
         match action.completion() {
-            FrameDocumentJavascriptUrlCompletion::FailedScriptJob => {
-                let target = action.target();
-                self.vm
-                    ._context_host
-                    .borrow_mut()
-                    .finish_child_javascript_url_without_string_completion(target, false);
-                return FrameDocumentJavascriptUrlPostExecutionApplication {
-                    attempted_script_job,
-                    failed_script_job,
-                    string_completion_committed: false,
-                    lifecycle_followup_queued: false,
-                    initial_classic_ready_work: None,
-                    owner_transition: None,
-                };
-            }
             FrameDocumentJavascriptUrlCompletion::String(markup) => {
                 let target = action.target();
                 let url = action.url().clone();
@@ -361,7 +335,8 @@ impl<'vm> ChildDocumentScriptOwnerHooks<'vm> {
                 }
                 return application;
             }
-            FrameDocumentJavascriptUrlCompletion::NonString => {}
+            FrameDocumentJavascriptUrlCompletion::NonString
+            | FrameDocumentJavascriptUrlCompletion::FailedScriptJob => {}
         }
         let lifecycle_followup_queued = self
             .vm

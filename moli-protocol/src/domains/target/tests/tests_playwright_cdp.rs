@@ -346,12 +346,13 @@ async fn playwright_page_session_auto_attach_does_not_duplicate_new_page_target_
         .as_str()
         .expect("new page session id")
         .to_owned();
-    assert!(
-        ctx.conn
-            .auto_attached_sessions_for_owner(Some(&page_session_id))
-            .is_empty(),
-        "page session autoAttach owner must not own a browser-created top-level page session"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.auto_attached_sessions_for_owner(Some(&page_session_id))
+                .is_empty(),
+            "page session autoAttach owner must not own a browser-created top-level page session"
+        )
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -373,15 +374,16 @@ async fn playwright_page_session_auto_attach_does_not_duplicate_new_page_target_
         "page session autoAttach must not attach existing top-level page targets: {:?}",
         ctx.sent
     );
-    assert!(
-        ctx.conn
-            .auto_attached_sessions_for_owner(Some(&new_page_session_id))
-            .is_empty(),
-        "new page session autoAttach owner must not own other top-level page sessions"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.auto_attached_sessions_for_owner(Some(&new_page_session_id))
+                .is_empty(),
+            "new page session autoAttach owner must not own other top-level page sessions"
+        )
+    });
 }
 
-async fn wait_for_playwright_child_frame_navigation(
+async fn wait_for_playwright_child_frame_load(
     ctx: &mut TestContext,
     session_id: &str,
     child_frame_id: &str,
@@ -395,6 +397,18 @@ async fn wait_for_playwright_child_frame_navigation(
             message["method"] == json!("Page.frameNavigated")
                 && message["params"]["frame"]["id"] == json!(child_frame_id)
                 && message["params"]["frame"]["url"] == json!(expected_url)
+        },
+    )
+    .await;
+    // Navigation commits precede Realm bootstrap and document parsing.
+    // The following utility-script assertions read the loaded body.
+    crate::testing::wait_until_message(
+        ctx,
+        Some(session_id),
+        "child frame loaded before playwright-style body evaluation",
+        |message| {
+            message["method"] == "Page.frameStoppedLoading"
+                && message["params"]["frameId"] == child_frame_id
         },
     )
     .await;
@@ -575,7 +589,7 @@ async fn playwright_over_cdp_child_frame_playwright_style_utility_script_uses_ch
         .and_then(|message| message["params"]["frameId"].as_str())
         .map(str::to_owned)
         .expect("child frame should emit Page.frameAttached");
-    wait_for_playwright_child_frame_navigation(
+    wait_for_playwright_child_frame_load(
         &mut ctx,
         session_id.as_str(),
         &child_frame_id,
@@ -1115,7 +1129,7 @@ async fn playwright_connect_over_cdp_auto_attach_child_frame_utility_script_uses
         .and_then(|message| message["params"]["frameId"].as_str())
         .map(str::to_owned)
         .expect("network child frame should emit a Document request");
-    wait_for_playwright_child_frame_navigation(
+    wait_for_playwright_child_frame_load(
         &mut ctx,
         session_id.as_str(),
         &child_frame_id,
@@ -1192,11 +1206,12 @@ async fn playwright_connect_over_cdp_second_page_window_query_keeps_background_t
         "<title>first</title><div id='first'>first page</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-first");
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-first")
+    });
 
     ctx.process_async(json!({
         "id": 53191,
@@ -1248,21 +1263,23 @@ async fn playwright_connect_over_cdp_second_page_window_query_keeps_background_t
     );
     assert_eq!(response["result"]["bounds"]["windowState"], json!("normal"));
 
-    let bc = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .expect("active browser context");
-    assert_eq!(bc.active_target_id(), Some("TID-PW-FIRST"));
-    assert_eq!(bc.active_session_id(), Some("SID-first"));
-    assert!(
-        bc.background_target(&second_target_id).is_some(),
-        "second page should remain background after Browser.getWindowForTarget"
-    );
-    assert!(
-        bc.background_target("TID-PW-FIRST").is_none(),
-        "first page should remain active after second-page Browser.getWindowForTarget"
-    );
+    ctx.with_fixture(|conn| {
+        let bc = {
+            conn.browser_context
+                .as_ref()
+                .expect("active browser context")
+        };
+        assert_eq!(bc.active_target_id(), Some("TID-PW-FIRST"));
+        assert_eq!(bc.active_session_id(), Some("SID-first"));
+        assert!(
+            bc.background_target(&second_target_id).is_some(),
+            "second page should remain background after Browser.getWindowForTarget"
+        );
+        assert!(
+            bc.background_target("TID-PW-FIRST").is_none(),
+            "first page should remain active after second-page Browser.getWindowForTarget"
+        );
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1409,6 +1426,179 @@ async fn playwright_over_cdp_child_frame_is_visible_in_frame_tree_after_frame_at
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn playwright_over_cdp_nested_siblings_commit_parent_before_attaching_children() {
+    async fn top(axum::extract::Path(kind): axum::extract::Path<String>) -> impl IntoResponse {
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            format!("<iframe name=container src=/container/{kind}></iframe>"),
+        )
+    }
+
+    async fn container(
+        axum::extract::Path(kind): axum::extract::Path<String>,
+    ) -> impl IntoResponse {
+        let second = if kind == "same" {
+            "child"
+        } else {
+            "other-child"
+        };
+        (
+            [(CONTENT_TYPE.as_str(), "text/html")],
+            format!(
+                "<iframe name=uno src=/child></iframe><iframe name=dos src=/{second}></iframe>"
+            ),
+        )
+    }
+
+    async fn child() -> impl IntoResponse {
+        ([(CONTENT_TYPE.as_str(), "text/html")], "<p>child</p>")
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/top/{kind}", get(top))
+                .route("/container/{kind}", get(container))
+                .route("/child", get(child))
+                .route("/other-child", get(child)),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut ctx = TestContext::new();
+    let attached =
+        create_attached_page_session_async(&mut ctx, 53200, 53201, 53202, 53203, 53204).await;
+    let session_id = attached.session_id;
+    ctx.enable_page_events_for_test(Some(session_id.as_str()));
+
+    for kind in ["same", "distinct"] {
+        ctx.sent.clear();
+        ctx.process_and_wait_for_response_async(json!({
+            "id": 53205,
+            "method": "Page.navigate",
+            "sessionId": session_id,
+            "params": { "url": format!("http://{addr}/top/{kind}") }
+        }))
+        .await;
+        crate::testing::wait_until_message(
+            &mut ctx,
+            Some(session_id.as_str()),
+            "nested siblings finish loading",
+            |message| {
+                message["sessionId"] == session_id && message["method"] == "Page.loadEventFired"
+            },
+        )
+        .await;
+        let events = ctx.sent.clone();
+
+        ctx.process_async(json!({
+            "id": 53206,
+            "method": "Page.getFrameTree",
+            "sessionId": session_id
+        }))
+        .await;
+        let response = take_response_by_id(&mut ctx, 53206);
+        let container = &response["result"]["frameTree"]["childFrames"][0];
+        let container_id = container["frame"]["id"].as_str().unwrap();
+        let children = container["childFrames"].as_array().unwrap();
+        assert_eq!(children.len(), 2, "{response}");
+        assert_ne!(children[0]["frame"]["id"], children[1]["frame"]["id"]);
+        let parent_commit = events
+            .iter()
+            .position(|event| {
+                event["method"] == "Page.frameNavigated"
+                    && event["params"]["frame"]["id"] == container_id
+                    && event["params"]["frame"]["url"] == format!("http://{addr}/container/{kind}")
+            })
+            .unwrap();
+        let parent_response = events
+            .iter()
+            .position(|event| {
+                event["method"] == "Network.responseReceived"
+                    && event["params"]["frameId"] == container_id
+            })
+            .unwrap();
+        assert!(parent_response < parent_commit, "{events:?}");
+        ctx.process_async(json!({
+            "id": 53207,
+            "method": "Page.createIsolatedWorld",
+            "sessionId": session_id,
+            "params": { "frameId": container_id, "worldName": "nested-frame-owners" }
+        }))
+        .await;
+        let world = take_response_by_id(&mut ctx, 53207);
+        let context_id = world["result"]["executionContextId"].as_i64().unwrap();
+        for (child, name) in children.iter().zip(["uno", "dos"]) {
+            assert_eq!(child["frame"]["name"], name);
+            let child_id = child["frame"]["id"].as_str().unwrap();
+            ctx.process_async(json!({
+                "id": 53208,
+                "method": "Runtime.evaluate",
+                "sessionId": session_id,
+                "params": {
+                    "contextId": context_id,
+                    "expression": format!("document.querySelector('iframe[name={name}]')")
+                }
+            }))
+            .await;
+            let element = take_response_by_id(&mut ctx, 53208);
+            let object_id = element["result"]["result"]["objectId"].as_str().unwrap();
+            ctx.process_async(json!({
+                "id": 53209,
+                "method": "DOM.describeNode",
+                "sessionId": session_id,
+                "params": { "objectId": object_id }
+            }))
+            .await;
+            let described = take_response_by_id(&mut ctx, 53209);
+            assert_eq!(
+                described["result"]["node"]["frameId"], child_id,
+                "an iframe must identify its hosted Frame, not its parent: {described}"
+            );
+            let attached = events
+                .iter()
+                .position(|event| {
+                    event["method"] == "Page.frameAttached"
+                        && event["params"]["frameId"] == child_id
+                })
+                .unwrap();
+            assert!(
+                parent_commit < attached,
+                "{kind}: parent must commit before attaching {name}; otherwise Playwright removes the new child subtree on parent navigation: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| {
+                        event["method"] == "Page.frameNavigated"
+                            && event["params"]["frame"]["id"] == child_id
+                    })
+                    .count(),
+                1,
+                "load completion must not repeat the child navigation: {events:?}"
+            );
+            for method in ["Network.requestWillBeSent", "Network.responseReceived"] {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event["method"] == method && event["params"]["frameId"] == child_id
+                        })
+                        .count(),
+                    1,
+                    "{name}: {method} must be emitted once per document: {events:?}"
+                );
+            }
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn playwright_over_cdp_navigation_redirect_exposes_final_response_and_body() {
     async fn redirect_handler(
         axum::extract::State(final_url): axum::extract::State<String>,
@@ -1445,7 +1635,7 @@ async fn playwright_over_cdp_navigation_redirect_exposes_final_response_and_body
         .await
         .session_id;
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 2244,
         "method": "Page.navigate",
         "sessionId": session_id,
@@ -4829,7 +5019,7 @@ async fn playwright_over_cdp_context_cookie_flows_through_redirect_and_subresour
             "cookieReports": [{
                 "status": { "kind": "Accepted", "storeAction": "Inserted" },
                 "rejectionReasons": [],
-                "effectiveSameSite": "NoRestriction",
+                "effectiveSameSite": "LaxAllowUnsafe",
                 "warningReasons": []
             }]
         }),
@@ -5442,13 +5632,13 @@ async fn playwright_over_cdp_inactive_context_seeded_cookies_apply_to_navigation
         "method": "Target.createBrowserContext"
     }))
     .await;
-    let active_browser_context_id = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .expect("active browser context should exist")
-        .id
-        .clone();
+    let active_browser_context_id = ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_ref()
+            .expect("active browser context should exist")
+            .id
+            .clone()
+    });
     ctx.expect_result(
         225,
         json!({ "browserContextId": active_browser_context_id }),
@@ -5487,7 +5677,7 @@ async fn playwright_over_cdp_inactive_context_seeded_cookies_apply_to_navigation
             "cookieReports": [{
                 "status": { "kind": "Accepted", "storeAction": "Inserted" },
                 "rejectionReasons": [],
-                "effectiveSameSite": "NoRestriction",
+                "effectiveSameSite": "LaxAllowUnsafe",
                 "warningReasons": []
             }]
         }),
@@ -5521,14 +5711,14 @@ async fn playwright_over_cdp_inactive_context_seeded_cookies_apply_to_navigation
 
     let active_cookie_report = {
         let page_url = url::Url::parse(&page_url).expect("page url should parse");
-        let cookie_store = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context")
-            .cookie_store_for_test()
-            .clone();
-        let mut cookie_store = cookie_store.lock();
+        let cookie_store = ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_ref()
+                .expect("active browser context")
+                .cookie_store_for_test()
+                .clone()
+        });
+        let mut cookie_store = cookie_store.lock().unwrap();
         cookie_store.cookie_access_report_for_request(
             &page_url,
             NetworkCookieRequestContext::top_level_navigation("GET")
@@ -5561,10 +5751,12 @@ async fn playwright_over_cdp_inactive_context_seeded_cookies_apply_to_navigation
     );
 
     assert_eq!(seen_cookie.lock().as_deref(), Some("sid=seeded"));
-    assert_eq!(
-        ctx.conn.browser_context.as_ref().map(|bc| bc.id.as_str()),
-        Some(inactive_browser_context_id.as_str())
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context.as_ref().map(|bc| bc.id.as_str()),
+            Some(inactive_browser_context_id.as_str())
+        )
+    });
 
     server.abort();
 }
@@ -5793,22 +5985,24 @@ async fn playwright_over_cdp_target_document_start_script_does_not_leak_to_new_t
         json!("undefined")
     );
 
-    let active = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .expect("active browser context");
-    assert_eq!(active.id, browser_context_id);
-    assert_eq!(active.active_target_id(), Some(second_target_id.as_str()));
-    assert_eq!(active.active_session_id(), Some(second_session_id.as_str()));
-    assert_eq!(
-        active
-            .active_page_target()
-            .owner_state
-            .document_start_scripts
-            .len(),
-        0
-    );
+    ctx.with_fixture(|conn| {
+        let active = {
+            conn.browser_context
+                .as_ref()
+                .expect("active browser context")
+        };
+        assert_eq!(active.id, browser_context_id);
+        assert_eq!(active.active_target_id(), Some(second_target_id.as_str()));
+        assert_eq!(active.active_session_id(), Some(second_session_id.as_str()));
+        assert_eq!(
+            active
+                .active_page_target()
+                .owner_state
+                .document_start_scripts
+                .len(),
+            0
+        );
+    });
 
     server.abort();
 }
@@ -5846,11 +6040,12 @@ async fn playwright_over_cdp_context_profile_surfaces_permissions_tls_and_metric
     }))
     .await;
     ctx.expect_result(234, json!({}), Some(&session_id));
-    assert!(!ctx.conn.tls_verify_host());
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("loader should exist after tls override");
-    assert!(!ctx.conn.tls_verify_host());
+    ctx.with_fixture(|conn| assert!(!conn.tls_verify_host()));
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("loader should exist after tls override")
+    });
+    ctx.with_fixture(|conn| assert!(!conn.tls_verify_host()));
 
     ctx.process_async(json!({
         "id": 235,
@@ -5903,6 +6098,7 @@ async fn playwright_over_cdp_context_profile_surfaces_permissions_tls_and_metric
         "denied"
     );
 
+    ctx.capture_fixture_layout(Some(&session_id)).await;
     ctx.process_async(json!({
         "id": 238,
         "method": "Page.getLayoutMetrics",
@@ -5940,27 +6136,29 @@ async fn playwright_over_cdp_context_profile_surfaces_permissions_tls_and_metric
     assert_eq!(payload["screenWidth"], 1440);
     assert_eq!(payload["screenHeight"], 900);
 
-    let active = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .expect("active browser context");
-    assert_eq!(active.id, browser_context_id);
-    assert_eq!(active.active_target_id(), Some(target_id.as_str()));
-    assert_eq!(active.active_session_id(), Some(session_id.as_str()));
-    assert_eq!(
-        active.active_page_target().tls_verify_host_override,
-        Some(false)
-    );
-    assert_eq!(
-        active
-            .active_page_target()
-            .effective_emulation_state
-            .emulated_device_metrics
-            .as_ref()
-            .map(|metrics| (metrics.width, metrics.height, metrics.device_scale_factor)),
-        Some((1280, 720, 2.0))
-    );
+    ctx.with_fixture(|conn| {
+        let active = {
+            conn.browser_context
+                .as_ref()
+                .expect("active browser context")
+        };
+        assert_eq!(active.id, browser_context_id);
+        assert_eq!(active.active_target_id(), Some(target_id.as_str()));
+        assert_eq!(active.active_session_id(), Some(session_id.as_str()));
+        assert_eq!(
+            active.active_page_target().tls_verify_host_override,
+            Some(false)
+        );
+        assert_eq!(
+            active
+                .active_page_target()
+                .effective_emulation_state
+                .emulated_device_metrics
+                .as_ref()
+                .map(|metrics| (metrics.width, metrics.height, metrics.device_scale_factor)),
+            Some((1280, 720, 2.0))
+        );
+    });
 
     server.abort();
 }
@@ -6136,45 +6334,47 @@ async fn playwright_over_cdp_script_execution_disabled_blocks_page_scripts_but_n
         &loader_id,
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .and_then(|browser_context| {
-            browser_context
-                .active_page_target_mut()
-                .runtime_slot
-                .loaded_page_mut()
-        })
-        .expect("script-disabled loaded page")
-        .refresh_script_execution_report_async()
-        .await
-        .expect("script-disabled report refresh");
+    ctx.run_fixture_page_query(
+        Some(session_id.as_str()),
+        "script-disabled report refresh",
+        |page| page.start_refresh_script_execution_report(),
+        |page, completed| {
+            page.finish_unit_runtime_page_command(completed, "refresh script execution report")
+        },
+    )
+    .await
+    .expect("script-disabled report refresh");
 
-    let active = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .expect("active browser context");
-    assert!(
-        active
-            .active_page_target()
-            .effective_emulation_state
-            .script_execution_disabled
-    );
-    let script_runs = active
-        .active_page_target()
-        .runtime_slot
-        .loaded_page()
-        .expect("loaded page should exist")
-        .script_execution()
-        .runs();
-    assert!(
-        script_runs.iter().any(|run| matches!(
-            run.outcome(),
-            ScriptRunOutcome::Skipped(ScriptSkipReason::ScriptExecutionDisabled)
-        )),
-        "expected at least one skipped page script when script execution is disabled"
-    );
+    ctx.with_fixture(|conn| {
+        let script_runs = {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert!(
+                active
+                    .active_page_target()
+                    .effective_emulation_state
+                    .script_execution_disabled
+            );
+
+            active
+                .active_page_target()
+                .runtime_slot
+                .loaded_page()
+                .expect("loaded page should exist")
+                .script_execution()
+                .runs()
+        };
+        assert!(
+            script_runs.iter().any(|run| matches!(
+                run.outcome(),
+                ScriptRunOutcome::Skipped(ScriptSkipReason::ScriptExecutionDisabled)
+            )),
+            "expected at least one skipped page script when script execution is disabled"
+        );
+    });
 
     ctx.process_async(json!({
             "id": 247,

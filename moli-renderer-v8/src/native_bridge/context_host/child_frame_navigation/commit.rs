@@ -1,11 +1,10 @@
 use super::super::{
     ChildBrowsingContextBootstrap, ChildBrowsingContextNavigationRequest,
-    ChildBrowsingContextSnapshot, JsContextHost,
+    ChildBrowsingContextSnapshot, PageScriptHost,
     child_documents::{ChildDocumentCommitResult, ChildDocumentCommitState},
 };
 use crate::native_bridge::context_host::child_documents::ChildDocumentNavigationInitiator;
 use crate::{
-    context_bootstrap::increment_top_level_history_length_for_runtime_owner,
     document_runtime::DomHandle,
     document_script_scheduler::FrameDocumentClassicScriptSchedulerWork,
     frame_owner_model::{
@@ -53,7 +52,7 @@ impl ChildFrameNavigationCommitTaskRun {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     fn suppress_pending_child_host_load_before_navigation_commit(&mut self, handle: DomHandle) {
         let _ = self
             .frame_owner_store
@@ -352,8 +351,14 @@ impl JsContextHost {
         if let ChildBrowsingContextBootstrap::Url(url) = &attribute_bootstrap
             && url.scheme() == "javascript"
         {
-            let dispatch_load_on_no_string_completion =
-                entry_snapshot.navigation_seed_is_initial_about_blank_commit();
+            // The initial about:blank history entry can outlive its load.
+            // Only an unfinished owner load can release the parent's delay
+            // through the existing initial-document lifecycle.
+            let dispatch_load_on_no_string_completion = entry_snapshot
+                .navigation_seed_is_initial_about_blank_commit()
+                && !self
+                    .frame_owner_store
+                    .current_child_document_owner_load_is_complete(handle, navigation_load.owner());
             let entry = self.child_browsing_contexts.get_mut(&handle)?;
             entry.set_pending_navigation(ChildBrowsingContextBootstrap::Url(url.clone()), true);
             self.queue_child_browsing_context_javascript_url_execution(
@@ -416,10 +421,6 @@ impl JsContextHost {
             self.sync_existing_child_browsing_context_window_state(scope, handle);
             return None;
         }
-        let increment_top_level_history_length = self
-            .child_browsing_contexts
-            .get_mut(&handle)
-            .is_some_and(|entry| entry.take_pending_top_level_history_length_increment());
         self.clear_child_browsing_context_pending_navigation(handle);
         self.clear_pending_form_submission_child_target(handle);
         let commit_result = self.commit_child_document_bootstrap_or_start_load(
@@ -430,11 +431,6 @@ impl JsContextHost {
             ChildDocumentNavigationInitiator::BrowsingContext,
         );
         self.sync_existing_child_browsing_context_window_state(scope, handle);
-        if increment_top_level_history_length
-            && let Some(window) = self.child_browsing_context_window_wrapper(scope, handle)
-        {
-            increment_top_level_history_length_for_runtime_owner(scope, window);
-        }
         commit_result
     }
 
@@ -508,7 +504,7 @@ impl JsContextHost {
             return false;
         };
         entry.clear_pending_navigation();
-        entry.clear_pending_top_level_history_length_increment();
+
         entry.restore_navigation_entry_seed_from_committed();
         self.clear_pending_form_submission_child_target(handle);
         self.reject_replaced_service_worker_child_client_navigation(
@@ -620,7 +616,12 @@ impl JsContextHost {
         preserve_window_event_state: bool,
     ) -> FrameDocumentJavascriptUrlPostExecutionApplication {
         let attempted_script_job = true;
-        if !self.frame_document_task_owner_is_current(target.child_handle(), target.task_owner()) {
+        // The script can start another navigation without replacing its
+        // Document yet. Its completion must not clear that newer request.
+        if !self.frame_document_task_owner_is_current(target.child_handle(), target.task_owner())
+            || self.current_child_navigation_load(target.child_handle())
+                != Some(target.navigation_load())
+        {
             return FrameDocumentJavascriptUrlPostExecutionApplication {
                 attempted_script_job,
                 failed_script_job: false,

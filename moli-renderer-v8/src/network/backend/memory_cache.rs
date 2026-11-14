@@ -45,7 +45,10 @@ type ScriptTextLoadCallback = Box<dyn FnOnce(ScriptTextLoadResult) + Send + 'sta
 pub(in crate::network) struct ScriptTextCacheKey {
     page_cache_partition_id: u64,
     url: String,
+    fetch_destination: Option<&'static str>,
     credentials_mode: String,
+    request_origin: Option<String>,
+    request_mode: String,
     site_context: String,
     site_for_cookies_origin: String,
     top_frame_origin: String,
@@ -59,10 +62,14 @@ pub(in crate::network) struct ScriptTextCacheKey {
 pub(in crate::network) struct RawSubresourceCacheKey {
     page_cache_partition_id: u64,
     url: String,
+    fetch_destination: Option<&'static str>,
     resource_type: &'static str,
     credentials_mode: String,
+    request_origin: Option<String>,
+    request_mode: String,
     network_partition_key: Option<String>,
     cookie_context: String,
+    accept_header_values: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -574,12 +581,15 @@ impl SharedMemoryResourceCache {
 }
 
 pub(in crate::network) fn script_text_request_is_memory_cacheable(request: &Request) -> bool {
-    request.cache_mode().allows_memory_cache_store()
+    request.effective_cache_mode().allows_memory_cache_store()
+        // These entries retain a complete response including its redirect
+        // history. A resumed fetch must assemble its own history in transport.
+        && request.redirect_chain().is_empty()
         && request.subresource_request_metadata().is_some()
         && request.method.eq_ignore_ascii_case("GET")
         && request.body.is_none()
         && request.auth().is_none()
-        && request.follow_redirects
+        && request.transport_follows_redirects()
 }
 
 pub(in crate::network) fn script_text_cache_key(request: &Request) -> ScriptTextCacheKey {
@@ -587,8 +597,15 @@ pub(in crate::network) fn script_text_cache_key(request: &Request) -> ScriptText
     ScriptTextCacheKey {
         page_cache_partition_id: 0,
         url: request.url.as_str().to_owned(),
+        fetch_destination: request
+            .browser_request_metadata()
+            .map(BrowserRequestMetadata::fetch_destination),
         credentials_mode: request.credentials_mode.as_ref().to_owned(),
-        site_context: format!("{:?}", request.cookie_context.site_context),
+        request_origin: request
+            .request_origin()
+            .map(|origin| origin.ascii_serialization().to_owned()),
+        request_mode: request.request_mode.as_ref().to_owned(),
+        site_context: format!("{:?}", request.cookie_context.site_context()),
         site_for_cookies_origin: script_cache_partition_url_component(
             browser_context.site_for_cookies_url.as_ref(),
             &request.url,
@@ -605,7 +622,7 @@ pub(in crate::network) fn script_text_cache_key(request: &Request) -> ScriptText
         integrity: request
             .subresource_request_metadata()
             .and_then(|metadata| metadata.integrity.clone()),
-        request_headers: request.request_headers.clone(),
+        request_headers: request.request_headers.to_byte_strings(),
     }
 }
 
@@ -623,10 +640,23 @@ pub(in crate::network) fn raw_subresource_memory_cache_key(
     Some(RawSubresourceCacheKey {
         page_cache_partition_id: 0,
         url: request.url.as_str().to_owned(),
+        fetch_destination: request
+            .browser_request_metadata()
+            .map(BrowserRequestMetadata::fetch_destination),
         resource_type: raw_subresource_cache_resource_type_key(request.resource_type),
         credentials_mode: request.credentials_mode.as_ref().to_owned(),
+        request_origin: request
+            .request_origin()
+            .map(|origin| origin.ascii_serialization().to_owned()),
+        request_mode: request.request_mode.as_ref().to_owned(),
         network_partition_key: request.network_partition_key().map(str::to_owned),
         cookie_context: format!("{:?}", request.cookie_context),
+        accept_header_values: request
+            .request_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("accept"))
+            .map(|(_, value)| value.clone())
+            .collect(),
     })
 }
 
@@ -647,12 +677,13 @@ fn raw_subresource_cache_resource_type_key(resource_type: RequestResourceType) -
 }
 
 fn raw_subresource_request_is_memory_cacheable(request: &Request) -> bool {
-    request.cache_mode().allows_memory_cache_store()
+    request.effective_cache_mode().allows_memory_cache_store()
+        && request.redirect_chain().is_empty()
         && raw_subresource_memory_cacheable_resource_type(request)
         && request.method.eq_ignore_ascii_case("GET")
         && request.body.is_none()
         && request.auth().is_none()
-        && request.follow_redirects
+        && request.transport_follows_redirects()
         && raw_subresource_memory_cacheable_headers(request)
 }
 
@@ -671,6 +702,7 @@ fn raw_subresource_memory_cacheable_resource_type(request: &Request) -> bool {
             Some(
                 BrowserRequestMetadata::Fetch
                     | BrowserRequestMetadata::JsonModule
+                    | BrowserRequestMetadata::TextModule
                     | BrowserRequestMetadata::Manifest
                     | BrowserRequestMetadata::StyleModule
                     | BrowserRequestMetadata::Xhr
@@ -680,20 +712,21 @@ fn raw_subresource_memory_cacheable_resource_type(request: &Request) -> bool {
 }
 
 fn raw_subresource_memory_cacheable_headers(request: &Request) -> bool {
-    request.request_headers.is_empty()
-        || request.browser_request_metadata().is_some_and(|metadata| {
-            matches!(
-                metadata,
-                BrowserRequestMetadata::Fetch
-                    | BrowserRequestMetadata::JsonModule
-                    | BrowserRequestMetadata::Manifest
-                    | BrowserRequestMetadata::StyleModule
-                    | BrowserRequestMetadata::Xhr
-            ) && request
-                .request_headers
-                .iter()
-                .all(|(name, _)| browser_cache_ignored_request_header(name))
-        })
+    let allow_browser_headers = request.browser_request_metadata().is_some_and(|metadata| {
+        matches!(
+            metadata,
+            BrowserRequestMetadata::Fetch
+                | BrowserRequestMetadata::JsonModule
+                | BrowserRequestMetadata::TextModule
+                | BrowserRequestMetadata::Manifest
+                | BrowserRequestMetadata::StyleModule
+                | BrowserRequestMetadata::Xhr
+        )
+    });
+    request.request_headers.iter().all(|(name, _)| {
+        name.eq_ignore_ascii_case("accept")
+            || (allow_browser_headers && browser_cache_ignored_request_header(name))
+    })
 }
 
 fn browser_cache_ignored_request_header(name: &str) -> bool {
@@ -749,7 +782,7 @@ fn raw_subresource_retained_bytes(key: &RawSubresourceCacheKey, response: &RawRe
         .saturating_add(response.body_bytes().len())
 }
 
-fn response_head_retained_bytes(final_url: &str, headers: &[(String, String)]) -> usize {
+fn response_head_retained_bytes(final_url: &str, headers: &[(String, Vec<u8>)]) -> usize {
     headers
         .iter()
         .fold(final_url.len(), |bytes, (name, value)| {
@@ -766,7 +799,10 @@ fn script_text_key_retained_bytes(key: &ScriptTextCacheKey) -> usize {
         });
     key.url
         .len()
+        .saturating_add(key.fetch_destination.map_or(0, str::len))
         .saturating_add(key.credentials_mode.len())
+        .saturating_add(key.request_origin.as_deref().map_or(0, str::len))
+        .saturating_add(key.request_mode.len())
         .saturating_add(key.site_context.len())
         .saturating_add(key.site_for_cookies_origin.len())
         .saturating_add(key.top_frame_origin.len())
@@ -780,7 +816,10 @@ fn raw_subresource_key_retained_bytes(key: &RawSubresourceCacheKey) -> usize {
     key.url
         .len()
         .saturating_add(key.resource_type.len())
+        .saturating_add(key.fetch_destination.map_or(0, str::len))
         .saturating_add(key.credentials_mode.len())
+        .saturating_add(key.request_origin.as_deref().map_or(0, str::len))
+        .saturating_add(key.request_mode.len())
         .saturating_add(key.network_partition_key.as_deref().map_or(0, str::len))
         .saturating_add(key.cookie_context.len())
 }
@@ -802,14 +841,16 @@ mod tests {
     fn response(url: &str, body: &str) -> Response {
         Response::from_head_and_text_body(
             ResponseHead {
+                status_text: None,
                 final_url: Url::parse(url).expect("response URL"),
                 status: 200,
-                headers: vec![("cache-control".to_owned(), "max-age=60".to_owned())],
+                headers: vec![("cache-control".to_owned(), b"max-age=60".to_vec())],
                 request_cookie_report: None,
                 cookie_set_reports: Vec::new(),
                 redirected: false,
                 redirect_chain: Vec::new(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             body.to_owned(),
@@ -819,14 +860,16 @@ mod tests {
     fn raw_response(url: &str, body: &[u8]) -> RawResponse {
         RawResponse::from_head_and_body(
             ResponseHead {
+                status_text: None,
                 final_url: Url::parse(url).expect("response URL"),
                 status: 200,
-                headers: vec![("cache-control".to_owned(), "max-age=60".to_owned())],
+                headers: vec![("cache-control".to_owned(), b"max-age=60".to_vec())],
                 request_cookie_report: None,
                 cookie_set_reports: Vec::new(),
                 redirected: false,
                 redirect_chain: Vec::new(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             body.to_vec(),
@@ -981,14 +1024,16 @@ mod tests {
         };
         let response = Response::from_head_and_body(
             ResponseHead {
+                status_text: None,
                 final_url: request.url.clone(),
                 status: 200,
-                headers: vec![("cache-control".to_owned(), "max-age=60".to_owned())],
+                headers: vec![("cache-control".to_owned(), b"max-age=60".to_vec())],
                 request_cookie_report: None,
                 cookie_set_reports: Vec::new(),
                 redirected: false,
                 redirect_chain: Vec::new(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             "x".repeat(64),

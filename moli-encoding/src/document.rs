@@ -13,16 +13,16 @@ const UTF16BE_XML_PREFIX: &[u8; 6] = b"\0<\0?\0x";
 pub type LegacyEncodingDetector =
     fn(bytes: &[u8], url_hint: Option<&str>) -> Option<&'static Encoding>;
 
-pub fn decode_html_document(bytes: &[u8], headers: &[(String, String)]) -> (String, &'static str) {
+pub fn decode_html_document(bytes: &[u8], headers: &[(String, Vec<u8>)]) -> (String, &'static str) {
     decode_html_document_with_fallback(bytes, headers, None)
 }
 
 pub fn decode_html_document_with_fallback(
     bytes: &[u8],
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     fallback_encoding: Option<&str>,
 ) -> (String, &'static str) {
-    let mut decoder = HtmlDocumentStreamingDecoder::new_with_fallback(headers, fallback_encoding);
+    let mut decoder = DocumentStreamingDecoder::new_with_fallback(headers, fallback_encoding);
     let mut output = String::new();
     for chunk in decoder.push(bytes) {
         output.push_str(&chunk);
@@ -36,7 +36,18 @@ pub fn decode_html_document_with_fallback(
     (output, encoding)
 }
 
-pub struct HtmlDocumentStreamingDecoder {
+#[derive(Clone, Copy)]
+enum DocumentDeclarationPolicy {
+    Html,
+    Xml,
+    Text,
+}
+
+/// Streaming decoder for HTML, XML, and text document responses.
+///
+/// [`Self::new`] uses HTML declaration rules. XML and text responses use
+/// [`Self::new_xml_document`] and [`Self::new_text_document`] respectively.
+pub struct DocumentStreamingDecoder {
     transport_encoding: Option<&'static Encoding>,
     fallback_encoding: &'static Encoding,
     sniff_buffer: Vec<u8>,
@@ -47,33 +58,84 @@ pub struct HtmlDocumentStreamingDecoder {
     url_hint: Option<String>,
     decoder: Option<Decoder>,
     selected_encoding: Option<&'static Encoding>,
+    declaration_policy: DocumentDeclarationPolicy,
 }
 
-impl HtmlDocumentStreamingDecoder {
-    pub fn new(headers: &[(String, String)]) -> Self {
-        Self::new_with_options(headers, None, None, None)
+impl DocumentStreamingDecoder {
+    /// Decode a text document without interpreting literal HTML/XML declarations.
+    /// BOMs and transport charsets take precedence. JSON then defaults to UTF-8;
+    /// other text uses a valid inherited encoding before heuristic detection.
+    pub fn new_text_document(
+        headers: &[(String, Vec<u8>)],
+        url_hint: &str,
+        detector: LegacyEncodingDetector,
+        json: bool,
+        inherited_encoding: Option<&str>,
+    ) -> Self {
+        let inherited_encoding =
+            inherited_encoding.filter(|label| encoding_for_label(label).is_some());
+        let mut decoder = Self::new_with_options(
+            headers,
+            inherited_encoding,
+            Some(url_hint),
+            inherited_encoding.is_none().then_some(detector),
+            DocumentDeclarationPolicy::Text,
+        );
+        if json && decoder.transport_encoding.is_none() {
+            decoder.transport_encoding = Some(encoding_rs::UTF_8);
+        }
+        decoder
+    }
+
+    /// Decode XML using BOMs, transport charsets, and its initial declaration.
+    /// HTML meta elements never select an encoding; undeclared XML uses UTF-8.
+    pub fn new_xml_document(headers: &[(String, Vec<u8>)]) -> Self {
+        Self::new_with_options(
+            headers,
+            Some("UTF-8"),
+            None,
+            None,
+            DocumentDeclarationPolicy::Xml,
+        )
+    }
+
+    pub fn new(headers: &[(String, Vec<u8>)]) -> Self {
+        Self::new_with_options(headers, None, None, None, DocumentDeclarationPolicy::Html)
     }
 
     pub fn new_with_legacy_encoding_detector(
-        headers: &[(String, String)],
+        headers: &[(String, Vec<u8>)],
         url_hint: &str,
         detector: LegacyEncodingDetector,
     ) -> Self {
-        Self::new_with_options(headers, None, Some(url_hint), Some(detector))
+        Self::new_with_options(
+            headers,
+            None,
+            Some(url_hint),
+            Some(detector),
+            DocumentDeclarationPolicy::Html,
+        )
     }
 
     pub fn new_with_fallback(
-        headers: &[(String, String)],
+        headers: &[(String, Vec<u8>)],
         fallback_encoding: Option<&str>,
     ) -> Self {
-        Self::new_with_options(headers, fallback_encoding, None, None)
+        Self::new_with_options(
+            headers,
+            fallback_encoding,
+            None,
+            None,
+            DocumentDeclarationPolicy::Html,
+        )
     }
 
     fn new_with_options(
-        headers: &[(String, String)],
+        headers: &[(String, Vec<u8>)],
         fallback_encoding: Option<&str>,
         url_hint: Option<&str>,
         legacy_encoding_detector: Option<LegacyEncodingDetector>,
+        declaration_policy: DocumentDeclarationPolicy,
     ) -> Self {
         Self {
             transport_encoding: encoding_from_response_headers(headers),
@@ -88,6 +150,7 @@ impl HtmlDocumentStreamingDecoder {
             url_hint: url_hint.map(str::to_owned),
             decoder: None,
             selected_encoding: None,
+            declaration_policy,
         }
     }
 
@@ -97,6 +160,7 @@ impl HtmlDocumentStreamingDecoder {
 
     pub fn document_encoding_name(&self) -> &'static str {
         self.selected_encoding_name()
+            .or_else(|| self.transport_encoding.map(Encoding::name))
             .unwrap_or(self.fallback_encoding.name())
     }
 
@@ -149,6 +213,49 @@ impl HtmlDocumentStreamingDecoder {
         if let Some(encoding) = self.transport_encoding {
             return Some(encoding);
         }
+        match self.declaration_policy {
+            DocumentDeclarationPolicy::Html => self.html_encoding_ready(finishing),
+            DocumentDeclarationPolicy::Xml => self.xml_encoding_ready(finishing),
+            DocumentDeclarationPolicy::Text => {
+                if self.legacy_encoding_detector.is_none() {
+                    return Some(self.fallback_encoding);
+                }
+                (finishing || self.sniff_buffer.len() >= 1024).then(|| {
+                    self.detected_legacy_content_encoding()
+                        .unwrap_or(self.fallback_encoding)
+                })
+            }
+        }
+    }
+
+    fn xml_encoding_ready(&self, finishing: bool) -> Option<&'static Encoding> {
+        let bytes = &self.sniff_buffer;
+        if let Some(encoding) = encoding_for_document_utf16_xml_prefix(bytes) {
+            return Some(encoding);
+        }
+        if !finishing
+            && (bytes_could_still_be_utf16_xml_prefix(bytes) || b"<?xml".starts_with(bytes))
+        {
+            return None;
+        }
+        // Only an initial XML declaration can select an encoding. In particular,
+        // <?xml-stylesheet ...?> is an ordinary processing instruction.
+        if bytes.starts_with(b"<?xml") && matches!(bytes.get(5), Some(b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            let Some(end) = bytes.iter().position(|byte| *byte == b'>') else {
+                return finishing.then_some(self.fallback_encoding);
+            };
+            if bytes[end - 1] == b'?' {
+                return Some(
+                    encoding_for_document_xml_declaration(&bytes[..=end])
+                        .unwrap_or(self.fallback_encoding),
+                );
+            }
+        }
+        Some(self.fallback_encoding)
+    }
+
+    fn html_encoding_ready(&mut self, finishing: bool) -> Option<&'static Encoding> {
         if let Some(encoding) = encoding_for_document_utf16_xml_prefix(&self.sniff_buffer) {
             return Some(encoding);
         }

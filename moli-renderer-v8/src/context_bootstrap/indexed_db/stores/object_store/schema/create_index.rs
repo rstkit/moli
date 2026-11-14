@@ -1,15 +1,20 @@
 use super::*;
+use crate::context_bootstrap::indexed_db::{
+    create_failed_index_object, schedule_schema_failure, schedule_schema_operation,
+    typed_state::sql::indexed_db_request_sql_client,
+};
 use crate::webidl;
+use moli_indexeddb::sqlite::service::Command;
 use moli_indexeddb::{IndexOptionsValidationError, validate_index_options};
 
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "IDBObjectStore.createIndex")]
 struct IdbObjectStoreCreateIndexArgs {
-    #[webidl(required)]
-    index_name: String,
+    #[webidl(required, converter = "raw")]
+    index_name: webidl::DomString16,
     #[webidl(name = "keyPath", with = parse_create_index_key_path_arg)]
     key_path: KeyPath,
-    #[webidl(index = 2, with = parse_create_index_options_arg)]
+    #[webidl(index = 2, dictionary)]
     options: IdbIndexParameters,
 }
 
@@ -30,48 +35,75 @@ pub(in crate::context_bootstrap::indexed_db) fn idb_object_store_create_index_ca
     let Some(parsed) = webidl::parse_args::<IdbObjectStoreCreateIndexArgs>(scope, &args) else {
         return;
     };
-    let index_name = parsed.index_name;
+    let index_name = moli_indexeddb::IndexedDbName::from_utf16(parsed.index_name.0);
     let key_path = parsed.key_path;
     let unique = parsed.options.unique;
     let multi_entry = parsed.options.multi_entry;
-    if let Err(error) = validate_index_options(&key_path, multi_entry) {
-        let error = dom_exception_value(
-            scope,
-            create_index_options_error_message(error),
-            "InvalidAccessError",
-        );
-        scope.throw_exception(error);
-        return;
-    }
     let store = args.this();
-    let Some((_transaction, database, handle, store_name)) =
-        object_store_versionchange_common(scope, store)
-    else {
-        let error = dom_exception_value(
-            scope,
-            "The object store is not running in a version change transaction.",
-            "InvalidStateError",
-        );
-        scope.throw_exception(error);
+    let (transaction, database, handle, metadata) =
+        match object_store_versionchange_common(scope, store) {
+            Ok(values) => values,
+            Err(error) => {
+                let error = request_error_object(scope, &error);
+                scope.throw_exception(error);
+                return;
+            }
+        };
+    let store_id = metadata.id();
+    let store_name = metadata.info().name.clone();
+    let Some(client) = indexed_db_request_sql_client(scope, transaction) else {
         return;
     };
-    match with_indexed_db_manager(scope, |manager| {
-        manager.create_index(
-            handle,
-            &store_name,
-            &index_name,
-            IndexOptions {
-                key_path,
-                unique,
-                multi_entry,
-            },
-        )
-    }) {
-        Ok(info) => {
-            let _ = set_database_index_metadata(scope, database, &store_name, &info);
-            if let Some(metadata) = indexed_db_database_store_metadata(scope, database, &store_name)
+    let result = if index_info_from_store_metadata(scope, store, &index_name).is_some() {
+        Err(moli_indexeddb::IndexedDbError::Constraint(
+            "The index already exists".into(),
+        ))
+    } else if !key_path.is_valid() {
+        Err(moli_indexeddb::IndexedDbError::Syntax(
+            "The keyPath is not valid.".into(),
+        ))
+    } else if let Err(error) = validate_index_options(&key_path, multi_entry) {
+        Err(moli_indexeddb::IndexedDbError::InvalidAccess(
+            create_index_options_error_message(error).into(),
+        ))
+    } else {
+        let info = crate::context_bootstrap::indexed_db::IndexInfo {
+            name: index_name.clone(),
+            key_path: key_path.clone(),
+            unique,
+            multi_entry,
+        };
+        client.allocate_index_id().and_then(|index_id| {
+            schedule_schema_operation(
+                scope,
+                transaction,
+                client,
+                Command::CreateIndex {
+                    transaction: handle,
+                    store: store_id,
+                    index: index_id,
+                    name: index_name,
+                    options: IndexOptions {
+                        key_path,
+                        unique,
+                        multi_entry,
+                    },
+                },
+                Some((store_id, index_id, info.clone())),
+            )
+            .map(|()| (info, index_id))
+        })
+    };
+    match result {
+        Ok((info, index_id)) => {
+            if let Err(error) =
+                set_database_index_metadata(scope, database, &store_name, &info, index_id)
             {
-                let _ = sync_store_surface_from_metadata(scope, store, metadata);
+                schedule_schema_failure(scope, transaction, error);
+                if let Some(index) = create_failed_index_object(scope, store, &info) {
+                    rv.set(index.into());
+                }
+                return;
             }
             if let Some(index) = create_index_object(scope, store, &info) {
                 rv.set(index.into());
@@ -101,18 +133,6 @@ fn parse_create_index_key_path_arg<'s>(
         args.get(index),
         webidl::Context::argument("IDBObjectStore.createIndex", (index + 1) as usize),
     )
-}
-
-fn parse_create_index_options_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<IdbIndexParameters, webidl::WebIdlError> {
-    let context = webidl::Context::argument("IDBObjectStore.createIndex", (index + 1) as usize);
-    webidl::dictionary_arg(args, index, context)?
-        .map(|object| webidl::parse_dictionary_object(scope, object))
-        .transpose()
-        .map(|options| options.unwrap_or_default())
 }
 
 fn create_index_options_error_message(error: IndexOptionsValidationError) -> &'static str {

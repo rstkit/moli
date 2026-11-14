@@ -21,6 +21,12 @@ static NEXT_DOCUMENT_RESOURCE_LOADER_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DocumentResourceLoaderIdentity(u64);
 
+impl DocumentResourceLoaderIdentity {
+    pub(crate) fn value(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DocumentResourceLoaderState {
     Active,
@@ -101,6 +107,10 @@ impl DocumentResourceLoaderBootstrap {
 
     pub(crate) fn author_styles_disabled(&self) -> bool {
         self.request_client.author_styles_disabled()
+    }
+
+    pub(crate) fn page_network_policy(&self) -> crate::network::PageNetworkPolicy {
+        self.request_client.page_network_policy().clone()
     }
 }
 
@@ -248,6 +258,10 @@ impl DocumentResourceLoader {
 
     pub(crate) fn request_client(&self) -> &ResourceRequestClient {
         &self.request_client
+    }
+
+    pub(crate) fn fetch_context(&self) -> DocumentFetchContext {
+        self.authority.lifecycle.lock().context.clone()
     }
 
     #[cfg(test)]

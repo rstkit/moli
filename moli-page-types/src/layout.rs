@@ -6,13 +6,28 @@ pub enum LayoutPolicy {
     /// such as renderer screenshots that require a real layout backend.
     #[default]
     Mock,
-    /// Build layout only for an operation that observes geometry or paint.
+    /// Only screenshot, screencast, and PDF output build layout.
+    /// Screenshots and screencasts publish layout; print projections are temporary.
+    /// Geometry queries and input read the last published layout, if any.
     OnDemand,
 }
 
 impl LayoutPolicy {
     pub const fn uses_real_layout(self) -> bool {
         matches!(self, Self::OnDemand)
+    }
+}
+
+/// Immutable browser layout configuration, sealed before its first Page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LayoutConfiguration {
+    pub policy: LayoutPolicy,
+    pub scrollbars_hidden: bool,
+}
+
+impl LayoutConfiguration {
+    pub const fn scrollbars_hidden_for(self, emulated_hidden: bool) -> bool {
+        self.scrollbars_hidden || emulated_hidden
     }
 }
 

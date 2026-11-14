@@ -3,6 +3,55 @@ use url::Url;
 
 pub const DEFAULT_REFERRER_POLICY: &str = "strict-origin-when-cross-origin";
 
+/// An empty request policy inherits the document policy before using the default.
+pub fn effective_referrer_policy<'a>(
+    request_policy: Option<&'a str>,
+    document_policy: Option<&'a str>,
+) -> &'a str {
+    request_policy
+        .filter(|policy| !policy.is_empty())
+        .or_else(|| document_policy.filter(|policy| !policy.is_empty()))
+        .unwrap_or(DEFAULT_REFERRER_POLICY)
+}
+
+const VALID_REFERRER_POLICIES: &[&str] = &[
+    "no-referrer",
+    "no-referrer-when-downgrade",
+    "origin",
+    "origin-when-cross-origin",
+    "same-origin",
+    "strict-origin",
+    "strict-origin-when-cross-origin",
+    "unsafe-url",
+];
+
+pub fn normalize_referrer_policy(raw: &str) -> Option<String> {
+    raw.split(',')
+        .filter_map(|token| {
+            let token = token.trim().to_ascii_lowercase();
+            VALID_REFERRER_POLICIES
+                .contains(&token.as_str())
+                .then_some(token)
+        })
+        .next_back()
+}
+
+pub fn response_referrer_policy_from_headers(headers: &[(String, Vec<u8>)]) -> Option<String> {
+    let mut combined = String::new();
+    for (_, value) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("referrer-policy"))
+    {
+        if !combined.is_empty() {
+            combined.push_str(", ");
+        }
+        combined.push_str(&crate::decode_header_value(value));
+    }
+    (!combined.is_empty())
+        .then(|| normalize_referrer_policy(&combined))
+        .flatten()
+}
+
 pub fn referrer_header_value(
     referrer_url: &Url,
     request_url: &Url,
@@ -12,13 +61,30 @@ pub fn referrer_header_value(
     if !matches!(request_url.scheme(), "http" | "https") {
         return None;
     }
+
+    referrer_value(
+        referrer_url,
+        request_url,
+        referrer_policy,
+        document_referrer_policy,
+    )
+}
+
+/// Applies Referrer Policy without requiring an HTTP(S) destination.
+///
+/// Local navigations still use the selected value for `Document.referrer`,
+/// even though they do not emit a `Referer` request header.
+pub fn referrer_value(
+    referrer_url: &Url,
+    request_url: &Url,
+    referrer_policy: Option<&str>,
+    document_referrer_policy: Option<&str>,
+) -> Option<String> {
     if !matches!(referrer_url.scheme(), "http" | "https") {
         return None;
     }
 
-    let policy = referrer_policy
-        .or(document_referrer_policy)
-        .unwrap_or(DEFAULT_REFERRER_POLICY);
+    let policy = effective_referrer_policy(referrer_policy, document_referrer_policy);
     let same_origin = same_origin(referrer_url, request_url);
     let downgrade = is_downgrade_request(referrer_url, request_url);
 
@@ -91,6 +157,39 @@ fn is_downgrade_request(referrer_url: &Url, request_url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_valid_referrer_policy_token_wins() {
+        assert_eq!(
+            normalize_referrer_policy("not-yet-standardized, no-referrer"),
+            Some("no-referrer".to_owned())
+        );
+        assert_eq!(
+            normalize_referrer_policy("origin, not-yet-standardized, strict-origin"),
+            Some("strict-origin".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_trailing_tokens_do_not_clear_previous_valid_policy() {
+        assert_eq!(
+            normalize_referrer_policy("same-origin, not-yet-standardized"),
+            Some("same-origin".to_owned())
+        );
+    }
+
+    #[test]
+    fn response_referrer_policy_combines_header_instances_before_normalizing() {
+        let headers: Vec<(String, Vec<u8>)> = vec![
+            ("Referrer-Policy".to_owned(), b"no-referrer".to_vec()),
+            ("referrer-policy".to_owned(), b"future-policy".to_vec()),
+        ];
+
+        assert_eq!(
+            response_referrer_policy_from_headers(&headers),
+            Some("no-referrer".to_owned())
+        );
+    }
 
     fn url(input: &str) -> Url {
         Url::parse(input).unwrap()
@@ -206,5 +305,65 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn non_http_navigation_target_still_has_a_policy_selected_referrer() {
+        let source = url("https://example.com/docs/page.html?x=1#section");
+        let target = url("about:blank");
+
+        assert_eq!(
+            referrer_value(&source, &target, None, None),
+            Some("https://example.com/".to_owned())
+        );
+        assert_eq!(referrer_header_value(&source, &target, None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod empty_policy_tests {
+    use super::*;
+
+    #[test]
+    fn empty_request_policy_inherits_the_document_policy() {
+        let source = Url::parse("https://origin.test/private?token=value").unwrap();
+        let target = Url::parse("https://destination.test/resource").unwrap();
+        for request_policy in [None, Some("")] {
+            assert_eq!(
+                referrer_value(&source, &target, request_policy, Some("no-referrer")),
+                None
+            );
+            assert_eq!(
+                referrer_value(&source, &target, request_policy, Some("unsafe-url")),
+                Some(source.to_string())
+            );
+        }
+        assert_eq!(
+            referrer_value(&source, &target, Some("origin"), Some("no-referrer")),
+            Some("https://origin.test/".to_owned())
+        );
+        for document_policy in [None, Some("")] {
+            assert_eq!(
+                referrer_value(&source, &target, Some(""), document_policy),
+                Some("https://origin.test/".to_owned())
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::{DEFAULT_REFERRER_POLICY, effective_referrer_policy};
+    #[test]
+    fn effective_policy_uses_request_then_document_then_default() {
+        for (request, document, expected) in [
+            (None, None, DEFAULT_REFERRER_POLICY),
+            (Some(""), Some(""), DEFAULT_REFERRER_POLICY),
+            (None, Some("no-referrer"), "no-referrer"),
+            (Some(""), Some("origin"), "origin"),
+            (Some("same-origin"), Some("origin"), "same-origin"),
+        ] {
+            assert_eq!(effective_referrer_policy(request, document), expected);
+        }
     }
 }

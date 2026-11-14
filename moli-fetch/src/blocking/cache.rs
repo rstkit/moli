@@ -86,14 +86,17 @@ pub(crate) struct CachedStreamingResponseLookup {
     pub(crate) metadata: HttpCacheEntryMetadata,
     pub(crate) final_url: String,
     pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, Vec<u8>)>,
     pub(crate) body: std::io::BufReader<std::fs::File>,
     pub(crate) expires_at_unix_ms: Option<u64>,
     pub(crate) force_validate: bool,
+    pub(crate) allow_stale: bool,
+    pub(crate) cache_state: crate::ResponseCacheState,
 }
 
 pub(crate) fn cached_streaming_response_is_stale(record: &CachedStreamingResponseLookup) -> bool {
-    cached_response_is_stale(record.expires_at_unix_ms, record.force_validate)
+    !record.allow_stale
+        && cached_response_is_stale(record.expires_at_unix_ms, record.force_validate)
 }
 
 pub(super) fn request_cache_control_requires_validation(
@@ -101,7 +104,7 @@ pub(super) fn request_cache_control_requires_validation(
     request: &Request,
     request_url: &Url,
 ) -> bool {
-    outgoing_request_headers_for_url(config, request, request_url, &[], None)
+    outgoing_request_headers_for_url(config, request, request_url, None)
         .iter()
         .any(|(name, value)| request_header_requires_validation(name, value))
 }
@@ -109,7 +112,7 @@ pub(super) fn request_cache_control_requires_validation(
 pub(crate) fn next_redirect_url_from_parts(
     final_url: &Url,
     status: u16,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     redirect_count: usize,
 ) -> Result<Option<Url>> {
     if !matches!(status, 301 | 302 | 303 | 307 | 308) {
@@ -119,7 +122,7 @@ pub(crate) fn next_redirect_url_from_parts(
     let Some(location) = headers
         .iter()
         .find(|(name, _)| name == "location")
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| crate::encode_redirect_location(value))
     else {
         return Ok(None);
     };
@@ -129,8 +132,8 @@ pub(crate) fn next_redirect_url_from_parts(
     }
 
     final_url
-        .join(location)
-        .or_else(|_| Url::parse(location))
+        .join(&location)
+        .or_else(|_| Url::parse(&location))
         .map(Some)
         .with_context(|| {
             anyhow!(
@@ -141,15 +144,38 @@ pub(crate) fn next_redirect_url_from_parts(
 }
 
 pub(crate) fn next_followed_redirect_url_from_parts(
+    request: &Request,
     final_url: &Url,
     status: u16,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     redirect_count: usize,
-    follow_redirects: bool,
 ) -> Result<Option<Url>> {
-    let next_url = next_redirect_url_from_parts(final_url, status, headers, redirect_count)?;
-    if follow_redirects && let Some(next_url) = next_url.as_ref() {
+    // HTTP fetch checks the network response before HTTP-redirect fetch. This
+    // also applies to cached redirects and manual/error redirect modes.
+    request
+        .validate_cross_origin_resource_policy_for_url(final_url, headers)
+        .map_err(anyhow::Error::msg)?;
+    if matches!(status, 301 | 302 | 303 | 307 | 308) {
+        request
+            .validate_cors_response_for_url(final_url, headers)
+            .map_err(anyhow::Error::msg)?;
+    }
+    // A browser may follow redirects itself, preserving the full URL list for
+    // CORS and Fetch Metadata while asking this transport for only one hop.
+    // Only automatically followed transport requests consume this layer's limit.
+    let transport_redirect_count = if request.transport_follows_redirects() {
+        redirect_count
+    } else {
+        0
+    };
+    let next_url =
+        next_redirect_url_from_parts(final_url, status, headers, transport_redirect_count)?;
+    if request.transport_follows_redirects()
+        && let Some(next_url) = next_url.as_ref()
+    {
         ensure_http_network_transport_url(next_url)?;
+        request.validate_request_mode_for_url(next_url)?;
+        request.check_redirect_policy(next_url)?;
     }
     Ok(next_url)
 }
@@ -178,21 +204,79 @@ mod tests {
     #[test]
     fn followed_redirect_rejects_non_http_target_before_request_state_changes() -> Result<()> {
         let current = Url::parse("https://example.test/start")?;
-        let headers = vec![(
+        let headers: Vec<(String, Vec<u8>)> = vec![(
             "location".to_owned(),
-            "file:///moli-policy-must-not-open".to_owned(),
+            b"file:///moli-policy-must-not-open".to_vec(),
         )];
 
-        let error = next_followed_redirect_url_from_parts(&current, 302, &headers, 0, true)
+        let request = Request::get_with_url(current.clone());
+        let error = next_followed_redirect_url_from_parts(&request, &current, 302, &headers, 0)
             .expect_err("followed file redirect must be rejected");
         assert_eq!(
             error.to_string(),
             "URL scheme \"file\" is not supported by the HTTP network transport."
         );
 
-        let manual = next_followed_redirect_url_from_parts(&current, 302, &headers, 0, false)?
+        let request = request.with_redirect_mode(crate::RequestRedirectMode::Manual);
+        let manual = next_followed_redirect_url_from_parts(&request, &current, 302, &headers, 0)?
             .expect("manual redirect URL should remain observable");
         assert_eq!(manual.as_str(), "file:///moli-policy-must-not-open");
+        Ok(())
+    }
+
+    #[test]
+    fn browser_followed_hops_preserve_cors_without_reapplying_transport_redirect_limit()
+    -> Result<()> {
+        let origin_url = Url::parse("https://origin.test/page")?;
+        let current = Url::parse("https://other.test/redirect")?;
+        let request = Request::new_browser(
+            "GET",
+            current.clone(),
+            None,
+            Vec::new(),
+            moli_url::WebOrigin::from_url(&origin_url),
+        )
+        .with_single_hop();
+        let headers = vec![
+            ("location".to_owned(), b"/next".to_vec()),
+            (
+                "access-control-allow-origin".to_owned(),
+                b"https://origin.test".to_vec(),
+            ),
+            (
+                "access-control-allow-credentials".to_owned(),
+                b"true".to_vec(),
+            ),
+        ];
+        let next = next_followed_redirect_url_from_parts(
+            &request,
+            &current,
+            302,
+            &headers,
+            super::super::MAX_REDIRECTS,
+        )?;
+        assert_eq!(next, Some(current.join("/next")?));
+        let automatic = request
+            .clone()
+            .with_redirect_mode(crate::RequestRedirectMode::Follow);
+        let error = next_followed_redirect_url_from_parts(
+            &automatic,
+            &current,
+            302,
+            &headers,
+            super::super::MAX_REDIRECTS,
+        )
+        .expect_err("automatically followed transport requests retain their redirect limit");
+        assert!(error.to_string().contains("redirect limit exceeded"));
+        let denied = next_followed_redirect_url_from_parts(
+            &request,
+            &current,
+            302,
+            &headers[..1],
+            super::super::MAX_REDIRECTS,
+        )
+        .expect_err("a manually followed browser hop still requires CORS permission");
+        assert!(denied.to_string().contains("CORS"));
         Ok(())
     }
 

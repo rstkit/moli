@@ -1,6 +1,6 @@
 [package]
 name = "moli"
-version = "1.1.5"
+version = "1.1.24"
 edition = "2024"
 license.workspace = true
 
@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [features]
 default = ["jemalloc"]
+ace-protocol = ["moli-protocol-server/ace-protocol"]
 jemalloc = ["dep:tikv-jemalloc-sys", "dep:tikv-jemallocator"]
 
 [dependencies]
@@ -20,6 +21,7 @@ cidr = "0.3.2"
 clap = { version = "4.5.39", features = ["derive", "env"] }
 moli-browser-profile = { path = "../moli-browser-profile" }
 moli-cookie-cache = { path = "../moli-cookie-cache" }
+moli-cookie-import = { path = "../moli-cookie-import" }
 moli-protocol = { path = "../moli-protocol" }
 moli-cookie-jar = { path = "../moli-cookie-jar" }
 moli-fetch = { path = "../moli-fetch" }
@@ -32,7 +34,7 @@ regex = "1.12.3"
 serde_json = "1.0.145"
 tokio = { version = "1.51.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.19", features = ["fmt"] }
 url = "2.5.7"
 
 # Keep the existing jemalloc fallback only where rusty_v8 does not publish a
@@ -42,9 +44,13 @@ tikv-jemalloc-sys = { version = "0.7.1", optional = true, default-features = fal
 tikv-jemallocator = { version = "0.7.0", optional = true, default-features = false, features = ["override_allocator_on_supported_platforms"] }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+futures-util = "0.3.31"
+lopdf = { version = "0.45.0", default-features = false }
 libc = "0.2"
 moli-test-support = { path = "../moli-test-support" }
 strip-ansi-escapes = "0.2.1"
+tokio-tungstenite = "0.28.0"
 
 [lints]
 workspace = true

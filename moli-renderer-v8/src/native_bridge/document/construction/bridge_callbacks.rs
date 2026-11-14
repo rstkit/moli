@@ -1,5 +1,5 @@
 use super::helpers::{
-    create_element_ns_for_document, create_element_options, create_element_wrapper_for_document,
+    create_element_ns_for_document, create_element_wrapper_for_document,
     registry_association_for_create_element, registry_association_has_autonomous_definition,
     validate_create_element_name, validate_create_element_ns_name,
 };
@@ -22,16 +22,20 @@ pub(in crate::native_bridge) fn bridge_create_element_callback<'s>(
         rv.set_null();
         return;
     };
-    let mut options = create_element_options(scope, &args, 1);
-    if options.registry_association.is_none() {
-        options.registry_association =
-            unsafe { &*runtime_ptr }.custom_element_registry_association(document_handle);
-    }
+    let Some(options) = parsed.options.flatten(scope, runtime_ptr, document_handle) else {
+        return;
+    };
+    let local_name = if is_html_document(unsafe { &*runtime_ptr }, document_handle) {
+        parsed.local_name.to_ascii_lowercase()
+    } else {
+        parsed.local_name
+    };
     match create_element_wrapper_for_document(
         scope,
+        args.this(),
         runtime_ptr,
         document_handle,
-        &parsed.local_name,
+        &local_name,
         options.is_name.as_deref(),
         options.registry_association,
         None,
@@ -59,11 +63,9 @@ pub(in crate::native_bridge) fn bridge_create_element_ns_callback<'s>(
         rv.set_null();
         return;
     };
-    let mut options = create_element_options(scope, &args, 2);
-    if options.registry_association.is_none() {
-        options.registry_association =
-            unsafe { &*runtime_ptr }.custom_element_registry_association(document_handle);
-    }
+    let Some(options) = parsed.options.flatten(scope, runtime_ptr, document_handle) else {
+        return;
+    };
     if namespace.as_deref() == Some(XHTML_NS) {
         let (prefix, local_name) = parsed
             .qualified_name
@@ -95,7 +97,7 @@ pub(in crate::native_bridge) fn bridge_create_element_ns_callback<'s>(
             unsafe { &mut *runtime_ptr }.capture_node_creation_stack_trace(scope, handle);
             match unsafe { &mut *runtime_ptr }
                 .native_bridge_mut()
-                .wrap_handle(scope, runtime_ptr, handle)
+                .wrap_handle_for_receiver(scope, runtime_ptr, args.this(), handle)
             {
                 Some(element) => rv.set(element.into()),
                 None => rv.set_null(),
@@ -104,6 +106,7 @@ pub(in crate::native_bridge) fn bridge_create_element_ns_callback<'s>(
         }
         match create_element_wrapper_for_document(
             scope,
+            args.this(),
             runtime_ptr,
             document_handle,
             local_name,
@@ -125,10 +128,11 @@ pub(in crate::native_bridge) fn bridge_create_element_ns_callback<'s>(
         rv.set_null();
         return;
     };
+    options.initialize_non_html_element(runtime_ptr, handle);
     unsafe { &mut *runtime_ptr }.capture_node_creation_stack_trace(scope, handle);
     match unsafe { &mut *runtime_ptr }
         .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, handle)
+        .wrap_handle_for_receiver(scope, runtime_ptr, args.this(), handle)
     {
         Some(element) => rv.set(element.into()),
         None => rv.set_null(),
@@ -152,10 +156,12 @@ pub(in crate::native_bridge) fn bridge_create_text_node_callback<'s>(
     let runtime = unsafe { &mut *runtime_ptr };
     let handle = runtime.create_text_node_for_document(document_handle, &parsed.data);
     runtime.capture_node_creation_stack_trace(scope, handle);
-    match runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, handle)
-    {
+    match runtime.native_bridge_mut().wrap_handle_for_receiver(
+        scope,
+        runtime_ptr,
+        args.this(),
+        handle,
+    ) {
         Some(node) => rv.set(node.into()),
         None => rv.set_null(),
     }
@@ -178,10 +184,12 @@ pub(in crate::native_bridge) fn bridge_create_comment_callback<'s>(
     let runtime = unsafe { &mut *runtime_ptr };
     let handle = runtime.create_comment_for_document(document_handle, &parsed.data);
     runtime.capture_node_creation_stack_trace(scope, handle);
-    match runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, handle)
-    {
+    match runtime.native_bridge_mut().wrap_handle_for_receiver(
+        scope,
+        runtime_ptr,
+        args.this(),
+        handle,
+    ) {
         Some(node) => rv.set(node.into()),
         None => rv.set_null(),
     }
@@ -227,10 +235,12 @@ pub(in crate::native_bridge) fn bridge_create_processing_instruction_callback<'s
         &parsed.data,
     );
     runtime.capture_node_creation_stack_trace(scope, handle);
-    match runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, handle)
-    {
+    match runtime.native_bridge_mut().wrap_handle_for_receiver(
+        scope,
+        runtime_ptr,
+        args.this(),
+        handle,
+    ) {
         Some(node) => rv.set(node.into()),
         None => rv.set_null(),
     }

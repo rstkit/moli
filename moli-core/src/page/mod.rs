@@ -40,9 +40,10 @@ use crate::renderer::{
 use anyhow::Result;
 pub use command_dispatch::{
     CompletedDevToolsIoCommandDispatch, CompletedPageCommand,
-    CompletedRuntimeInspectorCommandDispatch, PendingDevToolsIoCommandDispatch, PendingPageCommand,
-    PendingRuntimeInspectorCommandDispatch,
+    CompletedRuntimeInspectorCommandDispatch, PageDocumentCommandTarget,
+    PendingDevToolsIoCommandDispatch, PendingPageCommand, PendingRuntimeInspectorCommandDispatch,
 };
+pub use moli_renderer_v8::RendererPageRequestPolicyUpdate;
 
 #[cfg(all(test, debug_assertions))]
 use crate::network::ResourceRequestClient;
@@ -64,18 +65,20 @@ pub use dom_protocol_support::{
     RENDERER_BACKEND_NODE_ID_START, is_renderer_backend_node_id,
 };
 pub use input_support::{
-    PageInputExt, decode_input_dispatch_outcome_completion, decode_insert_text_completion,
+    PageInputExt, decode_element_click_dispatch_completion,
+    decode_element_click_preparation_completion, decode_input_dispatch_outcome_completion,
+    decode_insert_text_completion,
 };
+pub use moli_dom::accessibility::{AccessibilityNode, AccessibilityNodeId, AccessibilityValue};
 pub use moli_page_types::DomScrollIntoViewRect;
 pub use moli_page_types::{
     RendererDomDebuggerDomBreakpointType, RendererDomDebuggerEventListenerBreakpoint,
     RendererDomDebuggerXhrBreakpoint, RendererInspectorProtocolConfiguration,
     RendererInspectorProtocolConfigurationCommand, RendererInspectorSessionRestoreSnapshot,
-    SameDocumentHistoryUpdate, V8InspectorSessionAttach, V8InspectorSessionState,
+    SessionHistoryUpdateKind, V8InspectorSessionAttach, V8InspectorSessionState,
     renderer_inspector_protocol_configuration_command_from_message,
     renderer_inspector_protocol_configuration_command_from_method,
 };
-pub use moli_renderer_v8::RendererRuntimeInspectorMessageResponseOrder;
 pub use moli_renderer_v8::dom::native::SelectedFile;
 pub use moli_renderer_v8::network::{
     RendererNetworkResourceLoadOutcome, RendererNetworkResourceLoadPreparation,
@@ -86,10 +89,13 @@ pub use moli_renderer_v8::{
     PendingWorkerRuntimeInspectorSessionResponse, RendererActivityDiagnostics,
     RendererAgentAttachmentId, RendererAutofillAddressField, RendererAutofillCreditCard,
     RendererAutofillTriggerOutcome, RendererAutofillTriggerRequest,
-    RendererCaptureScreencastFrameReply, RendererCaptureScreencastFrameRequest,
-    RendererCaptureScreenshotReply, RendererCaptureScreenshotRequest,
-    RendererCommandTurnCompletion, RendererCommandTurnOutput, RendererDedicatedWorkerTargetEvent,
-    RendererDedicatedWorkerTargetInfo, RendererDevToolsAgentToken, RendererDocumentHitTestResult,
+    RendererAuxiliaryDocumentResponse, RendererAuxiliaryNavigationKind, RendererAuxiliaryWindow,
+    RendererBrowsingContextGroup, RendererBrowsingContextName, RendererCaptureScreencastFrameReply,
+    RendererCaptureScreencastFrameRequest, RendererCaptureScreenshotReply,
+    RendererCaptureScreenshotRequest, RendererCapturedDocumentEnvironment,
+    RendererCommandTurnCompletion, RendererCommandTurnOutput, RendererContentStripOptions,
+    RendererDedicatedWorkerTargetEvent, RendererDedicatedWorkerTargetInfo,
+    RendererDevToolsAgentToken, RendererDocumentHitTestResult,
     RendererDocumentIsolateAccountingDiagnostics, RendererDocumentLifecycleEvent,
     RendererDocumentLifecycleEventKind, RendererDocumentLifecycleIdentity,
     RendererDocumentLifecycleMilestone, RendererDocumentLifecycleSnapshot,
@@ -102,35 +108,38 @@ pub use moli_renderer_v8::{
     RendererDomFocusOutcome, RendererDomMutationEvent, RendererDomMutationEventBatch,
     RendererDomSnapshotCaptureOptions, RendererDomSnapshotCapturePayload, RendererDragData,
     RendererDragDataItem, RendererDraggedDirectory, RendererDraggedFile, RendererFrameToken,
-    RendererInputDispatchOutcome, RendererInspectorCommandRoute,
-    RendererJavaScriptDialogCompletion, RendererJavaScriptDialogId, RendererJavaScriptDialogResult,
-    RendererJavaScriptDialogSource, RendererLayoutMetrics, RendererLifecycleEpoch,
-    RendererLifecycleEventStamp, RendererLifecycleStartReason, RendererLifecycleTerminationStamp,
-    RendererMainDocumentCommit, RendererPageCommandPostResponseContinuation,
-    RendererPageCreationArtifacts, RendererPageCreationDiagnostics,
-    RendererPageDiagnosticsSnapshot, RendererPageDumpFormat, RendererPageDumpOptions,
-    RendererPageDumpStripOptions, RendererPendingDownloadActivation,
+    RendererHtmlSerializeOptions, RendererInputDispatchOutcome, RendererInspectorCommandRoute,
+    RendererInterceptedDrag, RendererJavaScriptDialogCompletion, RendererJavaScriptDialogId,
+    RendererJavaScriptDialogResult, RendererJavaScriptDialogSource, RendererLayoutMetrics,
+    RendererLifecycleEpoch, RendererLifecycleEventStamp, RendererLifecycleStartReason,
+    RendererLifecycleTerminationStamp, RendererMainDocumentCommit, RendererMainDocumentResource,
+    RendererMarkdownOptions, RendererNavigationInitiator,
+    RendererPageCommandPostResponseContinuation, RendererPageCreationArtifacts,
+    RendererPageCreationDiagnostics, RendererPageDiagnosticsSnapshot, RendererPageReplacementError,
+    RendererPageReplacementFailureDisposition, RendererPageWindowIdentity, RendererPdfOptions,
+    RendererPendingAuxiliaryPage, RendererPendingDownloadActivation,
     RendererPendingDownloadResponse, RendererPendingFileChooserActivation,
     RendererPendingJavaScriptDialog, RendererPendingPopupActivation,
     RendererPendingSameDocumentNavigation, RendererPendingTopLevelHistoryTraversal,
     RendererPendingWindowOpenEvent, RendererPerformanceMetricSnapshot,
     RendererPointerEventProperties, RendererPopupActivationSource, RendererPopupDisposition,
-    RendererResourceTextSearchOutcome, RendererRuntimeCommandOutput, RendererRuntimeHeapUsage,
-    RendererRuntimeInspectorIoCommandClaim, RendererRuntimeInspectorIoCommandRoute,
-    RendererRuntimeInspectorMainCommandCompletion, RendererRuntimeInspectorMainCommandRoute,
-    RendererRuntimeInspectorMessage, RendererRuntimeInspectorMessageBatch,
-    RendererRuntimeInspectorProtocolMessage, RendererRuntimeInspectorProtocolMessageValueMut,
+    RendererPrintToPdfReply, RendererPrintToPdfRequest, RendererResourceContentBody,
+    RendererResourceSearchRequest, RendererResourceTextSearchOutcome, RendererRuntimeCommandOutput,
+    RendererRuntimeHeapUsage, RendererRuntimeInspectorIoCommandClaim,
+    RendererRuntimeInspectorIoCommandRoute, RendererRuntimeInspectorMainCommandCompletion,
+    RendererRuntimeInspectorMainCommandRoute, RendererRuntimeInspectorMessage,
+    RendererRuntimeInspectorMessageBatch, RendererRuntimeInspectorProtocolMessage,
     RendererRuntimeObservableSourceItem, RendererRuntimeObservableSourceSummary,
     RendererRuntimeRealmInfo, RendererScreenshotClip, RendererScreenshotFormat,
-    RendererScreenshotPurpose, RendererScreenshotRegion, RendererScrollIntoViewResult,
-    RendererServiceWorkerConsoleMessage, RendererServiceWorkerExceptionMessage,
-    RendererServiceWorkerFetchDiagnostic, RendererServiceWorkerFetchDiagnosticResult,
-    RendererServiceWorkerRunIdentity, RendererServiceWorkerTargetEvent,
-    RendererServiceWorkerTargetInfo, RendererServiceWorkerVersionStatus,
-    RendererSetDocumentContentResult, RendererSharedWorkerConsoleMessage,
-    RendererSharedWorkerTargetEvent, RendererSharedWorkerTargetInfo, RendererSyntheticResponseBody,
-    RendererTextSearchMatch, RendererTouchPoint, RendererVisualStateToken,
-    RendererWindowDocumentSource, RuntimeConsoleMessageSnapshot,
+    RendererScreenshotRegion, RendererScrollIntoViewResult, RendererServiceWorkerConsoleMessage,
+    RendererServiceWorkerExceptionMessage, RendererServiceWorkerFetchDiagnostic,
+    RendererServiceWorkerFetchDiagnosticResult, RendererServiceWorkerRunIdentity,
+    RendererServiceWorkerTargetEvent, RendererServiceWorkerTargetInfo,
+    RendererServiceWorkerVersionStatus, RendererSetDocumentContentResult,
+    RendererSharedWorkerConsoleMessage, RendererSharedWorkerTargetEvent,
+    RendererSharedWorkerTargetInfo, RendererSyntheticResponseBody, RendererTextSearchMatch,
+    RendererTouchPoint, RendererVisualStateToken, RendererWindowDocumentSource,
+    RuntimeConsoleMessageSnapshot, WorkerInspectorError,
 };
 pub use moli_renderer_v8::{
     RendererAppManifest, RendererAppManifestDisplayMode, RendererAppManifestError,
@@ -140,12 +149,19 @@ pub use moli_renderer_v8::{
     RendererAppManifestQueryResult, RendererAppManifestRelatedApplication,
     RendererAppManifestShortcut, RendererPreparedAppManifestLoad,
 };
+pub use moli_renderer_v8::{
+    RendererElementClickError, RendererElementClickTarget, RendererPreparedPointerClick,
+};
+pub use moli_renderer_v8::{
+    RendererPopupActivationParts, RendererRuntimeInspectorMessageResponseOrder,
+};
 pub use navigation_diagnostics::{NavigationRedirect, NavigationResponse};
 pub use protocol_support::{
-    BidiPreloadChannelHandoff, ChildFrameAttachmentSnapshot, ChildFrameDetachmentSnapshot,
-    ChildFrameDocumentNetworkActivitySnapshot, ChildFrameDocumentNetworkSnapshot,
-    ChildFrameDocumentOpenedSnapshot, ChildFrameNavigationSnapshot, ChildFrameTreeEventSnapshot,
-    ChildFrameTreeSnapshot, ContentSecurityPolicyIssueSnapshot, ContentSecurityPolicyViolationType,
+    BidiPreloadChannelHandoff, ChildDocumentFetchRequest, ChildFrameAttachmentSnapshot,
+    ChildFrameDetachmentSnapshot, ChildFrameDocumentNetworkActivitySnapshot,
+    ChildFrameDocumentNetworkSnapshot, ChildFrameDocumentOpenedSnapshot,
+    ChildFrameNavigationSnapshot, ChildFrameTreeEventSnapshot, ChildFrameTreeSnapshot,
+    ContentSecurityPolicyIssueSnapshot, ContentSecurityPolicyViolationType, DocumentActivity,
     DocumentStartScript, EmulatedIdleOverride, EmulatedMediaOverrides, InspectorIssueSnapshot,
     InspectorSourceCodeLocationSnapshot, PendingRuntimeBindingCall, PendingSubresourceAuthInfo,
     PendingSubresourceContinueEvent, PendingSubresourceContinueOutcome,
@@ -157,30 +173,31 @@ pub use protocol_support::{
     ScriptObservableOutputItem, SubresourceAuthChallenge, SubresourceAuthCredentials,
     SubresourceAuthScheme, SubresourceAuthTarget, SubresourceBodyFinished,
     SubresourceBodyFinishedResult, SubresourceDataReceived, SubresourceEventSourceMessageReceived,
-    SubresourceJsonPathEquals, SubresourceJsonPathRegex, SubresourceNetworkOutcome,
-    SubresourceNetworkRecord, SubresourceNetworkRequestHandle, SubresourceRequestInitiatorType,
-    SubresourceRequestStarted, SubresourceResourceType, SubresourceResponseBody,
-    SubresourceResponseStarted, SubresourceResponseWaitCriteria, ViewportSurface,
-    WebSocketFrameDirection, WebSocketFrameOpcode, WebSocketLifecycleEvent, WebSocketLifecycleKind,
-    WebSocketNetworkEvent, extract_subresource_auth_challenge,
+    SubresourceInterceptionClasses, SubresourceJsonPathEquals, SubresourceJsonPathRegex,
+    SubresourceNetworkOutcome, SubresourceNetworkRecord, SubresourceNetworkRequestHandle,
+    SubresourceRequestInitiatorType, SubresourceRequestStarted, SubresourceResourceType,
+    SubresourceResponseBody, SubresourceResponseStarted, SubresourceResponseWaitCriteria,
+    ViewportSurface, WebSocketFrameDirection, WebSocketFrameOpcode, WebSocketLifecycleEvent,
+    WebSocketLifecycleKind, WebSocketNetworkEvent, extract_subresource_auth_challenge,
     subresource_auth_credentials_for_challenge,
 };
 pub use renderer_command_support::DocumentNodeClientRectResolution;
 pub use renderer_command_support::{
-    DocumentNodeRuntimeObjectResolution, PageObservableOutputUpdate, TestingOutcome,
+    DocumentNodeRuntimeObjectResolution, PageObservableOutputUpdate, SerializedHtmlDocument,
+    TestingOutcome,
 };
 
 #[cfg(test)]
 use crate::renderer::RendererPageTestingHandle;
 
 pub use crate::renderer::{
-    RendererDocumentFrontendNodeIdsResolution, RendererDocumentNodeAttributesResolution,
-    RendererDocumentNodePropertyResolution, RendererDocumentNodeReference,
-    RendererDocumentNodeTextResolution, RendererDocumentQuerySelectorNode,
-    RendererDocumentQuerySelectorResolution,
+    RendererDocumentChildNodeSnapshotEvents, RendererDocumentFrontendNodeIdsResolution,
+    RendererDocumentNodeAttributesResolution, RendererDocumentNodePropertyResolution,
+    RendererDocumentNodeReference, RendererDocumentNodeTextResolution,
+    RendererDocumentQuerySelectorNode, RendererDocumentQuerySelectorResolution,
     RendererDocumentQuerySelectorWithChildNodeSnapshotEvents, RendererDomBidiNodeBindingResolution,
     RendererDomBidiNodeSharedIdResolution, RendererDomFrontendNodeBindingResolution,
-    RendererDomNodeCreationStackFrame, RendererDomNodeCreationStackTrace,
+    RendererDomNodeCreationStackFrame, RendererDomNodeCreationStackTrace, RendererDomNodeReference,
     RendererDomNodeStackTraceResolution, RendererDomSearchRegistration,
     RendererDomSearchResultNode, RendererDomSearchResultsResolution, RendererRuntimeRemoteObject,
     RendererStyleSheetHeader, RendererStyleSheetInventoryUpdate, RendererStyleSheetPayload,
@@ -188,6 +205,7 @@ pub use crate::renderer::{
 
 pub struct Page {
     page_state: PageStateCache,
+    requested_document_activity: std::cell::Cell<moli_page_types::DocumentActivity>,
     // Chromium owns this on RenderFrameHostImpl::IdleManager. Keep it on the
     // current document handle instead of deriving browser-side navigation
     // policy from whichever renderer snapshot the protocol actor consumed
@@ -212,12 +230,30 @@ impl fmt::Debug for Page {
 }
 
 impl Page {
+    pub(crate) fn adopt_renderer_document_replacement(
+        &mut self,
+        replacement: moli_renderer_v8::RendererPageReplacementCommit,
+    ) -> Result<(
+        RendererPageCreationDiagnostics,
+        RendererPageCreationArtifacts,
+    )> {
+        let (state, diagnostics, artifacts) =
+            self.handle.adopt_document_replacement(replacement)?;
+        self.idle_override = state.idle_override();
+        self.requested_document_activity
+            .set(state.document_activity);
+        self.page_state.replace(state);
+        self.page_creation_artifacts = None;
+        Ok((diagnostics, artifacts))
+    }
+
     pub(crate) fn from_attached_handle(
         handle: RendererPageHandle,
         page_state: Arc<RendererPageState>,
     ) -> Self {
         let idle_override = page_state.idle_override();
         Self {
+            requested_document_activity: std::cell::Cell::new(page_state.document_activity),
             page_state: PageStateCache::new(page_state),
             idle_override,
             handle,
@@ -234,6 +270,7 @@ impl Page {
     ) -> Self {
         let idle_override = page_state.idle_override();
         Self {
+            requested_document_activity: std::cell::Cell::new(page_state.document_activity),
             page_state: PageStateCache::new(page_state),
             idle_override,
             handle,
@@ -384,6 +421,7 @@ impl Page {
             delta_y,
             pointer: RendererPointerEventProperties::default(),
             modifiers: 0,
+            intercept_drags: false,
         };
         let reply = self.dispatch_page_command_async(command).await?;
         expect_page_reply!(
@@ -565,3 +603,6 @@ mod tests {
         );
     }
 }
+
+mod resource_command;
+pub use resource_command::{CompletedResourceCommand, PendingResourceCommand};

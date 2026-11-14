@@ -4,14 +4,18 @@ mod frame_document_parser_tree;
 mod graph;
 mod graph_fetch_store;
 mod host_callbacks;
+mod import_attributes;
 mod import_map;
+mod json;
 mod modulator;
 mod owner_ids;
 mod parser_tree_registry;
 mod record;
 mod record_resolver;
 mod resolver;
+mod response_mime;
 mod single_module_fetch;
+mod synthetic_text;
 #[cfg(test)]
 mod tests;
 mod tree_adapter;
@@ -41,7 +45,9 @@ pub(crate) use self::dynamic_resolver::{
     DynamicModuleJoinedFetch, DynamicModuleScheduledFetch, PendingDynamicModuleEvaluationReaction,
     PendingDynamicModuleImport,
 };
+pub(crate) use self::import_attributes::{import_attributes_key, module_request_attributes};
 pub(crate) use self::import_map::ImportMapRegistryState;
+pub(crate) use self::json::{json_module_exception_source_url, parse_json_module};
 pub(crate) use self::modulator::{
     NativeDocumentModulator, NativeFrameDocumentDependencyFetchBuildFailure,
 };
@@ -50,7 +56,11 @@ pub(crate) use self::record::{ModuleRecordEntry, WasmImportRecord, WasmModuleRec
 pub(crate) use self::resolver::{
     ResolverScopeGuard, resolve_static_module_callback, resolve_static_source_callback,
 };
+pub(crate) use self::response_mime::{
+    validate_css_module_response_mime, validate_json_module_response_mime,
+};
 pub(crate) use self::single_module_fetch::NativeModuleSingleFetchRequest;
+pub(crate) use self::synthetic_text::SyntheticTextModuleSource;
 pub(crate) use self::tree_owner::{
     NativeModuleTreeDocumentOwnerAdapter, NativeModuleTreeFrameDocumentOwner,
 };
@@ -161,6 +171,14 @@ pub(crate) fn accept_parser_owned_import_map_handoff(
         .set_script_already_started(node_id, true);
     match import_map.source {
         PreparedImportMapSource::Inline(source) => {
+            let request =
+                crate::content_security_policy::ContentSecurityPolicyScriptElementRequest::
+                    parser_inserted_with_nonce(import_map.nonce.as_deref());
+            let Some(source) =
+                vm.inline_script_element_source_for_execution(node_id, &source, request)
+            else {
+                return;
+            };
             if let Err(error) =
                 register_parser_owned_import_map_source(vm, &source, &import_map.base_url)
             {
@@ -343,6 +361,14 @@ pub(crate) struct ModuleOwnerState {
 }
 
 impl ModuleOwnerState {
+    pub(crate) fn clear_for_context_teardown(&mut self) {
+        // Retained import.meta.resolve functions still use the import map, but
+        // compiled records and pending imports must not root the retired realm.
+        self.document_modulator = NativeDocumentModulator::default();
+        self.graph_fetches.clear();
+        self.owner_event_tasks = DocumentPostedTaskSource::default();
+    }
+
     pub(crate) fn clear_for_document_replacement(&mut self) {
         // Import maps, module-map entries, compiled records, ID allocation and
         // dynamic-import resolver state belong to the live ScriptState. Only
@@ -478,13 +504,6 @@ impl ModuleOwnerState {
         self.document_modulator.entry(entry_id).source().cloned()
     }
 
-    pub(crate) fn native_module_source_for(
-        &self,
-        module: v8::Local<'_, v8::Module>,
-    ) -> Option<(ModuleMapKey, ModuleSource)> {
-        self.document_modulator.module_source_for(module)
-    }
-
     pub(crate) fn native_module_wasm_record_for(
         &self,
         module: v8::Local<'_, v8::Module>,
@@ -582,12 +601,6 @@ impl ModuleOwnerState {
         self.document_modulator
             .compiled_record(entry_id)
             .map(|record| record.compiled_module().clone())
-    }
-
-    pub(crate) fn native_module_url_for(&self, module: v8::Local<'_, v8::Module>) -> Option<Url> {
-        self.document_modulator
-            .module_key_for(module)
-            .map(|key| key.url().clone())
     }
 
     pub(crate) fn mark_native_module_instantiated(&mut self, entry_id: ModuleEntryId) {

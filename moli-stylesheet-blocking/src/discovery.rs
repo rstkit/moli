@@ -1,7 +1,8 @@
 //! Renderer-independent stylesheet blocking discovery contract.
 //!
 //! The DOM owns candidate membership and order. This module only reads that
-//! canonical registry, classifies candidates, and produces blocking inputs.
+//! canonical registry and produces load inputs with independent script-blocking
+//! eligibility. The embedder supplies the Document media environment.
 
 use std::collections::HashSet;
 
@@ -91,9 +92,10 @@ pub struct DocumentOwnedBlockingStylesheet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentOwnedBlockingStylesheetDiscoveryInput {
+pub struct DocumentOwnedStylesheetDiscoveryInput {
     node_id: NodeId,
     signature: DocumentBlockingStylesheetSignature,
+    blocks_scripts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +126,7 @@ impl StylesheetElementRead {
             parser_blocking_eligible: if element.is_html_element("link") {
                 element.link_created_by_parser()
             } else {
-                node.flags().parser_created()
+                node.flags().parser_created() && !element.style_children_parsing()
             },
             rel: element.attribute("rel").map(str::to_owned),
             href: element.attribute("href").map(str::to_owned),
@@ -187,7 +189,11 @@ impl DocumentOwnedBlockingStylesheet {
     }
 }
 
-impl DocumentOwnedBlockingStylesheetDiscoveryInput {
+impl DocumentOwnedStylesheetDiscoveryInput {
+    pub fn blocks_scripts(&self) -> bool {
+        self.blocks_scripts
+    }
+
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
@@ -202,22 +208,22 @@ impl DocumentOwnedBlockingStylesheetDiscoveryInput {
     }
 }
 
-impl From<&DocumentOwnedBlockingStylesheet> for DocumentOwnedBlockingStylesheetDiscoveryInput {
+impl From<&DocumentOwnedBlockingStylesheet> for DocumentOwnedStylesheetDiscoveryInput {
     fn from(blocker: &DocumentOwnedBlockingStylesheet) -> Self {
         Self {
             node_id: blocker.node_id(),
             signature: blocker.signature().clone(),
+            blocks_scripts: true,
         }
     }
 }
 
-impl From<&DocumentOwnedBlockingStylesheetCandidate>
-    for DocumentOwnedBlockingStylesheetDiscoveryInput
-{
+impl From<&DocumentOwnedBlockingStylesheetCandidate> for DocumentOwnedStylesheetDiscoveryInput {
     fn from(candidate: &DocumentOwnedBlockingStylesheetCandidate) -> Self {
         Self {
             node_id: candidate.node_id(),
             signature: DocumentBlockingStylesheetSignature::from_candidate(candidate),
+            blocks_scripts: true,
         }
     }
 }
@@ -245,12 +251,20 @@ impl DocumentBlockingStylesheetSignature {
 }
 
 pub trait StylesheetBlockingReadView {
+    /// Match using this read view's Document environment. Executable embedders
+    /// must provide native evaluation; page-authored JavaScript is never called.
+    fn media_query_matches(&self, media: &str) -> bool;
+
     fn stylesheet_element(&self, node_id: NativeNodeId) -> Option<StylesheetElementRead>;
     fn child_ids(&self, node_id: NativeNodeId) -> Vec<NativeNodeId>;
     fn text_content(&self, node_id: NativeNodeId) -> Option<String>;
     fn final_url_clone(&self) -> Option<Url>;
     fn document_base_url_clone(&self) -> Option<Url>;
+    fn stylesheet_base_url_clone(&self, _node_id: NativeNodeId) -> Option<Url> {
+        self.document_base_url_clone()
+    }
     fn document_node_id(&self) -> NativeNodeId;
+    fn document_is_quirks_mode(&self) -> bool;
 
     fn document_order_stylesheet_candidate_ids_before(
         &self,
@@ -259,6 +273,10 @@ pub trait StylesheetBlockingReadView {
 }
 
 impl StylesheetBlockingReadView for NativeDom {
+    fn media_query_matches(&self, media: &str) -> bool {
+        default_screen_media_query_matches(media, self.document_is_quirks_mode())
+    }
+
     fn stylesheet_element(&self, node_id: NativeNodeId) -> Option<StylesheetElementRead> {
         self.node(node_id)
             .and_then(StylesheetElementRead::from_node)
@@ -284,6 +302,11 @@ impl StylesheetBlockingReadView for NativeDom {
         self.document_node_id()
     }
 
+    fn document_is_quirks_mode(&self) -> bool {
+        self.document()
+            .is_some_and(|document| document.is_quirks_mode())
+    }
+
     fn document_order_stylesheet_candidate_ids_before(
         &self,
         target_node_id: Option<NodeId>,
@@ -296,6 +319,10 @@ impl StylesheetBlockingReadView for NativeDom {
 }
 
 impl StylesheetBlockingReadView for DomHost {
+    fn media_query_matches(&self, media: &str) -> bool {
+        default_screen_media_query_matches(media, self.document_is_quirks_mode())
+    }
+
     fn stylesheet_element(&self, node_id: NativeNodeId) -> Option<StylesheetElementRead> {
         self.node(node_id)
             .and_then(StylesheetElementRead::from_node)
@@ -321,8 +348,19 @@ impl StylesheetBlockingReadView for DomHost {
             .map(|document| document.base_url().clone())
     }
 
+    fn stylesheet_base_url_clone(&self, node_id: NativeNodeId) -> Option<Url> {
+        let document = self.owner_document_handle(node_id)?;
+        self.document_base_url_for_handle(document)
+    }
+
     fn document_node_id(&self) -> NativeNodeId {
         self.document_handle()
+    }
+
+    fn document_is_quirks_mode(&self) -> bool {
+        self.node(self.document_handle())
+            .and_then(Node::as_document)
+            .is_some_and(|document| document.is_quirks_mode())
     }
 
     fn document_order_stylesheet_candidate_ids_before(
@@ -351,7 +389,10 @@ pub fn stylesheet_preload_link_request(
     let element = document.stylesheet_element(native_node_id)?;
     if !element.is_html_element("link")
         || element.disabled
-        || !stylesheet_type_is_supported(element.type_attr.as_deref())
+        || element
+            .type_attr
+            .as_deref()
+            .is_some_and(|value| !value.is_empty() && !moli_web_mime::is_css_mime(value))
     {
         return None;
     }
@@ -360,7 +401,7 @@ pub fn stylesheet_preload_link_request(
         || !element
             .as_attr
             .as_deref()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("style"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("style"))
     {
         return None;
     }
@@ -368,7 +409,10 @@ pub fn stylesheet_preload_link_request(
     if href.is_empty() {
         return None;
     }
-    let url = document.document_base_url_clone()?.join(href).ok()?;
+    let url = document
+        .stylesheet_base_url_clone(native_node_id)?
+        .join(href)
+        .ok()?;
     let options = StylesheetFetchOptions::from_link_attributes(
         element.cross_origin.as_deref(),
         element.referrer_policy.as_deref(),
@@ -401,7 +445,10 @@ fn stylesheet_link_disposition_in_view(
         return None;
     }
 
-    let url = document.document_base_url_clone()?.join(href).ok()?;
+    let url = document
+        .stylesheet_base_url_clone(native_node_id)?
+        .join(href)
+        .ok()?;
     let options = StylesheetFetchOptions::from_link_attributes(
         element.cross_origin.as_deref(),
         element.referrer_policy.as_deref(),
@@ -409,9 +456,11 @@ fn stylesheet_link_disposition_in_view(
         element.nonce.as_deref(),
         element.charset.as_deref(),
         element.fetch_priority.as_deref(),
-    );
+    )
+    .with_quirks_mode_mime_compatibility(document.document_is_quirks_mode());
     let is_alternate = link_rel_includes_token(rel, "alternate");
-    let blocking = !is_alternate && media_blocks_scripts(element.media.as_deref());
+    let blocking =
+        !is_alternate && document.media_query_matches(element.media.as_deref().unwrap_or_default());
     Some(if blocking {
         StylesheetLinkDisposition::Blocking { url, options }
     } else {
@@ -445,14 +494,15 @@ pub fn connected_preload_like_link_url(
     if href.is_empty() {
         return None;
     }
-    document.document_base_url_clone()?.join(href).ok()
+    document
+        .stylesheet_base_url_clone(native_node_id)?
+        .join(href)
+        .ok()
 }
 
 pub fn preload_like_link_loads_stylesheet(rel: &str, as_attr: Option<&str>, href: &str) -> bool {
     if link_rel_includes_token(rel, "preload") {
-        return as_attr
-            .map(str::trim)
-            .is_some_and(|value| value.eq_ignore_ascii_case("style"));
+        return as_attr.is_some_and(|value| value.eq_ignore_ascii_case("style"));
     }
     if !link_rel_includes_token(rel, "modulepreload") {
         return false;
@@ -471,13 +521,6 @@ fn stylesheet_type_is_supported(value: Option<&str>) -> bool {
         let value = value.trim();
         value.is_empty() || value.eq_ignore_ascii_case("text/css")
     })
-}
-
-fn media_blocks_scripts(media: Option<&str>) -> bool {
-    let Some(media) = media.map(str::trim) else {
-        return true;
-    };
-    media.is_empty() || media.eq_ignore_ascii_case("all") || media.eq_ignore_ascii_case("screen")
 }
 
 pub fn collect_blocking_stylesheet_nodes_before(
@@ -543,24 +586,53 @@ fn collect_document_owned_blocking_stylesheet_candidates_before_impl(
     out
 }
 
+pub fn document_owned_stylesheet_discovery_input_for_node(
+    document: &(impl StylesheetBlockingReadView + ?Sized),
+    node_id: NodeId,
+) -> Option<DocumentOwnedStylesheetDiscoveryInput> {
+    let element = document.stylesheet_element(NativeNodeId::new(node_id.index()))?;
+    if !element.parser_blocking_eligible {
+        return None;
+    }
+    if let Some(disposition) = stylesheet_link_disposition_in_view(document, node_id) {
+        return Some(DocumentOwnedStylesheetDiscoveryInput {
+            node_id,
+            signature: DocumentBlockingStylesheetSignature::Link {
+                url: disposition.url().clone(),
+                options: disposition.options().clone(),
+            },
+            blocks_scripts: disposition.is_blocking(),
+        });
+    }
+    parser_created_style_import_urls(document, node_id).map(|urls| {
+        DocumentOwnedStylesheetDiscoveryInput {
+            node_id,
+            signature: DocumentBlockingStylesheetSignature::ParserCreatedStyleImport { urls },
+            blocks_scripts: document
+                .media_query_matches(element.media.as_deref().unwrap_or_default()),
+        }
+    })
+}
+
 pub fn document_owned_blocking_stylesheet_candidate_for_node(
     document: &(impl StylesheetBlockingReadView + ?Sized),
     node_id: NodeId,
 ) -> Option<DocumentOwnedBlockingStylesheetCandidate> {
-    let native_node_id = NativeNodeId::new(node_id.index());
-    let element = document.stylesheet_element(native_node_id)?;
-    if element.parser_blocking_eligible
-        && let Some(disposition) = stylesheet_link_disposition_in_view(document, node_id)
-        && disposition.is_blocking()
-    {
-        return Some(DocumentOwnedBlockingStylesheetCandidate::Link {
-            node_id,
-            url: disposition.url().clone(),
-            options: disposition.options().clone(),
-        });
+    let input = document_owned_stylesheet_discovery_input_for_node(document, node_id)?;
+    if !input.blocks_scripts() {
+        return None;
     }
-    parser_created_style_import_urls(document, node_id).map(|urls| {
-        DocumentOwnedBlockingStylesheetCandidate::ParserCreatedStyleImport { node_id, urls }
+    Some(match input.signature {
+        DocumentBlockingStylesheetSignature::Link { url, options } => {
+            DocumentOwnedBlockingStylesheetCandidate::Link {
+                node_id,
+                url,
+                options,
+            }
+        }
+        DocumentBlockingStylesheetSignature::ParserCreatedStyleImport { urls } => {
+            DocumentOwnedBlockingStylesheetCandidate::ParserCreatedStyleImport { node_id, urls }
+        }
     })
 }
 
@@ -584,7 +656,7 @@ pub fn collect_document_owned_blocking_stylesheets_before(
 pub fn collect_document_owned_blocking_stylesheet_discovery_inputs_before_in_view(
     document: &(impl StylesheetBlockingReadView + ?Sized),
     target_node_ids: impl IntoIterator<Item = NodeId>,
-) -> Vec<DocumentOwnedBlockingStylesheetDiscoveryInput> {
+) -> Vec<DocumentOwnedStylesheetDiscoveryInput> {
     let mut discovered_inputs = Vec::new();
     let mut discovered_blocker_node_ids = HashSet::new();
     for target_node_id in target_node_ids {
@@ -592,9 +664,7 @@ pub fn collect_document_owned_blocking_stylesheet_discovery_inputs_before_in_vie
             collect_document_owned_blocking_stylesheets_before_in_view(document, target_node_id)
         {
             if discovered_blocker_node_ids.insert(blocker.node_id()) {
-                discovered_inputs.push(DocumentOwnedBlockingStylesheetDiscoveryInput::from(
-                    &blocker,
-                ));
+                discovered_inputs.push(DocumentOwnedStylesheetDiscoveryInput::from(&blocker));
             }
         }
     }
@@ -663,64 +733,32 @@ fn parser_created_style_import_urls(
     if !element.is_html_element("style") || !element.parser_blocking_eligible {
         return None;
     }
-    if element.disabled || !media_blocks_scripts(element.media.as_deref()) {
+    if element.disabled
+        || !moli_web_mime::is_css_style_element_type_attribute(element.type_attr.as_deref())
+    {
         return None;
     }
     let css_text = document.text_content(native_node_id)?;
-    let base_url = document.document_base_url_clone()?;
+    let base_url = document.stylesheet_base_url_clone(native_node_id)?;
     let urls = extract_css_import_urls(&base_url, &css_text);
     (!urls.is_empty()).then_some(urls)
 }
 
 fn extract_css_import_urls(base_url: &Url, css_text: &str) -> Vec<Url> {
-    let mut out = Vec::new();
-    for statement in css_text.split(';') {
-        let statement = statement.trim();
-        if !statement
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("@import"))
-        {
-            continue;
-        }
-        let remainder = statement[7..].trim_start();
-        let Some(specifier) = extract_css_import_specifier(remainder) else {
-            continue;
-        };
-        if let Ok(url) = base_url.join(&specifier) {
-            out.push(url);
-        }
-    }
-    out
+    moli_css_parse::stylesheet_import_urls_with_stylo(css_text, base_url)
 }
 
-fn extract_css_import_specifier(input: &str) -> Option<String> {
-    let input = input.trim_start();
-    if input.starts_with("url(") || input.starts_with("URL(") {
-        let rest = &input[4..];
-        let end = rest.find(')')?;
-        let inner = rest[..end].trim();
-        return trim_css_string(inner);
-    }
-    if let Some(quote) = input.chars().next().filter(|ch| matches!(ch, '"' | '\'')) {
-        let remainder = &input[quote.len_utf8()..];
-        let end = remainder.find(quote)?;
-        let specifier = &remainder[..end];
-        return Some(specifier.trim().to_owned());
-    }
-    trim_css_string(input)
-}
-
-fn trim_css_string(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    if trimmed.len() < 2 {
-        return None;
-    }
-    let first = trimmed.as_bytes()[0] as char;
-    let last = trimmed.as_bytes()[trimmed.len() - 1] as char;
-    if !matches!(first, '"' | '\'') || first != last {
-        return None;
-    }
-    Some(trimmed[1..trimmed.len() - 1].trim().to_owned())
+/// Inert DOM adapters have no browsing context and select the ordinary default
+/// screen explicitly. Executable adapters supply their actual Document device.
+pub fn default_screen_media_query_matches(media: &str, quirks_mode: bool) -> bool {
+    let viewport = moli_page_types::ViewportSurface::default();
+    moli_css_parse::screen_media_query_matches(
+        media,
+        quirks_mode,
+        (viewport.inner_width as f32, viewport.inner_height as f32),
+        (viewport.screen_width as f32, viewport.screen_height as f32),
+        viewport.device_pixel_ratio as f32,
+    )
 }
 
 #[cfg(test)]
@@ -731,6 +769,91 @@ mod tests {
         document_owned_blocking_stylesheet_candidate_for_node, extract_css_import_urls,
         stylesheet_link_disposition, stylesheet_preload_link_request,
     };
+
+    #[test]
+    fn parser_style_import_graph_deduplicates_network_identity() {
+        let base = url::Url::parse("https://example.com/path/page.html").unwrap();
+        let urls = extract_css_import_urls(
+            &base,
+            concat!(
+                "@import '/shared.css#first';",
+                "@import url('/shared.css#second') screen;",
+                "@import url('/shared.css') all;",
+                "@import 'other.css';",
+            ),
+        );
+        assert_eq!(
+            urls.iter().map(url::Url::as_str).collect::<Vec<_>>(),
+            [
+                "https://example.com/shared.css#first",
+                "https://example.com/path/other.css",
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_style_import_graph_uses_css_grammar_and_supports_conditions() {
+        let base = url::Url::parse("https://example.com/path/page.html").unwrap();
+        let urls = extract_css_import_urls(
+            &base,
+            concat!(
+                "/* @import 'comment.css'; */ @layer base;",
+                "@import '/skipped.css' supports(unknown-property: impossible);",
+                "@import url('/shar\\65 d.css#first');",
+                "@import '/shared.css#second';",
+                "@import url('/semi;colon.css') supports(display: block);",
+                "div {} @import '/too-late.css';",
+            ),
+        );
+        assert_eq!(
+            urls.iter().map(url::Url::as_str).collect::<Vec<_>>(),
+            [
+                "https://example.com/shared.css#first",
+                "https://example.com/semi;colon.css",
+            ]
+        );
+    }
+
+    #[test]
+    fn stylesheet_media_lists_recognize_screen_and_all_members() {
+        let document_url = url::Url::parse("https://example.com/page.html").unwrap();
+        let mut host = DomHost::from_dom(NativeDom::new_html(document_url));
+        let link = host.create_element("link");
+        assert!(host.set_attribute(link, "rel", "stylesheet"));
+        assert!(host.set_attribute(link, "href", "/style.css"));
+        assert!(host.append_child(host.document_handle(), link));
+        let node_id = moli_dom::NodeId::new(link.index());
+
+        for (media, blocking) in [
+            ("", true),
+            ("screen", true),
+            ("only screen", true),
+            ("only all", true),
+            ("not print", true),
+            ("(width >= 768px)", true),
+            ("(width > 99999px)", false),
+            ("screen,print", true),
+            ("print, screen", true),
+            (" PRINT , ScReEn ", true),
+            ("speech, ALL", true),
+            ("print, /* screen media */ screen", true),
+            (r"\73 creen,print", true),
+            ("/* an empty media list */", true),
+            ("print", false),
+            ("print, speech", false),
+            ("not screen, print", false),
+            ("screen and (color), print", true),
+            ("not all, screen", true),
+            (",print", false),
+            (r#""print,screen,speech""#, false),
+            ("(unknown: print,screen,speech)", false),
+        ] {
+            assert!(host.set_attribute(link, "media", media));
+            let disposition = stylesheet_link_disposition(&host, node_id)
+                .expect("the connected stylesheet should retain its load operation");
+            assert_eq!(disposition.is_blocking(), blocking, "media={media:?}");
+        }
+    }
 
     #[test]
     fn parser_created_style_imports_join_against_document_url() {
@@ -831,5 +954,21 @@ mod tests {
         assert!(host.remove_attribute(link, "disabled"));
         assert!(host.set_attribute(link, "type", "text/plain"));
         assert!(stylesheet_preload_link_request(&host, node_id).is_none());
+
+        for value in [
+            "text/css; charset=UTF-8",
+            "\tTEXT/CSS \r\n",
+            "text/css;ignored",
+        ] {
+            assert!(host.set_attribute(link, "type", value));
+            assert!(
+                stylesheet_preload_link_request(&host, node_id).is_some(),
+                "CSS preload MIME hint {value:?} must select the typed stylesheet owner"
+            );
+        }
+        for value in [" ", "\u{a0}text/css", "text/css, text/css"] {
+            assert!(host.set_attribute(link, "type", value));
+            assert!(stylesheet_preload_link_request(&host, node_id).is_none());
+        }
     }
 }

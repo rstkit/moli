@@ -2,9 +2,29 @@ use std::pin::pin;
 
 use moli_v8_test_util::ensure_v8;
 use moli_webapi_declare::{
-    ObjectLiteralDeclaration, WebApiFunctionTemplate, WebApiInterface, WebApiObject, WebApiValue,
-    define_array_data_property,
+    ObjectLiteralDeclaration, WebApiFunctionTemplate, WebApiFunctionTemplateDeclaration,
+    WebApiObject, WebApiValue, define_array_data_property,
 };
+
+fn install_template<'s, D: WebApiFunctionTemplateDeclaration>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+) -> v8::Local<'s, v8::Function> {
+    let constructor = D::build(scope)
+        .get_function(scope)
+        .expect("build constructor");
+    assert_eq!(
+        global.define_own_property(
+            scope,
+            v8::String::new(scope, D::NAME).unwrap().into(),
+            constructor.into(),
+            v8::PropertyAttribute::DONT_ENUM,
+        ),
+        Some(true),
+        "publish constructor"
+    );
+    constructor
+}
 
 fn run_script<'s>(scope: &mut v8::PinScope<'s, '_>, source: &str) -> v8::Local<'s, v8::Value> {
     let source = v8::String::new(scope, source).expect("test source should allocate");
@@ -129,8 +149,13 @@ const SAMPLE_HIDDEN_SLOT: &str = "__lmSampleHidden";
 const SAMPLE_LOCKED_HIDDEN_SLOT: &str = "__lmSampleLockedHidden";
 const SAMPLE_LOCAL_OBJECT_SLOT: &str = "__lmSampleLocalObject";
 
-#[derive(WebApiInterface)]
-#[webapi(name = "SamplePerformance", constructor = "illegal")]
+#[derive(WebApiFunctionTemplate)]
+#[webapi(
+    name = "SamplePerformance",
+    constructor = "illegal",
+    readonly_prototype,
+    prototype_to_string_tag = "SamplePerformance"
+)]
 struct SamplePerformanceInterface {
     #[webapi(method, length = 0, callback = sample_now_callback)]
     now: (),
@@ -141,15 +166,15 @@ struct SamplePerformanceInterface {
     current_time: (),
 }
 
-#[derive(WebApiInterface)]
+#[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "ConstructibleSample",
+    interface = interfaces::ConstructibleSample,
     constructor_callback = sample_constructor_callback,
     constructor_length = 2
 )]
 struct ConstructibleSampleInterface {}
 
-#[derive(WebApiInterface)]
+#[derive(WebApiFunctionTemplate)]
 #[webapi(name = "InterfaceDescriptorSample", constructor = "illegal")]
 struct InterfaceDescriptorSample {
     #[webapi(method, enumerable, readonly, dont_delete, callback = sample_now_callback)]
@@ -157,7 +182,7 @@ struct InterfaceDescriptorSample {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "SamplePerformance")]
+#[webapi(interface = interfaces::SamplePerformance)]
 struct SamplePerformanceObject {
     #[webapi(data_property = SAMPLE_TIME_ORIGIN_SLOT)]
     time_origin: f64,
@@ -237,14 +262,14 @@ struct SamplePerformanceObject {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "SamplePerformance")]
+#[webapi(interface = interfaces::SamplePerformance)]
 struct SampleLocalObjectSlot<'scope> {
     #[webapi(slot = SAMPLE_LOCAL_OBJECT_SLOT)]
     local_object: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct GeneratedConstructorObject<'scope> {
     #[webapi(data_property, init = true)]
     brand: (),
@@ -257,7 +282,7 @@ struct GeneratedConstructorObject<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NestedValueRecord {
     #[webapi(data_property, enumerable)]
     name: &'static str,
@@ -267,7 +292,17 @@ struct NestedValueRecord {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
+struct DeclaredDataProperties {
+    #[webapi(data_property)]
+    value: Option<u32>,
+
+    #[webapi(data_property, enumerable)]
+    enumerable_value: Option<u32>,
+}
+
+#[derive(WebApiObject)]
+#[webapi(plain)]
 struct DefaultNameObject<'scope> {
     #[webapi(data_property, enumerable)]
     _visible_label: &'static str,
@@ -328,7 +363,7 @@ struct DefaultNameObject<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct AliasObject {
     #[webapi(method, enumerable, length = 0, callback = sample_now_callback)]
     entries: (),
@@ -338,7 +373,7 @@ struct AliasObject {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct ConstantObject {
     #[webapi(constant = "READY", value = 4u32)]
     ready: (),
@@ -346,7 +381,7 @@ struct ConstantObject {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "SampleTemplate",
+    interface = interfaces::SampleTemplate,
     constructor_callback = sample_constructor_callback,
     constructor_length = 1,
     enumerable
@@ -399,6 +434,71 @@ struct SampleFunctionTemplateDeclaration {
     native_holder: (),
 }
 
+const DYNAMIC_ATTRIBUTE_NAME: &str = "runtimeAttribute";
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(name = "AttributeMetadata", enumerable)]
+struct AttributeMetadataTemplateDeclaration {
+    #[webapi(accessor_property, getter = sample_receiver_getter)]
+    implicit_name: (),
+    #[webapi(accessor_property = "explicit-name-Δ", getter = sample_receiver_getter)]
+    explicit: (),
+    #[webapi(native_data_property, getter = sample_native_holder_getter)]
+    native_holder: (),
+    #[webapi(accessor_property = DYNAMIC_ATTRIBUTE_NAME, getter = sample_receiver_getter)]
+    dynamic: (),
+    #[webapi(accessor_property, symbol = "toStringTag", getter = sample_receiver_getter)]
+    tag: (),
+    #[webapi(method, callback = sample_now_callback)]
+    method: (),
+    #[webapi(constant = "READY", value = 4u32)]
+    ready: (),
+}
+
+#[test]
+fn prototype_attribute_metadata_tracks_static_attribute_keys() {
+    ensure_v8();
+    let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    install_template::<AttributeMetadataTemplateDeclaration>(scope, global);
+    let attributes = AttributeMetadataTemplateDeclaration::PROTOTYPE_ATTRIBUTE_NAMES;
+    assert_eq!(
+        attributes,
+        ["implicitName", "explicit-name-Δ", "nativeHolder"]
+    );
+    for attribute in attributes {
+        assert!(
+            run_script(
+                scope,
+                &format!("Object.hasOwn(AttributeMetadata.prototype, {attribute:?})")
+            )
+            .boolean_value(scope)
+        );
+    }
+    assert!(
+        run_script(
+            scope,
+            r#"['implicitName', 'explicit-name-Δ'].every(key => {
+                const descriptor = Object.getOwnPropertyDescriptor(AttributeMetadata.prototype, key);
+                return descriptor.get.name === `get ${key}`
+                    && descriptor.get.length === 0 && descriptor.set === undefined;
+            })"#
+        )
+        .boolean_value(scope)
+    );
+    assert!(
+        run_script(
+            scope,
+            "['runtimeAttribute', 'method', 'READY'].every(key => Object.hasOwn(AttributeMetadata.prototype, key)) && Object.hasOwn(AttributeMetadata.prototype, Symbol.toStringTag)"
+        )
+        .boolean_value(scope)
+    );
+}
+
 #[derive(WebApiFunctionTemplate)]
 #[webapi(name = "IntrinsicArrayTemplate", enumerable)]
 struct IntrinsicArrayTemplateDeclaration {
@@ -439,7 +539,7 @@ struct IntrinsicIteratorTemplateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct ExplicitFunctionNameSymbolMethodObject {
     #[webapi(
         method,
@@ -451,14 +551,14 @@ struct ExplicitFunctionNameSymbolMethodObject {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NativeDataPropertyObject {
     #[webapi(native_data_property, getter = sample_native_holder_getter)]
     native_holder: (),
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", enumerable)]
+#[webapi(plain, enumerable)]
 struct DefaultEnumerableMembersObject {
     #[webapi(data_property)]
     property_value: &'static str,
@@ -478,7 +578,7 @@ struct DefaultEnumerableMembersObject {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct DefaultEnumerablePropertiesObject {
     client_x: f64,
     is_2d: bool,
@@ -487,48 +587,39 @@ struct DefaultEnumerablePropertiesObject {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "SamplePerformance", data_properties, enumerable)]
+#[webapi(interface = interfaces::SamplePerformance, data_properties, enumerable)]
 struct PrototypeBackedEnumerablePropertiesObject {
     client_x: f64,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", rename_all = "none", data_properties, enumerable)]
+#[webapi(plain, rename_all = "none", data_properties, enumerable)]
 struct ExplicitSnakeCasePropertiesObject {
     snake_case_name: &'static str,
 }
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "SamplePerformance",
+    interface = interfaces::SamplePerformance,
     own_to_string_tag = "ReadonlySample",
     readonly_to_string_tag,
-    allow_empty
 )]
 struct ReadonlyTagObject {}
 
 #[derive(WebApiObject)]
-#[webapi(interface = "MissingSampleInterface", require_prototype, allow_empty)]
+#[webapi(interface = interfaces::MissingSampleInterface, require_prototype)]
 struct RequiredPrototypeObject {}
 
 #[derive(WebApiObject)]
-#[webapi(
-    interface = "Object",
-    prototype = "SamplePerformance",
-    require_prototype
-)]
+#[webapi(plain, prototype = "SamplePerformance", require_prototype)]
 struct PrototypeOnlyObject {}
 
 #[derive(WebApiObject)]
-#[webapi(
-    interface = "Object",
-    prototype = "MissingSampleInterface",
-    require_prototype
-)]
+#[webapi(plain, prototype = "MissingSampleInterface", require_prototype)]
 struct MissingPrototypeOnlyObject {}
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", scope_lifetime = 'scope)]
+#[webapi(plain, scope_lifetime = 'scope)]
 struct RuntimePrototypeTaggedObject<'scope, 'tag> {
     #[webapi(prototype)]
     prototype: v8::Local<'scope, v8::Object>,
@@ -538,14 +629,14 @@ struct RuntimePrototypeTaggedObject<'scope, 'tag> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct RuntimeTagOnlyObject<'tag> {
     #[webapi(to_string_tag)]
     to_string_tag: Option<&'tag str>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct RuntimeReadonlyLockedTagObject {
     #[webapi(to_string_tag, readonly, dont_delete, init = string("LockedRuntimeTag"))]
     to_string_tag: (),
@@ -553,22 +644,62 @@ struct RuntimeReadonlyLockedTagObject {
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "SamplePerformance",
+    interface = interfaces::SamplePerformance,
     fallback_to_string_tag = "SampleFallback",
-    allow_empty
 )]
 struct PrototypeBackedFallbackTagObject {}
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "MissingSampleInterface",
+    interface = interfaces::MissingSampleInterface,
     fallback_to_string_tag = "MissingSample",
-    allow_empty
 )]
 struct MissingPrototypeFallbackTagObject {}
 
 #[test]
-fn declared_interface_and_object_have_expected_surface() {
+fn declared_data_properties_report_rejected_writes() {
+    ensure_v8();
+    let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    for (name, declaration) in [
+        (
+            "value",
+            DeclaredDataProperties {
+                value: Some(42),
+                enumerable_value: None,
+            },
+        ),
+        (
+            "enumerableValue",
+            DeclaredDataProperties {
+                value: None,
+                enumerable_value: Some(42),
+            },
+        ),
+    ] {
+        let target = v8::Object::new(scope);
+        assert_eq!(
+            target.set_integrity_level(scope, v8::IntegrityLevel::Frozen),
+            Some(true)
+        );
+        let error = declaration
+            .initialize(scope, target)
+            .expect_err("rejected property writes must fail initialization");
+        assert_eq!(
+            error.to_string(),
+            format!("failed to define `{name}` value")
+        );
+        let key = v8::String::new(scope, name).unwrap();
+        assert_eq!(target.has_own_property(scope, key.into()), Some(false));
+    }
+}
+
+#[test]
+fn declared_template_and_object_have_expected_surface() {
     ensure_v8();
     let mut isolate = v8::Isolate::new(v8::CreateParams::default());
     let scope = pin!(v8::HandleScope::new(&mut isolate));
@@ -577,12 +708,7 @@ fn declared_interface_and_object_have_expected_surface() {
     let scope = &mut v8::ContextScope::new(scope, context);
     let global = context.global(scope);
 
-    let interface = SamplePerformanceInterface {
-        now: (),
-        sample_now: (),
-        current_time: (),
-    };
-    interface.bind(scope, global).expect("bind interface");
+    install_template::<SamplePerformanceInterface>(scope, global);
     let declaration = SamplePerformanceObject {
         time_origin: 12.0,
         public_time_origin: 12.0,
@@ -1704,9 +1830,7 @@ fn declared_constructor_callback_uses_configured_length() {
     let scope = &mut v8::ContextScope::new(scope, context);
     let global = context.global(scope);
 
-    let constructor = ConstructibleSampleInterface {}
-        .bind(scope, global)
-        .expect("bind interface");
+    let constructor = install_template::<ConstructibleSampleInterface>(scope, global);
     let length = constructor
         .get(scope, v8::String::new(scope, "length").unwrap().into())
         .and_then(|value| value.number_value(scope));
@@ -1739,7 +1863,7 @@ fn declared_native_data_property_uses_native_holder() {
 }
 
 #[test]
-fn declared_interface_method_descriptor_attributes_are_applied() {
+fn declared_template_method_descriptor_attributes_are_applied() {
     ensure_v8();
     let mut isolate = v8::Isolate::new(v8::CreateParams::default());
     let scope = pin!(v8::HandleScope::new(&mut isolate));
@@ -1748,9 +1872,7 @@ fn declared_interface_method_descriptor_attributes_are_applied() {
     let scope = &mut v8::ContextScope::new(scope, context);
     let global = context.global(scope);
 
-    let constructor = InterfaceDescriptorSample { locked_visible: () }
-        .bind(scope, global)
-        .expect("bind descriptor sample");
+    let constructor = install_template::<InterfaceDescriptorSample>(scope, global);
     let prototype = constructor
         .get(scope, v8::String::new(scope, "prototype").unwrap().into())
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
@@ -1815,14 +1937,16 @@ fn indexed_property_handler_flags_are_forwarded_to_v8() {
                 .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
         })
         .expect("Object.prototype");
-    object_prototype
-        .define_own_property(
+    assert_eq!(
+        object_prototype.define_own_property(
             scope,
             v8::String::new(scope, "0").unwrap().into(),
             v8::Integer::new(scope, 5).into(),
             v8::PropertyAttribute::NONE,
-        )
-        .expect("define Object.prototype[0]");
+        ),
+        Some(true),
+        "define Object.prototype[0]"
+    );
 
     let masking_template = v8::ObjectTemplate::new(scope);
     masking_template.set_indexed_property_handler(
@@ -2159,13 +2283,7 @@ fn declared_enumerable_properties_bypass_prototype_assignment_semantics() {
     let scope = &mut v8::ContextScope::new(scope, context);
     let global = context.global(scope);
 
-    SamplePerformanceInterface {
-        now: (),
-        sample_now: (),
-        current_time: (),
-    }
-    .bind(scope, global)
-    .expect("bind SamplePerformance");
+    install_template::<SamplePerformanceInterface>(scope, global);
     let constructor = global
         .get(
             scope,
@@ -2179,14 +2297,16 @@ fn declared_enumerable_properties_bypass_prototype_assignment_semantics() {
         .expect("prototype");
     let client_x_name = v8::String::new(scope, "clientX").unwrap();
     let prototype_value = v8::String::new(scope, "prototype-blocked").unwrap();
-    prototype
-        .define_own_property(
+    assert_eq!(
+        prototype.define_own_property(
             scope,
             client_x_name.into(),
             prototype_value.into(),
             v8::PropertyAttribute::READ_ONLY,
-        )
-        .expect("readonly prototype property should define");
+        ),
+        Some(true),
+        "readonly prototype property should define"
+    );
 
     let object = PrototypeBackedEnumerablePropertiesObject { client_x: 42.0 }
         .bind(scope)
@@ -2981,4 +3101,203 @@ fn get_private_value<'s>(
     } else {
         Some(value)
     }
+}
+
+mod interfaces {
+    moli_webapi_declare::declare_web_api_interfaces! {
+        pub(super) ConstructibleSample;
+        pub(super) MissingSampleInterface;
+        pub(super) SamplePerformance;
+        pub(super) SampleTemplate;
+    }
+}
+
+#[test]
+fn null_prototype_declarations_ignore_object_prototype_pollution() {
+    #[derive(WebApiObject)]
+    #[webapi(plain)]
+    struct NullPrototype {
+        #[webapi(prototype, value = v8::null(scope))]
+        prototype: (),
+    }
+
+    ensure_v8();
+    let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let object = NullPrototype::new().bind(scope).unwrap();
+    assert!(object.get_prototype(scope).unwrap().is_null());
+    let invalid = v8::Integer::new(scope, 1);
+    assert!(moli_webapi_declare::set_declared_prototype(scope, object, &invalid).is_err());
+    assert!(object.get_prototype(scope).unwrap().is_null());
+    run_script(
+        scope,
+        "Object.prototype.get = () => { throw Error('inherited getter') };",
+    );
+    let value = v8::Integer::new(scope, 7);
+    let descriptor =
+        moli_webapi_declare::DataPropertyDescriptorDeclaration::new(value.into(), false, true)
+            .bind(scope)
+            .unwrap();
+    assert!(descriptor.get_prototype(scope).unwrap().is_null());
+    let global = context.global(scope);
+    assert_eq!(
+        global.create_data_property(
+            scope,
+            v8::String::new(scope, "descriptor").unwrap().into(),
+            descriptor.into()
+        ),
+        Some(true)
+    );
+    assert!(
+        run_script(
+            scope,
+            r#"(() => {
+        const target={};Object.defineProperty(target,'value',descriptor);
+        const d=Object.getOwnPropertyDescriptor(target,'value');
+        return target.value===7 && d.writable===false && d.enumerable && d.configurable;
+    })()"#
+        )
+        .is_true()
+    );
+}
+trait CallbackMarker {
+    const VALUE: u32;
+}
+
+struct Seven;
+impl CallbackMarker for Seven {
+    const VALUE: u32 = 7;
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(name = "GenericCallbacks")]
+struct GenericCallbacks<T: CallbackMarker> {
+    #[webapi(method, callback = Self::call, data = 3u32)]
+    call: (),
+    #[webapi(method, callback = Self::call)]
+    no_data: (),
+    #[webapi(accessor_property, getter = Self::call)]
+    value: (),
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<T: CallbackMarker> GenericCallbacks<T> {
+    fn call<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        args: v8::FunctionCallbackArguments<'s>,
+        mut rv: v8::ReturnValue<'s>,
+    ) {
+        let value = if let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(0)) {
+            let Some(value) = callback.call(scope, args.this().into(), &[args.data()]) else {
+                return;
+            };
+            value.uint32_value(scope).unwrap()
+        } else {
+            args.data().uint32_value(scope).unwrap()
+        };
+        rv.set_uint32(T::VALUE + value);
+    }
+}
+
+#[derive(WebApiObject)]
+#[webapi(plain)]
+struct GenericCallbackObject<'s, T: CallbackMarker> {
+    #[webapi(method, callback = GenericCallbacks::<T>::call, data = self.data)]
+    call: (),
+    data: v8::Local<'s, v8::Value>,
+    marker: std::marker::PhantomData<T>,
+}
+
+#[test]
+fn generic_callbacks_keep_data_and_return_values_across_nested_v8_entries() {
+    ensure_v8();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    install_template::<GenericCallbacks<Seven>>(scope, global);
+    let data = v8::Integer::new_from_unsigned(scope, 5).into();
+    let object = GenericCallbackObject::<Seven>::new(data, std::marker::PhantomData)
+        .bind(scope)
+        .unwrap();
+    global
+        .set(
+            scope,
+            v8::String::new(scope, "object").unwrap().into(),
+            object.into(),
+        )
+        .unwrap();
+    assert!(
+        run_script(
+            scope,
+            r#"
+        (() => {
+            const template = GenericCallbacks.prototype;
+            if (template.call() !== 10 || object.call() !== 12 || template.noData() !== 7 || template.value !== 7) return false;
+            if (template.call(n => object.call(m => n + m)) !== 22) return false;
+            const error = {};
+            try { object.call(() => { throw error; }); return false; }
+            catch (caught) { if (caught !== error) return false; }
+            return template.call() === 10 && object.call() === 12;
+        })()
+    "#
+        )
+        .boolean_value(scope)
+    );
+}
+#[derive(WebApiFunctionTemplate)]
+#[webapi(name = "MethodOrder", enumerable)]
+struct MethodOrder {
+    #[webapi(method, callback = sample_now_callback, readonly)]
+    first: (),
+    #[webapi(method, callback = sample_now_callback, length = 2, dont_delete)]
+    second: (),
+    #[webapi(accessor_property, getter = sample_now_callback, setter = sample_accessor_setter)]
+    middle: (),
+    #[webapi(method, callback = sample_data_callback, data = "payload")]
+    data: (),
+    #[webapi(method, callback = sample_now_callback)]
+    last: (),
+}
+
+#[test]
+fn template_method_runs_preserve_order_descriptors_and_callback_data() {
+    ensure_v8();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    install_template::<MethodOrder>(scope, global);
+    assert!(
+        run_script(
+            scope,
+            r#"
+        (() => {
+            const p = MethodOrder.prototype;
+            const names = Object.keys(p);
+            if (names.join(',') !== 'first,second,middle,data,last') return false;
+            const first = Object.getOwnPropertyDescriptor(p, 'first');
+            const second = Object.getOwnPropertyDescriptor(p, 'second');
+            const middle = Object.getOwnPropertyDescriptor(p, 'middle');
+            p.middle = 13;
+            return !first.writable && first.configurable && first.enumerable
+                && second.writable && !second.configurable && second.enumerable
+                && p.first.name === 'first' && p.first.length === 0
+                && p.second.name === 'second' && p.second.length === 2
+                && middle.get.name === 'get middle' && middle.get.length === 0
+                && middle.set.name === 'set middle' && middle.set.length === 1
+                && p.middle === 7 && p.writtenValue === 13 && p.setterPayload === 'undefined'
+                && p.data() === 'payload' && p.last() === 7;
+        })()
+    "#
+        )
+        .boolean_value(scope)
+    );
 }

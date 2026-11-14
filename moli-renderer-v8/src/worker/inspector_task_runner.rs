@@ -1,3 +1,5 @@
+use crate::runtime::WorkerInspectorError;
+use anyhow::Result;
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
@@ -10,6 +12,7 @@ use std::{
 };
 
 use moli_protocol_cdp::CdpInspectorTaskMode;
+use moli_v8_platform::{ProcessEnvironmentNotifications, ProcessEnvironmentNotifier};
 use parking_lot::{Condvar, Mutex};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -77,24 +80,119 @@ unsafe extern "C" fn dispatch_worker_inspector_interrupt(
 
 pub(crate) type WorkerInspectorTaskMode = CdpInspectorTaskMode;
 
+/// One native session incarnation. Wire ids may be reused after attach; tasks
+/// and channels retain this token so retired work cannot address its successor.
+#[derive(Clone)]
+pub(crate) struct WorkerInspectorSessionLifetime(Arc<WorkerInspectorSessionLifetimeState>);
+
+struct WorkerInspectorSessionLifetimeState {
+    active: AtomicBool,
+    native_created: AtomicBool,
+    detachment: Mutex<WorkerInspectorSessionCompletion>,
+    retirement: Mutex<WorkerInspectorSessionCompletion>,
+}
+
+#[derive(Default)]
+struct WorkerInspectorSessionCompletion {
+    result: Option<std::result::Result<(), WorkerInspectorError>>,
+    waiters: Vec<oneshot::Sender<Result<()>>>,
+}
+
+impl WorkerInspectorSessionCompletion {
+    fn complete(&mut self, result: std::result::Result<(), WorkerInspectorError>) {
+        if self.result.is_some() {
+            return;
+        }
+        self.result = Some(result);
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.send(result.map_err(Into::into));
+        }
+    }
+
+    fn subscribe(&mut self) -> oneshot::Receiver<Result<()>> {
+        let (tx, rx) = oneshot::channel();
+        if let Some(result) = self.result {
+            let _ = tx.send(result.map_err(Into::into));
+        } else {
+            self.waiters.push(tx);
+        }
+        rx
+    }
+}
+
+impl WorkerInspectorSessionLifetime {
+    fn new() -> Self {
+        Self(Arc::new(WorkerInspectorSessionLifetimeState {
+            active: AtomicBool::new(true),
+            native_created: AtomicBool::new(false),
+            detachment: Mutex::new(WorkerInspectorSessionCompletion::default()),
+            retirement: Mutex::new(WorkerInspectorSessionCompletion::default()),
+        }))
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.0.active.load(Ordering::Acquire)
+    }
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(crate) fn mark_native_created(&self) {
+        self.0.native_created.store(true, Ordering::Release);
+    }
+    pub(crate) fn native_was_created(&self) -> bool {
+        self.0.native_created.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn complete_retirement(
+        &self,
+        result: std::result::Result<(), WorkerInspectorError>,
+    ) {
+        self.0.retirement.lock().complete(result);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retirement(&self) -> oneshot::Receiver<Result<()>> {
+        self.0.retirement.lock().subscribe()
+    }
+
+    pub(crate) fn complete_detachment(
+        &self,
+        result: std::result::Result<(), WorkerInspectorError>,
+    ) {
+        self.0.detachment.lock().complete(result);
+    }
+
+    fn detachment(&self) -> oneshot::Receiver<Result<()>> {
+        self.0.detachment.lock().subscribe()
+    }
+}
+
 pub(crate) enum WorkerInspectorTask {
+    EnvironmentInvalidation(moli_v8_platform::ProcessEnvironmentInvalidation),
     DispatchProtocolMessage {
+        lifetime: WorkerInspectorSessionLifetime,
         inspector_session_id: Option<String>,
         raw_json: String,
         deferred_response: Option<RendererRuntimeInspectorResponseSender>,
-        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>, String>>,
+        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>>>,
     },
     AttachSession {
+        lifetime: WorkerInspectorSessionLifetime,
         inspector_session_id: Option<String>,
     },
     DetachSession {
+        lifetime: WorkerInspectorSessionLifetime,
         inspector_session_id: Option<String>,
     },
     RunIfWaitingForDebugger,
 }
 
 impl WorkerInspectorTask {
-    fn fail(self, message: &str) {
+    fn fail(self, error: WorkerInspectorError) {
+        if let Self::DetachSession { lifetime, .. } = &self {
+            lifetime.complete_detachment(Err(error));
+            lifetime.complete_retirement(Err(error));
+        }
         let Self::DispatchProtocolMessage {
             deferred_response,
             response_tx,
@@ -109,17 +207,18 @@ impl WorkerInspectorTask {
                 "id": call_id,
                 "error": {
                     "code": -32000,
-                    "message": message,
+                    "message": error.to_string(),
                 },
             }));
         }
-        let _ = response_tx.send(Err(message.to_owned()));
+        let _ = response_tx.send(Err(error.into()));
     }
 }
 
 struct WorkerInspectorTaskRunnerState {
     interrupting_tasks: VecDeque<WorkerInspectorTask>,
     dont_interrupting_tasks: VecDeque<WorkerInspectorTask>,
+    sessions: HashMap<String, WorkerInspectorSessionLifetime>,
     disposed: bool,
     isolate_ready: bool,
     pause_loop_active: bool,
@@ -128,6 +227,12 @@ struct WorkerInspectorTaskRunnerState {
 
 struct WorkerInspectorTaskRunnerShared {
     state: Mutex<WorkerInspectorTaskRunnerState>,
+    environment_notifications: ProcessEnvironmentNotifications,
+    // Tracks an outstanding fallback WorkerMessage::RunEnvironmentNotification,
+    // not whether the mailbox contains an invalidation. Only consumption of
+    // that owner message disarms it; interrupt/pause consumption must not,
+    // otherwise repeated interrupts can flood the ordinary Worker channel.
+    environment_owner_wake_armed: AtomicBool,
     pause_work: Condvar,
     wake_tx: mpsc::UnboundedSender<WorkerMessage>,
     isolate_handle: Arc<Mutex<Option<v8::IsolateHandle>>>,
@@ -147,15 +252,18 @@ impl WorkerInspectorTaskRunner {
         isolate_handle: Arc<Mutex<Option<v8::IsolateHandle>>>,
     ) -> Self {
         let route_id = NEXT_WORKER_INSPECTOR_ROUTE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
             .expect("worker Inspector route ID exhausted");
         Self {
             shared: Arc::new(WorkerInspectorTaskRunnerShared {
+                environment_notifications: ProcessEnvironmentNotifications::default(),
+                environment_owner_wake_armed: AtomicBool::new(false),
                 state: Mutex::new(WorkerInspectorTaskRunnerState {
                     interrupting_tasks: VecDeque::new(),
                     dont_interrupting_tasks: VecDeque::new(),
+                    sessions: HashMap::new(),
                     disposed: false,
                     isolate_ready: false,
                     pause_loop_active: false,
@@ -175,12 +283,64 @@ impl WorkerInspectorTaskRunner {
         self.shared.interrupt_target.route_id
     }
 
+    /// Share owner/interrupt/pause delivery without appending a task per change.
+    /// The controller publishes the mailbox before calling this wake, unlocked.
+    pub(crate) fn environment_notifier(&self) -> ProcessEnvironmentNotifier {
+        let runner = self.clone();
+        self.shared.environment_notifications.notifier(move || {
+            runner.wake_environment();
+        })
+    }
+
+    fn wake_environment(&self) {
+        if !self.shared.environment_notifications.has_pending() {
+            return;
+        }
+        if !self
+            .shared
+            .environment_owner_wake_armed
+            .swap(true, Ordering::AcqRel)
+            && self
+                .shared
+                .wake_tx
+                .send(WorkerMessage::RunEnvironmentNotification)
+                .is_err()
+        {
+            self.dispose(WorkerInspectorError::EnvironmentUnavailable);
+            return;
+        }
+        self.request_interrupt_if_needed();
+        self.shared.pause_work.notify_one();
+    }
+
+    /// Called only when consuming the fallback owner message. Disarm before
+    /// taking the mailbox so a racing publication can arm the next owner wake.
+    pub(crate) fn claim_environment_for_owner(
+        &self,
+    ) -> Option<moli_v8_platform::ProcessEnvironmentInvalidation> {
+        self.shared
+            .environment_owner_wake_armed
+            .store(false, Ordering::Release);
+        self.claim_environment_invalidation()
+    }
+
+    fn claim_environment_task(&self) -> Option<WorkerInspectorTask> {
+        self.claim_environment_invalidation()
+            .map(WorkerInspectorTask::EnvironmentInvalidation)
+    }
+
+    pub(crate) fn claim_environment_invalidation(
+        &self,
+    ) -> Option<moli_v8_platform::ProcessEnvironmentInvalidation> {
+        self.shared.environment_notifications.take()
+    }
+
     pub(crate) fn append_protocol_message(
         &self,
         inspector_session_id: Option<String>,
         raw_json: String,
         deferred_response: Option<RendererRuntimeInspectorResponseSender>,
-        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>, String>>,
+        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>>>,
     ) -> bool {
         let mode = serde_json::from_str::<serde_json::Value>(&raw_json)
             .ok()
@@ -194,6 +354,7 @@ impl WorkerInspectorTaskRunner {
         self.append(
             mode,
             WorkerInspectorTask::DispatchProtocolMessage {
+                lifetime: self.session_lifetime(inspector_session_id.as_deref()),
                 inspector_session_id,
                 raw_json,
                 deferred_response,
@@ -202,22 +363,66 @@ impl WorkerInspectorTaskRunner {
         )
     }
 
+    pub(crate) fn session_lifetime(&self, id: Option<&str>) -> WorkerInspectorSessionLifetime {
+        self.shared
+            .state
+            .lock()
+            .sessions
+            .entry(id.unwrap_or_default().to_owned())
+            .or_insert_with(WorkerInspectorSessionLifetime::new)
+            .clone()
+    }
+
+    pub(crate) fn attach_lifetime(&self, id: Option<&str>) -> WorkerInspectorSessionLifetime {
+        let mut state = self.shared.state.lock();
+        let lifetime = state
+            .sessions
+            .entry(id.unwrap_or_default().to_owned())
+            .or_insert_with(WorkerInspectorSessionLifetime::new);
+        if !lifetime.is_active() {
+            *lifetime = WorkerInspectorSessionLifetime::new();
+        }
+        lifetime.clone()
+    }
+
+    pub(crate) fn retire_lifetime(&self, id: Option<&str>) -> WorkerInspectorSessionLifetime {
+        let mut state = self.shared.state.lock();
+        let lifetime = state
+            .sessions
+            .entry(id.unwrap_or_default().to_owned())
+            .or_insert_with(WorkerInspectorSessionLifetime::new)
+            .clone();
+        lifetime.0.active.store(false, Ordering::Release);
+        lifetime
+    }
+
     pub(crate) fn append_attach(&self, inspector_session_id: Option<String>) -> bool {
         self.append(
             WorkerInspectorTaskMode::Interrupt,
             WorkerInspectorTask::AttachSession {
+                lifetime: self.attach_lifetime(inspector_session_id.as_deref()),
                 inspector_session_id,
             },
         )
     }
 
-    pub(crate) fn append_detach(&self, inspector_session_id: Option<String>) -> bool {
+    pub(crate) fn append_detach(
+        &self,
+        inspector_session_id: Option<String>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let lifetime = self.retire_lifetime(inspector_session_id.as_deref());
+        // A synchronous Inspector dispatch can retain its native session on
+        // a pause stack owned by another debugger. The frontend waits until
+        // its agent is stopped, not until that unrelated pause is resumed.
+        let receipt = lifetime.detachment();
         self.append(
             WorkerInspectorTaskMode::Interrupt,
             WorkerInspectorTask::DetachSession {
+                lifetime,
                 inspector_session_id,
             },
-        )
+        );
+        receipt
     }
 
     pub(crate) fn append_run_if_waiting_for_debugger(&self) -> bool {
@@ -231,7 +436,7 @@ impl WorkerInspectorTaskRunner {
         let mut state = self.shared.state.lock();
         if state.disposed {
             drop(state);
-            task.fail("Worker Inspector task runner is disposed");
+            task.fail(WorkerInspectorError::Disposed);
             return false;
         }
         match mode {
@@ -248,7 +453,7 @@ impl WorkerInspectorTaskRunner {
             .send(WorkerMessage::RunInspectorTask(mode))
             .is_err()
         {
-            self.dispose("Worker Inspector owner is unavailable");
+            self.dispose(WorkerInspectorError::OwnerUnavailable);
             return false;
         }
         if mode == WorkerInspectorTaskMode::Interrupt {
@@ -276,6 +481,14 @@ impl WorkerInspectorTaskRunner {
         }
     }
 
+    /// An interrupt can service the mailbox first. An ordinary command wake
+    /// must claim its command instead: using it up on environment work would
+    /// strand that command after an idle Worker consumed both wake messages.
+    pub(crate) fn claim_interrupt_task(&self) -> Option<WorkerInspectorTask> {
+        self.claim_environment_task()
+            .or_else(|| self.claim_task(WorkerInspectorTaskMode::Interrupt))
+    }
+
     pub(crate) fn interrupt_callback_started(&self) {
         self.shared.interrupt_armed.store(false, Ordering::Release);
     }
@@ -283,7 +496,10 @@ impl WorkerInspectorTaskRunner {
     pub(crate) fn request_interrupt_if_needed(&self) {
         let should_request = {
             let state = self.shared.state.lock();
-            !state.disposed && state.isolate_ready && !state.interrupting_tasks.is_empty()
+            !state.disposed
+                && state.isolate_ready
+                && (self.shared.environment_notifications.has_pending()
+                    || !state.interrupting_tasks.is_empty())
         };
         if !should_request
             || self
@@ -329,6 +545,9 @@ impl WorkerInspectorTaskRunner {
             if state.disposed || state.quit_pause_loop {
                 return None;
             }
+            if let Some(task) = self.claim_environment_task() {
+                return Some(task);
+            }
             if let Some(task) = state.interrupting_tasks.pop_front() {
                 return Some(task);
             }
@@ -355,13 +574,17 @@ impl WorkerInspectorTaskRunner {
         self.shared.resume_requested.swap(false, Ordering::AcqRel)
     }
 
-    pub(crate) fn dispose(&self, message: &str) {
+    pub(crate) fn dispose(&self, error: WorkerInspectorError) {
         let (interrupting_tasks, dont_interrupting_tasks) = {
             let mut state = self.shared.state.lock();
             if state.disposed {
                 return;
             }
             state.disposed = true;
+            for lifetime in state.sessions.values() {
+                lifetime.0.active.store(false, Ordering::Release);
+            }
+            self.shared.environment_notifications.close();
             state.isolate_ready = false;
             state.quit_pause_loop = true;
             (
@@ -374,7 +597,7 @@ impl WorkerInspectorTaskRunner {
             .into_iter()
             .chain(dont_interrupting_tasks)
         {
-            task.fail(message);
+            task.fail(error);
         }
     }
 }
@@ -398,6 +621,8 @@ impl std::fmt::Debug for WorkerInspectorTaskRunner {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::WorkerInspectorError;
+    use anyhow::Result;
     use std::sync::Arc;
 
     use parking_lot::Mutex;
@@ -420,8 +645,7 @@ mod tests {
         runner: &WorkerInspectorTaskRunner,
         id: i64,
         method: &str,
-    ) -> oneshot::Receiver<Result<Vec<crate::runtime::RendererRuntimeInspectorMessage>, String>>
-    {
+    ) -> oneshot::Receiver<Result<Vec<crate::runtime::RendererRuntimeInspectorMessage>>> {
         let (response_tx, response_rx) = oneshot::channel();
         assert!(runner.append_protocol_message(
             Some("SID-worker-runner".to_owned()),
@@ -562,16 +786,125 @@ mod tests {
     }
 
     #[test]
+    fn environment_bursts_and_interrupt_consumption_keep_the_owner_wake_bounded() {
+        use moli_v8_platform::ProcessEnvironmentInvalidation::{DateTime, LocaleAndDateTime};
+
+        let (runner, mut wake_rx) = runner();
+        let notifier = runner.environment_notifier();
+        for _ in 0..10_000 {
+            notifier.notify(DateTime);
+            notifier.notify(LocaleAndDateTime);
+        }
+        assert!(matches!(
+            wake_rx.try_recv(),
+            Ok(super::WorkerMessage::RunEnvironmentNotification)
+        ));
+        assert!(wake_rx.try_recv().is_err());
+        assert!(runner.shared.state.lock().interrupting_tasks.is_empty());
+
+        // Simulate JS repeatedly accepting V8 interrupts while the ordinary
+        // owner loop has not handled the already-posted fallback wake.
+        for _ in 0..1_000 {
+            notifier.notify(LocaleAndDateTime);
+            assert!(matches!(
+                runner.claim_interrupt_task(),
+                Some(WorkerInspectorTask::EnvironmentInvalidation(
+                    LocaleAndDateTime
+                ))
+            ));
+        }
+        assert!(wake_rx.try_recv().is_err());
+        assert!(runner.claim_environment_for_owner().is_none());
+        notifier.notify(DateTime);
+        assert!(matches!(
+            wake_rx.try_recv(),
+            Ok(super::WorkerMessage::RunEnvironmentNotification)
+        ));
+        assert!(matches!(
+            runner.claim_environment_for_owner(),
+            Some(DateTime)
+        ));
+        assert!(wake_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_environment_does_not_consume_an_ordinary_command_wake() {
+        use moli_v8_platform::ProcessEnvironmentInvalidation::LocaleAndDateTime;
+        let (runner, mut wake_rx) = runner();
+        let _command = append_protocol(&runner, 1, "Debugger.resume");
+        runner.environment_notifier().notify(LocaleAndDateTime);
+        assert!(matches!(
+            wake_rx.try_recv(),
+            Ok(super::WorkerMessage::RunInspectorTask(
+                WorkerInspectorTaskMode::Interrupt
+            ))
+        ));
+        assert!(matches!(
+            runner.claim_task(WorkerInspectorTaskMode::Interrupt),
+            Some(WorkerInspectorTask::DispatchProtocolMessage { .. })
+        ));
+        assert!(matches!(
+            wake_rx.try_recv(),
+            Ok(super::WorkerMessage::RunEnvironmentNotification)
+        ));
+        assert_eq!(
+            runner.claim_environment_for_owner(),
+            Some(LocaleAndDateTime)
+        );
+        assert!(wake_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn environment_notifications_merge_before_pause_commands_and_are_discarded_on_disposal() {
+        use moli_v8_platform::ProcessEnvironmentInvalidation::{DateTime, LocaleAndDateTime};
+
+        let (runner, _wake_rx) = runner();
+        let notifier = runner.environment_notifier();
+        let _first = append_protocol(&runner, 1, "Debugger.pause");
+        notifier.notify(LocaleAndDateTime);
+        let _second = append_protocol(&runner, 2, "Debugger.resume");
+        notifier.notify(DateTime);
+        assert!(runner.begin_pause_loop());
+        // The pause claims one merged invalidation ahead of queued commands,
+        // without a session or ordinary Worker-loop turn.
+        assert!(matches!(
+            runner.wait_for_pause_task(),
+            Some(WorkerInspectorTask::EnvironmentInvalidation(
+                LocaleAndDateTime
+            ))
+        ));
+        assert!(matches!(
+            runner.wait_for_pause_task(),
+            Some(WorkerInspectorTask::DispatchProtocolMessage { raw_json, .. })
+                if raw_json.contains("Debugger.pause")
+        ));
+        assert!(matches!(runner.wait_for_pause_task(),
+            Some(WorkerInspectorTask::DispatchProtocolMessage { raw_json, .. })
+                if raw_json.contains("Debugger.resume")));
+        notifier.notify(DateTime);
+        runner.dispose(WorkerInspectorError::Closed);
+        notifier.notify(LocaleAndDateTime);
+        assert!(
+            runner
+                .claim_task(WorkerInspectorTaskMode::Interrupt)
+                .is_none()
+        );
+        assert!(runner.wait_for_pause_task().is_none());
+    }
+
+    #[test]
     fn dispose_rejects_queued_and_late_protocol_tasks() {
         let (runner, _wake_rx) = runner();
         let mut queued = append_protocol(&runner, 1, "Runtime.evaluate");
-        runner.dispose("worker teardown");
+        runner.dispose(WorkerInspectorError::Closed);
         assert_eq!(
             queued
                 .try_recv()
                 .expect("queued task should be canceled")
-                .expect_err("queued task must not dispatch"),
-            "worker teardown"
+                .expect_err("queued task must not dispatch")
+                .downcast::<WorkerInspectorError>()
+                .unwrap(),
+            WorkerInspectorError::Closed
         );
 
         let (response_tx, mut late) = oneshot::channel();
@@ -584,8 +917,55 @@ mod tests {
         assert_eq!(
             late.try_recv()
                 .expect("late task should be rejected")
-                .expect_err("late task must not dispatch"),
-            "Worker Inspector task runner is disposed"
+                .expect_err("late task must not dispatch")
+                .downcast::<WorkerInspectorError>()
+                .unwrap(),
+            WorkerInspectorError::Disposed
         );
+    }
+    #[test]
+    fn queued_execution_keeps_its_original_session_incarnation_across_detach_attach() {
+        let (wake_tx, _wake_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = WorkerInspectorTaskRunner::new(wake_tx, Arc::new(Mutex::new(None)));
+        let (old_tx, _old_rx) = oneshot::channel();
+        assert!(runner.append_protocol_message(
+            Some("reused".into()),
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"'old'"}}"#.into(),
+            None,
+            old_tx
+        ));
+        let mut retired = runner.append_detach(Some("reused".into()));
+        assert!(runner.append_attach(Some("reused".into())));
+        let (new_tx, _new_rx) = oneshot::channel();
+        assert!(runner.append_protocol_message(
+            Some("reused".into()),
+            r#"{"id":1,"method":"Runtime.evaluate","params":{"expression":"'new'"}}"#.into(),
+            None,
+            new_tx
+        ));
+        let Some(WorkerInspectorTask::DispatchProtocolMessage { lifetime: old, .. }) =
+            runner.claim_task(WorkerInspectorTaskMode::DontInterrupt)
+        else {
+            panic!("old execution task")
+        };
+        let Some(WorkerInspectorTask::DispatchProtocolMessage { lifetime: new, .. }) =
+            runner.claim_task(WorkerInspectorTaskMode::DontInterrupt)
+        else {
+            panic!("new execution task")
+        };
+        assert!(!old.is_active());
+        assert!(new.is_active());
+        assert!(!old.matches(&new));
+        assert!(
+            matches!(retired.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "enqueueing detach has not stopped the native debugger agent"
+        );
+        let Some(WorkerInspectorTask::DetachSession { lifetime, .. }) =
+            runner.claim_task(WorkerInspectorTaskMode::Interrupt)
+        else {
+            panic!("detach owner task")
+        };
+        lifetime.complete_detachment(Ok(()));
+        retired.try_recv().unwrap().unwrap();
     }
 }

@@ -12,7 +12,173 @@ fn slotchange_microtask_callback(
     crate::observer_runtime::flush_slotchange_microtask(scope, host_ptr);
 }
 
-impl JsContextHost {
+impl PageScriptHost {
+    pub(crate) fn initialize_native_bridge_bindings(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_, ()>,
+        global: v8::Local<'_, v8::ObjectTemplate>,
+        cross_origin: v8::Local<'_, v8::ObjectTemplate>,
+    ) {
+        self.bridge
+            .bindings
+            .initialize_if_needed(scope, global, cross_origin);
+    }
+
+    pub(crate) fn mark_main_document_initial_empty(&mut self) {
+        assert!(moli_url::is_about_blank(self.document_url()));
+        self.initial_empty_main_document = true;
+    }
+
+    pub(crate) fn main_document_is_initial_empty(&self) -> bool {
+        self.initial_empty_main_document
+    }
+
+    pub(crate) fn rebind_initial_main_document_senders(
+        &mut self,
+        resource: RendererResourceCompletionSender,
+        navigation: crate::page_task_queue::RendererTopLevelNavigationHandoffSender,
+        service_worker: crate::page_task_queue::RendererPageServiceWorkerTaskSender,
+    ) {
+        self.resource_completion_tx = resource;
+        self.top_level_navigation_handoff_tx = navigation;
+        self.service_worker_task_tx = service_worker;
+        self.page_task_capabilities
+            .take()
+            .expect("a reused Window must have its previous complete Page task capabilities");
+    }
+
+    pub(crate) fn rebind_initial_window_debugger(
+        &mut self,
+        scheduler: crate::script_vm::RendererDomDebuggerPauseScheduler,
+    ) {
+        self.dom_debugger_state.rebind_pause_scheduler(scheduler);
+    }
+
+    pub(crate) fn main_document_local_window_transition_for_commit(
+        &self,
+        origin: &str,
+        inherited_opaque_origin_matches: bool,
+        inherited_document_domain: Option<&str>,
+        policy: &crate::document_runtime::DocumentPolicyContainer,
+    ) -> crate::frame_owner_model::FrameDocumentLocalWindowTransition {
+        let same_origin = self.document_domain_override.borrow().as_deref()
+            == inherited_document_domain
+            && (inherited_opaque_origin_matches
+                || moli_url::WebOrigin::from_serialized(&self.main_document_security_origin())
+                    .same_origin(&moli_url::WebOrigin::from_serialized(origin)));
+        crate::frame_owner_model::FrameDocumentLocalWindowTransition::for_document_commit(
+            self.initial_empty_main_document,
+            same_origin,
+            self.document_policy_container(),
+            policy,
+        )
+    }
+
+    pub(crate) fn prepare_initial_main_document_owner_transition(
+        &mut self,
+    ) -> Option<crate::frame_owner_model::MainDocumentOwnerTransition> {
+        assert!(self.initial_empty_main_document);
+        self.frame_owner_store
+            .prepare_initial_main_document_owner_transition()
+    }
+
+    pub(crate) fn commit_initial_main_document_in_current_window(
+        &mut self,
+        transition: crate::frame_owner_model::MainDocumentOwnerTransition,
+        document_handle: DomHandle,
+        url: Url,
+    ) -> Option<crate::frame_owner_model::MainDocumentOwnerTransition> {
+        assert!(self.initial_empty_main_document);
+        let transition = self.frame_owner_store.replace_initial_main_document(
+            transition,
+            document_handle,
+            url.clone(),
+            url,
+        )?;
+        self.initial_empty_main_document = false;
+        self.rebind_runtime_binding_document_owner(
+            transition.retired_owner(),
+            transition.current_owner(),
+        );
+        self.dom_agent_state
+            .reset_for_document_replacement(transition.current_owner().document_id);
+        self.dom_agent_state
+            .sync_mutation_recording_interest(self.dom_host());
+        self.style_engine
+            .clear_for_document_replacement(document_handle);
+        self.reset_document_layout_state();
+        Some(transition)
+    }
+
+    pub(crate) fn bind_page_script_environment(
+        &mut self,
+        environment: &crate::script_vm::RendererPageScriptEnvironment,
+    ) {
+        assert_eq!(
+            environment.window_identity(),
+            &self.window_identity,
+            "a Document must retain its Page window identity"
+        );
+        self.page_script_environment = Some(environment.downgrade());
+    }
+
+    pub(crate) fn page_script_environment(
+        &self,
+    ) -> Option<crate::script_vm::RendererPageScriptEnvironment> {
+        if self.context_host_lifecycle.get() != crate::util::ContextHostLifecycle::Active {
+            return None;
+        }
+        self.page_script_environment.as_ref()?.upgrade()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_auxiliary_window_for_test(
+        &mut self,
+        window: Option<crate::runtime::RendererAuxiliaryWindow>,
+    ) {
+        self.window_identity = crate::runtime::RendererPageWindowIdentity::new(
+            self.window_identity.name().clone(),
+            window,
+        );
+    }
+
+    pub(crate) fn auxiliary_window(&self) -> Option<crate::runtime::RendererAuxiliaryWindow> {
+        self.window_identity.auxiliary_window().cloned()
+    }
+
+    pub(crate) fn browsing_context_is_closed(&self) -> bool {
+        self.window_identity
+            .auxiliary_window()
+            .is_some_and(|window| window.is_closed())
+            || self
+                .page_script_environment
+                .as_ref()
+                .is_some_and(|environment| {
+                    environment
+                        .upgrade()
+                        .is_none_or(|environment| environment.browsing_context_is_closed())
+                })
+    }
+
+    pub(crate) fn request_auxiliary_window_close(
+        &mut self,
+        window: crate::runtime::RendererAuxiliaryWindow,
+    ) {
+        if window.close() {
+            self.append_live_turn_items(vec![crate::runtime::RendererOutputItem::OwnerAction(
+                crate::runtime::RendererOwnerAction::CloseAuxiliaryWindow(window),
+            )]);
+        }
+    }
+
+    pub(crate) fn window_identity(&self) -> &crate::runtime::RendererPageWindowIdentity {
+        &self.window_identity
+    }
+
+    pub(crate) fn browsing_context_name(&self) -> &crate::runtime::RendererBrowsingContextName {
+        self.window_identity.name()
+    }
+
     pub(crate) fn capture_node_creation_stack_trace(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
@@ -82,6 +248,7 @@ impl JsContextHost {
         context: v8::Local<'_, v8::Context>,
     ) {
         self.page_default_context = Some(v8::Weak::new(scope, context));
+        context.set_slot(std::rc::Rc::new(crate::util::MainDefaultWindowContext));
     }
 
     pub(crate) fn page_default_context<'s>(
@@ -130,7 +297,7 @@ impl JsContextHost {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn new(
         runtime: &mut DocumentRuntime,
         mut frame_owner_store: FrameOwnerStore,
@@ -141,17 +308,17 @@ impl JsContextHost {
         top_level_navigation_handoff_tx: crate::page_task_queue::RendererTopLevelNavigationHandoffSender,
         service_worker_task_tx: crate::page_task_queue::RendererPageServiceWorkerTaskSender,
         browser_context_runtime: RendererBrowserContextRuntime,
+        window_identity: crate::runtime::RendererPageWindowIdentity,
         javascript_dialog_runtime: crate::runtime::RendererJavaScriptDialogRuntime,
         page_context_cancel_rx: RendererPageContextCancelReceiver,
         top_level_storage_key: Option<moli_storage_key::MoliStorageKey>,
         reserved_service_worker_client_id: Option<ServiceWorkerClientId>,
+        page_network_policy: crate::network::PageNetworkPolicy,
     ) -> Self {
         let message_port_registry = browser_context_runtime.message_port_registry();
         let broadcast_channel_registry = browser_context_runtime.broadcast_channel_registry();
         let shared_worker_client_owner_id =
             browser_context_runtime.next_shared_worker_client_owner_id();
-        let javascript_dialog_handler_enabled =
-            browser_context_runtime.javascript_dialog_handler_enabled();
         let document_url = runtime.document_url().clone();
         let main_document_owner = frame_owner_store
             .current_main_document_task_owner()
@@ -167,26 +334,14 @@ impl JsContextHost {
             .unwrap_or_else(|| {
                 super::service_workers::service_worker_first_party_storage_key(&document_url)
             });
-        let service_worker_client_id = reserved_service_worker_client_id
-            .filter(|client_id| {
-                browser_context_runtime.update_service_worker_client_document_and_page_endpoint(
-                    *client_id,
-                    document_url.clone(),
-                    service_worker_storage_key.clone(),
-                    crate::service_worker_runtime::ServiceWorkerClientFrameType::TopLevel,
-                    Some(super::WindowDocumentOwner::Frame(main_document_owner)),
-                    service_worker_task_tx.clone(),
-                )
-            })
-            .unwrap_or_else(|| {
-                browser_context_runtime.register_service_worker_client(
-                    document_url,
-                    service_worker_storage_key,
-                    crate::service_worker_runtime::ServiceWorkerClientFrameType::TopLevel,
-                    Some(super::WindowDocumentOwner::Frame(main_document_owner)),
-                    service_worker_task_tx.clone(),
-                )
-            });
+        let service_worker_client_id = Self::register_main_service_worker_client(
+            &browser_context_runtime,
+            document_url,
+            service_worker_storage_key,
+            main_document_owner,
+            service_worker_task_tx.clone(),
+            reserved_service_worker_client_id,
+        );
         assert!(
             frame_owner_store
                 .set_current_main_service_worker_client_id(Some(service_worker_client_id,)),
@@ -195,8 +350,11 @@ impl JsContextHost {
         let visual_resource_generation =
             super::visual_resource_generation::VisualResourceGeneration::default();
         let mut host = Self {
-            runtime: runtime as *mut DocumentRuntime,
+            session_histories: Default::default(),
+            pending_history_traversal_admissions: Default::default(),
+            document_runtime: runtime as *mut DocumentRuntime,
             layout_policy: moli_page_types::LayoutPolicy::default(),
+            scrollbars_hidden: false,
             document_layout_state: RefCell::new(super::layout_state::DocumentLayoutState::default()),
             layout_pass_active: Cell::new(false),
             completed_layout_pass_count: Cell::new(0),
@@ -206,13 +364,16 @@ impl JsContextHost {
             layout_snapshot_cache_misses: Cell::new(0),
             layout_snapshot_cache_publishes: Cell::new(0),
             style_viewport_generation: Cell::new(0),
-            #[cfg(test)]
-            force_fresh_layout_reads_for_test: false,
             root_document_lifecycle: None,
             output_journal: None,
+            native_interception_output: None,
             page_context_resources_closed: false,
+            context_host_lifecycle: Rc::new(Cell::new(crate::util::ContextHostLifecycle::Active)),
+            deferred_context_host_release_queue: Default::default(),
+            retained_document_runtime: None,
+            published_document_host: false,
             page_default_context: None,
-            v8_finalizers: crate::v8_finalizer::V8FinalizerRegistry::default(),
+            common: Rc::new(crate::common_runtime::CommonRuntimeState::default()),
             bridge: NativeDomBridge::new(bindings),
             dom_agent_state: crate::runtime::RendererDomAgentState::new(
                 backend_node_registry.clone(),
@@ -232,45 +393,46 @@ impl JsContextHost {
             parser_defined_autonomous_custom_elements: VecDeque::new(),
             parser_custom_element_handoff_replacements: HashMap::new(),
             scoped_custom_element_registry_wrappers: HashMap::new(),
-            custom_element_registry_associations: IndexMap::new(),
+            custom_element_registry_associations: LinkedHashMap::new(),
             next_scoped_custom_elements_registry_id: 1,
             observers: ObserverStore::default(),
-            text_codecs: TextCodecStore::default(),
             child_browsing_contexts: IndexMap::new(),
             frame_owner_store,
+            inert_document_execution_contexts: None,
             frame_parser_classic_scripts: FrameParserClassicScriptRunnerStore::default(),
             frame_parser_deferred_script_order: FrameParserDeferredScriptOrderStore::default(),
-            frame_document_blocking_stylesheets: FrameDocumentBlockingStylesheetStore::default(),
+            frame_document_stylesheets: FrameDocumentStylesheetStore::default(),
             child_document_script_schedulers: FrameDocumentScriptSchedulerStore::default(),
             child_document_parsers: ChildDocumentParserStore::default(),
             child_window_proxy_records: ChildWindowProxyRecords::default(),
             child_default_context_bootstrap: None,
             #[cfg(test)]
             force_child_default_context_preflight_failure: false,
+            #[cfg(test)]
+            force_reused_isolated_proxy_bootstrap_failure: std::cell::Cell::new(false),
             child_browsing_context_document_handles: HashMap::new(),
-            document_domain_override: None,
-            next_child_browsing_context_id: 1,
+            document_domain_override: Rc::new(RefCell::new(None)),
             next_child_document_load_id: 0,
             next_child_classic_script_load_id: 0,
             pending_child_document_navigations: HashMap::new(),
             document_resource_loaders: DocumentResourceLoaderRegistry::default(),
             web_storage_store: new_shared_web_storage_store(),
+            local_storage_areas: HashMap::new(),
             session_storage_store: new_shared_web_storage_store(),
             indexed_db_manager: None,
             storage_bucket_store: new_shared_storage_bucket_store(),
             stored_document_start_scripts: Vec::new(),
             stored_runtime_bindings: Vec::new(),
             app_manifest_link_change_epoch: 0,
-            extra_http_headers: Vec::new(),
+            extra_http_headers: Default::default(),
             permission_overrides: Vec::new(),
-            locale_override: None,
-            timezone_override: None,
             idle_override: None,
             protocol_user_gesture_activation_depth: 0,
             current_input_event: None,
             webdriver_bidi_file_prompt_handler_stack: Vec::new(),
-            emulated_media: crate::protocol_types::EmulatedMediaOverrides::default(),
-            viewport_surface: None,
+            document_activity: moli_page_types::DocumentActivity::default(),
+            initial_empty_main_document: false,
+            subframe_loading_disabled_documents: Rc::default(),
             wpt_extensions_enabled: false,
             network_offline: false,
             navigator_overrides: Default::default(),
@@ -296,8 +458,7 @@ impl JsContextHost {
             pending_active_lightweight_popup_restore: None,
             pending_child_subresource_request_scope_pop: false,
             pending_text_control_change_commit: None,
-            directory_reader_callbacks:
-                super::directory_reader_callbacks::DirectoryReaderCallbackState::default(),
+            file_reading_tasks: super::file_reading_tasks::FileReadingState::default(),
             misc_platform_api_tasks:
                 super::misc_platform_api_tasks::MiscPlatformApiTaskState::default(),
             file_entry_file_callbacks:
@@ -314,6 +475,7 @@ impl JsContextHost {
             active_pointer_capture_ids: HashSet::new(),
             pending_pointer_capture_targets: HashMap::new(),
             pointer_capture_targets: HashMap::new(),
+            mouse_input: mouse_click::MouseInputState::default(),
             lazy_media_load_candidates: HashSet::new(),
             canvas_resources: super::canvas_resources::CanvasResourceStore::new(
                 visual_resource_generation.clone(),
@@ -324,6 +486,7 @@ impl JsContextHost {
             next_image_decode_id: 1,
             pending_image_decode_requests: HashMap::new(),
             resource_timing_buffers: SharedResourceTimingBufferRegistry::new(),
+            pending_font_face_loads: HashMap::new(),
             next_webcrypto_task_id: crate::page_task_queue::RendererPageWebCryptoTaskId::first(),
             pending_webcrypto_tasks: HashMap::new(),
             opfs_owner_state: None,
@@ -370,6 +533,8 @@ impl JsContextHost {
             next_child_window_event_registration_id: 0,
             event_callbacks: Default::default(),
             browser_context_runtime,
+            window_identity,
+            page_script_environment: None,
             top_level_navigation_handoff_tx,
             service_worker_task_tx,
             message_port_registry,
@@ -383,7 +548,6 @@ impl JsContextHost {
             child_web_storage_opaque_context_nonces: HashMap::new(),
             broadcast_channel_wrappers: HashMap::new(),
             form_past_named_items: HashMap::new(),
-            button_element_targets: HashMap::new(),
             constructing_form_data_forms: Vec::new(),
             active_form_submission_forms: Vec::new(),
             pending_form_submission_child_targets: HashMap::new(),
@@ -410,13 +574,11 @@ impl JsContextHost {
             pending_download_activations: Vec::new(),
             #[cfg(test)]
             pending_popup_activations: Vec::new(),
-            next_lightweight_popup_id: 1,
             next_lightweight_popup_local_window_id: 1,
             next_lightweight_popup_document_id: 1,
             next_lightweight_popup_document_load_id: 0,
             next_lightweight_popup_classic_script_load_id: 0,
             lightweight_popup_browsing_contexts: HashMap::new(),
-            lightweight_popup_window_names: HashMap::new(),
             lightweight_popup_document_handles: HashMap::new(),
             pending_lightweight_popup_document_loads: HashMap::new(),
             pending_lightweight_popup_classic_script_loads: HashMap::new(),
@@ -424,16 +586,12 @@ impl JsContextHost {
             pending_javascript_dialogs: Vec::new(),
             javascript_dialog_runtime,
             next_javascript_dialog_id: 1,
-            javascript_dialog_handler_enabled,
             pending_network_output: Vec::new(),
             focus_change_epoch: 0,
-            next_subresource_network_request_handle: 1,
             subresource_activity_epoch: 0,
             subresource_last_activity_at: std::time::Instant::now(),
-            fetch_subresource_interception_enabled: false,
-            fetch_subresource_interception_resource_type: None,
+            page_network_policy,
             active_subresource_requests: 0,
-            next_pending_subresource_fetch_id: 0,
             pending_subresource_fetches: HashMap::new(),
             pending_subresource_auths: HashMap::new(),
             pending_subresource_responses: HashMap::new(),
@@ -448,13 +606,11 @@ impl JsContextHost {
             pending_network_body_sources: HashMap::new(),
             pending_network_body_clones: HashMap::new(),
             page_task_capabilities: std::cell::OnceCell::new(),
-            resource_scheduler: RendererResourceScheduler::new(resource_completion_tx.clone()),
             resource_completion_tx,
             next_worker_id: 1,
             workers: HashMap::new(),
             next_websocket_id: 1,
             websockets: HashMap::new(),
-            synchronous_xhr_request_counts: HashMap::new(),
             page_context_cancel_rx,
             layout_metric_trace: RefCell::default(),
             layout_rect_cache: RefCell::default(),
@@ -477,7 +633,7 @@ impl JsContextHost {
             #[cfg(test)]
             style_observation_environment_resolutions: Cell::new(0),
         };
-        host.sync_owner_style_sheet_texts_for_document_tree_scopes(host.document_handle());
+        host.initialize_style_element_sources_for_document(host.document_handle());
         host
     }
 
@@ -502,11 +658,26 @@ impl JsContextHost {
             .map(RendererDocumentLifecycleJournalHandle::identity)
     }
 
-    pub(crate) fn open_root_document(&mut self, scope: &mut v8::PinScope<'_, '_>) {
-        let descendant_count_before = self.child_browsing_contexts.len();
-        for child_handle in self.top_level_child_browsing_context_handles_in_document_order() {
-            self.drop_child_browsing_context_subtree_with_window_realm(scope, child_handle);
+    pub(crate) fn open_root_document(scope: &mut v8::PinScope<'_, '_>, host_ptr: *mut Self) {
+        let (owner, descendant_count_before, document) = {
+            let host = unsafe { &*host_ptr };
+            (
+                host.current_main_document_task_owner(),
+                host.child_browsing_contexts.len(),
+                host.document_handle(),
+            )
+        };
+        Self::drop_child_browsing_context_subtree_with_window_realm(scope, host_ptr, document);
+        if unsafe { &*host_ptr }.current_main_document_task_owner() == owner {
+            unsafe { &mut *host_ptr }.commit_root_document_open(scope, descendant_count_before);
         }
+    }
+
+    fn commit_root_document_open(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        descendant_count_before: usize,
+    ) {
         let retired_document_handle = self.document_handle();
         let retired_image_event_count =
             self.retire_image_state_for_document(retired_document_handle);
@@ -544,6 +715,8 @@ impl JsContextHost {
         }
         self.dom_agent_state
             .reset_for_document_replacement(transition.current_owner().document_id);
+        self.dom_agent_state
+            .sync_mutation_recording_interest(self.dom_host());
         self.replace_main_document_resource_loader(transition);
         let rebound_meta_refresh = {
             let runtime: &mut DocumentRuntime = self;
@@ -603,7 +776,7 @@ impl JsContextHost {
 
     pub(crate) fn install_page_task_capabilities(
         &self,
-        capabilities: super::JsContextHostPageTaskCapabilities,
+        capabilities: super::PageScriptHostTaskCapabilities,
     ) {
         assert!(
             self.page_task_capabilities.set(capabilities).is_ok(),
@@ -1148,8 +1321,8 @@ impl JsContextHost {
     }
 
     pub(crate) fn queue_native_dynamic_module_evaluation_fulfilled(&mut self, reaction_id: u64) {
-        let import_owner =
-            unsafe { &*self.runtime }.native_dynamic_module_evaluation_reaction_owner(reaction_id);
+        let import_owner = unsafe { &*self.document_runtime }
+            .native_dynamic_module_evaluation_reaction_owner(reaction_id);
         let Some(import_owner) = import_owner else {
             tracing::debug!(
                 reaction_id,
@@ -1170,8 +1343,8 @@ impl JsContextHost {
         reaction_id: u64,
         reason: v8::Global<v8::Value>,
     ) {
-        let import_owner =
-            unsafe { &*self.runtime }.native_dynamic_module_evaluation_reaction_owner(reaction_id);
+        let import_owner = unsafe { &*self.document_runtime }
+            .native_dynamic_module_evaluation_reaction_owner(reaction_id);
         let Some(import_owner) = import_owner else {
             tracing::debug!(
                 reaction_id,
@@ -1210,6 +1383,16 @@ impl JsContextHost {
         &self.bridge
     }
 
+    pub(crate) fn retire_web_mcp_document(
+        &mut self,
+        owner: crate::native_bridge::WindowDocumentOwner,
+    ) {
+        let events = self.bridge.web_mcp.retire_document(owner);
+        for event in events {
+            crate::context_bootstrap::web_mcp::emit_protocol_event(self, event);
+        }
+    }
+
     pub(crate) fn character_data_utf16_units(&self, handle: DomHandle) -> Option<Vec<u16>> {
         self.character_data_utf16_overrides
             .get(&handle)
@@ -1225,7 +1408,7 @@ impl JsContextHost {
     pub(crate) fn set_character_data_utf16_units(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         units: &[u16],
     ) -> bool {
@@ -1235,7 +1418,7 @@ impl JsContextHost {
     pub(crate) fn set_character_data_utf16_units_for_edit(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         units: &[u16],
     ) -> bool {
@@ -1245,7 +1428,7 @@ impl JsContextHost {
     fn set_character_data_utf16_units_with_options(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         units: &[u16],
         force_mutation_record: bool,
@@ -1275,7 +1458,7 @@ impl JsContextHost {
     pub(crate) fn set_text_content(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         value: &str,
     ) -> bool {
@@ -1384,17 +1567,6 @@ impl JsContextHost {
             self.mutation_observer_delivery_depth.saturating_sub(1);
     }
 
-    pub(crate) fn allow_synchronous_xhr_request(&mut self, url: &Url) -> bool {
-        const MAX_SYNC_XHR_REQUESTS_PER_URL: u32 = 32;
-
-        let count = self
-            .synchronous_xhr_request_counts
-            .entry(url.as_str().to_owned())
-            .or_insert(0);
-        *count = count.saturating_add(1);
-        *count <= MAX_SYNC_XHR_REQUESTS_PER_URL
-    }
-
     pub(crate) fn page_context_cancel_receiver(&self) -> RendererPageContextCancelReceiver {
         self.page_context_cancel_rx.clone()
     }
@@ -1422,36 +1594,6 @@ impl JsContextHost {
             .form_control_elements(form_handle)
             .contains(&item_handle)
             .then_some(item_handle)
-    }
-
-    pub(in crate::native_bridge) fn remember_button_element_target(
-        &mut self,
-        source_handle: DomHandle,
-        slot: &str,
-        target_handle: DomHandle,
-    ) {
-        self.button_element_targets
-            .insert((source_handle, slot.to_owned()), target_handle);
-    }
-
-    pub(in crate::native_bridge) fn clear_button_element_target(
-        &mut self,
-        source_handle: DomHandle,
-        slot: &str,
-    ) {
-        self.button_element_targets
-            .remove(&(source_handle, slot.to_owned()));
-    }
-
-    pub(in crate::native_bridge) fn button_element_target(
-        &self,
-        source_handle: DomHandle,
-        slot: &str,
-    ) -> Option<DomHandle> {
-        self.button_element_targets
-            .get(&(source_handle, slot.to_owned()))
-            .copied()
-            .filter(|handle| self.dom_host().node(*handle).is_some())
     }
 
     pub(in crate::native_bridge) fn replace_active_image_submitter_coordinate(
@@ -1782,17 +1924,8 @@ impl JsContextHost {
         handle: DomHandle,
         association: CustomElementRegistryAssociation,
     ) {
-        match self
-            .custom_element_registry_associations
-            .get(&handle)
-            .copied()
-        {
-            Some(current) if current == association => return,
-            Some(_) => {
-                self.custom_element_registry_associations
-                    .shift_remove(&handle);
-            }
-            None => {}
+        if self.custom_element_registry_associations.get(&handle) == Some(&association) {
+            return;
         }
         self.custom_element_registry_associations
             .insert(handle, association);
@@ -1802,27 +1935,12 @@ impl JsContextHost {
         &mut self,
         retargets: &[RegistryAssociationRetarget],
     ) {
-        if retargets.is_empty() {
-            return;
-        }
-
         // Re-association is observable even when the registry itself does not
         // change: adopting a scoped-registry tree into another document moves
-        // that document to the end of the registry's association order. Build
-        // the final touched-handle order once so a large adopted subtree does
-        // not repeatedly shift the IndexMap.
-        let mut touched = HashSet::with_capacity(retargets.len());
-        let mut ordered_retargets = Vec::with_capacity(retargets.len());
-        for retarget in retargets.iter().rev() {
-            if touched.insert(retarget.handle) {
-                ordered_retargets.push(*retarget);
-            }
-        }
-        ordered_retargets.reverse();
-
-        self.custom_element_registry_associations
-            .retain(|handle, _| !touched.contains(handle));
-        for retarget in ordered_retargets {
+        // that document to the end of the registry's association order.
+        // LinkedHashMap::insert moves existing entries to the back in O(1),
+        // preserving last-retarget order without scanning unrelated entries.
+        for retarget in retargets {
             self.custom_element_registry_associations
                 .insert(retarget.handle, retarget.association);
         }
@@ -1879,8 +1997,7 @@ impl JsContextHost {
             })
             .collect::<Vec<_>>();
         for handle in stale_handles {
-            self.custom_element_registry_associations
-                .shift_remove(&handle);
+            self.custom_element_registry_associations.remove(&handle);
         }
     }
 
@@ -1899,8 +2016,7 @@ impl JsContextHost {
             })
             .collect::<Vec<_>>();
         for handle in stale_handles {
-            self.custom_element_registry_associations
-                .shift_remove(&handle);
+            self.custom_element_registry_associations.remove(&handle);
         }
     }
 
@@ -2134,11 +2250,12 @@ impl JsContextHost {
     }
 
     pub(crate) fn enter_parser_pause(&mut self) -> crate::document_runtime::ParserPauseGuard {
-        unsafe { &mut *self.runtime }.enter_parser_pause()
+        unsafe { &mut *self.document_runtime }.enter_parser_pause()
     }
 
     pub(crate) fn should_checkpoint_before_parser_custom_element_constructor(&self) -> bool {
-        unsafe { &*self.runtime }.should_checkpoint_before_parser_custom_element_constructor()
+        unsafe { &*self.document_runtime }
+            .should_checkpoint_before_parser_custom_element_constructor()
     }
 
     pub(crate) fn custom_elements_for_node_handle(
@@ -2203,11 +2320,6 @@ impl JsContextHost {
             CustomElementRegistryAssociation::Null => None,
             CustomElementRegistryAssociation::Registry(key) => Some(key),
         }
-    }
-
-    pub(crate) fn custom_element_handle_is_upgraded(&self, handle: DomHandle) -> bool {
-        self.custom_elements_for_node_handle(handle)
-            .is_some_and(|store| store.is_upgraded_handle(handle))
     }
 
     pub(crate) fn custom_elements_mut_for_node_handle(
@@ -2358,10 +2470,6 @@ impl JsContextHost {
             }
         }
         false
-    }
-
-    pub(crate) fn text_codecs_mut(&mut self) -> &mut TextCodecStore {
-        &mut self.text_codecs
     }
 
     pub(crate) fn renderer_backend_node_id_for_live_handle(

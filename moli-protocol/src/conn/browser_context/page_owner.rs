@@ -85,7 +85,6 @@ impl TargetSessionStateMut<'_> {
         state.page_file_chooser_opened_event_enabled = false;
         state.page_intercept_file_chooser_dialog_enabled = false;
         state.page_screencast.stop();
-        state.javascript_dialog_state.clear();
     }
 
     fn set_page_lifecycle_events_enabled(mut self, enabled: bool) {
@@ -460,14 +459,14 @@ fn devtools_session_page_domain_enabled(state: &DevToolsSessionState) -> bool {
 }
 
 fn browser_context_has_page_domain_enabled_session(browser_context: &BrowserContext) -> bool {
-    browser_context
-        .active_page_target()
-        .devtools_sessions
-        .states()
-        .any(devtools_session_page_domain_enabled)
-        || browser_context
-            .background_targets()
-            .any(|target| target.has_page_domain_enabled_session())
+    browser_context.page_targets.active().is_some_and(|target| {
+        target
+            .devtools_sessions
+            .states()
+            .any(devtools_session_page_domain_enabled)
+    }) || browser_context
+        .background_targets()
+        .any(|target| target.has_page_domain_enabled_session())
 }
 
 impl CdpConnection {
@@ -541,7 +540,7 @@ impl CdpConnection {
         frame_id: String,
         loader_id: String,
         url: url::Url,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         from_cache: bool,
         body: crate::conn::CapturedBody,
     ) -> bool {
@@ -564,13 +563,12 @@ impl CdpConnection {
         frame_id: String,
         loader_id: String,
         url: url::Url,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         from_cache: bool,
         body: Option<crate::conn::CapturedBody>,
     ) -> bool {
         if self
             .runtime_session_owner_slot_for_owner(owner)
-            .ok()
             .and_then(TargetRuntimeSlot::committed_document_loader_id)
             != Some(loader_id.as_str())
         {
@@ -594,8 +592,7 @@ impl CdpConnection {
         session_id: Option<&str>,
     ) -> Option<MainDocumentResourceSnapshot> {
         let loader_id = self
-            .runtime_session_owner_slot(session_id)
-            .ok()?
+            .runtime_session_owner_slot(session_id)?
             .committed_document_loader_id()?
             .to_owned();
         self.target_owner_state_for_session(session_id)?
@@ -603,6 +600,7 @@ impl CdpConnection {
             .main_document_for_loader(&loader_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn target_owner_has_attached_child_frame_id_for_session(
         &self,
         session_id: Option<&str>,
@@ -647,14 +645,18 @@ impl CdpConnection {
         handled
     }
 
-    fn sync_javascript_dialog_handler_enabled_for_browser_context(&self, browser_context_id: &str) {
+    pub(in crate::conn) fn sync_javascript_dialog_handler_enabled_for_browser_context(
+        &self,
+        browser_context_id: &str,
+    ) {
         let Some(browser_context) = self.browser_context_by_id(browser_context_id) else {
             return;
         };
         browser_context
             .renderer_runtime()
             .set_javascript_dialog_handler_enabled(
-                browser_context_has_page_domain_enabled_session(browser_context),
+                self.automation_javascript_dialog_wait_enabled()
+                    || browser_context_has_page_domain_enabled_session(browser_context),
             );
     }
 
@@ -682,7 +684,7 @@ impl CdpConnection {
             let renderer_console_agent_owns_page_console_api_events = enabled
                 && self
                     .runtime_session_owner_slot_for_owner(owner)
-                    .is_ok_and(|slot| slot.has_loaded_page());
+                    .is_some_and(|slot| slot.has_loaded_page());
             let _ = self.with_target_devtools_session_state_for_owner_mut(owner, |state| {
                 state
                     .console_output_session_state
@@ -1176,6 +1178,48 @@ mod tests {
 
         assert!(conn.disable_page_domain_for_session_owner(Some("SID-inactive-b")));
         assert!(!inactive_runtime.javascript_dialog_handler_enabled());
+    }
+
+    #[test]
+    fn page_domain_dialog_handler_tracks_background_sessions_without_active_target() {
+        let mut conn = CdpConnection::default();
+        let mut context = BrowserContext::new_with_page_for_test("BID-1", "TID-active");
+        for (target, session) in [("TID-a", "SID-a"), ("TID-b", "SID-b")] {
+            context.stage_background_target(
+                target.to_owned(),
+                Some(session.to_owned()),
+                "about:blank".to_owned(),
+                None,
+                None,
+            );
+        }
+        let runtime = context.renderer_runtime();
+        conn.install_browser_context_fixture_for_test(context);
+        conn.commit_declared_session_fixtures_for_test();
+        assert!(conn.set_page_domain_enabled_for_session_owner(Some("SID-a"), true));
+        assert!(conn.set_page_domain_enabled_for_session_owner(Some("SID-b"), true));
+        let context = conn.browser_context.as_mut().unwrap();
+        drop(context.take_page_target_for_close("TID-active").unwrap());
+        assert!(context.active_target_id().is_none());
+
+        assert!(conn.disable_page_domain_for_session_owner(Some("SID-a")));
+        assert!(
+            runtime.javascript_dialog_handler_enabled(),
+            "the remaining background Page subscriber still handles dialogs"
+        );
+        assert!(conn.disable_page_domain_for_session_owner(Some("SID-b")));
+        assert!(
+            !runtime.javascript_dialog_handler_enabled(),
+            "removing the final background subscriber must disable modal waits"
+        );
+        assert!(
+            conn.browser_context
+                .as_ref()
+                .unwrap()
+                .active_target_id()
+                .is_none(),
+            "session cleanup must not create or promote an active Page"
+        );
     }
 
     #[test]

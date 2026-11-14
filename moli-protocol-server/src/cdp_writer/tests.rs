@@ -67,6 +67,32 @@ fn graceful_close_is_queued_after_existing_output() {
     ));
 }
 
+#[tokio::test]
+async fn flush_confirmation_is_ordered_after_output_and_propagates_failure() {
+    let (sink, mut output_rx, _close_rx) = test_sink_with_limits(
+        2,
+        DEFAULT_MAX_PENDING_WRITER_BYTES,
+        DEFAULT_MAX_WRITER_MESSAGE_BYTES,
+    );
+    assert!(sink.enqueue_owned_message(json!({"id": 1, "result": {}})));
+    let pending = tokio::spawn(async move { sink.flush().await });
+    assert!(matches!(
+        output_rx.recv().await,
+        Some(SocketWriterCommand::Output(_))
+    ));
+    let Some(SocketWriterCommand::Flush(completed)) = output_rx.recv().await else {
+        panic!("flush must be queued after preceding output");
+    };
+    assert!(
+        !pending.is_finished(),
+        "queue admission is not a flush confirmation"
+    );
+    completed
+        .send(false)
+        .expect("flush waiter remains attached");
+    assert!(!pending.await.expect("flush task"));
+}
+
 #[test]
 fn peer_close_signal_has_priority_over_immediate_close() {
     let (sink, _output_rx, close_rx) = test_sink();
@@ -220,4 +246,32 @@ fn owned_non_outer_html_message_uses_the_generic_serializer() {
 
     assert_eq!(envelope.message, expected);
     assert_eq!(*close_rx.borrow(), SocketCloseSignal::Open);
+}
+
+#[test]
+fn raw_inspector_output_preserves_utf16_and_enforces_exact_wire_byte_limits() {
+    let body = format!(r#"{{"value":"{}\ud800"}}"#, "a".repeat(8192));
+    let mut message =
+        InspectorJson::from_slice(format!(r#"{{"id":7,"result":{body}}}"#).as_bytes()).unwrap();
+    message.set_id(u64::MAX);
+    message.set_session_id(Some("SID-\""));
+    let expected = message.to_string();
+    let (sink, mut output, close) = test_sink_with_limits(2, expected.len(), expected.len());
+    assert!(sink.enqueue_owned_message(message.clone()));
+    assert!(!message.is_materialized());
+    let SocketWriterCommand::Output(envelope) = output.try_recv().unwrap() else {
+        panic!("expected output")
+    };
+    assert_eq!(envelope.message, expected);
+    assert!(envelope.message.contains(&body));
+    assert_eq!(*close.borrow(), SocketCloseSignal::Open);
+    assert!(
+        !sink.enqueue_owned_message(message.clone()),
+        "the first output still reserves the exact byte budget"
+    );
+    drop(envelope);
+    let (sink, _output, close) = test_sink_with_limits(2, expected.len(), expected.len() - 1);
+    assert!(!sink.enqueue_owned_message(message.clone()));
+    assert_eq!(*close.borrow(), SocketCloseSignal::ImmediateClose);
+    assert!(!message.is_materialized());
 }

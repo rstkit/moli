@@ -1,8 +1,8 @@
-use super::PERFORMANCE_TIME_ORIGIN_SLOT;
 use crate::util::{
     callback_data_index_value, callback_data_item, get_private_value, set_private_value,
     throw_type_error,
 };
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,7 @@ const MEMORY_SLOTS: &[&str] = &[TOTAL_HEAP_SLOT, USED_HEAP_SLOT, HEAP_LIMIT_SLOT
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct MemoryInfoPrototypeDeclaration {
     #[webapi(accessor_property, name = "totalJSHeapSize", enumerable, getter = memory_info_getter, data = callback_data_index_value(scope, 0))]
     total_js_heap_size: (),
@@ -30,7 +30,7 @@ struct MemoryInfoPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::MemoryInfo)]
 struct MemoryInfoObjectDeclaration<'scope> {
     #[webapi(prototype)]
     prototype: Option<v8::Local<'scope, v8::Object>>,
@@ -54,10 +54,6 @@ pub(super) fn performance_memory_getter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if get_private_value(scope, args.this(), PERFORMANCE_TIME_ORIGIN_SLOT).is_none() {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let sizes = heap_sample(scope);
     let Some(context) = args.this().get_creation_context(scope) else {
         return;

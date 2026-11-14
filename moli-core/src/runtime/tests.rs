@@ -12,7 +12,8 @@ use crate::{
         DocumentNodeClientRectResolution, Page, PendingPageCommand,
         PendingSubresourceContinueOutcome, PendingSubresourceFetchInfo,
         RendererDocumentQuerySelectorNode, RendererDocumentQuerySelectorResolution,
-        RendererRuntimeInspectorMessage, SubresourceResourceType, SubresourceResponseWaitCriteria,
+        RendererRuntimeInspectorMessage, SubresourceInterceptionClasses, SubresourceResourceType,
+        SubresourceResponseWaitCriteria,
     },
     renderer::RendererPageCommand,
     renderer::{PageId, RendererOwnerCommand, RendererOwnerHandle, materialize_page_created_reply},
@@ -37,10 +38,14 @@ use support::FixtureServer;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::{Mutex, oneshot},
+    sync::{Mutex, Notify, oneshot},
     task::JoinHandle,
 };
 use url::Url;
+
+fn browser_navigation_request(url: &str) -> Result<Request> {
+    Ok(Request::get(url)?.with_request_origin(moli_url::WebOrigin::Opaque))
+}
 
 #[test]
 fn browser_clone_keeps_shared_renderer_and_fetch_owners_live_after_source_drop() -> Result<()> {
@@ -69,6 +74,59 @@ fn browser_clone_keeps_shared_renderer_and_fetch_owners_live_after_source_drop()
 }
 
 #[tokio::test]
+async fn raw_document_body_materialization_uses_the_fetch_deadline() -> Result<()> {
+    let browser = Browser::new(AppConfig::default())?;
+    let url = Url::parse("https://deadline.test/stalled.bin")?;
+    let (body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let cancel_handle = FetchCancelHandle::new();
+    // Headers are already available. This isolates the body budget from
+    // transport startup while exercising the real materializer and deadline.
+    let response = StreamingRawResponse::new_with_head(
+        ResponseHead {
+            status_text: None,
+            final_url: url.clone(),
+            status: 200,
+            headers: vec![(
+                "content-type".to_owned(),
+                b"application/octet-stream".to_vec(),
+            )],
+            request_cookie_report: None,
+            cookie_set_reports: Vec::new(),
+            redirected: false,
+            redirect_chain: Vec::new(),
+            from_cache: false,
+            cache_state: Default::default(),
+            negotiated_http_version: None,
+        },
+        body_rx,
+        cancel_handle.clone(),
+        completion_rx,
+    );
+    let timeout = Duration::from_millis(100);
+    let error = browser
+        .fetch_document_wait_timeout(
+            url.as_str(),
+            RenderedDomWaitUntil::Load,
+            timeout,
+            super::PageVmInitStage::Load,
+            tokio::time::Instant::now() + timeout,
+            || super::FetchTimeoutPhase::StreamingMainBody,
+            browser.materialize_streaming_raw_response_raw_document(response),
+        )
+        .await
+        .expect_err("the stalled raw body must time out");
+    let timeout = error
+        .downcast_ref::<super::FetchReadinessTimeout>()
+        .expect("the raw body timeout must retain its typed phase");
+    assert_eq!(timeout.phase(), super::FetchTimeoutPhase::StreamingMainBody);
+    assert!(cancel_handle.is_cancelled());
+    assert!(body_tx.is_closed());
+    assert!(completion_tx.is_closed());
+    Ok(())
+}
+
+#[tokio::test]
 async fn external_raw_bridge_drop_after_body_eof_cancels_pending_fetch_completion() -> Result<()> {
     let (body_tx, body_rx) = tokio::sync::mpsc::unbounded_channel();
     body_tx.send(b"complete body".to_vec())?;
@@ -77,14 +135,16 @@ async fn external_raw_bridge_drop_after_body_eof_cancels_pending_fetch_completio
     let (mut fetch_completion_tx, fetch_completion_rx) = oneshot::channel();
     let response = StreamingRawResponse::new_with_head(
         ResponseHead {
+            status_text: None,
             final_url: Url::parse("https://bridge.test/document")?,
             status: 200,
-            headers: vec![("content-type".to_owned(), "text/html".to_owned())],
+            headers: vec![("content-type".to_owned(), b"text/html".to_vec())],
             request_cookie_report: None,
             cookie_set_reports: Vec::new(),
             redirected: false,
             redirect_chain: Vec::new(),
             from_cache: false,
+            cache_state: Default::default(),
             negotiated_http_version: None,
         },
         body_rx,
@@ -189,92 +249,104 @@ async fn resolve_runtime_object_for_backend_node_id(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn page_creation_diagnostics_include_default_runtime_context_event() -> Result<()> {
+async fn page_creation_diagnostics_only_report_materialized_runtime_contexts() -> Result<()> {
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
     let renderer_owner = browser.js_runtime.renderer_owner_handle();
     let page_url: Url = server.url("/runtime-context-diagnostics").parse()?;
-    let html = "<!doctype html><html><body>ok</body></html>".to_owned();
-    let create_page_request = renderer_owner.build_create_html_page_request(
-        page_url.clone(),
-        None,
-        false,
-        0,
-        200,
-        vec![],
-        &browser.resource_request_client(),
-        moli_renderer_v8::RendererWebStorageHandles::new(
-            browser.partition.web_storage_store(),
-            browser.partition.session_storage_store(),
+    for (html, has_script) in [
+        ("<!doctype html><html><body>ok</body></html>", false),
+        (
+            "<!doctype html><html><body>ok<script>globalThis.hasScript = true</script></body></html>",
+            true,
         ),
-        page_url.clone(),
-        html,
-        vec![],
-        vec![],
-        vec![],
-        vec![],
-        false,
-        Vec::new(),
-        false,
-        None,
-        super::PageVmInitStage::Load,
-    );
-
-    let reply = renderer_owner
-        .dispatch_command(RendererOwnerCommand::CreateHtmlPage(create_page_request))
-        .await?;
-    let (handle, page_state, diagnostics, artifacts, pending_download) =
-        renderer_owner.materialize_page_created_reply_parts(reply)?;
-    assert!(pending_download.is_none());
-    let _page = Page::from_attached_handle(handle, page_state);
-
-    let default_context = diagnostics
-        .initial_runtime_realms
-        .iter()
-        .find(|realm| realm.is_default && realm.context_type == "default")
-        .context("page creation should report the default runtime context")?;
-    assert!(default_context.context_id > 0);
-    assert_eq!(default_context.name, page_url.as_str());
-    assert!(
-        default_context
-            .realm_id
-            .as_deref()
-            .is_some_and(|id| !id.is_empty()),
-        "page creation should expose the native V8 realm id"
-    );
-    assert_eq!(
-        artifacts.active_document.page_id,
-        artifacts.lifecycle_snapshot.frame.page_id
-    );
-    assert_eq!(artifacts.active_epoch, artifacts.lifecycle_snapshot.epoch);
-    assert_eq!(
-        artifacts
-            .initial_lifecycle_events
-            .iter()
-            .map(|event| event.kind)
-            .collect::<Vec<_>>(),
-        vec![
-            crate::page::RendererDocumentLifecycleEventKind::Started {
-                reason: crate::page::RendererLifecycleStartReason::InitialDocument,
-            },
-            crate::page::RendererDocumentLifecycleEventKind::Milestone(
-                crate::page::RendererDocumentLifecycleMilestone::DomContentLoaded,
+    ] {
+        let create_page_request = renderer_owner.build_create_html_page_request(
+            page_url.clone(),
+            None,
+            false,
+            0,
+            200,
+            vec![],
+            &browser.resource_request_client(),
+            moli_renderer_v8::RendererWebStorageHandles::new(
+                browser.partition.web_storage_store(),
+                browser.partition.session_storage_store(),
             ),
-            crate::page::RendererDocumentLifecycleEventKind::Milestone(
-                crate::page::RendererDocumentLifecycleMilestone::Load,
-            ),
-        ]
-    );
-    assert!(artifacts.lifecycle_snapshot.dom_content_loaded.is_some());
-    assert!(artifacts.lifecycle_snapshot.load.is_some());
-    assert!(
-        artifacts
-            .initial_lifecycle_events
-            .windows(2)
-            .all(|events| events[0].sequence < events[1].sequence
-                && events[0].timestamp_micros <= events[1].timestamp_micros)
-    );
+            page_url.clone(),
+            html.to_owned(),
+            vec![],
+            vec![],
+            vec![],
+            Default::default(),
+            false,
+            Vec::new(),
+            SubresourceInterceptionClasses::NONE,
+            super::PageVmInitStage::Load,
+        );
 
+        let reply = renderer_owner
+            .dispatch_command(RendererOwnerCommand::CreateHtmlPage(create_page_request))
+            .await?;
+        let (handle, page_state, diagnostics, artifacts, pending_download) =
+            renderer_owner.materialize_page_created_reply_parts(reply)?;
+        assert!(pending_download.is_none());
+        let _page = Page::from_attached_handle(handle, page_state);
+
+        if has_script {
+            let default_context = diagnostics
+                .initial_runtime_realms
+                .iter()
+                .find(|realm| realm.is_default && realm.context_type == "default")
+                .context("page creation should report the default runtime context")?;
+            assert!(default_context.context_id > 0);
+            assert_eq!(default_context.name, page_url.as_str());
+            assert!(
+                default_context
+                    .realm_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty()),
+                "page creation should expose the native V8 realm id"
+            );
+        } else {
+            assert!(
+                diagnostics.initial_runtime_realms.is_empty(),
+                "native-only creation must not publish an execution context"
+            );
+        }
+        assert_eq!(
+            artifacts.active_document.page_id,
+            artifacts.lifecycle_snapshot.frame.page_id
+        );
+        assert_eq!(artifacts.active_epoch, artifacts.lifecycle_snapshot.epoch);
+        assert_eq!(
+            artifacts
+                .initial_lifecycle_events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::page::RendererDocumentLifecycleEventKind::Started {
+                    reason: crate::page::RendererLifecycleStartReason::InitialDocument,
+                },
+                crate::page::RendererDocumentLifecycleEventKind::Milestone(
+                    crate::page::RendererDocumentLifecycleMilestone::DomContentLoaded,
+                ),
+                crate::page::RendererDocumentLifecycleEventKind::Milestone(
+                    crate::page::RendererDocumentLifecycleMilestone::Load,
+                ),
+            ]
+        );
+        assert!(artifacts.lifecycle_snapshot.dom_content_loaded.is_some());
+        assert!(artifacts.lifecycle_snapshot.load.is_some());
+        assert!(
+            artifacts
+                .initial_lifecycle_events
+                .windows(2)
+                .all(|events| events[0].sequence < events[1].sequence
+                    && events[0].timestamp_micros <= events[1].timestamp_micros)
+        );
+    }
     server.shutdown().await;
     Ok(())
 }
@@ -303,11 +375,10 @@ async fn page_creation_diagnostics_fence_initial_runtime_observable_output() -> 
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -373,45 +444,107 @@ impl Drop for TempProfileDir {
     }
 }
 
-fn indexed_db_origin_file(root: &std::path::Path, origin: &str) -> PathBuf {
-    let mut encoded = String::with_capacity(origin.len() * 2);
-    for byte in origin.as_bytes() {
-        use std::fmt::Write;
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    root.join(format!("{encoded}.json"))
-}
-
-fn indexed_db_origin_exists(root: &std::path::Path, origin: &str) -> bool {
-    if indexed_db_origin_file(root, origin).exists() {
-        return true;
-    }
-    let Ok(entries) = fs::read_dir(root) else {
-        return false;
-    };
-    entries.filter_map(|entry| entry.ok()).any(|entry| {
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            return false;
-        }
-        let Ok(bytes) = fs::read(path) else {
-            return false;
-        };
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("origin")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .as_deref()
-            == Some(origin)
-    })
+fn indexed_db_origin_exists(profile: &std::path::Path, origin: &str) -> bool {
+    // Reopen only after the browser owner dropped; inspect persisted SQLite
+    // through the production partition rather than assuming a JSON filename.
+    let partition = super::storage_partition::StoragePartitionState::open(Some(profile)).unwrap();
+    let service = partition.indexed_db_manager().lock().sqlite_service();
+    !service.databases(origin.as_bytes()).unwrap().is_empty()
 }
 
 fn first_party_storage_key_for_url(url: &Url) -> String {
     moli_storage_key::MoliStorageKey::first_party_from_url(url, None).serialized_storage_key()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn browser_version_five_profile_starts_sql_and_reopens_new_data_without_reading_legacy_idb()
+-> Result<()> {
+    let server = FixtureServer::spawn().await?;
+    let profile = TempProfileDir::new("v5-sql-default");
+    let paths = BrowserProfilePaths::new(&profile.path);
+    fs::create_dir_all(&paths.partition_root)?;
+    let mut previous = moli_browser_profile::BrowserProfileManifest::default_for_paths(&paths);
+    previous.version = 5;
+    previous.partitions[0].cookies = moli_browser_profile::ProfileBackendManifest {
+        backend: moli_browser_profile::ProfileBackendKind::Json,
+        path: Some("partitions/default/cookies.json".into()),
+    };
+    previous.partitions[0].local_storage = moli_browser_profile::ProfileBackendManifest {
+        backend: moli_browser_profile::ProfileBackendKind::Json,
+        path: Some("partitions/default/localstorage.json".into()),
+    };
+    previous.partitions[0].indexed_db = moli_browser_profile::ProfileBackendManifest {
+        backend: moli_browser_profile::ProfileBackendKind::Disk,
+        path: Some("partitions/default/indexeddb".into()),
+    };
+    fs::write(&paths.manifest_path, serde_json::to_vec(&previous)?)?;
+    let legacy = paths.partition_root.join("indexeddb");
+    fs::write(&legacy, b"this is deliberately not readable IDB JSON")?;
+    let mut config = AppConfig::default();
+    config.set_profile_dir(Some(profile.path.clone()));
+    for reopened in [false, true] {
+        let browser = Browser::new(config.clone())?;
+        assert!(
+            !browser
+                .partition
+                .indexed_db_manager()
+                .lock()
+                .sqlite_service()
+                .is_closed()
+        );
+        let mut page = browser.fetch(&server.url("/static")).await?;
+        let result = page
+            .evaluate_runtime_expression_with_await_async(
+                r#"
+            new Promise((resolve,reject) => {
+                let upgraded = false;
+                const request = indexedDB.open('sql-default',1);
+                request.onerror = () => reject(request.error);
+                request.onupgradeneeded = () => {
+                    upgraded = true;
+                    request.result.createObjectStore('records').put('kept',1);
+                };
+                request.onsuccess = () => {
+                    const db = request.result;
+                    const tx = db.transaction('records');
+                    let value;
+                    const get = tx.objectStore('records').get(1);
+                    get.onsuccess = () => value = get.result;
+                    tx.onabort = () => reject(tx.error);
+                    tx.oncomplete = () => { db.close(); resolve({value,upgraded}); };
+                };
+            }).then(value => JSON.stringify(value))
+        "#,
+                true,
+            )
+            .await?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                result["value"]
+                    .as_str()
+                    .context("expected JSON from SQL profile probe")?
+            )?,
+            serde_json::json!({"value":"kept","upgraded":!reopened})
+        );
+        drop(page);
+        drop(browser);
+    }
+    assert!(paths.indexeddb_root.join("format.json").is_file());
+    assert_eq!(
+        fs::read(&legacy)?,
+        b"this is deliberately not readable IDB JSON"
+    );
+    let current = load_profile_manifest(&paths)?;
+    assert_eq!(
+        current.version,
+        moli_browser_profile::PROFILE_MANIFEST_VERSION
+    );
+    assert_eq!(
+        current.partitions[0].indexed_db.backend,
+        moli_browser_profile::ProfileBackendKind::Sqlite
+    );
+    server.shutdown().await;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1036,11 +1169,12 @@ async fn browser_profile_dir_persists_local_storage_but_not_session_storage() ->
     }
 
     let profile_paths = BrowserProfilePaths::new(&profile.path);
-    let profile_json = fs::read_to_string(&profile_paths.local_storage_path)
-        .context("expected localStorage profile json to be written")?;
+    assert!(fs::read(&profile_paths.local_storage_path)?.starts_with(b"SQLite format 3\0"));
     assert!(
-        profile_json.contains("\"persisted\"") && profile_json.contains("\"yes\""),
-        "profile localStorage file should contain persisted key: {profile_json}"
+        !profile_paths
+            .partition_root
+            .join("localstorage.json")
+            .exists()
     );
 
     let browser = Browser::new(config)?;
@@ -1181,11 +1315,11 @@ async fn browser_profile_dir_persists_storage_bucket_indexeddb_separately() -> R
     let bucket_storage_key =
         crate::storage::storage_bucket_indexed_db_storage_key(&storage_key, bucket_id);
     assert!(
-        indexed_db_origin_exists(&profile_paths.indexeddb_root, &bucket_storage_key),
+        indexed_db_origin_exists(&profile.path, &bucket_storage_key),
         "bucket IndexedDB should write under its bucket storage key"
     );
     assert!(
-        !indexed_db_origin_exists(&profile_paths.indexeddb_root, &origin),
+        !indexed_db_origin_exists(&profile.path, &origin),
         "bucket IndexedDB should not write under the origin-wide IndexedDB key"
     );
 
@@ -1292,7 +1426,7 @@ async fn browser_profile_dir_prunes_expired_storage_bucket_indexeddb_on_open() -
     let bucket_storage_key =
         crate::storage::storage_bucket_indexed_db_storage_key(&storage_key, bucket_id);
     assert!(
-        indexed_db_origin_exists(&profile_paths.indexeddb_root, &bucket_storage_key),
+        indexed_db_origin_exists(&profile.path, &bucket_storage_key),
         "bucket IndexedDB should exist before profile-open pruning"
     );
 
@@ -1308,7 +1442,7 @@ async fn browser_profile_dir_prunes_expired_storage_bucket_indexeddb_on_open() -
     }
 
     assert!(
-        !indexed_db_origin_exists(&profile_paths.indexeddb_root, &bucket_storage_key),
+        !indexed_db_origin_exists(&profile.path, &bucket_storage_key),
         "profile-open pruning should remove expired bucket IndexedDB backing"
     );
     let pruned_json: serde_json::Value =
@@ -1425,11 +1559,11 @@ async fn browser_profile_dir_initializes_profile_manifest() -> Result<()> {
     assert_eq!(partition.root, "partitions/default");
     assert_eq!(
         partition.cookies.path.as_deref(),
-        Some("partitions/default/cookies.json")
+        Some("partitions/default/cookies.sqlite")
     );
     assert_eq!(
         partition.local_storage.path.as_deref(),
-        Some("partitions/default/localstorage.json")
+        Some("partitions/default/localstorage.sqlite")
     );
     assert_eq!(partition.session_storage.path, None);
     assert_eq!(
@@ -1446,7 +1580,7 @@ async fn browser_profile_dir_initializes_profile_manifest() -> Result<()> {
     );
     assert_eq!(
         partition.indexed_db.path.as_deref(),
-        Some("partitions/default/indexeddb")
+        Some("partitions/default/idb-lite")
     );
     assert_eq!(
         partition.http_cache.path.as_deref(),
@@ -1540,17 +1674,13 @@ async fn navigation_engine_keeps_network_runtime_when_web_storage_changes() -> R
             "<!doctype html><html><body>first</body></html>".to_owned(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
-            None,
-            None,
+            Default::default(),
             false,
-            1.0,
             Default::default(),
             None,
             false,
             Vec::new(),
-            false,
-            None,
+            SubresourceInterceptionClasses::NONE,
         )
         .await?
         .page;
@@ -1577,20 +1707,37 @@ async fn navigation_engine_keeps_network_runtime_when_web_storage_changes() -> R
             "<!doctype html><html><body>second</body></html>".to_owned(),
             Vec::new(),
             Vec::new(),
-            Vec::new(),
-            None,
-            None,
+            Default::default(),
             false,
-            1.0,
             Default::default(),
             None,
             false,
             Vec::new(),
-            false,
-            None,
+            SubresourceInterceptionClasses::NONE,
         )
         .await?
         .page;
+
+    first_page
+        .evaluate_runtime_expression_async("window.name = 'first-only'")
+        .await?;
+    assert_eq!(
+        second_page
+            .evaluate_runtime_expression_async("window.name")
+            .await?,
+        serde_json::json!({"type": "string", "value": ""}),
+        "independent Pages built by one engine must not share window.name",
+    );
+    second_page
+        .evaluate_runtime_expression_async("window.name = 'second-only'")
+        .await?;
+    assert_eq!(
+        first_page
+            .evaluate_runtime_expression_async("window.name")
+            .await?,
+        serde_json::json!({"type": "string", "value": "first-only"}),
+        "renaming the second Page must not mutate the first Page",
+    );
 
     assert_eq!(
         engine
@@ -1646,10 +1793,12 @@ async fn navigation_engine_bypasses_service_worker_for_main_resource() -> Result
             None,
             BrowserNavigationRequestKind::Navigate,
             false,
+            None,
+            None,
             "GET",
             &format!("{base_url}/app/controlled.html"),
             None,
-            Vec::new(),
+            Vec::new().into(),
             None,
         )
         .await?;
@@ -1720,10 +1869,12 @@ async fn navigation_engine_service_worker_main_resource_has_no_network_transport
             None,
             BrowserNavigationRequestKind::Navigate,
             false,
+            None,
+            None,
             "GET",
             &format!("{base_url}/app/controlled.html"),
             None,
-            Vec::new(),
+            Vec::new().into(),
             None,
         )
         .await?;
@@ -1743,6 +1894,260 @@ async fn navigation_engine_service_worker_main_resource_has_no_network_transport
     );
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn navigation_engine_service_worker_multipart_redirect_preserves_protocol_body_text()
+-> Result<()> {
+    let (base_url, requests, server) = spawn_main_resource_service_worker_server().await?;
+    let browser = Browser::new(AppConfig::default())?;
+    let mut registration_page = browser
+        .fetch_allow_http_error_with_wait_until(
+            &format!("{base_url}/app/register.html"),
+            RenderedDomWaitUntil::Load,
+            Duration::from_secs(5),
+        )
+        .await?;
+    browser
+        .wait_for_script_truthy(
+            &mut registration_page,
+            "globalThis.__mainResourceSwReady === 'ready:true'",
+            Duration::from_secs(5),
+        )
+        .await?;
+    registration_page
+        .evaluate_runtime_expression_async(
+            "navigator.serviceWorker.ready.then(registration => registration.navigationPreload.disable()).then(() => { globalThis.__multipartPreloadDisabled = true; })",
+        )
+        .await?;
+    browser
+        .wait_for_script_truthy(
+            &mut registration_page,
+            "globalThis.__multipartPreloadDisabled === true",
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    let mut engine = NavigationEngine::new_with_fetch_config_and_browser_context_access(
+        FetchConfig::default(),
+        browser._lifetime_owner.browser_context_owner.owner_access(),
+        OptionalResourceFetchMask::NONE,
+        true,
+    )?;
+    let initiator_url = Url::parse(&format!("{base_url}/app/register.html"))?;
+    let body_text = Arc::<str>::from(concat!(
+        "--upload\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n",
+        "--upload\r\nContent-Disposition: form-data; name=\"file\"; filename=\"data.txt\"\r\n",
+        "Content-Type: text/plain\r\n\r\n\r\n--upload--\r\n"
+    ));
+    let body = bytes::Bytes::from(body_text.replace(
+        "\r\n\r\n\r\n--upload--",
+        "\r\n\r\nUNIQUE-SERVICE-WORKER-FILE-PAYLOAD\r\n--upload--",
+    ));
+
+    for status in [307, 308] {
+        for final_handler in ["worker", "fallback"] {
+            let final_path = format!("/app/multipart/{status}/{final_handler}");
+            let upload_path = format!("{final_path}/upload");
+            let navigation = engine
+                .fetch_navigation_streaming_raw_response_bytes_with_storage_async(
+                    NavigationResourceStorageHandles::new(
+                        browser.partition.cookie_store(),
+                        browser.partition.web_storage_store(),
+                        browser.partition.session_storage_store(),
+                    ),
+                    Some(&initiator_url),
+                    BrowserNavigationRequestKind::Navigate,
+                    true,
+                    None,
+                    None,
+                    "POST",
+                    &format!("{base_url}{upload_path}"),
+                    Some(body.clone()),
+                    Some(body_text.clone()),
+                    vec![(
+                        "Content-Type".to_owned(),
+                        "multipart/form-data; boundary=upload".to_owned(),
+                    )]
+                    .into(),
+                    None,
+                    FetchCancelHandle::new(),
+                )
+                .await?;
+            let response = navigation
+                .fetch_result
+                .into_response()
+                .into_lossy_materialized_text_response()
+                .await?;
+            assert_eq!(response.status, 200);
+            assert_eq!(
+                response.final_url.as_str(),
+                format!("{base_url}{final_path}")
+            );
+            assert_eq!(response.body_text(), "<body>multipart-final</body>");
+            assert_eq!(response.redirect_chain.len(), 1);
+            let redirect = &response.redirect_chain[0];
+            assert_eq!(redirect.status, status);
+            assert_eq!(redirect.source, moli_fetch::RedirectSource::ServiceWorker);
+            let dispatched = redirect
+                .dispatched_request
+                .as_ref()
+                .context("Service Worker navigation must retain its redirected request")?;
+            assert_eq!(dispatched.method, "POST");
+            assert_eq!(dispatched.body.as_ref(), Some(&body));
+            assert_eq!(dispatched.body_text().as_deref(), Some(body_text.as_ref()));
+
+            let observed = requests.lock().await;
+            for path in [&upload_path, &final_path] {
+                let hops = observed
+                    .iter()
+                    .filter(|request| request_path(request).as_ref() == Some(path))
+                    .collect::<Vec<_>>();
+                assert_eq!(hops.len(), 1, "exactly one network request for {path}");
+                assert!(hops[0].starts_with(&format!("POST {path} HTTP/1.1\r\n")));
+                assert_eq!(
+                    hops[0]
+                        .split_once("\r\n\r\n")
+                        .map(|(_, body)| body.as_bytes()),
+                    Some(body.as_ref()),
+                    "the server must receive the complete file upload at {path}"
+                );
+            }
+        }
+    }
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn navigation_engine_cookie_scope_is_bound_before_service_worker_interception() -> Result<()>
+{
+    let (base_url, requests, server) = spawn_main_resource_service_worker_server().await?;
+    let browser = Browser::new(AppConfig::default())?;
+    let mut registration_page = browser
+        .fetch_allow_http_error_with_wait_until(
+            &format!("{base_url}/app/register.html"),
+            RenderedDomWaitUntil::Load,
+            Duration::from_secs(5),
+        )
+        .await?;
+    browser
+        .wait_for_script_truthy(
+            &mut registration_page,
+            "String(globalThis.__mainResourceSwReady).startsWith('ready:')",
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    // This fixture enables navigation preload by default. Disable it so the
+    // first scoped navigation never reaches the HTTP runtime, even speculatively.
+    registration_page
+        .evaluate_runtime_expression_async(
+            "navigator.serviceWorker.ready.then(registration => registration.navigationPreload.disable()).then(() => { globalThis.__scopePreloadDisabled = true; })",
+        )
+        .await?;
+    browser
+        .wait_for_script_truthy(
+            &mut registration_page,
+            "globalThis.__scopePreloadDisabled === true",
+            Duration::from_secs(5),
+        )
+        .await?;
+
+    let mut config = FetchConfig::default();
+    config.set_additional_cookies(Some("session=literal".to_owned()));
+    config.set_http_no_proxy(Some("*".to_owned()));
+    let mut engine = NavigationEngine::new_with_fetch_config_and_browser_context_access(
+        config,
+        browser._lifetime_owner.browser_context_owner.owner_access(),
+        OptionalResourceFetchMask::NONE,
+        true,
+    )?;
+    let storage = || {
+        NavigationResourceStorageHandles::new(
+            browser.partition.cookie_store(),
+            browser.partition.web_storage_store(),
+            browser.partition.session_storage_store(),
+        )
+    };
+    let navigation = engine
+        .fetch_navigation_streaming_raw_response_with_storage_async(
+            storage(),
+            None,
+            BrowserNavigationRequestKind::Navigate,
+            false,
+            None,
+            None,
+            "GET",
+            &format!("{base_url}/app/controlled.html"),
+            None,
+            Vec::new().into(),
+            None,
+        )
+        .await?;
+    assert!(navigation.fetch_result.request_observation().is_none());
+    let response = navigation
+        .fetch_result
+        .into_response()
+        .into_lossy_materialized_text_response()
+        .await?;
+    assert_eq!(
+        response.body_text(),
+        "<!doctype html><body>sw-main:document:navigate</body>"
+    );
+
+    engine.set_bypass_service_worker(true);
+    for (host, path) in [
+        ("localhost", "/foreign-after-service-worker"),
+        ("127.0.0.1", "/home-after-service-worker"),
+    ] {
+        let mut url = Url::parse(&base_url)?;
+        url.set_host(Some(host))?;
+        url.set_path(path);
+        engine
+            .fetch_navigation_streaming_raw_response_with_storage_async(
+                storage(),
+                None,
+                BrowserNavigationRequestKind::Navigate,
+                false,
+                None,
+                None,
+                "GET",
+                url.as_str(),
+                None,
+                Vec::new().into(),
+                None,
+            )
+            .await?
+            .fetch_result
+            .into_response()
+            .into_lossy_materialized_text_response()
+            .await?;
+    }
+
+    server.abort();
+    let requests = requests.lock().await.clone();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| { request_path(request).as_deref() == Some("/app/controlled.html") }),
+        "the first navigation must be served without an HTTP request: {requests:?}"
+    );
+    for (path, expected_cookie) in [
+        ("/foreign-after-service-worker", false),
+        ("/home-after-service-worker", true),
+    ] {
+        let request = requests
+            .iter()
+            .find(|request| request_path(request).as_deref() == Some(path))
+            .context("missing post-Service Worker network request")?;
+        assert_eq!(
+            request_has_header_value(request, "Cookie", "session=literal"),
+            expected_cookie,
+            "Cookie scope must follow the initial navigation, including when intercepted: {request}"
+        );
+    }
     Ok(())
 }
 
@@ -1790,15 +2195,16 @@ globalThis.__indexedDbRootResult = "ok";
         )
         .await?;
 
-    let profile_paths_a = BrowserProfilePaths::new(&profile_a.path);
-    let profile_paths_b = BrowserProfilePaths::new(&profile_b.path);
+    drop(page);
+    drop(browser_a);
+    drop(_browser_b);
     let storage_key = first_party_storage_key_for_url(&Url::parse(&format!("{origin}/"))?);
     assert!(
-        indexed_db_origin_exists(&profile_paths_a.indexeddb_root, &storage_key),
+        indexed_db_origin_exists(&profile_a.path, &storage_key),
         "browser A page should write IndexedDB under browser A profile"
     );
     assert!(
-        !indexed_db_origin_exists(&profile_paths_b.indexeddb_root, &storage_key),
+        !indexed_db_origin_exists(&profile_b.path, &storage_key),
         "browser B default root should not receive browser A page writes"
     );
 
@@ -1870,8 +2276,10 @@ async fn networkidle_times_out_while_intercepted_fetch_request_is_paused() -> Re
         )
         .await?;
 
-    page.set_fetch_subresource_interception_async(true, Some(SubresourceResourceType::Fetch))
-        .await?;
+    page.set_fetch_subresource_interception_async(
+        SubresourceInterceptionClasses::for_resource_type(SubresourceResourceType::Fetch),
+    )
+    .await?;
     page.evaluate_runtime_expression_async(
         "fetch('/wait-until-data').then(r => r.text()).then(text => { document.body.setAttribute('data-state', text); }); 'scheduled';",
     )
@@ -1908,8 +2316,10 @@ async fn networkidle_recovers_after_continuing_intercepted_fetch_request() -> Re
         )
         .await?;
 
-    page.set_fetch_subresource_interception_async(true, Some(SubresourceResourceType::Fetch))
-        .await?;
+    page.set_fetch_subresource_interception_async(
+        SubresourceInterceptionClasses::for_resource_type(SubresourceResourceType::Fetch),
+    )
+    .await?;
     page.evaluate_runtime_expression_async(
         "fetch('/wait-until-data').then(r => r.text()).then(text => { document.body.setAttribute('data-state', text); }); 'scheduled';",
     )
@@ -2086,7 +2496,7 @@ async fn fetch_deadline_spans_lifecycle_selector_and_script_without_reset() -> R
     let deadline = FetchDeadline::new(Duration::from_millis(600))?;
     let fetched = browser
         .fetch_request_document_allow_http_error_with_wait_until_deadline(
-            Request::get(&server.url("/static"))?,
+            browser_navigation_request(&server.url("/static"))?,
             RenderedDomWaitUntil::Load,
             deadline,
             RawDocumentFetchPolicy::Materialize,
@@ -2151,7 +2561,7 @@ async fn best_effort_page_readiness_consumes_only_the_remaining_fetch_deadline()
         let started = std::time::Instant::now();
         let fetched = browser
             .fetch_request_document_allow_http_error_with_wait_until_deadline(
-                Request::get(&server.url(path))?,
+                browser_navigation_request(&server.url(path))?,
                 wait_until,
                 deadline,
                 RawDocumentFetchPolicy::Materialize,
@@ -2244,7 +2654,7 @@ async fn best_effort_readiness_does_not_soften_a_base_lifecycle_timeout() -> Res
         let started = std::time::Instant::now();
         let error = browser
             .fetch_request_document_allow_http_error_with_wait_until(
-                Request::get(&server.url("/wait-until-slow-static"))?,
+                browser_navigation_request(&server.url("/wait-until-slow-static"))?,
                 wait_until,
                 Duration::from_millis(200),
             )
@@ -2609,7 +3019,7 @@ async fn standalone_selector_observes_replacement_document_before_load() -> Resu
             .headers
             .iter()
             .any(|(name, value)| {
-                name.eq_ignore_ascii_case("X-Fixture-Document") && value == "replacement"
+                name.eq_ignore_ascii_case("X-Fixture-Document") && value == b"replacement"
             })
     );
 
@@ -3057,36 +3467,64 @@ async fn live_page_subresource_response_wait_allows_unrelated_evaluate_while_pen
     Ok(())
 }
 
+async fn spawn_gated_async_response_server() -> Result<(String, Arc<Notify>, JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let release = Arc::new(Notify::new());
+    let server_release = release.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let release = server_release.clone();
+            tokio::spawn(async move {
+                let Ok(request) = read_http_request_head(&mut stream).await else {
+                    return;
+                };
+                let (content_type, body) =
+                    if request_path(&request).as_deref() == Some("/wait-until-slow-data") {
+                        release.notified().await;
+                        ("text/plain", "settled-slow")
+                    } else {
+                        ("text/html", "<!doctype html><html><body>ok</body></html>")
+                    };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Ok((url, release, server))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn window_fetch_returns_before_slow_network_response() -> Result<()> {
-    let server = FixtureServer::spawn().await?;
+    let (url, release_response, server) = spawn_gated_async_response_server().await?;
     let browser = Browser::new(AppConfig::default())?;
 
     let mut page = browser
         .fetch_with_wait_until(
-            &server.url("/static"),
+            &format!("{url}/static"),
             RenderedDomWaitUntil::Load,
             Duration::from_secs(5),
         )
         .await?;
 
-    let started = std::time::Instant::now();
-    let value = page
-        .evaluate_runtime_expression_async(
+    let value = tokio::time::timeout(
+        Duration::from_secs(2),
+        page.evaluate_runtime_expression_async(
             "fetch('/wait-until-slow-data').then(r => r.text()).then(text => { document.body.setAttribute('data-fetch-state', text); }); document.body.setAttribute('data-fetch-returned', '1'); 'returned';",
-        )
-        .await?;
+        ),
+    )
+    .await
+    .inspect_err(|_| release_response.notify_one())
+    .context("fetch() must return while its network response is gated")??;
     assert_eq!(value["value"], serde_json::json!("returned"));
-    assert!(
-        started.elapsed() < Duration::from_millis(200),
-        "fetch() should return a promise without waiting for the network response"
-    );
-    assert!(
-        page.serialize_html_async()
-            .await?
-            .contains("data-fetch-returned=\"1\"")
-    );
+    let before_response = page.serialize_html_async().await?;
+    assert!(before_response.contains("data-fetch-returned=\"1\""));
+    assert!(!before_response.contains("data-fetch-state="));
 
+    release_response.notify_one();
     browser
         .wait_for_page_network_idle(&mut page, Duration::from_secs(2))
         .await?;
@@ -3096,40 +3534,38 @@ async fn window_fetch_returns_before_slow_network_response() -> Result<()> {
             .contains("data-fetch-state=\"settled-slow\"")
     );
 
-    server.shutdown().await;
+    server.abort();
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn async_xhr_send_returns_before_slow_network_response() -> Result<()> {
-    let server = FixtureServer::spawn().await?;
+    let (url, release_response, server) = spawn_gated_async_response_server().await?;
     let browser = Browser::new(AppConfig::default())?;
 
     let mut page = browser
         .fetch_with_wait_until(
-            &server.url("/static"),
+            &format!("{url}/static"),
             RenderedDomWaitUntil::Load,
             Duration::from_secs(5),
         )
         .await?;
 
-    let started = std::time::Instant::now();
-    let value = page
-        .evaluate_runtime_expression_async(
+    let value = tokio::time::timeout(
+        Duration::from_secs(2),
+        page.evaluate_runtime_expression_async(
             "const xhr = new XMLHttpRequest(); xhr.open('GET', '/wait-until-slow-data'); xhr.onload = () => { document.body.setAttribute('data-xhr-state', xhr.responseText); }; xhr.send(); document.body.setAttribute('data-xhr-returned', '1'); 'returned';",
-        )
-        .await?;
+        ),
+    )
+    .await
+    .inspect_err(|_| release_response.notify_one())
+    .context("async XMLHttpRequest.send() must return while its response is gated")??;
     assert_eq!(value["value"], serde_json::json!("returned"));
-    assert!(
-        started.elapsed() < Duration::from_millis(200),
-        "async XMLHttpRequest.send() should not wait for the network response"
-    );
-    assert!(
-        page.serialize_html_async()
-            .await?
-            .contains("data-xhr-returned=\"1\"")
-    );
+    let before_response = page.serialize_html_async().await?;
+    assert!(before_response.contains("data-xhr-returned=\"1\""));
+    assert!(!before_response.contains("data-xhr-state="));
 
+    release_response.notify_one();
     browser
         .wait_for_page_network_idle(&mut page, Duration::from_secs(2))
         .await?;
@@ -3139,7 +3575,7 @@ async fn async_xhr_send_returns_before_slow_network_response() -> Result<()> {
             .contains("data-xhr-state=\"settled-slow\"")
     );
 
-    server.shutdown().await;
+    server.abort();
     Ok(())
 }
 
@@ -3551,7 +3987,7 @@ async fn renderer_owner_create_page_command_produces_page() -> Result<()> {
     let browser = Browser::new(AppConfig::default())?;
     let renderer_owner = browser.js_runtime.renderer_owner_handle();
 
-    let request = Request::get(&server.url("/static"))?;
+    let request = browser_navigation_request(&server.url("/static"))?;
     let requested_url = request.url.clone();
     let response = browser.resource_request_client().fetch(request).await?;
     let (response_head, response_body) = response.into_text_parts();
@@ -3572,11 +4008,10 @@ async fn renderer_owner_create_page_command_produces_page() -> Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -3613,7 +4048,7 @@ async fn renderer_owner_created_page_runs_common_page_commands() -> Result<()> {
     let browser = Browser::new(AppConfig::default())?;
     let renderer_owner = browser.js_runtime.renderer_owner_handle();
 
-    let request = Request::get(&server.url("/static"))?;
+    let request = browser_navigation_request(&server.url("/static"))?;
     let requested_url = request.url.clone();
     let response = browser.resource_request_client().fetch(request).await?;
     let (response_head, response_body) = response.into_text_parts();
@@ -3634,11 +4069,10 @@ async fn renderer_owner_created_page_runs_common_page_commands() -> Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -4498,6 +4932,7 @@ async fn renderer_owner_remove_unknown_page_keeps_never_tracked_state() -> Resul
             vm_creation_id: 0,
             view_generation: 0,
             page_state: std::sync::Arc::new(crate::renderer::RendererPageState {
+                snapshot_revision: Default::default(),
                 requested_url: Url::parse("https://example.com/requested")?,
                 navigation_initiator_url: None,
                 navigation_redirected: false,
@@ -4505,10 +4940,12 @@ async fn renderer_owner_remove_unknown_page_keeps_never_tracked_state() -> Resul
                 navigation_redirect_chain: Vec::new(),
                 final_url: Url::parse("https://example.com/final")?,
                 document_title: String::new(),
+                document_activity: Default::default(),
                 status: 200,
                 headers: Vec::new(),
                 idle_override: None,
                 service_worker_client_id: 0,
+                document_isolate_identity: 0,
                 dedicated_worker_running_worker_isolate_count: 0,
                 performance_metric_snapshot: Default::default(),
                 script_execution: Arc::new(crate::page::ScriptExecutionReport::default()),
@@ -4599,7 +5036,7 @@ async fn renderer_owner_created_page_runs_runtime_protocol_commands() -> Result<
     let browser = Browser::new(AppConfig::default())?;
     let renderer_owner = browser.js_runtime.renderer_owner_handle();
 
-    let request = Request::get(&server.url("/static"))?;
+    let request = browser_navigation_request(&server.url("/static"))?;
     let response = browser.resource_request_client().fetch(request).await?;
     let (response_head, response_body) = response.into_text_parts();
     let create_page_request = renderer_owner.build_create_html_page_request(
@@ -4619,11 +5056,10 @@ async fn renderer_owner_created_page_runs_runtime_protocol_commands() -> Result<
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -4664,7 +5100,7 @@ async fn renderer_owner_created_page_runs_document_start_commands() -> Result<()
     let browser = Browser::new(AppConfig::default())?;
     let renderer_owner = browser.js_runtime.renderer_owner_handle();
 
-    let request = Request::get(&server.url("/static"))?;
+    let request = browser_navigation_request(&server.url("/static"))?;
     let response = browser.resource_request_client().fetch(request).await?;
     let (response_head, response_body) = response.into_text_parts();
     let create_page_request = renderer_owner.build_create_html_page_request(
@@ -4684,11 +5120,10 @@ async fn renderer_owner_created_page_runs_document_start_commands() -> Result<()
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -4792,7 +5227,7 @@ async fn fetch_streaming_chunked_html_parses_incrementally_across_utf8_boundarie
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/streaming/chunked-html"))
         .await?;
 
@@ -4864,11 +5299,10 @@ async fn renderer_owner_created_page_runs_input_commands() -> Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -4939,11 +5373,10 @@ async fn renderer_owner_created_page_runs_input_query_commands() -> Result<()> {
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -4951,6 +5384,10 @@ async fn renderer_owner_created_page_runs_input_query_commands() -> Result<()> {
         .dispatch_command(RendererOwnerCommand::CreateHtmlPage(create_page_request))
         .await?;
     let mut page = materialize_page_created_reply(&renderer_owner, reply)?;
+
+    let capture = page.start_capture_screenshot()?;
+    let captured = capture.wait().await?;
+    page.finish_capture_screenshot(captured)?;
 
     let input_backend_node_id = query_selector_node_from_live_document(&mut page, "#field")
         .await?
@@ -5035,11 +5472,10 @@ async fn renderer_owner_created_page_reports_real_client_rect_for_positioned_nod
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -5047,6 +5483,10 @@ async fn renderer_owner_created_page_reports_real_client_rect_for_positioned_nod
         .dispatch_command(RendererOwnerCommand::CreateHtmlPage(create_page_request))
         .await?;
     let mut page = materialize_page_created_reply(&renderer_owner, reply)?;
+
+    let capture = page.start_capture_screenshot()?;
+    let captured = capture.wait().await?;
+    page.finish_capture_screenshot(captured)?;
 
     let target_backend_node_id = query_selector_node_from_live_document(&mut page, "#target")
         .await?
@@ -5118,11 +5558,10 @@ async fn renderer_owner_created_page_resolves_backend_node_runtime_object() -> R
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -5203,11 +5642,10 @@ async fn runtime_object_resolve_uses_live_backend_node_for_stale_snapshot_path()
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -5295,7 +5733,7 @@ fn runtime_protocol_response_by_id(
 ) -> Option<&serde_json::Value> {
     messages.iter().find_map(|message| match message {
         RendererRuntimeInspectorMessage::Protocol(value)
-            if value.get("id").and_then(serde_json::Value::as_i64) == Some(response_id) =>
+            if value.payload().id_i64() == Some(response_id) =>
         {
             Some(value.value())
         }
@@ -5338,11 +5776,10 @@ async fn renderer_owner_created_page_runs_inline_stylesheet_commands() -> Result
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -5431,7 +5868,7 @@ async fn renderer_owner_created_page_runs_subresource_interception_commands() ->
         .set_renderer_output_transport_sender(output_tx);
     let renderer_owner = browser.js_runtime.renderer_owner_handle();
 
-    let request = Request::get(&server.url("/static"))?;
+    let request = browser_navigation_request(&server.url("/static"))?;
     let requested_url = request.url.clone();
     let response = browser.resource_request_client().fetch(request).await?;
     let (response_head, response_body) = response.into_text_parts();
@@ -5452,11 +5889,10 @@ async fn renderer_owner_created_page_runs_subresource_interception_commands() ->
         vec![],
         vec![],
         vec![],
-        vec![],
+        Default::default(),
         false,
         Vec::new(),
-        false,
-        None,
+        SubresourceInterceptionClasses::NONE,
         super::PageVmInitStage::Load,
     );
 
@@ -5465,8 +5901,10 @@ async fn renderer_owner_created_page_runs_subresource_interception_commands() ->
         .await?;
     let mut page = materialize_page_created_reply(&renderer_owner, reply)?;
 
-    page.set_fetch_subresource_interception_async(true, Some(SubresourceResourceType::Fetch))
-        .await?;
+    page.set_fetch_subresource_interception_async(
+        SubresourceInterceptionClasses::for_resource_type(SubresourceResourceType::Fetch),
+    )
+    .await?;
     page.evaluate_runtime_expression_async(
         "fetch('/wait-until-data').then(r => r.text()).then(text => { document.body.setAttribute('data-state', text); }); 'scheduled';",
     )
@@ -5524,6 +5962,39 @@ async fn spawn_main_resource_service_worker_server()
                     Err(_) => return,
                 };
                 let path = request_path(&request).unwrap_or_else(|| "/".to_owned());
+                if let Some(multipart_path) = path.strip_prefix("/app/multipart/") {
+                    let content_length = request
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0; content_length];
+                    if stream.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    requests.lock().await.push(format!(
+                        "{request}{}",
+                        String::from_utf8(body).expect("multipart fixture uses ASCII file content")
+                    ));
+                    let response = if let Some(destination) = path.strip_suffix("/upload") {
+                        let (status, _) = multipart_path.split_once('/').unwrap();
+                        format!(
+                            "HTTP/1.1 {status} Redirect\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        let body = "<body>multipart-final</body>";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    return;
+                }
                 let preload_header_value = request
                     .lines()
                     .find_map(|line| {
@@ -5849,7 +6320,20 @@ self.addEventListener("message", event => {
 });
 self.addEventListener("fetch", event => {
   const url = new URL(event.request.url);
-	  if (url.pathname === "/app/controlled.html") {
+	  if (url.pathname.startsWith("/app/multipart/")) {
+        if (event.request.redirect !== "manual") {
+          event.respondWith(Promise.reject(new Error("navigation redirect mode must remain manual")));
+        } else if (url.pathname.endsWith("/upload")) {
+          event.respondWith(fetch(event.request).then(response => {
+            if (response.type !== "opaqueredirect") {
+              throw new Error("navigation must follow the worker's opaqueredirect response");
+            }
+            return response;
+          }));
+        } else if (url.pathname.endsWith("/worker")) {
+          event.respondWith(fetch(event.request));
+        }
+	  } else if (url.pathname === "/app/controlled.html") {
 	    event.respondWith(new Response(
 	      "<!doctype html><body>sw-main:" +
 	        event.request.destination + ":" + event.request.mode +

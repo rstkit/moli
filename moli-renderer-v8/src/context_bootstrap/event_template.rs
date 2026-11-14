@@ -2,59 +2,39 @@ use super::{
     event_document::{document_create_event_callback, document_has_focus_callback},
     event_legacy::{
         composition_event_init_callback, custom_event_init_callback, event_init_event_callback,
-        keyboard_event_get_modifier_state_callback, keyboard_event_init_callback,
         mouse_event_init_callback, storage_event_init_callback, text_event_init_callback,
         ui_event_init_callback,
     },
     events::{
+        before_unload_event_return_value_getter, before_unload_event_return_value_setter,
         close_event_code_getter_function, close_event_reason_getter_function,
         close_event_was_clean_getter_function, event_bubbles_getter_function,
         event_cancel_bubble_getter_function, event_cancel_bubble_setter_function,
         event_cancelable_getter_function, event_composed_getter_function,
         event_composed_path_callback, event_current_target_getter_function,
         event_default_prevented_getter_function, event_event_phase_getter_function,
+        event_get_modifier_state_callback, event_platform_attribute_getter,
         event_prevent_default_callback, event_return_value_getter_function,
         event_return_value_setter_function, event_src_element_getter_function,
         event_stop_immediate_propagation_callback, event_stop_propagation_callback,
         event_target_getter_function, event_time_stamp_getter_function, event_type_getter_function,
-        focus_event_related_target_getter_function, form_data_event_form_data_getter_function,
+        event_value_attribute_getter, focus_event_related_target_getter_function,
+        form_data_event_form_data_getter_function, input_event_get_target_ranges_callback,
+        keyboard_event_init_callback, message_event_init_callback,
         mouse_event_related_target_getter_function, pointer_event_get_predicted_events_callback,
+        submit_event_agent_invoked_getter_function, submit_event_respond_with_callback,
         submit_event_submitter_getter_function, track_event_track_getter_function,
-        ui_event_pseudo_target_getter_function,
+        ui_event_pseudo_target_getter_function, ui_event_which_getter_function,
     },
     selection_surface::document_get_selection_callback,
-    specs::{ConstructorKind, ConstructorSpec},
+    specs::ConstructorSpec,
 };
+use crate::web_api_interfaces;
 use crate::{native_bridge::document, window_host};
-use moli_webapi_declare::{EVENT_TARGET_INTERFACE_BRAND_SLOT, WebApiFunctionTemplate};
-
-pub(in crate::context_bootstrap) fn object_is_event_target<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-) -> bool {
-    if crate::util::get_private_value(scope, object, EVENT_TARGET_INTERFACE_BRAND_SLOT)
-        .is_some_and(|value| value.is_true())
-    {
-        return true;
-    }
-    super::exposed_interfaces::object_is_intrinsic_interface_instance(scope, "EventTarget", object)
-        || crate::native_bridge::object_is_native_event_target_wrapper_or_detached(scope, object)
-}
-
-pub(in crate::context_bootstrap) fn mark_event_target_interface_prototype<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    prototype: v8::Local<'s, v8::Object>,
-) {
-    crate::util::set_private_value(
-        scope,
-        prototype,
-        EVENT_TARGET_INTERFACE_BRAND_SLOT,
-        v8::Boolean::new(scope, true).into(),
-    );
-}
+use moli_webapi_declare::{WebApiFunctionTemplate, WebApiFunctionTemplateDeclaration};
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Event", enumerable)]
+#[webapi(interface = web_api_interfaces::Event, enumerable, receiver)]
 struct EventBaseTemplateMethodsDeclaration {
     #[webapi(accessor_property = "type", getter = event_type_getter_function)]
     event_type: (),
@@ -148,7 +128,7 @@ struct EventBaseTemplateMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CloseEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::CloseEvent, enumerable, receiver)]
 struct CloseEventTemplateAccessorsDeclaration {
     #[webapi(accessor_property = "wasClean", getter = close_event_was_clean_getter_function)]
     was_clean: (),
@@ -161,30 +141,67 @@ struct CloseEventTemplateAccessorsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TrackEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::TrackEvent, enumerable, receiver)]
 struct TrackEventTemplateAccessorsDeclaration {
     #[webapi(accessor_property, getter = track_event_track_getter_function)]
     track: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "SubmitEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::SubmitEvent, enumerable, receiver)]
 struct SubmitEventTemplateAccessorsDeclaration {
+    #[webapi(accessor_property = "agentInvoked", getter = submit_event_agent_invoked_getter_function)]
+    agent_invoked: (),
+    #[webapi(method = "respondWith", length = 1, callback = submit_event_respond_with_callback)]
+    respond_with: (),
     #[webapi(accessor_property, getter = submit_event_submitter_getter_function)]
     submitter: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FormDataEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::FormDataEvent, enumerable, receiver)]
 struct FormDataEventTemplateAccessorsDeclaration {
     #[webapi(accessor_property = "formData", getter = form_data_event_form_data_getter_function)]
     form_data: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "UIEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::BeforeUnloadEvent, enumerable, receiver)]
+struct BeforeUnloadEventTemplateAccessorsDeclaration {
+    #[webapi(accessor_property, getter = before_unload_event_return_value_getter, setter = before_unload_event_return_value_setter)]
+    return_value: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::DragEvent, enumerable, receiver)]
+struct DragEventTemplateAccessorsDeclaration {
+    #[webapi(accessor_property = "dataTransfer", getter = event_platform_attribute_getter, data = crate::util::v8str(scope, "dataTransfer"))]
+    data_transfer: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::HashChangeEvent, enumerable, receiver)]
+struct HashChangeEventTemplateAccessorsDeclaration {
+    #[webapi(accessor_property = "oldURL", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "oldURL"))]
+    old_url: (),
+    #[webapi(accessor_property = "newURL", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "newURL"))]
+    new_url: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::UIEvent, enumerable, receiver)]
 struct UiEventTemplateMethodsDeclaration {
-    #[webapi(method = "initUIEvent", length = 0, callback = ui_event_init_callback)]
+    #[webapi(accessor_property, getter = event_platform_attribute_getter, data = crate::util::v8str(scope, "sourceCapabilities"))]
+    source_capabilities: (),
+
+    #[webapi(accessor_property = "view", getter = event_platform_attribute_getter, data = crate::util::v8str(scope, "view"))]
+    view: (),
+    #[webapi(accessor_property = "detail", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "detail"))]
+    detail: (),
+    #[webapi(accessor_property = "which", getter = ui_event_which_getter_function, data = crate::util::v8str(scope, "which"))]
+    which: (),
+
+    #[webapi(method = "initUIEvent", length = 1, callback = ui_event_init_callback)]
     init_ui_event: (),
 
     #[webapi(
@@ -195,7 +212,7 @@ struct UiEventTemplateMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FocusEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::FocusEvent, enumerable, receiver)]
 struct FocusEventTemplateAccessorsDeclaration {
     #[webapi(
         accessor_property = "relatedTarget",
@@ -205,15 +222,21 @@ struct FocusEventTemplateAccessorsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::TextEvent, enumerable, receiver)]
 struct TextEventTemplateMethodsDeclaration {
+    #[webapi(accessor_property = "data", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "data"))]
+    data: (),
+
     #[webapi(method = "initTextEvent", length = 1, callback = text_event_init_callback)]
     init_text_event: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CompositionEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::CompositionEvent, enumerable, receiver)]
 struct CompositionEventTemplateMethodsDeclaration {
+    #[webapi(accessor_property = "data", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "data"))]
+    data: (),
+
     #[webapi(
         method = "initCompositionEvent",
         length = 1,
@@ -223,14 +246,33 @@ struct CompositionEventTemplateMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CustomEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::CustomEvent, enumerable, receiver)]
 struct CustomEventTemplateMethodsDeclaration {
     #[webapi(method = "initCustomEvent", length = 1, callback = custom_event_init_callback)]
     init_custom_event: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "StorageEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::InputEvent, enumerable, receiver)]
+struct InputEventTemplateAccessorsDeclaration {
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "dataTransfer"))]
+    data_transfer: (),
+
+    #[webapi(method, length = 0, callback = input_event_get_target_ranges_callback)]
+    get_target_ranges: (),
+
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "data"))]
+    data: (),
+
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "isComposing"))]
+    is_composing: (),
+
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "inputType"))]
+    input_type: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::StorageEvent, enumerable, receiver)]
 struct StorageEventTemplateMethodsDeclaration {
     #[webapi(
         method = "initStorageEvent",
@@ -241,22 +283,70 @@ struct StorageEventTemplateMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "KeyboardEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::KeyboardEvent, enumerable, receiver)]
 struct KeyboardEventTemplateMethodsDeclaration {
-    #[webapi(method = "initKeyboardEvent", length = 7, callback = keyboard_event_init_callback)]
+    #[webapi(constant = "DOM_KEY_LOCATION_STANDARD", value = 0u32)]
+    dom_key_location_standard: (),
+
+    #[webapi(constant = "DOM_KEY_LOCATION_LEFT", value = 1u32)]
+    dom_key_location_left: (),
+
+    #[webapi(constant = "DOM_KEY_LOCATION_RIGHT", value = 2u32)]
+    dom_key_location_right: (),
+
+    #[webapi(constant = "DOM_KEY_LOCATION_NUMPAD", value = 3u32)]
+    dom_key_location_numpad: (),
+
+    #[webapi(accessor_property = "key", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "key"))]
+    key: (),
+
+    #[webapi(accessor_property = "code", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "code"))]
+    code: (),
+
+    #[webapi(accessor_property = "location", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "location"))]
+    location: (),
+
+    #[webapi(accessor_property = "ctrlKey", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "ctrlKey"))]
+    ctrl_key: (),
+
+    #[webapi(accessor_property = "shiftKey", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "shiftKey"))]
+    shift_key: (),
+
+    #[webapi(accessor_property = "altKey", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "altKey"))]
+    alt_key: (),
+
+    #[webapi(accessor_property = "metaKey", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "metaKey"))]
+    meta_key: (),
+
+    #[webapi(accessor_property = "repeat", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "repeat"))]
+    repeat: (),
+
+    #[webapi(accessor_property = "isComposing", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "isComposing"))]
+    is_composing: (),
+
+    #[webapi(accessor_property = "charCode", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "charCode"))]
+    char_code: (),
+
+    #[webapi(accessor_property = "keyCode", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "keyCode"))]
+    key_code: (),
+
+    #[webapi(method = "initKeyboardEvent", length = 1, callback = keyboard_event_init_callback)]
     init_keyboard_event: (),
 
     #[webapi(
         method = "getModifierState",
-        length = 0,
-        callback = keyboard_event_get_modifier_state_callback
+        length = 1,
+        callback = event_get_modifier_state_callback
     )]
     get_modifier_state: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MouseEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::MouseEvent, enumerable, receiver)]
 struct MouseEventTemplateMethodsDeclaration {
+    #[webapi(method = "getModifierState", length = 1, callback = event_get_modifier_state_callback)]
+    get_modifier_state: (),
+
     #[webapi(
         accessor_property = "relatedTarget",
         getter = mouse_event_related_target_getter_function
@@ -269,13 +359,20 @@ struct MouseEventTemplateMethodsDeclaration {
     #[webapi(accessor_property = "offsetY", getter = window_host::mouse_event_offset_y_getter)]
     offset_y: (),
 
-    #[webapi(method = "initMouseEvent", length = 15, callback = mouse_event_init_callback)]
+    #[webapi(method = "initMouseEvent", length = 1, callback = mouse_event_init_callback)]
     init_mouse_event: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "WheelEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::WheelEvent, enumerable, receiver)]
 struct WheelEventTemplateConstantsDeclaration {
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "wheelDeltaX"))]
+    wheel_delta_x: (),
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "wheelDeltaY"))]
+    wheel_delta_y: (),
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "wheelDelta"))]
+    wheel_delta: (),
+
     #[webapi(constant = "DOM_DELTA_PIXEL", value = 0u32)]
     dom_delta_pixel: (),
 
@@ -287,8 +384,11 @@ struct WheelEventTemplateConstantsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "PointerEvent", enumerable)]
+#[webapi(interface = web_api_interfaces::PointerEvent, enumerable, receiver)]
 struct PointerEventTemplateMethodsDeclaration {
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "persistentDeviceId"))]
+    persistent_device_id: (),
+
     #[webapi(
         method = "getPredictedEvents",
         length = 0,
@@ -298,7 +398,7 @@ struct PointerEventTemplateMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "EventTarget", enumerable)]
+#[webapi(interface = web_api_interfaces::EventTarget, enumerable, receiver)]
 struct EventTargetTemplateMethodsDeclaration {
     #[webapi(
         method = "addEventListener",
@@ -323,7 +423,7 @@ struct EventTargetTemplateMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Document", enumerable)]
+#[webapi(interface = web_api_interfaces::Document, enumerable, receiver)]
 struct DocumentEventTemplateMethodsDeclaration {
     #[webapi(method = "createEvent", length = 1, callback = document_create_event_callback)]
     create_event: (),
@@ -335,13 +435,151 @@ struct DocumentEventTemplateMethodsDeclaration {
     get_selection: (),
 }
 
-fn install_event_base_bindings<'s>(
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::SecurityPolicyViolationEvent, enumerable, receiver)]
+struct SecurityPolicyViolationEventTemplateAccessorsDeclaration {
+    #[webapi(accessor_property = "documentURI", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "documentURI"))]
+    document_uri: (),
+
+    #[webapi(accessor_property = "referrer", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "referrer"))]
+    referrer: (),
+
+    #[webapi(accessor_property = "blockedURI", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "blockedURI"))]
+    blocked_uri: (),
+
+    #[webapi(accessor_property = "effectiveDirective", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "effectiveDirective"))]
+    effective_directive: (),
+
+    #[webapi(accessor_property = "violatedDirective", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "violatedDirective"))]
+    violated_directive: (),
+
+    #[webapi(accessor_property = "originalPolicy", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "originalPolicy"))]
+    original_policy: (),
+
+    #[webapi(accessor_property = "sourceFile", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "sourceFile"))]
+    source_file: (),
+
+    #[webapi(accessor_property = "sample", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "sample"))]
+    sample: (),
+
+    #[webapi(accessor_property = "disposition", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "disposition"))]
+    disposition: (),
+
+    #[webapi(accessor_property = "statusCode", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "statusCode"))]
+    status_code: (),
+
+    #[webapi(accessor_property = "lineNumber", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "lineNumber"))]
+    line_number: (),
+
+    #[webapi(accessor_property = "columnNumber", getter = event_value_attribute_getter, data = crate::util::v8str(scope, "columnNumber"))]
+    column_number: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::ErrorEvent, enumerable, receiver)]
+struct ErrorEventTemplateAccessorsDeclaration {
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "message"))]
+    message: (),
+
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "filename"))]
+    filename: (),
+
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "lineno"))]
+    lineno: (),
+
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "colno"))]
+    colno: (),
+
+    #[webapi(accessor_property, getter = event_value_attribute_getter, data = crate::util::v8str(scope, "error"))]
+    error: (),
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::MessageEvent, enumerable, receiver)]
+struct MessageEventTemplateMethodsDeclaration {
+    #[webapi(method = "initMessageEvent", length = 1, callback = message_event_init_callback)]
+    init_message_event: (),
+}
+
+struct EventTemplateDeclaration {
+    attributes: &'static [&'static str],
+    install: for<'s, 'p> fn(&mut v8::PinScope<'s, 'p, ()>, v8::Local<'s, v8::FunctionTemplate>),
+}
+
+impl EventTemplateDeclaration {
+    fn new<D: WebApiFunctionTemplateDeclaration>() -> Self {
+        Self {
+            attributes: D::PROTOTYPE_ATTRIBUTE_NAMES,
+            install: install_declaration::<D>,
+        }
+    }
+}
+
+fn install_declaration<'s, D: WebApiFunctionTemplateDeclaration>(
     scope: &mut v8::PinScope<'s, '_, ()>,
     template: v8::Local<'s, v8::FunctionTemplate>,
 ) {
-    let proto = template.prototype_template(scope);
-    EventBaseTemplateMethodsDeclaration::initialize_template(scope, template);
-    EventBaseTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
+    D::initialize_template(scope, template);
+    let prototype = template.prototype_template(scope);
+    D::initialize_prototype_template(scope, prototype);
+}
+
+// Installation and wrapper placement share the same native declarations. Public
+// prototype mutations cannot change which fields are exposed as own properties.
+fn event_template_declaration(interface: &str) -> Option<EventTemplateDeclaration> {
+    Some(match interface {
+        "ErrorEvent" => EventTemplateDeclaration::new::<ErrorEventTemplateAccessorsDeclaration>(),
+        "SecurityPolicyViolationEvent" => EventTemplateDeclaration::new::<
+            SecurityPolicyViolationEventTemplateAccessorsDeclaration,
+        >(),
+        "MessageEvent" => EventTemplateDeclaration::new::<MessageEventTemplateMethodsDeclaration>(),
+        "Event" => EventTemplateDeclaration::new::<EventBaseTemplateMethodsDeclaration>(),
+        "BeforeUnloadEvent" => {
+            EventTemplateDeclaration::new::<BeforeUnloadEventTemplateAccessorsDeclaration>()
+        }
+        "DragEvent" => EventTemplateDeclaration::new::<DragEventTemplateAccessorsDeclaration>(),
+        "UIEvent" => EventTemplateDeclaration::new::<UiEventTemplateMethodsDeclaration>(),
+        "FocusEvent" => EventTemplateDeclaration::new::<FocusEventTemplateAccessorsDeclaration>(),
+        "TextEvent" => EventTemplateDeclaration::new::<TextEventTemplateMethodsDeclaration>(),
+        "CompositionEvent" => {
+            EventTemplateDeclaration::new::<CompositionEventTemplateMethodsDeclaration>()
+        }
+        "CustomEvent" => EventTemplateDeclaration::new::<CustomEventTemplateMethodsDeclaration>(),
+        "InputEvent" => EventTemplateDeclaration::new::<InputEventTemplateAccessorsDeclaration>(),
+        "StorageEvent" => EventTemplateDeclaration::new::<StorageEventTemplateMethodsDeclaration>(),
+        "KeyboardEvent" => {
+            EventTemplateDeclaration::new::<KeyboardEventTemplateMethodsDeclaration>()
+        }
+        "MouseEvent" => EventTemplateDeclaration::new::<MouseEventTemplateMethodsDeclaration>(),
+        "WheelEvent" => EventTemplateDeclaration::new::<WheelEventTemplateConstantsDeclaration>(),
+        "PointerEvent" => EventTemplateDeclaration::new::<PointerEventTemplateMethodsDeclaration>(),
+        "CloseEvent" => EventTemplateDeclaration::new::<CloseEventTemplateAccessorsDeclaration>(),
+        "TrackEvent" => EventTemplateDeclaration::new::<TrackEventTemplateAccessorsDeclaration>(),
+        "SubmitEvent" => EventTemplateDeclaration::new::<SubmitEventTemplateAccessorsDeclaration>(),
+        "FormDataEvent" => {
+            EventTemplateDeclaration::new::<FormDataEventTemplateAccessorsDeclaration>()
+        }
+        "HashChangeEvent" => {
+            EventTemplateDeclaration::new::<HashChangeEventTemplateAccessorsDeclaration>()
+        }
+        "EventTarget" => EventTemplateDeclaration::new::<EventTargetTemplateMethodsDeclaration>(),
+        "Document" => EventTemplateDeclaration::new::<DocumentEventTemplateMethodsDeclaration>(),
+        _ => return None,
+    })
+}
+
+pub(super) fn event_has_prototype_attribute(interface: &str, property: &str) -> bool {
+    let mut interface = Some(interface);
+    while let Some(name) = interface {
+        if event_template_declaration(name)
+            .is_some_and(|declaration| declaration.attributes.contains(&property))
+        {
+            return true;
+        }
+        interface =
+            web_api_interfaces::descriptor(name).and_then(|descriptor| descriptor.parent_name());
+    }
+    false
 }
 
 pub(super) fn install_event_template_bindings<'s>(
@@ -349,77 +587,15 @@ pub(super) fn install_event_template_bindings<'s>(
     template: v8::Local<'s, v8::FunctionTemplate>,
     spec: ConstructorSpec,
 ) {
-    if spec.kind == ConstructorKind::Event {
-        install_event_base_bindings(scope, template);
+    let interface = spec.interface.name();
+    super::events::install_value_event_template_bindings(scope, template, interface);
+    super::events::install_device_event_template_bindings(scope, template, interface);
+    if interface == "Document" {
+        let prototype = template.prototype_template(scope);
+        document::install_document_prototype_methods(scope, prototype);
     }
-
-    match spec.name {
-        "UIEvent" => {
-            let proto = template.prototype_template(scope);
-            UiEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "FocusEvent" => {
-            let proto = template.prototype_template(scope);
-            FocusEventTemplateAccessorsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "TextEvent" => {
-            let proto = template.prototype_template(scope);
-            TextEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "CompositionEvent" => {
-            let proto = template.prototype_template(scope);
-            CompositionEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "CustomEvent" => {
-            let proto = template.prototype_template(scope);
-            CustomEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "StorageEvent" => {
-            let proto = template.prototype_template(scope);
-            StorageEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "KeyboardEvent" => {
-            let proto = template.prototype_template(scope);
-            KeyboardEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "MouseEvent" => {
-            let proto = template.prototype_template(scope);
-            MouseEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "WheelEvent" => {
-            let proto = template.prototype_template(scope);
-            WheelEventTemplateConstantsDeclaration::initialize_template(scope, template);
-            WheelEventTemplateConstantsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "PointerEvent" => {
-            let proto = template.prototype_template(scope);
-            PointerEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "CloseEvent" => {
-            let proto = template.prototype_template(scope);
-            CloseEventTemplateAccessorsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "TrackEvent" => {
-            let proto = template.prototype_template(scope);
-            TrackEventTemplateAccessorsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "SubmitEvent" => {
-            let proto = template.prototype_template(scope);
-            SubmitEventTemplateAccessorsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "FormDataEvent" => {
-            let proto = template.prototype_template(scope);
-            FormDataEventTemplateAccessorsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        "EventTarget" => {
-            let prototype = template.prototype_template(scope);
-            EventTargetTemplateMethodsDeclaration::initialize_prototype_template(scope, prototype);
-        }
-        "Document" => {
-            let proto = template.prototype_template(scope);
-            document::install_document_prototype_methods(scope, proto);
-            DocumentEventTemplateMethodsDeclaration::initialize_prototype_template(scope, proto);
-        }
-        _ => {}
+    super::events::speech::install(scope, template, interface);
+    if let Some(declaration) = event_template_declaration(interface) {
+        (declaration.install)(scope, template);
     }
 }

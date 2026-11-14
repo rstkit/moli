@@ -31,6 +31,8 @@ mod cache;
 mod cause;
 mod cleanup;
 mod computed;
+#[cfg(test)]
+pub(crate) use computed::take_style_resolution_context_count_for_test;
 mod document_world;
 mod drain;
 mod eligibility;
@@ -50,7 +52,7 @@ mod request;
 mod retained;
 pub(crate) use stylesheet::{
     NativeStylesheetFontFaceProjection, NativeStylesheetFontFaceRuleProjection,
-    StylesheetFontFaceProjection, StylesheetFontFaceRuleProjection,
+    StylesheetFontFaceProjection, StylesheetFontFaceRuleProjection, initial_font_size_px,
     native_font_face_projection_for_stylesheet, native_font_face_rules_for_stylesheet,
 };
 #[cfg(test)]
@@ -99,7 +101,7 @@ use cleanup::StyleInvalidationCleanup;
 pub(crate) use computed::{
     ComputedDisplayKind, ComputedRenderedStyleFacts, ComputedTextTransformKind,
     ComputedTextWrapModeKind, ComputedWhiteSpaceCollapseKind, StyleObservationSnapshot,
-    StyloAnonymousBoxKind, StyloComputedStyleSnapshot,
+    StyloAnonymousBoxKind, StyloComputedStyleSnapshot, serialize_resolved_computed_property,
 };
 use document_world::{DocumentStyleWorld, DocumentStyleWorlds};
 pub(in crate::style_engine) use drain::StyleInvalidationDrainBoundary;
@@ -111,8 +113,7 @@ pub(crate) use mutation_effect::{
     StyleAttributeImpact, StyleMutationEffect, normalized_style_attribute_name,
 };
 pub(crate) use property_metadata::{
-    computed_longhand_count, computed_longhand_first_vendor_index, computed_longhand_name_at,
-    computed_property_is_queryable,
+    computed_longhand_count, computed_longhand_name_at, computed_property_is_queryable,
 };
 pub(crate) use registered_properties::{
     CssCustomPropertyRegistration, CssCustomPropertyRegistrationError,
@@ -205,6 +206,33 @@ impl MoliStyleEngine {
         self.document_worlds.documents_with_adopted_style_sheets()
     }
 
+    pub(crate) fn document_has_adopted_style_sheet_sources(&self, document: DomHandle) -> bool {
+        self.document_worlds
+            .active_world(document)
+            .is_some_and(|world| {
+                world
+                    .adopted_style_sheet_sources
+                    .borrow()
+                    .document_source_count(document)
+                    != 0
+            })
+    }
+
+    pub(crate) fn shadow_root_has_adopted_style_sheet_sources(
+        &self,
+        host: &DomHost,
+        root: DomHandle,
+    ) -> bool {
+        self.active_owner_document_world(host, root)
+            .is_some_and(|world| {
+                world
+                    .adopted_style_sheet_sources
+                    .borrow()
+                    .shadow_root_source_count(root)
+                    != 0
+            })
+    }
+
     pub(in crate::style_engine) fn world_for_document(
         &self,
         document: DomHandle,
@@ -236,11 +264,13 @@ impl MoliStyleEngine {
             .computed_cache_generation
     }
 
-    pub(crate) fn computed_style_observation_generations(
+    /// Visual output changes with source inputs, not with materialization of
+    /// the computed cache (for example while observing temporary print media).
+    pub(crate) fn visual_style_input_generations(
         &self,
         documents: impl IntoIterator<Item = DomHandle>,
-    ) -> Vec<(DomHandle, u64, u64, u64)> {
-        self.document_worlds.observation_generations(documents)
+    ) -> Vec<(DomHandle, u64, u64)> {
+        self.document_worlds.visual_input_generations(documents)
     }
 
     pub(crate) fn stylesheet_resource_snapshot_for_document(
@@ -388,7 +418,7 @@ impl MoliStyleEngine {
     pub(crate) fn bump_target_context_epoch_for_document(&self, document: DomHandle) {
         self.world_for_document(document)
             .document_state
-            .bump_target_context_epoch();
+            .note_style_input_change();
     }
 
     #[cfg(test)]
@@ -1022,6 +1052,16 @@ impl MoliStyleEngine {
         )
     }
 
+    pub(crate) fn prepare_style_observation_targets(
+        &self,
+        host: &DomHost,
+        document_url: &url::Url,
+        document: DomHandle,
+        handles: &[DomHandle],
+    ) {
+        computed::prepare_style_observation_targets(self, host, document_url, document, handles);
+    }
+
     pub(crate) fn computed_style_snapshot_from_current_observation(
         &self,
         host: &DomHost,
@@ -1115,14 +1155,16 @@ pub(crate) fn ensure_stylo_browser_compat_prefs() {
         stylo_static_prefs::set_pref!("layout.container-queries.enabled", true);
         stylo_static_prefs::set_pref!("layout.columns.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.at-scope.enabled", true);
-        stylo_static_prefs::set_pref!("layout.css.attr.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.content.alt-text.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.font-palette.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.margin-rules.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.scroll-driven-animations.enabled", true);
+        stylo_static_prefs::set_pref!("layout.css.starting-style-at-rules.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.style-queries.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.tree-counting-functions.enabled", true);
         stylo_static_prefs::set_pref!("layout.css.zoom.enabled", true);
         stylo_static_prefs::set_pref!("layout.grid.enabled", true);
+        stylo_static_prefs::set_pref!("layout.variable_fonts.enabled", true);
         // Stylo exposes the experimental CSS Sizing `fit-content(<length>)`
         // form behind a Servo pref. Chromium 147 rejects that function for
         // width/height while still accepting the bare `fit-content` keyword

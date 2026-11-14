@@ -1,4 +1,4 @@
-use crate::devtools_runtime::{AutomationEvent, DevToolsNetworkResourceType};
+use crate::automation::{AutomationEvent, DevToolsNetworkResourceType};
 use moli_cookie_jar::{
     StoredCookieQueryReport, StoredCookieSetRejectionReason, StoredCookieSetStatus,
 };
@@ -18,13 +18,69 @@ use super::gate::{
 };
 use super::*;
 
+#[test]
+fn only_cancelled_navigation_preserves_the_document() {
+    use crate::automation::DevToolsRequestFailure;
+
+    for error in [
+        anyhow::Error::new(moli_fetch::FetchCancelled),
+        anyhow::Error::new(DevToolsRequestFailure::Aborted),
+        anyhow::anyhow!("transport detail").context(moli_fetch::FetchCancelled),
+        anyhow::anyhow!("interception detail").context(DevToolsRequestFailure::Aborted),
+    ] {
+        assert_eq!(
+            FailedNavigationDocumentPolicy::for_navigation_error(&error),
+            FailedNavigationDocumentPolicy::PreserveCommittedDocument,
+        );
+        let error = error
+            .context("failed to prepare page")
+            .context("failed to continue intercepted navigation");
+        assert_eq!(
+            FailedNavigationDocumentPolicy::for_navigation_error(&error),
+            FailedNavigationDocumentPolicy::PreserveCommittedDocument,
+        );
+    }
+    for error in [
+        anyhow::Error::new(DevToolsRequestFailure::Failed(
+            "net::ERR_BLOCKED_BY_CLIENT".to_owned(),
+        )),
+        anyhow::Error::new(DevToolsRequestFailure::Failed("TimedOut".to_owned())),
+        anyhow::anyhow!("interception detail").context(DevToolsRequestFailure::Failed(
+            "net::ERR_BLOCKED_BY_CLIENT".to_owned(),
+        )),
+        anyhow::anyhow!("Aborted"),
+        anyhow::anyhow!("net::ERR_ABORTED"),
+        anyhow::anyhow!("Failed"),
+        anyhow::anyhow!("net::ERR_CONNECTION_RESET"),
+        anyhow::anyhow!("net::ERR_BLOCKED_BY_CLIENT"),
+    ] {
+        assert_eq!(
+            FailedNavigationDocumentPolicy::for_navigation_error(&error),
+            FailedNavigationDocumentPolicy::InvalidateCommittedDocument,
+        );
+        assert_eq!(
+            FailedNavigationDocumentPolicy::for_navigation_error(
+                &error.context("net::ERR_ABORTED")
+            ),
+            FailedNavigationDocumentPolicy::InvalidateCommittedDocument,
+        );
+    }
+}
+
+fn dispatched_get_request() -> std::sync::Arc<moli_fetch::DispatchedRequest> {
+    std::sync::Arc::new(moli_fetch::DispatchedRequest {
+        method: "GET".to_owned(),
+        headers: vec![("Accept".to_owned(), "text/html".to_owned())],
+        body: None,
+        body_text: None,
+    })
+}
+
 fn completed_events() -> CompletedMainDocumentNetworkEvents {
     CompletedMainDocumentNetworkEvents::new(
-        "GET".to_owned(),
-        vec![("Accept".to_owned(), "text/html".to_owned())],
         None,
         200,
-        vec![("Content-Type".to_owned(), "text/html".to_owned())],
+        vec![("Content-Type".to_owned(), b"text/html".to_vec())],
         Vec::new(),
         Vec::new(),
         false,
@@ -41,7 +97,10 @@ fn observation_journal(
             .map(|(request_headers, status, response_headers)| {
                 NetworkExchangeObservation::new(
                     NetworkRequestObservation::new(request_headers),
-                    Some(NetworkResponseObservation::new(status, response_headers)),
+                    Some(NetworkResponseObservation::new(
+                        status,
+                        moli_fetch::headers_from_byte_strings(&response_headers).unwrap(),
+                    )),
                 )
             })
             .collect(),
@@ -70,6 +129,7 @@ fn live_progress_source() -> (
     let (sender, receiver) = unbounded_channel();
     (
         MainDocumentLiveNetworkProgressSource {
+            announced_redirects: 0,
             sender: Some(sender),
             progress_queue: super::gate::MainDocumentProgressQueueHandle::from_source(
                 MainDocumentProgressSource::streaming(),
@@ -79,11 +139,104 @@ fn live_progress_source() -> (
             loader_id: "LOADER-1".to_owned(),
             frame_id: "FRAME-1".to_owned(),
             timestamp: 12.5,
-            initial_request_headers: vec![("Accept".to_owned(), "text/html".to_owned())],
+            initial_request_headers: vec![("Accept".to_owned(), "text/html".to_owned())].into(),
             initial_request_cookie_report: None,
         },
         receiver,
     )
+}
+
+#[test]
+fn redirect_progress_tracks_each_hop_without_reapplying_announced_redirects() {
+    for (announced, statuses, expected) in [
+        (0, [307, 303], vec!["POST", "GET"]),
+        (1, [303, 307], vec!["POST"]),
+    ] {
+        let (mut source, _receiver) = live_progress_source();
+        source.announced_redirects = announced;
+        source.initial_request_headers = vec![
+            ("Content-Type".to_owned(), "text/plain".to_owned()),
+            ("X-Temporary".to_owned(), "override".to_owned()),
+        ]
+        .into();
+        // A client may override the method after an already announced 303.
+        // Its headers still revert to the baseline on the next redirect.
+        let baseline = Some(
+            vec![
+                ("Content-Type".to_owned(), "text/plain".to_owned()),
+                ("X-Baseline".to_owned(), "retained".to_owned()),
+            ]
+            .into(),
+        );
+        let mut dispatched =
+            moli_fetch::Request::get_with_url(Url::parse("http://example.test/0").unwrap())
+                .with_redirect_headers(baseline);
+        dispatched.method = "POST".to_owned();
+        dispatched.body = Some(bytes::Bytes::from_static(b"body"));
+        dispatched.request_headers = source.initial_request_headers.clone();
+        let redirects =
+            statuses
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    if index >= announced {
+                        dispatched.apply_redirect_status(status);
+                    }
+                    RedirectInfo {
+                        source: moli_fetch::RedirectSource::Network,
+                        from_url: Url::parse(&format!("http://example.test/{index}")).unwrap(),
+                        to_url: Url::parse(&format!("http://example.test/{}", index + 1)).unwrap(),
+                        status,
+                        headers: Vec::new(),
+                        network_extra_info_available: false,
+                        request_extra_info: None,
+                        dispatched_request: Some(dispatched.capture_dispatched_request(
+                            dispatched.request_headers.to_byte_strings(),
+                        )),
+                        response_extra_info: None,
+                        redirect_has_extra_info: false,
+                        request_cookie_report: None,
+                        cookie_set_reports: Vec::new(),
+                        from_cache: false,
+                        negotiated_http_version: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+        let events = source.redirect_request_events(None, &redirects, &Default::default(), false);
+        assert_eq!(events.len(), expected.len());
+        for (event, method) in events.into_iter().zip(expected) {
+            let MainDocumentNavigationProgressEvent::RequestWillBeSent {
+                method: actual_method,
+                request_body,
+                request_headers,
+                ..
+            } = event
+            else {
+                panic!("expected a redirect request event")
+            };
+            assert_eq!(actual_method, method);
+            assert_eq!(
+                request_body.as_deref(),
+                (method == "POST").then_some("body")
+            );
+            assert_eq!(
+                request_headers
+                    .iter()
+                    .any(|(name, _)| name == "Content-Type"),
+                method == "POST"
+            );
+            assert!(
+                request_headers
+                    .iter()
+                    .any(|(name, value)| name == "X-Baseline" && value == "retained")
+            );
+            assert!(
+                !request_headers
+                    .iter()
+                    .any(|(name, _)| name == "X-Temporary")
+            );
+        }
+    }
 }
 
 #[test]
@@ -122,12 +275,17 @@ fn failed_redirect_transport_emits_completed_hop_and_final_request_extra_info() 
     );
     let final_url = Url::parse("http://example.test/reset").unwrap();
     let redirect = RedirectInfo {
+        source: moli_fetch::RedirectSource::Network,
         from_url: Url::parse("http://example.test/start").unwrap(),
         to_url: final_url.clone(),
         status: 302,
-        headers: vec![("Location".to_owned(), final_url.to_string())],
+        headers: vec![(
+            "Location".to_owned(),
+            final_url.as_str().as_bytes().to_vec(),
+        )],
         network_extra_info_available: true,
         request_extra_info: None,
+        dispatched_request: Some(dispatched_get_request()),
         response_extra_info: None,
         redirect_has_extra_info: true,
         request_cookie_report: None,
@@ -143,7 +301,7 @@ fn failed_redirect_transport_emits_completed_hop_and_final_request_extra_info() 
             )]),
             Some(NetworkResponseObservation::new(
                 302,
-                vec![("X-Response-Hop".to_owned(), "redirect".to_owned())],
+                vec![("X-Response-Hop".to_owned(), b"redirect".to_vec())],
             )),
         ),
         NetworkExchangeObservation::new(
@@ -152,16 +310,10 @@ fn failed_redirect_transport_emits_completed_hop_and_final_request_extra_info() 
         ),
     ]);
 
-    source.emit_failed_request_progress(
-        "GET",
-        None,
-        &[("Accept".to_owned(), "text/html".to_owned())],
-        &[redirect],
-        &journal,
-    );
+    source.emit_failed_request_progress(&[redirect], &journal);
 
     let messages = std::iter::from_fn(|| receiver.try_recv().ok())
-        .map(crate::conn::BackgroundProtocolEvent::into_protocol_message)
+        .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
         .collect::<Vec<_>>();
     assert_eq!(
         messages
@@ -201,7 +353,7 @@ fn protocol_messages_from_background_events(
 ) -> Vec<Value> {
     events
         .into_iter()
-        .map(crate::conn::BackgroundProtocolEvent::into_protocol_message)
+        .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
         .collect()
 }
 
@@ -254,10 +406,10 @@ fn response_progress_batch_for_output_target() -> MainDocumentProgressEventBatch
             },
             final_url: Url::parse("http://example.test/target").unwrap(),
             status: 200,
-            headers: vec![("Content-Type".to_owned(), "text/html".to_owned())],
+            headers: vec![("Content-Type".to_owned(), b"text/html".to_vec())],
             cookie_set_reports: Vec::new(),
             extra_info_status: 200,
-            extra_info_headers: vec![("Content-Type".to_owned(), "text/html".to_owned())],
+            extra_info_headers: vec![("Content-Type".to_owned(), b"text/html".to_vec())],
             network_extra_info_available: false,
             emit_extra_info: false,
             encoded_data_length: 29,
@@ -404,12 +556,17 @@ fn live_progress_source_serializes_through_progress_emissions() {
         effective_same_site: None,
     }];
     let redirect = RedirectInfo {
+        source: moli_fetch::RedirectSource::Network,
         from_url: Url::parse("http://example.test/start").unwrap(),
         to_url: final_url.clone(),
         status: 302,
-        headers: vec![("Location".to_owned(), final_url.to_string())],
+        headers: vec![(
+            "Location".to_owned(),
+            final_url.as_str().as_bytes().to_vec(),
+        )],
         network_extra_info_available: true,
         request_extra_info: None,
+        dispatched_request: Some(dispatched_get_request()),
         response_extra_info: None,
         redirect_has_extra_info: true,
         request_cookie_report: None,
@@ -430,19 +587,11 @@ fn live_progress_source_serializes_through_progress_emissions() {
         ),
     ]);
 
-    source.emit_redirect_requests(
-        "GET",
-        None,
-        &[("Accept".to_owned(), "text/html".to_owned())],
-        None,
-        &[redirect],
-        &journal,
-        true,
-    );
+    source.emit_redirect_requests(None, &[redirect], &journal, true);
     source.emit_response_received(
         &final_url,
         200,
-        &[("Content-Type".to_owned(), "text/html".to_owned())],
+        &[("Content-Type".to_owned(), b"text/html".to_vec())],
         &[],
         &journal,
         1,
@@ -694,7 +843,7 @@ fn completed_body_revalidation_keeps_raw_304_extra_info() {
     let mut events = completed_events();
     events.network_extra_info_available = true;
     events.response_status = 200;
-    events.response_headers = vec![("X-Merged-Response".to_owned(), "cached".to_owned())];
+    events.response_headers = vec![("X-Merged-Response".to_owned(), b"cached".to_vec())];
     events = events.with_network_observation_journal(observation_journal(vec![(
         vec![("If-None-Match".to_owned(), "\"v1\"".to_owned())],
         304,
@@ -752,17 +901,117 @@ fn completed_body_http_service_worker_response_does_not_infer_extra_info_from_ur
 }
 
 #[test]
+fn completed_multipart_redirect_keeps_protocol_text_separate_from_upload_bytes() {
+    let text = "--boundary\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\n\r\n\r\n--boundary--\r\n";
+    let mut upload = text.as_bytes().to_vec();
+    let offset = upload.len() - b"\r\n--boundary--\r\n".len();
+    upload.splice(offset..offset, b"UNIQUE-FILE-PAYLOAD\0\xff".iter().copied());
+    let upload = bytes::Bytes::from(upload);
+    for (status, replacement) in [
+        (307, None),
+        (308, None),
+        (307, Some("replacement")),
+        (308, Some("replacement")),
+    ] {
+        let mut request = moli_fetch::Request::new_bytes(
+            "POST",
+            "http://example.test/start",
+            Some(upload.clone()),
+            vec![(
+                "Content-Type".to_owned(),
+                "multipart/form-data; boundary=boundary".to_owned(),
+            )],
+        )
+        .unwrap()
+        .with_body_text(Some(std::sync::Arc::from(text)));
+        if let Some(replacement) = replacement {
+            request.set_body(
+                Some(bytes::Bytes::from_static(replacement.as_bytes())),
+                None,
+            );
+        }
+        let expected_text = replacement.unwrap_or(text);
+        let expected_bytes = replacement
+            .map(|replacement| bytes::Bytes::from_static(replacement.as_bytes()))
+            .unwrap_or_else(|| upload.clone());
+        let mut redirect = RedirectInfo::from(moli_core::page::NavigationRedirect {
+            source: moli_fetch::RedirectSource::Network,
+            from_url: request.url.clone(),
+            to_url: Url::parse("http://example.test/final").unwrap(),
+            status,
+            headers: Vec::new(),
+            network_extra_info_available: false,
+            request_extra_info: None,
+            dispatched_request: None,
+            response_extra_info: None,
+            redirect_has_extra_info: false,
+            request_cookie_report: None,
+            cookie_set_reports: Vec::new(),
+            from_cache: false,
+            negotiated_http_version: None,
+        });
+        request.follow_redirect(redirect.clone()).unwrap();
+        redirect = request.redirect_chain()[0].clone();
+        assert_eq!(
+            redirect.dispatched_request.as_ref().unwrap().body.as_ref(),
+            Some(&expected_bytes)
+        );
+        let (source, _receiver) = live_progress_source();
+        let live = source.redirect_request_events(
+            None,
+            std::slice::from_ref(&redirect),
+            &Default::default(),
+            false,
+        );
+        let MainDocumentNavigationProgressEvent::RequestWillBeSent { request_body, .. } = &live[0]
+        else {
+            panic!("expected the streaming redirect request");
+        };
+        assert_eq!(request_body.as_deref(), Some(expected_text));
+        let mut context = completed_progress_context();
+        context.request_method = "POST".to_owned();
+        context.request_body = Some(text.to_owned());
+        let mut events = completed_events();
+        events.redirect_chain = vec![redirect.into()];
+        let batches = context.event_batches(&events, &request.url, 0);
+        let mut drain = MainDocumentProgressDrain::from_source(
+            MainDocumentProgressSource::completed_body(batches),
+        );
+        drain.mark_output_visible_until(MainDocumentProgressOutputBoundary::BodyFinishedVisible);
+        let out = drain_into_protocol_messages(&mut drain);
+        let requests = out
+            .iter()
+            .filter(|event| event["method"] == "Network.requestWillBeSent")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["params"]["request"]["postData"], json!(text));
+        for event in &requests[1..] {
+            assert_eq!(
+                event["params"]["request"]["postData"],
+                json!(expected_text),
+                "{status}: {event}"
+            );
+        }
+    }
+}
+
+#[test]
 fn completed_body_http_redirect_emits_correlated_no_cookie_extra_info() {
     let final_url = Url::parse("http://example.test/final").unwrap();
     let mut events = completed_events();
     events.network_extra_info_available = true;
     events.redirect_chain = vec![moli_core::page::NavigationRedirect {
+        source: moli_fetch::RedirectSource::Network,
         from_url: Url::parse("http://example.test/start").unwrap(),
         to_url: final_url.clone(),
         status: 302,
-        headers: vec![("location".to_owned(), final_url.to_string())],
+        headers: vec![(
+            "location".to_owned(),
+            final_url.as_str().as_bytes().to_vec(),
+        )],
         network_extra_info_available: true,
         request_extra_info: None,
+        dispatched_request: Some(dispatched_get_request()),
         response_extra_info: None,
         redirect_has_extra_info: true,
         request_cookie_report: None,
@@ -852,12 +1101,17 @@ fn completed_body_redirect_without_transport_extra_info_keeps_flag_false() {
     let final_url = Url::parse("http://example.test/final").unwrap();
     let mut events = completed_events();
     events.redirect_chain = vec![moli_core::page::NavigationRedirect {
+        source: moli_fetch::RedirectSource::Network,
         from_url: Url::parse("http://example.test/start").unwrap(),
         to_url: final_url.clone(),
         status: 302,
-        headers: vec![("location".to_owned(), final_url.to_string())],
+        headers: vec![(
+            "location".to_owned(),
+            final_url.as_str().as_bytes().to_vec(),
+        )],
         network_extra_info_available: false,
         request_extra_info: None,
+        dispatched_request: Some(dispatched_get_request()),
         response_extra_info: None,
         redirect_has_extra_info: false,
         request_cookie_report: None,
@@ -920,12 +1174,17 @@ fn critical_client_hint_restart_keeps_discarded_response_extra_info_separate_fro
         .with_network_observation_journal(journal);
     events.network_extra_info_available = true;
     events.redirect_chain = vec![moli_core::page::NavigationRedirect {
+        source: moli_fetch::RedirectSource::Internal,
         from_url: navigation_url.clone(),
         to_url: navigation_url.clone(),
         status: 307,
-        headers: vec![("Location".to_owned(), navigation_url.to_string())],
+        headers: vec![(
+            "Location".to_owned(),
+            navigation_url.as_str().as_bytes().to_vec(),
+        )],
         network_extra_info_available: false,
         request_extra_info: None,
+        dispatched_request: Some(dispatched_get_request()),
         response_extra_info: None,
         redirect_has_extra_info: false,
         request_cookie_report: None,
@@ -996,12 +1255,17 @@ fn completed_body_uses_negotiated_protocol_for_redirect_and_final_response() {
     let mut events =
         completed_events().with_negotiated_http_version(Some(NegotiatedHttpVersion::Http2));
     events.redirect_chain = vec![moli_core::page::NavigationRedirect {
+        source: moli_fetch::RedirectSource::Network,
         from_url: Url::parse("https://example.test/start").unwrap(),
         to_url: final_url.clone(),
         status: 302,
-        headers: vec![("location".to_owned(), final_url.to_string())],
+        headers: vec![(
+            "location".to_owned(),
+            final_url.as_str().as_bytes().to_vec(),
+        )],
         network_extra_info_available: false,
         request_extra_info: None,
+        dispatched_request: Some(dispatched_get_request()),
         response_extra_info: None,
         redirect_has_extra_info: false,
         request_cookie_report: None,
@@ -1073,12 +1337,17 @@ fn cached_completed_body_redirect_emits_cache_event_before_next_request() {
     let final_url = Url::parse("http://example.test/final").unwrap();
     let mut events = completed_events();
     events.redirect_chain = vec![moli_core::page::NavigationRedirect {
+        source: moli_fetch::RedirectSource::Network,
         from_url: Url::parse("http://example.test/start").unwrap(),
         to_url: final_url.clone(),
         status: 302,
-        headers: vec![("location".to_owned(), final_url.to_string())],
+        headers: vec![(
+            "location".to_owned(),
+            final_url.as_str().as_bytes().to_vec(),
+        )],
         network_extra_info_available: false,
         request_extra_info: None,
+        dispatched_request: Some(dispatched_get_request()),
         response_extra_info: None,
         redirect_has_extra_info: false,
         request_cookie_report: None,
@@ -1484,4 +1753,103 @@ fn aborted_navigation_progress_marks_loading_failed_canceled() {
     assert_eq!(out[0]["method"], json!("Network.loadingFailed"));
     assert_eq!(out[0]["params"]["errorText"], json!("net::ERR_ABORTED"));
     assert_eq!(out[0]["params"]["canceled"], json!(true));
+}
+
+#[test]
+fn no_content_navigation_retains_response_metadata_with_live_progress() {
+    use crate::conn::{
+        BrowserContext, CommandOwnerScope, NavigationRequestLoadPolicy, NavigationResultProjection,
+    };
+
+    for status in [204, 205] {
+        let mut conn = CdpConnection::new();
+        let mut browser_context = BrowserContext::new("BID-1".to_owned());
+        browser_context.set_active_target_id("FRAME-1");
+        browser_context.attach_active_session("SID-1");
+        browser_context
+            .active_page_target_mut()
+            .devtools_sessions
+            .primary_mut()
+            .network_session_state
+            .network_enabled = true;
+        browser_context
+            .active_page_target_mut()
+            .runtime_slot
+            .enable_primary_network_events();
+        conn.install_browser_context_fixture_for_test(browser_context);
+        assert!(main_document_network_observed(&conn, Some("SID-1")));
+        let state = NavigationDispatchState {
+            web_mcp_invocation: None,
+            navigation_initiator: None,
+            initial_document_environment: None,
+            auxiliary_document_response: None,
+            redirect_chain: Vec::new(),
+            redirect_headers: None,
+            navigate_id: Some(1),
+            owner: CommandOwnerScope::for_session("SID-1"),
+            result_projection: NavigationResultProjection::Cdp(json!({
+                "frameId": "FRAME-1", "loaderId": "LOADER-1",
+            })),
+            frame_id: "FRAME-1".to_owned(),
+            session_id: Some("SID-1".to_owned()),
+            request_id: Some("REQ-1".to_owned()),
+            loader_id: "LOADER-1".to_owned(),
+            request_announced: false,
+            announced_redirects: 0,
+            requested_url: Url::parse("http://example.test/start").unwrap(),
+            request_method: "GET".to_owned(),
+            request_body: None,
+            request_body_bytes: None,
+            request_headers: Vec::new().into(),
+            request_load_policy: NavigationRequestLoadPolicy::BrowserInitiated,
+            timestamp: 12.5,
+            source_document_security: Default::default(),
+        };
+        let (live_source, _receiver) = live_progress_source();
+        let source = MainDocumentBodyProgressSource::from_live_source(
+            Some(live_source),
+            MainDocumentResponseVisibility::Immediate,
+        );
+        let mut events = completed_events();
+        events.response_status = status;
+        events.response_headers = vec![("X-Ignored-Response".to_owned(), b"retained".to_vec())];
+        let navigation = NoContentNavigation {
+            final_url: Url::parse("http://example.test/final").unwrap(),
+            network_events: source.completed_body_network_events(events),
+        };
+        let MaterializedNavigationLoadOutcome::Failed(mut failed) =
+            materialize_no_content_navigation_progress(&conn, &state, navigation)
+        else {
+            panic!("ignored responses must retain main's failed-navigation projection");
+        };
+        let out = drain_gate_until_body_finished_visible_into_protocol_messages(
+            &mut failed.progress_gate,
+        );
+        let response = out
+            .iter()
+            .find(|event| event["method"] == "Network.responseReceived")
+            .expect("live ignored navigation must still emit its response metadata");
+        assert_eq!(response["params"]["requestId"], json!("REQ-1"));
+        assert_eq!(response["params"]["response"]["status"], json!(status));
+        assert_eq!(
+            response["params"]["response"]["headers"]["X-Ignored-Response"],
+            json!("retained")
+        );
+        let failure = out
+            .iter()
+            .find(|event| event["method"] == "Network.loadingFailed")
+            .expect("ignored navigation must terminate without committing a Document");
+        assert_eq!(
+            failure["params"]["errorText"],
+            json!(moli_fetch::NET_ERR_ABORTED_ERROR_TEXT)
+        );
+        assert_eq!(
+            failed.document_policy,
+            FailedNavigationDocumentPolicy::PreserveCommittedDocument
+        );
+        assert!(
+            !out.iter()
+                .any(|event| event["method"] == "Network.loadingFinished")
+        );
+    }
 }

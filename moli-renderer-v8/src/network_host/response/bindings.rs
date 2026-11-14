@@ -1,15 +1,17 @@
 mod init;
 
-pub(in crate::network_host) use self::init::{ParsedResponseInit, parse_response_init};
+pub(in crate::network_host) use self::init::ParsedResponseInit;
+use self::init::parse_response_init;
 use self::init::{install_response_body_stream, install_response_headers, response_body_init};
 use super::super::fetch_surface::{RESPONSE_BODY_USED_SLOT, mark_response_object};
 use super::*;
 use crate::util::throw_range_error;
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Response")]
+#[webapi(interface = web_api_interfaces::Response)]
 struct ResponseInstanceDeclaration {
     #[webapi(slot = RESPONSE_STATUS_SLOT)]
     status: f64,
@@ -17,12 +19,6 @@ struct ResponseInstanceDeclaration {
     status_text: String,
     #[webapi(slot = RESPONSE_OK_SLOT)]
     ok: bool,
-    #[webapi(slot = RESPONSE_URL_SLOT, init = "")]
-    url: (),
-    #[webapi(slot = RESPONSE_REDIRECTED_SLOT, init = false)]
-    redirected: (),
-    #[webapi(slot = RESPONSE_TYPE_SLOT, init = string("default"))]
-    response_type: (),
     #[webapi(slot = RESPONSE_BODY_USED_SLOT, init = false)]
     body_used: (),
 }
@@ -42,34 +38,14 @@ pub(crate) fn response_constructor_callback<'s>(
 
     let obj = args.this();
     let body_arg = args.get(0);
-    let body_stream = readable_stream_body_arg(scope, body_arg);
-    if body_stream.is_some_and(|stream| readable_stream_body_locked(scope, stream)) {
-        throw_type_error(
-            scope,
-            "Failed to construct 'Response': ReadableStream body is locked.",
-        );
-        return;
-    }
-    let body = match body_stream
-        .is_none()
-        .then(|| response_body_init(scope, body_arg))
-        .transpose()
-    {
-        Ok(body) => body.flatten(),
+    let body = match response_body_init(scope, body_arg) {
+        Ok(body) => body,
         Err(error) => {
             webidl::throw_error(scope, &error);
             return;
         }
     };
-    let has_body = body.is_some() || body_stream.is_some();
-    let (body_buffer, default_content_type) = if let Some(body) = body {
-        (
-            set_network_body_owned_bytes(scope, obj, body.bytes),
-            body.content_type,
-        )
-    } else {
-        (None, None)
-    };
+    let has_body = body.is_some();
 
     let init = match parse_response_init(scope, args.get(1)) {
         Ok(init) => init,
@@ -107,32 +83,14 @@ pub(crate) fn response_constructor_callback<'s>(
         .initialize(scope, obj)
         .expect("Response instance declaration should initialize");
 
-    install_response_headers(scope, obj, &init.headers, default_content_type.as_deref());
-    install_response_body_stream(scope, obj, body_buffer, body_stream);
+    super::metadata::set_response_metadata(scope, obj, &Default::default());
+
+    let default_content_type = body.as_ref().and_then(|body| body.content_type.as_deref());
+    install_response_headers(scope, obj, &init.headers, default_content_type);
+    let body_stream = body.and_then(|body| body.source.into_body_stream(scope, obj));
+    install_response_body_stream(scope, obj, None, body_stream);
     mark_response_object(scope, obj);
     rv.set(obj.into());
-}
-
-fn readable_stream_body_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Option<v8::Local<'s, v8::Object>> {
-    if value.is_null_or_undefined() {
-        return None;
-    }
-    let object = v8::Local::<v8::Object>::try_from(value).ok()?;
-    crate::context_bootstrap::object_prototype_matches(scope, object, "ReadableStream")
-        .then_some(object)
-}
-
-fn readable_stream_body_locked(
-    scope: &mut v8::PinScope<'_, '_>,
-    stream: v8::Local<'_, v8::Object>,
-) -> bool {
-    stream
-        .get(scope, v8str(scope, "locked").into())
-        .map(|value| value.boolean_value(scope))
-        .unwrap_or(false)
 }
 
 fn is_valid_response_status_text(value: &str) -> bool {

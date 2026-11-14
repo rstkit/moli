@@ -13,7 +13,7 @@ use live_attribute_bridge::install_live_attribute_bridge_methods;
 use node::{install_detached_node_methods, install_detached_parent_node_move_before};
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ParentNode")]
+#[webapi(fragment, prototype = "ParentNode")]
 struct DocumentFragmentParentNodeQueryMethodsDeclaration {
     #[webapi(method, callback = node_query_selector_callback)]
     query_selector: (),
@@ -23,7 +23,7 @@ struct DocumentFragmentParentNodeQueryMethodsDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "DocumentFragment")]
+#[webapi(fragment, prototype = "DocumentFragment")]
 struct DocumentFragmentGetElementByIdDeclaration {
     #[webapi(method, length = 1, callback = document_fragment_get_element_by_id_callback)]
     get_element_by_id: (),
@@ -76,12 +76,7 @@ pub(in crate::native_bridge) fn install_detached_bridge_methods(scope: &mut v8::
     let plain_document_prototype = bridge_prototype_object(scope, "__detachedDocumentPrototype");
     let detached_node_prototypes: Vec<v8::Local<'_, v8::Object>> = [
         bridge_prototype_object(scope, "__detachedDocumentTypePrototype"),
-        bridge_prototype_object(scope, "__detachedDocumentFragmentPrototype"),
         bridge_prototype_object(scope, "__detachedShadowRootPrototype"),
-        bridge_prototype_object(scope, "__detachedTextPrototype"),
-        bridge_prototype_object(scope, "__detachedCommentPrototype"),
-        bridge_prototype_object(scope, "__detachedProcessingInstructionPrototype"),
-        bridge_prototype_object(scope, "__detachedCDATASectionPrototype"),
         Some(element_prototype),
         Some(html_document_prototype),
         Some(xml_document_prototype),
@@ -91,7 +86,6 @@ pub(in crate::native_bridge) fn install_detached_bridge_methods(scope: &mut v8::
     .flatten()
     .collect();
     let detached_parent_node_prototypes: Vec<v8::Local<'_, v8::Object>> = [
-        bridge_prototype_object(scope, "__detachedDocumentFragmentPrototype"),
         bridge_prototype_object(scope, "__detachedShadowRootPrototype"),
         Some(element_prototype),
         Some(html_document_prototype),

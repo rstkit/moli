@@ -1,7 +1,10 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
 use std::collections::HashSet;
 
 use super::{
-    JsContextHost,
+    PageScriptHost,
+    layout::LayoutInputChange,
     permissions::{permission_names_match, permission_override_name},
 };
 use crate::{
@@ -23,11 +26,10 @@ use crate::{
         context_bootstrap::{
             SharedStorageBucketStore, SharedWebStorageStore, WeakIndexedDbManager,
         },
-        types::SubresourceResourceType,
+        types::{SubresourceInterceptionClasses, SubresourceResourceType},
     },
 };
 use dom::ElementState as StyloElementState;
-use moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE;
 
 fn push_unique_handle(handles: &mut Vec<DomHandle>, handle: DomHandle) {
     if !handles.contains(&handle) {
@@ -35,7 +37,7 @@ fn push_unique_handle(handles: &mut Vec<DomHandle>, handle: DomHandle) {
     }
 }
 
-fn hover_chain_for_input_hit(runtime: &JsContextHost, hit: Option<DomHandle>) -> Vec<DomHandle> {
+fn hover_chain_for_input_hit(runtime: &PageScriptHost, hit: Option<DomHandle>) -> Vec<DomHandle> {
     let mut hovered = Vec::new();
     let mut visited = HashSet::new();
     let mut current = hit;
@@ -72,7 +74,23 @@ fn hover_chain_for_input_hit(runtime: &JsContextHost, hit: Option<DomHandle>) ->
     hovered
 }
 
-impl JsContextHost {
+impl PageScriptHost {
+    pub(crate) fn media_query_matches_for_document(
+        &self,
+        document: DomHandle,
+        media: &str,
+    ) -> bool {
+        let Some(document_node) = self.dom_host().node(document).and_then(Node::as_document) else {
+            return false;
+        };
+        crate::style_engine::media_list::evaluate_media_query_list_with_context(
+            media,
+            Some(self.emulated_media()),
+            crate::native_bridge::element::style_viewport_for_document(self, document),
+            document_node.base_url(),
+            document_node.quirks_mode(),
+        )
+    }
     pub(crate) fn documents_with_adopted_style_sheets(&self) -> Vec<DomHandle> {
         self.style_engine.documents_with_adopted_style_sheets()
     }
@@ -279,43 +297,41 @@ impl JsContextHost {
             .imported_stylesheet_for_rule_wrapper(id, expected_stylesheet_id)
     }
 
-    pub(crate) fn install_live_stylesheet_import_graph(
-        &self,
+    pub(crate) fn install_and_refresh_live_stylesheet_import_graph(
+        &mut self,
         root: crate::document_runtime::ConnectedStyleImportRoot,
         responses: &[crate::live_stylesheet::LiveStylesheetImportResponse],
     ) -> Option<bool> {
-        self.live_stylesheets.install_import_graph(
+        let successful = self.live_stylesheets.install_import_graph(
             root.stylesheet_id,
             root.contents_revision,
             root.import_generation,
             responses,
             root.root_resource_url.as_ref(),
-        )
-    }
-
-    pub(crate) fn refresh_live_stylesheet_after_import_graph(
-        &mut self,
-        owner: DomHandle,
-        stylesheet_id: crate::live_stylesheet::StylesheetId,
-    ) -> bool {
+        )?;
+        // Some(false) still installs the valid branches of a partial graph.
+        // Only a stale root (None) must skip refreshing the cascade.
         let dom_host = self.dom_host() as *const _;
         let refreshed = self.style_engine.refresh_owner_live_stylesheet_with_host(
             unsafe { &*dom_host },
-            owner,
-            stylesheet_id,
+            root.owner,
+            root.stylesheet_id,
         ) || self.style_engine.refresh_linked_live_stylesheet_with_host(
             unsafe { &*dom_host },
-            owner,
-            stylesheet_id,
+            root.owner,
+            root.stylesheet_id,
         );
         if refreshed {
             self.clear_layout_rect_cache();
-            self.queue_stylesheet_source_css_projection(owner);
+            self.queue_stylesheet_source_css_projection(root.owner);
         }
-        refreshed
+        Some(successful)
     }
 
-    fn install_owner_live_stylesheet(&mut self, owner: DomHandle) {
+    pub(in crate::native_bridge::context_host) fn install_owner_live_stylesheet(
+        &mut self,
+        owner: DomHandle,
+    ) {
         let dom_host: *const crate::dom::native::DomHost = self.dom_host();
         if self
             .style_engine
@@ -405,13 +421,17 @@ impl JsContextHost {
         loader: &DocumentResourceLoader,
     ) {
         let loader = loader.clone();
+        // Initial Window reuse installs a new Document authority in an
+        // existing host. Its target policy must replace the retired binding;
+        // a transport-only replacement instead retains the same policy.
+        self.page_network_policy = loader.request_client().page_network_policy().clone();
         self.apply_page_network_policy_to_document_loader(&loader);
         let owner = self
             .current_main_document_task_owner()
             .expect("main Document must have an owner before its resource loader is installed");
         let owner = crate::native_bridge::WindowDocumentOwner::Frame(owner);
         self.document_resource_loaders.register(owner, loader);
-        unsafe { &mut *self.runtime }
+        unsafe { &mut *self.document_runtime }
             .bind_document_resource_loader(self.document_resource_loaders.clone(), owner);
     }
 
@@ -438,7 +458,11 @@ impl JsContextHost {
     /// backend replacement must leave a live Document's storage identity
     /// untouched.
     pub(crate) fn set_web_storage_handles(&mut self, handles: &RendererWebStorageHandles) {
-        self.web_storage_store = handles.local_storage();
+        let local = handles.local_storage();
+        if !std::sync::Arc::ptr_eq(&self.web_storage_store, &local) {
+            self.local_storage_areas.clear();
+            self.web_storage_store = local;
+        }
         self.session_storage_store = handles.session_storage();
     }
 
@@ -470,7 +494,11 @@ impl JsContextHost {
     }
 
     pub(crate) fn browser_cookie_enabled(&self) -> bool {
-        unsafe { (&*self.runtime).host_document().browser_cookie_enabled() }
+        unsafe {
+            (&*self.document_runtime)
+                .host_document()
+                .browser_cookie_enabled()
+        }
     }
 
     pub(crate) fn web_storage_store(&self) -> SharedWebStorageStore {
@@ -522,6 +550,60 @@ impl JsContextHost {
     ) -> Option<DocumentResourceLoader> {
         let target = self.current_window_document_task_target_for_dispatch_scope(dispatch_scope)?;
         self.document_resource_loader_for_window_owner(target.owner())
+    }
+
+    pub(crate) fn document_referrer_source_url_for_dispatch_scope(
+        &self,
+        dispatch_scope: crate::native_bridge::OwnerDispatchScope,
+    ) -> Option<url::Url> {
+        use crate::native_bridge::OwnerDispatchScope;
+        let mut document = match dispatch_scope {
+            OwnerDispatchScope::Top => self.document_handle(),
+            OwnerDispatchScope::Child(handle) => {
+                self.child_browsing_context_document_handle(handle)?
+            }
+            OwnerDispatchScope::LightweightPopup(popup_id) => {
+                self.lightweight_popup_document_handle(popup_id)?
+            }
+        };
+        loop {
+            let url = self.document_url_for_handle(document);
+            if url.scheme() != "about" || url.path() != "srcdoc" {
+                return Some(url);
+            }
+            // Srcdoc uses its containing Document's URL, repeating for nested
+            // srcdoc. Its own base URL still belongs to URL resolution only.
+            let frame = self.child_browsing_context_handle_for_stored_document(document)?;
+            document = self.dom_host().node(frame).and_then(Node::owner_document)?;
+        }
+    }
+
+    pub(crate) fn subresource_request_environment(
+        &self,
+        loader: &DocumentResourceLoader,
+        dispatch_scope: crate::native_bridge::OwnerDispatchScope,
+    ) -> Option<crate::network::context::SubresourceRequestEnvironment> {
+        use crate::native_bridge::OwnerDispatchScope;
+        let context = loader.fetch_context();
+        let target = self.current_window_document_task_target_for_dispatch_scope(dispatch_scope)?;
+        if target.owner() != context.owner() {
+            return None;
+        }
+        let (document, frame_id) = match dispatch_scope {
+            OwnerDispatchScope::Top => (self.document_handle(), None),
+            OwnerDispatchScope::Child(handle) => (
+                self.child_browsing_context_document_handle(handle)?,
+                Some(self.frame_owner_current_child_snapshot(handle)?.frame_id.0),
+            ),
+            OwnerDispatchScope::LightweightPopup(popup_id) => {
+                (self.lightweight_popup_document_handle(popup_id)?, None)
+            }
+        };
+        let base_url = self
+            .dom_host()
+            .document_base_url_for_handle(document)
+            .unwrap_or_else(|| context.base_url().clone());
+        Some(context.subresource_environment(base_url, frame_id))
     }
 
     pub(crate) fn parent_document_resource_loader_for_child_context(
@@ -643,7 +725,7 @@ impl JsContextHost {
             context,
             crate::network::context::DocumentResourceAuthoritySource::Inherited(current),
         );
-        unsafe { &mut *self.runtime }.bind_document_resource_loader(
+        unsafe { &mut *self.document_runtime }.bind_document_resource_loader(
             self.document_resource_loaders.clone(),
             crate::native_bridge::WindowDocumentOwner::Frame(transition.current_owner()),
         );
@@ -659,18 +741,21 @@ impl JsContextHost {
     }
 
     #[cfg(feature = "wpt-extensions")]
-    pub(crate) fn delete_all_cookies_for_wpt(&mut self) {
+    pub(crate) fn delete_all_cookies_for_wpt(
+        &mut self,
+    ) -> Result<(), moli_cookie_jar::CookieStoreError> {
         if let Some(resource_loader) = self.current_main_document_resource_loader() {
             resource_loader
                 .request_client()
                 .cookie_store()
-                .lock()
+                .lock()?
                 .clear();
         }
+        Ok(())
     }
 
-    pub(crate) fn set_extra_http_headers(&mut self, headers: &[(String, String)]) {
-        self.extra_http_headers = headers.to_vec();
+    pub(crate) fn set_extra_http_headers(&mut self, headers: &moli_fetch::RequestHeaders) {
+        self.extra_http_headers = headers.clone();
         if let Some(resource_loader) = self.current_main_document_resource_loader() {
             resource_loader
                 .request_client()
@@ -683,12 +768,12 @@ impl JsContextHost {
         }
     }
 
-    pub(crate) fn extra_http_headers(&self) -> &[(String, String)] {
+    pub(crate) fn extra_http_headers(&self) -> &moli_fetch::RequestHeaders {
         &self.extra_http_headers
     }
 
-    pub(crate) fn document_content_security_policies(&self) -> &[String] {
-        unsafe { &*self.runtime }.document_content_security_policies()
+    pub(crate) fn document_content_security_policies(&self) -> &[ContentSecurityPolicy] {
+        unsafe { &*self.document_runtime }.document_content_security_policies()
     }
 
     pub(crate) fn set_permission_overrides(
@@ -702,22 +787,6 @@ impl JsContextHost {
         &self,
     ) -> &[crate::protocol_types::PermissionOverrideRegistration] {
         &self.permission_overrides
-    }
-
-    pub(crate) fn set_locale_override(&mut self, locale: Option<&str>) {
-        self.locale_override = locale.map(str::to_owned);
-    }
-
-    pub(crate) fn set_timezone_override(&mut self, timezone: Option<&str>) {
-        self.timezone_override = timezone.map(str::to_owned);
-    }
-
-    pub(crate) fn locale_override(&self) -> Option<&str> {
-        self.locale_override.as_deref()
-    }
-
-    pub(crate) fn timezone_override(&self) -> Option<&str> {
-        self.timezone_override.as_deref()
     }
 
     pub(crate) fn set_idle_override(
@@ -780,47 +849,34 @@ impl JsContextHost {
         &mut self,
         overrides: &crate::protocol_types::EmulatedMediaOverrides,
     ) {
-        if self.emulated_media != *overrides {
-            self.style_engine
-                .bump_target_context_epoch_for_document(self.document_handle());
+        if self.emulated_media() != overrides {
+            self.invalidate_layout_inputs(LayoutInputChange::StyleEnvironment);
         }
-        self.emulated_media = overrides.clone();
+        unsafe { &mut *self.document_runtime }.set_emulated_media(overrides);
     }
 
     pub(crate) fn emulated_media(&self) -> &crate::protocol_types::EmulatedMediaOverrides {
-        &self.emulated_media
+        unsafe { &*self.document_runtime }.emulated_media()
     }
 
     pub(crate) fn set_viewport_surface(
         &mut self,
         viewport_surface: Option<crate::protocol_types::ViewportSurface>,
     ) -> bool {
-        let changed = self.viewport_surface != viewport_surface;
+        let changed = self.viewport_surface() != viewport_surface;
         if changed {
-            self.style_engine
-                .bump_target_context_epoch_for_document(self.document_handle());
+            self.invalidate_layout_inputs(LayoutInputChange::StyleEnvironment);
         }
-        self.viewport_surface = viewport_surface;
+        unsafe { &mut *self.document_runtime }.set_viewport_surface(viewport_surface);
         changed
     }
 
     pub(crate) fn style_viewport(&self) -> StyleViewport {
-        self.viewport_surface
-            .map(StyleViewport::from_viewport_surface)
-            .unwrap_or_else(|| {
-                StyleViewport::new(
-                    Some(DEFAULT_WINDOW_SURFACE_PROFILE.inner_width),
-                    Some(DEFAULT_WINDOW_SURFACE_PROFILE.inner_height),
-                )
-                .with_screen_size(
-                    Some(DEFAULT_WINDOW_SURFACE_PROFILE.screen_width),
-                    Some(DEFAULT_WINDOW_SURFACE_PROFILE.screen_height),
-                )
-            })
+        unsafe { &*self.document_runtime }.style_viewport()
     }
 
     pub(crate) fn viewport_surface(&self) -> Option<crate::protocol_types::ViewportSurface> {
-        self.viewport_surface
+        unsafe { &*self.document_runtime }.viewport_surface()
     }
 
     pub(crate) fn document_base_url_for_handle(&self, document: DomHandle) -> url::Url {
@@ -872,18 +928,63 @@ impl JsContextHost {
             .adopted_style_sheet_sources_for_document(document)
     }
 
-    pub(crate) fn sync_owner_style_sheet_text(&mut self, owner: DomHandle) {
-        let css_text = self.dom_host().text_content(owner).unwrap_or_default();
+    pub(crate) fn document_has_adopted_style_sheet_sources(&self, document: DomHandle) -> bool {
+        self.style_engine
+            .document_has_adopted_style_sheet_sources(document)
+    }
+
+    pub(crate) fn document_has_style_state(&self, document: DomHandle) -> bool {
+        self.style_engine.document_has_style_state(document)
+    }
+
+    pub(crate) fn document_style_input_generations(
+        &self,
+        mut document: DomHandle,
+    ) -> Vec<(DomHandle, u64, u64)> {
+        // An embedding element's computed size can change through ancestor
+        // CSSOM alone, without changing the child DOM or visual generation.
+        let mut documents = Vec::new();
+        while !documents.contains(&document) {
+            documents.push(document);
+            let Some(parent) = self
+                .child_browsing_context_host_for_document_handle(document)
+                .and_then(|frame| self.dom_host().owner_document_handle(frame))
+            else {
+                break;
+            };
+            document = parent;
+        }
+        self.style_engine.visual_style_input_generations(documents)
+    }
+
+    /// Initialize sources when taking ownership of an already constructed DOM.
+    /// Ordinary reads and synchronization only install lifecycle-prepared sources.
+    pub(crate) fn initialize_style_element_sources_for_document(&mut self, document: DomHandle) {
         let dom_host = self.dom_host() as *const _;
-        self.style_engine.sync_owner_style_sheet_text_with_host(
-            unsafe { &*dom_host },
-            owner,
-            css_text,
-        );
-        self.install_owner_live_stylesheet(owner);
+        self.style_engine
+            .initialize_style_element_sources_with_host(unsafe { &*dom_host }, document);
+        self.install_prepared_style_sheets_for_document(document);
     }
 
     pub(crate) fn apply_stylesheet_owner_changes(&mut self, changes: &[DomStylesheetOwnerChange]) {
+        for change in changes {
+            let reprocesses = match change.kind() {
+                DomStylesheetOwnerChangeKind::Attribute {
+                    namespace,
+                    local_name,
+                } => {
+                    namespace.is_none()
+                        && crate::document_runtime::attribute_reprocesses_connected_stylesheet(
+                            local_name,
+                        )
+                }
+                _ => true,
+            };
+            if reprocesses {
+                self.frame_document_stylesheets
+                    .invalidate_owner(crate::dom::NodeId::new(change.owner().index()));
+            }
+        }
         let dom_host = self.dom_host() as *const _;
         self.style_engine
             .apply_stylesheet_owner_changes_with_host(unsafe { &*dom_host }, changes);
@@ -892,19 +993,7 @@ impl JsContextHost {
         let mut linked_attribute_owners = Vec::new();
         for change in changes {
             let owner = change.owner();
-            let source_was_processed = match change.kind() {
-                DomStylesheetOwnerChangeKind::Registered
-                | DomStylesheetOwnerChangeKind::Contents => {
-                    unsafe { &*dom_host }.is_connected(owner)
-                }
-                DomStylesheetOwnerChangeKind::OwnerDocumentChanged => true,
-                DomStylesheetOwnerChangeKind::TreeConnectionChanged { connected } => *connected,
-                DomStylesheetOwnerChangeKind::Unregistered
-                | DomStylesheetOwnerChangeKind::Attribute { .. } => false,
-            };
-            if unsafe { &*dom_host }.is_inline_style_sheet_owner(owner)
-                && source_was_processed
-                && !owners.contains(&owner)
+            if unsafe { &*dom_host }.is_inline_style_sheet_owner(owner) && !owners.contains(&owner)
             {
                 owners.push(owner);
             }
@@ -944,10 +1033,7 @@ impl JsContextHost {
         }
     }
 
-    pub(crate) fn sync_owner_style_sheet_texts_for_document_tree_scopes(
-        &mut self,
-        document: DomHandle,
-    ) {
+    pub(crate) fn install_prepared_style_sheets_for_document(&mut self, document: DomHandle) {
         let owners = {
             let host = self.dom_host();
             let mut owners = Vec::new();
@@ -965,7 +1051,7 @@ impl JsContextHost {
             owners
         };
         for owner in owners {
-            self.sync_owner_style_sheet_text(owner);
+            self.install_owner_live_stylesheet(owner);
         }
     }
 
@@ -975,7 +1061,7 @@ impl JsContextHost {
             runtime.take_style_source_document_sync_pending()
         };
         if pending {
-            self.sync_owner_style_sheet_texts_for_document_tree_scopes(self.document_handle());
+            self.install_prepared_style_sheets_for_document(self.document_handle());
         }
     }
 
@@ -989,7 +1075,7 @@ impl JsContextHost {
     pub(crate) fn close_document(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) {
         self.close_root_document_parser_stream(scope, host_ptr);
         self.sync_pending_document_style_sources();
@@ -1030,13 +1116,8 @@ impl JsContextHost {
             owner,
             stylesheet_id,
         ) {
-            self.style_engine
-                .mark_owner_live_stylesheet_cssom_authoritative_with_host(
-                    unsafe { &*dom_host },
-                    owner,
-                );
             let canceled_load_event_bindings =
-                unsafe { &mut *self.runtime }.invalidate_style_related_state(owner);
+                unsafe { &mut *self.document_runtime }.invalidate_style_related_state(owner);
             for binding in canceled_load_event_bindings {
                 let settled = self.settle_main_style_load_event(binding);
                 tracing::debug!(
@@ -1048,7 +1129,7 @@ impl JsContextHost {
                 );
             }
             let host_ptr = self as *mut Self;
-            unsafe { &mut *self.runtime }
+            unsafe { &mut *self.document_runtime }
                 .apply_inline_cssom_source_change_after_invalidation(host_ptr, owner);
             return true;
         }
@@ -1060,7 +1141,8 @@ impl JsContextHost {
             self.clear_layout_rect_cache();
             self.queue_stylesheet_source_css_projection(owner);
             let host_ptr = self as *mut Self;
-            unsafe { &mut *self.runtime }.apply_linked_cssom_source_change(host_ptr, owner);
+            unsafe { &mut *self.document_runtime }
+                .apply_linked_cssom_source_change(host_ptr, owner);
             return true;
         }
         false
@@ -1095,7 +1177,7 @@ impl JsContextHost {
     }
 
     pub(crate) fn stylesheet_owner_is_csp_blocked(&self, owner: DomHandle) -> bool {
-        unsafe { &*self.runtime }.stylesheet_owner_is_csp_blocked(owner)
+        unsafe { &*self.document_runtime }.stylesheet_owner_is_csp_blocked(owner)
     }
 
     pub(crate) fn set_owner_style_sheet_csp_suppressed(
@@ -1176,6 +1258,16 @@ impl JsContextHost {
         owner: DomHandle,
         request_url: &url::Url,
     ) -> bool {
+        // A URL-only parsed source has no proof for this link's integrity.
+        // Admission through the stylesheet fetch cache can reuse only a terminal
+        // validated with the same request options, including integrity metadata.
+        if self
+            .dom_host()
+            .get_attribute(owner, "integrity")
+            .is_some_and(|metadata| !metadata.is_empty())
+        {
+            return false;
+        }
         let dom_host = self.dom_host() as *const _;
         let Some(source) = self.style_engine.cached_linked_stylesheet_source_with_host(
             unsafe { &*dom_host },
@@ -1270,6 +1362,11 @@ impl JsContextHost {
         let dom_host = self.dom_host() as *const _;
         self.style_engine
             .shadow_root_adopted_style_sheet_sources_with_host(unsafe { &*dom_host }, root)
+    }
+
+    pub(crate) fn shadow_root_has_adopted_style_sheet_sources(&self, root: DomHandle) -> bool {
+        self.style_engine
+            .shadow_root_has_adopted_style_sheet_sources(self.dom_host(), root)
     }
 
     pub(crate) fn register_css_custom_property_for_document(
@@ -1393,7 +1490,7 @@ impl JsContextHost {
         )
     }
 
-    fn style_source_document_context_for_read_document(
+    pub(crate) fn style_source_document_context_for_read_document(
         &self,
         read_document: DomHandle,
     ) -> OwnedStyleSourceDocumentContext {
@@ -1708,6 +1805,19 @@ impl JsContextHost {
             )
     }
 
+    pub(crate) fn prepare_style_observation_targets(
+        &self,
+        document: DomHandle,
+        handles: &[DomHandle],
+    ) {
+        self.style_engine.prepare_style_observation_targets(
+            self.dom_host(),
+            self.document_url(),
+            document,
+            handles,
+        );
+    }
+
     pub(crate) fn computed_style_snapshot_from_current_observation(
         &self,
         handle: DomHandle,
@@ -1771,9 +1881,9 @@ impl JsContextHost {
         owner: DomHandle,
         parent_style: &style::properties::ComputedValues,
         anonymous_kind: crate::style_engine::StyloAnonymousBoxKind,
+        document_context: &OwnedStyleSourceDocumentContext,
         read_document: DomHandle,
     ) -> Option<crate::style_engine::StyloComputedStyleSnapshot> {
-        let document_context = self.style_source_document_context_for_read_document(read_document);
         self.style_engine
             .computed_anonymous_style_snapshot_from_current_observation(
                 self.dom_host(),
@@ -1806,7 +1916,21 @@ impl JsContextHost {
     }
 
     pub(crate) fn set_document_url(&mut self, url: url::Url) -> bool {
+        let document = self.document_handle();
+        let inherited_base = (self.main_document_is_initial_empty()
+            && moli_url::is_about_blank(&url))
+        .then(|| {
+            self.dom_host()
+                .node(document)
+                .and_then(|node| node.as_document())
+                .map(|document| document.fallback_base_url().clone())
+        })
+        .flatten();
         let target_change = DocumentRuntime::set_document_url(self, url);
+        if let Some(base) = inherited_base {
+            self.dom_host_mut()
+                .set_document_fallback_base_url_for_handle(document, Some(base));
+        }
         if let Some((previous_target, next_target)) = target_change {
             self.note_target_style_activity(previous_target, next_target);
         }
@@ -1948,9 +2072,9 @@ impl JsContextHost {
                 old_state,
             );
         }
-        // Hover selectors may change box generation or geometry. The next hit
-        // test must observe that new tree instead of waiting for a paint pass
-        // to replace the latest owned layout snapshot.
+        // Hover changes the source style, not the published rendered world.
+        // Geometry reads and pointer phases keep consuming the retained
+        // snapshot until a fresh visual publication replaces it.
         self.invalidate_layout_after_interaction_state_change();
         true
     }
@@ -1990,8 +2114,9 @@ impl JsContextHost {
 
     pub(crate) fn set_media_paused(&mut self, handle: DomHandle, paused: bool) -> bool {
         let old_state = self.retained_current_element_state(handle);
-        let changed =
-            unsafe { DocumentRuntime::set_media_paused(&mut *self.runtime, handle, paused) };
+        let changed = unsafe {
+            DocumentRuntime::set_media_paused(&mut *self.document_runtime, handle, paused)
+        };
         if changed {
             self.note_element_state_style_activity_with_old_state(
                 handle,
@@ -2007,13 +2132,15 @@ impl JsContextHost {
         handle: DomHandle,
         error_code: Option<u32>,
     ) -> bool {
-        unsafe { DocumentRuntime::set_media_error_code(&mut *self.runtime, handle, error_code) }
+        unsafe {
+            DocumentRuntime::set_media_error_code(&mut *self.document_runtime, handle, error_code)
+        }
     }
 
     pub(crate) fn set_media_muted(&mut self, handle: DomHandle, muted: bool) -> bool {
         let old_state = self.retained_current_element_state(handle);
         let changed =
-            unsafe { DocumentRuntime::set_media_muted(&mut *self.runtime, handle, muted) };
+            unsafe { DocumentRuntime::set_media_muted(&mut *self.document_runtime, handle, muted) };
         if changed {
             self.note_element_state_style_activity_with_old_state(
                 handle,
@@ -2026,8 +2153,9 @@ impl JsContextHost {
 
     pub(crate) fn set_media_seeking(&mut self, handle: DomHandle, seeking: bool) -> bool {
         let old_state = self.retained_current_element_state(handle);
-        let changed =
-            unsafe { DocumentRuntime::set_media_seeking(&mut *self.runtime, handle, seeking) };
+        let changed = unsafe {
+            DocumentRuntime::set_media_seeking(&mut *self.document_runtime, handle, seeking)
+        };
         if changed {
             self.note_element_state_style_activity_with_old_state(
                 handle,
@@ -2047,12 +2175,69 @@ impl JsContextHost {
             .retained_current_element_state(unsafe { &*dom_host }, element)
     }
 
+    pub(crate) fn set_select_value(&mut self, handle: DomHandle, value: &str) -> bool {
+        // Capture selected peers before the native multi-option commit. The
+        // same wrapper serves the Web setter and native autofill.
+        let old_states = self
+            .dom_host()
+            .select_option_elements(handle)
+            .into_iter()
+            .filter_map(|option| {
+                let selected = self
+                    .dom_host()
+                    .node(option)
+                    .and_then(Node::as_element)?
+                    .selected();
+                Some((
+                    option,
+                    selected,
+                    self.retained_current_element_state(option),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let changed = unsafe {
+            DocumentRuntime::set_select_value(&mut *self.document_runtime, handle, value)
+        };
+        if changed {
+            for (option, was_selected, old_state) in old_states {
+                let selected = self
+                    .dom_host()
+                    .node(option)
+                    .and_then(Node::as_element)
+                    .is_some_and(|element| element.selected());
+                if selected != was_selected {
+                    self.note_element_state_style_activity_with_old_state(
+                        option,
+                        StyloElementState::CHECKED | StyloElementState::VALIDITY_STATES,
+                        old_state,
+                    );
+                }
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn set_input_files(
+        &mut self,
+        handle: DomHandle,
+        files: Vec<crate::dom::native::SelectedFile>,
+    ) -> bool {
+        let old_state = self.retained_current_element_state(handle);
+        let container_old_states = self.retained_old_states_for_validity_container_change(handle);
+        let changed =
+            unsafe { DocumentRuntime::set_input_files(&mut *self.document_runtime, handle, files) };
+        if changed {
+            self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
+        }
+        changed
+    }
+
     pub(crate) fn set_input_value(&mut self, handle: DomHandle, value: &str) -> bool {
         self.clear_text_control_change_pending(handle);
         let old_state = self.retained_current_element_state(handle);
         let container_old_states = self.retained_old_states_for_validity_container_change(handle);
         let changed =
-            unsafe { DocumentRuntime::set_input_value(&mut *self.runtime, handle, value) };
+            unsafe { DocumentRuntime::set_input_value(&mut *self.document_runtime, handle, value) };
         if changed {
             self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
         }
@@ -2069,7 +2254,12 @@ impl JsContextHost {
         let old_state = self.retained_current_element_state(handle);
         let container_old_states = self.retained_old_states_for_validity_container_change(handle);
         let changed = unsafe {
-            DocumentRuntime::set_input_value_with_dirty(&mut *self.runtime, handle, value, dirty)
+            DocumentRuntime::set_input_value_with_dirty(
+                &mut *self.document_runtime,
+                handle,
+                value,
+                dirty,
+            )
         };
         if changed {
             self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
@@ -2085,7 +2275,11 @@ impl JsContextHost {
         let old_state = self.retained_current_element_state(handle);
         let container_old_states = self.retained_old_states_for_validity_container_change(handle);
         let changed = unsafe {
-            DocumentRuntime::set_input_value_from_user_edit(&mut *self.runtime, handle, value)
+            DocumentRuntime::set_input_value_from_user_edit(
+                &mut *self.document_runtime,
+                handle,
+                value,
+            )
         };
         if changed {
             self.note_input_value_state_style_activity(handle, old_state, &container_old_states);
@@ -2095,8 +2289,9 @@ impl JsContextHost {
 
     pub(crate) fn set_autofilled(&mut self, handle: DomHandle, autofilled: bool) -> bool {
         let old_state = self.retained_current_element_state(handle);
-        let changed =
-            unsafe { DocumentRuntime::set_autofilled(&mut *self.runtime, handle, autofilled) };
+        let changed = unsafe {
+            DocumentRuntime::set_autofilled(&mut *self.document_runtime, handle, autofilled)
+        };
         if changed {
             self.note_element_state_style_activity_with_old_state(
                 handle,
@@ -2105,6 +2300,19 @@ impl JsContextHost {
             );
         }
         changed
+    }
+
+    pub(crate) fn set_web_mcp_activity(&mut self, handle: DomHandle, form: bool, submit: bool) {
+        let old_state = self.retained_current_element_state(handle);
+        if unsafe {
+            DocumentRuntime::set_web_mcp_activity(&mut *self.document_runtime, handle, form, submit)
+        } {
+            self.note_element_state_style_activity_with_old_state(
+                handle,
+                StyloElementState::TOOL_FORM_ACTIVE | StyloElementState::TOOL_SUBMIT_ACTIVE,
+                old_state,
+            );
+        }
     }
 
     fn note_input_value_state_style_activity(
@@ -2136,14 +2344,14 @@ impl JsContextHost {
     pub(crate) fn set_checked_state(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         checked: bool,
     ) -> bool {
         let old_states = self.retained_old_states_for_checked_state_change(handle, checked);
         unsafe {
             DocumentRuntime::set_checked_state_with_old_states(
-                &mut *self.runtime,
+                &mut *self.document_runtime,
                 scope,
                 host_ptr,
                 handle,
@@ -2155,7 +2363,7 @@ impl JsContextHost {
 
     pub(crate) fn set_checked_state_with_dirty(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         checked: bool,
         dirty: bool,
@@ -2163,7 +2371,7 @@ impl JsContextHost {
         let old_states = self.retained_old_states_for_checked_state_change(handle, checked);
         unsafe {
             DocumentRuntime::set_checked_state_with_dirty_and_old_states(
-                &mut *self.runtime,
+                &mut *self.document_runtime,
                 host_ptr,
                 handle,
                 checked,
@@ -2214,10 +2422,42 @@ impl JsContextHost {
             .collect()
     }
 
+    fn validity_containers_for_child_list_mutations(
+        &self,
+        effects: &[StyleMutationEffect],
+    ) -> Vec<DomHandle> {
+        let mut containers = Vec::new();
+        for effect in effects {
+            let StyleMutationEffect::ChildList { parent, .. } = effect else {
+                continue;
+            };
+            let mut current = Some(*parent);
+            while let Some(handle) = current {
+                if self.dom_host().is_html_element_named(handle, "form")
+                    || self.dom_host().is_html_element_named(handle, "fieldset")
+                {
+                    push_unique_handle(&mut containers, handle);
+                }
+                current = self.dom_host().parent_node(handle);
+            }
+        }
+        containers
+    }
+
     pub(crate) fn note_style_mutation_effects(&mut self, effects: &[StyleMutationEffect]) {
         if style_mutation_effects_affect_layout_metric(effects) {
             self.clear_layout_rect_cache();
         }
+        let changed_iframe_attributes = effects.iter().filter_map(|effect| {
+            let StyleMutationEffect::Attribute { element, name, .. } = effect else {
+                return None;
+            };
+            (StyleAttributeImpact::for_attribute_name(name).affects_layout_metric()
+                && self.dom_host().is_html_element_named(*element, "iframe"))
+            .then_some(*element)
+        });
+        self.invalidate_published_frame_viewports(changed_iframe_attributes);
+        let validity_containers = self.validity_containers_for_child_list_mutations(effects);
         let dom_host = self.dom_host() as *const _;
         let emulated_media = self.emulated_media().clone();
         let viewport = self.style_viewport();
@@ -2227,6 +2467,16 @@ impl JsContextHost {
             &emulated_media,
             viewport,
         );
+        for container in validity_containers {
+            // Child-list effects are produced after the tree splice, so the
+            // previous aggregate validity is unavailable. An absent old state
+            // deliberately selects the conservative state invalidation path.
+            self.note_element_state_style_activity_with_old_state(
+                container,
+                StyloElementState::VALIDITY_STATES,
+                None,
+            );
+        }
     }
 
     pub(crate) fn note_element_inline_style_subtree_activity(&mut self, root: DomHandle) {
@@ -2390,7 +2640,7 @@ impl JsContextHost {
 
     pub(crate) fn permission_state(&self, permission_name: &str) -> &str {
         let current_origin = unsafe {
-            (&*self.runtime)
+            (&*self.document_runtime)
                 .document_url()
                 .origin()
                 .ascii_serialization()
@@ -2503,36 +2753,18 @@ impl JsContextHost {
 
     pub(crate) fn set_fetch_subresource_interception(
         &mut self,
-        enabled: bool,
-        resource_type: Option<SubresourceResourceType>,
+        classes: SubresourceInterceptionClasses,
     ) {
-        self.fetch_subresource_interception_enabled = enabled;
-        self.fetch_subresource_interception_resource_type = resource_type;
-        for worker in self.workers.values() {
-            if let super::workers::WorkerExecutionState::Running { handle } = &worker.execution {
-                handle.set_fetch_subresource_interception(enabled, resource_type);
-            }
-        }
+        self.page_network_policy
+            .set_subresource_interception(classes);
     }
 
     pub(crate) fn should_intercept_subresource(
         &self,
         resource_type: SubresourceResourceType,
     ) -> bool {
-        self.fetch_subresource_interception_enabled
-            && self
-                .fetch_subresource_interception_resource_type
-                .is_none_or(|expected| expected.has_same_cdp_fetch_interception_type(resource_type))
-    }
-
-    pub(crate) fn fetch_subresource_interception_enabled(&self) -> bool {
-        self.fetch_subresource_interception_enabled
-    }
-
-    pub(crate) fn fetch_subresource_interception_resource_type(
-        &self,
-    ) -> Option<SubresourceResourceType> {
-        self.fetch_subresource_interception_resource_type
+        self.page_network_policy
+            .should_intercept_subresource(resource_type)
     }
 }
 

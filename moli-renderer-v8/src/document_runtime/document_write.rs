@@ -41,26 +41,17 @@ enum HtmlFragmentParserContextMode {
 struct DocumentWriteParserMutationOwner<'a, 'scope, 'pin> {
     runtime: &'a mut DocumentRuntime,
     scope: &'a mut v8::PinScope<'scope, 'pin>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     target: DocumentWriteParserMutationTarget,
 }
 
 #[derive(Clone, Copy)]
 enum DocumentWriteParserMutationTarget {
     LiveDocument,
-    DetachedFragment { owner_document: DomHandle },
+    DetachedFragment,
 }
 
 impl DocumentWriteParserMutationOwner<'_, '_, '_> {
-    fn owner_document_handle(&self) -> DomHandle {
-        match self.target {
-            DocumentWriteParserMutationTarget::LiveDocument => self.runtime.document_handle(),
-            DocumentWriteParserMutationTarget::DetachedFragment { owner_document } => {
-                owner_document
-            }
-        }
-    }
-
     fn targets_live_document(&self) -> bool {
         matches!(self.target, DocumentWriteParserMutationTarget::LiveDocument)
     }
@@ -80,9 +71,20 @@ impl ParserMutationEffectConsumer for DocumentWriteParserMutationOwner<'_, '_, '
                 effects,
             );
     }
+    fn finish_parser_dom_mutations(&mut self) -> std::ops::ControlFlow<()> {
+        if self.targets_live_document() {
+            self.runtime
+                .run_pending_parser_post_step_runtime_work(self.scope, self.host_ptr);
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 impl ParserDomReadConsumer for DocumentWriteParserMutationOwner<'_, '_, '_> {
+    fn stylesheet_media_matches(&mut self, media: &str) -> bool {
+        self.runtime.stylesheet_media_matches(media)
+    }
+
     fn node_exists(&mut self, node_id: DomHandle) -> bool {
         self.runtime.parser_runtime_dom_node_exists(node_id)
     }
@@ -185,19 +187,17 @@ impl ParserDomMutationConsumer for DocumentWriteParserMutationOwner<'_, '_, '_> 
             self.host_ptr,
             mutation,
         );
-        self.runtime
-            .run_pending_parser_post_step_runtime_work(self.scope, self.host_ptr);
     }
 
-    fn create_parser_element_without_attributes(
+    fn create_element_for_document_without_attributes(
         &mut self,
+        document_handle: DomHandle,
         local_name: String,
         namespace: String,
         prefix: Option<String>,
     ) -> DomHandle {
-        let document_handle = self.owner_document_handle();
         self.runtime
-            .create_parser_element_for_document_without_attributes_in_live_dom_host(
+            .create_element_for_document_without_attributes_in_live_dom_host(
                 document_handle,
                 local_name,
                 namespace,
@@ -207,6 +207,7 @@ impl ParserDomMutationConsumer for DocumentWriteParserMutationOwner<'_, '_, '_> 
 
     fn create_parser_element_for_document_without_attributes(
         &mut self,
+        construction: &moli_dom::native::ParserConstruction,
         document_handle: DomHandle,
         local_name: String,
         namespace: String,
@@ -214,6 +215,7 @@ impl ParserDomMutationConsumer for DocumentWriteParserMutationOwner<'_, '_, '_> 
     ) -> DomHandle {
         self.runtime
             .create_parser_element_for_document_without_attributes_in_live_dom_host(
+                construction,
                 document_handle,
                 local_name,
                 namespace,
@@ -271,14 +273,18 @@ impl ParserDomMutationConsumer for DocumentWriteParserMutationOwner<'_, '_, '_> 
             .create_document_type_for_document(document_handle, &name, &public_id, &system_id)
     }
 
-    fn prepend_text_to_text_node(&mut self, node_id: DomHandle, text: String) {
+    fn prepend_text_to_text_node(
+        &mut self,
+        node_id: DomHandle,
+        text: String,
+    ) -> DomMutationEffects {
         self.runtime
-            .prepend_text_to_text_node_in_live_dom_host(node_id, text);
+            .prepend_text_to_text_node_in_live_dom_host(node_id, text)
     }
 
-    fn append_text_to_text_node(&mut self, node_id: DomHandle, text: String) {
+    fn append_text_to_text_node(&mut self, node_id: DomHandle, text: String) -> DomMutationEffects {
         self.runtime
-            .append_text_to_text_node_in_live_dom_host(node_id, text);
+            .append_text_to_text_node_in_live_dom_host(node_id, text)
     }
 
     fn push_parse_error(&mut self, error: String) {
@@ -299,18 +305,13 @@ impl ParserDomMutationConsumer for DocumentWriteParserMutationOwner<'_, '_, '_> 
             .mark_script_already_started_for_parser_in_live_dom_host(node_id);
     }
 
-    fn finish_parsing_script_children(&mut self, node_id: DomHandle) {
-        let _ = self
-            .runtime
-            .dom_host_mut()
-            .finish_parsing_script_children(node_id);
-    }
-
-    fn finish_parsing_link_children(&mut self, node_id: DomHandle) {
-        let _ = self
-            .runtime
-            .dom_host_mut()
-            .finish_parsing_link_children(node_id);
+    fn finish_parsing_children(
+        &mut self,
+        construction: &moli_dom::native::ParserConstruction,
+        node_id: DomHandle,
+    ) {
+        let effects = construction.finish_children(self.runtime.dom_host_mut(), node_id);
+        self.consume_parser_mutation_effects(effects);
     }
 
     fn attach_declarative_shadow_for_parser(
@@ -334,15 +335,11 @@ impl ParserElementCreationConsumer for DocumentWriteParserMutationOwner<'_, '_, 
         &mut self,
         request: ParserElementCreationRequest<'_>,
     ) -> Option<DomHandle> {
-        let document_has_body = self
-            .document_body_handle_for_document(request.document_handle)
-            .is_some();
         let runtime = &mut *self.runtime;
         custom_elements::create_and_construct_parser_custom_element_direct_for_document(
             self.scope,
             self.host_ptr,
             request.document_handle,
-            document_has_body,
             request.local_name,
             request.namespace,
             request.prefix,
@@ -350,6 +347,7 @@ impl ParserElementCreationConsumer for DocumentWriteParserMutationOwner<'_, '_, 
             request.intended_parent,
             |document_handle, local_name, namespace, prefix| {
                 runtime.create_parser_element_for_document_without_attributes_in_live_dom_host(
+                    request.construction,
                     document_handle,
                     local_name,
                     namespace,
@@ -388,7 +386,7 @@ impl DocumentRuntime {
     pub(crate) fn close_root_document_parser_stream(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> bool {
         if self.root_document_parser.is_none() {
             return false;
@@ -415,7 +413,7 @@ impl DocumentRuntime {
     fn finish_root_document_parser_stream_if_ready(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> bool {
         if self
             .root_document_parser
@@ -465,13 +463,9 @@ impl DocumentRuntime {
                 .discovery_signals
                 .modulepreload_link_candidates,
         );
-        let completed_stylesheet_clients = self
-            .note_discovered_document_owned_blocking_stylesheet_inputs(
-                finish_signals
-                    .discovery_signals
-                    .blocking_stylesheet_inputs
-                    .iter(),
-            );
+        let completed_stylesheet_clients = self.note_discovered_document_owned_stylesheet_inputs(
+            finish_signals.discovery_signals.stylesheet_inputs.iter(),
+        );
         self.settle_stylesheet_link_clients_in_current_scope(
             scope,
             host_ptr,
@@ -500,7 +494,7 @@ impl DocumentRuntime {
 
     pub(crate) fn fragment_context_custom_element_registry_association(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         context_handle: DomHandle,
     ) -> custom_elements::CustomElementRegistryAssociation {
         if self
@@ -515,7 +509,7 @@ impl DocumentRuntime {
 
     fn set_fragment_root_custom_element_registry_association(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         root: DomHandle,
         association: custom_elements::CustomElementRegistryAssociation,
     ) {
@@ -532,7 +526,7 @@ impl DocumentRuntime {
     fn build_fragment_from_html_with_context_mode(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         context_handle: DomHandle,
         html: &str,
@@ -569,9 +563,7 @@ impl DocumentRuntime {
                 runtime,
                 scope,
                 host_ptr,
-                target: DocumentWriteParserMutationTarget::DetachedFragment {
-                    owner_document: document_handle,
-                },
+                target: DocumentWriteParserMutationTarget::DetachedFragment,
             };
             parser.parse_fragment_into_live_dom(
                 mutation_owner.runtime.document_url().clone(),
@@ -629,10 +621,17 @@ impl DocumentRuntime {
         if custom_element_upgrade_timing
             == HtmlFragmentCustomElementUpgradeTiming::InReturnedFragment
         {
-            for root in fragment_roots {
-                if !custom_elements::upgrade_subtree_if_defined(scope, host_ptr, root) {
-                    return None;
-                }
+            let upgraded =
+                custom_elements::with_custom_element_reaction_scope(scope, host_ptr, |scope| {
+                    for root in fragment_roots {
+                        if !custom_elements::upgrade_subtree_if_defined(scope, host_ptr, root) {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            if !upgraded {
+                return None;
             }
         }
         unsafe { &mut *host_ptr }.capture_node_creation_stack_traces_since(scope, first_node_index);
@@ -642,7 +641,7 @@ impl DocumentRuntime {
     pub(crate) fn build_range_contextual_fragment_from_html(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         context_handle: DomHandle,
         html: &str,
@@ -665,7 +664,7 @@ impl DocumentRuntime {
     pub(crate) fn build_fragment_from_html(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         context_handle: DomHandle,
         html: &str,
@@ -690,7 +689,7 @@ impl DocumentRuntime {
     pub(crate) fn build_unsafe_fragment_from_html(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         context_handle: DomHandle,
         html: &str,
@@ -712,20 +711,30 @@ impl DocumentRuntime {
     }
 
     fn is_template_contents_fragment(&self, handle: DomHandle) -> bool {
-        self.dom_host()
+        let Some(fragment) = self
+            .dom_host()
             .node(handle)
-            .is_some_and(Node::is_document_fragment)
-            && self.dom_host().nodes().iter().any(|node| {
-                node.as_element()
-                    .and_then(|element| element.template_contents())
-                    == Some(handle)
-            })
+            .and_then(Node::as_document_fragment)
+        else {
+            return false;
+        };
+        let Some(host) = fragment.host() else {
+            return false;
+        };
+        // Parser-only template nodes can alias a declarative ShadowRoot.
+        // The fragment's actual host distinguishes it from template contents
+        // without scanning every node in the arena.
+        self.dom_host()
+            .node(host)
+            .and_then(Node::as_element)
+            .and_then(|element| element.template_contents())
+            == Some(handle)
     }
 
     fn upgrade_inserted_html_fragment_custom_elements(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_parent: DomHandle,
         roots: &[DomHandle],
     ) -> bool {
@@ -744,7 +753,7 @@ impl DocumentRuntime {
     pub(crate) fn set_inner_html(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         html: &str,
     ) -> bool {
@@ -820,7 +829,7 @@ impl DocumentRuntime {
     pub(crate) fn set_html_unsafe(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         html: &str,
     ) -> bool {
@@ -873,7 +882,7 @@ impl DocumentRuntime {
     pub(crate) fn set_outer_html(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         html: &str,
     ) -> bool {
@@ -939,12 +948,17 @@ impl DocumentRuntime {
     pub(crate) fn insert_adjacent_html(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         target: DomHandle,
         document_handle: DomHandle,
         context_handle: DomHandle,
         html: &str,
-        insert: impl FnOnce(&mut Self, &mut v8::PinScope<'_, '_>, *mut JsContextHost, DomHandle) -> bool,
+        insert: impl FnOnce(
+            &mut Self,
+            &mut v8::PinScope<'_, '_>,
+            *mut PageScriptHost,
+            DomHandle,
+        ) -> bool,
     ) -> bool {
         let Some(fragment) = self.build_fragment_from_html(
             scope,
@@ -974,25 +988,30 @@ impl DocumentRuntime {
     }
 
     pub(crate) fn has_pending_document_write_external_script_load(&self) -> bool {
-        self.pending_document_write_external_script_load.is_some()
+        self.document_write_external_script_fetch_target().is_some()
+    }
+
+    fn document_write_external_script_fetch_target(
+        &self,
+    ) -> Option<crate::types::DocumentWriteExternalScriptFetchTarget> {
+        match &self.pending_parser_insertion()?.work {
+            ParserInsertionWork::ExternalScript { target, .. } => Some(*target),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn pending_document_write_external_script_fetch_target(
         &self,
     ) -> Option<crate::types::DocumentWriteExternalScriptFetchTarget> {
-        self.pending_document_write_external_script_load
-            .as_ref()
-            .map(|pending| pending.target)
+        self.document_write_external_script_fetch_target()
     }
 
     pub(crate) fn has_document_write_external_script_fetch_target(
         &self,
         target: crate::types::DocumentWriteExternalScriptFetchTarget,
     ) -> bool {
-        self.pending_document_write_external_script_load
-            .as_ref()
-            .is_some_and(|pending| pending.target == target)
+        self.document_write_external_script_fetch_target() == Some(target)
             || self
                 .document_write_script_preloads
                 .values()
@@ -1000,13 +1019,7 @@ impl DocumentRuntime {
     }
 
     pub(crate) fn has_pending_document_write_parser_blocking_work(&self) -> bool {
-        self.pending_document_write_external_script_load.is_some()
-            || self
-                .pending_document_write_stylesheet_blocked_script
-                .is_some()
-            || self
-                .pending_document_write_stylesheet_parser_pause
-                .is_some()
+        self.pending_parser_insertion().is_some()
     }
 
     pub(crate) fn has_unfinished_root_document_parser_stream(&self) -> bool {
@@ -1014,33 +1027,15 @@ impl DocumentRuntime {
     }
 
     pub(crate) fn has_pending_document_write_stylesheet_blocked_script(&self) -> bool {
-        self.pending_document_write_stylesheet_blocked_script
-            .is_some()
-            || self
-                .pending_document_write_stylesheet_parser_pause
-                .is_some()
-            || self
-                .pending_document_write_external_script_load
-                .as_ref()
-                .is_some_and(|pending| !pending.blocking_signatures_before.is_empty())
+        self.pending_parser_insertion()
+            .is_some_and(|pending| !pending.blocking_signatures.is_empty())
     }
 
     pub(crate) fn document_write_stylesheet_blocked_script_is_ready(&mut self) -> bool {
         let Some(signatures) = self
-            .pending_document_write_stylesheet_parser_pause
-            .as_ref()
+            .pending_parser_insertion()
+            .filter(|pending| !pending.blocking_signatures.is_empty())
             .map(|pending| pending.blocking_signatures.clone())
-            .or_else(|| {
-                self.pending_document_write_stylesheet_blocked_script
-                    .as_ref()
-                    .map(|pending| pending.blocking_signatures_before.clone())
-            })
-            .or_else(|| {
-                self.pending_document_write_external_script_load
-                    .as_ref()
-                    .filter(|pending| !pending.blocking_signatures_before.is_empty())
-                    .map(|pending| pending.blocking_signatures_before.clone())
-            })
         else {
             return false;
         };
@@ -1058,11 +1053,18 @@ impl DocumentRuntime {
 
     fn scan_document_write_script_preloads(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         html: &str,
         reset_scanner: bool,
     ) {
-        if html.is_empty() || unsafe { &*host_ptr }.fetch_subresource_interception_enabled() {
+        // Match the class-precise script interception gates (phase-one
+        // admission and scanned script preloads): speculative preloads are
+        // skipped only when the Script class itself routes through the
+        // protocol, not whenever interception is enabled for any class.
+        if html.is_empty()
+            || unsafe { &*host_ptr }
+                .should_intercept_subresource(crate::types::SubresourceResourceType::Script)
+        {
             return;
         }
         let Some(resource_loader) = self.current_document_resource_loader() else {
@@ -1133,9 +1135,11 @@ impl DocumentRuntime {
                     document_url.clone(),
                     script.url.clone(),
                 );
+            let request_origin = resource_loader.fetch_context().request_origin();
             resource_loader.spawn_resource_task(async move {
                 let outcome = crate::planning::load_prepared_script_source_outcome_with_document_character_set(
                     &script,
+&request_origin,
                     &request_client,
                     Some(&document_character_set),
                     Some(resource_type_hint),
@@ -1167,79 +1171,32 @@ impl DocumentRuntime {
         }
     }
 
-    fn append_to_pending_document_write_external_script_load(&mut self, html: &str) -> bool {
-        let Some(pending) = self.pending_document_write_external_script_load.as_mut() else {
+    fn append_to_pending_parser_insertion(&mut self, html: &str) -> bool {
+        let Some(pending) = self.pending_parser_insertion() else {
             return false;
         };
-        pending
+        let input = pending
             .insertion
             .parser_bridge
             .insertion_controller()
-            .input_session()
-            .enqueue_script_input_html(html.to_owned());
-        pending
-            .insertion
-            .parser_bridge
-            .insertion_controller()
-            .input_session()
-            .enqueue_script_input_preload_html(html.to_owned());
-        true
-    }
-
-    fn append_to_pending_document_write_stylesheet_blocked_script(&mut self, html: &str) -> bool {
-        let Some(pending) = self
-            .pending_document_write_stylesheet_blocked_script
-            .as_mut()
-        else {
-            return false;
-        };
-        pending
-            .insertion
-            .parser_bridge
-            .insertion_controller()
-            .input_session()
-            .enqueue_script_input_html(html.to_owned());
-        pending
-            .insertion
-            .parser_bridge
-            .insertion_controller()
-            .input_session()
-            .enqueue_script_input_preload_html(html.to_owned());
-        true
-    }
-
-    fn append_to_pending_document_write_stylesheet_parser_pause(&mut self, html: &str) -> bool {
-        let Some(pending) = self.pending_document_write_stylesheet_parser_pause.as_mut() else {
-            return false;
-        };
-        pending
-            .insertion
-            .parser_bridge
-            .insertion_controller()
-            .input_session()
-            .enqueue_script_input_html(html.to_owned());
-        pending
-            .insertion
-            .parser_bridge
-            .insertion_controller()
-            .input_session()
-            .enqueue_script_input_preload_html(html.to_owned());
+            .input_session();
+        input.enqueue_script_input_html(html.to_owned());
+        input.enqueue_script_input_preload_html(html.to_owned());
         true
     }
 
     fn start_document_write_external_script_load(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         start: DocumentWriteExternalScriptStart,
         insertion: SuspendedDocumentWriteInsertion,
         blocking_signatures_before: HashSet<DocumentBlockingStylesheetSignature>,
     ) -> bool {
-        if let Some(pending) = self.pending_document_write_external_script_load.as_mut() {
+        if let Some(pending) = self.pending_parser_insertion_mut() {
             tracing::error!(
-                pending_load_id = pending.target.load_id(),
                 queued_url = %start.script.url,
-                "document.write external script load attempted while another load is pending"
+                "document.write external script load attempted while another parser blocker is pending"
             );
             pending.resume_after_completion.push_back(
                 SuspendedDocumentWriteContinuation::StartExternal {
@@ -1276,33 +1233,21 @@ impl DocumentRuntime {
             start.script.url.clone(),
         );
         let script_for_load = start.script.clone();
-        self.pending_document_write_external_script_load =
-            Some(PendingDocumentWriteExternalScriptLoad {
+        let source_ready = ready_completion.is_some();
+        self.install_pending_parser_insertion(PendingParserInsertion {
+            insertion,
+            blocking_signatures: blocking_signatures_before,
+            work: ParserInsertionWork::ExternalScript {
                 target,
                 start,
-                insertion,
-                blocking_signatures_before,
-                ready_completion: None,
-                resume_after_completion: VecDeque::new(),
-            });
-        if let Some(completion) = ready_completion {
-            if self
-                .pending_document_write_external_script_load
-                .as_ref()
-                .is_some_and(|pending| !pending.blocking_signatures_before.is_empty())
-            {
-                self.pending_document_write_external_script_load
-                    .as_mut()
-                    .expect("preloaded script must retain its pending owner")
-                    .ready_completion = Some(completion);
-                return true;
-            }
-            let pending = self
-                .pending_document_write_external_script_load
-                .take()
-                .expect("ready preloaded script must retain its pending owner");
-            let _ = self
-                .finish_document_write_external_script_load(scope, host_ptr, pending, completion);
+                ready_completion: ready_completion.map(Box::new),
+            },
+            resume_after_completion: VecDeque::new(),
+        });
+        // Both source and stylesheet completion use the same readiness check.
+        // Take the work before executing; nested writes may install a new one.
+        if source_ready {
+            let _ = self.resume_ready_parser_insertion(scope, host_ptr);
             return true;
         }
         if preload_was_started {
@@ -1310,10 +1255,12 @@ impl DocumentRuntime {
         }
         let completion_tx = unsafe { &*host_ptr }.resource_completion_sender();
         let document_character_set = self.document_character_set().to_owned();
+        let request_origin = resource_loader.fetch_context().request_origin();
         resource_loader.spawn_resource_task(async move {
             let outcome =
                 crate::planning::load_prepared_script_source_outcome_with_document_character_set(
                     &script_for_load,
+                    &request_origin,
                     &loader,
                     Some(&document_character_set),
                     None,
@@ -1335,7 +1282,7 @@ impl DocumentRuntime {
         &mut self,
         mut continuations: VecDeque<SuspendedDocumentWriteContinuation>,
     ) {
-        let Some(pending) = self.pending_document_write_external_script_load.as_mut() else {
+        let Some(pending) = self.pending_parser_insertion_mut() else {
             debug_assert!(
                 continuations.is_empty(),
                 "document.write continuations should only be queued behind an active pending load"
@@ -1348,7 +1295,7 @@ impl DocumentRuntime {
     fn resume_document_write_continuation(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         continuation: SuspendedDocumentWriteContinuation,
     ) -> bool {
         match continuation {
@@ -1381,21 +1328,24 @@ impl DocumentRuntime {
     fn resume_document_write_continuations(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
-        first: SuspendedDocumentWriteContinuation,
+        host_ptr: *mut PageScriptHost,
         mut remaining: VecDeque<SuspendedDocumentWriteContinuation>,
     ) -> bool {
         let mut changed = false;
-        let mut next = Some(first);
-        while let Some(continuation) = next {
-            if self.resume_document_write_continuation(scope, host_ptr, continuation) {
-                changed = true;
+        while let Some(continuation) = remaining.pop_front() {
+            let insertion = match &continuation {
+                SuspendedDocumentWriteContinuation::ResumeAfterCompleted { insertion, .. }
+                | SuspendedDocumentWriteContinuation::StartExternal { insertion, .. } => insertion,
+            };
+            if insertion.document_incarnation != self.document_incarnation {
+                continue;
             }
-            if self.pending_document_write_external_script_load.is_some() {
+            if self.has_pending_document_write_parser_blocking_work() {
+                remaining.push_front(continuation);
                 self.queue_document_write_continuations_after_pending(remaining);
                 return true;
             }
-            next = remaining.pop_front();
+            changed |= self.resume_document_write_continuation(scope, host_ptr, continuation);
         }
         changed
     }
@@ -1403,9 +1353,12 @@ impl DocumentRuntime {
     fn resume_suspended_document_write_insertion(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         mut insertion: SuspendedDocumentWriteInsertion,
     ) -> bool {
+        if insertion.document_incarnation != self.document_incarnation {
+            return false;
+        }
         if self.park_suspended_insertion_behind_reentrant_parser_work(&mut insertion) {
             return true;
         }
@@ -1538,15 +1491,11 @@ impl DocumentRuntime {
     pub(crate) fn complete_document_write_external_script_load(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         completion: crate::types::DocumentWriteExternalScriptLoadCompletion,
     ) -> super::DocumentWriteExternalScriptLoadApplication {
         let completion_target = completion.target();
-        if self
-            .pending_document_write_external_script_load
-            .as_ref()
-            .is_none_or(|pending| pending.target != completion_target)
-        {
+        if self.document_write_external_script_fetch_target() != Some(completion_target) {
             return if self.complete_document_write_script_preload(completion) {
                 super::DocumentWriteExternalScriptLoadApplication::Applied
             } else {
@@ -1558,44 +1507,46 @@ impl DocumentRuntime {
         {
             return super::DocumentWriteExternalScriptLoadApplication::RejectedStaleTarget;
         }
-        let mut pending = self
-            .pending_document_write_external_script_load
-            .take()
-            .expect("matching document-write script completion must retain its pending owner");
-        if pending.target != completion_target
-            || unsafe { &*host_ptr }.current_main_document_task_owner()
-                != Some(completion_target.task_owner())
-        {
-            self.pending_document_write_external_script_load = Some(pending);
+        let pending = self
+            .pending_parser_insertion_mut()
+            .expect("matching script completion must retain its pending owner");
+        let ParserInsertionWork::ExternalScript {
+            ready_completion, ..
+        } = &mut pending.work
+        else {
+            unreachable!()
+        };
+        // A repeated delivery is stale even if stylesheets still keep the
+        // first terminal parked. It must never replace an accepted result.
+        if ready_completion.is_some() {
             return super::DocumentWriteExternalScriptLoadApplication::RejectedStaleTarget;
         }
-        if !pending.blocking_signatures_before.is_empty() {
-            debug_assert!(
-                pending.ready_completion.is_none(),
-                "one external parser script load must produce exactly one completion"
-            );
-            pending.ready_completion = Some(completion);
-            self.pending_document_write_external_script_load = Some(pending);
-            return super::DocumentWriteExternalScriptLoadApplication::Applied;
-        }
-
-        self.finish_document_write_external_script_load(scope, host_ptr, pending, completion)
+        *ready_completion = Some(Box::new(completion));
+        self.resume_ready_parser_insertion(scope, host_ptr)
+            .unwrap_or(super::DocumentWriteExternalScriptLoadApplication::Applied)
     }
 
     fn finish_document_write_external_script_load(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
-        pending: PendingDocumentWriteExternalScriptLoad,
-        completion: crate::types::DocumentWriteExternalScriptLoadCompletion,
+        host_ptr: *mut PageScriptHost,
+        pending: PendingParserInsertion,
     ) -> super::DocumentWriteExternalScriptLoadApplication {
-        let completion_target = completion.target();
-        let PendingDocumentWriteExternalScriptLoad {
-            start,
+        let PendingParserInsertion {
             mut insertion,
             mut resume_after_completion,
+            work,
             ..
         } = pending;
+        let ParserInsertionWork::ExternalScript {
+            start,
+            ready_completion: Some(completion),
+            ..
+        } = work
+        else {
+            unreachable!("only a ready external source can be executed")
+        };
+        let completion_target = completion.target();
         if !Self::resume_document_write_insertion_permit(&mut insertion) {
             tracing::debug!(
                 target = ?completion_target,
@@ -1647,6 +1598,7 @@ impl DocumentRuntime {
                         start.node,
                         &start.host_script_handle,
                         source,
+                        &start.script,
                         Some(insertion.parser_bridge.clone()),
                         DocumentWriteCurrentScriptEventBehavior::DispatchImmediately(
                             ScriptEventKind::Load,
@@ -1679,19 +1631,10 @@ impl DocumentRuntime {
             return super::DocumentWriteExternalScriptLoadApplication::SupersededDuringApplication;
         }
 
-        let first = SuspendedDocumentWriteContinuation::ResumeAfterCompleted { start, insertion };
-        if self.pending_document_write_external_script_load.is_some() {
-            resume_after_completion.push_front(first);
-            self.queue_document_write_continuations_after_pending(resume_after_completion);
-            return super::DocumentWriteExternalScriptLoadApplication::Applied;
-        }
-
-        let _ = self.resume_document_write_continuations(
-            scope,
-            host_ptr,
-            first,
-            resume_after_completion,
+        resume_after_completion.push_front(
+            SuspendedDocumentWriteContinuation::ResumeAfterCompleted { start, insertion },
         );
+        let _ = self.resume_document_write_continuations(scope, host_ptr, resume_after_completion);
         let _ = self.finish_root_document_parser_stream_if_ready(scope, host_ptr);
         if unsafe { &*host_ptr }.current_main_document_task_owner()
             == Some(completion_target.task_owner())
@@ -1705,8 +1648,8 @@ impl DocumentRuntime {
     fn pump_document_write_parser_step(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
-        stream: &mut DocumentStream,
+        host_ptr: *mut PageScriptHost,
+        stream: &DocumentStream,
         input: DocumentWriteParserPumpInput<'_>,
     ) -> DocumentWriteParserPumpStep {
         let outcome =
@@ -1747,6 +1690,7 @@ impl DocumentRuntime {
     ) -> SuspendedDocumentWriteInsertion {
         SuspendedDocumentWriteInsertion {
             document_handle,
+            document_incarnation: self.document_incarnation.clone(),
             parser_bridge: parser_bridge.clone(),
             resume_permit: parser_bridge.suspend(cause),
             resume_permit_consumed: false,
@@ -1763,11 +1707,6 @@ impl DocumentRuntime {
         script: PreparedScript,
         blocking_signatures_before: HashSet<DocumentBlockingStylesheetSignature>,
     ) -> bool {
-        debug_assert!(
-            self.pending_document_write_stylesheet_blocked_script
-                .is_none(),
-            "a live parser can only have one pending parser-blocking script"
-        );
         self.note_parser_script_start_position(node, start_line, start_column);
         let _ = self.dom_host_mut().set_script_already_started(node, true);
         let insertion = self.take_suspended_document_write_insertion(
@@ -1775,31 +1714,28 @@ impl DocumentRuntime {
             parser_bridge,
             ParserSuspensionCause::ParserClassicStylesheets { script: node },
         );
-        self.pending_document_write_stylesheet_blocked_script =
-            Some(PendingDocumentWriteStylesheetBlockedScript {
+        self.install_pending_parser_insertion(PendingParserInsertion {
+            insertion,
+            blocking_signatures: blocking_signatures_before,
+            work: ParserInsertionWork::Script {
                 node,
                 start_line,
                 start_column,
                 script,
-                blocking_signatures_before,
-                insertion,
-            });
+            },
+            resume_after_completion: VecDeque::new(),
+        });
         true
     }
 
     fn suspend_document_write_stylesheet_parser_pause(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         parser_bridge: &ParserConnectedScriptBridge,
         stylesheet_owner: DomHandle,
         blocking_signatures: HashSet<DocumentBlockingStylesheetSignature>,
     ) -> bool {
-        debug_assert!(
-            self.pending_document_write_stylesheet_parser_pause
-                .is_none(),
-            "a live parser can only have one stylesheet parser boundary"
-        );
         let insertion = self.take_suspended_document_write_insertion(
             document_handle,
             parser_bridge,
@@ -1811,18 +1747,19 @@ impl DocumentRuntime {
             .insertion_controller()
             .with_parser_stream(DocumentStream::snapshot_pending_input);
         self.scan_document_write_script_preloads(host_ptr, &preload_html, true);
-        self.pending_document_write_stylesheet_parser_pause =
-            Some(PendingDocumentWriteStylesheetParserPause {
-                blocking_signatures,
-                insertion,
-            });
+        self.install_pending_parser_insertion(PendingParserInsertion {
+            insertion,
+            blocking_signatures,
+            work: ParserInsertionWork::StylesheetBoundary,
+            resume_after_completion: VecDeque::new(),
+        });
         true
     }
 
     fn start_document_write_stylesheet_blocked_external_script(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         parser_bridge: &ParserConnectedScriptBridge,
         node: DomHandle,
@@ -1847,7 +1784,7 @@ impl DocumentRuntime {
         let insertion = self.take_suspended_document_write_insertion(
             document_handle,
             parser_bridge,
-            ParserSuspensionCause::DocumentWriteExternalScript { script: node },
+            ParserSuspensionCause::ParserClassicSource { script: node },
         );
         self.start_document_write_external_script_load(
             scope,
@@ -1862,55 +1799,84 @@ impl DocumentRuntime {
     pub(crate) fn resume_document_write_stylesheet_blocked_script(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> bool {
-        if !self.document_write_stylesheet_blocked_script_is_ready() {
-            return false;
+        self.resume_ready_parser_insertion(scope, host_ptr)
+            .is_some()
+    }
+
+    /// Resource notifications update the pending work, then enter this common
+    /// gate. Neither source completion nor stylesheet completion can execute
+    /// a script while the other prerequisite remains unresolved.
+    fn resume_ready_parser_insertion(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+    ) -> Option<DocumentWriteExternalScriptLoadApplication> {
+        let signatures = self.pending_parser_insertion()?.blocking_signatures.clone();
+        if self.has_pending_parser_script_blocking_stylesheet_signatures(signatures.iter()) {
+            return None;
         }
-        if let Some(pending) = self.pending_document_write_stylesheet_parser_pause.take() {
-            self.document_write_script_preload_scanner = None;
-            let _ =
-                self.resume_suspended_document_write_insertion(scope, host_ptr, pending.insertion);
-            let _ = self.finish_root_document_parser_stream_if_ready(scope, host_ptr);
-            return true;
+        let pending = self.pending_parser_insertion_mut()?;
+        pending.blocking_signatures.clear();
+        if matches!(
+            &pending.work,
+            ParserInsertionWork::ExternalScript {
+                ready_completion: None,
+                ..
+            }
+        ) {
+            return (!signatures.is_empty())
+                .then_some(DocumentWriteExternalScriptLoadApplication::Applied);
         }
-        if self
-            .pending_document_write_stylesheet_blocked_script
-            .is_none()
-        {
-            let ready_completion = {
-                let Some(pending) = self.pending_document_write_external_script_load.as_mut()
-                else {
-                    return false;
-                };
-                pending.blocking_signatures_before.clear();
-                pending.ready_completion.take()
-            };
-            let Some(completion) = ready_completion else {
-                // The stylesheet side is ready; the same pending parser script
-                // now waits only for its source. Element events are separate
-                // tasks and do not participate in this gate.
-                return true;
-            };
-            let pending = self
-                .pending_document_write_external_script_load
-                .take()
-                .expect("ready external parser script must retain its pending owner");
-            let _ = self
-                .finish_document_write_external_script_load(scope, host_ptr, pending, completion);
-            return true;
+        let pending = self.take_pending_parser_insertion()?;
+        match &pending.work {
+            ParserInsertionWork::ExternalScript { .. } => {
+                Some(self.finish_document_write_external_script_load(scope, host_ptr, pending))
+            }
+            ParserInsertionWork::Script { .. } => {
+                self.finish_stylesheet_blocked_parser_script(scope, host_ptr, pending);
+                Some(DocumentWriteExternalScriptLoadApplication::Applied)
+            }
+            ParserInsertionWork::StylesheetBoundary => {
+                self.document_write_script_preload_scanner = None;
+                let _ = self.resume_suspended_document_write_insertion(
+                    scope,
+                    host_ptr,
+                    pending.insertion,
+                );
+                let _ = self.resume_document_write_continuations(
+                    scope,
+                    host_ptr,
+                    pending.resume_after_completion,
+                );
+                let _ = self.finish_root_document_parser_stream_if_ready(scope, host_ptr);
+                Some(DocumentWriteExternalScriptLoadApplication::Applied)
+            }
         }
-        let Some(pending) = self.pending_document_write_stylesheet_blocked_script.take() else {
-            return false;
-        };
-        let PendingDocumentWriteStylesheetBlockedScript {
+    }
+
+    fn finish_stylesheet_blocked_parser_script(
+        &mut self,
+        scope: &mut v8::PinScope<'_, '_>,
+        host_ptr: *mut PageScriptHost,
+        pending: PendingParserInsertion,
+    ) -> bool {
+        let PendingParserInsertion {
+            mut insertion,
+            work,
+            resume_after_completion,
+            ..
+        } = pending;
+        let ParserInsertionWork::Script {
             node,
             start_line,
             start_column,
             script,
-            blocking_signatures_before: _,
-            mut insertion,
-        } = pending;
+        } = work
+        else {
+            unreachable!()
+        };
         if !Self::resume_document_write_insertion_permit(&mut insertion) {
             return false;
         }
@@ -1924,6 +1890,9 @@ impl DocumentRuntime {
             Some(insertion.parser_bridge.clone()),
         ) {
             DocumentWriteScriptRunOutcome::Complete => {
+                if insertion.document_incarnation != self.document_incarnation {
+                    return false;
+                }
                 let parser_bridge = insertion.parser_bridge.clone();
                 self.set_current_script_context(CurrentScriptContextSpec {
                     handle: Some(node),
@@ -1932,13 +1901,21 @@ impl DocumentRuntime {
                 });
                 let _ = self.resume_suspended_document_write_insertion(scope, host_ptr, insertion);
                 self.clear_current_script_handle();
+                let _ = self.resume_document_write_continuations(
+                    scope,
+                    host_ptr,
+                    resume_after_completion,
+                );
                 let _ = self.finish_root_document_parser_stream_if_ready(scope, host_ptr);
                 true
             }
             DocumentWriteScriptRunOutcome::Suspend(start) => {
+                if insertion.document_incarnation != self.document_incarnation {
+                    return false;
+                }
                 Self::resuspend_document_write_insertion(
                     &mut insertion,
-                    ParserSuspensionCause::DocumentWriteExternalScript { script: node },
+                    ParserSuspensionCause::ParserClassicSource { script: node },
                 );
                 self.start_document_write_external_script_load(
                     scope,
@@ -1946,6 +1923,11 @@ impl DocumentRuntime {
                     *start,
                     insertion,
                     HashSet::new(),
+                );
+                let _ = self.resume_document_write_continuations(
+                    scope,
+                    host_ptr,
+                    resume_after_completion,
                 );
                 true
             }
@@ -1955,7 +1937,7 @@ impl DocumentRuntime {
     fn run_prepared_document_write_parser_script(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         parser_bridge: &ParserConnectedScriptBridge,
         node: DomHandle,
@@ -1987,7 +1969,7 @@ impl DocumentRuntime {
     }
     fn queue_document_write_parser_owned_post_parse_script(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         node: DomHandle,
         start_line: u64,
         start_column: u64,
@@ -2093,6 +2075,7 @@ impl DocumentRuntime {
             .expect("document.write async classic requires its exact Document resource loader");
         let source_load = SharedScriptSourceLoad::spawn_with_request_resource_type(
             script.clone(),
+            resource_loader.fetch_context().request_origin(),
             resource_loader.request_client().clone(),
             resource_loader.task_runner(),
             Some(self.document_character_set().to_owned()),
@@ -2116,7 +2099,7 @@ impl DocumentRuntime {
     fn run_prepared_document_write_import_map(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         node: DomHandle,
         start_line: u64,
         start_column: u64,
@@ -2154,7 +2137,7 @@ impl DocumentRuntime {
     fn suspend_document_write_parser_handoff(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         parser_bridge: &ParserConnectedScriptBridge,
         start: Box<DocumentWriteExternalScriptStart>,
@@ -2163,7 +2146,7 @@ impl DocumentRuntime {
         let insertion = self.take_suspended_document_write_insertion(
             document_handle,
             parser_bridge,
-            ParserSuspensionCause::DocumentWriteExternalScript { script },
+            ParserSuspensionCause::ParserClassicSource { script },
         );
         self.start_document_write_external_script_load(
             scope,
@@ -2177,7 +2160,7 @@ impl DocumentRuntime {
     fn handle_document_write_parser_handoff(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         parser_bridge: &ParserConnectedScriptBridge,
         handoff: ParserScriptHandoff,
@@ -2310,7 +2293,7 @@ impl DocumentRuntime {
     fn write_html_via_parser_stream(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         html: &str,
         resume_existing_insertion: bool,
@@ -2348,7 +2331,7 @@ impl DocumentRuntime {
                 } else {
                     DocumentWriteParserPumpInput::Ordinary(chunk.as_str())
                 };
-                insertion_controller.with_parser_stream_mut(|stream| {
+                insertion_controller.with_parser_stream(|stream| {
                     self.pump_document_write_parser_step(scope, host_ptr, stream, input)
                 })
             };
@@ -2358,13 +2341,11 @@ impl DocumentRuntime {
                         result,
                         discovered_async_prefetch_scripts: _,
                         discovered_modulepreload_link_candidates,
-                        discovered_blocking_stylesheet_inputs,
+                        discovered_stylesheet_inputs,
                     },
             } = parser_step;
             let discovered_parser_meta_csp_candidates = insertion_controller
-                .with_parser_stream_mut(
-                    DocumentStream::drain_discovered_parser_meta_csp_candidates,
-                );
+                .with_parser_stream(DocumentStream::drain_discovered_parser_meta_csp_candidates);
             for handle in &discovered_parser_meta_csp_candidates {
                 self.process_parser_meta_content_security_policy(*handle);
             }
@@ -2380,8 +2361,8 @@ impl DocumentRuntime {
             begin_insertion = false;
 
             let completed_stylesheet_clients = self
-                .note_discovered_document_owned_blocking_stylesheet_inputs(
-                    discovered_blocking_stylesheet_inputs.iter(),
+                .note_discovered_document_owned_stylesheet_inputs(
+                    discovered_stylesheet_inputs.iter(),
                 );
             self.settle_stylesheet_link_clients_in_current_scope(
                 scope,
@@ -2390,7 +2371,8 @@ impl DocumentRuntime {
             );
 
             match result {
-                ParserPumpStep::InputDrained => {
+                ParserPumpStep::InputDrained
+                | ParserPumpStep::Yield(ParserYield::OwnerInterrupted) => {
                     return true;
                 }
                 ParserPumpStep::Yield(ParserYield::CustomElementConstruction(_handoff)) => {
@@ -2403,11 +2385,14 @@ impl DocumentRuntime {
                     if self.current_document_resource_loader().is_none() {
                         continue;
                     }
-                    let blocking_signatures = discovered_blocking_stylesheet_inputs
+                    let blocking_signatures = discovered_stylesheet_inputs
                         .iter()
                         .map(|input| input.signature().clone())
                         .collect::<HashSet<_>>();
                     if !blocking_signatures.is_empty()
+                        && self.has_pending_parser_script_blocking_stylesheet_signatures(
+                            blocking_signatures.iter(),
+                        )
                         && self.suspend_document_write_stylesheet_parser_pause(
                             host_ptr,
                             document_handle,
@@ -2441,7 +2426,7 @@ impl DocumentRuntime {
     fn accept_document_write_parser_modulepreloads(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         link_handles: Vec<DomHandle>,
     ) {
         if link_handles.is_empty() {
@@ -2507,20 +2492,14 @@ impl DocumentRuntime {
     pub(crate) fn write_html(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
         html: &str,
     ) -> bool {
         if self.has_pending_document_write_parser_blocking_work() {
             self.scan_document_write_script_preloads(host_ptr, html, false);
         }
-        if self.append_to_pending_document_write_external_script_load(html) {
-            return true;
-        }
-        if self.append_to_pending_document_write_stylesheet_blocked_script(html) {
-            return true;
-        }
-        if self.append_to_pending_document_write_stylesheet_parser_pause(html) {
+        if self.append_to_pending_parser_insertion(html) {
             return true;
         }
 
@@ -2543,7 +2522,7 @@ impl DocumentRuntime {
 
 fn record_document_write_modulepreload_warning(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     message: String,
 ) {
     tracing::warn!(warning = %message, "document.write modulepreload warning");

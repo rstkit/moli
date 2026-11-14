@@ -1,7 +1,6 @@
 mod adopted_lifecycle;
 mod attribute_lifecycle;
 mod connected_lifecycle;
-mod connected_lifecycle_initial_attributes;
 mod connected_subtree_lifecycle;
 mod construction;
 mod construction_failure;
@@ -27,7 +26,8 @@ pub(crate) use construction_failure::throw_already_constructed_custom_element_er
 use construction_failure::{ConstructionFailure, report_custom_element_construction_failure};
 pub(crate) use construction_result::set_wrapper_custom_element_constructor_prototype;
 use construction_result::{
-    FailedExistingConstructionPrototype, validate_custom_element_construction_result,
+    FailedExistingConstructionPrototype, synchronize_wrapper_custom_element_prototype,
+    validate_custom_element_construction_result,
 };
 use construction_runtime::construct_custom_element_directly;
 use definition::PendingInitialAttribute;
@@ -36,9 +36,7 @@ pub(crate) use definition_upgrade::{
     upgrade_existing_definition_for_child, upgrade_existing_definition_for_registry,
 };
 mod element_creation;
-pub(crate) use element_creation::{
-    create_element_for_document_local_name_is_and_registry, is_name_from_create_options_value,
-};
+pub(crate) use element_creation::create_element_for_document_local_name_is_and_registry;
 mod element_state;
 use element_state::{
     definition_name_for_handle, set_dom_custom_element_is_name, set_dom_custom_element_state,
@@ -49,8 +47,7 @@ pub(crate) use element_state::{
 };
 mod existing_upgrade;
 pub(crate) use existing_upgrade::{
-    has_pending_upgrade_reaction, upgrade_element_with_wrapper_if_defined,
-    upgrade_handle_if_defined,
+    upgrade_element_with_wrapper_if_defined, upgrade_handle_if_defined,
 };
 mod existing_upgrade_candidate;
 use existing_upgrade_candidate::custom_element_wrapper_for_existing_upgrade;
@@ -66,6 +63,8 @@ pub(crate) use form_lifecycle::{
     dispatch_form_association_callback_if_needed, dispatch_form_disabled_callback_if_needed,
     enqueue_form_association_callback_if_needed,
 };
+mod form_owner_mutation;
+pub(crate) use form_owner_mutation::form_owner_mutation_effects_touch_html_form;
 mod form_lifecycle_scans;
 pub(crate) use form_lifecycle_scans::{
     dispatch_form_association_callbacks_for_all, dispatch_form_disabled_callbacks_in_subtree,
@@ -121,9 +120,8 @@ pub(crate) use registry::{
     AdoptionCallbackTarget, CustomElementAdoptionPlan, CustomElementRegistryAssociation,
     CustomElementRegistryKey, RegistryAssociationRetarget,
 };
-mod registry_adoption_callbacks;
 mod registry_adoption_retarget;
-pub(crate) use registry_adoption_retarget::adoption_plan_for_roots_before_adoption;
+pub(crate) use registry_adoption_retarget::adoption_plan_before_adoption;
 mod registry_clone_association;
 mod registry_clone_retarget;
 pub(crate) use registry_clone_retarget::{
@@ -135,8 +133,8 @@ pub(crate) use registry_install::{
 };
 mod registry_runtime;
 pub(crate) use registry_runtime::{
-    mark_scoped_custom_elements_registry, registry_association_from_create_options_value,
-    registry_association_from_value, registry_association_matches_document_default,
+    mark_custom_elements_registry_owner, mark_scoped_custom_elements_registry,
+    registry_association_from_value, registry_association_matches_document, registry_owner_host,
     registry_store_key,
 };
 mod registry_initializer;
@@ -152,8 +150,9 @@ pub(crate) use registry_retarget::{
 };
 mod subtree_upgrade;
 pub(crate) use subtree_upgrade::{
-    enqueue_upgrade_reactions_for_subtree, upgrade_late_defined_connected_tree_after_parser_sync,
-    upgrade_subtree_if_defined, upgrade_subtree_if_defined_for_registry,
+    enqueue_upgrade_reaction_if_defined, enqueue_upgrade_reactions_for_subtree,
+    upgrade_late_defined_connected_tree_after_parser_sync, upgrade_subtree_if_defined,
+    upgrade_subtree_if_defined_for_registry,
 };
 mod traversal;
 mod upgrade_eligibility;

@@ -2,6 +2,7 @@ use super::super::blob::build_blob_object;
 use super::super::native_bridge::element;
 use super::super::util::{throw_type_error, v8_string};
 use super::shared::{global_constructor_object, global_constructor_prototype};
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiFunctionTemplate;
 use std::str::FromStr;
@@ -119,7 +120,7 @@ const WEBGL_SUPPORTED_EXTENSIONS: &[&str] = &[
 ];
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "HTMLCanvasElement", receiver = crate::native_bridge::receivers::html_canvas_element)]
+#[webapi(interface = web_api_interfaces::HTMLCanvasElement, receiver)]
 struct HtmlCanvasElementPrototypeAccessorsDeclaration {
     #[webapi(
         accessor_property,
@@ -196,6 +197,8 @@ mod state;
 mod transform;
 mod webgl;
 
+pub(crate) use transform::install_canvas_transform_bindings;
+
 pub(crate) use backing_store::{
     attach_canvas_like_context_object, canvas_like_to_data_url,
     reset_html_canvas_backing_store_for_dimension_assignment,
@@ -209,10 +212,9 @@ pub(crate) use constructors::{
 pub(crate) use context2d::{
     canvas_context_arc_callback, canvas_context_arc_to_callback,
     canvas_context_begin_path_callback, canvas_context_bezier_curve_to_callback,
-    canvas_context_clear_rect_callback, canvas_context_close_path_callback,
-    canvas_context_create_image_data_callback, canvas_context_create_linear_gradient_callback,
-    canvas_context_draw_image_callback, canvas_context_ellipse_callback,
-    canvas_context_fill_callback, canvas_context_fill_rect_callback,
+    canvas_context_close_path_callback, canvas_context_create_image_data_callback,
+    canvas_context_create_linear_gradient_callback, canvas_context_draw_image_callback,
+    canvas_context_ellipse_callback, canvas_context_fill_callback,
     canvas_context_fill_style_getter_callback, canvas_context_fill_style_setter_callback,
     canvas_context_fill_text_callback, canvas_context_font_getter_callback,
     canvas_context_font_setter_callback, canvas_context_get_image_data_callback,
@@ -239,7 +241,7 @@ pub(crate) use context2d::{
     canvas_context_stroke_rect_callback, canvas_context_stroke_style_getter_callback,
     canvas_context_stroke_style_setter_callback, canvas_context_stroke_text_callback,
     canvas_context_transform_callback, canvas_context_translate_callback,
-    canvas_gradient_add_color_stop_callback,
+    canvas_gradient_add_color_stop_callback, install_canvas_rect_bindings,
 };
 pub(crate) use image_bitmap::window_create_image_bitmap_callback;
 pub(crate) use objects::{
@@ -270,6 +272,7 @@ pub(super) fn install_canvas_template_bindings<'s>(
     template: v8::Local<'s, v8::FunctionTemplate>,
     interface_name: &str,
 ) {
+    webgl::install_value_template_bindings(scope, template, interface_name);
     match interface_name {
         "HTMLCanvasElement" => {
             let prototype = template.prototype_template(scope);

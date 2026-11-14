@@ -11,22 +11,25 @@ use axum::{
     http::StatusCode,
     response::Response,
 };
-use moli_core::page::RendererDocumentLifecycleMilestone;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use moli_core::page::{
+    RendererDocumentLifecycleMilestone, RendererElementClickError, RendererElementClickTarget,
+};
 use moli_html_input_type::InputType;
 use moli_protocol::{
-    DevToolsPageResidenceIdentity,
-    devtools_runtime::{
-        DevToolsCommand, DevToolsCommandContext, DevToolsCommandResult, DevToolsDomGeometryResult,
-        DevToolsDomNodeReference, DevToolsDownloadBehaviorSetting, DevToolsError,
-        DevToolsErrorKind, DevToolsFrameId, DevToolsGetFrameOwnerCommand,
-        DevToolsGetFrameOwnerResult, DevToolsGetRealmsCommand, DevToolsGetRealmsResult,
-        DevToolsGetServiceWorkerLogsCommand, DevToolsGetServiceWorkerLogsResult,
-        DevToolsGetTargetsCommand, DevToolsGetTargetsResult, DevToolsLayoutMetricsResult,
-        DevToolsLocateNodesResult, DevToolsProtocol, DevToolsQuerySelectorResult,
+    DevToolsDocumentResidenceIdentity,
+    automation::{
+        AutomationCommand, AutomationContext, AutomationResult, DevToolsDomGeometryResult,
+        DevToolsDomNodeReference, DevToolsDownloadBehaviorSetting, DevToolsElementClickCommand,
+        DevToolsElementClickOperation, DevToolsError, DevToolsErrorKind, DevToolsFrameId,
+        DevToolsGetFrameOwnerCommand, DevToolsGetFrameOwnerResult, DevToolsGetRealmsCommand,
+        DevToolsGetRealmsResult, DevToolsGetServiceWorkerLogsCommand,
+        DevToolsGetServiceWorkerLogsResult, DevToolsGetTargetsCommand, DevToolsGetTargetsResult,
+        DevToolsLayoutMetricsResult, DevToolsLocateNodesResult, DevToolsQuerySelectorResult,
         DevToolsRemoteHandleId, DevToolsRemoteValue, DevToolsScriptException, DevToolsScriptResult,
         DevToolsSessionId, DevToolsSetDownloadBehaviorCommand, DevToolsSetFileInputFilesCommand,
-        DevToolsTargetId, DevToolsTargetInfo, DevToolsTargetKind, RuntimeConsoleEvent,
-        RuntimeExecutionContextEvent,
+        DevToolsTargetId, DevToolsTargetInfo, DevToolsTargetKind, FrontendProtocol,
+        RuntimeConsoleEvent, RuntimeExecutionContextEvent,
     },
     version,
 };
@@ -41,7 +44,7 @@ use moli_protocol_webdriver_classic::{
     clear_element_command, create_initial_target_command, current_url_command,
     delete_session_response, describe_node_command, describe_node_reference_command,
     element_center_from_geometry, element_click_command, element_click_input_commands,
-    element_click_prepare_reference_commands, element_screenshot_command,
+    element_geometry_prepare_commands, element_screenshot_command,
     element_send_keys_input_commands, element_send_keys_prepare_text_control_command,
     element_send_keys_text, execute_async_command, execute_sync_command, find_element_command,
     find_element_command_with_root, get_element_attributes_reference_command,
@@ -85,19 +88,21 @@ pub(super) use cookies::{
     webdriver_classic_delete_cookie, webdriver_classic_get_cookies,
     webdriver_classic_get_named_cookie,
 };
-use dom_refs::{resolve_classic_element_dom_reference, resolve_classic_shadow_root_dom_reference};
+use dom_refs::{
+    get_or_create_classic_node_reference, resolve_classic_element_dom_reference,
+    resolve_classic_shadow_root_dom_reference,
+};
 use helpers::{
     classic_error_into_response, classic_json_body, classic_success_into_response,
     classic_webdriver_json_response,
 };
+use moli_protocol::automation::WebDriverNodeKind;
 use script_refs::{
     ClassicScriptCanonicalNodeReference, ClassicScriptFrameOwnerReferenceKey,
-    ClassicScriptResultReference, classic_script_canonical_dom_reference,
-    classic_script_canonical_dom_reference_from_described_node,
+    ClassicScriptResultReference, classic_script_canonical_dom_reference_from_described_node,
     classic_script_frame_owner_dom_reference_from_described_node,
     classic_script_result_contains_popup_window_reference, classic_script_result_reference,
-    collect_classic_script_dom_reference_node_ids,
-    collect_classic_script_frame_reference_owner_keys,
+    collect_classic_script_frame_reference_owner_keys, collect_classic_script_node_references,
 };
 pub(super) use state::SharedClassicSessionRegistry;
 use state::{ClassicPageBoundDomReference, ClassicSessionBinding, ClassicSessionRuntimeHandle};
@@ -135,9 +140,9 @@ fn classic_top_level_context(binding: &ClassicSessionBinding) -> ClassicDevTools
     ClassicDevToolsCommandContext::with_target_id(&binding.session_id, &binding.target_id)
 }
 
-fn classic_top_level_devtools_context(binding: &ClassicSessionBinding) -> DevToolsCommandContext {
-    DevToolsCommandContext {
-        protocol: DevToolsProtocol::WebDriverClassic,
+fn classic_top_level_devtools_context(binding: &ClassicSessionBinding) -> AutomationContext {
+    AutomationContext {
+        protocol: FrontendProtocol::WebDriverClassic,
         session_id: Some(DevToolsSessionId::from(binding.session_id.as_str())),
         target_id: Some(DevToolsTargetId::from(binding.target_id.as_str())),
         browser_context_id: None,
@@ -237,7 +242,7 @@ async fn classic_handle_unhandled_prompt(
     context: &ClassicDevToolsCommandContext,
 ) -> Result<(), ClassicError> {
     let dialog = match binding.runtime.execute(alert_text_command(context)).await {
-        Ok(DevToolsCommandResult::JavaScriptDialog(dialog)) => dialog,
+        Ok(AutomationResult::JavaScriptDialog(dialog)) => dialog,
         Ok(_) => {
             return Err(ClassicError::new(
                 ClassicErrorCode::UnknownError,
@@ -259,7 +264,7 @@ async fn classic_handle_unhandled_prompt(
                 .execute(alert_handle_command(context, accept))
                 .await
             {
-                Ok(DevToolsCommandResult::Empty) => {
+                Ok(AutomationResult::Empty) => {
                     if notify {
                         Err(classic_unexpected_alert_open_error(&dialog.message))
                     } else {
@@ -309,7 +314,7 @@ async fn ensure_classic_top_level_browsing_context_exists(
         .execute(window_handles_command(&context))
         .await
     {
-        Ok(DevToolsCommandResult::GetTargets(result)) => {
+        Ok(AutomationResult::GetTargets(result)) => {
             if window_handles_from_targets(result)
                 .iter()
                 .any(|target_id| target_id == &binding.target_id)
@@ -355,7 +360,7 @@ async fn ensure_classic_frame_switch_target_ready(
         .execute(page_source_command(&frame_context))
         .await
     {
-        Ok(DevToolsCommandResult::GetOuterHtml(_)) => Ok(()),
+        Ok(AutomationResult::GetOuterHtml(_)) => Ok(()),
         Ok(_) => Err(ClassicError::new(
             ClassicErrorCode::UnknownError,
             "frame readiness probe returned an unexpected result",
@@ -407,66 +412,53 @@ fn classic_element_reference_from_id(element_id: String) -> Value {
     })
 }
 
-fn registered_classic_element_reference_from_dom_reference(
-    state: &AppState,
+async fn registered_classic_element_reference_from_dom_reference(
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
-    node_id: u32,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     reference: DevToolsDomNodeReference,
-) -> Value {
-    let element_id = state
-        .classic_session_registry
-        .lock()
-        .register_element_reference(
-            binding,
-            node_id,
-            ClassicPageBoundDomReference {
-                page_residence: page_residence.clone(),
-                reference,
-            },
-        );
-    classic_element_reference_from_id(element_id)
+) -> Result<Value, ClassicError> {
+    get_or_create_classic_node_reference(
+        binding,
+        page_residence,
+        reference,
+        WebDriverNodeKind::Element,
+    )
+    .await
+    .map(classic_element_reference_from_id)
 }
 
-fn registered_classic_element_references_from_canonical_references(
-    state: &AppState,
+async fn registered_classic_element_references_from_canonical_references(
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     references: impl IntoIterator<Item = ClassicScriptCanonicalNodeReference>,
-) -> Vec<Value> {
-    references
-        .into_iter()
-        .map(|reference| {
+) -> Result<Vec<Value>, ClassicError> {
+    let mut values = Vec::new();
+    for reference in references {
+        values.push(
             registered_classic_element_reference_from_dom_reference(
-                state,
                 binding,
                 page_residence,
-                reference.node_id,
                 reference.reference,
             )
-        })
-        .collect()
+            .await?,
+        );
+    }
+    Ok(values)
 }
 
-fn registered_classic_shadow_root_reference_from_dom_reference(
-    state: &AppState,
+async fn registered_classic_shadow_root_reference_from_dom_reference(
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
-    node_id: u32,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     reference: DevToolsDomNodeReference,
-) -> Value {
-    let shadow_root_id = state
-        .classic_session_registry
-        .lock()
-        .register_shadow_root_reference(
-            binding,
-            node_id,
-            ClassicPageBoundDomReference {
-                page_residence: page_residence.clone(),
-                reference,
-            },
-        );
-    classic_shadow_root_reference(shadow_root_id)
+) -> Result<Value, ClassicError> {
+    get_or_create_classic_node_reference(
+        binding,
+        page_residence,
+        reference,
+        WebDriverNodeKind::ShadowRoot,
+    )
+    .await
+    .map(classic_shadow_root_reference)
 }
 
 fn classic_window_reference(window_id: impl Into<String>) -> Value {
@@ -483,7 +475,7 @@ fn classic_frame_reference(frame_id: impl Into<String>) -> Value {
 
 #[derive(Debug)]
 struct ClassicPageBoundRemoteObject {
-    page_residence: DevToolsPageResidenceIdentity,
+    page_residence: DevToolsDocumentResidenceIdentity,
     object_id: String,
 }
 
@@ -514,7 +506,7 @@ async fn release_classic_remote_handle(
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     value: &DevToolsRemoteValue,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     label: &str,
 ) {
     let object_id = value
@@ -559,7 +551,7 @@ async fn resolve_classic_element_remote_object_from_reference(
         .execute_on_page(resolve, page_residence.clone())
         .await
     {
-        Ok(DevToolsCommandResult::ResolveNode(result)) => result
+        Ok(AutomationResult::ResolveNode(result)) => result
             .object
             .get("objectId")
             .and_then(Value::as_str)
@@ -589,14 +581,13 @@ async fn resolve_classic_element_remote_object_from_reference(
 }
 
 async fn resolve_classic_remote_object(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
     object_group: &str,
     label: &str,
 ) -> Result<ClassicPageBoundRemoteObject, ClassicError> {
-    let reference = resolve_classic_element_dom_reference(state, binding, element_id)?;
+    let reference = resolve_classic_element_dom_reference(binding, element_id).await?;
     resolve_classic_element_remote_object_from_reference(
         binding,
         context,
@@ -631,7 +622,7 @@ async fn resolve_classic_shadow_root_remote_object_from_reference(
         .execute_on_page(resolve, page_residence.clone())
         .await
     {
-        Ok(DevToolsCommandResult::ResolveNode(result)) => result
+        Ok(AutomationResult::ResolveNode(result)) => result
             .object
             .get("objectId")
             .and_then(Value::as_str)
@@ -661,15 +652,15 @@ async fn classic_frame_owner_dom_reference(
     binding: &ClassicSessionBinding,
     frame_id: &str,
 ) -> Result<ClassicPageBoundDomReference, ClassicError> {
-    let context = DevToolsCommandContext {
-        protocol: DevToolsProtocol::WebDriverClassic,
+    let context = AutomationContext {
+        protocol: FrontendProtocol::WebDriverClassic,
         session_id: Some(DevToolsSessionId::from(binding.session_id.as_str())),
         target_id: Some(DevToolsTargetId::from(binding.target_id.as_str())),
         browser_context_id: None,
     };
     match binding
         .runtime
-        .execute_with_page_residence(DevToolsCommand::GetFrameOwner(
+        .execute_with_page_residence(AutomationCommand::GetFrameOwner(
             DevToolsGetFrameOwnerCommand {
                 context,
                 frame_id: DevToolsFrameId::from(frame_id),
@@ -677,7 +668,7 @@ async fn classic_frame_owner_dom_reference(
         ))
         .await
     {
-        Ok((DevToolsCommandResult::GetFrameOwner(owner), page_residence)) => {
+        Ok((AutomationResult::GetFrameOwner(owner), page_residence)) => {
             Ok(ClassicPageBoundDomReference {
                 page_residence,
                 reference: classic_dom_reference_from_frame_owner_result(owner),
@@ -716,12 +707,12 @@ fn classic_dom_reference_from_frame_owner_result(
 async fn classic_default_execution_context_id(
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     label: &str,
 ) -> Result<i64, ClassicError> {
-    let command = DevToolsCommand::GetRealms(DevToolsGetRealmsCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverClassic,
+    let command = AutomationCommand::GetRealms(DevToolsGetRealmsCommand {
+        context: AutomationContext {
+            protocol: FrontendProtocol::WebDriverClassic,
             session_id: Some(DevToolsSessionId::from(context.session_id.as_str())),
             target_id: context.target_id.as_deref().map(DevToolsTargetId::from),
             browser_context_id: None,
@@ -733,7 +724,7 @@ async fn classic_default_execution_context_id(
         .execute_on_page(command, page_residence.clone())
         .await
     {
-        Ok(DevToolsCommandResult::Realms(result)) => result
+        Ok(AutomationResult::Realms(result)) => result
             .realms
             .iter()
             .find(|realm| realm.is_default == Some(true) && realm.context_id.is_some())
@@ -772,7 +763,7 @@ async fn release_classic_remote_objects(
 struct ClassicScriptArgumentHandles {
     descriptors: Vec<Value>,
     remote_handles: Vec<ClassicPageBoundRemoteObject>,
-    page_residence: Option<DevToolsPageResidenceIdentity>,
+    page_residence: Option<DevToolsDocumentResidenceIdentity>,
 }
 
 enum ClassicScriptArgumentReference<'a> {
@@ -790,7 +781,7 @@ enum ClassicResolvedScriptArgumentReference {
 }
 
 impl ClassicResolvedScriptArgumentReference {
-    fn page_residence(&self) -> Option<&DevToolsPageResidenceIdentity> {
+    fn page_residence(&self) -> Option<&DevToolsDocumentResidenceIdentity> {
         match self {
             Self::Element(reference) | Self::ShadowRoot(reference) | Self::Frame(reference) => {
                 Some(&reference.page_residence)
@@ -807,7 +798,6 @@ enum ClassicElementLiveIdentity {
 }
 
 async fn prepare_classic_script_argument_handles(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     params: &Value,
@@ -820,12 +810,12 @@ async fn prepare_classic_script_argument_handles(
         let reference = match reference {
             ClassicScriptArgumentReference::Element(element_id) => {
                 ClassicResolvedScriptArgumentReference::Element(
-                    resolve_classic_element_dom_reference(state, binding, element_id)?,
+                    resolve_classic_element_dom_reference(binding, element_id).await?,
                 )
             }
             ClassicScriptArgumentReference::ShadowRoot(shadow_root_id) => {
                 ClassicResolvedScriptArgumentReference::ShadowRoot(
-                    resolve_classic_shadow_root_dom_reference(state, binding, shadow_root_id)?,
+                    resolve_classic_shadow_root_dom_reference(binding, shadow_root_id).await?,
                 )
             }
             ClassicScriptArgumentReference::Frame(frame_id) => {
@@ -1110,10 +1100,10 @@ fn classic_script_reference_id<'a>(
 }
 
 fn apply_classic_script_argument_handles(
-    command: &mut DevToolsCommand,
+    command: &mut AutomationCommand,
     handles: &ClassicScriptArgumentHandles,
 ) {
-    let DevToolsCommand::CallFunction(command) = command else {
+    let AutomationCommand::CallFunction(command) = command else {
         return;
     };
     let user_function = command.function_declaration.clone();
@@ -1130,16 +1120,17 @@ fn apply_classic_script_argument_handles(
 
 async fn execute_classic_script_with_argument_page(
     binding: &ClassicSessionBinding,
-    command: DevToolsCommand,
+    command: AutomationCommand,
     timeout: Option<Duration>,
-    expected_page: Option<DevToolsPageResidenceIdentity>,
-) -> Result<(DevToolsCommandResult, DevToolsPageResidenceIdentity), DevToolsError> {
+    expected_page: Option<DevToolsDocumentResidenceIdentity>,
+) -> Result<(AutomationResult, DevToolsDocumentResidenceIdentity), DevToolsError> {
     match expected_page {
-        Some(expected_page) => binding
-            .runtime
-            .execute_script_on_page(command, timeout, expected_page.clone())
-            .await
-            .map(|result| (result, expected_page)),
+        Some(expected_page) => {
+            binding
+                .runtime
+                .execute_script_on_page(command, timeout, expected_page)
+                .await
+        }
         None => {
             binding
                 .runtime
@@ -1285,11 +1276,9 @@ fn classic_script_argument_deserializer_function(user_function: String) -> Strin
 }
 
 fn classic_script_result_value(
-    state: &AppState,
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
     value: Value,
-    dom_references_by_node_id: &BTreeMap<u32, ClassicScriptCanonicalNodeReference>,
+    node_references: &BTreeMap<ClassicScriptResultReference, String>,
     frame_ids_by_owner_reference: &BTreeMap<ClassicScriptFrameOwnerReferenceKey, String>,
     popup_window_handles_by_id: &BTreeMap<u64, String>,
 ) -> Result<Value, ClassicError> {
@@ -1298,11 +1287,9 @@ fn classic_script_result_value(
             .into_iter()
             .map(|value| {
                 classic_script_result_value(
-                    state,
                     binding,
-                    page_residence,
                     value,
-                    dom_references_by_node_id,
+                    node_references,
                     frame_ids_by_owner_reference,
                     popup_window_handles_by_id,
                 )
@@ -1311,51 +1298,26 @@ fn classic_script_result_value(
             .map(Value::Array),
         Value::Object(map) => {
             if let Some(reference) = classic_script_result_reference(&map) {
+                let node_id = || {
+                    node_references.get(&reference).cloned().ok_or_else(|| {
+                        ClassicError::new(
+                            ClassicErrorCode::UnknownError,
+                            "missing exported node reference",
+                        )
+                    })
+                };
                 return Ok(match reference {
-                    ClassicScriptResultReference::Element {
-                        node_id,
-                        backend_node_id,
-                    } => {
-                        let reference = classic_script_canonical_dom_reference(
-                            node_id,
-                            backend_node_id,
-                            dom_references_by_node_id,
-                        );
-                        registered_classic_element_reference_from_dom_reference(
-                            state,
-                            binding,
-                            page_residence,
-                            reference.node_id,
-                            reference.reference,
-                        )
+                    ClassicScriptResultReference::Element { .. } => {
+                        classic_element_reference_from_id(node_id()?)
                     }
-                    ClassicScriptResultReference::ShadowRoot {
-                        node_id,
-                        backend_node_id,
-                    } => {
-                        let reference = classic_script_canonical_dom_reference(
-                            node_id,
-                            backend_node_id,
-                            dom_references_by_node_id,
-                        );
-                        registered_classic_shadow_root_reference_from_dom_reference(
-                            state,
-                            binding,
-                            page_residence,
-                            reference.node_id,
-                            reference.reference,
-                        )
+                    ClassicScriptResultReference::ShadowRoot { .. } => {
+                        classic_shadow_root_reference(node_id()?)
                     }
-                    ClassicScriptResultReference::Frame {
-                        owner: owner_reference,
-                    } => {
-                        let Some(frame_id) = frame_ids_by_owner_reference.get(&owner_reference)
-                        else {
-                            return Err(ClassicError::new(
-                                ClassicErrorCode::NoSuchFrame,
-                                "frame not found",
-                            ));
-                        };
+                    ClassicScriptResultReference::Frame { owner } => {
+                        let frame_id =
+                            frame_ids_by_owner_reference.get(&owner).ok_or_else(|| {
+                                ClassicError::new(ClassicErrorCode::NoSuchFrame, "frame not found")
+                            })?;
                         classic_frame_reference(frame_id.clone())
                     }
                     ClassicScriptResultReference::Window => {
@@ -1366,12 +1328,13 @@ fn classic_script_result_value(
                         }
                     }
                     ClassicScriptResultReference::PopupWindow(popup_id) => {
-                        let Some(handle) = popup_window_handles_by_id.get(&popup_id) else {
-                            return Err(ClassicError::new(
-                                ClassicErrorCode::NoSuchWindow,
-                                "popup window handle not found",
-                            ));
-                        };
+                        let handle =
+                            popup_window_handles_by_id.get(&popup_id).ok_or_else(|| {
+                                ClassicError::new(
+                                    ClassicErrorCode::NoSuchWindow,
+                                    "popup window handle not found",
+                                )
+                            })?;
                         classic_window_reference(handle.clone())
                     }
                 });
@@ -1381,11 +1344,9 @@ fn classic_script_result_value(
                 out.insert(
                     key,
                     classic_script_result_value(
-                        state,
                         binding,
-                        page_residence,
                         value,
-                        dom_references_by_node_id,
+                        node_references,
                         frame_ids_by_owner_reference,
                         popup_window_handles_by_id,
                     )?,
@@ -1398,68 +1359,36 @@ fn classic_script_result_value(
 }
 
 async fn classic_webdriver_script_result_value(
-    state: &AppState,
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     value: Value,
 ) -> Result<Value, ClassicError> {
-    let dom_references =
-        classic_script_dom_references_by_node_id(binding, page_residence, &value).await?;
+    let mut nodes = std::collections::BTreeSet::new();
+    collect_classic_script_node_references(&value, &mut nodes);
+    let mut node_references = BTreeMap::new();
+    for node in nodes {
+        if let Some((reference, kind)) = node.node_reference() {
+            let id = get_or_create_classic_node_reference(binding, page_residence, reference, kind)
+                .await?;
+            node_references.insert(node, id);
+        }
+    }
     let frame_ids =
         classic_script_frame_ids_by_owner_reference(binding, page_residence, &value).await?;
-    let popup_window_handles_by_id =
+    let popup_window_handles =
         classic_popup_window_handles_by_id_for_script_result(binding, &value).await?;
     classic_script_result_value(
-        state,
         binding,
-        page_residence,
         value,
-        &dom_references,
+        &node_references,
         &frame_ids,
-        &popup_window_handles_by_id,
+        &popup_window_handles,
     )
-}
-
-async fn classic_script_dom_references_by_node_id(
-    binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
-    value: &Value,
-) -> Result<BTreeMap<u32, ClassicScriptCanonicalNodeReference>, ClassicError> {
-    let mut node_ids = Vec::new();
-    collect_classic_script_dom_reference_node_ids(value, &mut node_ids);
-    node_ids.sort_unstable();
-    node_ids.dedup();
-
-    let mut out = BTreeMap::new();
-    let context = classic_browsing_context(binding);
-    for node_id in node_ids {
-        let reference = match binding
-            .runtime
-            .execute_on_page(
-                describe_node_command(&context, node_id, 0, false),
-                page_residence.clone(),
-            )
-            .await
-        {
-            Ok(DevToolsCommandResult::DescribeNode(result)) => {
-                classic_script_canonical_dom_reference_from_described_node(&result.node, node_id)
-            }
-            Ok(_) => {
-                return Err(ClassicError::new(
-                    ClassicErrorCode::UnknownError,
-                    "script result node lookup returned an unexpected result",
-                ));
-            }
-            Err(error) => return Err(classic_error_from_devtools_error(error)),
-        };
-        out.insert(node_id, reference);
-    }
-    Ok(out)
 }
 
 async fn classic_script_frame_ids_by_owner_reference(
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     value: &Value,
 ) -> Result<BTreeMap<ClassicScriptFrameOwnerReferenceKey, String>, ClassicError> {
     let mut owner_references = Vec::new();
@@ -1488,7 +1417,7 @@ async fn classic_script_frame_ids_by_owner_reference(
 
 async fn classic_script_frame_owner_dom_reference(
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     owner_reference: ClassicScriptFrameOwnerReferenceKey,
 ) -> Result<ClassicPageBoundDomReference, ClassicError> {
     if owner_reference.has_backend_node_id() {
@@ -1507,7 +1436,7 @@ async fn classic_script_frame_owner_dom_reference(
         )
         .await
     {
-        Ok(DevToolsCommandResult::DescribeNode(result)) => Ok(ClassicPageBoundDomReference {
+        Ok(AutomationResult::DescribeNode(result)) => Ok(ClassicPageBoundDomReference {
             page_residence: page_residence.clone(),
             reference: classic_script_frame_owner_dom_reference_from_described_node(
                 owner_reference,
@@ -1603,6 +1532,12 @@ pub(super) async fn webdriver_classic_new_session(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Response {
+    let Some(instance_connection) = state.control.connection() else {
+        return classic_error_into_response(ClassicError::new(
+            ClassicErrorCode::SessionNotCreated,
+            "protocol server is shutting down",
+        ));
+    };
     let params = match classic_json_body(&body) {
         Ok(params) => params,
         Err(error) => return classic_error_into_response(error),
@@ -1623,6 +1558,16 @@ pub(super) async fn webdriver_classic_new_session(
     let downloads_enabled = match downloads_enabled_from_capabilities(&matched_capabilities) {
         Ok(enabled) => enabled,
         Err(error) => return classic_error_into_response(error),
+    };
+    let bidi_requested = match matched_capabilities.get("webSocketUrl") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(requested)) => *requested,
+        Some(_) => {
+            return classic_error_into_response(ClassicError::new(
+                ClassicErrorCode::InvalidArgument,
+                "webSocketUrl must be a boolean",
+            ));
+        }
     };
     let session = state
         .classic_session_registry
@@ -1655,25 +1600,18 @@ pub(super) async fn webdriver_classic_new_session(
     } else {
         None
     };
-    let initial_cookies = state.cookie_profile.snapshot();
-    let initial_cookie_snapshot = initial_cookies.clone();
-    let initial_storage_partition = state.initial_storage_partition(initial_cookies);
+    let initial_storage_partition = state.initial_storage_partition();
     let runtime = ClassicSessionRuntimeHandle::spawn(
-        initial_cookie_snapshot,
         initial_storage_partition,
-        moli_core::runtime::NavigationRuntimeConfig::new(
-            state.fetch_config.clone(),
-            state.optional_resource_fetch_mask,
-            state.subframe_loading_enabled,
-            state.layout_policy,
-        ),
+        state.navigation_runtime_config.clone(),
+        instance_connection,
     );
     let create_context = ClassicDevToolsCommandContext::new(session.session_id.as_str());
     let target_id = match runtime
         .execute(create_initial_target_command(&create_context))
         .await
     {
-        Ok(DevToolsCommandResult::CreateTarget(result)) => result.target_id.into_string(),
+        Ok(AutomationResult::CreateTarget(result)) => result.target_id.into_string(),
         Ok(_) => {
             state
                 .classic_session_registry
@@ -1697,7 +1635,7 @@ pub(super) async fn webdriver_classic_new_session(
             ));
         }
     };
-    if let Err(error) = runtime.set_javascript_dialog_handler_enabled(true).await {
+    if let Err(error) = runtime.register_javascript_dialog_handler().await {
         state
             .classic_session_registry
             .lock()
@@ -1712,7 +1650,7 @@ pub(super) async fn webdriver_classic_new_session(
         let download_behavior =
             selenium_download_behavior_command(&session.session_id, directory.as_path());
         match runtime.execute(download_behavior).await {
-            Ok(DevToolsCommandResult::Empty) => {}
+            Ok(AutomationResult::Empty) => {}
             Ok(_) => {
                 state
                     .classic_session_registry
@@ -1747,6 +1685,7 @@ pub(super) async fn webdriver_classic_new_session(
         page_load_strategy,
         &unhandled_prompt_behavior,
         downloads_enabled,
+        bidi_requested,
     );
     classic_webdriver_json_response(
         StatusCode::OK,
@@ -1763,9 +1702,8 @@ pub(super) async fn webdriver_classic_delete_session(
         .lock()
         .release_session(&session_id);
     if let Some(runtime) = runtime {
-        let cookie_commit = runtime.shutdown().await;
-        if let Err(error) = state.cookie_profile.commit_and_save(cookie_commit) {
-            warn!(?error, "failed to persist Classic cookie profile");
+        if let Err(error) = runtime.shutdown_and_join().await {
+            warn!(?error, "Classic session shutdown failed");
         }
         return classic_webdriver_json_response(StatusCode::OK, delete_session_response());
     }
@@ -1918,15 +1856,15 @@ pub(super) async fn webdriver_classic_get_service_workers(
         Ok(binding) => binding,
         Err(error) => return classic_error_into_response(error),
     };
-    let context = DevToolsCommandContext {
-        protocol: DevToolsProtocol::WebDriverClassic,
+    let context = AutomationContext {
+        protocol: FrontendProtocol::WebDriverClassic,
         session_id: Some(DevToolsSessionId::from(binding.session_id.as_str())),
         target_id: None,
         browser_context_id: None,
     };
     let targets = match binding
         .runtime
-        .execute(DevToolsCommand::GetTargets(DevToolsGetTargetsCommand {
+        .execute(AutomationCommand::GetTargets(DevToolsGetTargetsCommand {
             context: context.clone(),
             root: None,
             max_depth: None,
@@ -1934,7 +1872,7 @@ pub(super) async fn webdriver_classic_get_service_workers(
         }))
         .await
     {
-        Ok(DevToolsCommandResult::GetTargets(result)) => result,
+        Ok(AutomationResult::GetTargets(result)) => result,
         Ok(_) => {
             return classic_error_into_response(ClassicError::new(
                 ClassicErrorCode::UnknownError,
@@ -1945,13 +1883,13 @@ pub(super) async fn webdriver_classic_get_service_workers(
     };
     let realms = match binding
         .runtime
-        .execute(DevToolsCommand::GetRealms(DevToolsGetRealmsCommand {
+        .execute(AutomationCommand::GetRealms(DevToolsGetRealmsCommand {
             context: context.clone(),
             realm_type: Some("service-worker".to_owned()),
         }))
         .await
     {
-        Ok(DevToolsCommandResult::Realms(result)) => result,
+        Ok(AutomationResult::Realms(result)) => result,
         Ok(_) => {
             return classic_error_into_response(ClassicError::new(
                 ClassicErrorCode::UnknownError,
@@ -1962,7 +1900,7 @@ pub(super) async fn webdriver_classic_get_service_workers(
     };
     let logs = match binding
         .runtime
-        .execute(DevToolsCommand::GetServiceWorkerLogs(
+        .execute(AutomationCommand::GetServiceWorkerLogs(
             DevToolsGetServiceWorkerLogsCommand {
                 context,
                 target_id: None,
@@ -1970,7 +1908,7 @@ pub(super) async fn webdriver_classic_get_service_workers(
         ))
         .await
     {
-        Ok(DevToolsCommandResult::ServiceWorkerLogs(result)) => result,
+        Ok(AutomationResult::ServiceWorkerLogs(result)) => result,
         Ok(_) => {
             return classic_error_into_response(ClassicError::new(
                 ClassicErrorCode::UnknownError,
@@ -2084,7 +2022,7 @@ pub(super) async fn webdriver_classic_navigate(
         Err(error) => return classic_error_into_response(error),
     };
     match webdriver_classic_execute_page_load_command(&binding, command).await {
-        Ok(DevToolsCommandResult::Navigate(_)) => {
+        Ok(AutomationResult::Navigate(_)) => {
             classic_reset_to_top_level_browsing_context(&state, &session_id);
             classic_success_into_response(Value::Null)
         }
@@ -2106,7 +2044,7 @@ pub(super) async fn webdriver_classic_get_url(
     };
     let context = classic_top_level_context(&binding);
     match binding.runtime.execute(current_url_command(&context)).await {
-        Ok(DevToolsCommandResult::GetTargets(result)) => {
+        Ok(AutomationResult::GetTargets(result)) => {
             let Some(target) = result.targets.into_iter().next() else {
                 return classic_error_into_response(ClassicError::new(
                     ClassicErrorCode::NoSuchWindow,
@@ -2197,7 +2135,7 @@ pub(super) async fn webdriver_classic_get_source(
     };
     let context = classic_browsing_context(&binding);
     match binding.runtime.execute(page_source_command(&context)).await {
-        Ok(DevToolsCommandResult::GetOuterHtml(result)) => {
+        Ok(AutomationResult::GetOuterHtml(result)) => {
             classic_success_into_response(json!(result.outer_html))
         }
         Ok(_) => classic_error_into_response(ClassicError::new(
@@ -2218,6 +2156,9 @@ pub(super) async fn webdriver_classic_take_screenshot(
     };
     let context = classic_top_level_context(&binding);
     match binding.runtime.execute(screenshot_command(&context)).await {
+        Ok(AutomationResult::CaptureScreenshot(result)) => {
+            classic_success_into_response(json!(BASE64_STANDARD.encode(result.bytes.as_ref())))
+        }
         Ok(_) => classic_error_into_response(ClassicError::new(
             ClassicErrorCode::UnknownError,
             "screenshot returned an unexpected result",
@@ -2256,7 +2197,7 @@ pub(super) async fn webdriver_classic_print_page(
 async fn webdriver_classic_evaluate_string_command(
     session_id: String,
     state: AppState,
-    build_command: impl FnOnce(&ClassicDevToolsCommandContext) -> DevToolsCommand,
+    build_command: impl FnOnce(&ClassicDevToolsCommandContext) -> AutomationCommand,
     label: &'static str,
 ) -> Response {
     let binding = match classic_top_level_browsing_context_binding(&state, &session_id).await {
@@ -2273,7 +2214,7 @@ async fn webdriver_classic_evaluate_string_command(
         )
         .await
     {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => {
                 if !value.value.is_string() {
                     return classic_error_into_response(ClassicError::new(
@@ -2309,7 +2250,7 @@ fn classic_webdriver_title(title: &str) -> String {
 async fn classic_current_url(binding: &ClassicSessionBinding) -> Result<String, ClassicError> {
     let context = classic_top_level_context(binding);
     match binding.runtime.execute(current_url_command(&context)).await {
-        Ok(DevToolsCommandResult::GetTargets(result)) => {
+        Ok(AutomationResult::GetTargets(result)) => {
             let Some(target) = result.targets.into_iter().next() else {
                 return Err(ClassicError::new(
                     ClassicErrorCode::NoSuchWindow,
@@ -2397,7 +2338,7 @@ pub(super) async fn webdriver_classic_switch_frame(
         if let Err(error) = ensure_classic_current_browsing_context_exists(&binding).await {
             return classic_error_into_response(error);
         }
-        let reference = match resolve_classic_element_dom_reference(&state, &binding, element_id) {
+        let reference = match resolve_classic_element_dom_reference(&binding, element_id).await {
             Ok(reference) => reference,
             Err(error) => return classic_error_into_response(error),
         };
@@ -2520,12 +2461,10 @@ async fn classic_popup_window_handles_by_id_for_script_result(
         .execute(window_handles_command(&context))
         .await
     {
-        Ok(DevToolsCommandResult::GetTargets(result)) => Ok(result
+        Ok(AutomationResult::GetTargets(result)) => Ok(result
             .targets
             .into_iter()
-            .filter(|target| {
-                target.kind == moli_protocol::devtools_runtime::DevToolsTargetKind::Page
-            })
+            .filter(|target| target.kind == moli_protocol::automation::DevToolsTargetKind::Page)
             .filter_map(|target| {
                 let popup_id = target.moli_popup_id?;
                 let target_id = target.target_id?.into_string();
@@ -2555,7 +2494,7 @@ pub(super) async fn webdriver_classic_refresh(
     )
     .await
     {
-        Ok(DevToolsCommandResult::Navigate(_)) => {
+        Ok(AutomationResult::Navigate(_)) => {
             classic_reset_to_top_level_browsing_context(&state, &session_id);
             classic_success_into_response(Value::Null)
         }
@@ -2596,7 +2535,7 @@ async fn webdriver_classic_traverse_history(
         .execute(navigation_history_command(&context))
         .await
     {
-        Ok(DevToolsCommandResult::GetNavigationHistory(history)) => history,
+        Ok(AutomationResult::GetNavigationHistory(history)) => history,
         Ok(_) => {
             return classic_error_into_response(ClassicError::new(
                 ClassicErrorCode::UnknownError,
@@ -2619,13 +2558,13 @@ async fn webdriver_classic_traverse_history(
     )
     .await
     {
-        Ok(DevToolsCommandResult::TraverseHistory(result)) => {
+        Ok(AutomationResult::TraverseHistory(result)) => {
             if !result.same_document {
                 classic_reset_to_top_level_browsing_context(&state, &session_id);
             }
             classic_success_into_response(Value::Null)
         }
-        Ok(DevToolsCommandResult::Empty) => classic_success_into_response(Value::Null),
+        Ok(AutomationResult::Empty) => classic_success_into_response(Value::Null),
         Ok(_) => classic_error_into_response(ClassicError::new(
             ClassicErrorCode::UnknownError,
             "history traversal returned an unexpected result",
@@ -2636,8 +2575,8 @@ async fn webdriver_classic_traverse_history(
 
 async fn webdriver_classic_execute_page_load_command(
     binding: &ClassicSessionBinding,
-    command: DevToolsCommand,
-) -> Result<DevToolsCommandResult, ClassicError> {
+    command: AutomationCommand,
+) -> Result<AutomationResult, ClassicError> {
     match binding
         .runtime
         .execute_inner(
@@ -2674,7 +2613,6 @@ pub(super) async fn webdriver_classic_execute_sync(
         Err(error) => return classic_error_into_response(error),
     };
     let script_argument_handles = match prepare_classic_script_argument_handles(
-        &state,
         &binding,
         &context,
         &params,
@@ -2701,15 +2639,10 @@ pub(super) async fn webdriver_classic_execute_sync(
     )
     .await;
     match result {
-        Ok((DevToolsCommandResult::Script(result), page_residence)) => match *result {
+        Ok((AutomationResult::Script(result), page_residence)) => match *result {
             DevToolsScriptResult::Value(value) => {
-                match classic_webdriver_script_result_value(
-                    &state,
-                    &binding,
-                    &page_residence,
-                    value.value,
-                )
-                .await
+                match classic_webdriver_script_result_value(&binding, &page_residence, value.value)
+                    .await
                 {
                     Ok(value) => classic_success_into_response(value),
                     Err(error) => classic_error_into_response(error),
@@ -2755,7 +2688,6 @@ pub(super) async fn webdriver_classic_execute_async(
         Err(error) => return classic_error_into_response(error),
     };
     let script_argument_handles = match prepare_classic_script_argument_handles(
-        &state,
         &binding,
         &context,
         &params,
@@ -2782,15 +2714,10 @@ pub(super) async fn webdriver_classic_execute_async(
     )
     .await;
     match result {
-        Ok((DevToolsCommandResult::Script(result), page_residence)) => match *result {
+        Ok((AutomationResult::Script(result), page_residence)) => match *result {
             DevToolsScriptResult::Value(value) => {
-                match classic_webdriver_script_result_value(
-                    &state,
-                    &binding,
-                    &page_residence,
-                    value.value,
-                )
-                .await
+                match classic_webdriver_script_result_value(&binding, &page_residence, value.value)
+                    .await
                 {
                     Ok(value) => classic_success_into_response(value),
                     Err(error) => classic_error_into_response(error),
@@ -2872,14 +2799,12 @@ pub(super) async fn webdriver_classic_get_element_shadow_root(
         Err(error) => return classic_error_into_response(error),
     };
     let context = classic_browsing_context(&binding);
-    let reference = match resolve_classic_element_dom_reference(&state, &binding, &element_id) {
+    let reference = match resolve_classic_element_dom_reference(&binding, &element_id).await {
         Ok(reference) => reference,
         Err(error) => return classic_error_into_response(error),
     };
 
-    if let Err(error) =
-        verify_classic_element_attached(&state, &binding, &context, &element_id).await
-    {
+    if let Err(error) = verify_classic_element_attached(&binding, &context, &element_id).await {
         return classic_error_into_response(error);
     }
 
@@ -2892,8 +2817,8 @@ pub(super) async fn webdriver_classic_get_element_shadow_root(
         )
         .await;
     match result {
-        Ok(DevToolsCommandResult::DescribeNode(result)) => {
-            let Some((node_id, reference)) =
+        Ok(AutomationResult::DescribeNode(result)) => {
+            let Some((_, reference)) =
                 classic_author_shadow_root_reference_from_described_node(&result.node)
             else {
                 return classic_error_into_response(ClassicError::new(
@@ -2901,15 +2826,14 @@ pub(super) async fn webdriver_classic_get_element_shadow_root(
                     "shadow root not found",
                 ));
             };
-            classic_success_into_response(
-                registered_classic_shadow_root_reference_from_dom_reference(
-                    &state,
-                    &binding,
-                    &page_residence,
-                    node_id,
-                    reference,
-                ),
+            registered_classic_shadow_root_reference_from_dom_reference(
+                &binding,
+                &page_residence,
+                reference,
             )
+            .await
+            .map(classic_success_into_response)
+            .unwrap_or_else(classic_error_into_response)
         }
         Ok(_) => classic_error_into_response(ClassicError::new(
             ClassicErrorCode::UnknownError,
@@ -2926,13 +2850,11 @@ pub(super) async fn webdriver_classic_get_element_shadow_root(
 }
 
 async fn verify_classic_element_attached(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
 ) -> Result<(), ClassicError> {
     let object_id = resolve_classic_remote_object(
-        state,
         binding,
         context,
         element_id,
@@ -2955,7 +2877,7 @@ async fn verify_classic_element_attached(
     )
     .await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(_) => Ok(()),
             DevToolsScriptResult::Exception(exception) => {
                 Err(classic_webdriver_command_exception_error(exception))
@@ -3045,7 +2967,7 @@ async fn webdriver_classic_find_shadow_element_with_mode(
     };
     let context = classic_browsing_context(&binding);
     let shadow_root_reference =
-        match resolve_classic_shadow_root_dom_reference(&state, &binding, &shadow_root_id) {
+        match resolve_classic_shadow_root_dom_reference(&binding, &shadow_root_id).await {
             Ok(reference) => reference,
             Err(error) => return classic_error_into_response(error),
         };
@@ -3070,7 +2992,6 @@ async fn webdriver_classic_find_shadow_element_with_mode(
     {
         Ok(result) => {
             webdriver_classic_find_element_result_response(
-                &state,
                 &binding,
                 result,
                 multiple,
@@ -3099,7 +3020,7 @@ async fn webdriver_classic_find_element_with_mode_and_root(
     };
     let context = classic_browsing_context(&binding);
     let (command, expected_page) = if let Some(root_element_id) = root_element_id {
-        let root = match resolve_classic_element_dom_reference(&state, &binding, &root_element_id) {
+        let root = match resolve_classic_element_dom_reference(&binding, &root_element_id).await {
             Ok(reference) => reference,
             Err(error) => return classic_error_into_response(error),
         };
@@ -3119,7 +3040,6 @@ async fn webdriver_classic_find_element_with_mode_and_root(
     {
         Ok(result) => {
             webdriver_classic_find_element_result_response(
-                &state,
                 &binding,
                 result,
                 multiple,
@@ -3179,11 +3099,11 @@ async fn verify_classic_shadow_root_remote_object_attached(
 }
 
 fn verify_classic_shadow_root_attached_result(
-    result: Result<DevToolsCommandResult, DevToolsError>,
+    result: Result<AutomationResult, DevToolsError>,
     label: &str,
 ) -> Result<(), ClassicError> {
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) if value.value.as_bool().unwrap_or(false) => Ok(()),
             DevToolsScriptResult::Value(_) | DevToolsScriptResult::Exception(_) => {
                 Err(ClassicError::new(
@@ -3205,9 +3125,9 @@ fn verify_classic_shadow_root_attached_result(
 
 async fn webdriver_classic_execute_find_element_command(
     binding: &ClassicSessionBinding,
-    command: DevToolsCommand,
+    command: AutomationCommand,
     multiple: bool,
-    expected_page: Option<DevToolsPageResidenceIdentity>,
+    expected_page: Option<DevToolsDocumentResidenceIdentity>,
 ) -> Result<ClassicFindElementExecution, DevToolsError> {
     let implicit_wait = Duration::from_millis(binding.timeouts.implicit.unwrap_or(0));
     let started = tokio::time::Instant::now();
@@ -3226,24 +3146,24 @@ async fn webdriver_classic_execute_find_element_command(
             }
         };
         match execution {
-            Ok((DevToolsCommandResult::QuerySelector(result), page_residence)) => {
+            Ok((AutomationResult::QuerySelector(result), page_residence)) => {
                 if !result.node_ids.is_empty()
                     || implicit_wait.is_zero()
                     || started.elapsed() >= implicit_wait
                 {
                     return Ok(ClassicFindElementExecution {
-                        result: DevToolsCommandResult::QuerySelector(result),
+                        result: AutomationResult::QuerySelector(result),
                         page_residence: Some(page_residence),
                     });
                 }
             }
-            Ok((DevToolsCommandResult::LocateNodes(result), page_residence)) => {
+            Ok((AutomationResult::LocateNodes(result), page_residence)) => {
                 if !result.node_ids.is_empty()
                     || implicit_wait.is_zero()
                     || started.elapsed() >= implicit_wait
                 {
                     return Ok(ClassicFindElementExecution {
-                        result: DevToolsCommandResult::LocateNodes(result),
+                        result: AutomationResult::LocateNodes(result),
                         page_residence: Some(page_residence),
                     });
                 }
@@ -3273,12 +3193,11 @@ async fn webdriver_classic_execute_find_element_command(
 }
 
 struct ClassicFindElementExecution {
-    result: DevToolsCommandResult,
-    page_residence: Option<DevToolsPageResidenceIdentity>,
+    result: AutomationResult,
+    page_residence: Option<DevToolsDocumentResidenceIdentity>,
 }
 
 async fn webdriver_classic_find_element_result_response(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     execution: ClassicFindElementExecution,
     multiple: bool,
@@ -3289,7 +3208,7 @@ async fn webdriver_classic_find_element_result_response(
         page_residence,
     } = execution;
     match result {
-        DevToolsCommandResult::QuerySelector(result) if multiple => {
+        AutomationResult::QuerySelector(result) if multiple => {
             if result.node_ids.is_empty() {
                 return classic_success_into_response(json!([]));
             }
@@ -3307,16 +3226,16 @@ async fn webdriver_classic_find_element_result_response(
                 Ok(references) => references,
                 Err(error) => return classic_error_into_response(error),
             };
-            classic_success_into_response(json!(
-                registered_classic_element_references_from_canonical_references(
-                    state,
-                    binding,
-                    page_residence,
-                    references
-                )
-            ))
+            registered_classic_element_references_from_canonical_references(
+                binding,
+                page_residence,
+                references,
+            )
+            .await
+            .map(|references| classic_success_into_response(json!(references)))
+            .unwrap_or_else(classic_error_into_response)
         }
-        DevToolsCommandResult::LocateNodes(result) if multiple => {
+        AutomationResult::LocateNodes(result) if multiple => {
             if result.node_ids.is_empty() {
                 return classic_success_into_response(json!([]));
             }
@@ -3334,16 +3253,16 @@ async fn webdriver_classic_find_element_result_response(
                 Ok(references) => references,
                 Err(error) => return classic_error_into_response(error),
             };
-            classic_success_into_response(json!(
-                registered_classic_element_references_from_canonical_references(
-                    state,
-                    binding,
-                    page_residence,
-                    references
-                )
-            ))
+            registered_classic_element_references_from_canonical_references(
+                binding,
+                page_residence,
+                references,
+            )
+            .await
+            .map(|references| classic_success_into_response(json!(references)))
+            .unwrap_or_else(classic_error_into_response)
         }
-        DevToolsCommandResult::QuerySelector(result) => {
+        AutomationResult::QuerySelector(result) => {
             let Some(frontend_node_id) = result.node_ids.first().copied() else {
                 return classic_error_into_response(ClassicError::new(
                     ClassicErrorCode::NoSuchElement,
@@ -3363,17 +3282,18 @@ async fn webdriver_classic_find_element_result_response(
                 Ok(reference) => reference,
                 Err(error) => return classic_error_into_response(error),
             };
-            classic_success_into_response(registered_classic_element_reference_from_dom_reference(
-                state,
+            registered_classic_element_reference_from_dom_reference(
                 binding,
                 page_residence
                     .as_ref()
                     .expect("non-empty find result must retain its Page residence"),
-                reference.node_id,
                 reference.reference,
-            ))
+            )
+            .await
+            .map(classic_success_into_response)
+            .unwrap_or_else(classic_error_into_response)
         }
-        DevToolsCommandResult::LocateNodes(result) => {
+        AutomationResult::LocateNodes(result) => {
             let Some(frontend_node_id) = result.node_ids.first().copied() else {
                 return classic_error_into_response(ClassicError::new(
                     ClassicErrorCode::NoSuchElement,
@@ -3393,15 +3313,16 @@ async fn webdriver_classic_find_element_result_response(
                 Ok(reference) => reference,
                 Err(error) => return classic_error_into_response(error),
             };
-            classic_success_into_response(registered_classic_element_reference_from_dom_reference(
-                state,
+            registered_classic_element_reference_from_dom_reference(
                 binding,
                 page_residence
                     .as_ref()
                     .expect("non-empty find result must retain its Page residence"),
-                reference.node_id,
                 reference.reference,
-            ))
+            )
+            .await
+            .map(classic_success_into_response)
+            .unwrap_or_else(classic_error_into_response)
         }
         _ => classic_error_into_response(ClassicError::new(
             ClassicErrorCode::UnknownError,
@@ -3412,7 +3333,7 @@ async fn webdriver_classic_find_element_result_response(
 
 async fn classic_find_canonical_dom_references_by_frontend_node_id(
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     frontend_node_ids: Vec<u32>,
     label: &str,
 ) -> Result<Vec<ClassicScriptCanonicalNodeReference>, ClassicError> {
@@ -3439,7 +3360,7 @@ async fn classic_find_canonical_dom_references_by_frontend_node_id(
 
 async fn classic_find_canonical_dom_reference_for_frontend_node_id(
     binding: &ClassicSessionBinding,
-    page_residence: &DevToolsPageResidenceIdentity,
+    page_residence: &DevToolsDocumentResidenceIdentity,
     frontend_node_id: u32,
     label: &str,
 ) -> Result<ClassicScriptCanonicalNodeReference, ClassicError> {
@@ -3452,7 +3373,7 @@ async fn classic_find_canonical_dom_reference_for_frontend_node_id(
         )
         .await
     {
-        Ok(DevToolsCommandResult::DescribeNode(result)) => {
+        Ok(AutomationResult::DescribeNode(result)) => {
             Ok(classic_script_canonical_dom_reference_from_described_node(
                 &result.node,
                 frontend_node_id,
@@ -3467,17 +3388,17 @@ async fn classic_find_canonical_dom_reference_for_frontend_node_id(
 }
 
 fn empty_classic_find_result_for_command(
-    command: &DevToolsCommand,
+    command: &AutomationCommand,
     multiple: bool,
-) -> DevToolsCommandResult {
+) -> AutomationResult {
     match command {
-        DevToolsCommand::LocateNodes(_) => {
-            DevToolsCommandResult::LocateNodes(DevToolsLocateNodesResult {
+        AutomationCommand::LocateNodes(_) => {
+            AutomationResult::LocateNodes(DevToolsLocateNodesResult {
                 nodes: Vec::new(),
                 node_ids: Vec::new(),
             })
         }
-        _ => DevToolsCommandResult::QuerySelector(DevToolsQuerySelectorResult {
+        _ => AutomationResult::QuerySelector(DevToolsQuerySelectorResult {
             node_ids: Vec::new(),
             multiple,
         }),
@@ -3497,7 +3418,7 @@ pub(super) async fn webdriver_classic_get_element_attribute(
         Err(error) => return classic_error_into_response(error),
     };
     let context = classic_browsing_context(&binding);
-    let reference = match resolve_classic_element_dom_reference(&state, &binding, &element_id) {
+    let reference = match resolve_classic_element_dom_reference(&binding, &element_id).await {
         Ok(reference) => reference,
         Err(error) => return classic_error_into_response(error),
     };
@@ -3507,7 +3428,7 @@ pub(super) async fn webdriver_classic_get_element_attribute(
         .execute_on_page(command, reference.page_residence)
         .await
     {
-        Ok(DevToolsCommandResult::GetAttributes(result)) => {
+        Ok(AutomationResult::GetAttributes(result)) => {
             classic_success_into_response(json!(classic_attribute_value(result, &name)))
         }
         Ok(_) => classic_error_into_response(ClassicError::new(
@@ -3528,7 +3449,6 @@ pub(super) async fn webdriver_classic_get_element_text(
     };
     let context = classic_browsing_context(&binding);
     let object_id = match resolve_classic_remote_object(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -3539,13 +3459,8 @@ pub(super) async fn webdriver_classic_get_element_text(
     {
         Ok(object_id) => object_id,
         Err(error) if classic_text_should_fallback_to_dom_text(&error) => {
-            return webdriver_classic_get_element_text_from_dom(
-                &state,
-                &binding,
-                &context,
-                &element_id,
-            )
-            .await;
+            return webdriver_classic_get_element_text_from_dom(&binding, &context, &element_id)
+                .await;
         }
         Err(error) => return classic_error_into_response(error),
     };
@@ -3559,7 +3474,7 @@ pub(super) async fn webdriver_classic_get_element_text(
     release_classic_page_bound_remote_object(&binding, &context, object_id, "get element text")
         .await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => {
                 classic_success_into_response(json!(value.value.as_str().unwrap_or_default()))
             }
@@ -3576,12 +3491,11 @@ pub(super) async fn webdriver_classic_get_element_text(
 }
 
 async fn webdriver_classic_get_element_text_from_dom(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
 ) -> Response {
-    let reference = match resolve_classic_element_dom_reference(state, binding, element_id) {
+    let reference = match resolve_classic_element_dom_reference(binding, element_id).await {
         Ok(reference) => reference,
         Err(error) => return classic_error_into_response(error),
     };
@@ -3591,7 +3505,7 @@ async fn webdriver_classic_get_element_text_from_dom(
         .execute_on_page(command, reference.page_residence)
         .await
     {
-        Ok(DevToolsCommandResult::GetText(result)) => {
+        Ok(AutomationResult::GetText(result)) => {
             classic_success_into_response(json!(classic_text_value(result)))
         }
         Ok(_) => classic_error_into_response(ClassicError::new(
@@ -3618,7 +3532,7 @@ pub(super) async fn webdriver_classic_get_element_tag_name(
         Err(error) => return classic_error_into_response(error),
     };
     let context = classic_browsing_context(&binding);
-    let reference = match resolve_classic_element_dom_reference(&state, &binding, &element_id) {
+    let reference = match resolve_classic_element_dom_reference(&binding, &element_id).await {
         Ok(reference) => reference,
         Err(error) => return classic_error_into_response(error),
     };
@@ -3629,7 +3543,7 @@ pub(super) async fn webdriver_classic_get_element_tag_name(
         .execute_on_page(command, reference.page_residence)
         .await
     {
-        Ok(DevToolsCommandResult::GetProperty(result)) => {
+        Ok(AutomationResult::GetProperty(result)) => {
             classic_success_into_response(classic_property_value(result))
         }
         Ok(_) => classic_error_into_response(ClassicError::new(
@@ -3654,7 +3568,7 @@ pub(super) async fn webdriver_classic_get_active_element(
         .execute_with_page_residence(active_element_command(&context))
         .await
     {
-        Ok((DevToolsCommandResult::Script(result), page_residence)) => match *result {
+        Ok((AutomationResult::Script(result), page_residence)) => match *result {
             DevToolsScriptResult::Value(value) => {
                 let Some(node_id) = value.node_id else {
                     return classic_error_into_response(ClassicError::new(
@@ -3666,7 +3580,6 @@ pub(super) async fn webdriver_classic_get_active_element(
                     .backend_node_id
                     .map(DevToolsDomNodeReference::BackendNodeId)
                     .unwrap_or(DevToolsDomNodeReference::FrontendNodeId(node_id));
-                let owner_node_id = value.backend_node_id.unwrap_or(node_id);
                 release_classic_remote_handle(
                     &binding,
                     &context,
@@ -3675,15 +3588,14 @@ pub(super) async fn webdriver_classic_get_active_element(
                     "active element",
                 )
                 .await;
-                classic_success_into_response(
-                    registered_classic_element_reference_from_dom_reference(
-                        &state,
-                        &binding,
-                        &page_residence,
-                        owner_node_id,
-                        reference,
-                    ),
+                registered_classic_element_reference_from_dom_reference(
+                    &binding,
+                    &page_residence,
+                    reference,
                 )
+                .await
+                .map(classic_success_into_response)
+                .unwrap_or_else(classic_error_into_response)
             }
             DevToolsScriptResult::Exception(exception) => {
                 classic_error_into_response(classic_webdriver_command_exception_error(exception))
@@ -3707,12 +3619,12 @@ pub(super) async fn webdriver_classic_element_equals(
     };
     let context = classic_browsing_context(&binding);
     let element_identity =
-        match classic_element_live_identity(&state, &binding, &context, &element_id).await {
+        match classic_element_live_identity(&binding, &context, &element_id).await {
             Ok(identity) => identity,
             Err(error) => return classic_error_into_response(error),
         };
     let other_element_identity =
-        match classic_element_live_identity(&state, &binding, &context, &other_element_id).await {
+        match classic_element_live_identity(&binding, &context, &other_element_id).await {
             Ok(identity) => identity,
             Err(error) => return classic_error_into_response(error),
         };
@@ -3720,19 +3632,18 @@ pub(super) async fn webdriver_classic_element_equals(
 }
 
 async fn classic_element_live_identity(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
 ) -> Result<ClassicElementLiveIdentity, ClassicError> {
-    let reference = resolve_classic_element_dom_reference(state, binding, element_id)?;
+    let reference = resolve_classic_element_dom_reference(binding, element_id).await?;
     let command = describe_node_reference_command(context, reference.reference, 0, false);
     match binding
         .runtime
         .execute_on_page(command, reference.page_residence)
         .await
     {
-        Ok(DevToolsCommandResult::DescribeNode(result)) => {
+        Ok(AutomationResult::DescribeNode(result)) => {
             classic_element_live_identity_from_described_node(&result.node).ok_or_else(|| {
                 ClassicError::new(
                     ClassicErrorCode::NoSuchElement,
@@ -3775,7 +3686,6 @@ pub(super) async fn webdriver_classic_is_element_enabled(
     };
     let context = classic_browsing_context(&binding);
     let object_id = match resolve_classic_remote_object(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -3797,7 +3707,7 @@ pub(super) async fn webdriver_classic_is_element_enabled(
     release_classic_page_bound_remote_object(&binding, &context, object_id, "is element enabled")
         .await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => {
                 classic_success_into_response(json!(value.value.as_bool().unwrap_or(false)))
             }
@@ -3823,7 +3733,6 @@ pub(super) async fn webdriver_classic_is_element_selected(
     };
     let context = classic_browsing_context(&binding);
     let tag_name = match webdriver_classic_element_property_value(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -3837,7 +3746,6 @@ pub(super) async fn webdriver_classic_is_element_selected(
     };
     let selected = match tag_name.as_str() {
         "option" => match webdriver_classic_element_property_value(
-            &state,
             &binding,
             &context,
             &element_id,
@@ -3851,7 +3759,6 @@ pub(super) async fn webdriver_classic_is_element_selected(
         },
         "input" => {
             let input_type = match webdriver_classic_element_property_value(
-                &state,
                 &binding,
                 &context,
                 &element_id,
@@ -3865,7 +3772,6 @@ pub(super) async fn webdriver_classic_is_element_selected(
             };
             if InputType::from_attribute_value(Some(&input_type)).is_checkable() {
                 match webdriver_classic_element_property_value(
-                    &state,
                     &binding,
                     &context,
                     &element_id,
@@ -3895,7 +3801,7 @@ pub(super) async fn webdriver_classic_get_element_rect(
         Err(error) => return classic_error_into_response(error),
     };
     let context = classic_browsing_context(&binding);
-    let reference = match resolve_classic_element_dom_reference(&state, &binding, &element_id) {
+    let reference = match resolve_classic_element_dom_reference(&binding, &element_id).await {
         Ok(reference) => reference,
         Err(error) => return classic_error_into_response(error),
     };
@@ -3905,8 +3811,7 @@ pub(super) async fn webdriver_classic_get_element_rect(
         .execute_on_page(command, reference.page_residence)
         .await
     {
-        Ok(DevToolsCommandResult::DomGeometry(result)) => match classic_rect_from_geometry(&result)
-        {
+        Ok(AutomationResult::DomGeometry(result)) => match classic_rect_from_geometry(&result) {
             Ok(rect) => classic_success_into_response(rect),
             Err(error) => classic_error_into_response(error),
         },
@@ -3928,7 +3833,6 @@ pub(super) async fn webdriver_classic_take_element_screenshot(
     };
     let context = classic_browsing_context(&binding);
     let object_id = match resolve_classic_remote_object(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -3968,7 +3872,6 @@ pub(super) async fn webdriver_classic_get_element_css_value(
     };
     let context = classic_browsing_context(&binding);
     let object_id = match resolve_classic_remote_object(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -3994,7 +3897,7 @@ pub(super) async fn webdriver_classic_get_element_css_value(
     )
     .await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => {
                 classic_success_into_response(json!(value.value.as_str().unwrap_or_default()))
             }
@@ -4061,7 +3964,7 @@ impl ClassicComputedElementValue {
         self,
         context: &ClassicDevToolsCommandContext,
         object_id: String,
-    ) -> DevToolsCommand {
+    ) -> AutomationCommand {
         match self {
             Self::Label => get_element_computed_label_command(context, object_id),
             Self::Role => get_element_computed_role_command(context, object_id),
@@ -4081,7 +3984,6 @@ async fn webdriver_classic_get_element_computed_value(
     };
     let context = classic_browsing_context(&binding);
     let object_id = match resolve_classic_remote_object(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -4102,7 +4004,7 @@ async fn webdriver_classic_get_element_computed_value(
         .await;
     release_classic_page_bound_remote_object(&binding, &context, object_id, kind.label()).await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => {
                 classic_success_into_response(json!(value.value.as_str().unwrap_or_default()))
             }
@@ -4128,7 +4030,6 @@ pub(super) async fn webdriver_classic_is_element_displayed(
     };
     let context = classic_browsing_context(&binding);
     let object_id = match resolve_classic_remote_object(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -4148,7 +4049,7 @@ pub(super) async fn webdriver_classic_is_element_displayed(
     release_classic_page_bound_remote_object(&binding, &context, object_id, "is element displayed")
         .await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => {
                 classic_success_into_response(json!(value.value.as_bool().unwrap_or(false)))
             }
@@ -4165,21 +4066,20 @@ pub(super) async fn webdriver_classic_is_element_displayed(
 }
 
 async fn webdriver_classic_element_property_value(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
     name: impl Into<String>,
     label: &'static str,
 ) -> Result<Value, ClassicError> {
-    let reference = resolve_classic_element_dom_reference(state, binding, element_id)?;
+    let reference = resolve_classic_element_dom_reference(binding, element_id).await?;
     let command = get_element_property_reference_command(context, reference.reference, name);
     match binding
         .runtime
         .execute_on_page(command, reference.page_residence)
         .await
     {
-        Ok(DevToolsCommandResult::GetProperty(result)) => Ok(classic_property_value(result)),
+        Ok(AutomationResult::GetProperty(result)) => Ok(classic_property_value(result)),
         Ok(_) => Err(ClassicError::new(
             ClassicErrorCode::UnknownError,
             format!("{label} returned an unexpected result"),
@@ -4209,7 +4109,6 @@ pub(super) async fn webdriver_classic_get_element_property(
         Err(error) => return classic_error_into_response(error),
     };
     let script_argument_handles = match prepare_classic_script_argument_handles(
-        &state,
         &binding,
         &context,
         &params,
@@ -4236,15 +4135,10 @@ pub(super) async fn webdriver_classic_get_element_property(
     )
     .await;
     match result {
-        Ok((DevToolsCommandResult::Script(result), page_residence)) => match *result {
+        Ok((AutomationResult::Script(result), page_residence)) => match *result {
             DevToolsScriptResult::Value(value) => {
-                match classic_webdriver_script_result_value(
-                    &state,
-                    &binding,
-                    &page_residence,
-                    value.value,
-                )
-                .await
+                match classic_webdriver_script_result_value(&binding, &page_residence, value.value)
+                    .await
                 {
                     Ok(value) => classic_success_into_response(value),
                     Err(error) => classic_error_into_response(error),
@@ -4281,7 +4175,6 @@ pub(super) async fn webdriver_classic_clear_element(
     };
     let context = classic_browsing_context(&binding);
     let object_id = match resolve_classic_remote_object(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -4303,7 +4196,7 @@ pub(super) async fn webdriver_classic_clear_element(
         .await;
     release_classic_page_bound_remote_object(&binding, &context, object_id, "clear element").await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => match classic_clear_element_result(value.value) {
                 Ok(()) => classic_success_into_response(Value::Null),
                 Err(error) => classic_error_into_response(error),
@@ -4384,34 +4277,24 @@ pub(super) async fn webdriver_classic_send_keys_to_element(
         Err(error) => return classic_error_into_response(error),
     };
     let context = classic_browsing_context(&binding);
-    let is_file_input = match webdriver_classic_element_is_file_input(
-        &state,
-        &binding,
-        &context,
-        &element_id,
-    )
-    .await
-    {
-        Ok(is_file_input) => is_file_input,
-        Err(error) => return classic_error_into_response(error),
-    };
+    let is_file_input =
+        match webdriver_classic_element_is_file_input(&binding, &context, &element_id).await {
+            Ok(is_file_input) => is_file_input,
+            Err(error) => return classic_error_into_response(error),
+        };
     if is_file_input {
-        match webdriver_classic_send_file_input_keys(&state, &binding, &context, &element_id, &text)
-            .await
-        {
+        match webdriver_classic_send_file_input_keys(&binding, &context, &element_id, &text).await {
             Ok(()) => {
                 return classic_success_into_response(Value::Null);
             }
             Err(error) => return classic_error_into_response(error),
         }
     }
-    let geometry =
-        match webdriver_classic_element_geometry(&state, &binding, &context, &element_id).await {
-            Ok(geometry) => geometry,
-            Err(error) => return classic_error_into_response(error),
-        };
+    let geometry = match webdriver_classic_element_geometry(&binding, &context, &element_id).await {
+        Ok(geometry) => geometry,
+        Err(error) => return classic_error_into_response(error),
+    };
     let send_keys_preflight = match webdriver_classic_prepare_text_control_for_send_keys(
-        &state,
         &binding,
         &context,
         &element_id,
@@ -4430,10 +4313,11 @@ pub(super) async fn webdriver_classic_send_keys_to_element(
         ClassicSendKeysPreflight::NotTextControl
     ) {
         let input_context = classic_top_level_context(&binding);
-        let commands = match element_click_input_commands(&input_context, &geometry) {
-            Ok(commands) => commands,
+        let point = match element_center_from_geometry(&geometry) {
+            Ok(point) => point,
             Err(error) => return classic_error_into_response(error),
         };
+        let commands = element_click_input_commands(&input_context, point);
         if let Err(error) = webdriver_classic_execute_empty_commands(
             &binding,
             commands,
@@ -4464,14 +4348,12 @@ enum ClassicSendKeysPreflight {
 }
 
 async fn webdriver_classic_prepare_text_control_for_send_keys(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
     text: &str,
 ) -> Result<ClassicSendKeysPreflight, ClassicError> {
     let object_id = resolve_classic_remote_object(
-        state,
         binding,
         context,
         element_id,
@@ -4493,7 +4375,7 @@ async fn webdriver_classic_prepare_text_control_for_send_keys(
     )
     .await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => match *result {
+        Ok(AutomationResult::Script(result)) => match *result {
             DevToolsScriptResult::Value(value) => match value.value.as_str() {
                 Some("text-control") => Ok(ClassicSendKeysPreflight::TextControl),
                 Some("value-set") => Ok(ClassicSendKeysPreflight::ValueSet),
@@ -4515,6 +4397,31 @@ async fn webdriver_classic_prepare_text_control_for_send_keys(
     }
 }
 
+fn classic_error_from_click_preparation(error: RendererElementClickError) -> ClassicError {
+    let (code, message) = match error {
+        RendererElementClickError::StaleNode => (
+            ClassicErrorCode::StaleElementReference,
+            "element no longer belongs to the current document".to_owned(),
+        ),
+        RendererElementClickError::MissingBrowsingContext => (
+            ClassicErrorCode::NoSuchWindow,
+            "element browsing context is no longer available".to_owned(),
+        ),
+        RendererElementClickError::NoClickableRect => (
+            ClassicErrorCode::ElementNotInteractable,
+            "element has no in-view clickable rectangle".to_owned(),
+        ),
+        RendererElementClickError::Obscured => (
+            ClassicErrorCode::ElementClickIntercepted,
+            "another element obscures the element's in-view center".to_owned(),
+        ),
+        RendererElementClickError::LayoutUnavailable(message) => {
+            (ClassicErrorCode::UnknownError, message)
+        }
+    };
+    ClassicError::new(code, message)
+}
+
 async fn webdriver_classic_activate_element_by_handle(
     state: &AppState,
     binding: &ClassicSessionBinding,
@@ -4523,28 +4430,95 @@ async fn webdriver_classic_activate_element_by_handle(
     object_group: &str,
     unexpected_result_message: &str,
 ) -> Result<(), ClassicError> {
-    let object_id = resolve_classic_remote_object(
-        state,
-        binding,
-        context,
-        element_id,
-        object_group,
-        object_group,
-    )
-    .await?;
-    let result = binding
+    let object_id =
+        resolve_classic_remote_object(binding, context, element_id, object_group, object_group)
+            .await?;
+    let prepared = binding
         .runtime
-        .execute_with_pending_navigation_wait_on_page(
-            element_click_command(context, object_id.object_id.clone()),
-            None,
-            binding.timeouts.page_load.map(Duration::from_millis),
+        .execute_on_page(
+            AutomationCommand::ElementClick(DevToolsElementClickCommand {
+                context: classic_top_level_devtools_context(binding),
+                operation: DevToolsElementClickOperation::Prepare {
+                    object_id: object_id.object_id.clone().into(),
+                },
+            }),
             object_id.page_residence.clone(),
         )
         .await;
+    let preparation = match prepared {
+        Ok(AutomationResult::ElementClickPreparation(result)) => {
+            result.map_err(classic_error_from_click_preparation)
+        }
+        Ok(_) => Err(ClassicError::new(
+            ClassicErrorCode::UnknownError,
+            "element click preparation returned an unexpected result",
+        )),
+        Err(error) => Err(classic_error_from_devtools_error(error)),
+    };
+    let mut activation_dispatched = false;
+    let operation = async {
+        match preparation? {
+            RendererElementClickTarget::FileInput => Err(ClassicError::new(
+                ClassicErrorCode::InvalidArgument,
+                "file inputs cannot be clicked by WebDriver",
+            )),
+            RendererElementClickTarget::DomActivation | RendererElementClickTarget::Option => {
+                activation_dispatched = true;
+                Ok(binding
+                    .runtime
+                    .execute_on_page(
+                        element_click_command(context, object_id.object_id.clone()),
+                        object_id.page_residence.clone(),
+                    )
+                    .await)
+            }
+            RendererElementClickTarget::Pointer(click) => {
+                activation_dispatched = true;
+                // The renderer validates document ownership before move and
+                // between phases. No phase can be retried on a successor.
+                let result = binding
+                    .runtime
+                    .execute_on_page(
+                        AutomationCommand::ElementClick(DevToolsElementClickCommand {
+                            context: classic_top_level_devtools_context(binding),
+                            operation: DevToolsElementClickOperation::Dispatch(click),
+                        }),
+                        object_id.page_residence.clone(),
+                    )
+                    .await;
+                match result {
+                    Ok(AutomationResult::ElementClickDispatch(Err(error))) => {
+                        Err(classic_error_from_click_preparation(error))
+                    }
+                    result => Ok(result),
+                }
+            }
+        }
+    }
+    .await;
     release_classic_page_bound_remote_object(binding, context, object_id, object_group).await;
+    let result = operation?;
     let post_click_navigation = classic_wait_for_current_document(binding).await;
     match result {
-        Ok(DevToolsCommandResult::Script(result)) => {
+        Ok(AutomationResult::Empty | AutomationResult::ElementClickDispatch(Ok(()))) => {
+            post_click_navigation?;
+            if binding.current_frame_id.is_some()
+                && let Err(error) = ensure_classic_current_browsing_context_exists(binding).await
+            {
+                if error.code != ClassicErrorCode::NoSuchWindow {
+                    return Err(error);
+                }
+                state.classic_session_registry.lock().set_current_frame_id(
+                    &binding.session_id,
+                    Some(format!(
+                        "__moli-detached-frame__:{}",
+                        binding.browsing_context_target_id()
+                    )),
+                );
+            }
+            Ok(())
+        }
+        Ok(AutomationResult::Script(result)) => {
             post_click_navigation?;
             match *result {
                 DevToolsScriptResult::Value(value) => {
@@ -4588,19 +4562,19 @@ async fn webdriver_classic_activate_element_by_handle(
         // Chromium references:
         // chrome/test/chromedriver/element_commands.cc (ExecuteClickElement)
         // chrome/test/chromedriver/window_commands.cc (ExecuteWindowCommand)
-        Err(error) if error.message == "Renderer attachment changed" => post_click_navigation,
+        Err(error) if activation_dispatched && error.message == "Renderer attachment changed" => {
+            post_click_navigation
+        }
         Err(error) => Err(classic_error_from_devtools_error(error)),
     }
 }
 
 async fn webdriver_classic_element_is_file_input(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
 ) -> Result<bool, ClassicError> {
     let tag_name = webdriver_classic_element_property_value(
-        state,
         binding,
         context,
         element_id,
@@ -4611,29 +4585,21 @@ async fn webdriver_classic_element_is_file_input(
     if tag_name.as_str() != Some("input") {
         return Ok(false);
     }
-    let input_type = webdriver_classic_element_property_value(
-        state,
-        binding,
-        context,
-        element_id,
-        "type",
-        "send keys",
-    )
-    .await?;
+    let input_type =
+        webdriver_classic_element_property_value(binding, context, element_id, "type", "send keys")
+            .await?;
     Ok(input_type
         .as_str()
         .is_some_and(|input_type| input_type.eq_ignore_ascii_case("file")))
 }
 
 async fn webdriver_classic_send_file_input_keys(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
     text: &str,
 ) -> Result<(), ClassicError> {
     let multiple = webdriver_classic_element_property_value(
-        state,
         binding,
         context,
         element_id,
@@ -4653,7 +4619,6 @@ async fn webdriver_classic_send_file_input_keys(
     let files = selected_files_from_paths(&paths, "WebDriver Classic file upload")
         .map_err(|error| ClassicError::new(ClassicErrorCode::InvalidArgument, error.message))?;
     let object_id = resolve_classic_remote_object(
-        state,
         binding,
         context,
         element_id,
@@ -4664,9 +4629,9 @@ async fn webdriver_classic_send_file_input_keys(
     let result = binding
         .runtime
         .execute_on_page(
-            DevToolsCommand::SetFileInputFiles(DevToolsSetFileInputFilesCommand {
-                context: DevToolsCommandContext {
-                    protocol: DevToolsProtocol::WebDriverClassic,
+            AutomationCommand::SetFileInputFiles(DevToolsSetFileInputFilesCommand {
+                context: AutomationContext {
+                    protocol: FrontendProtocol::WebDriverClassic,
                     session_id: Some(DevToolsSessionId::from(context.session_id.as_str())),
                     target_id: context.target_id.as_deref().map(DevToolsTargetId::from),
                     browser_context_id: None,
@@ -4681,7 +4646,7 @@ async fn webdriver_classic_send_file_input_keys(
     release_classic_page_bound_remote_object(binding, context, object_id, "element file upload")
         .await;
     match result {
-        Ok(DevToolsCommandResult::Empty) => Ok(()),
+        Ok(AutomationResult::Empty) => Ok(()),
         Ok(_) => Err(ClassicError::new(
             ClassicErrorCode::UnknownError,
             "element file upload returned an unexpected result",
@@ -4712,14 +4677,13 @@ fn classic_file_input_paths_from_send_keys(text: &str) -> Result<Vec<String>, Cl
 }
 
 async fn webdriver_classic_element_geometry(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     element_id: &str,
 ) -> Result<DevToolsDomGeometryResult, ClassicError> {
-    let reference = resolve_classic_element_dom_reference(state, binding, element_id)?;
+    let reference = resolve_classic_element_dom_reference(binding, element_id).await?;
     let page_residence = reference.page_residence;
-    let commands = element_click_prepare_reference_commands(context, reference.reference);
+    let commands = element_geometry_prepare_commands(context, reference.reference);
     let mut geometry = None;
     for command in commands {
         match binding
@@ -4727,8 +4691,8 @@ async fn webdriver_classic_element_geometry(
             .execute_on_page(command, page_residence.clone())
             .await
         {
-            Ok(DevToolsCommandResult::Empty) => {}
-            Ok(DevToolsCommandResult::DomGeometry(result)) => geometry = Some(result),
+            Ok(AutomationResult::Empty) => {}
+            Ok(AutomationResult::DomGeometry(result)) => geometry = Some(result),
             Ok(_) => {
                 return Err(ClassicError::new(
                     ClassicErrorCode::UnknownError,
@@ -4747,7 +4711,6 @@ async fn webdriver_classic_element_geometry(
 }
 
 async fn webdriver_classic_action_element_origin_points(
-    state: &AppState,
     binding: &ClassicSessionBinding,
     context: &ClassicDevToolsCommandContext,
     params: &serde_json::Value,
@@ -4755,8 +4718,7 @@ async fn webdriver_classic_action_element_origin_points(
     let element_ids = action_element_origin_ids(params)?;
     let mut origins = ClassicElementOriginViewportPoints::new();
     for element_id in element_ids {
-        let geometry =
-            webdriver_classic_element_geometry(state, binding, context, &element_id).await?;
+        let geometry = webdriver_classic_element_geometry(binding, context, &element_id).await?;
         let point = element_center_from_geometry(&geometry)?;
         origins.insert(element_id, point);
     }
@@ -4772,7 +4734,7 @@ async fn webdriver_classic_viewport_bounds(
         .execute(layout_metrics_command(context))
         .await
     {
-        Ok(DevToolsCommandResult::LayoutMetrics(metrics)) => Ok(classic_viewport_bounds(metrics)),
+        Ok(AutomationResult::LayoutMetrics(metrics)) => Ok(classic_viewport_bounds(metrics)),
         Ok(_) => Err(ClassicError::new(
             ClassicErrorCode::UnknownError,
             "layout metrics returned an unexpected result",
@@ -4790,7 +4752,7 @@ fn classic_viewport_bounds(metrics: DevToolsLayoutMetricsResult) -> ClassicViewp
 
 async fn webdriver_classic_execute_empty_commands(
     binding: &ClassicSessionBinding,
-    commands: Vec<DevToolsCommand>,
+    commands: Vec<AutomationCommand>,
     unexpected_result_message: &str,
 ) -> Result<(), ClassicError> {
     for command in commands {
@@ -4803,11 +4765,11 @@ async fn webdriver_classic_execute_empty_commands(
 }
 
 fn webdriver_classic_expect_empty_result(
-    result: Result<DevToolsCommandResult, DevToolsError>,
+    result: Result<AutomationResult, DevToolsError>,
     unexpected_result_message: &str,
 ) -> Result<(), ClassicError> {
     match result {
-        Ok(DevToolsCommandResult::Empty) => Ok(()),
+        Ok(AutomationResult::Empty) => Ok(()),
         Ok(_) => Err(ClassicError::new(
             ClassicErrorCode::UnknownError,
             unexpected_result_message,
@@ -4832,9 +4794,7 @@ pub(super) async fn webdriver_classic_perform_actions(
     let context = classic_browsing_context(&binding);
     let input_context = classic_top_level_context(&binding);
     let element_origins =
-        match webdriver_classic_action_element_origin_points(&state, &binding, &context, &params)
-            .await
-        {
+        match webdriver_classic_action_element_origin_points(&binding, &context, &params).await {
             Ok(element_origins) => element_origins,
             Err(error) => return classic_error_into_response(error),
         };
@@ -4904,18 +4864,21 @@ fn webdriver_classic_capabilities(
     page_load_strategy: ClassicPageLoadStrategy,
     unhandled_prompt_behavior: &ClassicUnhandledPromptBehavior,
     downloads_enabled: bool,
+    bidi_requested: bool,
 ) -> serde_json::Value {
-    let web_socket_url = format!("{}/{}", state.bidi_ws_url.trim_end_matches('/'), session_id);
     let mut capabilities = json!({
         "browserName": "moli",
         "browserVersion": version::PRODUCT,
         "platformName": std::env::consts::OS,
-        "acceptInsecureCerts": !state.fetch_config.tls_verify_host(),
+        "acceptInsecureCerts": !state.navigation_runtime_config.fetch_config().tls_verify_host(),
         "pageLoadStrategy": page_load_strategy.as_str(),
         "unhandledPromptBehavior": unhandled_prompt_behavior.returned_capability(),
         "setWindowRect": false,
-        "webSocketUrl": web_socket_url,
     });
+    if bidi_requested && let Some(object) = capabilities.as_object_mut() {
+        let web_socket_url = format!("{}/{}", state.bidi_ws_url.trim_end_matches('/'), session_id);
+        object.insert("webSocketUrl".to_owned(), json!(web_socket_url));
+    }
     if downloads_enabled && let Some(object) = capabilities.as_object_mut() {
         object.insert("se:downloadsEnabled".to_owned(), json!(true));
     }
@@ -4940,10 +4903,10 @@ fn downloads_enabled_capability_value(value: &Value) -> Result<bool, ClassicErro
     })
 }
 
-fn selenium_download_behavior_command(session_id: &str, directory: &FsPath) -> DevToolsCommand {
-    DevToolsCommand::SetDownloadBehavior(DevToolsSetDownloadBehaviorCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverClassic,
+fn selenium_download_behavior_command(session_id: &str, directory: &FsPath) -> AutomationCommand {
+    AutomationCommand::SetDownloadBehavior(DevToolsSetDownloadBehaviorCommand {
+        context: AutomationContext {
+            protocol: FrontendProtocol::WebDriverClassic,
             session_id: Some(DevToolsSessionId::from(session_id)),
             target_id: None,
             browser_context_id: None,

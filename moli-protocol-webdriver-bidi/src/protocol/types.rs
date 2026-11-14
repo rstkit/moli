@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use moli_protocol::devtools_runtime::{
-    DevToolsBrowserContextId, DevToolsCommand, DevToolsCommandContext, DevToolsProtocol,
-    DevToolsSessionId, DevToolsTargetId,
+use moli_protocol::automation::{
+    AutomationCommand, AutomationContext, DevToolsBrowserContextId, DevToolsSessionId,
+    DevToolsTargetId, FrontendProtocol,
 };
 use serde_json::{Value, json};
 
@@ -104,10 +104,7 @@ impl BidiDevToolsCommandContext {
         }
     }
 
-    pub(crate) fn command_context(
-        &self,
-        target_id: Option<DevToolsTargetId>,
-    ) -> DevToolsCommandContext {
+    pub(crate) fn command_context(&self, target_id: Option<DevToolsTargetId>) -> AutomationContext {
         self.command_context_with_browser_context_id(
             target_id,
             self.browser_context_id
@@ -120,9 +117,9 @@ impl BidiDevToolsCommandContext {
         &self,
         target_id: Option<DevToolsTargetId>,
         browser_context_id: Option<DevToolsBrowserContextId>,
-    ) -> DevToolsCommandContext {
-        DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
+    ) -> AutomationContext {
+        AutomationContext {
+            protocol: FrontendProtocol::WebDriverBidi,
             session_id: Some(DevToolsSessionId::from(self.session_id.as_str())),
             target_id,
             browser_context_id,
@@ -134,7 +131,7 @@ impl BidiDevToolsCommandContext {
 pub struct BidiDevToolsCommandDispatch {
     pub id: u64,
     pub session_id: String,
-    pub command: DevToolsCommand,
+    pub command: AutomationCommand,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,7 +155,7 @@ pub struct BidiCommandOutcome {
     pub session_id: Option<String>,
     pub channel: Option<String>,
     pub close_connection: bool,
-    pub devtools_command: Option<BidiDevToolsCommandDispatch>,
+    pub automation_command: Option<BidiDevToolsCommandDispatch>,
     pub input_command: Option<BidiInputCommandDispatch>,
 }
 
@@ -222,7 +219,7 @@ impl BidiCommandOutcome {
             session_id,
             channel: None,
             close_connection: false,
-            devtools_command: None,
+            automation_command: None,
             input_command: None,
         }
     }
@@ -231,23 +228,15 @@ impl BidiCommandOutcome {
 pub(super) fn is_event_subscribed_by(
     subscriptions: &[BidiSubscription],
     event: &Value,
-    context_user_contexts: &BTreeMap<String, String>,
-    context_top_level_contexts: &BTreeMap<String, String>,
+    frame_index: &moli_protocol::frame_index::FrameIndex,
 ) -> bool {
-    !bidi_event_subscribed_channels(
-        subscriptions,
-        event,
-        context_user_contexts,
-        context_top_level_contexts,
-    )
-    .is_empty()
+    !bidi_event_subscribed_channels(subscriptions, event, frame_index).is_empty()
 }
 
 pub(super) fn bidi_event_subscribed_channels(
     subscriptions: &[BidiSubscription],
     event: &Value,
-    context_user_contexts: &BTreeMap<String, String>,
-    context_top_level_contexts: &BTreeMap<String, String>,
+    frame_index: &moli_protocol::frame_index::FrameIndex,
 ) -> BTreeSet<Option<String>> {
     let Some(method) = event.get("method").and_then(Value::as_str) else {
         return BTreeSet::new();
@@ -267,9 +256,11 @@ pub(super) fn bidi_event_subscribed_channels(
         .and_then(Value::as_str)
         .or_else(|| {
             context.and_then(|context| {
-                context_user_contexts
-                    .get(context)
-                    .map(std::string::String::as_str)
+                frame_index.get(context).map(|record| {
+                    crate::user_context::bidi_user_context_from_browser_context_id(
+                        record.browser_context_id.as_deref(),
+                    )
+                })
             })
         });
     subscriptions
@@ -281,7 +272,7 @@ pub(super) fn bidi_event_subscribed_channels(
                         bidi_context_subscription_matches(
                             context,
                             &subscription.contexts,
-                            context_top_level_contexts,
+                            frame_index,
                         )
                     })
                 } else if !subscription.user_contexts.is_empty() {
@@ -299,25 +290,15 @@ pub(super) fn bidi_event_subscribed_channels(
 fn bidi_context_subscription_matches(
     event_context: &str,
     subscribed_contexts: &BTreeSet<String>,
-    context_top_level_contexts: &BTreeMap<String, String>,
+    frame_index: &moli_protocol::frame_index::FrameIndex,
 ) -> bool {
     if subscribed_contexts.contains(event_context) {
         return true;
     }
-    let event_top_level = bidi_top_level_context(event_context, context_top_level_contexts);
-    subscribed_contexts.iter().any(|context| {
-        bidi_top_level_context(context, context_top_level_contexts) == event_top_level
-    })
-}
-
-fn bidi_top_level_context<'a>(
-    context: &'a str,
-    context_top_level_contexts: &'a BTreeMap<String, String>,
-) -> &'a str {
-    context_top_level_contexts
-        .get(context)
-        .map(std::string::String::as_str)
-        .unwrap_or(context)
+    let event_top_level = frame_index.top_level_context(event_context);
+    subscribed_contexts
+        .iter()
+        .any(|context| frame_index.top_level_context(context) == event_top_level)
 }
 
 pub fn parse_bidi_command(message: Value) -> Result<BidiCommand, BidiError> {
@@ -368,7 +349,7 @@ pub fn parse_bidi_command(message: Value) -> Result<BidiCommand, BidiError> {
     })
 }
 
-pub(super) fn bidi_message_with_channel(mut message: Value, channel: Option<&str>) -> Value {
+pub fn bidi_message_with_channel(mut message: Value, channel: Option<&str>) -> Value {
     if let Some(channel) = channel
         && let Some(message) = message.as_object_mut()
     {
@@ -436,7 +417,7 @@ pub(super) fn is_known_session_command(method: &str) -> bool {
     )
 }
 
-pub(super) fn is_devtools_command(method: &str) -> bool {
+pub(super) fn is_automation_command(method: &str) -> bool {
     matches!(
         method,
         "browser.createUserContext"

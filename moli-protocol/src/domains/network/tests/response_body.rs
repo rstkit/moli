@@ -15,10 +15,10 @@ use crate::domains::network::{
 
 use super::*;
 
-fn bidi_network_context(session_id: &str) -> crate::devtools_runtime::DevToolsCommandContext {
-    crate::devtools_runtime::DevToolsCommandContext {
-        protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-        session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(session_id)),
+fn bidi_network_context(session_id: &str) -> crate::automation::AutomationContext {
+    crate::automation::AutomationContext {
+        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+        session_id: Some(crate::automation::DevToolsSessionId::from(session_id)),
         target_id: None,
         browser_context_id: None,
     }
@@ -40,7 +40,7 @@ async fn get_response_body_respects_recorded_session_visibility() {
         "aux-only body".to_owned(),
         [Some("SID-attached".to_owned())],
     );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_280,
@@ -82,7 +82,7 @@ async fn get_response_body_requires_calling_session_network_listener() {
             Some("SID-attached".to_owned()),
         ],
     );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_282,
@@ -123,7 +123,7 @@ async fn get_response_body_reports_pending_body_as_existing_without_data() {
         .runtime_slot
         .enable_primary_network_events();
     bc.record_pending_response_body("REQ-pending".to_owned(), [None::<String>]);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_281,
@@ -150,7 +150,7 @@ async fn get_response_body_ready_body_replaces_pending_body() {
         "ready body".to_owned(),
         [None::<String>],
     );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_282,
@@ -168,14 +168,13 @@ async fn get_response_body_ready_body_replaces_pending_body() {
 async fn get_response_body_rejects_bodies_over_materialization_limit() {
     let mut config = FetchConfig::default();
     config.set_connection_limits(None, None, Some(4));
-    let mut ctx = TestContext::new();
-    ctx.conn = CdpConnection::new_with_fetch_config(config);
+    let mut ctx = TestContext::from_conn(CdpConnection::new_with_fetch_config(config));
     let mut bc = BrowserContext::new_with_page_for_test("BID-1", "TID-1");
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
     bc.record_captured_response_body("REQ-large".to_owned(), "hello".to_owned(), [None::<String>]);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_282,
@@ -202,7 +201,7 @@ async fn get_response_body_reports_default_single_resource_budget_eviction() {
         CapturedBody::from_bytes(vec![b'x'; 2_000_001]),
         [None::<String>],
     );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_285,
@@ -229,7 +228,7 @@ async fn get_response_body_base64_encodes_non_utf8_captured_bytes() {
         CapturedBody::from_bytes(vec![0x00, 0xff, b'a']),
         [None::<String>],
     );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_283,
@@ -257,7 +256,7 @@ async fn get_request_post_data_matches_chromium_errors_and_binary_encoding() {
         .runtime_slot
         .record_captured_request_body_with_collector_scope(
             "REQ-empty".to_owned(),
-            Vec::new(),
+            bytes::Bytes::new(),
             [None::<String>],
             std::iter::empty::<String>(),
             false,
@@ -267,12 +266,12 @@ async fn get_request_post_data_matches_chromium_errors_and_binary_encoding() {
         .runtime_slot
         .record_captured_request_body_with_collector_scope(
             "REQ-binary".to_owned(),
-            vec![0x00, 0xff, b'a'],
+            bytes::Bytes::from_static(&[0x00, 0xff, b'a']),
             [None::<String>],
             std::iter::empty::<String>(),
             false,
         );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_284,
@@ -337,7 +336,7 @@ async fn get_response_body_returns_partial_body_after_staged_loading_failed() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     let handle = SubresourceNetworkRequestHandle::new(41);
     let document_url = Url::parse("https://example.test/page").unwrap();
@@ -348,7 +347,7 @@ async fn get_response_body_returns_partial_body_after_staged_loading_failed() {
         document_url,
         request_url.clone(),
         "GET".to_owned(),
-        Vec::new(),
+        Vec::new().into(),
         None,
         SubresourceResourceType::Fetch,
         SubresourceRequestInitiatorType::Script,
@@ -359,7 +358,7 @@ async fn get_response_body_returns_partial_body_after_staged_loading_failed() {
         Vec::new(),
         request_url.clone(),
         200,
-        vec![("content-type".to_owned(), "text/plain".to_owned())],
+        vec![("content-type".to_owned(), b"text/plain".to_vec())],
         Vec::new(),
     );
     let body = SubresourceBodyFinished::failed_with_partial_body(
@@ -388,16 +387,18 @@ async fn get_response_body_returns_partial_body_after_staged_loading_failed() {
 
     let mut emitted_events = Vec::new();
     let owner = crate::conn::CommandOwnerScope::for_session("SID-1");
-    emit_pending_network_backlog_activity_background_events(
-        &mut ctx.conn,
-        &mut emitted_events,
-        NetworkBacklogProjectionContext::for_owner(&owner)
-            .with_base_timestamp(Some(100.0))
-            .with_prepared_outputs(Some(&mut prepared_outputs)),
-    );
+    ctx.with_fixture(|conn| {
+        emit_pending_network_backlog_activity_background_events(
+            conn,
+            &mut emitted_events,
+            NetworkBacklogProjectionContext::for_owner(&owner)
+                .with_base_timestamp(Some(100.0))
+                .with_prepared_outputs(Some(&mut prepared_outputs)),
+        )
+    });
     let emitted = emitted_events
         .into_iter()
-        .map(crate::conn::BackgroundProtocolEvent::into_protocol_message)
+        .filter_map(crate::conn::BackgroundProtocolEvent::into_wire_message)
         .collect::<Vec<_>>();
 
     let request = emitted
@@ -464,12 +465,12 @@ async fn get_request_post_data_respects_recorded_session_visibility() {
         .runtime_slot
         .record_captured_request_body_with_collector_scope(
             "REQ-aux-only".to_owned(),
-            b"aux-only body".to_vec(),
+            bytes::Bytes::from_static(b"aux-only body"),
             [Some("SID-attached".to_owned())],
             std::iter::empty::<String>(),
             false,
         );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_288,
@@ -503,10 +504,16 @@ async fn get_request_post_data_returns_main_document_navigation_post_body() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     let requested_url = Url::parse("http://127.0.0.1:1/post").unwrap();
     let navigation_state = NavigationDispatchState {
+        web_mcp_invocation: None,
+        navigation_initiator: None,
+        initial_document_environment: None,
+        auxiliary_document_response: None,
+        redirect_chain: Vec::new(),
+        redirect_headers: None,
         navigate_id: Some(1),
         owner: crate::conn::CommandOwnerScope::for_session("SID-1"),
         result_projection: crate::conn::NavigationResultProjection::Cdp(
@@ -517,23 +524,26 @@ async fn get_request_post_data_returns_main_document_navigation_post_body() {
         request_id: Some("REQ-main-post".to_owned()),
         loader_id: LOADER_ID.to_owned(),
         request_announced: false,
+        announced_redirects: 0,
         requested_url,
         request_method: "POST".to_owned(),
         request_body: Some("username=alice&pw=s3cret".to_owned()),
-        request_body_bytes: Some(b"username=alice&pw=s3cret".to_vec()),
-        request_headers: Vec::new(),
+        request_body_bytes: Some(bytes::Bytes::from_static(b"username=alice&pw=s3cret")),
+        request_headers: Vec::new().into(),
         request_load_policy: crate::conn::NavigationRequestLoadPolicy::DocumentInitiated,
         timestamp: 0.0,
         source_document_security: Default::default(),
     };
 
     let mut events = Vec::new();
-    start_observed_main_document_navigation_progress_background_events(
-        &mut ctx.conn,
-        &mut events,
-        &navigation_state,
-        None,
-    );
+    ctx.with_fixture(|conn| {
+        start_observed_main_document_navigation_progress_background_events(
+            conn,
+            &mut events,
+            &navigation_state,
+            None,
+        )
+    });
 
     ctx.process_async(json!({
         "id": 7_290,
@@ -558,34 +568,32 @@ async fn get_request_post_data_uses_text_projection_while_bidi_collector_keeps_t
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
-                    context: crate::devtools_runtime::DevToolsCommandContext {
-                        protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                        session_id: Some(crate::devtools_runtime::DevToolsSessionId::from("SID-1")),
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from("SID-1")),
                         target_id: None,
                         browser_context_id: None,
                     },
-                    collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-multipart-request-bytes",
                     ),
-                    data_types: vec![crate::devtools_runtime::DevToolsNetworkDataType::Request],
+                    data_types: vec![crate::automation::DevToolsNetworkDataType::Request],
                     max_encoded_data_size: 1000,
                     target_ids: Vec::new(),
                     browser_context_ids: Vec::new(),
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
     let multipart_text = "----MoliFormDataBoundary0000\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nvalue\r\n----MoliFormDataBoundary0000\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n";
@@ -593,9 +601,16 @@ async fn get_request_post_data_uses_text_projection_while_bidi_collector_keeps_t
     let mut transport_bytes = multipart_text.as_bytes().to_vec();
     transport_bytes.extend_from_slice(&file_bytes);
     transport_bytes.extend_from_slice(b"\r\n----MoliFormDataBoundary0000--\r\n");
+    let transport_bytes = bytes::Bytes::from(transport_bytes);
 
     let requested_url = Url::parse("http://127.0.0.1:1/upload").unwrap();
     let navigation_state = NavigationDispatchState {
+        web_mcp_invocation: None,
+        navigation_initiator: None,
+        initial_document_environment: None,
+        auxiliary_document_response: None,
+        redirect_chain: Vec::new(),
+        redirect_headers: None,
         navigate_id: Some(1),
         owner: crate::conn::CommandOwnerScope::for_session("SID-1"),
         result_projection: crate::conn::NavigationResultProjection::Cdp(
@@ -606,23 +621,26 @@ async fn get_request_post_data_uses_text_projection_while_bidi_collector_keeps_t
         request_id: Some("REQ-multipart".to_owned()),
         loader_id: LOADER_ID.to_owned(),
         request_announced: false,
+        announced_redirects: 0,
         requested_url,
         request_method: "POST".to_owned(),
         request_body: Some(multipart_text.to_owned()),
         request_body_bytes: Some(transport_bytes.clone()),
-        request_headers: Vec::new(),
+        request_headers: Vec::new().into(),
         request_load_policy: crate::conn::NavigationRequestLoadPolicy::DocumentInitiated,
         timestamp: 0.0,
         source_document_security: Default::default(),
     };
 
     let mut events = Vec::new();
-    start_observed_main_document_navigation_progress_background_events(
-        &mut ctx.conn,
-        &mut events,
-        &navigation_state,
-        None,
-    );
+    ctx.with_fixture(|conn| {
+        start_observed_main_document_navigation_progress_background_events(
+            conn,
+            &mut events,
+            &navigation_state,
+            None,
+        )
+    });
 
     ctx.process_async(json!({
         "id": 7_291,
@@ -637,21 +655,23 @@ async fn get_request_post_data_uses_text_projection_while_bidi_collector_keeps_t
         Some("SID-1"),
     );
 
-    let collected = ctx
-        .conn
-        .network_data_collectors
-        .collected_body(
-            "REQ-multipart",
-            crate::devtools_runtime::DevToolsNetworkDataType::Request,
-        )
-        .expect("BiDi collector should retain the request body");
-    assert_eq!(
-        collected
-            .body_bytes_limited(usize::MAX)
-            .expect("collected body"),
-        transport_bytes,
-        "the BiDi collector must keep the raw transport bytes including file payload"
-    );
+    ctx.with_fixture(|conn| {
+        let collected = {
+            conn.network_data_collectors
+                .collected_body(
+                    "REQ-multipart",
+                    crate::automation::DevToolsNetworkDataType::Request,
+                )
+                .expect("BiDi collector should retain the request body")
+        };
+        assert_eq!(
+            collected
+                .body_bytes_limited(usize::MAX)
+                .expect("collected body"),
+            transport_bytes,
+            "the BiDi collector must keep the raw transport bytes including file payload"
+        );
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -663,20 +683,19 @@ async fn get_network_data_returns_bidi_response_body_bytes() {
     bc.active_page_target_mut()
         .runtime_slot
         .enable_primary_network_events();
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
                     context: bidi_network_context("bidi-session-1"),
-                    collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-bidi-bytes",
                     ),
                     data_types: vec![
-                        crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                        crate::devtools_runtime::DevToolsNetworkDataType::Request,
+                        crate::automation::DevToolsNetworkDataType::Response,
+                        crate::automation::DevToolsNetworkDataType::Request,
                     ],
                     max_encoded_data_size: 1000,
                     target_ids: Vec::new(),
@@ -684,308 +703,322 @@ async fn get_network_data_returns_bidi_response_body_bytes() {
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
-    let response_collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        crate::devtools_runtime::DevToolsNetworkDataType::Response,
-        "bidi body".len(),
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-bidi-text".to_owned(),
-            CapturedBody::from_string("bidi body".to_owned()),
-            [Some("bidi-session-1".to_owned())],
-            response_collector_ids,
-            false,
-        );
+    let response_collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            crate::automation::DevToolsNetworkDataType::Response,
+            "bidi body".len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-bidi-text".to_owned(),
+                CapturedBody::from_string("bidi body".to_owned()),
+                [Some("bidi-session-1".to_owned())],
+                response_collector_ids,
+                false,
+            )
+    });
 
     let binary_response = CapturedBody::from_bytes(vec![0x00, 0xff]);
-    let binary_response_collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        crate::devtools_runtime::DevToolsNetworkDataType::Response,
-        binary_response.len(),
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-bidi-binary".to_owned(),
-            binary_response,
-            [Some("bidi-session-1".to_owned())],
-            binary_response_collector_ids,
-            false,
-        );
-
-    let primary_response_collector_ids =
-        ctx.conn.network_data_collector_ids_for_session_owner_body(
+    let binary_response_collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
             Some("bidi-session-1"),
-            crate::devtools_runtime::DevToolsNetworkDataType::Response,
+            crate::automation::DevToolsNetworkDataType::Response,
+            binary_response.len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-bidi-binary".to_owned(),
+                binary_response,
+                [Some("bidi-session-1".to_owned())],
+                binary_response_collector_ids,
+                false,
+            )
+    });
+
+    let primary_response_collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            crate::automation::DevToolsNetworkDataType::Response,
             "primary body".len(),
-        );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-bidi-primary".to_owned(),
-            CapturedBody::from_string("primary body".to_owned()),
-            [None::<String>],
-            primary_response_collector_ids,
-            false,
-        );
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-bidi-primary".to_owned(),
+                CapturedBody::from_string("primary body".to_owned()),
+                [None::<String>],
+                primary_response_collector_ids,
+                false,
+            )
+    });
 
-    let request_collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        crate::devtools_runtime::DevToolsNetworkDataType::Request,
-        "bidi request body".len(),
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_request_body_with_collector_scope(
-            "REQ-bidi-request".to_owned(),
-            "bidi request body".as_bytes().to_vec(),
-            [Some("bidi-session-1".to_owned())],
-            request_collector_ids,
-            false,
-        );
+    let request_collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            crate::automation::DevToolsNetworkDataType::Request,
+            "bidi request body".len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_request_body_with_collector_scope(
+                "REQ-bidi-request".to_owned(),
+                bytes::Bytes::from_static(b"bidi request body"),
+                [Some("bidi-session-1".to_owned())],
+                request_collector_ids,
+                false,
+            )
+    });
 
-    let binary_request = vec![0x00, 0xff, b'a'];
-    let binary_request_collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        crate::devtools_runtime::DevToolsNetworkDataType::Request,
-        binary_request.len(),
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_request_body_with_collector_scope(
-            "REQ-bidi-request-binary".to_owned(),
-            binary_request,
-            [Some("bidi-session-1".to_owned())],
-            binary_request_collector_ids,
-            false,
-        );
+    let binary_request = bytes::Bytes::from_static(&[0x00, 0xff, b'a']);
+    let binary_request_collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            crate::automation::DevToolsNetworkDataType::Request,
+            binary_request.len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_request_body_with_collector_scope(
+                "REQ-bidi-request-binary".to_owned(),
+                binary_request,
+                [Some("bidi-session-1".to_owned())],
+                binary_request_collector_ids,
+                false,
+            )
+    });
 
     let (result, scheduler_events) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                    session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                        "bidi-session-1",
-                    )),
-                    target_id: None,
-                    browser_context_id: None,
+        .execute_owned_automation_command_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from(
+                            "bidi-session-1",
+                        )),
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-bidi-text"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: None,
+                    disown: false,
                 },
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-bidi-text"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: None,
-                disown: false,
-            },
-        ))
+            ),
+        )
         .await
         .into_parts();
 
     assert!(scheduler_events.is_empty());
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: "bidi body".to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                    session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                        "bidi-session-1",
-                    )),
-                    target_id: None,
-                    browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from(
+                            "bidi-session-1",
+                        )),
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-bidi-request"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Request,
+                    collector: None,
+                    disown: false,
                 },
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-bidi-request"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Request,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+            ),
+        )
+        .await;
 
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: "bidi request body".to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                    session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                        "bidi-session-1",
-                    )),
-                    target_id: None,
-                    browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from(
+                            "bidi-session-1",
+                        )),
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    request_id: crate::automation::DevToolsRequestId::from(
+                        "REQ-bidi-request-binary",
+                    ),
+                    data_type: crate::automation::DevToolsNetworkDataType::Request,
+                    collector: None,
+                    disown: false,
                 },
-                request_id: crate::devtools_runtime::DevToolsRequestId::from(
-                    "REQ-bidi-request-binary",
-                ),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Request,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+            ),
+        )
+        .await;
 
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::Base64,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::Base64,
                 value: "AP9h".to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                    session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                        "bidi-session-1",
-                    )),
-                    target_id: None,
-                    browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from(
+                            "bidi-session-1",
+                        )),
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-bidi-binary"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: None,
+                    disown: false,
                 },
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-bidi-binary"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+            ),
+        )
+        .await;
 
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::Base64,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::Base64,
                 value: "AP8=".to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                    session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                        "bidi-session-1",
-                    )),
-                    target_id: None,
-                    browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from(
+                            "bidi-session-1",
+                        )),
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-bidi-primary"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: None,
+                    disown: false,
                 },
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-bidi-primary"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+            ),
+        )
+        .await;
 
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: "primary body".to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                    session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                        "bidi-session-2",
-                    )),
-                    target_id: None,
-                    browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from(
+                            "bidi-session-2",
+                        )),
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-bidi-text"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: None,
+                    disown: false,
                 },
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-bidi-text"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+            ),
+        )
+        .await;
 
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                    session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                        "bidi-session-2",
-                    )),
-                    target_id: None,
-                    browser_context_id: None,
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                        session_id: Some(crate::automation::DevToolsSessionId::from(
+                            "bidi-session-2",
+                        )),
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-bidi-request"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Request,
+                    collector: None,
+                    disown: false,
                 },
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-bidi-request"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Request,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+            ),
+        )
+        .await;
 
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
@@ -1002,39 +1035,35 @@ async fn network_data_collectors_gate_get_data_disown_and_remove() {
         "pre collector body".to_owned(),
         [Some("bidi-session-1".to_owned())],
     );
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     for (collector, max_encoded_data_size) in [
         ("collector-ok", 1000),
         ("collector-disown-command", 1000),
         ("collector-small", 1),
     ] {
-        let (result, _) = ctx
-            .conn
-            .execute_devtools_command(
-                crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                    crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+        let result = ctx
+            .execute_automation_command_through_renderer_fence_for_test(
+                crate::automation::AutomationCommand::AddNetworkDataCollector(
+                    crate::automation::DevToolsAddNetworkDataCollectorCommand {
                         context: bidi_network_context("bidi-session-1"),
-                        collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                        collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                             collector,
                         ),
-                        data_types: vec![
-                            crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                        ],
+                        data_types: vec![crate::automation::DevToolsNetworkDataType::Response],
                         max_encoded_data_size,
                         target_ids: Vec::new(),
                         browser_context_ids: Vec::new(),
                     },
                 ),
             )
-            .await
-            .into_parts();
+            .await;
         assert_eq!(
             result,
             Ok(
-                crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(
-                    crate::devtools_runtime::DevToolsAddNetworkDataCollectorResult {
-                        collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                crate::automation::AutomationResult::AddNetworkDataCollector(
+                    crate::automation::DevToolsAddNetworkDataCollectorResult {
+                        collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                             collector,
                         ),
                     },
@@ -1044,264 +1073,247 @@ async fn network_data_collectors_gate_get_data_disown_and_remove() {
     }
 
     let body_text = "collector body";
-    let collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        crate::devtools_runtime::DevToolsNetworkDataType::Response,
-        body_text.len(),
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-collected".to_owned(),
-            CapturedBody::from_string(body_text.to_owned()),
-            [Some("bidi-session-1".to_owned())],
-            collector_ids,
-            false,
-        );
+    let collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            crate::automation::DevToolsNetworkDataType::Response,
+            body_text.len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-collected".to_owned(),
+                CapturedBody::from_string(body_text.to_owned()),
+                [Some("bidi-session-1".to_owned())],
+                collector_ids,
+                false,
+            )
+    });
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from(
-                    "REQ-before-collector",
-                ),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from("collector-ok"),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-before-collector"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
+                        "collector-ok",
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from("collector-ok"),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
+                        "collector-ok",
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: "collector body".to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-small",
-                    ),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::DisownNetworkData(
-            crate::devtools_runtime::DevToolsDisownNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
-                    "collector-disown-command",
-                ),
-            },
-        ))
-        .await
-        .into_parts();
-    assert_eq!(
-        result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::Empty)
-    );
-
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::DisownNetworkData(
+                crate::automation::DevToolsDisownNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-disown-command",
                     ),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
-    assert_eq!(
-        result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
-            "no such network data",
-        ))
-    );
+                },
+            ),
+        )
+        .await;
+    assert_eq!(result, Ok(crate::automation::AutomationResult::Empty));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
-    assert!(matches!(
-        result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            _
-        ))
-    ));
-
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from("collector-ok"),
-                ),
-                disown: true,
-            },
-        ))
-        .await
-        .into_parts();
-    assert!(matches!(
-        result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            _
-        ))
-    ));
-
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from("collector-ok"),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
-    assert_eq!(
-        result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
-            "no such network data",
-        ))
-    );
-
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-collected"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
-    assert_eq!(
-        result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
-            "no such network data",
-        ))
-    );
-
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::RemoveNetworkDataCollector(
-                crate::devtools_runtime::DevToolsRemoveNetworkDataCollectorCommand {
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
                     context: bidi_network_context("bidi-session-1"),
-                    collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
+                        "collector-disown-command",
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
+            "no such network data",
+        ))
+    );
+
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: None,
+                    disown: false,
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Ok(crate::automation::AutomationResult::NetworkData(_))
+    ));
+
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
+                        "collector-ok",
+                    )),
+                    disown: true,
+                },
+            ),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Ok(crate::automation::AutomationResult::NetworkData(_))
+    ));
+
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
+                        "collector-ok",
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
+            "no such network data",
+        ))
+    );
+
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-collected"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: None,
+                    disown: false,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(
+        result,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
+            "no such network data",
+        ))
+    );
+
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::RemoveNetworkDataCollector(
+                crate::automation::DevToolsRemoveNetworkDataCollectorCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-small",
                     ),
                 },
             ),
         )
-        .await
-        .into_parts();
-    assert_eq!(
-        result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::Empty)
-    );
+        .await;
+    assert_eq!(result, Ok(crate::automation::AutomationResult::Empty));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::RemoveNetworkDataCollector(
-                crate::devtools_runtime::DevToolsRemoveNetworkDataCollectorCommand {
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::RemoveNetworkDataCollector(
+                crate::automation::DevToolsRemoveNetworkDataCollectorCommand {
                     context: bidi_network_context("bidi-session-1"),
-                    collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-small",
                     ),
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkCollector,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkCollector,
             "no such network collector",
         ))
     );
@@ -1313,67 +1325,69 @@ async fn network_data_collector_body_persists_after_target_artifact_cleanup() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("bidi-session-1".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-    let collector_id =
-        crate::devtools_runtime::DevToolsNetworkDataCollectorId::from("collector-persist");
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+    let collector_id = crate::automation::DevToolsNetworkDataCollectorId::from("collector-persist");
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
                     context: bidi_network_context("bidi-session-1"),
                     collector_id: collector_id.clone(),
-                    data_types: vec![crate::devtools_runtime::DevToolsNetworkDataType::Response],
+                    data_types: vec![crate::automation::DevToolsNetworkDataType::Response],
                     max_encoded_data_size: 1000,
                     target_ids: Vec::new(),
                     browser_context_ids: Vec::new(),
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
     let request_id = "REQ-persist";
-    let data_type = crate::devtools_runtime::DevToolsNetworkDataType::Response;
+    let data_type = crate::automation::DevToolsNetworkDataType::Response;
     let body = CapturedBody::from_string("persistent collector body".to_owned());
-    let collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        data_type,
-        body.len(),
-    );
-    ctx.conn.record_collected_network_data_body(
-        request_id.to_owned(),
-        data_type,
-        body.clone(),
-        collector_ids.iter().cloned(),
-        false,
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
+    let collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            data_type,
+            body.len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.record_collected_network_data_body(
             request_id.to_owned(),
-            body,
-            [Some("bidi-session-1".to_owned())],
-            collector_ids,
+            data_type,
+            body.clone(),
+            collector_ids.iter().cloned(),
             false,
-        );
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                request_id.to_owned(),
+                body,
+                [Some("bidi-session-1".to_owned())],
+                collector_ids,
+                false,
+            )
+    });
 
     fn get_collected_command(
         request_id: &str,
-        data_type: crate::devtools_runtime::DevToolsNetworkDataType,
-        collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId,
+        data_type: crate::automation::DevToolsNetworkDataType,
+        collector_id: crate::automation::DevToolsNetworkDataCollectorId,
         disown: bool,
-    ) -> crate::devtools_runtime::DevToolsCommand {
-        crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
+    ) -> crate::automation::AutomationCommand {
+        crate::automation::AutomationCommand::GetNetworkData(
+            crate::automation::DevToolsGetNetworkDataCommand {
                 context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from(request_id),
+                request_id: crate::automation::DevToolsRequestId::from(request_id),
                 data_type,
                 collector: Some(collector_id),
                 disown,
@@ -1381,82 +1395,73 @@ async fn network_data_collector_body_persists_after_target_artifact_cleanup() {
         )
     }
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(get_collected_command(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(get_collected_command(
             request_id,
             data_type,
             collector_id.clone(),
             false,
         ))
-        .await
-        .into_parts();
+        .await;
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: "persistent collector body".to_owned(),
             },
         ))
     );
 
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .clear_network_body_artifacts();
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .clear_network_body_artifacts()
+    });
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(get_collected_command(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(get_collected_command(
             request_id,
             data_type,
             collector_id.clone(),
             false,
         ))
-        .await
-        .into_parts();
+        .await;
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: "persistent collector body".to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(get_collected_command(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(get_collected_command(
             request_id,
             data_type,
             collector_id.clone(),
             true,
         ))
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            _
-        ))
+        Ok(crate::automation::AutomationResult::NetworkData(_))
     ));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(get_collected_command(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(get_collected_command(
             request_id,
             data_type,
             collector_id,
             false,
         ))
-        .await
-        .into_parts();
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
@@ -1468,16 +1473,14 @@ async fn network_data_explicit_collector_prefers_collected_body_over_stale_targe
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("bidi-session-1".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-    let collector_id =
-        crate::devtools_runtime::DevToolsNetworkDataCollectorId::from("collector-shadow");
-    let data_type = crate::devtools_runtime::DevToolsNetworkDataType::Response;
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+    let collector_id = crate::automation::DevToolsNetworkDataCollectorId::from("collector-shadow");
+    let data_type = crate::automation::DevToolsNetworkDataType::Response;
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
                     context: bidi_network_context("bidi-session-1"),
                     collector_id: collector_id.clone(),
                     data_types: vec![data_type],
@@ -1487,57 +1490,61 @@ async fn network_data_explicit_collector_prefers_collected_body_over_stale_targe
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
     let request_id = "REQ-shadow";
     let collected_body = CapturedBody::from_string("collector-owned body".to_owned());
-    let collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        data_type,
-        collected_body.len(),
-    );
-    ctx.conn.record_collected_network_data_body(
-        request_id.to_owned(),
-        data_type,
-        collected_body,
-        collector_ids.iter().cloned(),
-        false,
-    );
-
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
+    let collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            data_type,
+            collected_body.len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.record_collected_network_data_body(
             request_id.to_owned(),
-            CapturedBody::from_string("stale target artifact".to_owned()),
-            [Some("bidi-session-1".to_owned())],
-            std::iter::empty::<String>(),
+            data_type,
+            collected_body,
+            collector_ids.iter().cloned(),
             false,
-        );
+        )
+    });
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from(request_id),
-                data_type,
-                collector: Some(collector_id),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                request_id.to_owned(),
+                CapturedBody::from_string("stale target artifact".to_owned()),
+                [Some("bidi-session-1".to_owned())],
+                std::iter::empty::<String>(),
+                false,
+            )
+    });
+
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from(request_id),
+                    data_type,
+                    collector: Some(collector_id),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: "collector-owned body".to_owned(),
             },
         ))
@@ -1550,59 +1557,58 @@ async fn network_data_explicit_collector_rejects_unconfigured_data_type() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("bidi-session-1".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     let collector_id =
-        crate::devtools_runtime::DevToolsNetworkDataCollectorId::from("collector-request-only");
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+        crate::automation::DevToolsNetworkDataCollectorId::from("collector-request-only");
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
                     context: bidi_network_context("bidi-session-1"),
                     collector_id: collector_id.clone(),
-                    data_types: vec![crate::devtools_runtime::DevToolsNetworkDataType::Request],
+                    data_types: vec![crate::automation::DevToolsNetworkDataType::Request],
                     max_encoded_data_size: 1000,
                     target_ids: Vec::new(),
                     browser_context_ids: Vec::new(),
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-type-mismatch".to_owned(),
-            CapturedBody::from_string("response body".to_owned()),
-            [Some("bidi-session-1".to_owned())],
-            [collector_id.as_str().to_owned()],
-            true,
-        );
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-type-mismatch".to_owned(),
+                CapturedBody::from_string("response body".to_owned()),
+                [Some("bidi-session-1".to_owned())],
+                [collector_id.as_str().to_owned()],
+                true,
+            )
+    });
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-type-mismatch"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(collector_id),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-type-mismatch"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(collector_id),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
@@ -1614,67 +1620,67 @@ async fn network_data_without_collector_requires_matching_collected_data_type() 
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("bidi-session-1".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
                     context: bidi_network_context("bidi-session-1"),
-                    collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-request-only",
                     ),
-                    data_types: vec![crate::devtools_runtime::DevToolsNetworkDataType::Request],
+                    data_types: vec![crate::automation::DevToolsNetworkDataType::Request],
                     max_encoded_data_size: 1000,
                     target_ids: Vec::new(),
                     browser_context_ids: Vec::new(),
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
-    let data_type = crate::devtools_runtime::DevToolsNetworkDataType::Response;
-    assert!(
-        !ctx.conn
-            .network_data_collection_is_gated_for_body(data_type),
-        "request-only collectors must not gate response bodies"
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-response-not-collected".to_owned(),
-            CapturedBody::from_string("response body".to_owned()),
-            [Some("bidi-session-1".to_owned())],
-            std::iter::empty::<String>(),
-            false,
-        );
+    let data_type = crate::automation::DevToolsNetworkDataType::Response;
+    ctx.with_fixture(|conn| {
+        assert!(
+            !conn.network_data_collection_is_gated_for_body(data_type),
+            "request-only collectors must not gate response bodies"
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-response-not-collected".to_owned(),
+                CapturedBody::from_string("response body".to_owned()),
+                [Some("bidi-session-1".to_owned())],
+                std::iter::empty::<String>(),
+                false,
+            )
+    });
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from(
-                    "REQ-response-not-collected",
-                ),
-                data_type,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from(
+                        "REQ-response-not-collected",
+                    ),
+                    data_type,
+                    collector: None,
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
@@ -1691,40 +1697,34 @@ async fn network_data_collector_membership_uses_recorded_target_scope() {
         None,
         "about:blank".to_owned(),
     ));
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     for (collector, target_id) in [
         ("collector-active", "TID-active"),
         ("collector-other", "TID-other"),
     ] {
-        let (result, _) = ctx
-            .conn
-            .execute_devtools_command(
-                crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                    crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+        let result = ctx
+            .execute_automation_command_through_renderer_fence_for_test(
+                crate::automation::AutomationCommand::AddNetworkDataCollector(
+                    crate::automation::DevToolsAddNetworkDataCollectorCommand {
                         context: bidi_network_context("bidi-session-1"),
-                        collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                        collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                             collector,
                         ),
-                        data_types: vec![
-                            crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                        ],
+                        data_types: vec![crate::automation::DevToolsNetworkDataType::Response],
                         max_encoded_data_size: 1000,
-                        target_ids: vec![crate::devtools_runtime::DevToolsTargetId::from(
-                            target_id,
-                        )],
+                        target_ids: vec![crate::automation::DevToolsTargetId::from(target_id)],
                         browser_context_ids: Vec::new(),
                     },
                 ),
             )
-            .await
-            .into_parts();
+            .await;
         assert_eq!(
             result,
             Ok(
-                crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(
-                    crate::devtools_runtime::DevToolsAddNetworkDataCollectorResult {
-                        collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                crate::automation::AutomationResult::AddNetworkDataCollector(
+                    crate::automation::DevToolsAddNetworkDataCollectorResult {
+                        collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                             collector,
                         ),
                     },
@@ -1734,70 +1734,69 @@ async fn network_data_collector_membership_uses_recorded_target_scope() {
     }
 
     let body_text = "scoped body";
-    let collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        crate::devtools_runtime::DevToolsNetworkDataType::Response,
-        body_text.len(),
-    );
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-scoped".to_owned(),
-            CapturedBody::from_string(body_text.to_owned()),
-            [Some("bidi-session-1".to_owned())],
-            collector_ids,
-            false,
-        );
+    let collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            crate::automation::DevToolsNetworkDataType::Response,
+            body_text.len(),
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-scoped".to_owned(),
+                CapturedBody::from_string(body_text.to_owned()),
+                [Some("bidi-session-1".to_owned())],
+                collector_ids,
+                false,
+            )
+    });
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-scoped"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-scoped"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-active",
-                    ),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::NetworkData(
-            crate::devtools_runtime::DevToolsNetworkDataResult {
-                bytes_type: crate::devtools_runtime::DevToolsNetworkDataBytesType::String,
+        Ok(crate::automation::AutomationResult::NetworkData(
+            crate::automation::DevToolsNetworkDataResult {
+                bytes_type: crate::automation::DevToolsNetworkDataBytesType::String,
                 value: body_text.to_owned(),
             },
         ))
     );
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-scoped"),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Response,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-scoped"),
+                    data_type: crate::automation::DevToolsNetworkDataType::Response,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-other",
-                    ),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
@@ -1814,75 +1813,75 @@ async fn network_data_collector_gated_body_without_match_is_not_readable() {
         None,
         "about:blank".to_owned(),
     ));
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
                     context: bidi_network_context("bidi-session-1"),
-                    collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-other",
                     ),
-                    data_types: vec![crate::devtools_runtime::DevToolsNetworkDataType::Response],
+                    data_types: vec![crate::automation::DevToolsNetworkDataType::Response],
                     max_encoded_data_size: 1000,
-                    target_ids: vec![crate::devtools_runtime::DevToolsTargetId::from("TID-other")],
+                    target_ids: vec![crate::automation::DevToolsTargetId::from("TID-other")],
                     browser_context_ids: Vec::new(),
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
     let body_text = "active body";
-    let data_type = crate::devtools_runtime::DevToolsNetworkDataType::Response;
-    let collection_was_gated = ctx
-        .conn
-        .network_data_collection_is_gated_for_body(data_type);
-    let collector_ids = ctx.conn.network_data_collector_ids_for_session_owner_body(
-        Some("bidi-session-1"),
-        data_type,
-        body_text.len(),
-    );
+    let data_type = crate::automation::DevToolsNetworkDataType::Response;
+    let collection_was_gated =
+        ctx.with_fixture(|conn| conn.network_data_collection_is_gated_for_body(data_type));
+    let collector_ids = ctx.with_fixture(|conn| {
+        conn.network_data_collector_ids_for_session_owner_body(
+            Some("bidi-session-1"),
+            data_type,
+            body_text.len(),
+        )
+    });
     assert!(collection_was_gated);
     assert!(
         collector_ids.is_empty(),
         "active target should not match the collector scoped to TID-other"
     );
 
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("bidi-session-1"))
-        .expect("bidi session runtime slot")
-        .record_captured_response_body_source_with_collector_scope(
-            "REQ-unmatched".to_owned(),
-            CapturedBody::from_string(body_text.to_owned()),
-            [Some("bidi-session-1".to_owned())],
-            collector_ids,
-            collection_was_gated,
-        );
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("bidi-session-1"))
+            .expect("bidi session runtime slot")
+            .record_captured_response_body_source_with_collector_scope(
+                "REQ-unmatched".to_owned(),
+                CapturedBody::from_string(body_text.to_owned()),
+                [Some("bidi-session-1".to_owned())],
+                collector_ids,
+                collection_was_gated,
+            )
+    });
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("bidi-session-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from("REQ-unmatched"),
-                data_type,
-                collector: None,
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("bidi-session-1"),
+                    request_id: crate::automation::DevToolsRequestId::from("REQ-unmatched"),
+                    data_type,
+                    collector: None,
+                    disown: false,
+                },
+            ),
+        )
+        .await;
     assert_eq!(
         result,
-        Err(crate::devtools_runtime::DevToolsError::new(
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+        Err(crate::automation::DevToolsError::new(
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
             "no such network data",
         ))
     );
@@ -1893,55 +1892,55 @@ async fn get_network_data_reports_unimplemented_or_missing_data_with_bidi_errors
     let mut ctx = TestContext::new();
     let mut bc = BrowserContext::new_with_page_for_test("BID-1", "TID-1");
     bc.record_pending_response_body("REQ-pending".to_owned(), [None::<String>]);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     for (request_id, data_type, collector, expected_kind) in [
         (
             "REQ-pending",
-            crate::devtools_runtime::DevToolsNetworkDataType::Response,
+            crate::automation::DevToolsNetworkDataType::Response,
             None,
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
         ),
         (
             "REQ-missing",
-            crate::devtools_runtime::DevToolsNetworkDataType::Response,
+            crate::automation::DevToolsNetworkDataType::Response,
             None,
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
         ),
         (
             "REQ-pending",
-            crate::devtools_runtime::DevToolsNetworkDataType::Request,
+            crate::automation::DevToolsNetworkDataType::Request,
             None,
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkData,
+            crate::automation::DevToolsErrorKind::NoSuchNetworkData,
         ),
         (
             "REQ-pending",
-            crate::devtools_runtime::DevToolsNetworkDataType::Response,
+            crate::automation::DevToolsNetworkDataType::Response,
             Some("collector-1"),
-            crate::devtools_runtime::DevToolsErrorKind::NoSuchNetworkCollector,
+            crate::automation::DevToolsErrorKind::NoSuchNetworkCollector,
         ),
     ] {
-        let (result, _) = ctx
-            .conn
-            .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-                crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                    context: crate::devtools_runtime::DevToolsCommandContext {
-                        protocol: crate::devtools_runtime::DevToolsProtocol::WebDriverBidi,
-                        session_id: Some(crate::devtools_runtime::DevToolsSessionId::from(
-                            "bidi-session-1",
-                        )),
-                        target_id: None,
-                        browser_context_id: None,
+        let result = ctx
+            .execute_automation_command_through_renderer_fence_for_test(
+                crate::automation::AutomationCommand::GetNetworkData(
+                    crate::automation::DevToolsGetNetworkDataCommand {
+                        context: crate::automation::AutomationContext {
+                            protocol: crate::automation::FrontendProtocol::WebDriverBidi,
+                            session_id: Some(crate::automation::DevToolsSessionId::from(
+                                "bidi-session-1",
+                            )),
+                            target_id: None,
+                            browser_context_id: None,
+                        },
+                        request_id: crate::automation::DevToolsRequestId::from(request_id),
+                        data_type,
+                        collector: collector
+                            .map(crate::automation::DevToolsNetworkDataCollectorId::from),
+                        disown: false,
                     },
-                    request_id: crate::devtools_runtime::DevToolsRequestId::from(request_id),
-                    data_type,
-                    collector: collector
-                        .map(crate::devtools_runtime::DevToolsNetworkDataCollectorId::from),
-                    disown: false,
-                },
-            ))
-            .await
-            .into_parts();
+                ),
+            )
+            .await;
         let error = result.expect_err("network.getData should fail");
         assert_eq!(error.kind, expected_kind);
     }
@@ -1949,7 +1948,12 @@ async fn get_network_data_reports_unimplemented_or_missing_data_with_bidi_errors
 #[tokio::test(flavor = "multi_thread")]
 async fn get_response_body_rejects_invalid_params() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new("BID-1".into()));
+    {
+        let fixture_value = Some(BrowserContext::new("BID-1".into()));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
 
     ctx.process_async(json!({
         "id": 3,
@@ -1992,7 +1996,7 @@ async fn main_document_navigation_get_response_body_preserves_binary_bytes() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_284,
@@ -2082,7 +2086,7 @@ fetch('/binary')
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 7_287,
@@ -2209,29 +2213,27 @@ fetch("/upload", {method: "POST", body: formData})
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(
-            crate::devtools_runtime::DevToolsCommand::AddNetworkDataCollector(
-                crate::devtools_runtime::DevToolsAddNetworkDataCollectorCommand {
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::AddNetworkDataCollector(
+                crate::automation::DevToolsAddNetworkDataCollectorCommand {
                     context: bidi_network_context("SID-1"),
-                    collector_id: crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+                    collector_id: crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-request-body",
                     ),
-                    data_types: vec![crate::devtools_runtime::DevToolsNetworkDataType::Request],
+                    data_types: vec![crate::automation::DevToolsNetworkDataType::Request],
                     max_encoded_data_size: 4096,
                     target_ids: Vec::new(),
                     browser_context_ids: Vec::new(),
                 },
             ),
         )
-        .await
-        .into_parts();
+        .await;
     assert!(matches!(
         result,
-        Ok(crate::devtools_runtime::DevToolsCommandResult::AddNetworkDataCollector(_))
+        Ok(crate::automation::AutomationResult::AddNetworkDataCollector(_))
     ));
 
     ctx.process_async(json!({
@@ -2267,31 +2269,29 @@ fetch("/upload", {method: "POST", body: formData})
         .expect("multipart upload request id")
         .to_owned();
 
-    let (result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetNetworkData(
-            crate::devtools_runtime::DevToolsGetNetworkDataCommand {
-                context: bidi_network_context("SID-1"),
-                request_id: crate::devtools_runtime::DevToolsRequestId::from(request_id),
-                data_type: crate::devtools_runtime::DevToolsNetworkDataType::Request,
-                collector: Some(
-                    crate::devtools_runtime::DevToolsNetworkDataCollectorId::from(
+    let result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetNetworkData(
+                crate::automation::DevToolsGetNetworkDataCommand {
+                    context: bidi_network_context("SID-1"),
+                    request_id: crate::automation::DevToolsRequestId::from(request_id),
+                    data_type: crate::automation::DevToolsNetworkDataType::Request,
+                    collector: Some(crate::automation::DevToolsNetworkDataCollectorId::from(
                         "collector-request-body",
-                    ),
-                ),
-                disown: false,
-            },
-        ))
-        .await
-        .into_parts();
+                    )),
+                    disown: false,
+                },
+            ),
+        )
+        .await;
 
     let result = result.expect("multipart request body should be collected");
-    let crate::devtools_runtime::DevToolsCommandResult::NetworkData(data) = result else {
+    let crate::automation::AutomationResult::NetworkData(data) = result else {
         panic!("expected network data result");
     };
     assert_eq!(
         data.bytes_type,
-        crate::devtools_runtime::DevToolsNetworkDataBytesType::Base64
+        crate::automation::DevToolsNetworkDataBytesType::Base64
     );
     let decoded = BASE64_STANDARD
         .decode(data.value)

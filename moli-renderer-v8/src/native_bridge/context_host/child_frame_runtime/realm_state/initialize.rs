@@ -6,13 +6,13 @@ use super::{
 };
 use crate::{
     context_bootstrap::{
-        WINDOW_NAME_SLOT, bind_window_navigator_identity_seed, bind_window_performance_seed,
-        install_navigation_bootstrap_entry_for_holder,
+        WINDOW_NAME_SLOT, bind_current_child_window_document, bind_window_navigator_identity_seed,
+        bind_window_performance_seed, install_navigation_bootstrap_entry_for_holder,
         reset_window_location_history_navigation_runtime_state, set_window_origin_runtime_state,
         sync_window_location_history_navigation_runtime_surface,
     },
     native_bridge::{
-        JsContextHost, OwnerDispatchScope, WindowExecutionContextOwner,
+        OwnerDispatchScope, PageScriptHost, WindowExecutionContextOwner,
         child_window_surface::{
             bind_materialized_child_window_indexed_db_factory,
             initialize_child_window_realm_environment, rebind_child_window_document_environment,
@@ -30,7 +30,7 @@ use super::super::{
 pub(in crate::native_bridge::context_host::child_frame_runtime) fn initialize_child_window_realm_state<
     's,
 >(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     scope: &mut v8::PinScope<'s, '_>,
     global: v8::Local<'s, v8::Object>,
     init: ChildWindowRealmInit,
@@ -65,18 +65,15 @@ pub(in crate::native_bridge::context_host::child_frame_runtime) fn initialize_ch
     sync_child_document_window_slots(scope, document, global, true);
     set_object_slot(scope, global, "document", document.into());
     validate_child_window_realm_snapshot(host, &snapshot)?;
+    bind_document(host, scope, &snapshot, document)?;
 
-    Ok(ChildWindowRealmProjection {
-        parent,
-        top,
-        document,
-    })
+    Ok(ChildWindowRealmProjection { top, document })
 }
 
 pub(in crate::native_bridge::context_host::child_frame_runtime) fn rebind_child_window_realm_document_state<
     's,
 >(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     scope: &mut v8::PinScope<'s, '_>,
     global: v8::Local<'s, v8::Object>,
     rebind: ChildWindowRealmRebind,
@@ -125,11 +122,22 @@ pub(in crate::native_bridge::context_host::child_frame_runtime) fn rebind_child_
         .ok_or_else(|| anyhow::anyhow!("missing rebound child Document wrapper"))?;
     sync_child_document_window_slots(scope, document, global, true);
     set_object_slot(scope, global, "document", document.into());
-    validate_child_window_realm_snapshot(host, &snapshot)
+    validate_child_window_realm_snapshot(host, &snapshot)?;
+    bind_document(host, scope, &snapshot, document)
+}
+
+fn bind_document<'s>(
+    host: &PageScriptHost,
+    scope: &mut v8::PinScope<'s, '_>,
+    snapshot: &super::model::ChildWindowRealmSnapshot,
+    document: v8::Local<'s, v8::Object>,
+) -> Result<()> {
+    bind_current_child_window_document(scope, host, snapshot.handle, document)
+        .ok_or_else(|| anyhow::anyhow!("missing current child Window Document binding"))
 }
 
 fn validate_registered_realm(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     scope: &mut v8::PinScope<'_, '_>,
     init: ChildWindowRealmInit,
 ) -> Result<()> {
@@ -166,12 +174,12 @@ fn bind_window_name(
 }
 
 fn bind_frame_element<'s>(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     scope: &mut v8::PinScope<'s, '_>,
     global: v8::Local<'s, v8::Object>,
     handle: crate::document_runtime::DomHandle,
 ) {
-    let host_ptr = host as *mut JsContextHost;
+    let host_ptr = host as *mut PageScriptHost;
     if let Some(frame_element) = host
         .native_bridge_mut()
         .wrap_handle(scope, host_ptr, handle)

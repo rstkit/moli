@@ -3,8 +3,9 @@ mod request;
 mod service_worker;
 
 use self::paths::{
-    record_intercepted_fetch, reject_bad_port_fetch, reject_blocked_fetch, reject_csp_fetch,
-    reject_offline_fetch, reject_url_policy_fetch, resolve_local_fetch, spawn_network_fetch,
+    local_fetch_error_text, record_intercepted_fetch, reject_bad_port_fetch, reject_blocked_fetch,
+    reject_csp_fetch, reject_offline_fetch, reject_url_policy_fetch, resolve_local_fetch,
+    spawn_network_fetch,
 };
 use self::request::prepare_window_fetch_request;
 use self::service_worker::dispatch_service_worker_fetch;
@@ -16,7 +17,7 @@ use crate::structured_clone::V8StructuredClonePayload;
 use moli_webapi_declare::{ObjectLiteralDeclaration, WebApiObject};
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct FetchAbortListenerOptionsDeclaration {
     #[webapi(init = true)]
     once: (),
@@ -54,7 +55,12 @@ fn window_fetch_abort_signal_callback<'s>(
         .and_then(|signal| host.abort_signal_reason(scope, signal))
         .unwrap_or_else(|| abort_error_value(scope));
     let reason_payload = structured_serialize_fetch_abort_reason(scope, reason);
-    let _ = host.abort_fetch_promise(scope, internal_id, reason, reason_payload);
+    let timing = host.abort_fetch_promise(scope, internal_id, reason, reason_payload);
+    if let Some((context, entry)) = timing {
+        let context = v8::Local::new(scope, &context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        crate::context_bootstrap::record_resource_performance_entry(scope, entry);
+    }
     rv.set_undefined();
 }
 
@@ -76,7 +82,7 @@ fn error_name_message_snapshot<'s>(
     value: v8::Local<'s, v8::Value>,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let global = scope.get_current_context().global(scope);
-    let error_constructor = crate::util::registered_intrinsic_constructor(scope, global, "Error")?;
+    let error_constructor = crate::util::registered_ecmascript_constructor(scope, global, "Error")?;
     if !value.instance_of(scope, error_constructor).unwrap_or(false) {
         return None;
     }
@@ -151,26 +157,14 @@ pub(crate) fn window_fetch_callback<'s>(
     // caller's realm is still current. Besides choosing the right realm for
     // conversion failures, this permits getters to run; the frozen receiver
     // is revalidated only after all such author code has completed.
-    let mut parsed = match parse_window_fetch_input(scope, &args) {
-        Ok(parsed) => parsed,
-        Err(message) => {
-            rv.set(make_rejected_promise(scope, &message).into());
-            return;
-        }
-    };
-    let signal_value = window_fetch_signal_value(scope, &args);
-    let signal = match signal_value {
-        Some(value) => {
-            match validate_window_fetch_signal(scope, unsafe { &mut *host_ptr }, value) {
-                Ok(signal) => signal,
-                Err(message) => {
-                    rv.set(make_rejected_promise(scope, &message).into());
-                    return;
-                }
+    let mut parsed =
+        match convert_fetch_arguments(scope, |scope| parse_window_fetch_input(scope, &args)) {
+            Ok(parsed) => parsed,
+            Err(exception) => {
+                rv.set(make_rejected_promise_with_value(scope, exception).into());
+                return;
             }
-        }
-        None => None,
-    };
+        };
 
     let Some(binding) = receiver.resolve_live_binding(unsafe { &*host_ptr }) else {
         // This also catches the subtle generation race where a RequestInit
@@ -190,13 +184,13 @@ pub(crate) fn window_fetch_callback<'s>(
         mark_request_input_body_used_for_fetch(scope, request_body_owner);
     }
     let fetch_context = crate::native_bridge::WindowFetchContext::from_realm(binding);
-    let signal = signal.map(|signal| v8::Global::new(scope, signal));
     let relevant_context = {
         let context = fetch_context.script_realm().context(scope);
         v8::Global::new(scope, context)
     };
     let relevant_context = v8::Local::new(scope, &relevant_context);
     let scope = &mut v8::ContextScope::new(scope, relevant_context);
+    let signal = parsed.signal.take();
     window_fetch_callback_in_relevant_realm(scope, parsed, signal, fetch_context, rv);
 }
 
@@ -216,8 +210,8 @@ fn window_fetch_callback_in_relevant_realm<'s>(
     let signal = signal.as_ref().map(|signal| v8::Local::new(scope, signal));
     let prepared = match prepare_window_fetch_request(scope, parsed, fetch_context, host) {
         Ok(prepared) => prepared,
-        Err(message) => {
-            rv.set(make_rejected_promise(scope, &message).into());
+        Err(error) => {
+            rv.set(make_rejected_promise(scope, &error.to_string()).into());
             return;
         }
     };
@@ -262,6 +256,24 @@ fn window_fetch_callback_in_relevant_realm<'s>(
         return;
     }
 
+    if let Err(error) = moli_fetch::FetchUrlList::new(&prepared.resolved_url, &[])
+        .validate_request_mode(prepared.request_mode, &prepared.request_origin)
+    {
+        rv.set(make_rejected_promise(scope, &error.to_string()).into());
+        return;
+    }
+
+    if let Err(error) = validate_no_cors_http_redirect_mode(
+        &prepared.request_origin,
+        &prepared.resolved_url,
+        prepared.request_mode,
+        prepared.redirect_mode,
+    ) {
+        let message = reject_url_policy_fetch(host, prepared, error.to_string());
+        rv.set(make_rejected_promise(scope, &message).into());
+        return;
+    }
+
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         rv.set_undefined();
         return;
@@ -274,8 +286,45 @@ fn window_fetch_callback_in_relevant_realm<'s>(
         return;
     }
 
+    // Renderer-owned URLs, including local errors, bypass network interception.
+    match resolve_local_fetch(host, &prepared) {
+        Ok(Some(response)) => {
+            let response_obj = build_fetch_response_object_for_request_mode(
+                scope,
+                &prepared.request_origin,
+                FetchResponseRequest {
+                    method: &prepared.method,
+                    mode: prepared.request_mode,
+                },
+                response,
+            );
+            resolver.resolve(scope, response_obj.into());
+            rv.set(promise.into());
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let message = local_fetch_error_text(&error);
+            let exception = v8_string(scope, &message)
+                .map(|message| v8::Exception::type_error(scope, message))
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            resolver.reject(scope, exception);
+            rv.set(promise.into());
+            return;
+        }
+    }
+
     if host.should_intercept_subresource(SubresourceResourceType::Fetch) {
-        record_intercepted_fetch(scope, host, resolver, prepared);
+        let internal_id = match record_intercepted_fetch(scope, host, resolver, prepared) {
+            Ok(internal_id) => internal_id,
+            Err(message) => {
+                rv.set(make_rejected_promise(scope, &message).into());
+                return;
+            }
+        };
+        if let Some(signal) = signal {
+            install_window_fetch_abort_listener(scope, signal, internal_id);
+        }
         rv.set(promise.into());
         return;
     }
@@ -286,42 +335,12 @@ fn window_fetch_callback_in_relevant_realm<'s>(
         return;
     }
 
-    match dispatch_service_worker_fetch(scope, host, resolver, &prepared) {
-        Ok(Some(internal_id)) => {
-            if let Some(signal) = signal {
-                install_window_fetch_abort_listener(scope, signal, internal_id);
-            }
-            rv.set(promise.into());
-            return;
+    if let Some(internal_id) = dispatch_service_worker_fetch(scope, host, resolver, &prepared) {
+        if let Some(signal) = signal {
+            install_window_fetch_abort_listener(scope, signal, internal_id);
         }
-        Ok(None) => {}
-        Err(message) => {
-            rv.set(make_rejected_promise(scope, &message).into());
-            return;
-        }
-    }
-
-    match resolve_local_fetch(host, &prepared) {
-        Ok(Some((document_url, response))) => {
-            let response_obj = build_fetch_response_object_for_request_mode(
-                scope,
-                &document_url,
-                prepared.request_mode,
-                response,
-            );
-            resolver.resolve(scope, response_obj.into());
-            rv.set(promise.into());
-            return;
-        }
-        Ok(None) => {}
-        Err(message) => {
-            let exception = v8_string(scope, &message)
-                .map(|message| v8::Exception::type_error(scope, message))
-                .unwrap_or_else(|| v8::undefined(scope).into());
-            resolver.reject(scope, exception);
-            rv.set(promise.into());
-            return;
-        }
+        rv.set(promise.into());
+        return;
     }
 
     let internal_id = match spawn_network_fetch(scope, host, resolver, prepared) {
@@ -335,57 +354,6 @@ fn window_fetch_callback_in_relevant_realm<'s>(
         install_window_fetch_abort_listener(scope, signal, internal_id);
     }
     rv.set(promise.into());
-}
-
-fn window_fetch_signal_value<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let signal_key = v8str(scope, "signal");
-    if args.length() > 1 {
-        let init_arg = args.get(1);
-        if !init_arg.is_null_or_undefined()
-            && let Ok(init) = v8::Local::<v8::Object>::try_from(init_arg)
-            && init.has(scope, signal_key.into()).unwrap_or(false)
-        {
-            let value = init
-                .get(scope, signal_key.into())
-                .unwrap_or_else(|| v8::undefined(scope).into());
-            return Some(value);
-        }
-    }
-
-    let request_like = args.get(0);
-    if !request_like.is_null_or_undefined()
-        && request_like.is_object()
-        && let Ok(request_like) = v8::Local::<v8::Object>::try_from(request_like)
-        && let Some(value) = request_like.get(scope, signal_key.into())
-    {
-        return Some(value);
-    }
-
-    None
-}
-
-fn validate_window_fetch_signal<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    host: &mut JsContextHost,
-    value: v8::Local<'s, v8::Value>,
-) -> Result<Option<v8::Local<'s, v8::Object>>, String> {
-    if value.is_null_or_undefined() {
-        return Ok(None);
-    }
-    let Ok(signal) = v8::Local::<v8::Object>::try_from(value) else {
-        return Err(
-            "Failed to execute 'fetch' on 'Window': signal must be an AbortSignal.".to_owned(),
-        );
-    };
-    if !host.is_abort_signal(scope, signal) {
-        return Err(
-            "Failed to execute 'fetch' on 'Window': signal must be an AbortSignal.".to_owned(),
-        );
-    }
-    Ok(Some(signal))
 }
 
 fn install_window_fetch_abort_listener<'s>(

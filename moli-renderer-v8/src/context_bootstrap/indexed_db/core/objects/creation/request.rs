@@ -1,41 +1,63 @@
 use super::*;
+use crate::context_bootstrap::{
+    SIMPLE_EVENT_TARGET_LISTENERS_SLOT, simple_event_target_handler_getter_callback,
+    simple_event_target_handler_setter_callback,
+};
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
-#[derive(WebApiObject)]
-#[webapi(interface = "Object")]
-struct IdbRequestObjectDeclaration<'scope> {
-    #[webapi(slot = INDEXED_DB_EVENT_LISTENERS_SLOT, init = "null_object")]
+#[derive(Default, WebApiObject)]
+#[webapi(prototype = "Object", interface = web_api_interfaces::IDBRequest)]
+struct IdbRequestObjectDeclaration {
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
     event_listeners: (),
 
-    #[webapi(data_property, enumerable)]
-    source: v8::Local<'scope, v8::Value>,
-
-    #[webapi(data_property, enumerable)]
-    transaction: v8::Local<'scope, v8::Value>,
-
-    #[webapi(data_property, enumerable, init = "undefined")]
-    result: (),
-
-    #[webapi(data_property, enumerable, init = "null")]
-    error: (),
-
-    #[webapi(data_property, enumerable)]
-    ready_state: &'static str,
-
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(
+        accessor_property = "onsuccess",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onsuccess"),
+        setter_data = v8str(scope, "onsuccess"),
+        enumerable,
+        receiver = web_api_interfaces::IDBRequest::is_instance
+    )]
     onsuccess: (),
 
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(
+        accessor_property = "onerror",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onerror"),
+        setter_data = v8str(scope, "onerror"),
+        enumerable,
+        receiver = web_api_interfaces::IDBRequest::is_instance
+    )]
     onerror: (),
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::IDBOpenDBRequest)]
 struct IdbOpenRequestHandlersDeclaration {
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(
+        accessor_property = "onupgradeneeded",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onupgradeneeded"),
+        setter_data = v8str(scope, "onupgradeneeded"),
+        enumerable,
+        receiver = web_api_interfaces::IDBOpenDBRequest::is_instance
+    )]
     onupgradeneeded: (),
 
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(
+        accessor_property = "onblocked",
+        getter = simple_event_target_handler_getter_callback,
+        setter = simple_event_target_handler_setter_callback,
+        data = v8str(scope, "onblocked"),
+        setter_data = v8str(scope, "onblocked"),
+        enumerable,
+        receiver = web_api_interfaces::IDBOpenDBRequest::is_instance
+    )]
     onblocked: (),
 }
 
@@ -131,9 +153,7 @@ fn create_request_object_in_current_context<'s>(
     let transaction_value = transaction
         .map(Into::into)
         .unwrap_or_else(|| v8::null(scope).into());
-    let request = IdbRequestObjectDeclaration::new(source, transaction_value, "pending")
-        .bind(scope)
-        .ok()?;
+    let request = IdbRequestObjectDeclaration::default().bind(scope).ok()?;
     if is_open {
         IdbOpenRequestHandlersDeclaration::default()
             .initialize(scope, request)
@@ -144,13 +164,15 @@ fn create_request_object_in_current_context<'s>(
     } else {
         global_constructor_prototype(scope, "IDBRequest")?
     };
-    let _ = request.set_prototype(scope, prototype.into());
+    request
+        .set_prototype(scope, prototype.into())?
+        .then_some(())?;
     let kind = if is_open {
         IndexedDbWrapperKind::OpenRequest
     } else {
         IndexedDbWrapperKind::Request
     };
     register_indexed_db_wrapper_with_owner(scope, request, kind, owner, storage_scope);
-    register_indexed_db_request_lifecycle(scope, request, source, transaction_value, false);
+    register_indexed_db_request_lifecycle(scope, request, source, transaction_value);
     Some(request)
 }

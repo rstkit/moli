@@ -19,6 +19,21 @@ pub(in crate::context_bootstrap) const STORAGE_INTERFACE_NAMES: &[&str] = &[
 ];
 
 pub(in crate::context_bootstrap) const WORKER_SHARED_INTERFACE_NAMES: &[&str] = &[
+    "NetworkInformation",
+    // WorkerNavigator's native Service Worker support needs the intrinsic
+    // prototype even when the interface object is hidden on the global.
+    "ServiceWorkerContainer",
+    "ServiceWorkerRegistration",
+    "ServiceWorker",
+    "RTCEncodedAudioFrame",
+    "RTCEncodedVideoFrame",
+    "DOMRectReadOnly",
+    "DOMRect",
+    "DOMPointReadOnly",
+    "DOMPoint",
+    "DOMQuad",
+    "DOMMatrixReadOnly",
+    "DOMMatrix",
     "EventTarget",
     "Event",
     "CustomEvent",
@@ -28,11 +43,16 @@ pub(in crate::context_bootstrap) const WORKER_SHARED_INTERFACE_NAMES: &[&str] = 
     "SecurityPolicyViolationEvent",
     "CloseEvent",
     "Worker",
+    "WebTransportError",
+    "WebTransportBidirectionalStream",
+    "WebTransportDatagramDuplexStream",
     "WebSocket",
+    "WebSocketError",
     "AbortSignal",
     "AbortController",
     "Headers",
     "Request",
+    "ReportBody",
     "Response",
     "ProgressEvent",
     "XMLHttpRequestEventTarget",
@@ -44,20 +64,30 @@ pub(in crate::context_bootstrap) const WORKER_SHARED_INTERFACE_NAMES: &[&str] = 
     "Crypto",
     "SubtleCrypto",
     "CryptoKey",
+    "PerformanceServerTiming",
     "MediaCapabilities",
     "NavigatorUAData",
+    "Lock",
+    "LockManager",
     "WorkerNavigator",
     "MessageChannel",
     "MessagePort",
     "BroadcastChannel",
     "Notification",
     "ImageData",
+    "MediaSourceHandle",
+    "SourceBuffer",
+    "SourceBufferList",
+    "EncodedVideoChunk",
     "ImageBitmap",
+    "ImageBitmapRenderingContext",
     "CanvasGradient",
     "CanvasPattern",
     "TextMetrics",
     "OffscreenCanvas",
     "OffscreenCanvasRenderingContext2D",
+    "VideoDecoder",
+    "VideoEncoder",
     "WebGLRenderingContext",
     "WebGL2RenderingContext",
     "WebGLObject",
@@ -67,6 +97,15 @@ pub(in crate::context_bootstrap) const WORKER_SHARED_INTERFACE_NAMES: &[&str] = 
     "WebGLRenderbuffer",
     "WebGLShader",
     "WebGLUniformLocation",
+    "WebGLTexture",
+    "WebGLQuery",
+    "WebGLSampler",
+    "WebGLSync",
+    "WebGLTransformFeedback",
+    "WebGLVertexArrayObject",
+    "WebGLActiveInfo",
+    "WebGLShaderPrecisionFormat",
+    "WebGLContextEvent",
     "Path2D",
     "Blob",
     "File",
@@ -75,18 +114,72 @@ pub(in crate::context_bootstrap) const WORKER_SHARED_INTERFACE_NAMES: &[&str] = 
     "FileReaderSync",
     "DOMException",
     "QuotaExceededError",
+    "Performance",
+    "PerformanceObserver",
+    "PerformanceObserverEntryList",
+    "PerformanceEntry",
+    "PerformanceMark",
+    "PerformanceMeasure",
+    "PerformanceResourceTiming",
     "URL",
     "URLSearchParams",
     "FormData",
+    "Cache",
+    "CacheStorage",
 ];
 
 const SECURE_CONTEXT_ONLY_INTERFACE_NAMES: &[&str] = &[
+    "BatteryManager",
+    "ServiceWorkerContainer",
+    "ServiceWorkerRegistration",
+    "ServiceWorker",
+    "PaymentRequestUpdateEvent",
+    "PaymentMethodChangeEvent",
+    "AuthenticatorAssertionResponse",
+    "AuthenticatorAttestationResponse",
+    "AuthenticatorResponse",
+    "PublicKeyCredential",
+    "Credential",
+    "CredentialsContainer",
+    "MIDIPort",
+    "MIDIConnectionEvent",
+    "MIDIMessageEvent",
+    "MIDIAccess",
+    "MIDIInput",
+    "MIDIOutput",
+    "MIDIInputMap",
+    "MIDIOutputMap",
+    "ModelContext",
+    "ToolActivatedEvent",
+    "ToolCancelEvent",
+    "WebTransportError",
+    "WebTransportBidirectionalStream",
+    "WebTransportDatagramDuplexStream",
+    "MediaKeySession",
+    "MediaKeyStatusMap",
+    "MediaKeySystemAccess",
+    "MediaKeys",
+    "MediaDeviceInfo",
+    "InputDeviceInfo",
+    "DeviceMotionEvent",
+    "DeviceMotionEventAcceleration",
+    "DeviceMotionEventRotationRate",
+    "DeviceOrientationEvent",
     "MediaDevices",
     "SubtleCrypto",
     "CryptoKey",
+    "PaymentResponse",
+    "Lock",
+    "LockManager",
     "IdleDetector",
+    "Worklet",
+    "AudioWorklet",
     "Clipboard",
     "ClipboardItem",
+    "Cache",
+    "CacheStorage",
+    "VideoDecoder",
+    "VideoEncoder",
 ];
 const WORKER_ONLY_INTERFACE_NAMES: &[&str] = &["WorkerNavigator", "WorkerLocation"];
 const WINDOW_DEDICATED_AND_SHARED_WORKER_INTERFACE_NAMES: &[&str] = &[
@@ -97,6 +190,8 @@ const WINDOW_DEDICATED_AND_SHARED_WORKER_INTERFACE_NAMES: &[&str] = &[
     "XMLHttpRequest",
 ];
 const DEDICATED_AND_SHARED_WORKER_INTERFACE_NAMES: &[&str] = &["FileReaderSync"];
+const WINDOW_AND_DEDICATED_WORKER_INTERFACE_NAMES: &[&str] =
+    &["MediaSourceHandle", "SourceBuffer", "SourceBufferList"];
 
 pub(in crate::context_bootstrap) const INDEXED_DB_INTERFACE_NAMES: &[&str] = &[
     "DOMStringList",
@@ -110,6 +205,7 @@ pub(in crate::context_bootstrap) const INDEXED_DB_INTERFACE_NAMES: &[&str] = &[
     "IDBCursor",
     "IDBCursorWithValue",
     "IDBKeyRange",
+    "IDBRecord",
     "IDBVersionChangeEvent",
 ];
 
@@ -121,6 +217,7 @@ pub(crate) fn dedicated_worker_lazy_interface_names_for_test() -> Vec<&'static s
         .chain(WORKER_SHARED_INTERFACE_NAMES.iter().copied())
         .chain(crate::context_bootstrap::streams::stream_interface_names())
         .chain(INDEXED_DB_INTERFACE_NAMES.iter().copied())
+        .filter(|name| exposure_for_name(name).contains(RealmKind::DedicatedWorker))
         .collect()
 }
 
@@ -212,6 +309,8 @@ impl ExposureSet {
     const SERVICE_WORKER: u8 = 1 << 3;
 
     const WINDOW_ONLY: Self = Self(Self::WINDOW);
+    const WINDOW_AND_DEDICATED_WORKER: Self = Self(Self::WINDOW | Self::DEDICATED_WORKER);
+    const WINDOW_AND_SERVICE_WORKER: Self = Self(Self::WINDOW | Self::SERVICE_WORKER);
     const ALL_REALMS: Self =
         Self(Self::WINDOW | Self::DEDICATED_WORKER | Self::SHARED_WORKER | Self::SERVICE_WORKER);
     const WORKERS: Self = Self(Self::DEDICATED_WORKER | Self::SHARED_WORKER | Self::SERVICE_WORKER);
@@ -264,7 +363,12 @@ impl ExposedInterfaceMetadata {
     }
 
     pub(super) fn is_supported_by(self, profile: TemplateBuildProfile) -> bool {
-        self.exposure.contains(profile.realm_kind()) && profile.supports_name(self.name)
+        // Native WorkerNavigator factories need these prototypes independently
+        // of whether their interface objects are exposed on the worker global.
+        let worker_factory_intrinsic = profile != TemplateBuildProfile::Window
+            && matches!(self.name, "ServiceWorkerContainer" | "ServiceWorker");
+        (self.exposure.contains(profile.realm_kind()) || worker_factory_intrinsic)
+            && profile.supports_name(self.name)
     }
 }
 
@@ -278,10 +382,10 @@ impl ExposedInterfaceMetadataTable {
         let mut by_name = HashMap::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
             let id = InterfaceId::from_index(index)?;
-            if by_name.insert(spec.name, id).is_some() {
+            if by_name.insert(spec.interface.name(), id).is_some() {
                 return Err(anyhow!(
                     "duplicate exposed interface metadata name `{}`",
-                    spec.name
+                    spec.interface.name()
                 ));
             }
         }
@@ -289,18 +393,19 @@ impl ExposedInterfaceMetadataTable {
         let mut entries = Vec::with_capacity(specs.len());
         for (index, spec) in specs.iter().enumerate() {
             let parent = spec
-                .parent
+                .interface
+                .parent_name()
                 .map(|name| {
                     by_name.get(name).copied().ok_or_else(|| {
                         anyhow!(
                             "exposed interface `{}` references unknown parent `{name}`",
-                            spec.name
+                            spec.interface.name()
                         )
                     })
                 })
                 .transpose()?;
-            let is_storage = STORAGE_INTERFACE_NAMES.contains(&spec.name);
-            let exposure = exposure_for_name(spec.name);
+            let is_storage = STORAGE_INTERFACE_NAMES.contains(&spec.interface.name());
+            let exposure = exposure_for_name(spec.interface.name());
             let prototype_property = match spec.prototype_property() {
                 ConstructorPrototypeProperty::TemplateReadOnly => {
                     ResolvedPrototypeProperty::TemplateReadOnly
@@ -311,7 +416,7 @@ impl ExposedInterfaceMetadataTable {
                     let prototype = by_name.get(prototype_interface).copied().ok_or_else(|| {
                         anyhow!(
                             "exposed interface `{}` references unknown runtime prototype interface `{prototype_interface}`",
-                            spec.name
+                            spec.interface.name()
                         )
                     })?;
                     ResolvedPrototypeProperty::RuntimeInstalled { prototype }
@@ -319,12 +424,12 @@ impl ExposedInterfaceMetadataTable {
             };
             entries.push(ExposedInterfaceMetadata {
                 id: InterfaceId::from_index(index)?,
-                name: spec.name,
+                name: spec.interface.name(),
                 kind: spec.kind,
                 parent,
                 exposure,
                 secure_context_only: is_storage
-                    || SECURE_CONTEXT_ONLY_INTERFACE_NAMES.contains(&spec.name),
+                    || SECURE_CONTEXT_ONLY_INTERFACE_NAMES.contains(&spec.interface.name()),
                 installation: installation_for_spec(*spec),
                 prototype_property,
             });
@@ -357,9 +462,9 @@ impl ExposedInterfaceMetadataTable {
 }
 
 pub(super) fn installation_for_spec(spec: ConstructorSpec) -> GlobalInstallation {
-    if NON_EXPOSED_INTERFACE_NAMES.contains(&spec.name) {
+    if NON_EXPOSED_INTERFACE_NAMES.contains(&spec.interface.name()) {
         GlobalInstallation::NotExposed
-    } else if EAGER_INTERFACE_NAMES.contains(&spec.name) {
+    } else if EAGER_INTERFACE_NAMES.contains(&spec.interface.name()) {
         GlobalInstallation::Eager
     } else {
         GlobalInstallation::Lazy
@@ -368,13 +473,22 @@ pub(super) fn installation_for_spec(spec: ConstructorSpec) -> GlobalInstallation
 
 fn exposure_for_name(name: &str) -> ExposureSet {
     match name {
+        "ServiceWorkerContainer" => ExposureSet::WINDOW_ONLY,
+        "ServiceWorker" => ExposureSet::WINDOW_AND_SERVICE_WORKER,
         "FileSystemSyncAccessHandle" => ExposureSet::DEDICATED_WORKER_ONLY,
+        "RTCEncodedAudioFrame" | "RTCEncodedVideoFrame" | "EncodedVideoChunk" => {
+            ExposureSet::WINDOW_AND_DEDICATED_WORKER
+        }
         _ if WINDOW_DEDICATED_AND_SHARED_WORKER_INTERFACE_NAMES.contains(&name) => {
             ExposureSet::WINDOW_DEDICATED_AND_SHARED_WORKER
+        }
+        _ if WINDOW_AND_DEDICATED_WORKER_INTERFACE_NAMES.contains(&name) => {
+            ExposureSet::WINDOW_AND_DEDICATED_WORKER
         }
         _ if DEDICATED_AND_SHARED_WORKER_INTERFACE_NAMES.contains(&name) => {
             ExposureSet::DEDICATED_AND_SHARED_WORKER
         }
+        "VideoDecoder" | "VideoEncoder" => ExposureSet::WINDOW_AND_DEDICATED_WORKER,
         _ if WORKER_ONLY_INTERFACE_NAMES.contains(&name) => ExposureSet::WORKERS,
         _ if STORAGE_INTERFACE_NAMES.contains(&name)
             || WORKER_SHARED_INTERFACE_NAMES.contains(&name)
@@ -431,11 +545,15 @@ fn validate_materialization_cycles(entries: &[ExposedInterfaceMetadata]) -> Resu
 mod tests {
     use super::*;
     use crate::context_bootstrap::specs::ConstructorKind;
+    use crate::web_api_interfaces;
+    use moli_webapi_declare::WebApiInterfaceDescriptor;
 
-    fn spec(name: &'static str, parent: Option<&'static str>) -> ConstructorSpec {
+    fn spec(
+        name: &'static str,
+        parent: Option<&'static moli_webapi_declare::WebApiInterfaceDescriptor>,
+    ) -> ConstructorSpec {
         ConstructorSpec {
-            name,
-            parent,
+            interface: moli_webapi_declare::WebApiInterfaceDescriptor::new(name, parent),
             kind: ConstructorKind::Illegal,
         }
     }
@@ -444,7 +562,10 @@ mod tests {
     fn metadata_assigns_stable_ids_and_resolves_parents() {
         let table = ExposedInterfaceMetadataTable::from_constructor_specs(&[
             spec("Parent", None),
-            spec("Child", Some("Parent")),
+            spec(
+                "Child",
+                Some(&const { WebApiInterfaceDescriptor::new("Parent", None) }),
+            ),
         ])
         .expect("valid metadata");
         let parent = table.metadata_by_name("Parent").expect("parent metadata");
@@ -454,6 +575,32 @@ mod tests {
         assert_eq!(child.id.index(), 1);
         assert_eq!(child.parent, Some(parent.id));
         assert_eq!(child.installation, GlobalInstallation::Lazy);
+    }
+
+    #[test]
+    fn shell_encoded_video_chunk_uses_the_expected_exposure_and_lazy_policy() {
+        let table = ExposedInterfaceMetadataTable::from_constructor_specs(
+            &crate::context_bootstrap::specs::constructor_specs(),
+        )
+        .expect("shell exposure metadata");
+        for name in ["EncodedVideoChunk"] {
+            let metadata = table.metadata_by_name(name).expect("interface metadata");
+            assert_eq!(metadata.installation, GlobalInstallation::Lazy, "{name}");
+            for (realm, expected) in [
+                (RealmKind::Window, true),
+                (RealmKind::DedicatedWorker, true),
+                (RealmKind::SharedWorker, false),
+                (RealmKind::ServiceWorker, false),
+            ] {
+                assert_eq!(metadata.is_exposed(realm, true), expected, "{name}");
+                assert_eq!(metadata.is_exposed(realm, false), expected, "{name}");
+                assert_eq!(
+                    metadata.is_supported_by(TemplateBuildProfile::for_realm(realm)),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -477,6 +624,32 @@ mod tests {
         assert!(!sync.is_exposed(RealmKind::Window, true));
         assert!(sync.is_exposed(RealmKind::DedicatedWorker, true));
         assert!(!sync.is_exposed(RealmKind::SharedWorker, true));
+    }
+
+    #[test]
+    fn shell_video_codecs_uses_the_expected_exposure_and_lazy_policy() {
+        let table = ExposedInterfaceMetadataTable::from_constructor_specs(
+            &crate::context_bootstrap::specs::constructor_specs(),
+        )
+        .expect("shell exposure metadata");
+        for name in ["VideoDecoder", "VideoEncoder"] {
+            let metadata = table.metadata_by_name(name).expect("interface metadata");
+            assert_eq!(metadata.installation, GlobalInstallation::Lazy, "{name}");
+            for (realm, expected) in [
+                (RealmKind::Window, true),
+                (RealmKind::DedicatedWorker, true),
+                (RealmKind::SharedWorker, false),
+                (RealmKind::ServiceWorker, false),
+            ] {
+                assert_eq!(metadata.is_exposed(realm, true), expected, "{name}");
+                assert!(!metadata.is_exposed(realm, false), "{name}");
+                assert_eq!(
+                    metadata.is_supported_by(TemplateBuildProfile::for_realm(realm)),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -526,15 +699,56 @@ mod tests {
     }
 
     #[test]
+    fn shell_media_recorder_uses_the_expected_exposure_and_lazy_policy() {
+        let table = ExposedInterfaceMetadataTable::from_constructor_specs(
+            &crate::context_bootstrap::specs::constructor_specs(),
+        )
+        .expect("shell exposure metadata");
+        for name in ["MediaRecorder"] {
+            let metadata = table.metadata_by_name(name).expect("interface metadata");
+            assert_eq!(metadata.installation, GlobalInstallation::Lazy, "{name}");
+            for (realm, expected) in [
+                (RealmKind::Window, true),
+                (RealmKind::DedicatedWorker, false),
+                (RealmKind::SharedWorker, false),
+                (RealmKind::ServiceWorker, false),
+            ] {
+                assert_eq!(metadata.is_exposed(realm, true), expected, "{name}");
+                assert_eq!(metadata.is_exposed(realm, false), expected, "{name}");
+                assert_eq!(
+                    metadata.is_supported_by(TemplateBuildProfile::for_realm(realm)),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn chromium_worker_exposure_exceptions_are_preserved() {
         let table = ExposedInterfaceMetadataTable::from_constructor_specs(&[
-            spec("Worker", Some("EventTarget")),
+            spec(
+                "Worker",
+                Some(&const { WebApiInterfaceDescriptor::new("EventTarget", None) }),
+            ),
             spec("EventTarget", None),
-            spec("ProgressEvent", Some("Event")),
+            spec(
+                "ProgressEvent",
+                Some(&const { WebApiInterfaceDescriptor::new("Event", None) }),
+            ),
             spec("Event", None),
-            spec("XMLHttpRequestEventTarget", Some("EventTarget")),
-            spec("XMLHttpRequestUpload", Some("XMLHttpRequestEventTarget")),
-            spec("XMLHttpRequest", Some("XMLHttpRequestEventTarget")),
+            spec(
+                "XMLHttpRequestEventTarget",
+                Some(&const { WebApiInterfaceDescriptor::new("EventTarget", None) }),
+            ),
+            spec(
+                "XMLHttpRequestUpload",
+                Some(&const { WebApiInterfaceDescriptor::new("XMLHttpRequestEventTarget", None) }),
+            ),
+            spec(
+                "XMLHttpRequest",
+                Some(&const { WebApiInterfaceDescriptor::new("XMLHttpRequestEventTarget", None) }),
+            ),
             spec("FileReaderSync", None),
         ])
         .expect("worker exposure metadata");
@@ -580,8 +794,7 @@ mod tests {
             spec("Window", None),
             spec("DOMError", None),
             ConstructorSpec {
-                name: "Audio",
-                parent: None,
+                interface: web_api_interfaces::Audio::DESCRIPTOR,
                 kind: ConstructorKind::Audio,
             },
             spec("HTMLAudioElement", None),
@@ -618,6 +831,32 @@ mod tests {
     }
 
     #[test]
+    fn shell_speech_events_uses_the_expected_exposure_and_lazy_policy() {
+        let table = ExposedInterfaceMetadataTable::from_constructor_specs(
+            &crate::context_bootstrap::specs::constructor_specs(),
+        )
+        .expect("shell exposure metadata");
+        for name in ["SpeechSynthesisEvent", "SpeechSynthesisErrorEvent"] {
+            let metadata = table.metadata_by_name(name).expect("interface metadata");
+            assert_eq!(metadata.installation, GlobalInstallation::Lazy, "{name}");
+            for (realm, expected) in [
+                (RealmKind::Window, true),
+                (RealmKind::DedicatedWorker, false),
+                (RealmKind::SharedWorker, false),
+                (RealmKind::ServiceWorker, false),
+            ] {
+                assert_eq!(metadata.is_exposed(realm, true), expected, "{name}");
+                assert_eq!(metadata.is_exposed(realm, false), expected, "{name}");
+                assert_eq!(
+                    metadata.is_supported_by(TemplateBuildProfile::for_realm(realm)),
+                    expected,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn metadata_rejects_duplicate_unknown_parent_and_cycle() {
         assert!(
             ExposedInterfaceMetadataTable::from_constructor_specs(&[
@@ -629,14 +868,20 @@ mod tests {
         assert!(
             ExposedInterfaceMetadataTable::from_constructor_specs(&[spec(
                 "Child",
-                Some("Missing"),
+                Some(&const { WebApiInterfaceDescriptor::new("Missing", None) }),
             )])
             .is_err()
         );
         assert!(
             ExposedInterfaceMetadataTable::from_constructor_specs(&[
-                spec("A", Some("B")),
-                spec("B", Some("A")),
+                spec(
+                    "A",
+                    Some(&const { WebApiInterfaceDescriptor::new("B", None) })
+                ),
+                spec(
+                    "B",
+                    Some(&const { WebApiInterfaceDescriptor::new("A", None) })
+                ),
             ])
             .is_err()
         );
@@ -646,8 +891,7 @@ mod tests {
     fn metadata_resolves_and_validates_runtime_prototype_dependencies() {
         let table = ExposedInterfaceMetadataTable::from_constructor_specs(&[
             ConstructorSpec {
-                name: "Audio",
-                parent: None,
+                interface: web_api_interfaces::Audio::DESCRIPTOR,
                 kind: ConstructorKind::Audio,
             },
             spec("HTMLAudioElement", None),
@@ -666,8 +910,7 @@ mod tests {
 
         assert!(
             ExposedInterfaceMetadataTable::from_constructor_specs(&[ConstructorSpec {
-                name: "Audio",
-                parent: None,
+                interface: web_api_interfaces::Audio::DESCRIPTOR,
                 kind: ConstructorKind::Audio,
             }])
             .is_err(),
@@ -676,11 +919,13 @@ mod tests {
         assert!(
             ExposedInterfaceMetadataTable::from_constructor_specs(&[
                 ConstructorSpec {
-                    name: "Audio",
-                    parent: None,
+                    interface: web_api_interfaces::Audio::DESCRIPTOR,
                     kind: ConstructorKind::Audio,
                 },
-                spec("HTMLAudioElement", Some("Audio")),
+                spec(
+                    "HTMLAudioElement",
+                    Some(&const { WebApiInterfaceDescriptor::new("Audio", None) })
+                ),
             ])
             .is_err(),
             "runtime prototype dependencies must participate in cycle validation"

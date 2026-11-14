@@ -22,8 +22,8 @@ pub(crate) use documents::{
 pub(crate) use elements::preserve_detached_element_bridge_for_custom_prototype;
 pub(in crate::native_bridge::document) use elements::{
     build_detached_element_object, copy_detached_element_bridge_members,
-    generic_html_element_proxy, mirror_detached_private_slots,
-    remove_detached_element_instance_selector_matching_methods, select_html_element_proxy,
+    generic_html_element_proxy, remove_detached_element_instance_selector_matching_methods,
+    select_html_element_proxy,
 };
 pub(crate) use names::is_valid_pi_target;
 pub(in crate::native_bridge::document) use names::{
@@ -36,7 +36,7 @@ pub(in crate::native_bridge::document) use nodes::{
 pub(in crate::native_bridge::document) use state::{new_detached_state_object, new_map_object};
 
 fn initialize_new_detached_native_node_owner_document(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     owner_document: DomHandle,
     handle: DomHandle,
 ) -> Option<DomHandle> {

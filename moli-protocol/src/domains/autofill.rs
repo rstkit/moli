@@ -1,3 +1,5 @@
+use anyhow::Result;
+
 use chromiumoxide_cdp::cdp::browser_protocol::autofill::TriggerParams;
 use moli_core::page::{
     CompletedPageCommand, PendingPageCommand, RendererAutofillAddressField,
@@ -18,7 +20,7 @@ pub(crate) struct PendingAutofillCommandDispatch {
 pub(crate) struct CompletedAutofillCommandDispatch {
     command_id: Option<u64>,
     owner_scope: CommandOwnerScope,
-    completed: Result<CompletedPageCommand, String>,
+    completed: Result<CompletedPageCommand>,
 }
 
 pub(crate) enum AutofillCommandTaskStep {
@@ -31,7 +33,7 @@ impl PendingAutofillCommandDispatch {
         CompletedAutofillCommandDispatch {
             command_id: self.command_id,
             owner_scope: self.owner_scope,
-            completed: self.pending.wait().await.map_err(|error| error.to_string()),
+            completed: self.pending.wait().await,
         }
     }
 }
@@ -50,32 +52,82 @@ pub(crate) fn try_start_autofill_command_dispatch(
     conn: &mut CdpConnection,
     cmd: &Cmd<'_>,
 ) -> AutofillCommandTaskStep {
+    let request = match prepare_request(conn, cmd) {
+        Ok(request) => request,
+        Err(plan) => return AutofillCommandTaskStep::Complete(plan),
+    };
+    let owner_scope = CommandOwnerScope::capture(conn, cmd.session_id);
+    let pending = conn
+        .loaded_page_mut_for_protocol_access(cmd.session_id)
+        .and_then(|page| page.start_autofill_trigger(request));
+    match pending {
+        Ok(pending) => AutofillCommandTaskStep::Pending(PendingAutofillCommandDispatch {
+            command_id: cmd.id,
+            owner_scope,
+            pending,
+        }),
+        Err(message) => {
+            AutofillCommandTaskStep::Complete(CommandOutputPlan::error(-32000, message))
+        }
+    }
+}
+
+pub(crate) fn complete_pending_autofill_command(
+    conn: &mut CdpConnection,
+    completed: CompletedAutofillCommandDispatch,
+) -> CommandOutputPlan {
+    let outcome = completed.completed.and_then(|completion| {
+        conn.loaded_page_mut_for_protocol_access_for_owner(&completed.owner_scope)
+            .and_then(|page| page.finish_autofill_trigger(completion))
+    });
+    project_outcome(outcome)
+        .map(|()| CommandOutputPlan::success())
+        .unwrap_or_else(|(code, message)| CommandOutputPlan::error(code, message))
+}
+
+fn project_outcome(outcome: Result<RendererAutofillTriggerOutcome>) -> Result<(), (i32, String)> {
+    match outcome {
+        Ok(RendererAutofillTriggerOutcome::Applied { .. }) => Ok(()),
+        Ok(RendererAutofillTriggerOutcome::FieldNotFound) => {
+            Err((-32600, "Field not found".to_owned()))
+        }
+        Ok(RendererAutofillTriggerOutcome::FrameNotFound) => {
+            Err((-32000, "Frame not found".to_owned()))
+        }
+        Ok(RendererAutofillTriggerOutcome::CardAndAddressProvided) => Err((
+            -32600,
+            "Card and address cannot both be provided".to_owned(),
+        )),
+        Ok(RendererAutofillTriggerOutcome::MissingCardOrAddress) => {
+            Err((-32600, "Either card or address must be provided".to_owned()))
+        }
+        Ok(RendererAutofillTriggerOutcome::AddressNotSupported) => {
+            Err((-32000, "Address autofill is not supported".to_owned()))
+        }
+        Err(error) => Err((-32000, format!("{error:#}"))),
+    }
+}
+fn prepare_request(
+    conn: &CdpConnection,
+    cmd: &Cmd<'_>,
+) -> Result<RendererAutofillTriggerRequest, CommandOutputPlan> {
     match cmd.parse_action::<AutofillAction>() {
         Some(AutofillAction::Trigger) => {}
         None => {
-            return AutofillCommandTaskStep::Complete(CommandOutputPlan::error(
-                -32601,
-                "UnknownMethod",
-            ));
+            return Err(CommandOutputPlan::error(-32601, "UnknownMethod"));
         }
     }
     if let Err(message) = conn.ensure_document_accessible_for_session_owner(cmd.session_id) {
-        return AutofillCommandTaskStep::Complete(CommandOutputPlan::error(-32000, message));
+        return Err(CommandOutputPlan::error(-32000, message));
     }
     let params = match cmd.get_params::<TriggerParams>() {
         Ok(Some(params)) => params,
         _ => {
-            return AutofillCommandTaskStep::Complete(CommandOutputPlan::error(
-                -32602,
-                "Invalid parameters",
-            ));
+            return Err(CommandOutputPlan::error(-32602, "Invalid parameters"));
         }
     };
     let Ok(field_id) = u32::try_from(*params.field_id.inner()) else {
-        return AutofillCommandTaskStep::Complete(CommandOutputPlan::error(
-            -32602,
-            "Invalid parameters",
-        ));
+        return Err(CommandOutputPlan::error(-32602, "Invalid parameters"));
     };
     let top_frame_id = conn
         .target_session_owner_frame_tree_identity(cmd.session_id)
@@ -107,55 +159,32 @@ pub(crate) fn try_start_autofill_command_dispatch(
         card,
         address,
     };
-    let owner_scope = CommandOwnerScope::capture(conn, cmd.session_id);
-    let pending = conn
-        .loaded_page_mut_for_protocol_access(cmd.session_id)
-        .and_then(|page| {
-            page.start_autofill_trigger(request)
-                .map_err(|error| error.to_string())
-        });
-    match pending {
-        Ok(pending) => AutofillCommandTaskStep::Pending(PendingAutofillCommandDispatch {
-            command_id: cmd.id,
-            owner_scope,
-            pending,
-        }),
-        Err(message) => {
-            AutofillCommandTaskStep::Complete(CommandOutputPlan::error(-32000, message))
-        }
-    }
+    Ok(request)
 }
 
-pub(crate) fn complete_pending_autofill_command(
+pub(crate) fn try_start_native_command(
     conn: &mut CdpConnection,
-    completed: CompletedAutofillCommandDispatch,
-) -> CommandOutputPlan {
-    let outcome = completed.completed.and_then(|completion| {
-        conn.loaded_page_mut_for_protocol_access_for_owner(&completed.owner_scope)
-            .and_then(|page| {
-                page.finish_autofill_trigger(completion)
-                    .map_err(|error| error.to_string())
+    cmd: &Cmd<'_>,
+) -> Option<super::native::NativeCommandStep> {
+    use moli_core::{
+        RendererNativeProtocolResponse as Response, RendererPageCommand as Command,
+        RendererPageReply as Reply,
+    };
+    Some(match prepare_request(conn, cmd) {
+        Ok(request) => {
+            super::native::start(conn, cmd, Command::TriggerAutofill(request), |reply| {
+                let outcome = match reply {
+                    Ok(Reply::AutofillTriggerOutcome(outcome)) => Ok(outcome),
+                    Err(error) => Err(error),
+                    _ => unreachable!("Autofill trigger reply"),
+                };
+                project_outcome(outcome)
+                    .map(|()| Response::success(serde_json::json!({})))
+                    .unwrap_or_else(|(code, message)| Response::error(code, message))
             })
-    });
-    match outcome {
-        Ok(RendererAutofillTriggerOutcome::Applied { .. }) => CommandOutputPlan::success(),
-        Ok(RendererAutofillTriggerOutcome::FieldNotFound) => {
-            CommandOutputPlan::error(-32600, "Field not found")
         }
-        Ok(RendererAutofillTriggerOutcome::FrameNotFound) => {
-            CommandOutputPlan::error(-32000, "Frame not found")
-        }
-        Ok(RendererAutofillTriggerOutcome::CardAndAddressProvided) => {
-            CommandOutputPlan::error(-32600, "Card and address cannot both be provided")
-        }
-        Ok(RendererAutofillTriggerOutcome::MissingCardOrAddress) => {
-            CommandOutputPlan::error(-32600, "Either card or address must be provided")
-        }
-        Ok(RendererAutofillTriggerOutcome::AddressNotSupported) => {
-            CommandOutputPlan::error(-32000, "Address autofill is not supported")
-        }
-        Err(message) => CommandOutputPlan::error(-32000, message),
-    }
+        Err(plan) => super::native::NativeCommandStep::Complete(plan),
+    })
 }
 
 #[cfg(test)]
@@ -168,8 +197,7 @@ mod tests {
         browser_context.set_active_target_id("TID-1".to_owned());
         browser_context.set_target_url("data:text/html,autofill-test".to_owned());
         browser_context.attach_active_session("SID-1".to_owned());
-        ctx.conn
-            .install_browser_context_fixture_for_test(browser_context);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser_context));
         ctx.install_navigation_fixture_for_session_owner(
             &format!("data:text/html,{html}"),
             Some("SID-1"),

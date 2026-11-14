@@ -1,30 +1,31 @@
 use crate::util::{get_private_value, set_private_value, throw_type_error, v8_string, v8str};
+use std::ops::ControlFlow;
 
 use crate::document_runtime::DomHandle;
 use crate::native_bridge::{
-    BridgeHandle, ComputedStyleTargetKey, JsContextHost, bridge_handle_from_object,
+    BridgeHandle, ComputedStyleTargetKey, PageScriptHost, bridge_handle_from_object,
 };
 use crate::style_engine::StyleViewport;
 use crate::webidl;
 
-use super::super::node::{
-    node_is_element, node_runtime_and_handle_from_object,
-    node_runtime_and_handle_from_object_or_detached,
-};
+use super::super::node::{node_is_element, node_runtime_and_handle_from_object_or_detached};
 mod accessors;
+mod ancestry;
 mod computed_names;
 mod declaration;
 mod methods;
 mod named;
+#[cfg(test)]
+mod snapshot_tests;
 
 pub(crate) use accessors::{
     style_css_text_getter_callback, style_css_text_setter_callback, style_length_getter_callback,
 };
 pub(in crate::native_bridge::element) use declaration::style_base_url;
-pub(crate) use declaration::{ComputedStyleRead, StyleObservation};
+pub(crate) use declaration::{ComputedStyleRead, PreparedAnonymousStyleContext, StyleObservation};
 use declaration::{
-    StyleComputationContext, shorthand_longhands, style_property_count_with_context,
-    style_property_value_with_context, style_runtime_and_handle_from_object,
+    StyleComputationContext, style_property_count_with_context, style_property_value_with_context,
+    style_runtime_and_handle_from_object,
 };
 pub(crate) use declaration::{
     StyleMode, active_css_animation_transform_value, css_animation_start_applies,
@@ -58,6 +59,7 @@ pub(crate) const STYLE_DECLARATION_VIEWPORT_WIDTH_SLOT: &str =
     "__moliStyleDeclarationViewportWidth";
 pub(crate) const STYLE_DECLARATION_VIEWPORT_HEIGHT_SLOT: &str =
     "__moliStyleDeclarationViewportHeight";
+const STYLE_DECLARATION_DEVICE_PIXEL_RATIO_SLOT: &str = "__moliStyleDeclarationDevicePixelRatio";
 pub(crate) const STYLE_DECLARATION_SCREEN_WIDTH_SLOT: &str = "__moliStyleDeclarationScreenWidth";
 pub(crate) const STYLE_DECLARATION_SCREEN_HEIGHT_SLOT: &str = "__moliStyleDeclarationScreenHeight";
 pub(crate) const STYLE_DECLARATION_FORCED_EMPTY_COMPUTED_SLOT: &str =
@@ -75,17 +77,12 @@ const STYLE_DECLARATION_COMPUTED_PROPERTY_COUNT_GENERATION_SLOT: &str =
     "__moliStyleDeclarationComputedPropertyCountGeneration";
 const STYLE_DECLARATION_COMPUTED_PROPERTY_COUNT_TARGET_EPOCH_SLOT: &str =
     "__moliStyleDeclarationComputedPropertyCountTargetEpoch";
-const DETACHED_STYLE_SLOT: &str = "__lmDetachedStyle";
 
 pub(crate) fn is_live_style_declaration_object(
     scope: &mut v8::PinScope<'_, '_>,
     style: v8::Local<'_, v8::Object>,
 ) -> bool {
     style_runtime_and_handle_from_object(scope, style).is_ok()
-}
-
-pub(crate) fn computed_style_property_is_shorthand(property: &str) -> bool {
-    shorthand_longhands(property).is_some()
 }
 
 fn style_object_forces_empty_computed<'s>(
@@ -105,6 +102,16 @@ fn style_object_forces_empty_computed<'s>(
     {
         return true;
     }
+    // A target can retain its child or popup document while detached. Check
+    // connection before consulting the cached browsing-context state.
+    if let BridgeHandle::ComputedStyle(handle, _) = &bridge_handle
+        && !unsafe { &*runtime_ptr }
+            .dom_host()
+            .is_connected_to_document(*handle)
+    {
+        unsafe { &*runtime_ptr }.retire_computed_style_for_inactive_handle(*handle);
+        return true;
+    }
     if let Some(value) =
         get_private_value(scope, style, STYLE_DECLARATION_TARGET_EMPTY_COMPUTED_SLOT)
         && value.is_boolean()
@@ -114,23 +121,15 @@ fn style_object_forces_empty_computed<'s>(
     }
     let empty = match bridge_handle {
         BridgeHandle::ComputedStyle(handle, ref descriptor) => match descriptor.target {
-            ComputedStyleTargetKey::ChildFrame(frame_handle) => {
+            ComputedStyleTargetKey::ChildFrame(_) => {
                 let runtime = unsafe { &*runtime_ptr };
-                let empty = !child_frame_target_document_is_current(runtime, handle, frame_handle)
-                    || style_property_value(runtime, frame_handle, StyleMode::Computed, "display")
-                        == "none";
+                // A live declaration follows its Element after adoption. An
+                // outgoing Document still becomes empty when it is retired.
+                let context = computed_style_target_context(scope, runtime, handle, None);
+                let empty = context.returns_empty_style();
                 cache_target_empty_context(scope, runtime, style, empty);
-                cache_frame_viewport(scope, runtime, style, frame_handle);
+                cache_computed_viewport(scope, style, (!empty).then(|| context.viewport(runtime)));
                 empty
-            }
-            ComputedStyleTargetKey::DetachedIframe(frame_handle) => {
-                !detached_iframe_target_document_is_current(
-                    scope,
-                    runtime_ptr,
-                    style,
-                    handle,
-                    frame_handle,
-                )
             }
             ComputedStyleTargetKey::PopupDocument(document_handle) => {
                 !popup_document_target_is_current(unsafe { &*runtime_ptr }, handle, document_handle)
@@ -148,22 +147,8 @@ fn style_object_forces_empty_computed<'s>(
     empty
 }
 
-fn child_frame_target_document_is_current(
-    runtime: &JsContextHost,
-    target: DomHandle,
-    frame_handle: DomHandle,
-) -> bool {
-    let target_document = runtime
-        .dom_host()
-        .node(target)
-        .and_then(crate::dom::native::Node::owner_document);
-    runtime
-        .child_browsing_context_document_handle(frame_handle)
-        .is_some_and(|document| Some(document) == target_document)
-}
-
 fn popup_document_target_is_current(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     target: DomHandle,
     popup_document: DomHandle,
 ) -> bool {
@@ -177,31 +162,9 @@ fn popup_document_target_is_current(
             .is_some_and(|popup_id| runtime.lightweight_popup_is_open(popup_id))
 }
 
-fn detached_iframe_target_document_is_current<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
-    style: v8::Local<'s, v8::Object>,
-    target: DomHandle,
-    frame_handle: DomHandle,
-) -> bool {
-    let runtime = unsafe { &*runtime_ptr };
-    let read_document = style_object_read_document(scope, style);
-    let owner_document = runtime
-        .dom_host()
-        .node(target)
-        .and_then(crate::dom::native::Node::owner_document);
-    let target_document = read_document.or(owner_document);
-    crate::native_bridge::document::detached_iframe_current_content_document_handle(
-        scope,
-        runtime_ptr,
-        frame_handle,
-    )
-    .is_some_and(|document| Some(document) == target_document)
-}
-
 fn target_context_epoch_is_current<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     style: v8::Local<'s, v8::Object>,
 ) -> bool {
     let Some(value) = get_private_value(scope, style, STYLE_DECLARATION_TARGET_CONTEXT_EPOCH_SLOT)
@@ -217,7 +180,7 @@ fn target_context_epoch_is_current<'s>(
 
 fn cache_target_empty_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     style: v8::Local<'s, v8::Object>,
     empty: bool,
 ) {
@@ -237,13 +200,11 @@ fn cache_target_empty_context<'s>(
     );
 }
 
-fn cache_frame_viewport<'s>(
+fn cache_computed_viewport<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &JsContextHost,
     style: v8::Local<'s, v8::Object>,
-    frame_handle: DomHandle,
+    viewport: Option<StyleViewport>,
 ) {
-    let viewport = iframe_handle_viewport(runtime, frame_handle);
     let width = viewport
         .and_then(|viewport| viewport.width)
         .map(|width| v8::Number::new(scope, width).into())
@@ -273,6 +234,16 @@ fn cache_frame_viewport<'s>(
         style,
         STYLE_DECLARATION_SCREEN_HEIGHT_SLOT,
         screen_height,
+    );
+    let ratio = viewport
+        .and_then(|viewport| viewport.device_pixel_ratio)
+        .map(|ratio| v8::Number::new(scope, ratio).into())
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    set_private_value(
+        scope,
+        style,
+        STYLE_DECLARATION_DEVICE_PIXEL_RATIO_SLOT,
+        ratio,
     );
 }
 
@@ -337,6 +308,11 @@ fn style_object_viewport<'s>(
         style_object_screen_width(scope, style),
         style_object_screen_height(scope, style),
     )
+    .with_device_pixel_ratio(
+        get_private_value(scope, style, STYLE_DECLARATION_DEVICE_PIXEL_RATIO_SLOT)
+            .and_then(|value| value.number_value(scope))
+            .filter(|value| value.is_finite() && *value > 0.0),
+    )
 }
 
 fn style_object_computation_context<'s>(
@@ -360,7 +336,7 @@ fn live_computed_style_viewport<'s>(
     };
     let runtime = unsafe { &*runtime_ptr };
     match descriptor.target {
-        ComputedStyleTargetKey::Dynamic => {
+        ComputedStyleTargetKey::Dynamic | ComputedStyleTargetKey::ChildFrame(_) => {
             if let Some(frame) = computed_style_target_child_frame_handle(scope, runtime, handle) {
                 return iframe_handle_viewport(runtime, frame);
             }
@@ -370,21 +346,14 @@ fn live_computed_style_viewport<'s>(
             let document = runtime.dom_host().owner_document_handle(handle)?;
             Some(style_viewport_for_document(runtime, document))
         }
-        ComputedStyleTargetKey::ChildFrame(frame)
-            if child_frame_target_document_is_current(runtime, handle, frame) =>
-        {
-            iframe_handle_viewport(runtime, frame)
-        }
-        ComputedStyleTargetKey::ChildFrame(_)
-        | ComputedStyleTargetKey::DetachedIframe(_)
-        | ComputedStyleTargetKey::PopupDocument(_) => None,
+        ComputedStyleTargetKey::PopupDocument(_) => None,
     }
 }
 
 fn style_object_property_count_with_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     style: v8::Local<'s, v8::Object>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     mode: StyleMode,
     context: StyleComputationContext,
@@ -489,7 +458,7 @@ impl ComputedStyleTargetContext {
         }
     }
 
-    pub(crate) fn viewport(self, host: &JsContextHost) -> StyleViewport {
+    pub(crate) fn viewport(self, host: &PageScriptHost) -> StyleViewport {
         match self {
             Self::ChildFrameDocument { frame_handle, .. } => {
                 iframe_handle_viewport(host, frame_handle).unwrap_or_default()
@@ -502,7 +471,7 @@ impl ComputedStyleTargetContext {
 
 pub(crate) fn computed_style_target_context(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
     requesting_child_window: Option<DomHandle>,
 ) -> ComputedStyleTargetContext {
@@ -531,7 +500,7 @@ pub(crate) fn computed_style_target_context(
 
 fn computed_style_target_child_frame_handle(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
     let document_handle = host
@@ -542,7 +511,7 @@ fn computed_style_target_child_frame_handle(
 }
 
 fn computed_style_target_requesting_child_frame_handle(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
     requesting_child_window: Option<DomHandle>,
 ) -> Option<DomHandle> {
@@ -557,14 +526,14 @@ fn computed_style_target_requesting_child_frame_handle(
 }
 
 pub(crate) fn iframe_handle_viewport(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     frame_handle: DomHandle,
 ) -> Option<StyleViewport> {
     iframe_handle_viewport_with_depth(host, frame_handle, 0)
 }
 
-pub(in crate::native_bridge::element) fn style_viewport_for_document(
-    host: &JsContextHost,
+pub(crate) fn style_viewport_for_document(
+    host: &PageScriptHost,
     document: DomHandle,
 ) -> StyleViewport {
     if document == host.document_handle() {
@@ -576,33 +545,67 @@ pub(in crate::native_bridge::element) fn style_viewport_for_document(
 }
 
 pub(crate) fn computed_style_property_values_for_document_snapshot(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handles: impl IntoIterator<Item = DomHandle>,
     properties: &[String],
 ) -> Vec<Vec<String>> {
-    let mut observation = StyleObservation::new(host);
-    handles
+    computed_style_export_values_for_document_snapshot(host, handles, properties)
         .into_iter()
-        .map(
-            |handle| match style_computation_context_for_document_snapshot(host, handle) {
-                None => Vec::new(),
-                Some(DocumentSnapshotStyleComputation::HiddenChildFrame) => {
-                    vec![String::new(); properties.len()]
-                }
-                Some(DocumentSnapshotStyleComputation::Available(_)) => {
-                    let style = observation.read(handle);
-                    properties
-                        .iter()
-                        .map(|property| style.property(property))
-                        .collect()
-                }
-            },
-        )
+        .map(|style| style.values)
         .collect()
 }
 
+#[derive(Default)]
+pub(crate) struct ComputedStyleExportValues {
+    pub(crate) values: Vec<String>,
+    pub(crate) own_visibility: bool,
+    pub(crate) original_display: String,
+    pub(crate) hides_contents: bool,
+}
+
+pub(crate) fn computed_style_export_values_for_document_snapshot(
+    host: &PageScriptHost,
+    handles: impl IntoIterator<Item = DomHandle>,
+    properties: &[String],
+) -> Vec<ComputedStyleExportValues> {
+    let mut observation = StyleObservation::new(host);
+    let mut values = Vec::new();
+    let mut available = Vec::new();
+    for handle in handles {
+        let context = document_snapshot_style_context(host, handle, |handle| {
+            observation.target_is_in_flat_tree(handle)
+        });
+        let value = match context {
+            None => ComputedStyleExportValues::default(),
+            Some(DocumentSnapshotStyleComputation::HiddenChildFrame) => ComputedStyleExportValues {
+                values: vec![String::new(); properties.len()],
+                ..Default::default()
+            },
+            Some(DocumentSnapshotStyleComputation::Available(_)) => {
+                available.push((values.len(), handle));
+                ComputedStyleExportValues::default()
+            }
+        };
+        values.push(value);
+    }
+    observation.prepare_targets(available.iter().map(|&(_, handle)| handle));
+    for (index, handle) in available {
+        let style = observation.read(handle);
+        values[index] = ComputedStyleExportValues {
+            values: properties
+                .iter()
+                .map(|property| style.property(property))
+                .collect(),
+            own_visibility: style.computed_style_has_own_visibility_value(),
+            original_display: style.computed_style_original_display(),
+            hides_contents: style.computed_style_hides_contents(),
+        };
+    }
+    values
+}
+
 pub(crate) fn computed_style_properties_for_inspector_handle(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<Vec<(String, String)>> {
     let node = host.dom_host().node(handle)?;
@@ -622,7 +625,7 @@ pub(crate) fn computed_style_properties_for_inspector_handle(
 }
 
 pub(crate) fn marker_pseudo_element_is_generated_for_document_snapshot(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<bool> {
     let DocumentSnapshotStyleComputation::Available(context) =
@@ -661,7 +664,7 @@ pub(crate) fn marker_pseudo_element_is_generated_for_document_snapshot(
 }
 
 fn document_snapshot_has_display_none_ancestor(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
     context: StyleComputationContext,
 ) -> bool {
@@ -682,7 +685,7 @@ fn document_snapshot_has_display_none_ancestor(
 }
 
 fn document_snapshot_flat_tree_parent(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
     if let Some(slot) = host.dom_host().assigned_slot_for_node(handle) {
@@ -704,8 +707,18 @@ enum DocumentSnapshotStyleComputation {
 }
 
 fn style_computation_context_for_document_snapshot(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     handle: DomHandle,
+) -> Option<DocumentSnapshotStyleComputation> {
+    document_snapshot_style_context(host, handle, |handle| {
+        computed_style_target_is_in_flat_tree(host, handle)
+    })
+}
+
+fn document_snapshot_style_context(
+    host: &PageScriptHost,
+    handle: DomHandle,
+    target_is_in_flat_tree: impl FnOnce(DomHandle) -> bool,
 ) -> Option<DocumentSnapshotStyleComputation> {
     let document = host
         .dom_host()
@@ -713,7 +726,7 @@ fn style_computation_context_for_document_snapshot(
         .filter(|node| node.is_element())?
         .owner_document()?;
     if document == host.document_handle() {
-        if !computed_style_target_is_in_flat_tree(host, handle) {
+        if !target_is_in_flat_tree(handle) {
             return None;
         }
         Some(DocumentSnapshotStyleComputation::Available(
@@ -732,7 +745,7 @@ fn style_computation_context_for_document_snapshot(
 }
 
 fn iframe_handle_viewport_with_depth(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     frame_handle: DomHandle,
     depth: usize,
 ) -> Option<StyleViewport> {
@@ -754,7 +767,8 @@ fn iframe_handle_viewport_with_depth(
                 Some(f64::from(viewport.css_width)),
                 Some(f64::from(viewport.css_height)),
             )
-            .with_screen_size(parent_viewport.screen_width, parent_viewport.screen_height),
+            .with_screen_size(parent_viewport.screen_width, parent_viewport.screen_height)
+            .with_device_pixel_ratio(parent_viewport.device_pixel_ratio),
         );
     }
     Some(
@@ -802,42 +816,56 @@ fn iframe_handle_viewport_with_depth(
                 ));
             StyleViewport::new(width, height)
                 .with_screen_size(parent_viewport.screen_width, parent_viewport.screen_height)
+                .with_device_pixel_ratio(parent_viewport.device_pixel_ratio)
         }),
     )
 }
 
-fn computed_style_target_is_in_flat_tree(host: &JsContextHost, handle: DomHandle) -> bool {
+fn computed_style_target_is_in_flat_tree(host: &PageScriptHost, handle: DomHandle) -> bool {
     let mut current = handle;
     loop {
-        let Some(parent) = host
-            .dom_host()
-            .node(current)
-            .and_then(crate::dom::native::Node::parent_node)
-        else {
-            return current == host.dom_host().document_handle()
-                && host
-                    .dom_host()
-                    .node(current)
-                    .is_some_and(crate::dom::native::Node::is_document);
-        };
-        if host.dom_host().is_shadow_root(parent) {
-            let Some(shadow_host) = host.dom_host().shadow_root_host(parent) else {
-                return false;
-            };
-            current = shadow_host;
-            continue;
+        match computed_style_flat_tree_step(host, current) {
+            ControlFlow::Break(connected) => return connected,
+            ControlFlow::Continue(parent) => current = parent,
         }
-        if host.dom_host().shadow_root_handle(parent).is_some()
-            && computed_style_node_is_slotable_for_flat_tree(host, current)
-            && host.dom_host().assigned_slot_for_node(current).is_none()
-        {
-            return false;
-        }
-        current = parent;
     }
 }
 
-fn computed_style_node_is_slotable_for_flat_tree(host: &JsContextHost, handle: DomHandle) -> bool {
+fn computed_style_flat_tree_step(
+    host: &PageScriptHost,
+    current: DomHandle,
+) -> ControlFlow<bool, DomHandle> {
+    #[cfg(test)]
+    snapshot_tests::note_flat_tree_step();
+    let Some(parent) = host
+        .dom_host()
+        .node(current)
+        .and_then(crate::dom::native::Node::parent_node)
+    else {
+        return ControlFlow::Break(
+            current == host.dom_host().document_handle()
+                && host
+                    .dom_host()
+                    .node(current)
+                    .is_some_and(crate::dom::native::Node::is_document),
+        );
+    };
+    if host.dom_host().is_shadow_root(parent) {
+        return match host.dom_host().shadow_root_host(parent) {
+            Some(shadow_host) => ControlFlow::Continue(shadow_host),
+            None => ControlFlow::Break(false),
+        };
+    }
+    if host.dom_host().shadow_root_handle(parent).is_some()
+        && computed_style_node_is_slotable_for_flat_tree(host, current)
+        && host.dom_host().assigned_slot_for_node(current).is_none()
+    {
+        return ControlFlow::Break(false);
+    }
+    ControlFlow::Continue(parent)
+}
+
+fn computed_style_node_is_slotable_for_flat_tree(host: &PageScriptHost, handle: DomHandle) -> bool {
     host.dom_host()
         .node(handle)
         .is_some_and(|node| node.is_element() || node.is_text())
@@ -970,70 +998,17 @@ fn style_for_element<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    if let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, receiver) {
-        return style_for_element_handle(scope, runtime_ptr, handle);
-    }
-    let Ok((runtime_ptr, handle)) =
-        node_runtime_and_handle_from_object_or_detached(scope, receiver)
-    else {
-        return None;
-    };
-    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
-        return None;
-    }
-    if unsafe { &*runtime_ptr }
-        .dom_host()
-        .node(handle)
-        .is_some_and(crate::dom::native::Node::is_connected)
-    {
-        return style_for_element_handle(scope, runtime_ptr, handle);
-    }
-    if let Some(style) = get_private_value(scope, receiver, DETACHED_STYLE_SLOT)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-    {
-        return Some(style);
-    }
-    let style = crate::detached_css_style::build_lightweight_detached_css_style_declaration(scope);
-    if let Some(callback) = v8::Function::builder(detached_style_changed_callback)
-        .data(receiver.into())
-        .build(scope)
-    {
-        crate::detached_css_style::set_lightweight_css_style_change_callback(
-            scope, style, callback,
-        );
-    }
-    set_private_value(scope, receiver, DETACHED_STYLE_SLOT, style.into());
-    Some(style)
-}
-
-fn detached_style_changed_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Ok(element) = v8::Local::<v8::Object>::try_from(args.data()) else {
-        return;
-    };
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, element)
-    else {
-        return;
-    };
-    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
-        return;
-    }
-    let Ok(style) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
-        return;
-    };
-    let Some(css_text) = crate::detached_css_style::lightweight_css_style_css_text(scope, style)
-    else {
-        return;
-    };
-    unsafe { &mut *runtime_ptr }.set_attribute(scope, runtime_ptr, handle, "style", &css_text);
+    let (runtime_ptr, handle) =
+        node_runtime_and_handle_from_object_or_detached(scope, receiver).ok()?;
+    // Windowless elements have native handles too. Sharing their declaration
+    // with the handle preserves typed values, held style objects, and attribute
+    // synchronization when the element is adopted or connected.
+    style_for_element_handle(scope, runtime_ptr, handle)
 }
 
 pub(crate) fn style_for_element_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut crate::native_bridge::JsContextHost,
+    runtime_ptr: *mut crate::native_bridge::PageScriptHost,
     handle: crate::document_runtime::DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
     if !node_is_element(unsafe { &*runtime_ptr }, handle) {

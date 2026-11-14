@@ -20,17 +20,40 @@ use super::{
     RendererDocumentIsolateAccountingDiagnostics, RendererInspectorSessionRestoreSnapshot,
     RendererOwnerCommand, RendererOwnerHandle, RendererOwnerReply, RendererPageCreationArtifacts,
     RendererPageCreationDiagnostics, RendererPageHandle, RendererPageReservationToken,
-    RendererPageState, RendererPendingDownloadActivation, RendererPerformanceMetricSnapshot,
-    RendererReservedServiceWorkerClient,
+    RendererPageState, RendererPageStateRevision, RendererPendingDownloadActivation,
+    RendererPerformanceMetricSnapshot, RendererReservedServiceWorkerClient,
 };
 
+/// Optional document bootstrap inputs shared by HTML and streaming creation.
+/// Applied before document-start scripts; live updates use Page commands.
+#[derive(Default)]
+pub struct RendererDocumentOptions {
+    /// Identity captured when accepting a new Page; ignored for replacement Documents.
+    pub window_identity: super::RendererPageWindowIdentity,
+    pub indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
+    pub storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
+    pub document_start_scripts: Vec<DocumentStartScript>,
+    pub runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
+    pub extra_http_headers: moli_fetch::RequestHeaders,
+    pub document_settings: moli_page_types::DocumentSettings,
+    pub network_offline: bool,
+    pub blocked_url_patterns: Vec<String>,
+    pub fetch_subresource_interception_classes: crate::SubresourceInterceptionClasses,
+    pub runtime_inspector_session_restore_snapshots: Vec<RendererInspectorSessionRestoreSnapshot>,
+    pub root_frame_id: Option<String>,
+    pub main_document_commit: Option<crate::RendererMainDocumentCommit>,
+}
+
 pub(crate) struct PageVmStateCapture {
+    pub(crate) snapshot_revision: RendererPageStateRevision,
     pub(crate) final_url: Url,
     pub(crate) document_title: String,
+    pub(crate) document_activity: moli_page_types::DocumentActivity,
     pub(crate) report: Arc<ScriptExecutionReport>,
     pub(crate) navigation_response: Option<PageVmNavigationResponse>,
     pub(crate) idle_override: Option<crate::protocol_types::EmulatedIdleOverride>,
     pub(crate) service_worker_client_id: u64,
+    pub(crate) document_isolate_identity: usize,
     pub(crate) dedicated_worker_running_worker_isolate_count: usize,
     pub(crate) performance_metric_snapshot: RendererPerformanceMetricSnapshot,
 }
@@ -42,7 +65,7 @@ pub(crate) struct PageVmNavigationResponse {
     pub(crate) redirect_count: usize,
     pub(crate) redirect_chain: Vec<crate::protocol_types::NavigationRedirect>,
     pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,10 +89,43 @@ struct JsRuntimeInner {
     _render_runtime: RenderRuntimeOwner,
 }
 
+/// A renderer-owner lifetime capability. Keeping its recursive actor/channel
+/// graph behind this interface also bounds Send/Sync proofs in protocol crates.
+pub(in crate::runtime) trait RendererRuntimeLease:
+    Send + Sync + std::fmt::Debug
+{
+    fn into_runtime(self: Arc<Self>) -> JsRuntime;
+    fn cancel_page_producers(&self);
+    fn cancel_pending_auxiliary_page(&self, reservation: RendererPageReservationToken);
+    fn release_captured_document_environment(&self, id: u64);
+}
+
+impl RendererRuntimeLease for JsRuntimeInner {
+    fn release_captured_document_environment(&self, id: u64) {
+        let _ = self.renderer_owner.enqueue_command_with_reply(
+            RendererOwnerCommand::ReleaseCapturedDocumentEnvironment { id },
+        );
+    }
+
+    fn into_runtime(self: Arc<Self>) -> JsRuntime {
+        JsRuntime { inner: self }
+    }
+
+    fn cancel_page_producers(&self) {
+        cancel_js_runtime_page_producers(self);
+    }
+
+    fn cancel_pending_auxiliary_page(&self, reservation: RendererPageReservationToken) {
+        let _ = self.renderer_owner.enqueue_command_with_reply(
+            RendererOwnerCommand::CancelPendingAuxiliaryPage { reservation },
+        );
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RendererProducerShutdownHandle {
     renderer_owner_id: u64,
-    runtime: Weak<JsRuntimeInner>,
+    runtime: Weak<dyn RendererRuntimeLease>,
 }
 
 impl std::fmt::Debug for RendererProducerShutdownHandle {
@@ -81,13 +137,17 @@ impl std::fmt::Debug for RendererProducerShutdownHandle {
 }
 
 impl RendererProducerShutdownHandle {
+    pub(in crate::runtime) fn upgrade_runtime(&self) -> Option<Arc<dyn RendererRuntimeLease>> {
+        self.runtime.upgrade()
+    }
+
     pub(crate) fn renderer_owner_id(&self) -> u64 {
         self.renderer_owner_id
     }
 
     pub(crate) fn cancel_page_producers(&self) {
         if let Some(runtime) = self.runtime.upgrade() {
-            cancel_js_runtime_page_producers(&runtime);
+            runtime.cancel_page_producers();
         }
     }
 
@@ -153,13 +213,23 @@ impl JsRuntime {
             browser_context_runtime.clone(),
         );
 
-        Self {
+        let runtime = Self {
             inner: Arc::new(JsRuntimeInner {
                 renderer_owner,
                 browser_context_runtime,
                 _render_runtime: render_runtime,
             }),
-        }
+        };
+        assert!(
+            runtime
+                .inner
+                .renderer_owner
+                .state
+                .runtime_handle
+                .set(runtime.producer_shutdown_handle())
+                .is_ok()
+        );
+        runtime
     }
 
     pub fn browser_context_runtime(&self) -> RendererBrowserContextRuntime {
@@ -176,9 +246,10 @@ impl JsRuntime {
     }
 
     pub(crate) fn producer_shutdown_handle(&self) -> RendererProducerShutdownHandle {
+        let runtime: Arc<dyn RendererRuntimeLease> = self.inner.clone();
         RendererProducerShutdownHandle {
             renderer_owner_id: self.renderer_owner_id_for_diagnostics(),
-            runtime: Arc::downgrade(&self.inner),
+            runtime: Arc::downgrade(&runtime),
         }
     }
 
@@ -221,7 +292,7 @@ impl JsRuntime {
     ) -> Result<PendingHtmlPage> {
         let url = Url::parse("https://reservation.test/")
             .expect("static reservation test URL should parse");
-        self.start_create_html_page_from_response_with_inspector_session_restores(
+        self.start_create_html_page_from_response(
             page_reservation,
             url.clone(),
             url,
@@ -229,31 +300,15 @@ impl JsRuntime {
             false,
             0,
             200,
-            vec![("content-type".to_owned(), "text/html".to_owned())],
+            vec![("content-type".to_owned(), b"text/html".to_vec())],
             loader,
             crate::RendererWebStorageHandles::ephemeral(),
             "<!doctype html>".to_owned(),
             None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-            false,
-            false,
-            1.0,
-            Default::default(),
-            None,
-            false,
-            Vec::new(),
-            false,
-            None,
-            Vec::new(),
-            None,
-            None,
             crate::RendererTopLevelNavigationDispatch::FollowInStandaloneAdapter,
-            None,
+            crate::RendererDocumentOptions {
+                ..Default::default()
+            },
         )
     }
 
@@ -293,7 +348,7 @@ impl JsRuntime {
     }
 
     pub fn document_isolate_model_for_diagnostics(&self) -> &'static str {
-        "page-vm"
+        "related-pages"
     }
 
     pub fn document_isolate_accounting_for_diagnostics(
@@ -326,6 +381,7 @@ impl JsRuntime {
             .set_renderer_output_transport_sender(sender);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_html_page_from_response(
         &self,
         requested_url: Url,
@@ -334,25 +390,11 @@ impl JsRuntime {
         navigation_redirected: bool,
         navigation_redirect_count: usize,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         loader: &ResourceRequestClient,
         web_storage: crate::RendererWebStorageHandles,
         html: String,
-        indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
-        storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
-        document_start_scripts: Vec<DocumentStartScript>,
-        runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
-        extra_http_headers: Vec<(String, String)>,
-        locale_override: Option<String>,
-        timezone_override: Option<String>,
-        script_execution_disabled: bool,
-        cpu_throttling_rate: f64,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-        network_offline: bool,
-        blocked_url_patterns: Vec<String>,
-        fetch_subresource_interception_enabled: bool,
-        fetch_subresource_interception_resource_type: Option<crate::SubresourceResourceType>,
+        options: RendererDocumentOptions,
     ) -> Result<(
         RendererPageHandle,
         Arc<RendererPageState>,
@@ -360,80 +402,7 @@ impl JsRuntime {
         RendererPageCreationArtifacts,
         Option<RendererPendingDownloadActivation>,
     )> {
-        self.create_html_page_from_response_with_inspector_session_restores(
-            requested_url,
-            final_url,
-            navigation_initiator_url,
-            navigation_redirected,
-            navigation_redirect_count,
-            response_status,
-            response_headers,
-            loader,
-            web_storage,
-            html,
-            indexed_db_manager,
-            storage_bucket_store,
-            document_start_scripts,
-            runtime_bindings,
-            extra_http_headers,
-            locale_override,
-            timezone_override,
-            script_execution_disabled,
-            false,
-            cpu_throttling_rate,
-            emulated_media,
-            viewport_surface,
-            network_offline,
-            blocked_url_patterns,
-            fetch_subresource_interception_enabled,
-            fetch_subresource_interception_resource_type,
-            Vec::new(),
-            None,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_html_page_from_response_with_inspector_session_restores(
-        &self,
-        requested_url: Url,
-        final_url: Url,
-        navigation_initiator_url: Option<Url>,
-        navigation_redirected: bool,
-        navigation_redirect_count: usize,
-        response_status: u16,
-        response_headers: Vec<(String, String)>,
-        loader: &ResourceRequestClient,
-        web_storage: crate::RendererWebStorageHandles,
-        html: String,
-        indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
-        storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
-        document_start_scripts: Vec<DocumentStartScript>,
-        runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
-        extra_http_headers: Vec<(String, String)>,
-        locale_override: Option<String>,
-        timezone_override: Option<String>,
-        script_execution_disabled: bool,
-        bypass_content_security_policy: bool,
-        cpu_throttling_rate: f64,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-        network_offline: bool,
-        blocked_url_patterns: Vec<String>,
-        fetch_subresource_interception_enabled: bool,
-        fetch_subresource_interception_resource_type: Option<crate::SubresourceResourceType>,
-        runtime_inspector_session_restore_snapshots: Vec<RendererInspectorSessionRestoreSnapshot>,
-        root_frame_id: Option<String>,
-        main_document_commit: Option<crate::RendererMainDocumentCommit>,
-    ) -> Result<(
-        RendererPageHandle,
-        Arc<RendererPageState>,
-        RendererPageCreationDiagnostics,
-        RendererPageCreationArtifacts,
-        Option<RendererPendingDownloadActivation>,
-    )> {
-        let mut request = self
+        let request = self
             .inner
             .renderer_owner
             .build_create_html_page_request_with_env(
@@ -448,27 +417,9 @@ impl JsRuntime {
                 web_storage,
                 final_url,
                 html,
-                document_start_scripts,
-                runtime_bindings,
-                runtime_inspector_session_restore_snapshots,
-                extra_http_headers,
-                locale_override,
-                timezone_override,
-                script_execution_disabled,
-                bypass_content_security_policy,
-                cpu_throttling_rate,
-                emulated_media,
-                viewport_surface,
-                network_offline,
-                blocked_url_patterns,
-                fetch_subresource_interception_enabled,
-                fetch_subresource_interception_resource_type,
                 PageVmInitStage::Load,
+                options,
             );
-        request.indexed_db_manager = indexed_db_manager;
-        request.storage_bucket_store = storage_bucket_store;
-        request.root_frame_id = root_frame_id;
-        request.main_document_commit = main_document_commit;
         let reply = self
             .inner
             .renderer_owner
@@ -479,80 +430,8 @@ impl JsRuntime {
             .materialize_page_created_reply_parts(reply)
     }
 
-    /// Fire-and-defer variant of [`Self::create_html_page_from_response`].
-    ///
-    /// Performs the synchronous request preparation, enqueues the renderer
-    /// command, and returns a [`PendingHtmlPage`] without awaiting the reply.
-    /// The renderer thread can then process the heavy V8/parse work in
-    /// parallel with conn-side bookkeeping; the caller awaits the result via
-    /// [`PendingHtmlPage::await_ready`] when the page is actually needed.
     #[allow(clippy::too_many_arguments)]
     pub fn start_create_html_page_from_response(
-        &self,
-        requested_url: Url,
-        final_url: Url,
-        navigation_initiator_url: Option<Url>,
-        navigation_redirected: bool,
-        navigation_redirect_count: usize,
-        response_status: u16,
-        response_headers: Vec<(String, String)>,
-        loader: &ResourceRequestClient,
-        web_storage: crate::RendererWebStorageHandles,
-        html: String,
-        indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
-        storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
-        document_start_scripts: Vec<DocumentStartScript>,
-        runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
-        extra_http_headers: Vec<(String, String)>,
-        locale_override: Option<String>,
-        timezone_override: Option<String>,
-        script_execution_disabled: bool,
-        cpu_throttling_rate: f64,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-        network_offline: bool,
-        blocked_url_patterns: Vec<String>,
-        fetch_subresource_interception_enabled: bool,
-        fetch_subresource_interception_resource_type: Option<crate::SubresourceResourceType>,
-    ) -> Result<PendingHtmlPage> {
-        self.start_create_html_page_from_response_with_inspector_session_restores(
-            self.reserve_page_for_creation(),
-            requested_url,
-            final_url,
-            navigation_initiator_url,
-            navigation_redirected,
-            navigation_redirect_count,
-            response_status,
-            response_headers,
-            loader,
-            web_storage,
-            html,
-            indexed_db_manager,
-            storage_bucket_store,
-            document_start_scripts,
-            runtime_bindings,
-            extra_http_headers,
-            locale_override,
-            timezone_override,
-            script_execution_disabled,
-            false,
-            cpu_throttling_rate,
-            emulated_media,
-            viewport_surface,
-            network_offline,
-            blocked_url_patterns,
-            fetch_subresource_interception_enabled,
-            fetch_subresource_interception_resource_type,
-            Vec::new(),
-            None,
-            None,
-            crate::RendererTopLevelNavigationDispatch::FollowInStandaloneAdapter,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_create_html_page_from_response_with_inspector_session_restores(
         &self,
         page_reservation: RendererPageReservationToken,
         requested_url: Url,
@@ -561,31 +440,13 @@ impl JsRuntime {
         navigation_redirected: bool,
         navigation_redirect_count: usize,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         loader: &ResourceRequestClient,
         web_storage: crate::RendererWebStorageHandles,
         html: String,
-        indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
-        storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
-        document_start_scripts: Vec<DocumentStartScript>,
-        runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
-        extra_http_headers: Vec<(String, String)>,
-        locale_override: Option<String>,
-        timezone_override: Option<String>,
-        script_execution_disabled: bool,
-        bypass_content_security_policy: bool,
-        cpu_throttling_rate: f64,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-        network_offline: bool,
-        blocked_url_patterns: Vec<String>,
-        fetch_subresource_interception_enabled: bool,
-        fetch_subresource_interception_resource_type: Option<crate::SubresourceResourceType>,
-        runtime_inspector_session_restore_snapshots: Vec<RendererInspectorSessionRestoreSnapshot>,
-        root_frame_id: Option<String>,
         top_level_storage_key: Option<moli_storage_key::MoliStorageKey>,
         top_level_navigation_dispatch: crate::RendererTopLevelNavigationDispatch,
-        main_document_commit: Option<crate::RendererMainDocumentCommit>,
+        options: RendererDocumentOptions,
     ) -> Result<PendingHtmlPage> {
         let mut request = self
             .inner
@@ -602,29 +463,11 @@ impl JsRuntime {
                 web_storage,
                 final_url,
                 html,
-                document_start_scripts,
-                runtime_bindings,
-                runtime_inspector_session_restore_snapshots,
-                extra_http_headers,
-                locale_override,
-                timezone_override,
-                script_execution_disabled,
-                bypass_content_security_policy,
-                cpu_throttling_rate,
-                emulated_media,
-                viewport_surface,
-                network_offline,
-                blocked_url_patterns,
-                fetch_subresource_interception_enabled,
-                fetch_subresource_interception_resource_type,
                 PageVmInitStage::Load,
+                options,
             );
-        request.indexed_db_manager = indexed_db_manager;
-        request.storage_bucket_store = storage_bucket_store;
-        request.root_frame_id = root_frame_id;
         request.top_level_storage_key = top_level_storage_key;
         request.top_level_navigation_dispatch = top_level_navigation_dispatch;
-        request.main_document_commit = main_document_commit;
         let reply_rx = self
             .inner
             .renderer_owner
@@ -640,11 +483,12 @@ impl JsRuntime {
     ///
     /// Protocol coordinators that must route pre-install output bind this
     /// identity to their target first, then pass it to
-    /// [`Self::start_create_html_page_from_response_with_inspector_session_restores`].
+    /// [`Self::start_create_html_page_from_response`].
     pub fn reserve_page_for_creation(&self) -> RendererPageReservationToken {
         self.inner.renderer_owner.allocate_page_reservation_token()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_streaming_raw_page_from_external_body(
         &self,
         requested_url: Url,
@@ -654,118 +498,18 @@ impl JsRuntime {
         navigation_redirect_count: usize,
         navigation_redirect_chain: Vec<crate::protocol_types::NavigationRedirect>,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         loader: &ResourceRequestClient,
         web_storage: crate::RendererWebStorageHandles,
         raw_body: ExternalRawDocumentBodyStream,
-        indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
-        storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
-        document_start_scripts: Vec<DocumentStartScript>,
-        runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
-        extra_http_headers: Vec<(String, String)>,
-        locale_override: Option<String>,
-        timezone_override: Option<String>,
-        script_execution_disabled: bool,
-        cpu_throttling_rate: f64,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-        network_offline: bool,
-        blocked_url_patterns: Vec<String>,
-        fetch_subresource_interception_enabled: bool,
-        fetch_subresource_interception_resource_type: Option<crate::SubresourceResourceType>,
-        wpt_extensions_enabled: bool,
-        stage: PageVmInitStage,
-        top_level_navigation_dispatch: crate::RendererTopLevelNavigationDispatch,
-        navigation_reply_policy: crate::RendererNavigationReplyPolicy,
-    ) -> Result<(
-        RendererPageHandle,
-        Arc<RendererPageState>,
-        RendererPageCreationDiagnostics,
-        RendererPageCreationArtifacts,
-        Option<RendererPendingDownloadActivation>,
-    )> {
-        self.create_streaming_raw_page_from_external_body_with_inspector_session_restores(
-            requested_url,
-            final_url,
-            navigation_initiator_url,
-            navigation_redirected,
-            navigation_redirect_count,
-            navigation_redirect_chain,
-            response_status,
-            response_headers,
-            loader,
-            web_storage,
-            raw_body,
-            indexed_db_manager,
-            storage_bucket_store,
-            document_start_scripts,
-            runtime_bindings,
-            extra_http_headers,
-            locale_override,
-            timezone_override,
-            script_execution_disabled,
-            false,
-            cpu_throttling_rate,
-            emulated_media,
-            viewport_surface,
-            network_offline,
-            blocked_url_patterns,
-            fetch_subresource_interception_enabled,
-            fetch_subresource_interception_resource_type,
-            Vec::new(),
-            wpt_extensions_enabled,
-            stage,
-            crate::RendererReplyBoundary::Stage,
-            top_level_navigation_dispatch,
-            navigation_reply_policy,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_streaming_raw_page_from_external_body_with_inspector_session_restores(
-        &self,
-        requested_url: Url,
-        final_url: Url,
-        navigation_initiator_url: Option<Url>,
-        navigation_redirected: bool,
-        navigation_redirect_count: usize,
-        navigation_redirect_chain: Vec<crate::protocol_types::NavigationRedirect>,
-        response_status: u16,
-        response_headers: Vec<(String, String)>,
-        loader: &ResourceRequestClient,
-        web_storage: crate::RendererWebStorageHandles,
-        raw_body: ExternalRawDocumentBodyStream,
-        indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
-        storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
-        document_start_scripts: Vec<DocumentStartScript>,
-        runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
-        extra_http_headers: Vec<(String, String)>,
-        locale_override: Option<String>,
-        timezone_override: Option<String>,
-        script_execution_disabled: bool,
-        bypass_content_security_policy: bool,
-        cpu_throttling_rate: f64,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-        network_offline: bool,
-        blocked_url_patterns: Vec<String>,
-        fetch_subresource_interception_enabled: bool,
-        fetch_subresource_interception_resource_type: Option<crate::SubresourceResourceType>,
-        runtime_inspector_session_restore_snapshots: Vec<RendererInspectorSessionRestoreSnapshot>,
         wpt_extensions_enabled: bool,
         stage: PageVmInitStage,
         reply_boundary: crate::RendererReplyBoundary,
         top_level_navigation_dispatch: crate::RendererTopLevelNavigationDispatch,
         navigation_reply_policy: crate::RendererNavigationReplyPolicy,
-        root_frame_id: Option<String>,
         reserved_service_worker_client: Option<RendererReservedServiceWorkerClient>,
-        main_document_commit: Option<crate::RendererMainDocumentCommit>,
         lifecycle_decider: Option<crate::RendererLifecycleDecider>,
+        options: RendererDocumentOptions,
     ) -> Result<(
         RendererPageHandle,
         Arc<RendererPageState>,
@@ -774,7 +518,7 @@ impl JsRuntime {
         Option<RendererPendingDownloadActivation>,
     )> {
         let prepared = self
-            .prepare_streaming_raw_document_from_external_body_with_inspector_session_restores(
+            .prepare_streaming_raw_document_from_external_body(
                 self.reserve_page_for_creation(),
                 requested_url,
                 final_url,
@@ -787,32 +531,14 @@ impl JsRuntime {
                 loader,
                 web_storage,
                 raw_body,
-                indexed_db_manager,
-                storage_bucket_store,
-                document_start_scripts,
-                runtime_bindings,
-                extra_http_headers,
-                locale_override,
-                timezone_override,
-                script_execution_disabled,
-                bypass_content_security_policy,
-                cpu_throttling_rate,
-                emulated_media,
-                viewport_surface,
-                network_offline,
-                blocked_url_patterns,
-                fetch_subresource_interception_enabled,
-                fetch_subresource_interception_resource_type,
-                runtime_inspector_session_restore_snapshots,
                 wpt_extensions_enabled,
                 stage,
                 reply_boundary,
                 top_level_navigation_dispatch,
                 navigation_reply_policy,
-                root_frame_id,
                 reserved_service_worker_client,
-                main_document_commit,
                 lifecycle_decider,
+                options,
             )
             .await?;
         let permit = prepared.issue_commit_permit();
@@ -822,9 +548,9 @@ impl JsRuntime {
     /// Moves a streaming response and all document bootstrap inputs onto the
     /// renderer owner lane without starting the parser or author scripts.
     #[allow(clippy::too_many_arguments)]
-    pub async fn prepare_streaming_raw_document_from_external_body_with_inspector_session_restores(
+    pub async fn prepare_streaming_raw_document_from_external_body(
         &self,
-        page_reservation: RendererPageReservationToken,
+        page_target: impl Into<super::RendererDocumentPreparationTarget>,
         requested_url: Url,
         final_url: Url,
         navigation_initiator_url: Option<Url>,
@@ -832,36 +558,18 @@ impl JsRuntime {
         navigation_redirect_count: usize,
         navigation_redirect_chain: Vec<crate::protocol_types::NavigationRedirect>,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         loader: &ResourceRequestClient,
         web_storage: crate::RendererWebStorageHandles,
         raw_body: ExternalRawDocumentBodyStream,
-        indexed_db_manager: Option<crate::context_bootstrap::WeakIndexedDbManager>,
-        storage_bucket_store: Option<crate::context_bootstrap::SharedStorageBucketStore>,
-        document_start_scripts: Vec<DocumentStartScript>,
-        runtime_bindings: Vec<crate::protocol_types::RuntimeBindingRegistration>,
-        extra_http_headers: Vec<(String, String)>,
-        locale_override: Option<String>,
-        timezone_override: Option<String>,
-        script_execution_disabled: bool,
-        bypass_content_security_policy: bool,
-        cpu_throttling_rate: f64,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides,
-        viewport_surface: Option<crate::protocol_types::ViewportSurface>,
-        network_offline: bool,
-        blocked_url_patterns: Vec<String>,
-        fetch_subresource_interception_enabled: bool,
-        fetch_subresource_interception_resource_type: Option<crate::SubresourceResourceType>,
-        runtime_inspector_session_restore_snapshots: Vec<RendererInspectorSessionRestoreSnapshot>,
         wpt_extensions_enabled: bool,
         stage: PageVmInitStage,
         reply_boundary: crate::RendererReplyBoundary,
         top_level_navigation_dispatch: crate::RendererTopLevelNavigationDispatch,
         navigation_reply_policy: crate::RendererNavigationReplyPolicy,
-        root_frame_id: Option<String>,
         reserved_service_worker_client: Option<RendererReservedServiceWorkerClient>,
-        main_document_commit: Option<crate::RendererMainDocumentCommit>,
         lifecycle_decider: Option<crate::RendererLifecycleDecider>,
+        options: RendererDocumentOptions,
     ) -> Result<PreparedRendererDocument> {
         let mut request = self
             .inner
@@ -878,33 +586,31 @@ impl JsRuntime {
                 loader,
                 web_storage,
                 raw_body,
-                document_start_scripts,
-                runtime_bindings,
-                runtime_inspector_session_restore_snapshots,
-                extra_http_headers,
-                locale_override,
-                timezone_override,
-                script_execution_disabled,
-                bypass_content_security_policy,
-                cpu_throttling_rate,
-                emulated_media,
-                viewport_surface,
-                network_offline,
-                blocked_url_patterns,
-                fetch_subresource_interception_enabled,
-                fetch_subresource_interception_resource_type,
                 stage,
+                options,
             );
-        request.indexed_db_manager = indexed_db_manager;
-        request.storage_bucket_store = storage_bucket_store;
-        request.root_frame_id = root_frame_id;
-        request.main_document_commit = main_document_commit;
         request.wpt_extensions_enabled = wpt_extensions_enabled;
         request.reply_boundary = reply_boundary;
         request.top_level_navigation_dispatch = top_level_navigation_dispatch;
         request.navigation_reply_policy = navigation_reply_policy;
         request.reserved_service_worker_client = reserved_service_worker_client;
         request.lifecycle_decider = lifecycle_decider;
+        // This is the provisional-load boundary. Wake the old document before
+        // dispatching owner work: queuing the wake itself would deadlock behind
+        // a paused script. Downloads and intercepted responses never get here.
+        let (page_reservation, replacement) = page_target
+            .into()
+            .begin_and_reserve(&self.inner.renderer_owner)
+            .await?;
+        request.document_replacement = replacement.clone();
+        // Own cancellation before awaiting the prepare reply, so abandoning
+        // the future also retires a queued or already stored preparation.
+        let preparation = RendererDocumentPreparation {
+            runtime: self.clone(),
+            token: page_reservation,
+            cancel_on_drop: true,
+            _document_replacement: replacement,
+        };
         let reply = self
             .inner
             .renderer_owner
@@ -916,11 +622,10 @@ impl JsRuntime {
         match reply {
             RendererOwnerReply::PreparedRendererDocumentStored {
                 renderer_devtools_agent_token,
-            } => Ok(PreparedRendererDocument::new(
-                self.clone(),
-                page_reservation,
+            } => Ok(PreparedRendererDocument {
+                preparation,
                 renderer_devtools_agent_token,
-            )),
+            }),
             _ => Err(anyhow!(
                 "renderer owner returned non-prepare reply for prepared document request"
             )),
@@ -966,28 +671,52 @@ impl Drop for JsRuntimeOwner {
 /// Dropping this handle schedules cancellation. Only a permit issued for this
 /// exact handle can consume the owner-local residence and start bootstrap.
 pub struct PreparedRendererDocument {
+    preparation: RendererDocumentPreparation,
+    renderer_devtools_agent_token: super::RendererDevToolsAgentToken,
+}
+
+/// One synchronously enqueued commit and its exact renderer reply. Dropping
+/// the wait cancels preparation; it cannot prove that commit never started.
+pub struct PendingRendererPageReplacement {
+    preparation: RendererDocumentPreparation,
+    reply_rx: tokio::sync::oneshot::Receiver<Result<RendererOwnerReply>>,
+}
+
+impl PendingRendererPageReplacement {
+    pub async fn wait(
+        mut self,
+    ) -> std::result::Result<
+        super::RendererPageReplacementCommit,
+        super::RendererPageReplacementError,
+    > {
+        use super::RendererPageReplacementError;
+        let reply = self
+            .reply_rx
+            .await
+            .map_err(|_| anyhow!("render runtime reply channel closed"))
+            .and_then(|reply| reply)
+            .map_err(RendererPageReplacementError::from_dispatch_error)?;
+        self.preparation.cancel_on_drop = false;
+        match reply {
+            RendererOwnerReply::PageReplacementCommitted(replacement) => Ok(*replacement),
+            _ => Err(RendererPageReplacementError::document_unavailable(anyhow!(
+                "renderer owner returned a non-replacement commit reply"
+            ))),
+        }
+    }
+}
+
+struct RendererDocumentPreparation {
     runtime: JsRuntime,
     token: RendererPageReservationToken,
-    renderer_devtools_agent_token: super::RendererDevToolsAgentToken,
     cancel_on_drop: bool,
+    _document_replacement:
+        Option<Arc<super::document_replacement::RendererDocumentReplacementScope>>,
 }
 
 impl PreparedRendererDocument {
-    fn new(
-        runtime: JsRuntime,
-        token: RendererPageReservationToken,
-        renderer_devtools_agent_token: super::RendererDevToolsAgentToken,
-    ) -> Self {
-        Self {
-            runtime,
-            token,
-            renderer_devtools_agent_token,
-            cancel_on_drop: true,
-        }
-    }
-
     pub fn token(&self) -> RendererPageReservationToken {
-        self.token
+        self.preparation.token
     }
 
     pub fn renderer_devtools_agent_token(&self) -> super::RendererDevToolsAgentToken {
@@ -995,7 +724,7 @@ impl PreparedRendererDocument {
     }
 
     pub fn issue_commit_permit(&self) -> RendererDocumentCommitPermit {
-        RendererDocumentCommitPermit::new(self.token)
+        RendererDocumentCommitPermit::new(self.token())
     }
 
     /// Replaces the live target configuration consumed when the first
@@ -1005,12 +734,13 @@ impl PreparedRendererDocument {
         configuration: super::RendererPreparedDocumentCommitConfiguration,
     ) -> Result<()> {
         let reply = self
+            .preparation
             .runtime
             .inner
             .renderer_owner
             .dispatch_command(
                 RendererOwnerCommand::UpdatePreparedRendererDocumentCommitConfiguration {
-                    token: self.token,
+                    token: self.token(),
                     configuration,
                 },
             )
@@ -1023,8 +753,49 @@ impl PreparedRendererDocument {
         }
     }
 
-    pub async fn commit(
+    pub fn start_commit(
         mut self,
+        permit: RendererDocumentCommitPermit,
+        configuration: Option<super::RendererPreparedDocumentCommitConfiguration>,
+    ) -> Result<
+        impl std::future::Future<
+            Output = Result<(
+                RendererPageHandle,
+                Arc<RendererPageState>,
+                RendererPageCreationDiagnostics,
+                RendererPageCreationArtifacts,
+                Option<RendererPendingDownloadActivation>,
+            )>,
+        > + 'static,
+    > {
+        anyhow::ensure!(
+            permit.prepared_document() == self.token(),
+            "renderer document commit permit does not belong to this prepared document"
+        );
+        let reply_rx = self
+            .preparation
+            .runtime
+            .inner
+            .renderer_owner
+            .enqueue_command_with_reply(RendererOwnerCommand::CommitPreparedRendererDocument {
+                permit,
+                configuration: configuration.map(Box::new),
+            })?;
+        Ok(async move {
+            let reply = reply_rx
+                .await
+                .map_err(|_| anyhow!("render runtime reply channel closed"))??;
+            self.preparation.cancel_on_drop = false;
+            self.preparation
+                .runtime
+                .inner
+                .renderer_owner
+                .materialize_page_created_reply_parts(reply)
+        })
+    }
+
+    pub async fn commit(
+        self,
         permit: RendererDocumentCommitPermit,
     ) -> Result<(
         RendererPageHandle,
@@ -1033,35 +804,69 @@ impl PreparedRendererDocument {
         RendererPageCreationArtifacts,
         Option<RendererPendingDownloadActivation>,
     )> {
-        anyhow::ensure!(
-            permit.prepared_document() == self.token,
-            "renderer document commit permit does not belong to this prepared document"
-        );
-        self.cancel_on_drop = false;
-        let reply = self
+        self.start_commit(permit, None)?.await
+    }
+
+    /// Commits a response into the Page that issued this replacement reservation.
+    /// The reply must be adopted by that Page's existing handle.
+    pub fn start_commit_page_replacement(
+        self,
+        permit: RendererDocumentCommitPermit,
+        configuration: Option<super::RendererPreparedDocumentCommitConfiguration>,
+    ) -> std::result::Result<PendingRendererPageReplacement, super::RendererPageReplacementError>
+    {
+        use super::RendererPageReplacementError;
+        if permit.prepared_document() != self.token() {
+            return Err(RendererPageReplacementError::document_preserved(anyhow!(
+                "renderer document commit permit does not belong to this prepared document"
+            )));
+        }
+        if self.token().replacement.is_none() {
+            return Err(RendererPageReplacementError::document_preserved(anyhow!(
+                "a fresh Page reservation cannot replace an existing Page"
+            )));
+        }
+        let reply_rx = self
+            .preparation
             .runtime
             .inner
             .renderer_owner
-            .dispatch_command(RendererOwnerCommand::CommitPreparedRendererDocument { permit })
-            .await?;
-        self.runtime
-            .inner
-            .renderer_owner
-            .materialize_page_created_reply_parts(reply)
+            .enqueue_command_with_reply(RendererOwnerCommand::CommitPreparedPageReplacement {
+                permit,
+                configuration: configuration.map(Box::new),
+            })
+            .map_err(RendererPageReplacementError::from_dispatch_error)?;
+        Ok(PendingRendererPageReplacement {
+            preparation: self.preparation,
+            reply_rx,
+        })
+    }
+
+    pub async fn commit_page_replacement(
+        self,
+        permit: RendererDocumentCommitPermit,
+    ) -> std::result::Result<
+        super::RendererPageReplacementCommit,
+        super::RendererPageReplacementError,
+    > {
+        self.start_commit_page_replacement(permit, None)?
+            .wait()
+            .await
     }
 
     pub async fn cancel(mut self) -> Result<()> {
         let reply = self
+            .preparation
             .runtime
             .inner
             .renderer_owner
             .dispatch_command(RendererOwnerCommand::CancelPreparedRendererDocument {
-                token: self.token,
+                token: self.token(),
             })
             .await?;
         match reply {
             RendererOwnerReply::PreparedRendererDocumentCanceled => {
-                self.cancel_on_drop = false;
+                self.preparation.cancel_on_drop = false;
                 Ok(())
             }
             _ => Err(anyhow!(
@@ -1071,7 +876,7 @@ impl PreparedRendererDocument {
     }
 }
 
-impl Drop for PreparedRendererDocument {
+impl Drop for RendererDocumentPreparation {
     fn drop(&mut self) {
         if !self.cancel_on_drop {
             return;

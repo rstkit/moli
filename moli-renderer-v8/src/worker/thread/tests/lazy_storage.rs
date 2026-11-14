@@ -1,4 +1,44 @@
 use super::*;
+use crate::worker::WorkerGlobalKind;
+
+#[tokio::test]
+async fn worker_indexed_db_first_use_ignores_public_constructor_overrides() {
+    ensure_v8();
+    let script_url = url::Url::parse("https://indexeddb-first-use.test/worker.js").unwrap();
+    let fixture = include_str!("../../../../tests/fixtures/indexeddb-first-use.js");
+    for kind in [
+        WorkerGlobalKind::Dedicated {
+            name: String::new(),
+        },
+        WorkerGlobalKind::Shared {
+            name: String::new(),
+            storage_key: moli_storage_key::MoliStorageKey::first_party_from_url(&script_url, None),
+        },
+        WorkerGlobalKind::Service {
+            registration_id: ServiceWorkerRegistrationId::from_u64_for_test(1),
+            version_id: ServiceWorkerVersionId::from_u64_for_test(1),
+            scope_url: url::Url::parse("https://indexeddb-first-use.test/").unwrap(),
+        },
+    ] {
+        for mode in ["number", "function", "getter", "delete"] {
+            let (bootstrap_tx, mut bootstrap_rx) = tokio::sync::mpsc::unbounded_channel();
+            let handle = spawn_test_worker_with_options(
+                WorkerSpawnOptions::new(format!("({fixture})({mode:?})"), script_url.to_string())
+                    .with_global_kind(kind.clone())
+                    .with_bootstrap_completion_sender(bootstrap_tx),
+            );
+            let bootstrap = timeout(TIMEOUT, bootstrap_rx.recv()).await;
+            handle.terminate_and_join();
+            bootstrap
+                .expect("timed out waiting for IndexedDB first-use checks")
+                .expect("worker bootstrap channel closed")
+                .result
+                .unwrap_or_else(|error| {
+                    panic!("{kind:?}, {mode}: first IndexedDB access failed: {error:?}")
+                });
+        }
+    }
+}
 
 async fn lazy_diagnostics(
     handle: &WorkerHandle,
@@ -176,17 +216,31 @@ async fn worker_storage_surfaces_materialize_in_independent_stages() {
               return;
             }
 
+            if (event.data === "indexedDBDescriptor") {
+              const descriptor = Object.getOwnPropertyDescriptor(WorkerGlobalScope.prototype, "indexedDB");
+              let illegalReceiver;
+              try { descriptor.get.call({}); } catch (error) { illegalReceiver = error.name; }
+              postMessage({
+                phase: "indexedDBDescriptor",
+                own: Object.hasOwn(self, "indexedDB"),
+                accessor: typeof descriptor.get === "function" && descriptor.set === undefined,
+                illegalReceiver
+              });
+              return;
+            }
+
             if (event.data === "indexedDB") {
               const factory = indexedDB;
               const descriptor =
-                Object.getOwnPropertyDescriptor(self, "indexedDB");
+                Object.getOwnPropertyDescriptor(WorkerGlobalScope.prototype, "indexedDB");
               postMessage({
                 phase: "indexedDB",
                 same: factory === indexedDB,
                 instance: factory instanceof IDBFactory,
-                dataDescriptor:
-                  descriptor.value === factory &&
-                  typeof descriptor.get === "undefined"
+                prototypeAccessor:
+                  !Object.hasOwn(self, "indexedDB") &&
+                  descriptor.get.call(self) === factory &&
+                  descriptor.set === undefined
               });
               return;
             }
@@ -256,9 +310,10 @@ async fn worker_storage_surfaces_materialize_in_independent_stages() {
     );
     let diagnostics = lazy_diagnostics(&handle).await;
     assert_eq!(diagnostics.storage_constructor_materializations, 0);
-    assert!(
-        diagnostics.materialized_interfaces.is_empty(),
-        "blank worker bootstrap must not materialize Navigator or Crypto constructors"
+    assert_eq!(
+        diagnostics.materialized_interfaces,
+        vec![("Performance", 1), ("EventTarget", 1)],
+        "only constructors required by the eagerly exposed performance object may materialize during worker bootstrap"
     );
     assert!(!diagnostics.storage_manager_materialized);
     assert!(!diagnostics.storage_bucket_manager_materialized);
@@ -378,10 +433,22 @@ async fn worker_storage_surfaces_materialize_in_independent_stages() {
     assert_eq!(diagnostics.storage_constructor_materializations, 0);
     assert!(!diagnostics.opfs_owner_state_materialized);
 
+    handle.post_message(serialize_test_string("indexedDBDescriptor"));
+    assert_eq!(
+        recv_post_json(&mut handle).await,
+        r#"{"phase":"indexedDBDescriptor","own":false,"accessor":true,"illegalReceiver":"TypeError"}"#
+    );
+    let before_factory = lazy_diagnostics(&handle).await;
+    assert_eq!(
+        before_factory.materialized_interfaces, diagnostics.materialized_interfaces,
+        "inspecting the accessor and rejecting a receiver must not materialize IDBFactory"
+    );
+    assert_eq!(materialization_count(&before_factory, "IDBFactory"), 0);
+
     handle.post_message(serialize_test_string("indexedDB"));
     assert_eq!(
         recv_post_json(&mut handle).await,
-        r#"{"phase":"indexedDB","same":true,"instance":true,"dataDescriptor":true}"#
+        r#"{"phase":"indexedDB","same":true,"instance":true,"prototypeAccessor":true}"#
     );
     let diagnostics = lazy_diagnostics(&handle).await;
     assert_eq!(materialization_count(&diagnostics, "IDBFactory"), 1);
@@ -395,6 +462,7 @@ async fn worker_storage_surfaces_materialize_in_independent_stages() {
         "IDBCursor",
         "IDBCursorWithValue",
         "IDBKeyRange",
+        "IDBRecord",
         "IDBVersionChangeEvent",
     ] {
         assert_eq!(

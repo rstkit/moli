@@ -1,6 +1,6 @@
 use crate::document_runtime::DomHandle;
 use crate::native_bridge::document::detached_native_handle_for_runtime;
-use crate::native_bridge::{ImageDecodeRequestId, JsContextHost};
+use crate::native_bridge::{ImageDecodeRequestId, PageScriptHost};
 use crate::util::context_host_ptr_from_global_bridge;
 
 use super::super::super::node::{live_delegate_arg_handle, node_runtime_and_handle_from_object};
@@ -10,6 +10,10 @@ pub(in crate::native_bridge) fn image_decode_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
+    let realm = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .and_then(|receiver| receiver.get_creation_context(scope))
+        .unwrap_or_else(|| scope.get_current_context());
+    let scope = &mut v8::ContextScope::new(scope, realm);
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         rv.set(v8::undefined(scope).into());
         return;
@@ -40,7 +44,7 @@ pub(in crate::native_bridge) fn image_decode_callback<'s>(
 fn image_decode_target<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     if let Ok(target) = node_runtime_and_handle_from_object(scope, object) {
         return Some(target);
     }

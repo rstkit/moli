@@ -7,36 +7,28 @@ use serde_json::{Value, json};
 
 async fn complete_pending_command_task_for_test(
     ctx: &mut TestContext,
-    mut pending: crate::conn::PendingCdpCommandDispatch,
+    pending: crate::conn::PendingCdpCommandDispatch,
 ) -> (Vec<Value>, Vec<CdpSchedulerEvent>) {
-    loop {
-        let completed = pending.wait().await;
-        match ctx.conn.complete_pending_command_dispatch(completed).await {
-            CdpCommandTaskStep::Pending(next) => pending = *next,
-            CdpCommandTaskStep::Complete(outcome) => return outcome.into_parts(),
-        }
-    }
+    ctx.complete_command_task_step_with_events_for_test(CdpCommandTaskStep::Pending(Box::new(
+        pending,
+    )))
+    .await
 }
 
 async fn complete_command_task_for_test(
     ctx: &mut TestContext,
     step: CdpCommandTaskStep,
 ) -> Vec<Value> {
-    match step {
-        CdpCommandTaskStep::Complete(outcome) => outcome.into_parts().0,
-        CdpCommandTaskStep::Pending(pending) => {
-            complete_pending_command_task_for_test(ctx, *pending)
-                .await
-                .0
-        }
-    }
+    ctx.complete_command_task_step_with_events_for_test(step)
+        .await
+        .0
 }
 
 async fn load_page_async(ctx: &mut TestContext, html: &str) {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     let data_url = format!("data:text/html,{html}");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.enable_page_events_for_test(None);
     ctx.install_navigation_fixture_for_session_owner(&data_url, None)
         .await;
@@ -49,20 +41,639 @@ async fn load_page_async(ctx: &mut TestContext, html: &str) {
 }
 
 async fn complete_child_frame_lifecycle(ctx: &mut TestContext) {
-    let owner = crate::conn::CommandOwnerScope::capture(&ctx.conn, None);
-    let pending = ctx
-        .conn
-        .start_child_frame_lifecycle_work_for_owner(owner, std::time::Duration::from_secs(2))
-        .expect("loaded page should expose child-frame lifecycle work");
+    let owner = ctx.with_fixture(|conn| crate::conn::CommandOwnerScope::capture(conn, None));
+    let pending = ctx.with_fixture(|conn| {
+        conn.start_child_frame_lifecycle_work_for_owner(owner, std::time::Duration::from_secs(2))
+            .expect("loaded page should expose child-frame lifecycle work")
+    });
     let completed = pending
         .wait()
         .await
         .expect("child-frame lifecycle work should complete");
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.complete_child_frame_lifecycle_work_for_session_owner(completed)
+                .expect("child-frame lifecycle completion should apply"),
+            "child-frame lifecycle should settle before inspecting the nested frame tree"
+        )
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ax_snapshot_filters_computed_visibility_without_losing_visible_overrides() {
+    let mut ctx = TestContext::new();
+    load_page_async(&mut ctx, r#"<!doctype html><style>
+      .none { display:none } .shown { display:block }
+    </style><body>
+      <button>Visible</button><button class=none>Display none</button>
+      <button style='visibility:collapse'>Collapsed</button>
+      <button style='position:absolute;left:100000px'>Offscreen</button>
+      <button hidden>Hidden</button><button hidden class=shown>Hidden override</button>
+      <div style='visibility:hidden'><button>Invisible</button>
+        <button style='visibility:visible'>Visibility override</button></div>
+      <div inert><button>Inert</button></div>
+      <div role=button style='content-visibility:hidden'>Hidden contents<button>CV child</button></div>
+      <div hidden=until-found><button>Until found child</button></div>
+      <div hidden=until-found style='content-visibility:visible'><button>Until found override</button></div>
+      <div style='content-visibility:hidden;display:contents'><button>CV contents</button></div>
+      <div style='content-visibility:hidden;display:inline'><button>CV inline</button></div>
+      <button style='opacity:0'>Transparent</button>
+      <button style='width:0;height:0;padding:0;border:0'>Zero size</button>
+      <div role=button style='display:contents'>Contents host</div>
+    </body>"#).await;
+    ctx.process_async(json!({"id":1,"method":"Accessibility.getFullAXTree"}))
+        .await;
+    let response = ctx.take_response_by_id(1);
+    let nodes = response["result"]["nodes"].as_array().expect("AX nodes");
+    let mut names = nodes
+        .iter()
+        .filter(|node| node["role"]["value"] == "button")
+        .map(|node| node["name"]["value"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "",
+            "CV contents",
+            "CV inline",
+            "Contents host",
+            "Hidden override",
+            "Offscreen",
+            "Transparent",
+            "Until found override",
+            "Visibility override",
+            "Visible",
+            "Zero size"
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ax_names_filter_hidden_contents_and_preserve_hidden_aria_reference_roots() {
+    let mut ctx = TestContext::new();
+    load_page_async(&mut ctx, r#"<!doctype html><body>
+      <button>Direct<span style='display:none'> hidden</span><span aria-hidden=true> aria</span></button>
+      <button>Before<span style='content-visibility:hidden;display:block'>CV hidden</span>After</button>
+      <button>Before<span inert>Inert hidden</span>After</button>
+      <span id=visible>Visible label<span style='display:none'> hidden</span></span>
+      <button aria-labelledby=visible></button>
+      <span id=hidden style='display:none'>Hidden root<span aria-hidden=true>hidden aria child</span></span>
+      <button aria-labelledby=hidden></button>
+      <label for=native>Native label<span style='display:none'> hidden</span></label><input id=native>
+      <label for=nativeHidden style='display:none'>Hidden native label</label><input id=nativeHidden>
+      <span id=inert inert>Inert label</span><button aria-labelledby=inert></button>
+      <div id=host role=button>assigned text</div>
+      <script>host.attachShadow({mode:'closed'}).innerHTML='Shadow <slot></slot>';</script>
+    </body>"#).await;
+    ctx.process_async(json!({"id":1,"method":"Accessibility.getFullAXTree"}))
+        .await;
+    let response = ctx.take_response_by_id(1);
+    let nodes = response["result"]["nodes"].as_array().expect("AX nodes");
+    let mut names = nodes
+        .iter()
+        .filter(|node| node["role"]["value"] == "button")
+        .map(|node| node["name"]["value"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "",
+            "Before After",
+            "BeforeAfter",
+            "Direct",
+            "Hidden root hidden aria child",
+            "Shadow assigned text",
+            "Visible label"
+        ]
+    );
+    let input_names = nodes
+        .iter()
+        .filter(|node| node["role"]["value"] == "textbox")
+        .map(|node| node["name"]["value"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(input_names, ["Native label", ""]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ax_tree_shadow_root_uses_all_node_reference_kinds() {
+    for mode in ["open", "closed"] {
+        let mut ctx = TestContext::new();
+        load_page_async(
+            &mut ctx,
+            &format!(
+                r#"<!doctype html><html><body>
+                <div id='host'><button slot='action'>Slotted action</button><button>Unassigned action</button></div>
+                <button>Outside action</button>
+                <script>
+                globalThis.axQueryRoot = document.getElementById('host').attachShadow({{mode:'{mode}'}});
+                axQueryRoot.innerHTML = '<slot name="action"><button>Fallback action</button></slot><button>Shadow action</button>';
+                </script></body></html>"#
+            ),
+        )
+        .await;
+
+        ctx.process_async(json!({"id": 1, "method": "Accessibility.getFullAXTree"}))
+            .await;
+        let tree = ctx.take_response_by_id(1);
+        let nodes = tree["result"]["nodes"].as_array().expect("full AX nodes");
+        let mut expected_ids = ["Shadow action", "Slotted action"]
+            .map(|name| renderer_backed_ax_node_id(find_ax_node(nodes, "button", name)))
+            .to_vec();
+        expected_ids.sort();
+
+        ctx.process_async(json!({
+            "id": 2, "method": "Runtime.evaluate", "params": {"expression": "axQueryRoot"}
+        }))
+        .await;
+        let evaluated = ctx.take_response_by_id(2);
+        let object_id = evaluated["result"]["result"]["objectId"]
+            .as_str()
+            .expect("live shadow root object")
+            .to_owned();
+
+        ctx.process_async(json!({
+            "id": 3, "method": "DOM.getDocument", "params": {"depth": -1, "pierce": true}
+        }))
+        .await;
+        assert!(ctx.take_response_by_id(3)["result"]["root"].is_object());
+        ctx.process_async(json!({
+            "id": 4, "method": "DOM.requestNode", "params": {"objectId": object_id}
+        }))
+        .await;
+        let node_id = ctx.take_response_by_id(4)["result"]["nodeId"]
+            .as_u64()
+            .expect("shadow root frontend ID");
+        ctx.process_async(json!({
+            "id": 5, "method": "DOM.describeNode", "params": {"nodeId": node_id}
+        }))
+        .await;
+        let described = ctx.take_response_by_id(5);
+        assert_eq!(described["result"]["node"]["shadowRootType"], mode);
+        let backend_id = described["result"]["node"]["backendNodeId"]
+            .as_u64()
+            .expect("shadow root backend ID");
+
+        for (id, reference) in [
+            (6, json!({"objectId": object_id, "role": "button"})),
+            (7, json!({"nodeId": node_id, "role": "button"})),
+            (8, json!({"backendNodeId": backend_id, "role": "button"})),
+        ] {
+            ctx.process_async(json!({
+                "id": id, "method": "Accessibility.queryAXTree", "params": reference
+            }))
+            .await;
+            let response = ctx.take_response_by_id(id);
+            let queried = response["result"]["nodes"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{mode} shadow root query: {response}"));
+            let mut names = queried
+                .iter()
+                .map(|node| node["name"]["value"].as_str().expect("button name"))
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["Shadow action", "Slotted action"],
+                "{mode}: {response}"
+            );
+            let mut queried_ids = queried
+                .iter()
+                .map(renderer_backed_ax_node_id)
+                .collect::<Vec<_>>();
+            queried_ids.sort();
+            assert_eq!(queried_ids, expected_ids, "{mode}: {response}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ax_style_mutations_preserve_refs_and_hidden_node_queries() {
+    let mut ctx = TestContext::new();
+    load_page_async(
+        &mut ctx,
+        r#"<!doctype html><html><body><div id=host>
+      <button id=target>Live action</button></div><script>
+      globalThis.axRoot = host.attachShadow({mode:'closed'});
+      axRoot.innerHTML = '<slot></slot>';
+      </script></body></html>"#,
+    )
+    .await;
+    ctx.process_async(json!({"id":1,"method":"Accessibility.enable"}))
+        .await;
+    assert!(ctx.take_response_by_id(1).get("result").is_some());
+    ctx.process_async(json!({"id":2,"method":"Accessibility.getFullAXTree"}))
+        .await;
+    let full = ctx.take_response_by_id(2);
+    let initial = find_ax_node(
+        full["result"]["nodes"].as_array().expect("AX nodes"),
+        "button",
+        "Live action",
+    )
+    .clone();
+    let backend = renderer_backend_dom_node_id(&initial);
+    let ax_id = renderer_backed_ax_node_id(&initial);
+    dom_document_node_id_async(&mut ctx, None, 3).await;
+    ctx.process_async(json!({"id":4,"method":"Runtime.evaluate","params":{"expression":"document.getElementById('target')"}})).await;
+    let object = ctx.take_response_by_id(4)["result"]["result"]["objectId"]
+        .as_str()
+        .expect("target object")
+        .to_owned();
+    ctx.process_async(json!({"id":5,"method":"DOM.requestNode","params":{"objectId":object}}))
+        .await;
+    let frontend = ctx.take_response_by_id(5)["result"]["nodeId"]
+        .as_u64()
+        .expect("frontend node");
+    for (mutation, reason) in [
+        ("target.style.display='none'", "notRendered"),
+        (
+            "target.style.display='';target.style.visibility='hidden'",
+            "notVisible",
+        ),
+        (
+            "target.style.visibility='';target.inert=true",
+            "inertElement",
+        ),
+    ] {
+        ctx.process_async(
+            json!({"id":10,"method":"Runtime.evaluate","params":{"expression":mutation}}),
+        )
+        .await;
+        assert!(
+            ctx.take_response_by_id(10)["result"]
+                .get("exceptionDetails")
+                .is_none()
+        );
+        for reference in [
+            json!({"nodeId":frontend}),
+            json!({"backendNodeId":backend}),
+            json!({"objectId":object}),
+        ] {
+            let mut params = reference.clone();
+            params["fetchRelatives"] = json!(false);
+            ctx.process_async(
+                json!({"id":11,"method":"Accessibility.getPartialAXTree","params":params}),
+            )
+            .await;
+            let partial = ctx.take_response_by_id(11);
+            let nodes = partial["result"]["nodes"]
+                .as_array()
+                .expect("partial AX nodes");
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0]["ignored"], true);
+            assert_eq!(nodes[0]["backendDOMNodeId"], backend);
+            assert_eq!(nodes[0]["nodeId"], ax_id);
+            assert_eq!(nodes[0]["ignoredReasons"][0]["name"], reason);
+            ctx.process_async(
+                json!({"id":12,"method":"Accessibility.queryAXTree","params":reference}),
+            )
+            .await;
+            assert!(
+                ctx.take_response_by_id(12)["result"]["nodes"]
+                    .as_array()
+                    .expect("query nodes")
+                    .iter()
+                    .all(|node| node["ignored"] == true)
+            );
+        }
+        ctx.process_async(json!({"id":13,"method":"Accessibility.getAXNodeAndAncestors","params":{"backendNodeId":backend}})).await;
+        let ancestors = ctx.take_response_by_id(13);
+        let nodes = ancestors["result"]["nodes"].as_array().expect("ancestors");
+        assert_eq!(nodes[0]["ignored"], true);
+        assert_eq!(
+            nodes.last().expect("root ancestor")["role"]["value"],
+            "RootWebArea"
+        );
+        ctx.process_async(
+            json!({"id":14,"method":"Accessibility.getChildAXNodes","params":{"id":ax_id}}),
+        )
+        .await;
+        let children = ctx.take_response_by_id(14);
+        assert!(
+            children["result"]["nodes"]
+                .as_array()
+                .expect("AX children")
+                .iter()
+                .all(|node| node["ignored"] == true)
+        );
+    }
+    ctx.process_async(
+        json!({"id":20,"method":"Runtime.evaluate","params":{"expression":"target.inert=false"}}),
+    )
+    .await;
+    ctx.take_response_by_id(20);
+    ctx.process_async(json!({"id":21,"method":"Accessibility.getFullAXTree"}))
+        .await;
+    let restored = ctx.take_response_by_id(21);
+    let button = find_ax_node(
+        restored["result"]["nodes"].as_array().expect("AX nodes"),
+        "button",
+        "Live action",
+    );
+    assert_eq!(button["nodeId"], initial["nodeId"]);
+    assert_eq!(button["backendDOMNodeId"], initial["backendDOMNodeId"]);
+
+    ctx.process_async(
+        json!({"id":22,"method":"Runtime.evaluate","params":{"expression":"axRoot"}}),
+    )
+    .await;
+    let root_object = ctx.take_response_by_id(22)["result"]["result"]["objectId"]
+        .as_str()
+        .expect("shadow object")
+        .to_owned();
+    ctx.process_async(json!({"id":23,"method":"Accessibility.getAXNodeAndAncestors","params":{"objectId":root_object}})).await;
+    let no_object = ctx.take_response_by_id(23);
+    let nodes = no_object["result"]["nodes"]
+        .as_array()
+        .expect("transparent root placeholder");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["ignoredReasons"][0]["name"], "notRendered");
+    ctx.process_async(json!({"id":24,"method":"Accessibility.getPartialAXTree","params":{"objectId":root_object}})).await;
+    let relatives = ctx.take_response_by_id(24);
     assert!(
-        ctx.conn
-            .complete_child_frame_lifecycle_work_for_session_owner(completed)
-            .expect("child-frame lifecycle completion should apply"),
-        "child-frame lifecycle should settle before inspecting the nested frame tree"
+        relatives["result"]["nodes"]
+            .as_array()
+            .expect("transparent root relatives")
+            .len()
+            > 1
+    );
+    ctx.process_async(json!({"id":25,"method":"Runtime.evaluate","params":{"expression":"globalThis.detachedControl=document.createElement('button');detachedControl"}})).await;
+    let detached = ctx.take_response_by_id(25)["result"]["result"]["objectId"]
+        .as_str()
+        .expect("detached object")
+        .to_owned();
+    ctx.process_async(
+        json!({"id":26,"method":"Accessibility.getPartialAXTree","params":{"objectId":detached}}),
+    )
+    .await;
+    let placeholder = ctx.take_response_by_id(26);
+    let nodes = placeholder["result"]["nodes"]
+        .as_array()
+        .expect("detached placeholder");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["ignored"], true);
+    assert!(nodes[0]["backendDOMNodeId"].as_u64().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ax_styles_use_child_and_nested_document_cascades() {
+    let mut ctx = TestContext::new();
+    load_page_async(&mut ctx, r#"<!doctype html><html><body><style>button{display:none}</style>
+    <iframe srcdoc="<!doctype html><html><body><button hidden>Child hidden</button><button hidden style='display:block'>Child visible</button><iframe srcdoc='<!doctype html><html><body><button hidden>Nested hidden</button><button>Nested visible</button></body></html>'></iframe></body></html>"></iframe>
+    </body></html>"#).await;
+    complete_child_frame_lifecycle(&mut ctx).await;
+    let child = child_frame_id_for_single_iframe_async(&mut ctx).await;
+    let nested = nested_child_frame_id_for_single_nested_iframe_async(&mut ctx).await;
+    for (frame, name) in [(child, "Child visible"), (nested, "Nested visible")] {
+        ctx.process_async(
+            json!({"id":30,"method":"Accessibility.getFullAXTree","params":{"frameId":frame}}),
+        )
+        .await;
+        let response = ctx.take_response_by_id(30);
+        let nodes = response["result"]["nodes"]
+            .as_array()
+            .expect("frame AX nodes");
+        let buttons = nodes
+            .iter()
+            .filter(|node| node["role"]["value"] == "button")
+            .collect::<Vec<_>>();
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0]["name"]["value"], name);
+        let hidden = child_frame_renderer_backend_node_id_for_selector_async(
+            &mut ctx,
+            &frame,
+            "button[hidden]",
+            40,
+        )
+        .await;
+        ctx.process_async(json!({"id":44,"method":"Accessibility.getPartialAXTree","params":{"backendNodeId":hidden,"frameId":frame,"fetchRelatives":false}})).await;
+        let partial = ctx.take_response_by_id(44);
+        assert_eq!(
+            partial["result"]["nodes"][0]["ignored"], true,
+            "frame partial: {partial}"
+        );
+        assert_eq!(
+            partial["result"]["nodes"][0]["ignoredReasons"][0]["name"],
+            "notRendered"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ax_modal_dialog_escapes_ancestor_inertness_but_not_its_own() {
+    let mut ctx = TestContext::new();
+    load_page_async(
+        &mut ctx,
+        r#"<!doctype html><html><body><button>Outside</button>
+    <div inert><dialog id=modal><button>Modal action</button></dialog></div>
+    <script>modal.showModal()</script></body></html>"#,
+    )
+    .await;
+    ctx.process_async(json!({"id":50,"method":"Accessibility.getFullAXTree"}))
+        .await;
+    let response = ctx.take_response_by_id(50);
+    let buttons = response["result"]["nodes"]
+        .as_array()
+        .expect("AX nodes")
+        .iter()
+        .filter(|node| node["role"]["value"] == "button")
+        .collect::<Vec<_>>();
+    assert_eq!(buttons.len(), 1);
+    assert_eq!(buttons[0]["name"]["value"], "Modal action");
+    ctx.process_async(
+        json!({"id":51,"method":"Runtime.evaluate","params":{"expression":"modal.inert=true"}}),
+    )
+    .await;
+    ctx.take_response_by_id(51);
+    ctx.process_async(json!({"id":52,"method":"Accessibility.getFullAXTree"}))
+        .await;
+    let response = ctx.take_response_by_id(52);
+    assert!(
+        !response["result"]["nodes"]
+            .as_array()
+            .expect("AX nodes")
+            .iter()
+            .any(|node| node["role"]["value"] == "button")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ax_inert_frames_block_modal_escape_and_update_nested_documents() {
+    let mut ctx = TestContext::new();
+    load_page_async(&mut ctx, r#"<!doctype html><html><body><iframe id=outer inert srcdoc="<!doctype html><html><body><dialog id=modal><button>Modal action</button></dialog><iframe srcdoc='<!doctype html><html><body><button>Nested action</button></body></html>'></iframe><script>modal.showModal()</script></body></html>"></iframe></body></html>"#).await;
+    complete_child_frame_lifecycle(&mut ctx).await;
+    let child = child_frame_id_for_single_iframe_async(&mut ctx).await;
+    let nested = nested_child_frame_id_for_single_nested_iframe_async(&mut ctx).await;
+    for frame in [&child, &nested] {
+        ctx.process_async(
+            json!({"id":60,"method":"Accessibility.getFullAXTree","params":{"frameId":frame}}),
+        )
+        .await;
+        let response = ctx.take_response_by_id(60);
+        assert!(
+            !response["result"]["nodes"]
+                .as_array()
+                .expect("inert frame AX tree")
+                .iter()
+                .any(|node| node["role"]["value"] == "button")
+        );
+    }
+    ctx.process_async(
+        json!({"id":61,"method":"Runtime.evaluate","params":{"expression":"outer.inert=false"}}),
+    )
+    .await;
+    ctx.take_response_by_id(61);
+    ctx.process_async(
+        json!({"id":62,"method":"Accessibility.getFullAXTree","params":{"frameId":child}}),
+    )
+    .await;
+    let response = ctx.take_response_by_id(62);
+    find_ax_node(
+        response["result"]["nodes"]
+            .as_array()
+            .expect("active frame AX tree"),
+        "button",
+        "Modal action",
+    );
+    ctx.process_async(json!({"id":63,"method":"Page.createIsolatedWorld","params":{"frameId":child,"worldName":"modal-close"}})).await;
+    let context = ctx.take_response_by_id(63)["result"]["executionContextId"]
+        .as_i64()
+        .expect("child world");
+    ctx.process_async(json!({"id":64,"method":"Runtime.evaluate","params":{"contextId":context,"expression":"document.getElementById('modal').close()"}})).await;
+    ctx.take_response_by_id(64);
+    ctx.process_async(
+        json!({"id":65,"method":"Accessibility.getFullAXTree","params":{"frameId":nested}}),
+    )
+    .await;
+    let response = ctx.take_response_by_id(65);
+    find_ax_node(
+        response["result"]["nodes"]
+            .as_array()
+            .expect("nested frame AX tree"),
+        "button",
+        "Nested action",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_full_ax_tree_shadow_button_ref_supports_mouse_click() {
+    let mut ctx = TestContext::new();
+    load_page_async(
+        &mut ctx,
+        r#"<!doctype html><html><body style='margin:0'>
+        <div id='host'></div>
+        <script>
+        const root = document.getElementById('host').attachShadow({mode:'open'});
+        root.innerHTML = '<button style="width:160px;height:40px">Shadow action</button>';
+        globalThis.shadowClicks = 0;
+        root.querySelector('button').addEventListener('click', function() {
+            globalThis.shadowClicks++;
+            this.textContent = 'Clicked';
+        });
+        </script></body></html>"#,
+    )
+    .await;
+
+    ctx.process_async(json!({"id": 1, "method": "Accessibility.getFullAXTree"}))
+        .await;
+    let tree = ctx.take_response_by_id(1);
+    let nodes = tree["result"]["nodes"].as_array().expect("AX nodes");
+    let button = find_ax_node(nodes, "button", "Shadow action");
+    assert_eq!(button["ignored"], false);
+    let button_ax_id = renderer_backed_ax_node_id(button);
+    let button_backend_id = renderer_backend_dom_node_id(button);
+
+    ctx.process_async(json!({
+        "id": 2, "method": "DOM.resolveNode",
+        "params": {"backendNodeId": button_backend_id}
+    }))
+    .await;
+    let resolved = ctx.take_response_by_id(2);
+    let object_id = resolved["result"]["object"]["objectId"]
+        .as_str()
+        .expect("AX backend ID must resolve to the live button")
+        .to_owned();
+
+    for (id, method, params) in [
+        (
+            3,
+            "Accessibility.getPartialAXTree",
+            json!({"objectId": object_id, "fetchRelatives": true}),
+        ),
+        (
+            4,
+            "Accessibility.getAXNodeAndAncestors",
+            json!({"backendNodeId": button_backend_id}),
+        ),
+        (
+            5,
+            "Accessibility.queryAXTree",
+            json!({"objectId": object_id, "role": "button", "accessibleName": "Shadow action"}),
+        ),
+    ] {
+        ctx.process_async(json!({"id": id, "method": method, "params": params}))
+            .await;
+        let response = ctx.take_response_by_id(id);
+        assert_eq!(
+            response["result"]["nodes"][0]["nodeId"], button_ax_id,
+            "{method}: {response}"
+        );
+    }
+
+    ctx.process_async(json!({
+        "id": 6, "method": "DOM.getBoxModel",
+        "params": {"backendNodeId": button_backend_id}
+    }))
+    .await;
+    let geometry = ctx.take_response_by_id(6);
+    let border = geometry["result"]["model"]["border"]
+        .as_array()
+        .expect("button border quad");
+    assert!(
+        geometry["result"]["model"]["width"]
+            .as_f64()
+            .expect("button width")
+            > 0.0
+    );
+    assert!(
+        geometry["result"]["model"]["height"]
+            .as_f64()
+            .expect("button height")
+            > 0.0
+    );
+    let x = (border[0].as_f64().expect("left") + border[4].as_f64().expect("right")) / 2.0;
+    let y = (border[1].as_f64().expect("top") + border[5].as_f64().expect("bottom")) / 2.0;
+    for (id, event, buttons) in [
+        (7, "mouseMoved", 0),
+        (8, "mousePressed", 1),
+        (9, "mouseReleased", 0),
+    ] {
+        ctx.process_async(json!({
+            "id": id, "method": "Input.dispatchMouseEvent",
+            "params": {"type": event, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": 1}
+        })).await;
+        ctx.expect_result(id, json!({}), None);
+    }
+
+    ctx.process_async(json!({
+        "id": 10, "method": "Runtime.evaluate",
+        "params": {"expression": "globalThis.shadowClicks", "returnByValue": true}
+    }))
+    .await;
+    assert_eq!(ctx.take_response_by_id(10)["result"]["result"]["value"], 1);
+
+    ctx.process_async(json!({"id": 11, "method": "Accessibility.getFullAXTree"}))
+        .await;
+    let updated_tree = ctx.take_response_by_id(11);
+    let updated_nodes = updated_tree["result"]["nodes"]
+        .as_array()
+        .expect("updated AX nodes");
+    let updated_button = find_ax_node(updated_nodes, "button", "Clicked");
+    assert_eq!(updated_button["nodeId"], button_ax_id);
+    assert_eq!(
+        renderer_backend_dom_node_id(updated_button),
+        button_backend_id
     );
 }
 
@@ -81,7 +692,7 @@ async fn accessibility_top_frame_snapshot_commands_use_explicit_dispatch() {
         "method": "Accessibility.getFullAXTree"
     })
     .to_string();
-    let full_tree_step = ctx.conn.start_command_dispatch(&full_tree_raw);
+    let full_tree_step = ctx.with_fixture(|conn| conn.start_command_dispatch(&full_tree_raw));
     let full_tree = complete_command_task_for_test(&mut ctx, full_tree_step).await;
     let nodes = full_tree[0]["result"]["nodes"]
         .as_array()
@@ -130,7 +741,7 @@ async fn accessibility_top_frame_snapshot_commands_use_explicit_dispatch() {
             "params": params
         })
         .to_string();
-        let step = ctx.conn.start_command_dispatch(&raw);
+        let step = ctx.with_fixture(|conn| conn.start_command_dispatch(&raw));
         let messages = complete_command_task_for_test(&mut ctx, step).await;
         assert_eq!(messages.len(), 1, "{method} should emit one response");
         assert_eq!(messages[0]["id"], id);
@@ -151,15 +762,17 @@ async fn accessibility_get_full_tree_rejects_while_main_document_navigation_is_p
     )
     .await;
     ctx.sent.clear();
-    let browser_context = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("browser context should exist");
-    browser_context.attach_active_session("SID-1".to_owned());
-    browser_context
-        .start_document_navigation_for_active_target("PENDING-LOADER".to_owned())
-        .expect("active navigation should start");
+    ctx.with_fixture(|conn| {
+        let browser_context = {
+            conn.browser_context
+                .as_mut()
+                .expect("browser context should exist")
+        };
+        browser_context.attach_active_session("SID-1".to_owned());
+        browser_context
+            .start_document_navigation_for_active_target("PENDING-LOADER".to_owned())
+            .expect("active navigation should start");
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -182,26 +795,28 @@ async fn get_full_ax_tree_reads_live_renderer_dom_when_page_snapshot_is_stale() 
     .await;
 
     let mutation_completion = {
-        let page = ctx
-            .conn
-            .browser_context
-            .as_mut()
-            .expect("browser context")
-            .active_page_target_mut()
-            .runtime_slot
-            .loaded_page_mut()
-            .expect("loaded page");
-        let mutation = json!({
-            "id": 910,
-            "method": "Runtime.evaluate",
-            "params": {
-                "expression": "document.getElementById('target').textContent = 'live'; 'done';",
-                "returnByValue": true
-            }
+        let pending = ctx.with_fixture(|conn| {
+            let page = {
+                conn.browser_context
+                    .as_mut()
+                    .expect("browser context")
+                    .active_page_target_mut()
+                    .runtime_slot
+                    .loaded_page_mut()
+                    .expect("loaded page")
+            };
+            let mutation = json!({
+                "id": 910,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": "document.getElementById('target').textContent = 'live'; 'done';",
+                    "returnByValue": true
+                }
+            });
+
+            page.start_runtime_protocol_message(mutation.to_string())
+                .expect("runtime mutation should start")
         });
-        let pending = page
-            .start_runtime_protocol_message(mutation.to_string())
-            .expect("runtime mutation should start");
         pending
             .wait()
             .await
@@ -226,18 +841,20 @@ async fn get_full_ax_tree_reads_live_renderer_dom_when_page_snapshot_is_stale() 
             .any(|node| node["name"]["value"] == json!("old"))
     );
 
-    let page = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("browser context")
-        .active_page_target_mut()
-        .runtime_slot
-        .loaded_page_mut()
-        .expect("loaded page");
-    let _ = page
-        .finish_runtime_protocol_message(mutation_completion)
-        .expect("runtime mutation completion should finish");
+    ctx.with_fixture(|conn| {
+        let page = {
+            conn.browser_context
+                .as_mut()
+                .expect("browser context")
+                .active_page_target_mut()
+                .runtime_slot
+                .loaded_page_mut()
+                .expect("loaded page")
+        };
+        let _ = page
+            .finish_runtime_protocol_message(mutation_completion)
+            .expect("runtime mutation completion should finish");
+    });
 }
 
 async fn enable_runtime_async(ctx: &mut TestContext) {
@@ -304,6 +921,11 @@ async fn child_frame_renderer_dom_node_ids_for_selector_async(
     selector: &str,
     base_id: u64,
 ) -> ChildFrameRendererDomNodeIds {
+    ctx.process_async(
+        json!({"id":base_id+3,"method":"DOM.getDocument","params":{"depth":-1,"pierce":true}}),
+    )
+    .await;
+    let _ = ctx.take_response_by_id(base_id + 3);
     ctx.process_async(json!({
         "id": base_id,
         "method": "Page.createIsolatedWorld",
@@ -422,7 +1044,7 @@ async fn accessibility_loaded_page_methods_target_background_owner_without_activ
     bc.set_active_target_id("TID-active".to_owned());
     bc.attach_active_session("SID-active".to_owned());
     bc.insert_page_target_host(background);
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.install_navigation_fixture_for_session_owner(
         "data:text/html,<html><body><p>Intro</p><button>Owner</button></body></html>",
         Some("SID-background"),
@@ -435,7 +1057,7 @@ async fn accessibility_loaded_page_methods_target_background_owner_without_activ
         "method": "Accessibility.getFullAXTree"
     }))
     .await;
-    let full_tree = ctx.take_one();
+    let full_tree = ctx.take_response_by_id(201);
     assert_eq!(full_tree["sessionId"], "SID-background");
     let nodes = full_tree["result"]["nodes"]
         .as_array()
@@ -519,13 +1141,14 @@ async fn accessibility_loaded_page_methods_target_background_owner_without_activ
     assert_eq!(partial["sessionId"], "SID-background");
     assert_eq!(partial["result"]["nodes"][0]["nodeId"], button_ax_id);
 
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(BrowserContext::active_target_id),
-        Some("TID-active")
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .and_then(BrowserContext::active_target_id),
+            Some("TID-active")
+        )
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -534,14 +1157,13 @@ async fn accessibility_loaded_page_methods_target_inactive_owner_without_activat
     let mut active = BrowserContext::new("BID-active".to_owned());
     active.set_active_target_id("TID-active".to_owned());
     active.attach_active_session("SID-active".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(active);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(active));
 
     let mut inactive = BrowserContext::new("BID-inactive".to_owned());
     inactive.set_active_target_id("TID-inactive".to_owned());
     inactive.set_target_url("about:blank".to_owned());
     inactive.attach_active_session("SID-inactive".to_owned());
-    ctx.conn
-        .push_inactive_browser_context_fixture_for_test(inactive);
+    ctx.with_fixture(|conn| conn.push_inactive_browser_context_fixture_for_test(inactive));
     ctx.install_navigation_fixture_for_session_owner(
         "data:text/html,<html><body><button>Inactive</button></body></html>",
         Some("SID-inactive"),
@@ -554,7 +1176,7 @@ async fn accessibility_loaded_page_methods_target_inactive_owner_without_activat
         "method": "Accessibility.getFullAXTree"
     }))
     .await;
-    let full_tree = ctx.take_one();
+    let full_tree = ctx.take_response_by_id(211);
     assert_eq!(full_tree["sessionId"], "SID-inactive");
     let nodes = full_tree["result"]["nodes"]
         .as_array()
@@ -570,13 +1192,15 @@ async fn accessibility_loaded_page_methods_target_inactive_owner_without_activat
         "method": "Accessibility.getRootAXNode"
     }))
     .await;
-    let root = ctx.take_one();
+    let root = ctx.take_response_by_id(212);
     assert_eq!(root["sessionId"], "SID-inactive");
     assert_eq!(root["result"]["node"]["role"]["value"], "RootWebArea");
-    assert_eq!(
-        ctx.conn.browser_context.as_ref().map(|bc| bc.id.as_str()),
-        Some("BID-active")
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context.as_ref().map(|bc| bc.id.as_str()),
+            Some("BID-active")
+        )
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -590,7 +1214,12 @@ async fn get_full_ax_tree_requires_browser_context() {
 #[tokio::test(flavor = "multi_thread")]
 async fn get_full_ax_tree_requires_loaded_page() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new("BID-1".into()));
+    {
+        let fixture_value = Some(BrowserContext::new("BID-1".into()));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
     ctx.process_async(json!({"id": 2, "method": "Accessibility.getFullAXTree"}))
         .await;
     ctx.expect_error(2, -32000, "NoDocumentLoaded");
@@ -623,16 +1252,17 @@ async fn get_full_ax_tree_uses_fresh_initial_document_without_adapter() {
     let nodes = response["result"]["nodes"].as_array().expect("nodes array");
     assert!(!nodes.is_empty());
     assert_eq!(nodes[0]["role"]["value"], "RootWebArea");
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .expect("browser context")
-            .active_page_target()
-            .runtime_slot
-            .has_loaded_page(),
-        "Target.createTarget should install the initial about:blank page before Accessibility"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.browser_context
+                .as_ref()
+                .expect("browser context")
+                .active_page_target()
+                .runtime_slot
+                .has_loaded_page(),
+            "Target.createTarget should install the initial about:blank page before Accessibility"
+        )
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -754,10 +1384,10 @@ async fn get_full_ax_tree_child_frame_can_complete_through_pending_command_dispa
         "params": { "frameId": child_frame_id }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame getFullAXTree should start as a pending command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame getFullAXTree should start as a pending command")
+    });
     let (messages, scheduler_events) =
         complete_pending_command_task_for_test(&mut ctx, pending).await;
     assert!(
@@ -864,10 +1494,10 @@ async fn get_root_ax_node_child_frame_can_complete_through_pending_command_dispa
         "params": { "frameId": child_frame_id }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame getRootAXNode should start as a pending command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame getRootAXNode should start as a pending command")
+    });
     let (messages, scheduler_events) =
         complete_pending_command_task_for_test(&mut ctx, pending).await;
     assert!(
@@ -907,7 +1537,12 @@ async fn get_root_ax_node_rejects_foreign_frame() {
 #[tokio::test(flavor = "multi_thread")]
 async fn get_root_ax_node_requires_loaded_page() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new("BID-1".into()));
+    {
+        let fixture_value = Some(BrowserContext::new("BID-1".into()));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
 
     ctx.process_async(json!({
         "id": 350,
@@ -1025,10 +1660,10 @@ async fn get_child_ax_nodes_child_frame_can_complete_through_pending_command_dis
         "params": { "id": main_ax_id, "frameId": child_frame_id }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame getChildAXNodes should start as a pending command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame getChildAXNodes should start as a pending command")
+    });
     let (messages, scheduler_events) =
         complete_pending_command_task_for_test(&mut ctx, pending).await;
     assert!(
@@ -1098,7 +1733,12 @@ async fn get_child_ax_nodes_validates_ax_id_and_frame() {
 #[tokio::test(flavor = "multi_thread")]
 async fn get_child_ax_nodes_requires_loaded_page() {
     let mut ctx = TestContext::new();
-    ctx.conn.browser_context = Some(BrowserContext::new("BID-1".into()));
+    {
+        let fixture_value = Some(BrowserContext::new("BID-1".into()));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
 
     ctx.process_async(json!({
         "id": 390,
@@ -1960,17 +2600,24 @@ async fn get_ax_node_and_ancestors_object_id_completes_with_single_renderer_comm
         "params": { "objectId": object_id }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("object id AX ancestors lookup should start as a pending renderer command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("object id AX ancestors lookup should start as a pending renderer command")
+    });
     let completed = pending.wait().await;
-    let CdpCommandTaskStep::Complete(outcome) =
-        ctx.conn.complete_pending_command_dispatch(completed).await
-    else {
+    let CdpCommandTaskStep::Complete(outcome) = ({
+        ctx.state
+            .with_state(|state| {
+                state.complete_command_dispatch_with_context(
+                    completed,
+                    &mut crate::conn::CommandDispatchContext::default(),
+                )
+            })
+            .expect("live test owner")
+    }) else {
         panic!("top-frame object id AX lookup should complete after one renderer command");
     };
-    let (messages, scheduler_events) = outcome.into_parts();
+    let (messages, scheduler_events) = ctx.route_completed_command_outcome_for_test(outcome).await;
     assert!(
         scheduler_events.is_empty(),
         "AX top-frame object lookup should not enqueue scheduler events: {scheduler_events:?}"
@@ -2048,7 +2695,12 @@ async fn get_ax_node_and_ancestors_requires_context_loaded_page_and_bound_node()
     .await;
     ctx.expect_error(530, -31998, "BrowserContextNotLoaded");
 
-    ctx.conn.browser_context = Some(BrowserContext::new("BID-1".into()));
+    {
+        let fixture_value = Some(BrowserContext::new("BID-1".into()));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
     ctx.process_async(json!({
         "id": 531,
         "method": "Accessibility.getAXNodeAndAncestors",
@@ -2159,10 +2811,10 @@ async fn get_ax_node_and_ancestors_child_frame_can_complete_through_pending_comm
         "params": { "backendNodeId": button_backend_id, "frameId": child_frame_id }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame getAXNodeAndAncestors should start as a pending command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame getAXNodeAndAncestors should start as a pending command")
+    });
     let (messages, scheduler_events) =
         complete_pending_command_task_for_test(&mut ctx, pending).await;
     assert!(
@@ -2272,17 +2924,24 @@ async fn async_dispatch_get_ax_node_and_ancestors_accepts_child_frame_object_id(
         "params": { "objectId": object_id, "frameId": child_frame_id }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame object id AX lookup should start as a pending renderer command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame object id AX lookup should start as a pending renderer command")
+    });
     let completed = pending.wait().await;
-    let CdpCommandTaskStep::Complete(outcome) =
-        ctx.conn.complete_pending_command_dispatch(completed).await
-    else {
+    let CdpCommandTaskStep::Complete(outcome) = ({
+        ctx.state
+            .with_state(|state| {
+                state.complete_command_dispatch_with_context(
+                    completed,
+                    &mut crate::conn::CommandDispatchContext::default(),
+                )
+            })
+            .expect("live test owner")
+    }) else {
         panic!("child-frame object id AX lookup should complete after one renderer command");
     };
-    let (messages, scheduler_events) = outcome.into_parts();
+    let (messages, scheduler_events) = ctx.route_completed_command_outcome_for_test(outcome).await;
     assert!(
         scheduler_events.is_empty(),
         "AX child-frame object lookup should not enqueue scheduler events: {scheduler_events:?}"
@@ -2350,21 +3009,31 @@ async fn child_frame_ax_reference_accepts_renderer_backend_node_id_live() {
             "params": params,
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .unwrap_or_else(|| {
-                panic!("{method} with child renderer backend id should start as a pending command")
-            });
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{method} with child renderer backend id should start as a pending command"
+                    )
+                })
+        });
         let completed = pending.wait().await;
-        let CdpCommandTaskStep::Complete(outcome) =
-            ctx.conn.complete_pending_command_dispatch(completed).await
-        else {
+        let CdpCommandTaskStep::Complete(outcome) = ({
+            ctx.state
+                .with_state(|state| {
+                    state.complete_command_dispatch_with_context(
+                        completed,
+                        &mut crate::conn::CommandDispatchContext::default(),
+                    )
+                })
+                .expect("live test owner")
+        }) else {
             panic!(
                 "{method} with child renderer backend id should complete after one renderer command"
             );
         };
-        let (messages, scheduler_events) = outcome.into_parts();
+        let (messages, scheduler_events) =
+            ctx.route_completed_command_outcome_for_test(outcome).await;
         assert!(
             scheduler_events.is_empty(),
             "{method} should not enqueue scheduler events: {scheduler_events:?}"
@@ -2482,6 +3151,59 @@ async fn query_ax_tree_filters_by_role_and_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn query_ax_tree_distinguishes_html_space_and_nbsp_in_names() {
+    let mut ctx = TestContext::new();
+    load_page_async(
+        &mut ctx,
+        "<!doctype html><body><nav aria-label='Main menu'>\
+         <a href='/a'>A&nbsp;link</a><a href='/b'>A link</a>\
+         <a href='/c'>A&nbsp;&nbsp;link</a></nav>",
+    )
+    .await;
+    ctx.process_async(json!({"id": 1, "method": "DOM.getDocument"}))
+        .await;
+    let document = ctx.take_response_by_id(1)["result"]["root"].clone();
+    enable_runtime_async(&mut ctx).await;
+    ctx.process_async(json!({
+        "id": 2, "method": "Runtime.evaluate", "params": {"expression": "document"}
+    }))
+    .await;
+    let object_id = ctx.take_response_by_id(2)["result"]["result"]["objectId"]
+        .as_str()
+        .expect("document object id")
+        .to_owned();
+
+    for reference in [
+        json!({"nodeId": document["nodeId"]}),
+        json!({"backendNodeId": document["backendNodeId"]}),
+        json!({"objectId": object_id}),
+    ] {
+        for (name, expected_count) in [
+            ("A link", 1),
+            ("A\u{a0}link", 1),
+            ("A\u{a0}\u{a0}link", 1),
+            ("A \u{a0}link", 0),
+            ("A\tlink", 0),
+        ] {
+            let mut params = reference.clone();
+            params["role"] = json!("link");
+            params["accessibleName"] = json!(name);
+            ctx.process_async(json!({
+                "id": 3, "method": "Accessibility.queryAXTree", "params": params
+            }))
+            .await;
+            let response = ctx.take_response_by_id(3);
+            let nodes = response["result"]["nodes"].as_array().expect("AX nodes");
+            assert_eq!(nodes.len(), expected_count, "{reference}, {name:?}");
+            if let Some(node) = nodes.first() {
+                assert_eq!(node["name"]["value"], name);
+                assert_eq!(node["role"]["value"], "link");
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn query_ax_tree_supports_object_id_and_empty_match() {
     let mut ctx = TestContext::new();
     load_page_async(
@@ -2525,6 +3247,135 @@ async fn query_ax_tree_supports_object_id_and_empty_match() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn query_ax_tree_object_id_uses_owning_inspector_session() {
+    let mut ctx = TestContext::new();
+    load_page_async(
+        &mut ctx,
+        "<!doctype html><html><body><button id='go'>Go</button></body></html>",
+    )
+    .await;
+    ctx.with_fixture(|conn| {
+        let browser_context = conn.browser_context.as_mut().expect("browser context");
+        browser_context.attach_active_session("SID-primary");
+        assert!(
+            browser_context.assign_attached_session_to_target("TID-1", "SID-attached".to_owned())
+        );
+    });
+
+    for (session_id, other_session_id) in [
+        ("SID-primary", "SID-attached"),
+        ("SID-attached", "SID-primary"),
+    ] {
+        ctx.process_async(json!({
+            "id": 560,
+            "method": "Runtime.enable",
+            "sessionId": session_id
+        }))
+        .await;
+        ctx.take_all();
+        ctx.process_async(json!({
+            "id": 561,
+            "method": "Page.createIsolatedWorld",
+            "sessionId": session_id,
+            "params": { "frameId": "TID-1", "worldName": format!("ax-query-{session_id}") }
+        }))
+        .await;
+        let context_id = ctx.take_response_by_id(561)["result"]["executionContextId"]
+            .as_i64()
+            .expect("isolated world id");
+        ctx.take_all();
+        ctx.process_async(json!({
+            "id": 562,
+            "method": "Runtime.evaluate",
+            "sessionId": session_id,
+            "params": { "expression": "document", "contextId": context_id }
+        }))
+        .await;
+        let object_id = ctx.take_response_by_id(562)["result"]["result"]["objectId"]
+            .as_str()
+            .expect("document object id")
+            .to_owned();
+
+        ctx.process_async(json!({
+            "id": 563,
+            "method": "Accessibility.queryAXTree",
+            "sessionId": session_id,
+            "params": { "objectId": object_id, "role": "button", "accessibleName": "Go" }
+        }))
+        .await;
+        let message = ctx.take_response_by_id(563);
+        let nodes = message["result"]["nodes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{session_id} AX query failed: {message}"));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["role"]["value"], "button");
+        assert_eq!(nodes[0]["name"]["value"], "Go");
+
+        ctx.process_async(json!({
+            "id": 564,
+            "method": "Accessibility.queryAXTree",
+            "sessionId": other_session_id,
+            "params": { "objectId": object_id, "role": "button" }
+        }))
+        .await;
+        ctx.expect_error(564, -32000, "Could not find node with given id");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_ax_tree_object_id_infers_child_frame_and_checks_explicit_frame() {
+    let mut ctx = TestContext::new();
+    load_page_async(
+        &mut ctx,
+        "<!doctype html><html><body><button>Parent</button><iframe srcdoc=\"<button>Go</button>\"></iframe></body></html>",
+    )
+    .await;
+    enable_runtime_async(&mut ctx).await;
+    let child_frame_id = child_frame_id_for_single_iframe_async(&mut ctx).await;
+    ctx.process_async(json!({
+        "id": 565,
+        "method": "Page.createIsolatedWorld",
+        "params": { "frameId": child_frame_id, "worldName": "ax-query-child-document" }
+    }))
+    .await;
+    let context_id = ctx.take_response_by_id(565)["result"]["executionContextId"]
+        .as_i64()
+        .expect("child isolated world id");
+    ctx.take_all();
+    ctx.process_async(json!({
+        "id": 566,
+        "method": "Runtime.evaluate",
+        "params": { "expression": "document", "contextId": context_id }
+    }))
+    .await;
+    let object_id = ctx.take_response_by_id(566)["result"]["result"]["objectId"]
+        .as_str()
+        .expect("child document object id")
+        .to_owned();
+
+    ctx.process_async(json!({
+        "id": 567,
+        "method": "Accessibility.queryAXTree",
+        "params": { "objectId": object_id, "role": "button" }
+    }))
+    .await;
+    let message = ctx.take_response_by_id(567);
+    let nodes = message["result"]["nodes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("child AX query failed: {message}"));
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["name"]["value"], "Go");
+
+    ctx.process_async(json!({
+        "id": 568,
+        "method": "Accessibility.queryAXTree",
+        "params": { "objectId": object_id, "frameId": "TID-1", "role": "button" }
+    }))
+    .await;
+    ctx.expect_error(568, -32000, "Could not find node with given id");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn query_ax_tree_requires_context_loaded_page_and_bound_node() {
     let mut ctx = TestContext::new();
     ctx.process_async(json!({
@@ -2535,7 +3386,12 @@ async fn query_ax_tree_requires_context_loaded_page_and_bound_node() {
     .await;
     ctx.expect_error(580, -31998, "BrowserContextNotLoaded");
 
-    ctx.conn.browser_context = Some(BrowserContext::new("BID-1".into()));
+    {
+        let fixture_value = Some(BrowserContext::new("BID-1".into()));
+        ctx.with_fixture(|conn| {
+            conn.browser_context = fixture_value;
+        });
+    }
     ctx.process_async(json!({
         "id": 581,
         "method": "Accessibility.queryAXTree",
@@ -2706,10 +3562,10 @@ async fn query_ax_tree_child_frame_can_complete_through_pending_command_dispatch
         }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame queryAXTree should start as a pending command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame queryAXTree should start as a pending command")
+    });
     let (messages, scheduler_events) =
         complete_pending_command_task_for_test(&mut ctx, pending).await;
     assert!(
@@ -2829,17 +3685,24 @@ async fn async_dispatch_query_ax_tree_accepts_child_frame_object_id() {
         }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame object id AX query should start as a pending renderer command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame object id AX query should start as a pending renderer command")
+    });
     let completed = pending.wait().await;
-    let CdpCommandTaskStep::Complete(outcome) =
-        ctx.conn.complete_pending_command_dispatch(completed).await
-    else {
+    let CdpCommandTaskStep::Complete(outcome) = ({
+        ctx.state
+            .with_state(|state| {
+                state.complete_command_dispatch_with_context(
+                    completed,
+                    &mut crate::conn::CommandDispatchContext::default(),
+                )
+            })
+            .expect("live test owner")
+    }) else {
         panic!("child-frame object id AX query should complete after one renderer command");
     };
-    let (messages, scheduler_events) = outcome.into_parts();
+    let (messages, scheduler_events) = ctx.route_completed_command_outcome_for_test(outcome).await;
     assert!(
         scheduler_events.is_empty(),
         "AX child-frame object query should not enqueue scheduler events: {scheduler_events:?}"
@@ -3042,10 +3905,10 @@ async fn get_partial_ax_tree_child_frame_can_complete_through_pending_command_di
         }
     })
     .to_string();
-    let pending = ctx
-        .conn
-        .try_start_pending_command_dispatch(&raw)
-        .expect("child-frame getPartialAXTree should start as a pending command");
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw)
+            .expect("child-frame getPartialAXTree should start as a pending command")
+    });
     let (messages, scheduler_events) =
         complete_pending_command_task_for_test(&mut ctx, pending).await;
     assert!(
@@ -3154,18 +4017,27 @@ async fn async_dispatch_get_partial_ax_tree_accepts_child_frame_object_id() {
         "params": { "objectId": object_id, "frameId": child_frame_id }
     })
     .to_string();
-    let pending = ctx.conn.try_start_pending_command_dispatch(&raw).expect(
-        "child-frame object id partial AX lookup should start as a pending renderer command",
-    );
+    let pending = ctx.with_fixture(|conn| {
+        conn.try_start_pending_command_dispatch(&raw).expect(
+            "child-frame object id partial AX lookup should start as a pending renderer command",
+        )
+    });
     let completed = pending.wait().await;
-    let CdpCommandTaskStep::Complete(outcome) =
-        ctx.conn.complete_pending_command_dispatch(completed).await
-    else {
+    let CdpCommandTaskStep::Complete(outcome) = ({
+        ctx.state
+            .with_state(|state| {
+                state.complete_command_dispatch_with_context(
+                    completed,
+                    &mut crate::conn::CommandDispatchContext::default(),
+                )
+            })
+            .expect("live test owner")
+    }) else {
         panic!(
             "child-frame object id partial AX lookup should complete after one renderer command"
         );
     };
-    let (messages, scheduler_events) = outcome.into_parts();
+    let (messages, scheduler_events) = ctx.route_completed_command_outcome_for_test(outcome).await;
     assert!(
         scheduler_events.is_empty(),
         "AX child-frame object partial lookup should not enqueue scheduler events: {scheduler_events:?}"

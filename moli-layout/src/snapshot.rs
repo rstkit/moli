@@ -276,6 +276,14 @@ impl PaintCornerRadii {
     }
 }
 
+/// The winding rule used when filling a shape.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PaintFillRule {
+    #[default]
+    NonZero,
+    EvenOdd,
+}
+
 /// A backend-neutral shape embedded in an owned paint command.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PaintShape {
@@ -575,7 +583,12 @@ pub enum PaintImageSampling {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaintImage {
     pub image: PaintImageId,
+    /// One image tile, before the property transform.
     pub destination: PaintRect,
+    /// When present, repeat the tile continuously on both axes inside these
+    /// finite bounds, in the same coordinate space as `destination`.
+    /// The tile phase and size stay fractional; only the coverage is snapped.
+    pub repeat_bounds: Option<PaintRect>,
     pub sampling: PaintImageSampling,
     pub transform: PaintTransform2D,
 }
@@ -636,8 +649,44 @@ pub struct PaintGlyphRun {
     pub glyph_embolden: PaintPoint,
     /// Fully positioned glyphs.
     pub glyphs: Vec<PaintGlyph>,
+    /// Logical text and UTF-8 cluster ranges, shared with other runs in this paragraph.
+    /// Masks and other purely visual glyphs have no text semantics.
+    pub text: Option<PaintTextSemantics>,
     /// Maps the glyph positions from their layout coordinate space to viewport CSS pixels.
     pub transform: PaintTransform2D,
+    /// `-webkit-text-stroke` paint, if any.
+    pub stroke: Option<PaintTextStroke>,
+}
+
+/// `-webkit-text-stroke` paint for one glyph run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaintTextStroke {
+    /// Stroke width in CSS pixels, centered on the glyph outline.
+    pub width: f32,
+    /// Resolved `-webkit-text-stroke-color`.
+    pub color: PaintColor,
+    /// `paint-order` paints the stroke before (beneath) the fill.
+    pub paint_first: bool,
+}
+
+impl PaintTextStroke {
+    /// Ordinary HTML text uses miter joins with this fixed limit, matching
+    /// Chromium's PaintFlags. Backends must not substitute their defaults.
+    pub const MITER_LIMIT: f32 = 4.0;
+
+    /// Conservative ink expansion in local CSS pixels for a centered miter
+    /// stroke, including the widening used to follow synthetic bold.
+    pub fn ink_outset(width: f32, embolden: f32) -> f32 {
+        (width.max(0.0) * 0.5 + embolden.max(0.0)) * Self::MITER_LIMIT
+    }
+}
+
+/// Owned text mapping retained across the layout/paint boundary for document export.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaintTextSemantics {
+    pub text: std::sync::Arc<str>,
+    /// One range per positioned glyph; a cluster may cover several glyphs or characters.
+    pub clusters: Vec<std::ops::Range<usize>>,
 }
 
 /// CSS line style for an owned text-decoration command.
@@ -725,6 +774,7 @@ pub enum PaintFragment {
         shape: PaintShape,
         brush: PaintBrush,
         transform: PaintTransform2D,
+        fill_rule: PaintFillRule,
     },
     /// Strokes one owned path.
     Stroke(PaintStroke),
@@ -755,6 +805,7 @@ impl PaintFragment {
     /// Creates a solid rectangle fragment.
     pub const fn solid_rect(rect: PaintRect, color: PaintColor) -> Self {
         Self::Fill {
+            fill_rule: crate::PaintFillRule::NonZero,
             shape: PaintShape::Rect(rect),
             brush: PaintBrush::Solid(color),
             transform: PaintTransform2D::IDENTITY,
@@ -778,12 +829,14 @@ impl PaintFragment {
             && radii.bottom_left.y <= 0.0
         {
             return Self::Fill {
+                fill_rule: crate::PaintFillRule::NonZero,
                 shape: PaintShape::Rect(rect),
                 brush: PaintBrush::Solid(color),
                 transform,
             };
         }
         Self::Fill {
+            fill_rule: crate::PaintFillRule::NonZero,
             shape: PaintShape::RoundedRect { rect, radii },
             brush: PaintBrush::Solid(color),
             transform,
@@ -820,6 +873,7 @@ impl PaintFragment {
             shape,
             brush: PaintBrush::Solid(color),
             transform,
+            ..
         } = self
         else {
             return None;
@@ -869,6 +923,25 @@ impl PaintDiagnostic {
     }
 }
 
+/// An owned hyperlink region in the coordinate system of its paint scope.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaintLink {
+    /// Scopes active immediately before this paint command also clip the link.
+    /// May equal `fragments.len()` (before closing an embedded snapshot).
+    pub before_fragment: usize,
+    pub rect: PaintRect,
+    pub transform: PaintTransform2D,
+    pub target: PaintLinkTarget,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaintLinkTarget {
+    /// Absolute URL; also the fallback if an internal destination is not printed.
+    pub url: std::sync::Arc<str>,
+    /// Same-document destination in capture-surface CSS pixels.
+    pub destination: Option<PaintPoint>,
+}
+
 /// Fully owned input to a paint backend.
 ///
 /// No source-tree identifier, computed-style handle, or renderer borrow is
@@ -876,6 +949,8 @@ impl PaintDiagnostic {
 /// representation before returning.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PaintSnapshot {
+    /// Print projections retain Unicode mappings; raster-only captures omit them.
+    pub(crate) retain_text_semantics: bool,
     /// Live CSS layout viewport used to build this snapshot.
     pub viewport: PaintViewport,
     /// Short-lived raster surface selected for this capture.
@@ -891,6 +966,8 @@ pub struct PaintSnapshot {
     pub content_size: PaintSize,
     /// Paint operations in back-to-front order.
     pub fragments: Vec<PaintFragment>,
+    /// Print-only hyperlinks. No DOM handles or live layout borrows are retained.
+    pub links: Vec<PaintLink>,
     /// Immutable resources referenced by glyph fragments.
     pub fonts: Vec<PaintFontResource>,
     /// Immutable resources referenced by image fragments.
@@ -905,12 +982,14 @@ impl PaintSnapshot {
     /// Creates an empty snapshot for a viewport and canvas color.
     pub fn new(viewport: PaintViewport, canvas_color: PaintColor) -> Self {
         Self {
+            retain_text_semantics: false,
             viewport,
             surface: PaintCaptureSurface::for_viewport(viewport),
             viewport_to_surface: PaintTransform2D::IDENTITY,
             canvas_color,
             content_size: PaintSize::new(viewport.css_width as f32, viewport.css_height as f32),
             fragments: Vec::new(),
+            links: Vec::new(),
             fonts: Vec::new(),
             images: Vec::new(),
             svg_images: Vec::new(),
@@ -1022,12 +1101,18 @@ impl PaintSnapshot {
         });
         if child.canvas_color.alpha > 0.0 {
             self.push_fragment(PaintFragment::Fill {
+                fill_rule: crate::PaintFillRule::NonZero,
                 shape: PaintShape::Rect(clip),
                 brush: PaintBrush::Solid(child.canvas_color),
                 transform: local_to_surface,
             });
         }
+        let mut fragment_offsets =
+            (!child.links.is_empty()).then(|| Vec::with_capacity(child.fragments.len() + 1));
         for fragment in child.fragments {
+            if let Some(offsets) = &mut fragment_offsets {
+                offsets.push(self.fragments.len());
+            }
             if let Some(fragment) = rebase_embedded_fragment(
                 fragment,
                 local_to_surface,
@@ -1037,6 +1122,23 @@ impl PaintSnapshot {
             ) {
                 self.push_fragment(fragment);
             }
+        }
+        if let Some(offsets) = &mut fragment_offsets {
+            offsets.push(self.fragments.len());
+        }
+        for mut link in child.links {
+            // Do not turn malformed child metadata into a valid parent index.
+            link.before_fragment = fragment_offsets
+                .as_ref()
+                .and_then(|offsets| offsets.get(link.before_fragment))
+                .copied()
+                .unwrap_or(usize::MAX);
+            link.transform = local_to_surface.concatenate(link.transform);
+            link.target.destination = link
+                .target
+                .destination
+                .map(|point| local_to_surface.map_point(point));
+            self.links.push(link);
         }
         self.push_fragment(PaintFragment::PopLayer);
         for diagnostic in child.diagnostics {
@@ -1079,10 +1181,12 @@ fn rebase_embedded_fragment(
             shape,
             brush,
             transform,
+            fill_rule,
         } => PaintFragment::Fill {
             shape,
             brush,
             transform: parent.concatenate(transform),
+            fill_rule,
         },
         PaintFragment::Stroke(mut stroke) => {
             stroke.transform = parent.concatenate(stroke.transform);
@@ -1183,6 +1287,7 @@ mod tests {
             PaintColor::new(0.1, 0.2, 0.3, 1.0),
         );
         child.push_fragment(PaintFragment::Fill {
+            fill_rule: crate::PaintFillRule::NonZero,
             shape: PaintShape::Rect(PaintRect::new(0.0, 0.0, 10.0, 5.0)),
             brush: PaintBrush::Solid(PaintColor::BLACK),
             transform: PaintTransform2D::translation(1.0, 2.0),

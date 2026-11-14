@@ -1,12 +1,12 @@
 use super::super::window_security_tokens::WindowAccessOrigin;
-use super::super::{ChildBrowsingContextSnapshot, JsContextHost};
+use super::super::{ChildBrowsingContextSnapshot, PageScriptHost};
 use crate::document_script_scheduler::FrameDocumentClassicScriptSchedulerWork;
 use crate::frame_owner_model::{
     DocumentCreationKind, FrameDocumentInteractiveLifecycleAction,
     FrameDocumentLocalWindowTransition, FrameLocalWindowOwnerTransition,
 };
 use crate::{document_runtime::DomHandle, frame_owner_model::FrameDocumentOwnerTransition};
-use moli_web_mime::is_dom_parser_xml_mime;
+use moli_web_mime::is_xml_document_mime;
 use url::Url;
 
 pub(crate) struct ChildDocumentInstallResult {
@@ -39,7 +39,7 @@ impl ChildDocumentWindowCommitPreflight {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(in crate::native_bridge::context_host) fn capture_child_document_window_commit_preflight(
         &self,
         handle: DomHandle,
@@ -135,7 +135,7 @@ impl JsContextHost {
         let is_xml_document = snapshot
             .content_type
             .as_deref()
-            .is_some_and(is_dom_parser_xml_mime);
+            .is_some_and(is_xml_document_mime);
         self.install_live_child_document_from_snapshot(
             scope,
             handle,
@@ -192,6 +192,8 @@ impl JsContextHost {
                 );
             document_handle
         };
+        self.dom_host_mut()
+            .set_document_character_set_for_handle(document_handle, &snapshot.character_set);
         let document_url = self.document_url_for_handle(document_handle);
         let document_base_url = self.document_base_url_for_handle(document_handle);
         let parser_base_url = document_base_url.clone();
@@ -222,6 +224,9 @@ impl JsContextHost {
             owner_local_window_id,
             owner_document_id,
         );
+        // Parsing can attach descendant Frames. Their client identities must
+        // belong to this committed Document, rather than the one it replaces.
+        self.publish_child_frame_navigation_commit(handle);
         let parser_start = self.start_live_child_document_parser(
             scope,
             handle,
@@ -231,6 +236,7 @@ impl JsContextHost {
             parser_base_url,
             source.as_ref(),
             is_xml_document,
+            snapshot.content_type.as_deref(),
         );
         Some(ChildDocumentInstallResult {
             initial_classic_ready_work: parser_start.initial_classic_ready_work,
@@ -290,6 +296,7 @@ impl JsContextHost {
                 .expect("synthetic child Document commit requires its parent authority")
                 .clone()
         });
+        let web_mcp_navigation = self.current_child_navigation_load(handle);
         let owner_transition = self
             .frame_owner_store
             .replace_child_document_with_local_window_transition(
@@ -309,12 +316,22 @@ impl JsContextHost {
                 expected_current_owner,
             )?;
         debug_assert_eq!(owner_transition.retired_owner(), expected_current_owner);
+        crate::context_bootstrap::web_mcp::commit_child_navigation(
+            self,
+            handle,
+            web_mcp_navigation,
+            crate::native_bridge::WindowDocumentOwner::Frame(
+                owner_transition
+                    .current_owner()
+                    .expect("committed child document"),
+            ),
+        );
 
         match owner_transition.local_window_owner_transition() {
             FrameLocalWindowOwnerTransition::Replaced { .. } => {
                 self.disconnect_shared_worker_clients_for_child_context(handle);
                 if !preserve_window_event_state {
-                    self.clear_child_window_document_event_state(scope, handle);
+                    self.clear_child_window_event_listeners(handle);
                 }
                 self.replace_child_custom_elements_registry_for_document_commit(scope, handle);
             }
@@ -373,6 +390,15 @@ impl JsContextHost {
             ),
             resource_authority,
         );
+        // A preserved initial LocalWindow may already have a history surface
+        // without running realm bootstrap again. Commit its Document seed here;
+        // subsequent view refreshes must never replay this history transition.
+        if let Some(window) = self.existing_child_browsing_context_window_wrapper(scope, handle)
+            && let Some(entry) = self.child_browsing_contexts.get(&handle)
+        {
+            let seed = entry.committed_navigation_entry_seed();
+            crate::context_bootstrap::commit_navigation_history_for_document(scope, window, &seed);
+        }
         Some(owner_transition)
     }
 

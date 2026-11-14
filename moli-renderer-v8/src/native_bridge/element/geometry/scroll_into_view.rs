@@ -1,21 +1,16 @@
 use moli_page_types::DomScrollIntoViewRect;
 
-use crate::{document_runtime::DomHandle, native_bridge::JsContextHost};
+use crate::{
+    document_runtime::DomHandle, native_bridge::PageScriptHost,
+    scroll_options::ScrollLogicalPosition as ScrollIntoViewAlignment,
+};
 
-use super::provider::{observable_box_model, observable_scroll_into_view_geometry};
+use super::provider::{read_box_model, read_scroll_into_view_geometry};
 use super::scroll::{
     apply_observable_window_scroll, resolve_scroll_target, set_node_scroll_position,
 };
 
 const CHILD_FRAME_DEPTH_LIMIT: usize = 16;
-
-#[derive(Clone, Copy)]
-pub(super) enum ScrollIntoViewAlignment {
-    Start,
-    Center,
-    End,
-    Nearest,
-}
 
 #[derive(Clone, Copy)]
 struct ScrollIntoViewParams {
@@ -69,7 +64,7 @@ fn aligned_scroll_position(
 
 pub(crate) fn scroll_node_into_view_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     relative_rect: Option<DomScrollIntoViewRect>,
 ) -> Result<Option<bool>, moli_layout::LayoutError> {
@@ -88,7 +83,7 @@ pub(crate) fn scroll_node_into_view_if_needed(
 
 pub(super) fn scroll_node_into_view(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     relative_rect: Option<DomScrollIntoViewRect>,
     horizontal: ScrollIntoViewAlignment,
@@ -109,7 +104,7 @@ pub(super) fn scroll_node_into_view(
 
 fn scroll_node_into_view_with_params(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     relative_rect: Option<DomScrollIntoViewRect>,
     params: ScrollIntoViewParams,
@@ -118,12 +113,7 @@ fn scroll_node_into_view_with_params(
     let Some(target) = resolve_scroll_target(runtime, handle) else {
         return Ok(None);
     };
-    let Some(mut geometry) = observable_scroll_into_view_geometry(
-        runtime,
-        target,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    )?
-    else {
+    let Some(mut geometry) = read_scroll_into_view_geometry(runtime, target)? else {
         return Ok(None);
     };
     if let Some(relative) = relative_rect {
@@ -146,9 +136,27 @@ fn scroll_node_into_view_with_params(
     perform_bubbling_scroll_into_view(scope, runtime_ptr, target, geometry, params, 0).map(Some)
 }
 
+pub(crate) fn scroll_node_into_view_at_center(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+) -> Result<Option<bool>, moli_layout::LayoutError> {
+    scroll_node_into_view_with_params(
+        scope,
+        runtime_ptr,
+        handle,
+        None,
+        ScrollIntoViewParams {
+            horizontal: ScrollIntoViewAlignment::Center,
+            vertical: ScrollIntoViewAlignment::Center,
+            center_if_fully_hidden: false,
+        },
+    )
+}
+
 pub(crate) fn scroll_node_into_view_at_start(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Result<Option<bool>, moli_layout::LayoutError> {
     scroll_node_into_view_with_params(
@@ -169,7 +177,7 @@ pub(crate) fn scroll_node_into_view_at_start(
 /// frame, then continue with the frame owner.
 fn perform_bubbling_scroll_into_view(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     target: DomHandle,
     mut geometry: moli_layout::LayoutScrollIntoViewGeometry<DomHandle>,
     params: ScrollIntoViewParams,
@@ -282,12 +290,7 @@ fn perform_bubbling_scroll_into_view(
     let Some(frame) = runtime.child_browsing_context_host_for_document_handle(document) else {
         return Ok(changed);
     };
-    let Some(frame_content) = observable_box_model(
-        runtime,
-        frame,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    )?
-    .map(|model| model.content) else {
+    let Some(frame_content) = read_box_model(runtime, frame)?.map(|model| model.content) else {
         return Ok(changed);
     };
     let Some(parent_target_rects) = convert_quads_to_parent_frame(
@@ -297,12 +300,7 @@ fn perform_bubbling_scroll_into_view(
     ) else {
         return Ok(changed);
     };
-    let Some(mut parent_geometry) = observable_scroll_into_view_geometry(
-        runtime,
-        frame,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    )?
-    else {
+    let Some(mut parent_geometry) = read_scroll_into_view_geometry(runtime, frame)? else {
         return Ok(changed);
     };
     parent_geometry.target_rects = parent_target_rects;

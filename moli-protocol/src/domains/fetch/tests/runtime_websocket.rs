@@ -10,8 +10,9 @@ async fn websocket_echo_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
                 Message::Binary(bytes) => {
                     let _ = socket.send(Message::Binary(bytes)).await;
                 }
-                Message::Close(frame) => {
-                    let _ = socket.send(Message::Close(frame)).await;
+                Message::Close(_frame) => {
+                    // recv already queued the Close reply; flush before releasing TCP.
+                    let _ = futures_util::SinkExt::flush(&mut socket).await;
                     break;
                 }
                 Message::Ping(bytes) => {
@@ -116,15 +117,14 @@ async fn open_auto_attached_popup_from_session(
         .as_str()
         .expect("popup session id")
         .to_owned();
-    let popup_runtime = ctx
-        .conn
-        .runtime_session_owner_slot(Some(&popup_session_id))
-        .expect("auto-attached popup runtime slot");
-    assert!(
-        popup_runtime.has_loaded_page(),
-        "window.open completion must leave a command-addressable popup Document; diagnostics={}",
-        popup_runtime.moli_memory_diagnostics()
-    );
+    ctx.wait_for_initial_document_for_target(&target_id).await;
+    ctx.with_fixture(|conn| {
+        let popup_runtime = conn.runtime_session_owner_slot(Some(&popup_session_id))
+            .expect("auto-attached popup runtime slot");
+        assert!(popup_runtime.has_loaded_page(),
+            "joining initialization must leave a command-addressable popup Document; diagnostics={}",
+            popup_runtime.moli_memory_diagnostics());
+    });
     (target_id, popup_session_id)
 }
 
@@ -879,14 +879,15 @@ async fn background_websocket_synthetic_socket_injection_routes_to_session_owner
         "background synthetic WebSocket text frame should dispatch to owner page",
     )
     .await;
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .and_then(|browser_context| browser_context.active_target_id()),
-        Some("TID-active"),
-        "background Fetch.dispatchWebSocketMessage should not activate the target"
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .and_then(|browser_context| browser_context.active_target_id()),
+            Some("TID-active"),
+            "background Fetch.dispatchWebSocketMessage should not activate the target"
+        )
+    });
 
     server.abort();
 }

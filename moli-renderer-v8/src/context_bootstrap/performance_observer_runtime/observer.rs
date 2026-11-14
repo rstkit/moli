@@ -1,15 +1,17 @@
-use super::super::performance_runtime::PERFORMANCE_OBSERVER_SUPPORTED_ENTRY_TYPES;
 use super::delivery::{enqueue_buffered_performance_entries, queue_performance_observer_delivery};
+use super::registration::{
+    PerformanceObserverRegistration, register_performance_observer_callback,
+};
 use super::*;
-use crate::observer_runtime::ObserverCallbackId;
 use crate::util::{
     define_v8_array_data_property, get_private_value, serialize_v8_iter_array, set_private_value,
 };
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "PerformanceObserver")]
+#[webapi(interface = web_api_interfaces::PerformanceObserver)]
 struct PerformanceObserverObjectDeclaration<'s> {
     #[webapi(slot = PERFORMANCE_OBSERVER_CALLBACK_ID_SLOT)]
     callback_id: u32,
@@ -23,12 +25,16 @@ struct PerformanceObserverObjectDeclaration<'s> {
     pending: (),
     #[webapi(slot = PERFORMANCE_OBSERVER_TYPE_SLOT, init = "null")]
     observed_type: (),
+    #[webapi(slot = PERFORMANCE_OBSERVER_MODE_SLOT, init = 0)]
+    observe_mode: (),
     #[webapi(slot = PERFORMANCE_OBSERVER_ENTRY_TYPES_SLOT, init = "array")]
     entry_types: (),
     #[webapi(slot = PERFORMANCE_OBSERVER_ACTIVE_SLOT, init = false)]
     active: (),
     #[webapi(slot = PERFORMANCE_OBSERVER_SCHEDULED_SLOT, init = false)]
     scheduled: (),
+    #[webapi(slot = PERFORMANCE_OBSERVER_REQUIRES_DROPPED_ENTRIES_SLOT, init = false)]
+    requires_dropped_entries: (),
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -44,20 +50,29 @@ struct PerformanceObserverConstructorArgs {
 
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "PerformanceObserver.observe")]
-struct PerformanceObserverObserveArgs<'s> {
-    #[webidl(required)]
-    options: v8::Local<'s, v8::Object>,
+struct PerformanceObserverObserveArgs {
+    #[webidl(required, dictionary)]
+    options: PerformanceObserverInit,
 }
 
 #[derive(Default, webidl::WebIdlDictionary)]
 #[webidl(prefix = "PerformanceObserverInit")]
 struct PerformanceObserverInit {
+    buffered: Option<bool>,
+    #[webidl(converter = "double")]
+    duration_threshold: Option<f64>,
+    #[webidl(converter = "raw")]
+    entry_types: Option<webidl::Sequence<webidl::DomString>>,
     #[webidl(name = "type")]
     observed_type: Option<String>,
-    #[webidl(with = performance_entry_types_member)]
-    entry_types: Option<Vec<String>>,
-    #[webidl(default = false)]
-    buffered: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u32)]
+enum ObserveMode {
+    Undefined = 0,
+    Single = 1,
+    Multiple = 2,
 }
 
 pub(in crate::context_bootstrap) fn performance_observer_constructor_callback<'s>(
@@ -76,14 +91,17 @@ pub(in crate::context_bootstrap) fn performance_observer_constructor_callback<'s
     else {
         return;
     };
-    let host_ptr = context_host_ptr_from_global_bridge(scope)
-        .expect("PerformanceObserver constructor must execute in a Window realm");
-    let registered_callback =
-        crate::observer_runtime::register_callback(scope, host_ptr, args.this(), parsed.callback);
-    let (callback_id, callback, relevant_global, incumbent_global) =
-        registered_callback.into_parts();
+    let Some((callback_id, callback, relevant_global, incumbent_global)) =
+        register_performance_observer_callback(scope, args.this(), parsed.callback)
+    else {
+        throw_type_error(
+            scope,
+            "PerformanceObserver is unavailable outside a Window or Worker realm.",
+        );
+        return;
+    };
     PerformanceObserverObjectDeclaration::new(
-        callback_id.as_u32(),
+        callback_id,
         callback,
         relevant_global,
         incumbent_global,
@@ -101,20 +119,15 @@ pub(in crate::context_bootstrap) fn performance_observer_observe_callback<'s>(
     let Some(parsed) = webidl::parse_args::<PerformanceObserverObserveArgs>(scope, &args) else {
         return;
     };
-    let init =
-        match webidl::parse_dictionary_object::<PerformanceObserverInit>(scope, parsed.options) {
-            Ok(init) => init,
-            Err(error) => {
-                webidl::throw_error(scope, &error);
-                return;
-            }
-        };
+    let init = parsed.options;
     let has_entry_types_member = init.entry_types.is_some();
     let has_type_member = init.observed_type.is_some();
-    if has_entry_types_member && has_type_member {
+    if has_entry_types_member
+        && (has_type_member || init.buffered.is_some() || init.duration_threshold.is_some())
+    {
         throw_type_error(
             scope,
-            "PerformanceObserver.observe options must not include both type and entryTypes.",
+            "PerformanceObserver.observe entryTypes must not be combined with other options.",
         );
         return;
     }
@@ -126,11 +139,13 @@ pub(in crate::context_bootstrap) fn performance_observer_observe_callback<'s>(
         return;
     }
 
-    let current_type_mode = performance_observer_type_slot_is_set(scope, args.this());
-    let current_entry_types_mode = !current_type_mode
-        && performance_observer_entry_types(scope, args.this())
-            .is_some_and(|entry_types| entry_types.length() > 0);
-    if has_entry_types_member && current_type_mode {
+    let requested_mode = if has_entry_types_member {
+        ObserveMode::Multiple
+    } else {
+        ObserveMode::Single
+    };
+    let current_mode = performance_observer_mode(scope, args.this());
+    if current_mode == ObserveMode::Single && requested_mode == ObserveMode::Multiple {
         webidl::throw_dom_exception(
             scope,
             "InvalidModificationError",
@@ -138,7 +153,7 @@ pub(in crate::context_bootstrap) fn performance_observer_observe_callback<'s>(
         );
         return;
     }
-    if has_type_member && current_entry_types_mode {
+    if current_mode == ObserveMode::Multiple && requested_mode == ObserveMode::Single {
         webidl::throw_dom_exception(
             scope,
             "InvalidModificationError",
@@ -146,9 +161,28 @@ pub(in crate::context_bootstrap) fn performance_observer_observe_callback<'s>(
         );
         return;
     }
+    if current_mode == ObserveMode::Undefined {
+        // Choosing a mode precedes support filtering, which may abort registration.
+        let value = v8::Integer::new_from_unsigned(scope, requested_mode as u32);
+        set_performance_observer_slot_value(
+            scope,
+            args.this(),
+            PERFORMANCE_OBSERVER_MODE_SLOT,
+            value.into(),
+        );
+    }
 
+    // observe() rearms reporting before support filtering. An unsupported
+    // type or empty entryTypes keeps an existing registration, but still
+    // requests its cumulative count on the next nonempty delivery.
+    set_performance_observer_bool_slot(
+        scope,
+        args.this(),
+        PERFORMANCE_OBSERVER_REQUIRES_DROPPED_ENTRIES_SLOT,
+        true,
+    );
     let observed_entry_types = if let Some(observed_type) = init.observed_type.as_deref() {
-        if !performance_observer_entry_type_supported(observed_type) {
+        if !performance_observer_entry_type_supported(scope, observed_type) {
             rv.set_undefined();
             return;
         }
@@ -162,18 +196,26 @@ pub(in crate::context_bootstrap) fn performance_observer_observe_callback<'s>(
         }
         entry_types
     } else {
-        performance_entry_types_array_from_strings(
-            scope,
-            init.entry_types
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|entry_type| performance_observer_entry_type_supported(entry_type)),
-        )
+        let supported_entry_types = init
+            .entry_types
+            .map(|entry_types| entry_types.0)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry_type| entry_type.0)
+            .filter(|entry_type| performance_observer_entry_type_supported(scope, entry_type))
+            .collect::<Vec<_>>();
+        performance_entry_types_array_from_strings(scope, supported_entry_types)
     };
     if observed_entry_types.length() == 0 {
         rv.set_undefined();
         return;
     }
+    let Some(context) = args.this().get_creation_context(scope) else {
+        return;
+    };
+    // Web IDL conversion and option validation above use the method Realm.
+    // Registration, buffered records and delivery use the observer's global.
+    let scope = &mut v8::ContextScope::new(scope, context);
     let performance = super::super::performance_runtime::ensure_current_performance_for_api(scope);
     let observes_navigation = (0..observed_entry_types.length()).any(|index| {
         observed_entry_types
@@ -187,34 +229,17 @@ pub(in crate::context_bootstrap) fn performance_observer_observe_callback<'s>(
             performance,
         );
     }
-    set_performance_observer_type(
-        scope,
-        args.this(),
-        init.observed_type
-            .as_deref()
-            .and_then(|value| v8_string(scope, value))
-            .map(|value| value.into())
-            .unwrap_or_else(|| v8::null(scope).into()),
-    );
+    let observed_type = init
+        .observed_type
+        .as_deref()
+        .and_then(|value| v8_string(scope, value))
+        .map(|value| value.into())
+        .unwrap_or_else(|| v8::null(scope).into());
+    set_performance_observer_type(scope, args.this(), observed_type);
     set_performance_observer_entry_types(scope, args.this(), observed_entry_types);
-    let Some(callback_id) = performance_observer_callback_id(scope, args.this()) else {
-        rv.set_undefined();
-        return;
-    };
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
-        rv.set_undefined();
-        return;
-    };
-    // Blink keeps a PerformanceObserver alive only while it is registered
-    // (`HasPendingActivity() == is_registered_`). The exact callback binding
-    // owns the same active root so disconnect and Realm retirement can release
-    // it without a parallel global JS registry.
-    if !crate::observer_runtime::activate_performance_observer_callback(
-        scope,
-        host_ptr,
-        callback_id,
-        args.this(),
-    ) {
+    let activated = PerformanceObserverRegistration::from_observer(scope, args.this())
+        .is_some_and(|registration| registration.activate(scope));
+    if !activated {
         set_performance_observer_active(scope, args.this(), false);
         let pending = v8::Array::new(scope, 0);
         set_performance_observer_pending(scope, args.this(), pending);
@@ -222,8 +247,10 @@ pub(in crate::context_bootstrap) fn performance_observer_observe_callback<'s>(
         return;
     }
     set_performance_observer_active(scope, args.this(), true);
-    if init.buffered && has_type_member {
-        enqueue_buffered_performance_entries(scope, args.this());
+    if init.buffered.unwrap_or(false) && has_type_member {
+        if let Some(performance) = performance {
+            enqueue_buffered_performance_entries(scope, performance, args.this());
+        }
         queue_performance_observer_delivery(scope, args.this());
     }
     rv.set_undefined();
@@ -235,13 +262,14 @@ pub(in crate::context_bootstrap) fn performance_observer_disconnect_callback<'s>
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     set_performance_observer_active(scope, args.this(), false);
-    if let Some(callback_id) = performance_observer_callback_id(scope, args.this())
-        && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
-    {
-        crate::observer_runtime::deactivate_performance_observer_callback(host_ptr, callback_id);
+    if let Some(registration) = PerformanceObserverRegistration::from_observer(scope, args.this()) {
+        registration.deactivate(scope);
     }
     let pending = v8::Array::new(scope, 0);
     set_performance_observer_pending(scope, args.this(), pending);
+    let entry_types = v8::Array::new(scope, 0);
+    set_performance_observer_entry_types(scope, args.this(), entry_types);
+    set_performance_observer_type(scope, args.this(), v8::null(scope).into());
     rv.set_undefined();
 }
 
@@ -255,21 +283,6 @@ pub(in crate::context_bootstrap) fn performance_observer_take_records_callback<'
     let pending = v8::Array::new(scope, 0);
     set_performance_observer_pending(scope, args.this(), pending);
     rv.set(records.into());
-}
-
-fn performance_entry_types_member<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-    name: &'static str,
-) -> Result<Option<Vec<String>>, webidl::WebIdlError> {
-    let entry_types = webidl::optional_member::<webidl::Sequence<webidl::DomString>>(
-        scope,
-        object,
-        name,
-        webidl::Context::member("PerformanceObserverInit", name),
-    )?
-    .map(|entry_types| entry_types.0.into_iter().map(Into::into).collect());
-    Ok(entry_types)
 }
 
 fn performance_entry_types_array_from_strings<'s>(
@@ -286,16 +299,32 @@ fn performance_entry_types_array_from_strings<'s>(
     serialize_v8_iter_array(scope, entry_types).unwrap_or_else(|| v8::Array::new(scope, 0))
 }
 
-fn performance_observer_type_slot_is_set<'s>(
+fn performance_observer_mode<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     observer: v8::Local<'s, v8::Object>,
-) -> bool {
-    performance_observer_slot_value(scope, observer, PERFORMANCE_OBSERVER_TYPE_SLOT)
-        .is_some_and(|value| !value.is_null_or_undefined())
+) -> ObserveMode {
+    match performance_observer_slot_value(scope, observer, PERFORMANCE_OBSERVER_MODE_SLOT)
+        .and_then(|value| v8::Local::<v8::Uint32>::try_from(value).ok())
+        .map(|value| value.value())
+    {
+        Some(1) => ObserveMode::Single,
+        Some(2) => ObserveMode::Multiple,
+        _ => ObserveMode::Undefined,
+    }
 }
 
-fn performance_observer_entry_type_supported(entry_type: &str) -> bool {
-    PERFORMANCE_OBSERVER_SUPPORTED_ENTRY_TYPES.contains(&entry_type)
+fn performance_observer_entry_type_supported(
+    scope: &mut v8::PinScope<'_, '_>,
+    entry_type: &str,
+) -> bool {
+    let global = scope.get_current_context().global(scope);
+    get_private_value(
+        scope,
+        global,
+        PERFORMANCE_OBSERVER_SUPPORTED_ENTRY_TYPES_SLOT,
+    )
+    .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
+    .is_some_and(|entry_types| array_contains_string(scope, entry_types, entry_type))
 }
 
 pub(super) fn array_contains_string(
@@ -311,51 +340,51 @@ pub(super) fn array_contains_string(
     })
 }
 
-pub(super) fn performance_observer_callback_id<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    observer: v8::Local<'s, v8::Object>,
-) -> Option<ObserverCallbackId> {
-    let value =
-        performance_observer_slot_value(scope, observer, PERFORMANCE_OBSERVER_CALLBACK_ID_SLOT)?;
-    ObserverCallbackId::from_number(value.number_value(scope)?)
-}
-
-pub(super) fn performance_observer_callback_residence<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    observer: v8::Local<'s, v8::Object>,
-) -> Option<crate::observer_runtime::ObserverCallbackResidence<'s>> {
-    let callback_id = performance_observer_callback_id(scope, observer)?;
-    let callback =
-        performance_observer_slot_value(scope, observer, PERFORMANCE_OBSERVER_CALLBACK_VALUE_SLOT)
-            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let relevant_global = performance_observer_slot_value(
-        scope,
-        observer,
-        PERFORMANCE_OBSERVER_CALLBACK_RELEVANT_GLOBAL_SLOT,
-    )
-    .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let incumbent_global = performance_observer_slot_value(
-        scope,
-        observer,
-        PERFORMANCE_OBSERVER_CALLBACK_INCUMBENT_GLOBAL_SLOT,
-    )
-    .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    Some(
-        crate::observer_runtime::ObserverCallbackResidence::from_parts(
-            callback_id,
-            callback,
-            relevant_global,
-            incumbent_global,
-        ),
-    )
-}
-
 pub(super) fn performance_observer_pending<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     observer: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Array>> {
     performance_observer_slot_value(scope, observer, PERFORMANCE_OBSERVER_PENDING_SLOT)
         .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
+}
+
+pub(super) fn take_performance_observer_dropped_entries_count<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    observer: v8::Local<'s, v8::Object>,
+) -> Option<u64> {
+    if !performance_observer_slot_bool(
+        scope,
+        observer,
+        PERFORMANCE_OBSERVER_REQUIRES_DROPPED_ENTRIES_SLOT,
+    )
+    .unwrap_or(false)
+    {
+        return None;
+    }
+    // Resource Timing is the bounded entry buffer currently exposed by
+    // Moli; mark/measure and the other timelines do not discard queued entries.
+    let observes_resource = performance_observer_entry_types(scope, observer)
+        .is_some_and(|types| array_contains_string(scope, types, "resource"));
+    let count = if observes_resource {
+        super::super::performance_runtime::ensure_current_performance_for_api(scope).map_or(
+            0,
+            |performance| {
+                super::super::performance_runtime::resource_timing_dropped_entries_count(
+                    scope,
+                    performance,
+                )
+            },
+        )
+    } else {
+        0
+    };
+    set_performance_observer_bool_slot(
+        scope,
+        observer,
+        PERFORMANCE_OBSERVER_REQUIRES_DROPPED_ENTRIES_SLOT,
+        false,
+    );
+    Some(count)
 }
 
 pub(super) fn set_performance_observer_pending(

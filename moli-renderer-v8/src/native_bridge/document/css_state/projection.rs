@@ -1,15 +1,12 @@
 use super::{
-    font_faces::{
-        OwnerFontFaceProjection, apply_font_face_owner_projection,
-        finish_font_face_owner_projections, owner_font_face_projection,
-    },
+    font_faces::{apply_font_face_owner_projection, finish_font_face_owner_projections},
     style_sheets::sync_document_style_sheets,
 };
 use crate::{
     document_runtime::DomHandle,
     dom::native::{DomStylesheetOwnerChange, DomStylesheetOwnerChangeKind, Node},
-    native_bridge::JsContextHost,
-    util::node_wrapper_from_handle,
+    native_bridge::PageScriptHost,
+    util::with_cached_node_wrapper_realm,
 };
 use std::collections::HashMap;
 
@@ -21,7 +18,7 @@ enum DocumentCssProjection {
     FontFaceOwner {
         document: DomHandle,
         owner: DomHandle,
-        projection: Option<OwnerFontFaceProjection>,
+        refresh: bool,
     },
 }
 
@@ -32,7 +29,7 @@ struct DocumentCssProjections {
 }
 
 impl DocumentCssProjections {
-    fn from_owner_changes(host: &JsContextHost, changes: &[DomStylesheetOwnerChange]) -> Self {
+    fn from_owner_changes(host: &PageScriptHost, changes: &[DomStylesheetOwnerChange]) -> Self {
         let mut projections = Self::default();
         for change in changes {
             if !owner_change_projects_css(host, change) {
@@ -41,39 +38,38 @@ impl DocumentCssProjections {
             let owner = change.owner();
             let scopes = change.tree_scopes();
             if let Some(old_scope) = scopes.old() {
-                projections.push_for_scope(host, old_scope, owner, None);
+                projections.push_for_scope(host, old_scope, owner, false);
             }
-            let current_projection = match change.kind() {
+            let refresh = !matches!(
+                change.kind(),
                 DomStylesheetOwnerChangeKind::TreeConnectionChanged { connected: false }
-                | DomStylesheetOwnerChangeKind::Unregistered => None,
-                _ => owner_font_face_projection(host, owner),
-            };
+                    | DomStylesheetOwnerChangeKind::Unregistered
+            );
             if let Some(current_scope) = scopes.current_scope() {
-                projections.push_for_scope(host, current_scope, owner, current_projection.clone());
+                projections.push_for_scope(host, current_scope, owner, refresh);
             }
             if let Some(new_scope) = scopes.new_scope() {
-                projections.push_for_scope(host, new_scope, owner, current_projection.clone());
+                projections.push_for_scope(host, new_scope, owner, refresh);
             }
         }
         projections
     }
 
-    fn for_source_change(host: &JsContextHost, owner: DomHandle) -> Self {
+    fn for_source_change(host: &PageScriptHost, owner: DomHandle) -> Self {
         let mut projections = Self::default();
         let Some(tree_scope) = host.dom_host().root_node_handle(owner) else {
             return projections;
         };
-        let projection = owner_font_face_projection(host, owner);
-        projections.push_for_scope(host, tree_scope, owner, projection);
+        projections.push_for_scope(host, tree_scope, owner, true);
         projections
     }
 
     fn push_for_scope(
         &mut self,
-        host: &JsContextHost,
+        host: &PageScriptHost,
         scope: DomHandle,
         owner: DomHandle,
-        projection: Option<OwnerFontFaceProjection>,
+        refresh: bool,
     ) {
         if !host.dom_host().node(scope).is_some_and(Node::is_document) {
             return;
@@ -94,57 +90,67 @@ impl DocumentCssProjections {
         {
             let existing = &mut self.projections[index];
             let DocumentCssProjection::FontFaceOwner {
-                projection: existing_projection,
+                refresh: existing_refresh,
                 ..
             } = existing
             else {
                 unreachable!();
             };
-            *existing_projection = projection;
+            *existing_refresh = refresh;
             return;
         }
         let index = self.projections.len();
         self.projections.push(DocumentCssProjection::FontFaceOwner {
             document: scope,
             owner,
-            projection,
+            refresh,
         });
         self.font_face_projection_indices
             .insert((scope, owner), index);
     }
 
-    fn apply(self, scope: &mut v8::PinScope<'_, '_>, host: &JsContextHost) {
+    fn apply(self, scope: &mut v8::PinScope<'_, '_>, host: &PageScriptHost) {
         let mut font_face_documents = Vec::new();
         for projection in self.projections {
-            match projection {
-                DocumentCssProjection::StyleSheetList { document } => {
-                    let Some(holder) = node_wrapper_from_handle(scope, document) else {
-                        continue;
-                    };
-                    let _ = sync_document_style_sheets(scope, holder, host.dom_host(), document);
-                }
-                DocumentCssProjection::FontFaceOwner {
-                    document,
-                    owner,
-                    projection,
-                } => {
-                    if apply_font_face_owner_projection(scope, document, owner, projection.as_ref())
-                        && !font_face_documents.contains(&document)
-                    {
-                        font_face_documents.push(document);
+            let document = match &projection {
+                DocumentCssProjection::StyleSheetList { document }
+                | DocumentCssProjection::FontFaceOwner { document, .. } => *document,
+            };
+            // CSS getters initialize unexposed objects from prepared native sources.
+            with_cached_node_wrapper_realm(
+                scope,
+                host,
+                document,
+                |scope, holder| match projection {
+                    DocumentCssProjection::StyleSheetList { document } => {
+                        let _ =
+                            sync_document_style_sheets(scope, holder, host.dom_host(), document);
                     }
-                }
-            }
+                    DocumentCssProjection::FontFaceOwner {
+                        document,
+                        owner,
+                        refresh,
+                    } => {
+                        if apply_font_face_owner_projection(scope, holder, host, owner, refresh)
+                            && !font_face_documents.contains(&document)
+                        {
+                            font_face_documents.push(document);
+                        }
+                    }
+                },
+            );
         }
         for document in font_face_documents {
-            finish_font_face_owner_projections(scope, host, document);
+            with_cached_node_wrapper_realm(scope, host, document, |scope, holder| {
+                finish_font_face_owner_projections(scope, host, holder, document);
+            });
         }
     }
 }
 
 pub(crate) fn apply_stylesheet_owner_css_projections(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     changes: &[DomStylesheetOwnerChange],
 ) {
     for change in changes {
@@ -154,9 +160,10 @@ pub(crate) fn apply_stylesheet_owner_css_projections(
         } else {
             owner_change_detaches_cached_inline_sheet(host, change)
         };
-        if owner_change_projects_css(host, change)
-            && let Some(owner_wrapper) = node_wrapper_from_handle(scope, owner)
-        {
+        if !owner_change_projects_css(host, change) {
+            continue;
+        }
+        with_cached_node_wrapper_realm(scope, host, owner, |scope, owner_wrapper| {
             if matches!(
                 change.kind(),
                 DomStylesheetOwnerChangeKind::Attribute {
@@ -186,13 +193,13 @@ pub(crate) fn apply_stylesheet_owner_css_projections(
                     stylesheet.id(),
                 );
             }
-        }
+        });
     }
     DocumentCssProjections::from_owner_changes(host, changes).apply(scope, host);
 }
 
 fn owner_change_detaches_cached_inline_sheet(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     change: &DomStylesheetOwnerChange,
 ) -> bool {
     owner_is_inline_style_element(host, change.owner())
@@ -204,7 +211,7 @@ fn owner_change_detaches_cached_inline_sheet(
 }
 
 fn owner_change_detaches_cached_link_sheet(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     change: &DomStylesheetOwnerChange,
 ) -> bool {
     if matches!(
@@ -242,25 +249,26 @@ fn owner_change_detaches_cached_link_sheet(
 
 pub(crate) fn apply_stylesheet_source_css_projection(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     owner: DomHandle,
 ) {
     if host.dom_host().is_html_element_named(owner, "link")
         && let Some(expected_id) = host
             .linked_stylesheet_source_for_owner(owner)
             .and_then(|source| source.live_stylesheet_id())
-        && let Some(owner_wrapper) = node_wrapper_from_handle(scope, owner)
     {
-        crate::native_bridge::element::detach_cached_style_sheet_if_live_stylesheet_changed(
-            scope,
-            owner_wrapper,
-            expected_id,
-        );
+        with_cached_node_wrapper_realm(scope, host, owner, |scope, owner_wrapper| {
+            crate::native_bridge::element::detach_cached_style_sheet_if_live_stylesheet_changed(
+                scope,
+                owner_wrapper,
+                expected_id,
+            );
+        });
     }
     DocumentCssProjections::for_source_change(host, owner).apply(scope, host);
 }
 
-fn owner_change_projects_css(host: &JsContextHost, change: &DomStylesheetOwnerChange) -> bool {
+fn owner_change_projects_css(host: &PageScriptHost, change: &DomStylesheetOwnerChange) -> bool {
     match change.kind() {
         DomStylesheetOwnerChangeKind::Attribute {
             namespace,
@@ -275,12 +283,13 @@ fn owner_change_projects_css(host: &JsContextHost, change: &DomStylesheetOwnerCh
         DomStylesheetOwnerChangeKind::Registered
         | DomStylesheetOwnerChangeKind::Unregistered
         | DomStylesheetOwnerChangeKind::Contents
+        | DomStylesheetOwnerChangeKind::ParsingFinished
         | DomStylesheetOwnerChangeKind::OwnerDocumentChanged
         | DomStylesheetOwnerChangeKind::TreeConnectionChanged { .. } => true,
     }
 }
 
-fn owner_is_inline_style_element(host: &JsContextHost, owner: DomHandle) -> bool {
+fn owner_is_inline_style_element(host: &PageScriptHost, owner: DomHandle) -> bool {
     host.dom_host().is_inline_style_sheet_owner(owner)
 }
 

@@ -12,12 +12,12 @@ use super::super::super::{
 use super::super::{element_attribute, element_attribute_names, element_has_attribute};
 use super::{AttributeNameArgs, AttributeNamespaceNameArgs};
 
-fn element_method_receiver<'s>(
+pub(super) fn element_method_receiver<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     method: &str,
 ) -> Option<(
-    *mut super::super::super::JsContextHost,
+    *mut super::super::super::PageScriptHost,
     crate::document_runtime::DomHandle,
 )> {
     let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_args_or_detached(scope, args)

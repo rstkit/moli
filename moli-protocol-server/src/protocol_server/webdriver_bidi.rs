@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -13,79 +13,68 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::SinkExt;
-use moli_cookie_jar::StoredCookie;
 use moli_core::{RendererOutputTransportMessage, runtime::NavigationRuntimeConfig};
 use moli_protocol::{
     BackgroundCommandResponsePayload, BackgroundProtocolEvent, CdpInitialStoragePartition,
-    conn::RuntimeInspectorResponseReady,
-    devtools_runtime::{
-        AutomationEvent, DevToolsCommand, DevToolsCommandContext, DevToolsCommandResult,
-        DevToolsDomObjectReferenceCommand, DevToolsDomObjectReferenceOperation, DevToolsError,
-        DevToolsErrorKind, DevToolsFrameId, DevToolsGetBrowserContextsCommand,
-        DevToolsGetFrameTreesCommand, DevToolsGetLayoutMetricsCommand, DevToolsGetRealmsCommand,
-        DevToolsGetTargetInfoCommand, DevToolsNavigationWait, DevToolsProtocol,
+    automation::{
+        AutomationCommand, AutomationContext, AutomationEvent, AutomationResult, DevToolsError,
+        DevToolsErrorKind, DevToolsGetBrowserContextsCommand, DevToolsGetLayoutMetricsCommand,
+        DevToolsGetRealmsCommand, DevToolsGetTargetInfoCommand, DevToolsNavigationWait,
         DevToolsRemoteHandleId, DevToolsSessionId, DevToolsSetFileInputFilesCommand,
-        DevToolsTargetId, DevToolsTargetInfo, DevToolsTargetKind, NavigationFrameEvent,
-        NavigationFrameEventKind, NavigationLifecycleEvent, TargetLifecycleEvent,
+        DevToolsTargetId, DevToolsTargetInfo, DevToolsTargetKind, FrontendProtocol,
         webdriver_bidi_navigation_id_from_loader_id,
     },
+    conn::{PendingAutomationCommandAdmission, RuntimeInspectorResponseReady},
 };
 use moli_protocol_webdriver_bidi::{
     BidiCommandOutcome, BidiConnectionState, BidiDevToolsCommandDispatch, BidiErrorCode,
     BidiEventSourceHookPlan, BidiInputCommand, BidiInputCommandDispatch, BidiSessionRegistry,
-    bidi_response_from_devtools_error, bidi_response_from_devtools_result, error_response,
-    script_realm_created_event, success_response,
+    bidi_response_from_devtools_error, bidi_response_from_devtools_result,
+    bidi_user_context_from_browser_context_id, error_response, script_realm_created_event,
+    success_response,
 };
 use moli_protocol_webdriver_classic::{
     CLASSIC_ELEMENT_REFERENCE_KEY, ClassicActionState, ClassicDevToolsCommandContext,
-    ClassicElementOriginViewportPoints, ClassicError, ClassicErrorCode, ClassicViewportBounds,
-    classic_element_id, element_center_from_geometry,
-    perform_actions_ticks_with_state_and_viewport, release_actions_commands,
+    ClassicElementOriginViewportPoints, ClassicError, ClassicErrorCode,
+    ClassicUnhandledPromptBehavior, ClassicViewportBounds, classic_element_id,
+    element_center_from_geometry, perform_actions_ticks_with_state_and_viewport,
+    release_actions_commands,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep_until};
+
+mod input_progress;
+use input_progress::{BidiInputState, BidiPendingInput, wait_for_bidi_input_deadline};
 use tracing::warn;
 
 use crate::cdp_scheduler::{
-    CdpScheduler, CdpSchedulerEventReceivers, DevToolsRuntimeCommandProgress,
-    PendingDevToolsRuntimeDeferredReplyExecution, ProtocolAdapterScheduler,
-    ProtocolAdapterSchedulerAdvance, ProtocolAdapterSchedulerInput, ProtocolOutputSequence,
-    RendererOutputTransportFailure,
+    AutomationCommandProgress, AutomationWorkflowReady, CdpScheduler, CdpSchedulerEventReceivers,
+    PendingAutomationExecution, ProtocolAdapterScheduler, ProtocolAdapterSchedulerAdvance,
+    ProtocolAdapterSchedulerInput, ProtocolOutputSequence, RendererOutputTransportFailure,
 };
 
 use super::webdriver_files::selected_files_from_paths;
-use super::{
-    AppState, CookieProfileCommit, SharedCookieProfile,
-    protocol_local_executor::spawn_protocol_local_task,
-};
+use super::{AppState, BrowserInstanceControl, protocol_local_executor::spawn_protocol_local_task};
 
 pub(super) async fn ws_bidi_session_upgrade_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> Response {
-    let initial_cookies = state.cookie_profile.snapshot();
-    let initial_cookie_snapshot = initial_cookies.clone();
-    let initial_storage_partition = state.initial_storage_partition(initial_cookies);
+    let initial_storage_partition = state.initial_storage_partition();
     let web_socket_url = state.bidi_ws_url;
     let session_registry = state.bidi_session_registry;
-    let cookie_profile = state.cookie_profile;
-    let navigation_runtime_config = NavigationRuntimeConfig::new(
-        state.fetch_config,
-        state.optional_resource_fetch_mask,
-        state.subframe_loading_enabled,
-        state.layout_policy,
-    );
+    let control = state.control;
+    let navigation_runtime_config = state.navigation_runtime_config;
     ws.on_upgrade(move |socket| {
         handle_bidi_session_socket(
             socket,
             web_socket_url,
             session_registry,
-            cookie_profile,
-            initial_cookie_snapshot,
             initial_storage_partition,
             navigation_runtime_config,
+            control,
         )
     })
 }
@@ -108,18 +97,23 @@ pub(super) async fn ws_bidi_existing_session_upgrade_handler(
     {
         return StatusCode::CONFLICT.into_response();
     }
-    let file_prompt_handler = state
+    let Some(unhandled_prompt_behavior) = state
         .classic_session_registry
-        .file_prompt_handler_for_bidi_script_commands(&session_id)
-        .map(str::to_owned);
+        .unhandled_prompt_behavior(&session_id)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let web_socket_url = format!("{}/{}", state.bidi_ws_url.trim_end_matches('/'), session_id);
     ws.on_upgrade(move |socket| async move {
+        let Some(_connection) = state.control.connection() else {
+            return;
+        };
         if !runtime
             .attach_bidi_socket(
                 socket,
                 web_socket_url,
                 session_id,
-                file_prompt_handler,
+                unhandled_prompt_behavior,
                 state.bidi_session_registry,
             )
             .await
@@ -133,32 +127,26 @@ async fn handle_bidi_session_socket(
     socket: WebSocket,
     web_socket_url: String,
     session_registry: SharedBidiSessionRegistry,
-    cookie_profile: SharedCookieProfile,
-    initial_cookie_snapshot: Vec<StoredCookie>,
     initial_storage_partition: CdpInitialStoragePartition,
     navigation_runtime_config: NavigationRuntimeConfig,
+    control: BrowserInstanceControl,
 ) {
-    let cookie_commit = spawn_protocol_local_task("bidi-socket", move || {
+    let Some(_connection) = control.connection() else {
+        return;
+    };
+    let completion = spawn_protocol_local_task("bidi-socket", move || {
         handle_bidi_session_socket_local(
             socket,
             web_socket_url,
             session_registry,
-            initial_cookie_snapshot,
             initial_storage_partition,
             navigation_runtime_config,
+            control,
         )
     })
     .await;
-    match cookie_commit {
-        Ok(cookie_commit) => {
-            if let Err(error) = cookie_profile.commit_and_save(cookie_commit) {
-                warn!(?error, "failed to persist BiDi cookie profile");
-            }
-        }
-        Err(error) => warn!(
-            ?error,
-            "BiDi socket worker failed before cookie profile writeback"
-        ),
+    if let Err(error) = completion {
+        warn!(?error, "BiDi socket worker failed");
     }
 }
 
@@ -166,10 +154,10 @@ async fn handle_bidi_session_socket_local(
     socket: WebSocket,
     web_socket_url: String,
     session_registry: SharedBidiSessionRegistry,
-    initial_cookie_snapshot: Vec<StoredCookie>,
     initial_storage_partition: CdpInitialStoragePartition,
     navigation_runtime_config: NavigationRuntimeConfig,
-) -> CookieProfileCommit {
+    control: BrowserInstanceControl,
+) {
     let mut actor = BidiSocketActor::new(socket, web_socket_url);
     let (mut scheduler, mut receivers) = CdpScheduler::new_with_initial_state_runtime_config(
         initial_storage_partition,
@@ -178,10 +166,24 @@ async fn handle_bidi_session_socket_local(
     actor.install_runtime_response_ready_sender(&mut scheduler);
     let mut adapter_scheduler = ProtocolAdapterScheduler::default();
     loop {
-        let page_javascript_blocked = scheduler.has_pending_javascript_dialog();
-        adapter_scheduler.schedule_turn_if_needed(&scheduler, page_javascript_blocked);
+        adapter_scheduler.schedule_turn_if_needed(&scheduler, false);
+        let input_deadline = actor.next_input_deadline();
         tokio::select! {
             biased;
+            _ = control.shutdown_requested() => break,
+            completion = receivers.protocol_work_completion_rx.recv() => {
+                let Some(completion) = completion else { break; };
+                if !actor.handle_protocol_work_completion(&mut scheduler, &mut receivers, completion).await { break; }
+            }
+            _ = receivers.state_events_ready.notified() => {
+                scheduler.apply_protocol_state_events();
+                if !actor.advance_pending_commands(&mut scheduler, &mut receivers).await {
+                    break;
+                }
+            }
+            _ = wait_for_bidi_input_deadline(input_deadline) => {
+                if !actor.advance_pending_commands(&mut scheduler, &mut receivers).await { break; }
+            }
             maybe_message = actor.socket.recv() => {
                 let Some(message) = maybe_message else {
                     break;
@@ -219,7 +221,7 @@ async fn handle_bidi_session_socket_local(
                     break;
                 }
             }
-            maybe_publication = receivers.renderer_publication_rx.recv(), if !page_javascript_blocked => {
+            maybe_publication = receivers.renderer_publication_rx.recv() => {
                 let Some(publication) = maybe_publication else {
                     break;
                 };
@@ -232,6 +234,10 @@ async fn handle_bidi_session_socket_local(
                     break;
                 }
             }
+            maybe_ready = actor.automation_workflow_ready_rx.recv() => {
+                let Some(ready) = maybe_ready else { break; };
+                if !actor.handle_automation_workflow_ready(&mut scheduler, &mut receivers, ready).await { break; }
+            }
             maybe_response = actor.runtime_response_ready_rx.recv() => {
                 let Some(response) = maybe_response else {
                     break;
@@ -240,7 +246,7 @@ async fn handle_bidi_session_socket_local(
                     break;
                 }
             }
-            input = adapter_scheduler.recv_input(), if !page_javascript_blocked => {
+            input = adapter_scheduler.recv_input() => {
                 if !actor.handle_adapter_scheduler_input(
                     &mut adapter_scheduler,
                     &mut scheduler,
@@ -256,39 +262,43 @@ async fn handle_bidi_session_socket_local(
         .release_event_sources(&mut scheduler, &mut receivers)
         .await;
     actor.release_session(&mut session_registry.lock());
-    CookieProfileCommit::from_optional_profile_backed_snapshot(
-        initial_cookie_snapshot,
-        scheduler.snapshot_profile_backed_cookies(),
-    )
 }
 
 pub(in crate::protocol_server) struct BidiSocketActor {
     socket: WebSocket,
     bidi: BidiConnectionState,
-    input_action_states: BTreeMap<String, ClassicActionState>,
-    pending_navigation_response: Option<BidiPendingNavigationResponse>,
-    pending_runtime_command: Option<BidiPendingRuntimeCommand>,
+    input_action_states: BTreeMap<String, std::rc::Rc<std::cell::RefCell<BidiInputState>>>,
+    pending_navigation_responses: Vec<BidiPendingNavigationResponse>,
+    pending_commands: VecDeque<BidiPendingCommand>,
     runtime_response_ready_tx: mpsc::UnboundedSender<RuntimeInspectorResponseReady>,
     runtime_response_ready_rx: mpsc::UnboundedReceiver<RuntimeInspectorResponseReady>,
+    automation_workflow_ready_tx: mpsc::UnboundedSender<AutomationWorkflowReady>,
+    automation_workflow_ready_rx: mpsc::UnboundedReceiver<AutomationWorkflowReady>,
 }
 
 pub(in crate::protocol_server) enum BidiSocketActorInput {
     Socket(Option<Result<Message, axum::Error>>),
     AdapterScheduler(ProtocolAdapterSchedulerInput),
     RuntimeResponseReady(Option<Box<RuntimeInspectorResponseReady>>),
+    AutomationWorkflowReady(Option<Box<AutomationWorkflowReady>>),
+    InputDeadline,
 }
 
 impl BidiSocketActor {
     pub(in crate::protocol_server) fn new(socket: WebSocket, web_socket_url: String) -> Self {
         let (runtime_response_ready_tx, runtime_response_ready_rx) = mpsc::unbounded_channel();
+        let (automation_workflow_ready_tx, automation_workflow_ready_rx) =
+            mpsc::unbounded_channel();
         Self {
             socket,
             bidi: BidiConnectionState::with_web_socket_url(web_socket_url),
             input_action_states: BTreeMap::new(),
-            pending_navigation_response: None,
-            pending_runtime_command: None,
+            pending_navigation_responses: Vec::new(),
+            pending_commands: VecDeque::new(),
             runtime_response_ready_tx,
             runtime_response_ready_rx,
+            automation_workflow_ready_tx,
+            automation_workflow_ready_rx,
         }
     }
 
@@ -308,12 +318,18 @@ impl BidiSocketActor {
         self.bidi.attach_existing_session(session_id, registry)
     }
 
-    pub(in crate::protocol_server) fn set_file_prompt_handler_for_script_commands(
+    pub(in crate::protocol_server) fn configure_existing_session_prompt_handlers(
         &mut self,
-        handler: Option<&str>,
-    ) {
+        scheduler: &mut CdpScheduler,
+        behavior: &ClassicUnhandledPromptBehavior,
+    ) -> Result<(), moli_protocol_webdriver_bidi::BidiError> {
         self.bidi
-            .set_file_prompt_handler_for_script_commands(handler);
+            .set_unhandled_prompt_behavior(&behavior.returned_capability())?;
+        self.bidi.set_file_prompt_handler_for_script_commands(
+            behavior.file_prompt_handler_for_bidi_script_commands(),
+        );
+        scheduler.register_bidi_javascript_dialog_handler(self.bidi.javascript_dialog_handlers());
+        Ok(())
     }
 
     pub(in crate::protocol_server) fn release_session(
@@ -328,7 +344,11 @@ impl BidiSocketActor {
         scheduler: &mut CdpScheduler,
         receivers: &mut CdpSchedulerEventReceivers,
     ) {
-        self.release_pending_runtime_command_state(scheduler);
+        // Release the handler before renderer cleanup can wait on an abandoned prompt.
+        // An attached Classic session retains its independent registration.
+        let _ = scheduler
+            .unregister_automation_javascript_dialog_handler(FrontendProtocol::WebDriverBidi);
+        self.release_pending_commands(scheduler, receivers).await;
         let plan = self.bidi.release_event_source_hook_plan();
         let mut events = Vec::new();
         let _ = append_bidi_event_source_hook_plan_events(
@@ -341,15 +361,24 @@ impl BidiSocketActor {
         .await;
     }
 
-    fn release_pending_runtime_command_state(&mut self, scheduler: &mut CdpScheduler) {
-        let Some(pending) = self.pending_runtime_command.take() else {
-            return;
-        };
-        if let Some(runtime_pending) = pending.pending {
-            scheduler.cancel_devtools_runtime_deferred_reply(runtime_pending);
-        }
-        if let Some(previous_target_discovery) = pending.completion.previous_target_discovery {
-            scheduler.replace_target_discovery_enabled(previous_target_discovery);
+    async fn release_pending_commands(
+        &mut self,
+        scheduler: &mut CdpScheduler,
+        receivers: &mut CdpSchedulerEventReceivers,
+    ) {
+        while let Some(pending) = self.pending_commands.pop_front() {
+            match pending.stage {
+                Some(BidiPendingCommandStage::Executing(runtime_pending)) => {
+                    let _output = scheduler
+                        .cancel_automation_command_progress(receivers, runtime_pending)
+                        .await;
+                }
+                Some(BidiPendingCommandStage::WaitingForNavigation { key, .. }) => {
+                    scheduler
+                        .release_navigation_completion(&pending.completion.command_context, &key);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -363,16 +392,20 @@ impl BidiSocketActor {
     pub(in crate::protocol_server) async fn recv_attached_input(
         &mut self,
         adapter_scheduler: &mut ProtocolAdapterScheduler,
-        page_javascript_blocked: bool,
     ) -> BidiSocketActorInput {
+        let input_deadline = self.next_input_deadline();
         tokio::select! {
             biased;
             message = self.socket.recv() => BidiSocketActorInput::Socket(message),
-            input = adapter_scheduler.recv_input(), if !page_javascript_blocked => {
+            _ = wait_for_bidi_input_deadline(input_deadline) => BidiSocketActorInput::InputDeadline,
+            input = adapter_scheduler.recv_input() => {
                 BidiSocketActorInput::AdapterScheduler(input)
             }
             response = self.runtime_response_ready_rx.recv() => {
                 BidiSocketActorInput::RuntimeResponseReady(response.map(Box::new))
+            }
+            ready = self.automation_workflow_ready_rx.recv() => {
+                BidiSocketActorInput::AutomationWorkflowReady(ready.map(Box::new))
             }
         }
     }
@@ -384,19 +417,181 @@ impl BidiSocketActor {
         session_registry: &SharedBidiSessionRegistry,
         message: Result<Message, axum::Error>,
     ) -> bool {
-        handle_bidi_socket_message(
+        if !handle_bidi_socket_message(
             &mut self.socket,
             scheduler,
             receivers,
             &mut self.bidi,
             &mut self.input_action_states,
             session_registry,
-            &mut self.pending_navigation_response,
-            &mut self.pending_runtime_command,
-            &self.runtime_response_ready_tx,
+            &mut self.pending_navigation_responses,
+            &mut self.pending_commands,
+            &self.automation_workflow_ready_tx,
             message,
         )
         .await
+        {
+            return false;
+        }
+        self.advance_pending_commands(scheduler, receivers).await
+    }
+
+    pub(in crate::protocol_server) async fn advance_pending_commands(
+        &mut self,
+        scheduler: &mut CdpScheduler,
+        receivers: &mut CdpSchedulerEventReceivers,
+    ) -> bool {
+        // Commands own independent waits. Iteration order is not an execution
+        // dependency, and one slow context must not retain another's reply.
+        loop {
+            let mut progressed = false;
+            for _ in 0..self.pending_commands.len() {
+                let mut command = self
+                    .pending_commands
+                    .pop_front()
+                    .expect("bounded pending snapshot");
+                let stage = command.stage.take().expect("an owned pending stage");
+                match stage {
+                    BidiPendingCommandStage::WaitingForInputTurn => {
+                        if !self.input_owner_is_current(scheduler, &command)
+                            || self.input_turn_is_available(&command)
+                        {
+                            progressed = true;
+                            if !self
+                                .begin_input_command(scheduler, receivers, command)
+                                .await
+                            {
+                                return false;
+                            }
+                        } else {
+                            command.stage = Some(BidiPendingCommandStage::WaitingForInputTurn);
+                            self.pending_commands.push_back(command);
+                        }
+                    }
+                    BidiPendingCommandStage::InputPause(deadline) => {
+                        if deadline <= Instant::now()
+                            || !self.input_owner_is_current(scheduler, &command)
+                        {
+                            progressed = true;
+                            if !self
+                                .continue_input_actions(scheduler, receivers, command)
+                                .await
+                            {
+                                return false;
+                            }
+                        } else {
+                            command.stage = Some(BidiPendingCommandStage::InputPause(deadline));
+                            self.pending_commands.push_back(command);
+                        }
+                    }
+                    BidiPendingCommandStage::WaitingForDocument(admission) => {
+                        if command.input.is_some()
+                            && !self.input_owner_is_current(scheduler, &command)
+                        {
+                            progressed = true;
+                            if !self
+                                .fail_closed_input_command(scheduler, receivers, command)
+                                .await
+                            {
+                                return false;
+                            }
+                            continue;
+                        }
+                        match scheduler
+                            .resume_owned_automation_command_admission(
+                                receivers,
+                                &self.automation_workflow_ready_tx,
+                                admission,
+                            )
+                            .await
+                        {
+                            Ok(progress) => {
+                                progressed = true;
+                                if !self
+                                    .apply_pending_command_progress(
+                                        scheduler, receivers, command, progress,
+                                    )
+                                    .await
+                                {
+                                    return false;
+                                }
+                            }
+                            Err(admission) => {
+                                command.stage =
+                                    Some(BidiPendingCommandStage::WaitingForDocument(admission));
+                                self.pending_commands.push_back(command);
+                            }
+                        }
+                    }
+                    BidiPendingCommandStage::NativeComplete(execution) => {
+                        progressed = true;
+                        if !self
+                            .apply_pending_command_progress(
+                                scheduler,
+                                receivers,
+                                command,
+                                AutomationCommandProgress::Complete(execution),
+                            )
+                            .await
+                        {
+                            return false;
+                        }
+                    }
+                    BidiPendingCommandStage::WaitingForNavigation { key, mut execution } => {
+                        if let Some(result) = scheduler
+                            .poll_navigation_completion(&command.completion.command_context, &key)
+                        {
+                            progressed = true;
+                            scheduler.release_navigation_completion(
+                                &command.completion.command_context,
+                                &key,
+                            );
+                            if let Err(error) = result {
+                                execution.result = Err(error);
+                            }
+                            if !self
+                                .finish_pending_command(scheduler, receivers, command, *execution)
+                                .await
+                            {
+                                return false;
+                            }
+                        } else {
+                            command.stage = Some(BidiPendingCommandStage::WaitingForNavigation {
+                                key,
+                                execution,
+                            });
+                            self.pending_commands.push_back(command);
+                        }
+                    }
+                    stage => {
+                        command.stage = Some(stage);
+                        self.pending_commands.push_back(command);
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        true
+    }
+
+    pub(in crate::protocol_server) async fn handle_protocol_work_completion(
+        &mut self,
+        scheduler: &mut CdpScheduler,
+        receivers: &mut CdpSchedulerEventReceivers,
+        completion: crate::cdp_scheduler::ProtocolWorkCompletion,
+    ) -> bool {
+        match scheduler.complete_protocol_work(completion) {
+            Ok(output) => {
+                self.send_or_route_protocol_output(scheduler, receivers, output, None)
+                    .await
+            }
+            Err(error) => {
+                tracing::error!(%error, "protocol owner work failed during recovery");
+                false
+            }
+        }
     }
 
     pub(in crate::protocol_server) async fn handle_background_navigation_completion(
@@ -430,9 +625,7 @@ impl BidiSocketActor {
         receivers: &mut CdpSchedulerEventReceivers,
         publication: RendererOutputTransportMessage,
     ) -> bool {
-        let output = adapter_scheduler
-            .ingest_renderer_publication(scheduler, publication)
-            .await;
+        let output = adapter_scheduler.ingest_renderer_publication(scheduler, publication);
         self.send_or_route_protocol_output(scheduler, receivers, output, None)
             .await
     }
@@ -443,24 +636,24 @@ impl BidiSocketActor {
         receivers: &mut CdpSchedulerEventReceivers,
         response: RuntimeInspectorResponseReady,
     ) -> bool {
-        let command_id = response.command_id();
-        let matches_pending_runtime_command = self
-            .pending_runtime_command
-            .as_ref()
-            .and_then(|pending_command| pending_command.pending.as_ref())
-            .is_some_and(|pending| pending.command_id() == command_id);
-
-        if matches_pending_runtime_command {
-            return self
-                .advance_pending_runtime_command_after_renderer_response(
-                    scheduler, receivers, response,
-                )
-                .await;
-        }
-
         let output = scheduler.route_registered_runtime_inspector_response(response);
         self.send_or_route_protocol_output(scheduler, receivers, output, None)
             .await
+    }
+
+    pub(in crate::protocol_server) async fn handle_automation_workflow_ready(
+        &mut self,
+        scheduler: &mut CdpScheduler,
+        receivers: &mut CdpSchedulerEventReceivers,
+        ready: AutomationWorkflowReady,
+    ) -> bool {
+        if !self
+            .complete_pending_command_workflow(scheduler, receivers, ready)
+            .await
+        {
+            return false;
+        }
+        self.advance_pending_commands(scheduler, receivers).await
     }
 
     pub(in crate::protocol_server) async fn handle_adapter_scheduler_input(
@@ -470,15 +663,9 @@ impl BidiSocketActor {
         receivers: &mut CdpSchedulerEventReceivers,
         input: ProtocolAdapterSchedulerInput,
     ) -> bool {
-        let output = match adapter_scheduler.advance_input(scheduler, input).await {
-            ProtocolAdapterSchedulerAdvance::ProtocolResidenceCompleted(output)
-            | ProtocolAdapterSchedulerAdvance::DeferredLoadCompleted { output, .. } => output,
-            ProtocolAdapterSchedulerAdvance::Idle
-            | ProtocolAdapterSchedulerAdvance::ClientTurnYielded
-            | ProtocolAdapterSchedulerAdvance::DeferredLoadStarted { .. }
-            | ProtocolAdapterSchedulerAdvance::StaleDeferredLoadCompletion { .. } => {
-                ProtocolOutputSequence::empty()
-            }
+        let output = match adapter_scheduler.advance_input(scheduler, input) {
+            ProtocolAdapterSchedulerAdvance::ProtocolResidenceCompleted(output) => output,
+            ProtocolAdapterSchedulerAdvance::Idle => ProtocolOutputSequence::empty(),
         };
         self.send_or_route_protocol_output(scheduler, receivers, output, None)
             .await
@@ -491,125 +678,181 @@ impl BidiSocketActor {
         output: ProtocolOutputSequence,
         owner_context: Option<&str>,
     ) -> bool {
-        if self.pending_runtime_command.is_none() {
-            return send_bidi_protocol_output(
-                &mut self.socket,
-                scheduler,
-                receivers,
-                &mut self.bidi,
-                output,
-                owner_context,
-                &mut self.pending_navigation_response,
-            )
-            .await;
-        }
-        self.advance_pending_runtime_command_after_protocol_output(scheduler, receivers, output)
+        if !self
+            .publish_pending_command_output(scheduler, receivers, output, owner_context)
             .await
+        {
+            return false;
+        }
+        self.advance_pending_commands(scheduler, receivers).await
     }
 
-    async fn advance_pending_runtime_command_after_protocol_output(
+    async fn publish_pending_command_output(
         &mut self,
         scheduler: &mut CdpScheduler,
         receivers: &mut CdpSchedulerEventReceivers,
         output: ProtocolOutputSequence,
+        owner_context: Option<&str>,
     ) -> bool {
-        let Some(mut pending_command) = self.pending_runtime_command.take() else {
-            return send_bidi_protocol_output(
-                &mut self.socket,
-                scheduler,
-                receivers,
-                &mut self.bidi,
-                output,
-                None,
-                &mut self.pending_navigation_response,
-            )
-            .await;
-        };
-        let pending = pending_command
-            .pending
-            .take()
-            .expect("pending runtime command should carry scheduler state");
-        let progress = scheduler
-            .advance_devtools_runtime_deferred_reply_after_protocol_output(pending, output)
-            .await;
-        self.apply_pending_runtime_progress(scheduler, receivers, pending_command, progress)
-            .await
+        let output = self.route_pending_command_output(scheduler, output);
+        send_bidi_protocol_output(
+            &mut self.socket,
+            scheduler,
+            receivers,
+            &mut self.bidi,
+            output,
+            owner_context,
+            &mut self.pending_navigation_responses,
+        )
+        .await
     }
 
-    async fn advance_pending_runtime_command_after_renderer_response(
+    fn route_pending_command_output(
+        &mut self,
+        scheduler: &mut CdpScheduler,
+        mut output: ProtocolOutputSequence,
+    ) -> ProtocolOutputSequence {
+        for command in &mut self.pending_commands {
+            let stage = command
+                .stage
+                .take()
+                .expect("a pending command retains its stage");
+            command.stage = Some(match stage {
+                BidiPendingCommandStage::Executing(pending) => {
+                    let AutomationCommandProgress::Pending {
+                        pending,
+                        protocol_output,
+                    } = scheduler.route_automation_command_output(pending, output)
+                    else {
+                        unreachable!("routing recorded output does not complete a Native wait")
+                    };
+                    output = protocol_output;
+                    BidiPendingCommandStage::Executing(pending)
+                }
+                stage => stage,
+            });
+        }
+        output
+    }
+
+    async fn complete_pending_command_workflow(
         &mut self,
         scheduler: &mut CdpScheduler,
         receivers: &mut CdpSchedulerEventReceivers,
-        response: RuntimeInspectorResponseReady,
+        ready: AutomationWorkflowReady,
     ) -> bool {
-        let Some(mut pending_command) = self.pending_runtime_command.take() else {
-            let output = scheduler.route_registered_runtime_inspector_response(response);
-            return send_bidi_protocol_output(
-                &mut self.socket,
-                scheduler,
-                receivers,
-                &mut self.bidi,
-                output,
-                None,
-                &mut self.pending_navigation_response,
-            )
-            .await;
+        let Some(index) = self.pending_commands.iter().position(|command| {
+            matches!(command.stage.as_ref(), Some(BidiPendingCommandStage::Executing(pending)) if pending.command_id() == ready.command_id())
+        }) else { return true; };
+        let mut pending_command = self
+            .pending_commands
+            .remove(index)
+            .expect("the matched command remains owned");
+        let Some(BidiPendingCommandStage::Executing(pending)) = pending_command.stage.take() else {
+            unreachable!("the matching Runtime notification requires an executing command");
         };
-        let pending = pending_command
-            .pending
-            .take()
-            .expect("pending runtime command should carry scheduler state");
         let progress = scheduler
-            .advance_devtools_runtime_deferred_reply_after_renderer_response(
+            .complete_automation_workflow_ready(
                 receivers,
-                &self.runtime_response_ready_tx,
+                &self.automation_workflow_ready_tx,
                 pending,
-                response,
+                ready,
+                ProtocolOutputSequence::empty(),
             )
             .await;
-        self.apply_pending_runtime_progress(scheduler, receivers, pending_command, progress)
+        self.apply_pending_command_progress(scheduler, receivers, pending_command, progress)
             .await
     }
 
-    async fn apply_pending_runtime_progress(
+    async fn apply_pending_command_progress(
         &mut self,
         scheduler: &mut CdpScheduler,
         receivers: &mut CdpSchedulerEventReceivers,
-        mut pending_command: BidiPendingRuntimeCommand,
-        progress: DevToolsRuntimeCommandProgress,
+        mut pending_command: BidiPendingCommand,
+        progress: AutomationCommandProgress,
     ) -> bool {
         match progress {
-            DevToolsRuntimeCommandProgress::Complete(execution) => {
-                complete_and_send_bidi_pending_runtime_command(
-                    &mut self.socket,
-                    scheduler,
-                    receivers,
-                    &mut self.bidi,
-                    &mut self.pending_navigation_response,
-                    pending_command,
-                    *execution,
-                )
-                .await
+            AutomationCommandProgress::Complete(mut execution) => {
+                if pending_command.input.is_some() {
+                    return self
+                        .advance_input_command(scheduler, receivers, pending_command, *execution)
+                        .await;
+                }
+                if let Some(key) = scheduler.navigation_completion_key(
+                    &pending_command.completion.command_context,
+                    pending_command.completion.navigation_wait,
+                    &execution.result,
+                ) {
+                    if let Some(result) = scheduler.poll_navigation_completion(
+                        &pending_command.completion.command_context,
+                        &key,
+                    ) {
+                        scheduler.release_navigation_completion(
+                            &pending_command.completion.command_context,
+                            &key,
+                        );
+                        if let Err(error) = result {
+                            execution.result = Err(error);
+                        }
+                    } else {
+                        let output = std::mem::take(&mut execution.protocol_output);
+                        pending_command.stage =
+                            Some(BidiPendingCommandStage::WaitingForNavigation { key, execution });
+                        self.pending_commands.push_back(pending_command);
+                        return self
+                            .publish_pending_command_output(scheduler, receivers, output, None)
+                            .await;
+                    }
+                }
+                self.finish_pending_command(scheduler, receivers, pending_command, *execution)
+                    .await
             }
-            DevToolsRuntimeCommandProgress::PendingDeferredReply {
+            AutomationCommandProgress::Pending {
                 pending,
                 protocol_output,
             } => {
-                pending_command.pending = Some(pending);
-                let sent = send_bidi_protocol_output(
+                pending_command.stage = Some(BidiPendingCommandStage::Executing(pending));
+                self.pending_commands.push_back(pending_command);
+                let protocol_output = self.route_pending_command_output(scheduler, protocol_output);
+                send_bidi_protocol_output(
                     &mut self.socket,
                     scheduler,
                     receivers,
                     &mut self.bidi,
                     protocol_output,
                     None,
-                    &mut self.pending_navigation_response,
+                    &mut self.pending_navigation_responses,
                 )
-                .await;
-                self.pending_runtime_command = Some(pending_command);
-                sent
+                .await
             }
         }
+    }
+    async fn finish_pending_command(
+        &mut self,
+        scheduler: &mut CdpScheduler,
+        receivers: &mut CdpSchedulerEventReceivers,
+        mut pending: BidiPendingCommand,
+        mut execution: crate::cdp_scheduler::AutomationExecution,
+    ) -> bool {
+        execution.protocol_output =
+            self.route_pending_command_output(scheduler, execution.protocol_output);
+        let output = complete_bidi_automation_command_execution(
+            scheduler,
+            receivers,
+            &mut pending.completion,
+            execution,
+        )
+        .await;
+        send_completed_bidi_command(
+            &mut self.socket,
+            scheduler,
+            receivers,
+            &mut self.bidi,
+            &mut self.pending_navigation_responses,
+            pending,
+            output,
+        )
+        .await
     }
 }
 
@@ -618,11 +861,11 @@ async fn handle_bidi_socket_message(
     scheduler: &mut CdpScheduler,
     receivers: &mut CdpSchedulerEventReceivers,
     bidi: &mut BidiConnectionState,
-    input_action_states: &mut BTreeMap<String, ClassicActionState>,
+    input_action_states: &mut BTreeMap<String, std::rc::Rc<std::cell::RefCell<BidiInputState>>>,
     session_registry: &SharedBidiSessionRegistry,
-    pending_navigation_response: &mut Option<BidiPendingNavigationResponse>,
-    pending_runtime_command: &mut Option<BidiPendingRuntimeCommand>,
-    runtime_response_ready_tx: &mpsc::UnboundedSender<RuntimeInspectorResponseReady>,
+    pending_navigation_responses: &mut Vec<BidiPendingNavigationResponse>,
+    pending_commands: &mut VecDeque<BidiPendingCommand>,
+    runtime_response_ready_tx: &mpsc::UnboundedSender<AutomationWorkflowReady>,
     message: Result<Message, axum::Error>,
 ) -> bool {
     let payload: Result<serde_json::Value, _> = match message {
@@ -635,6 +878,8 @@ async fn handle_bidi_socket_message(
             return false;
         }
     };
+    let mut context_created_replay = Vec::new();
+    let mut admission_event_sources = BidiDevToolsEventSources::default();
     let (
         outcome,
         command_method,
@@ -656,7 +901,7 @@ async fn handle_bidi_socket_message(
                         session_id: bidi.session_id().map(ToOwned::to_owned),
                         channel: None,
                         close_connection: false,
-                        devtools_command: None,
+                        automation_command: None,
                         input_command: None,
                     };
                     (outcome, command_method, command_params, None, None)
@@ -667,17 +912,42 @@ async fn handle_bidi_socket_message(
                     .then(|| bidi.replay_contexts_for_bidi_event("script.realmCreated"));
                     let mut subscribe_hook_plan = None;
                     let outcome = if command_method.as_deref() == Some("session.subscribe")
-                        && let Some(validation) =
-                            validate_bidi_session_subscribe_targets(scheduler, bidi, &message).await
-                    {
+                        && let Some(validation) = validate_bidi_session_subscribe_targets(
+                            scheduler,
+                            &mut admission_event_sources,
+                            bidi,
+                            &message,
+                        ) {
                         match validation {
                             BidiSessionSubscribeTargetValidation::Valid(targets) => {
                                 targets.record_to_bidi_state(bidi);
+                                let frames = scheduler.frame_index_snapshot();
+                                bidi.record_frame_index_snapshot(frames.clone());
+                                let previously_observed = bidi
+                                    .context_created_events_for_frames(&frames)
+                                    .into_iter()
+                                    .filter_map(|event| {
+                                        event["params"]["context"].as_str().map(str::to_owned)
+                                    })
+                                    .collect::<BTreeSet<_>>();
                                 subscribe_hook_plan = message.get("params").and_then(|params| {
                                     bidi.subscribe_hook_plan_for_params(params).ok()
                                 });
                                 let mut registry = session_registry.lock();
-                                bidi.handle_message_with_session_registry(message, &mut registry)
+                                let outcome = bidi
+                                    .handle_message_with_session_registry(message, &mut registry);
+                                if outcome.response["type"] == "success" {
+                                    context_created_replay = bidi
+                                        .context_created_events_for_frames(&frames)
+                                        .into_iter()
+                                        .filter(|event| {
+                                            event["params"]["context"].as_str().is_some_and(
+                                                |context| !previously_observed.contains(context),
+                                            )
+                                        })
+                                        .collect();
+                                }
+                                outcome
                             }
                             BidiSessionSubscribeTargetValidation::Error(response) => {
                                 BidiCommandOutcome {
@@ -688,7 +958,7 @@ async fn handle_bidi_socket_message(
                                     session_id: bidi.session_id().map(ToOwned::to_owned),
                                     channel: command_channel.clone(),
                                     close_connection: false,
-                                    devtools_command: None,
+                                    automation_command: None,
                                     input_command: None,
                                 }
                             }
@@ -717,7 +987,7 @@ async fn handle_bidi_socket_message(
                 session_id: bidi.session_id().map(ToOwned::to_owned),
                 channel: None,
                 close_connection: false,
-                devtools_command: None,
+                automation_command: None,
                 input_command: None,
             },
             None,
@@ -726,38 +996,27 @@ async fn handle_bidi_socket_message(
             None,
         ),
     };
+    admission_event_sources.extend_protocol_output(apply_bidi_dialog_handler_lifecycle(
+        scheduler,
+        bidi,
+        command_method.as_deref(),
+        &outcome,
+    ));
     let BidiCommandOutcome {
         response,
         channel: command_channel,
         close_connection,
-        devtools_command,
+        automation_command,
         input_command,
         ..
     } = outcome;
-    let pending_navigation_candidate = devtools_command.as_ref().and_then(|dispatch| {
+    let pending_navigation_candidate = automation_command.as_ref().and_then(|dispatch| {
         pending_navigation_response_for_dispatch(dispatch, command_channel.as_deref())
     });
-    let command_start = if pending_runtime_command.is_some()
-        && (devtools_command.is_some() || input_command.is_some())
-    {
-        BidiDevToolsCommandStart::Complete(BidiDevToolsCommandOutput {
-            response: error_response(
-                response.get("id").and_then(serde_json::Value::as_u64),
-                BidiErrorCode::UnsupportedOperation,
-                "another BiDi runtime command is still pending",
-            ),
-            event_sources: Vec::new(),
-            post_response_event_sources: Vec::new(),
-            post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-            event_context: None,
-        })
-    } else {
-        match (devtools_command, input_command) {
+    let command_start = {
+        match (automation_command, input_command) {
             (Some(dispatch), None) => {
-                let observe_context_created = bidi
-                    .subscribed_contexts_for_bidi_event("browsingContext.contextCreated")
-                    .is_some();
-                start_bidi_devtools_command(
+                start_bidi_automation_command(
                     scheduler,
                     receivers,
                     runtime_response_ready_tx,
@@ -766,16 +1025,20 @@ async fn handle_bidi_socket_message(
                     pending_navigation_candidate
                         .as_ref()
                         .map(|candidate| candidate.background_command_id),
-                    observe_context_created,
-                    bidi.subscribed_contexts_for_bidi_event("browsingContext.load")
-                        .is_some(),
                 )
                 .await
             }
-            (None, Some(dispatch)) => BidiDevToolsCommandStart::Complete(
-                execute_bidi_input_command(scheduler, receivers, input_action_states, dispatch)
-                    .await,
-            ),
+            (None, Some(dispatch)) => {
+                input_progress::start_bidi_input_command(
+                    scheduler,
+                    receivers,
+                    runtime_response_ready_tx,
+                    bidi,
+                    input_action_states,
+                    dispatch,
+                )
+                .await
+            }
             (Some(_), Some(_)) => BidiDevToolsCommandStart::Complete(BidiDevToolsCommandOutput {
                 response: error_response(
                     None,
@@ -784,28 +1047,37 @@ async fn handle_bidi_socket_message(
                 ),
                 event_sources: Vec::new(),
                 post_response_event_sources: Vec::new(),
-                post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
                 event_context: None,
             }),
             (None, None) => BidiDevToolsCommandStart::Complete(BidiDevToolsCommandOutput {
                 response,
                 event_sources: Vec::new(),
                 post_response_event_sources: Vec::new(),
-                post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
                 event_context: None,
             }),
         }
     };
     let mut command_output = match command_start {
-        BidiDevToolsCommandStart::Complete(output) => output,
-        BidiDevToolsCommandStart::PendingRuntime(pending) => {
+        BidiDevToolsCommandStart::Complete(mut output) => {
+            let mut prefix = admission_event_sources.into_sources();
+            prefix.append(&mut output.event_sources);
+            output.event_sources = prefix;
+            output
+        }
+        BidiDevToolsCommandStart::Pending(pending) => {
             let mut pending = *pending;
+            admission_event_sources.append(std::mem::take(&mut pending.completion.event_sources));
+            pending.completion.event_sources = admission_event_sources;
             pending.command_method = command_method;
             pending.command_params = command_params;
             pending.command_channel = command_channel;
             pending.pending_navigation_candidate = pending_navigation_candidate;
             let initial_sources =
                 std::mem::take(&mut pending.completion.event_sources).into_sources();
+            let pending_navigation_reply = take_pending_navigation_response_from_sources(
+                pending_navigation_responses,
+                &initial_sources,
+            );
             let mut bidi_events = subscribed_bidi_events_from_devtools_event_sources(
                 Some(&*scheduler),
                 bidi,
@@ -826,7 +1098,10 @@ async fn handle_bidi_socket_message(
             if !send_bidi_json_events(socket, bidi_events).await {
                 return false;
             }
-            *pending_runtime_command = Some(pending);
+            if !send_bidi_json_events(socket, pending_navigation_reply).await {
+                return false;
+            }
+            pending_commands.push_back(pending);
             return true;
         }
     };
@@ -839,28 +1114,27 @@ async fn handle_bidi_socket_message(
         &command_output.response,
     );
     let defer_current_response = pending_navigation_candidate.is_some()
-        && pending_navigation_response.is_none()
-        && bidi_response_is_missing_devtools_command_result(&command_output.response)
+        && bidi_response_is_missing_automation_command_result(&command_output.response)
         && sources_include_auth_required_pause(&command_output.event_sources);
     if defer_current_response {
-        *pending_navigation_response = pending_navigation_candidate;
+        pending_navigation_responses.extend(pending_navigation_candidate);
     }
-    let pending_response_from_event_sources = (!defer_current_response)
-        .then(|| {
-            take_pending_navigation_response_from_sources(
-                pending_navigation_response,
-                &command_output.event_sources,
-            )
-        })
-        .flatten();
-    let pending_response_from_post_response_event_sources = (!defer_current_response)
-        .then(|| {
-            take_pending_navigation_response_from_sources(
-                pending_navigation_response,
-                &command_output.post_response_event_sources,
-            )
-        })
-        .flatten();
+    let mut pending_response_from_event_sources = if defer_current_response {
+        Vec::new()
+    } else {
+        take_pending_navigation_response_from_sources(
+            pending_navigation_responses,
+            &command_output.event_sources,
+        )
+    };
+    let pending_response_from_post_response_event_sources = if defer_current_response {
+        Vec::new()
+    } else {
+        take_pending_navigation_response_from_sources(
+            pending_navigation_responses,
+            &command_output.post_response_event_sources,
+        )
+    };
     let mut bidi_events = subscribed_bidi_events_from_devtools_event_sources(
         Some(&*scheduler),
         bidi,
@@ -883,6 +1157,7 @@ async fn handle_bidi_socket_message(
         && command_output.response["type"] == json!("success")
         && !renderer_output_transport_terminal
     {
+        bidi_events.extend(context_created_replay);
         if let Some(plan) = subscribe_hook_plan.as_ref()
             && !append_bidi_event_source_hook_plan_events(
                 scheduler,
@@ -896,14 +1171,27 @@ async fn handle_bidi_socket_message(
             let _ = send_bidi_json_events(socket, bidi_events).await;
             return false;
         }
-        bidi_events.extend(
-            replay_existing_bidi_realm_created_events(
-                scheduler,
-                bidi,
-                previous_realm_created_contexts.flatten(),
-            )
-            .await,
-        );
+        let mut replay_event_sources = BidiDevToolsEventSources::default();
+        let replay_events = replay_existing_bidi_realm_created_events(
+            scheduler,
+            receivers,
+            &mut replay_event_sources,
+            bidi,
+            previous_realm_created_contexts.flatten(),
+        )
+        .await;
+        let replay_event_sources = replay_event_sources.into_sources();
+        pending_response_from_event_sources.extend(take_pending_navigation_response_from_sources(
+            pending_navigation_responses,
+            &replay_event_sources,
+        ));
+        bidi_events.extend(subscribed_bidi_events_from_devtools_event_sources(
+            Some(&*scheduler),
+            bidi,
+            &replay_event_sources,
+            None,
+        ));
+        bidi_events.extend(replay_events);
         bidi_events.extend(bidi.replay_buffered_bidi_log_entry_events_for_subscriptions());
     }
     if !append_bidi_event_source_hook_plan_events(
@@ -948,38 +1236,13 @@ async fn handle_bidi_socket_message(
     {
         return false;
     }
-    if let Some(response) = pending_response_from_event_sources
-        && socket
-            .send(Message::Text(response.to_string().into()))
-            .await
-            .is_err()
-    {
+    if !send_bidi_json_events(socket, pending_response_from_event_sources).await {
         return false;
     }
     if !send_bidi_json_events(socket, post_response_bidi_events).await {
         return false;
     }
-    if let Some(response) = pending_response_from_post_response_event_sources
-        && socket
-            .send(Message::Text(response.to_string().into()))
-            .await
-            .is_err()
-    {
-        return false;
-    }
-    if command_output
-        .post_response_background_navigation_drain
-        .waits_for_inflight_navigation()
-        && !drain_and_send_bidi_navigation_after_response(
-            socket,
-            scheduler,
-            receivers,
-            bidi,
-            pending_navigation_response,
-            command_output.event_context.as_deref(),
-        )
-        .await
-    {
+    if !send_bidi_json_events(socket, pending_response_from_post_response_event_sources).await {
         return false;
     }
     if close_connection || renderer_output_transport_terminal {
@@ -987,6 +1250,22 @@ async fn handle_bidi_socket_message(
         return false;
     }
     true
+}
+
+fn apply_bidi_dialog_handler_lifecycle(
+    scheduler: &mut CdpScheduler,
+    bidi: &BidiConnectionState,
+    method: Option<&str>,
+    outcome: &BidiCommandOutcome,
+) -> ProtocolOutputSequence {
+    if outcome.close_connection {
+        return scheduler
+            .unregister_automation_javascript_dialog_handler(FrontendProtocol::WebDriverBidi);
+    }
+    if method == Some("session.new") && outcome.response["type"] == "success" {
+        scheduler.register_bidi_javascript_dialog_handler(bidi.javascript_dialog_handlers());
+    }
+    ProtocolOutputSequence::empty()
 }
 
 async fn send_bidi_json_events(socket: &mut WebSocket, events: Vec<serde_json::Value>) -> bool {
@@ -1002,25 +1281,22 @@ async fn send_bidi_json_events(socket: &mut WebSocket, events: Vec<serde_json::V
     true
 }
 
-async fn complete_and_send_bidi_pending_runtime_command(
+async fn send_completed_bidi_command(
     socket: &mut WebSocket,
     scheduler: &mut CdpScheduler,
     receivers: &mut CdpSchedulerEventReceivers,
     bidi: &mut BidiConnectionState,
-    pending_navigation_response: &mut Option<BidiPendingNavigationResponse>,
-    pending: BidiPendingRuntimeCommand,
-    execution: crate::cdp_scheduler::DevToolsCommandExecution,
+    pending_navigation_responses: &mut Vec<BidiPendingNavigationResponse>,
+    pending: BidiPendingCommand,
+    mut command_output: BidiDevToolsCommandOutput,
 ) -> bool {
-    let BidiPendingRuntimeCommand {
+    let BidiPendingCommand {
         command_method,
         command_params,
         command_channel,
         pending_navigation_candidate,
-        pending: _,
-        completion,
+        ..
     } = pending;
-    let mut command_output =
-        complete_bidi_devtools_command_execution(scheduler, receivers, completion, execution).await;
     let renderer_output_transport_terminal = receivers.renderer_publication_rx.is_closed();
     command_output.response =
         bidi_message_with_channel(command_output.response, command_channel.as_deref());
@@ -1030,28 +1306,27 @@ async fn complete_and_send_bidi_pending_runtime_command(
         &command_output.response,
     );
     let defer_current_response = pending_navigation_candidate.is_some()
-        && pending_navigation_response.is_none()
-        && bidi_response_is_missing_devtools_command_result(&command_output.response)
+        && bidi_response_is_missing_automation_command_result(&command_output.response)
         && sources_include_auth_required_pause(&command_output.event_sources);
     if defer_current_response {
-        *pending_navigation_response = pending_navigation_candidate;
+        pending_navigation_responses.extend(pending_navigation_candidate);
     }
-    let pending_response_from_event_sources = (!defer_current_response)
-        .then(|| {
-            take_pending_navigation_response_from_sources(
-                pending_navigation_response,
-                &command_output.event_sources,
-            )
-        })
-        .flatten();
-    let pending_response_from_post_response_event_sources = (!defer_current_response)
-        .then(|| {
-            take_pending_navigation_response_from_sources(
-                pending_navigation_response,
-                &command_output.post_response_event_sources,
-            )
-        })
-        .flatten();
+    let pending_response_from_event_sources = if defer_current_response {
+        Vec::new()
+    } else {
+        take_pending_navigation_response_from_sources(
+            pending_navigation_responses,
+            &command_output.event_sources,
+        )
+    };
+    let pending_response_from_post_response_event_sources = if defer_current_response {
+        Vec::new()
+    } else {
+        take_pending_navigation_response_from_sources(
+            pending_navigation_responses,
+            &command_output.post_response_event_sources,
+        )
+    };
     let mut bidi_events = subscribed_bidi_events_from_devtools_event_sources(
         Some(&*scheduler),
         bidi,
@@ -1112,117 +1387,19 @@ async fn complete_and_send_bidi_pending_runtime_command(
     {
         return false;
     }
-    if let Some(response) = pending_response_from_event_sources
-        && socket
-            .send(Message::Text(response.to_string().into()))
-            .await
-            .is_err()
-    {
+    if !send_bidi_json_events(socket, pending_response_from_event_sources).await {
         return false;
     }
     if !send_bidi_json_events(socket, post_response_bidi_events).await {
         return false;
     }
-    if let Some(response) = pending_response_from_post_response_event_sources
-        && socket
-            .send(Message::Text(response.to_string().into()))
-            .await
-            .is_err()
-    {
-        return false;
-    }
-    if command_output
-        .post_response_background_navigation_drain
-        .waits_for_inflight_navigation()
-        && !drain_and_send_bidi_navigation_after_response(
-            socket,
-            scheduler,
-            receivers,
-            bidi,
-            pending_navigation_response,
-            command_output.event_context.as_deref(),
-        )
-        .await
-    {
+    if !send_bidi_json_events(socket, pending_response_from_post_response_event_sources).await {
         return false;
     }
     !renderer_output_transport_terminal
 }
 
-/// Completes the optional navigation tail after a BiDi command response is on
-/// the wire.
-///
-/// A renderer-output transport terminal cannot retroactively replace that
-/// response. We still deliver the concrete FIFO prefix admitted before the
-/// terminal, then return `false` so the caller closes the connection instead
-/// of issuing any later successful response from an incomplete output stream.
-async fn drain_and_send_bidi_navigation_after_response(
-    socket: &mut WebSocket,
-    scheduler: &mut CdpScheduler,
-    receivers: &mut CdpSchedulerEventReceivers,
-    bidi: &mut BidiConnectionState,
-    pending_navigation_response: &mut Option<BidiPendingNavigationResponse>,
-    event_context: Option<&str>,
-) -> bool {
-    let (background_navigation_sources, transport_is_live) =
-        match drain_bidi_background_navigation_before_command(scheduler, receivers).await {
-            Ok(sources) => (sources.into_sources(), true),
-            Err(failure) => {
-                let (sources, _terminal_error) = failure.into_parts();
-                (sources.into_sources(), false)
-            }
-        };
-    let pending_response = transport_is_live
-        .then(|| {
-            take_pending_navigation_response_from_sources(
-                pending_navigation_response,
-                &background_navigation_sources,
-            )
-        })
-        .flatten();
-    let mut background_navigation_events = subscribed_bidi_events_from_devtools_event_sources(
-        Some(&*scheduler),
-        bidi,
-        &background_navigation_sources,
-        event_context,
-    );
-    if transport_is_live
-        && !append_context_created_event_source_hook_events(
-            scheduler,
-            receivers,
-            bidi,
-            &mut background_navigation_events,
-        )
-        .await
-    {
-        let _ = send_bidi_json_events(socket, background_navigation_events).await;
-        return false;
-    }
-    if !send_bidi_json_events(socket, background_navigation_events).await {
-        return false;
-    }
-    if let Some(response) = pending_response
-        && socket
-            .send(Message::Text(response.to_string().into()))
-            .await
-            .is_err()
-    {
-        return false;
-    }
-    transport_is_live
-}
-
-fn bidi_message_with_channel(
-    mut message: serde_json::Value,
-    channel: Option<&str>,
-) -> serde_json::Value {
-    if let Some(channel) = channel
-        && let Some(message) = message.as_object_mut()
-    {
-        message.insert("goog:channel".to_owned(), json!(channel));
-    }
-    message
-}
+use moli_protocol_webdriver_bidi::bidi_message_with_channel;
 
 fn bidi_command_channel_from_message(message: &serde_json::Value) -> Result<Option<String>, &str> {
     match message.get("goog:channel") {
@@ -1424,14 +1601,14 @@ async fn send_bidi_protocol_output(
     bidi: &mut BidiConnectionState,
     output: ProtocolOutputSequence,
     owner_context: Option<&str>,
-    pending_navigation_response: &mut Option<BidiPendingNavigationResponse>,
+    pending_navigation_responses: &mut Vec<BidiPendingNavigationResponse>,
 ) -> bool {
     if output.is_empty() {
         return true;
     }
     let sources = BidiDevToolsEventSources::from_protocol_output(output).into_sources();
     let pending_response =
-        take_pending_navigation_response_from_sources(pending_navigation_response, &sources);
+        take_pending_navigation_response_from_sources(pending_navigation_responses, &sources);
     let mut events = subscribed_bidi_events_from_devtools_event_sources(
         Some(&*scheduler),
         bidi,
@@ -1447,12 +1624,7 @@ async fn send_bidi_protocol_output(
     if !send_bidi_json_events(socket, events).await {
         return false;
     }
-    if let Some(response) = pending_response
-        && socket
-            .send(Message::Text(response.to_string().into()))
-            .await
-            .is_err()
-    {
+    if !send_bidi_json_events(socket, pending_response).await {
         return false;
     }
     true
@@ -1472,47 +1644,42 @@ struct BidiDevToolsCommandOutput {
     response: serde_json::Value,
     event_sources: Vec<BidiDevToolsEventSource>,
     post_response_event_sources: Vec<BidiDevToolsEventSource>,
-    post_response_background_navigation_drain: BidiBackgroundNavigationDrain,
     event_context: Option<String>,
 }
 
 enum BidiDevToolsCommandStart {
     Complete(BidiDevToolsCommandOutput),
-    PendingRuntime(Box<BidiPendingRuntimeCommand>),
+    Pending(Box<BidiPendingCommand>),
 }
 
-struct BidiPendingRuntimeCommand {
+struct BidiPendingCommand {
     command_method: Option<String>,
     command_params: Option<serde_json::Value>,
     command_channel: Option<String>,
     pending_navigation_candidate: Option<BidiPendingNavigationResponse>,
-    pending: Option<Box<PendingDevToolsRuntimeDeferredReplyExecution>>,
+    stage: Option<BidiPendingCommandStage>,
     completion: BidiDevToolsCommandCompletion,
+    input: Option<BidiPendingInput>,
+}
+
+enum BidiPendingCommandStage {
+    WaitingForInputTurn,
+    InputPause(Instant),
+    NativeComplete(Box<crate::cdp_scheduler::AutomationExecution>),
+    WaitingForNavigation {
+        key: moli_protocol::DevToolsDocumentLifecycleWaitKey,
+        execution: Box<crate::cdp_scheduler::AutomationExecution>,
+    },
+    WaitingForDocument(Box<PendingAutomationCommandAdmission>),
+    Executing(Box<PendingAutomationExecution>),
 }
 
 struct BidiDevToolsCommandCompletion {
     id: u64,
-    session_id: String,
+    command_context: AutomationContext,
+    navigation_wait: Option<DevToolsNavigationWait>,
     event_sources: BidiDevToolsEventSources,
     event_context: Option<String>,
-    close_target_event: Option<TargetLifecycleEvent>,
-    create_target_browser_context_id:
-        Option<moli_protocol::devtools_runtime::DevToolsBrowserContextId>,
-    observe_browsing_context_load: bool,
-    script_may_create_targets: bool,
-    previous_target_discovery: Option<bool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BidiBackgroundNavigationDrain {
-    None,
-    ScriptCreatedTargetLoadSubscription,
-}
-
-impl BidiBackgroundNavigationDrain {
-    fn waits_for_inflight_navigation(self) -> bool {
-        matches!(self, Self::ScriptCreatedTargetLoadSubscription)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1576,7 +1743,6 @@ fn bidi_command_output_from_renderer_transport_failure(
         response: bidi_response_from_devtools_error(id, error),
         event_sources: preceding_sources.into_sources(),
         post_response_event_sources: Vec::new(),
-        post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
         event_context,
     }
 }
@@ -1600,6 +1766,10 @@ impl BidiDevToolsEventSources {
     }
 
     fn push_background_event(&mut self, event: BackgroundProtocolEvent) {
+        if event.is_frame_lifecycle_projection() || event.is_javascript_dialog_opening_projection()
+        {
+            return;
+        }
         let event = match event.into_command_response_payload() {
             Ok((command_id, _, response)) => {
                 self.sources.push(BidiDevToolsEventSource::CommandResponse {
@@ -1610,8 +1780,10 @@ impl BidiDevToolsEventSources {
             }
             Err(event) => event,
         };
+        let has_protocol_message = event.protocol_method().is_some();
         let (message, automation_event) = event.into_parts();
         match automation_event {
+            Some(event) if !has_protocol_message => self.push_automation_event(event),
             Some(event) => self.sources.push(
                 BidiDevToolsEventSource::ProtocolMessageWithAutomationEvent {
                     message,
@@ -1628,27 +1800,6 @@ impl BidiDevToolsEventSources {
         self.sources.append(&mut other.sources);
     }
 
-    fn push_initial_load_events_for_script_created_targets(&mut self) {
-        let load_events = self
-            .sources
-            .iter()
-            .filter_map(|source| match source {
-                BidiDevToolsEventSource::ProtocolMessage(message) => {
-                    initial_load_events_for_target_created_message(message)
-                }
-                BidiDevToolsEventSource::ProtocolMessageWithAutomationEvent { message, .. } => {
-                    initial_load_events_for_target_created_message(message)
-                }
-                BidiDevToolsEventSource::CommandResponse { .. } => None,
-                BidiDevToolsEventSource::AutomationEvent(_) => None,
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        for event in load_events {
-            self.push_automation_event(event);
-        }
-    }
-
     fn into_sources(self) -> Vec<BidiDevToolsEventSource> {
         self.sources
     }
@@ -1658,7 +1809,7 @@ fn pending_navigation_response_for_dispatch(
     dispatch: &BidiDevToolsCommandDispatch,
     channel: Option<&str>,
 ) -> Option<BidiPendingNavigationResponse> {
-    let DevToolsCommand::Navigate(command) = &dispatch.command else {
+    let AutomationCommand::Navigate(command) = &dispatch.command else {
         return None;
     };
     if command.wait == DevToolsNavigationWait::None {
@@ -1672,7 +1823,7 @@ fn pending_navigation_response_for_dispatch(
     })
 }
 
-fn bidi_response_is_missing_devtools_command_result(response: &serde_json::Value) -> bool {
+fn bidi_response_is_missing_automation_command_result(response: &serde_json::Value) -> bool {
     response["type"] == json!("error")
         && response["message"].as_str() == Some("MissingDevToolsCommandResult")
 }
@@ -1699,37 +1850,46 @@ fn sources_include_auth_required_pause(sources: &[BidiDevToolsEventSource]) -> b
 }
 
 fn take_pending_navigation_response_from_sources(
-    pending: &mut Option<BidiPendingNavigationResponse>,
+    pending: &mut Vec<BidiPendingNavigationResponse>,
     sources: &[BidiDevToolsEventSource],
-) -> Option<serde_json::Value> {
-    let pending_response = pending.as_ref()?;
-    let response = sources
-        .iter()
-        .find_map(|source| match source {
-            BidiDevToolsEventSource::CommandResponse {
-                command_id,
-                response,
-            } => pending_navigation_response_from_command_response(
-                pending_response,
-                *command_id,
-                response,
-            ),
-            BidiDevToolsEventSource::ProtocolMessage(_)
-            | BidiDevToolsEventSource::ProtocolMessageWithAutomationEvent { .. }
-            | BidiDevToolsEventSource::AutomationEvent(_) => None,
-        })
-        .or_else(|| {
-            sources.iter().find_map(|source| match source {
-                BidiDevToolsEventSource::ProtocolMessage(message)
-                | BidiDevToolsEventSource::ProtocolMessageWithAutomationEvent { message, .. } => {
-                    pending_navigation_response_from_protocol_message(pending_response, message)
-                }
-                BidiDevToolsEventSource::CommandResponse { .. }
+) -> Vec<serde_json::Value> {
+    let mut responses = Vec::new();
+    pending.retain(|pending_response| {
+        let response = sources
+            .iter()
+            .find_map(|source| match source {
+                BidiDevToolsEventSource::CommandResponse {
+                    command_id,
+                    response,
+                } => pending_navigation_response_from_command_response(
+                    pending_response,
+                    *command_id,
+                    response,
+                ),
+                BidiDevToolsEventSource::ProtocolMessage(_)
+                | BidiDevToolsEventSource::ProtocolMessageWithAutomationEvent { .. }
                 | BidiDevToolsEventSource::AutomationEvent(_) => None,
             })
-        })?;
-    *pending = None;
-    Some(response)
+            .or_else(|| {
+                sources.iter().find_map(|source| match source {
+                    BidiDevToolsEventSource::ProtocolMessage(message)
+                    | BidiDevToolsEventSource::ProtocolMessageWithAutomationEvent {
+                        message, ..
+                    } => {
+                        pending_navigation_response_from_protocol_message(pending_response, message)
+                    }
+                    BidiDevToolsEventSource::CommandResponse { .. }
+                    | BidiDevToolsEventSource::AutomationEvent(_) => None,
+                })
+            });
+        if let Some(response) = response {
+            responses.push(response);
+            false
+        } else {
+            true
+        }
+    });
+    responses
 }
 
 fn pending_navigation_response_from_command_response(
@@ -1811,47 +1971,6 @@ fn bidi_navigation_value_from_command_result(result: &serde_json::Value) -> serd
         .map(webdriver_bidi_navigation_id_from_loader_id)
         .map(|navigation_id| json!(navigation_id.into_string()))
         .unwrap_or(serde_json::Value::Null)
-}
-
-fn initial_load_events_for_target_created_message(
-    message: &serde_json::Value,
-) -> Option<Vec<AutomationEvent>> {
-    if message.get("method").and_then(serde_json::Value::as_str) != Some("Target.targetCreated") {
-        return None;
-    }
-    let target_info = &message["params"]["targetInfo"];
-    if target_info.get("type").and_then(serde_json::Value::as_str) != Some("page") {
-        return None;
-    }
-    let target_id = target_info.get("targetId")?.as_str()?;
-    let url = target_info
-        .get("url")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let target_id = DevToolsTargetId::from(target_id);
-    let frame_id = DevToolsFrameId::from(target_id.as_str());
-    Some(vec![
-        AutomationEvent::NavigationFrame(NavigationFrameEvent {
-            target_id: target_id.clone(),
-            frame_id: frame_id.clone(),
-            parent_frame_id: None,
-            loader_id: None,
-            url: url.clone(),
-            kind: NavigationFrameEventKind::Navigated,
-            frame_name: None,
-            security_origin: None,
-            secure_context_type: None,
-        }),
-        AutomationEvent::Load(NavigationLifecycleEvent {
-            target_id,
-            frame_id,
-            navigation_id: None,
-            loader_id: None,
-            url,
-            timestamp: 0.0,
-        }),
-    ])
 }
 
 fn subscribed_bidi_events_from_devtools_event_sources(
@@ -1980,7 +2099,9 @@ async fn enable_bidi_network_protocol_sources(
 
 async fn replay_existing_bidi_realm_created_events(
     scheduler: &mut CdpScheduler,
-    bidi: &BidiConnectionState,
+    receivers: &mut CdpSchedulerEventReceivers,
+    event_sources: &mut BidiDevToolsEventSources,
+    bidi: &mut BidiConnectionState,
     previous_contexts: Option<Vec<String>>,
 ) -> Vec<serde_json::Value> {
     let Some(contexts) = replay_contexts_for_new_subscription(
@@ -1994,14 +2115,21 @@ async fn replay_existing_bidi_realm_created_events(
     };
     let mut events = Vec::new();
     if contexts.is_empty() {
-        let events =
-            replay_existing_bidi_realm_created_events_for_context(scheduler, session_id, None)
-                .await;
+        let events = replay_existing_bidi_realm_created_events_for_context(
+            scheduler,
+            receivers,
+            event_sources,
+            session_id,
+            None,
+        )
+        .await;
         return bidi.subscribed_bidi_events_from_bidi_events_with_context(&events, None);
     } else {
         for context_id in contexts {
             let replayed = replay_existing_bidi_realm_created_events_for_context(
                 scheduler,
+                receivers,
+                event_sources,
                 session_id,
                 Some(context_id.clone()),
             )
@@ -2039,12 +2167,14 @@ fn replay_contexts_for_new_subscription(
 
 async fn replay_existing_bidi_realm_created_events_for_context(
     scheduler: &mut CdpScheduler,
+    receivers: &mut CdpSchedulerEventReceivers,
+    event_sources: &mut BidiDevToolsEventSources,
     session_id: &str,
     context_id: Option<String>,
 ) -> Vec<serde_json::Value> {
-    let command = DevToolsCommand::GetRealms(DevToolsGetRealmsCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
+    let command = AutomationCommand::GetRealms(DevToolsGetRealmsCommand {
+        context: AutomationContext {
+            protocol: FrontendProtocol::WebDriverBidi,
             session_id: Some(DevToolsSessionId::from(session_id)),
             target_id: context_id.as_deref().map(DevToolsTargetId::from),
             browser_context_id: None,
@@ -2052,9 +2182,10 @@ async fn replay_existing_bidi_realm_created_events_for_context(
         realm_type: None,
     });
     let execution = scheduler
-        .execute_devtools_command_with_protocol_messages(command)
+        .execute_automation_command_with_protocol_messages(receivers, command)
         .await;
-    let Ok(DevToolsCommandResult::Realms(result)) = execution.result else {
+    event_sources.extend_protocol_output(execution.protocol_output);
+    let Ok(AutomationResult::Realms(result)) = execution.result else {
         return Vec::new();
     };
     result
@@ -2064,156 +2195,107 @@ async fn replay_existing_bidi_realm_created_events_for_context(
         .collect()
 }
 
-async fn start_bidi_devtools_command(
+async fn start_bidi_automation_command(
     scheduler: &mut CdpScheduler,
     receivers: &mut CdpSchedulerEventReceivers,
-    runtime_response_ready_tx: &mpsc::UnboundedSender<RuntimeInspectorResponseReady>,
+    runtime_response_ready_tx: &mpsc::UnboundedSender<AutomationWorkflowReady>,
     bidi: &BidiConnectionState,
     mut dispatch: BidiDevToolsCommandDispatch,
     background_command_id: Option<u64>,
-    observe_context_created: bool,
-    observe_browsing_context_load: bool,
 ) -> BidiDevToolsCommandStart {
     dispatch
         .command
         .set_webdriver_bidi_file_prompt_handler_for_script_command(
             bidi.file_prompt_handler_for_script_commands(),
         );
-    let event_context = bidi_event_context_from_devtools_command(&dispatch.command);
-    let close_target_id = match &dispatch.command {
-        DevToolsCommand::CloseTarget(command) => Some(command.target_id.as_str().to_owned()),
-        _ => None,
+    let event_context = bidi_event_context_from_automation_command(&dispatch.command);
+    // Consume ready facts here; Document readiness belongs to the pending
+    // command and must not hold the socket's command-admission turn.
+    let admission = drain_ready_bidi_background_navigation(scheduler, receivers).await;
+    let mut event_sources = match admission {
+        Ok(event_sources) => event_sources,
+        Err(failure) => {
+            let (event_sources, error) = failure.into_parts();
+            return BidiDevToolsCommandStart::Complete(BidiDevToolsCommandOutput {
+                response: bidi_response_from_devtools_error(dispatch.id, error),
+                event_sources: event_sources.into_sources(),
+                post_response_event_sources: Vec::new(),
+                event_context,
+            });
+        }
     };
-    let script_may_create_targets = matches!(
+    event_sources
+        .extend_protocol_output(scheduler.complete_ready_protocol_residences_after_command());
+    if let Some(error) = validate_bidi_top_level_context_command(
+        scheduler,
+        &mut event_sources,
+        &dispatch.session_id,
         &dispatch.command,
-        DevToolsCommand::EvaluateScript(_) | DevToolsCommand::CallFunction(_)
-    );
-    let mut event_sources =
-        match drain_bidi_background_navigation_before_command(scheduler, receivers).await {
-            Ok(event_sources) => event_sources,
-            Err(failure) => {
-                let (event_sources, error) = failure.into_parts();
-                return BidiDevToolsCommandStart::Complete(BidiDevToolsCommandOutput {
-                    response: bidi_response_from_devtools_error(dispatch.id, error),
-                    event_sources: event_sources.into_sources(),
-                    post_response_event_sources: Vec::new(),
-                    post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-                    event_context,
-                });
-            }
-        };
-    event_sources.extend_protocol_output(
-        scheduler
-            .complete_ready_protocol_residences_after_command()
-            .await,
-    );
-    let close_target_event = if let Some(target_id) = close_target_id.as_deref() {
-        bidi_target_lifecycle_event_for_target(scheduler, &dispatch.session_id, target_id).await
-    } else {
-        None
-    };
-    if let Some(error) =
-        validate_bidi_top_level_context_command(scheduler, &dispatch.session_id, &dispatch.command)
-            .await
-    {
+    ) {
         return BidiDevToolsCommandStart::Complete(BidiDevToolsCommandOutput {
             response: bidi_response_from_devtools_error(dispatch.id, error),
             event_sources: event_sources.into_sources(),
             post_response_event_sources: Vec::new(),
-            post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
             event_context,
         });
     }
-    let previous_target_discovery = ((observe_context_created || observe_browsing_context_load)
-        && script_may_create_targets)
-        .then(|| scheduler.replace_target_discovery_enabled(true));
-    let create_target_browser_context_id = match &dispatch.command {
-        DevToolsCommand::CreateTarget(command) => command.browser_context_id.clone(),
-        _ => None,
-    };
     let completion = BidiDevToolsCommandCompletion {
         id: dispatch.id,
-        session_id: dispatch.session_id.clone(),
+        command_context: dispatch.command.context().clone(),
+        navigation_wait: crate::cdp_scheduler::devtools_navigation_wait(&dispatch.command),
         event_sources,
         event_context,
-        close_target_event,
-        create_target_browser_context_id,
-        observe_browsing_context_load,
-        script_may_create_targets,
-        previous_target_discovery,
     };
-    if bidi_devtools_command_uses_deferred_runtime_progress(&dispatch.command) {
-        return match scheduler
-            .start_devtools_runtime_command_with_deferred_reply_progress(
-                receivers,
-                runtime_response_ready_tx,
-                dispatch.command,
-            )
-            .await
-        {
-            DevToolsRuntimeCommandProgress::Complete(execution) => {
-                BidiDevToolsCommandStart::Complete(
-                    complete_bidi_devtools_command_execution(
-                        scheduler, receivers, completion, *execution,
-                    )
-                    .await,
-                )
-            }
-            DevToolsRuntimeCommandProgress::PendingDeferredReply {
-                pending,
-                protocol_output,
-            } => {
-                let mut completion = completion;
-                completion
-                    .event_sources
-                    .extend_protocol_output(protocol_output);
-                BidiDevToolsCommandStart::PendingRuntime(Box::new(BidiPendingRuntimeCommand {
-                    command_method: None,
-                    command_params: None,
-                    command_channel: None,
-                    pending_navigation_candidate: None,
-                    pending: Some(pending),
-                    completion,
-                }))
-            }
-        };
-    }
-    let execution = scheduler
-        .execute_devtools_command_with_external_load_wait_and_protocol_messages_background_command_id(
+    let (stage, protocol_output) = match scheduler
+        .start_owned_automation_command_progress(
             receivers,
+            runtime_response_ready_tx,
             dispatch.command,
             background_command_id,
         )
-        .await;
-    BidiDevToolsCommandStart::Complete(
-        complete_bidi_devtools_command_execution(scheduler, receivers, completion, execution).await,
-    )
+        .await
+    {
+        Ok(AutomationCommandProgress::Complete(execution)) => (
+            BidiPendingCommandStage::NativeComplete(execution),
+            ProtocolOutputSequence::empty(),
+        ),
+        Ok(AutomationCommandProgress::Pending {
+            pending,
+            protocol_output,
+        }) => (BidiPendingCommandStage::Executing(pending), protocol_output),
+        Err(admission) => (
+            BidiPendingCommandStage::WaitingForDocument(admission),
+            ProtocolOutputSequence::empty(),
+        ),
+    };
+    let mut completion = completion;
+    completion
+        .event_sources
+        .extend_protocol_output(protocol_output);
+    BidiDevToolsCommandStart::Pending(Box::new(BidiPendingCommand {
+        command_method: None,
+        command_params: None,
+        command_channel: None,
+        pending_navigation_candidate: None,
+        stage: Some(stage),
+        completion,
+        input: None,
+    }))
 }
 
-async fn complete_bidi_devtools_command_execution(
+async fn complete_bidi_automation_command_execution(
     scheduler: &mut CdpScheduler,
     receivers: &mut CdpSchedulerEventReceivers,
-    completion: BidiDevToolsCommandCompletion,
-    execution: crate::cdp_scheduler::DevToolsCommandExecution,
+    completion: &mut BidiDevToolsCommandCompletion,
+    execution: crate::cdp_scheduler::AutomationExecution,
 ) -> BidiDevToolsCommandOutput {
-    let BidiDevToolsCommandCompletion {
-        id,
-        session_id,
-        mut event_sources,
-        event_context,
-        close_target_event,
-        create_target_browser_context_id,
-        observe_browsing_context_load,
-        script_may_create_targets,
-        previous_target_discovery,
-    } = completion;
+    let id = completion.id;
+    let mut event_sources = std::mem::take(&mut completion.event_sources);
+    let event_context = completion.event_context.clone();
     event_sources.extend_protocol_output(execution.protocol_output);
     match drain_ready_bidi_background_navigation(scheduler, receivers).await {
         Ok(sources) => event_sources.append(sources),
         Err(failure) => {
-            if let Some(previous_target_discovery) = previous_target_discovery {
-                scheduler.replace_target_discovery_enabled(previous_target_discovery);
-            }
             return bidi_command_output_from_renderer_transport_failure(
                 id,
                 event_context,
@@ -2222,48 +2304,14 @@ async fn complete_bidi_devtools_command_execution(
             );
         }
     }
-    let created_target_id = match &execution.result {
-        Ok(DevToolsCommandResult::CreateTarget(result)) => {
-            Some(result.target_id.as_str().to_owned())
-        }
-        _ => None,
-    };
-    let close_succeeded = matches!(&execution.result, Ok(DevToolsCommandResult::CloseTarget(_)));
-    if let Some(target_id) = created_target_id.as_deref() {
-        let mut event =
-            match bidi_target_lifecycle_event_for_target(scheduler, &session_id, target_id).await {
-                Some(event) => event,
-                None => TargetLifecycleEvent {
-                    target_id: DevToolsTargetId::from(target_id),
-                    browser_context_id: create_target_browser_context_id.clone(),
-                    kind: DevToolsTargetKind::Page,
-                    url: "about:blank".to_owned(),
-                    target_info: None,
-                },
-            };
-        if let Some(browser_context_id) = create_target_browser_context_id {
-            event.browser_context_id = Some(browser_context_id);
-            event.target_info = None;
-        }
-        event_sources.push_automation_event(AutomationEvent::TargetCreated(event));
-    }
-    if close_succeeded && let Some(event) = close_target_event {
-        event_sources.push_automation_event(AutomationEvent::TargetDestroyed(event));
-    }
-    if observe_browsing_context_load && script_may_create_targets {
-        event_sources.push_initial_load_events_for_script_created_targets();
-    }
     let response = match execution.result {
         Ok(result) => bidi_response_from_devtools_result(id, result),
         Err(error) => bidi_response_from_devtools_error(id, error),
     };
-    let mut post_response_event_sources =
+    let post_response_event_sources =
         match complete_bidi_post_response_protocol_residences(scheduler, receivers).await {
             Ok(sources) => sources,
             Err(failure) => {
-                if let Some(previous_target_discovery) = previous_target_discovery {
-                    scheduler.replace_target_discovery_enabled(previous_target_discovery);
-                }
                 return bidi_command_output_from_renderer_transport_failure(
                     id,
                     event_context,
@@ -2272,319 +2320,11 @@ async fn complete_bidi_devtools_command_execution(
                 );
             }
         };
-    if observe_browsing_context_load && script_may_create_targets {
-        post_response_event_sources.push_initial_load_events_for_script_created_targets();
-    }
-    if let Some(previous_target_discovery) = previous_target_discovery {
-        scheduler.replace_target_discovery_enabled(previous_target_discovery);
-    }
-    let post_response_background_navigation_drain = if observe_browsing_context_load
-        && script_may_create_targets
-        && scheduler.has_inflight_background_navigation()
-    {
-        BidiBackgroundNavigationDrain::ScriptCreatedTargetLoadSubscription
-    } else {
-        BidiBackgroundNavigationDrain::None
-    };
     BidiDevToolsCommandOutput {
         response,
         event_sources: event_sources.into_sources(),
         post_response_event_sources: post_response_event_sources.into_sources(),
-        post_response_background_navigation_drain,
         event_context,
-    }
-}
-
-fn bidi_devtools_command_uses_deferred_runtime_progress(command: &DevToolsCommand) -> bool {
-    matches!(
-        command,
-        DevToolsCommand::GetRealms(_)
-            | DevToolsCommand::EvaluateScript(_)
-            | DevToolsCommand::CallFunction(_)
-            | DevToolsCommand::LocateNodes(_)
-            | DevToolsCommand::ReleaseObjects(_)
-    )
-}
-
-async fn execute_bidi_input_command(
-    scheduler: &mut CdpScheduler,
-    receivers: &mut CdpSchedulerEventReceivers,
-    action_states: &mut BTreeMap<String, ClassicActionState>,
-    dispatch: BidiInputCommandDispatch,
-) -> BidiDevToolsCommandOutput {
-    let mut event_sources =
-        match drain_bidi_background_navigation_before_command(scheduler, receivers).await {
-            Ok(event_sources) => event_sources,
-            Err(failure) => {
-                let (event_sources, error) = failure.into_parts();
-                return BidiDevToolsCommandOutput {
-                    response: bidi_response_from_devtools_error(dispatch.id, error),
-                    event_sources: event_sources.into_sources(),
-                    post_response_event_sources: Vec::new(),
-                    post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-                    event_context: Some(dispatch.context),
-                };
-            }
-        };
-    event_sources.extend_protocol_output(
-        scheduler
-            .complete_ready_protocol_residences_after_command()
-            .await,
-    );
-    if !bidi_context_exists(scheduler, &dispatch.session_id, &dispatch.context).await {
-        return BidiDevToolsCommandOutput {
-            response: bidi_response_from_devtools_error(
-                dispatch.id,
-                DevToolsError::new(DevToolsErrorKind::NoSuchTarget, "NoSuchTarget"),
-            ),
-            event_sources: event_sources.into_sources(),
-            post_response_event_sources: Vec::new(),
-            post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-            event_context: Some(dispatch.context),
-        };
-    }
-
-    let context = ClassicDevToolsCommandContext::with_protocol_and_target_id(
-        DevToolsProtocol::WebDriverBidi,
-        &dispatch.session_id,
-        &dispatch.context,
-    );
-    let command = dispatch.command.clone();
-    if let BidiInputCommand::SetFiles { params } = command {
-        return execute_bidi_set_files_command(
-            scheduler,
-            receivers,
-            dispatch,
-            params,
-            event_sources,
-        )
-        .await;
-    }
-    let viewport_bounds = match bidi_input_viewport_bounds(
-        scheduler,
-        &dispatch.session_id,
-        &dispatch.context,
-    )
-    .await
-    {
-        Ok(viewport_bounds) => viewport_bounds,
-        Err(error) => {
-            return BidiDevToolsCommandOutput {
-                response: bidi_response_from_devtools_error(dispatch.id, error),
-                event_sources: event_sources.into_sources(),
-                post_response_event_sources: Vec::new(),
-                post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-                event_context: Some(dispatch.context),
-            };
-        }
-    };
-    let ticks = match command {
-        BidiInputCommand::PerformActions { params } => {
-            let (params, element_origins) = match bidi_input_classic_params_and_element_origins(
-                scheduler,
-                receivers,
-                &dispatch.session_id,
-                &dispatch.context,
-                params,
-                &mut event_sources,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(BidiInputPreparationError::Classic(error)) => {
-                    return BidiDevToolsCommandOutput {
-                        response: bidi_response_from_classic_input_error(dispatch.id, error),
-                        event_sources: event_sources.into_sources(),
-                        post_response_event_sources: Vec::new(),
-                        post_response_background_navigation_drain:
-                            BidiBackgroundNavigationDrain::None,
-                        event_context: Some(dispatch.context),
-                    };
-                }
-                Err(BidiInputPreparationError::DevTools(error)) => {
-                    return BidiDevToolsCommandOutput {
-                        response: bidi_response_from_devtools_error(dispatch.id, error),
-                        event_sources: event_sources.into_sources(),
-                        post_response_event_sources: Vec::new(),
-                        post_response_background_navigation_drain:
-                            BidiBackgroundNavigationDrain::None,
-                        event_context: Some(dispatch.context),
-                    };
-                }
-            };
-            let action_state = action_states.entry(dispatch.context.clone()).or_default();
-            perform_actions_ticks_with_state_and_viewport(
-                &context,
-                &params,
-                &element_origins,
-                Some(viewport_bounds),
-                action_state,
-            )
-        }
-        BidiInputCommand::ReleaseActions => {
-            let action_state = action_states.entry(dispatch.context.clone()).or_default();
-            Ok(vec![moli_protocol_webdriver_classic::ClassicActionTick {
-                commands: release_actions_commands(&context, action_state),
-                duration_ms: 0,
-            }])
-        }
-        BidiInputCommand::SetFiles { .. } => unreachable!("input.setFiles returns before actions"),
-    };
-    let ticks = match ticks {
-        Ok(ticks) => ticks,
-        Err(error) => {
-            return BidiDevToolsCommandOutput {
-                response: bidi_response_from_classic_input_error(dispatch.id, error),
-                event_sources: event_sources.into_sources(),
-                post_response_event_sources: Vec::new(),
-                post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-                event_context: Some(dispatch.context),
-            };
-        }
-    };
-
-    for tick in ticks {
-        for command in tick.commands {
-            let execution = scheduler
-                .execute_devtools_command_with_external_load_wait_and_protocol_messages(
-                    receivers, command,
-                )
-                .await;
-            event_sources.extend_protocol_output(execution.protocol_output);
-            match execution.result {
-                Ok(DevToolsCommandResult::Empty) => {}
-                Ok(_) => {
-                    return BidiDevToolsCommandOutput {
-                        response: bidi_response_from_devtools_error(
-                            dispatch.id,
-                            DevToolsError::new(
-                                DevToolsErrorKind::Internal,
-                                "input action returned an unexpected result",
-                            ),
-                        ),
-                        event_sources: event_sources.into_sources(),
-                        post_response_event_sources: Vec::new(),
-                        post_response_background_navigation_drain:
-                            BidiBackgroundNavigationDrain::None,
-                        event_context: Some(dispatch.context),
-                    };
-                }
-                Err(error) => {
-                    return BidiDevToolsCommandOutput {
-                        response: bidi_response_from_devtools_error(dispatch.id, error),
-                        event_sources: event_sources.into_sources(),
-                        post_response_event_sources: Vec::new(),
-                        post_response_background_navigation_drain:
-                            BidiBackgroundNavigationDrain::None,
-                        event_context: Some(dispatch.context),
-                    };
-                }
-            }
-        }
-        if tick.duration_ms > 0 {
-            sleep(Duration::from_millis(tick.duration_ms)).await;
-        }
-    }
-    let post_response_event_sources =
-        match complete_bidi_post_response_protocol_residences(scheduler, receivers).await {
-            Ok(sources) => sources,
-            Err(failure) => {
-                return bidi_command_output_from_renderer_transport_failure(
-                    dispatch.id,
-                    Some(dispatch.context),
-                    event_sources,
-                    failure,
-                );
-            }
-        };
-    BidiDevToolsCommandOutput {
-        response: success_response(dispatch.id, json!({})),
-        event_sources: event_sources.into_sources(),
-        post_response_event_sources: post_response_event_sources.into_sources(),
-        post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-        event_context: Some(dispatch.context),
-    }
-}
-
-async fn execute_bidi_set_files_command(
-    scheduler: &mut CdpScheduler,
-    receivers: &mut CdpSchedulerEventReceivers,
-    dispatch: BidiInputCommandDispatch,
-    params: Value,
-    mut event_sources: BidiDevToolsEventSources,
-) -> BidiDevToolsCommandOutput {
-    let (shared_id, file_paths) = match parse_bidi_set_files_params(&params) {
-        Ok(parsed) => parsed,
-        Err(message) => {
-            return BidiDevToolsCommandOutput {
-                response: error_response(
-                    Some(dispatch.id),
-                    BidiErrorCode::InvalidArgument,
-                    &message,
-                ),
-                event_sources: event_sources.into_sources(),
-                post_response_event_sources: Vec::new(),
-                post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-                event_context: Some(dispatch.context),
-            };
-        }
-    };
-    let files = match selected_files_from_paths(&file_paths, "input.setFiles") {
-        Ok(files) => files,
-        Err(error) => {
-            return BidiDevToolsCommandOutput {
-                response: bidi_response_from_devtools_error(dispatch.id, error),
-                event_sources: event_sources.into_sources(),
-                post_response_event_sources: Vec::new(),
-                post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-                event_context: Some(dispatch.context),
-            };
-        }
-    };
-    let command = DevToolsCommand::SetFileInputFiles(DevToolsSetFileInputFilesCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
-            session_id: Some(DevToolsSessionId::from(dispatch.session_id.as_str())),
-            target_id: Some(DevToolsTargetId::from(dispatch.context.as_str())),
-            browser_context_id: None,
-        },
-        object_id: DevToolsRemoteHandleId::from(shared_id.as_str()),
-        files,
-        append: false,
-    });
-    let execution = scheduler
-        .execute_devtools_command_with_external_load_wait_and_protocol_messages(receivers, command)
-        .await;
-    event_sources.extend_protocol_output(execution.protocol_output);
-    let response = match execution.result {
-        Ok(DevToolsCommandResult::Empty) => success_response(dispatch.id, json!({})),
-        Ok(_) => bidi_response_from_devtools_error(
-            dispatch.id,
-            DevToolsError::new(
-                DevToolsErrorKind::Internal,
-                "input.setFiles returned an unexpected result",
-            ),
-        ),
-        Err(error) => bidi_response_from_devtools_error(dispatch.id, error),
-    };
-    let post_response_event_sources =
-        match complete_bidi_post_response_protocol_residences(scheduler, receivers).await {
-            Ok(sources) => sources,
-            Err(failure) => {
-                return bidi_command_output_from_renderer_transport_failure(
-                    dispatch.id,
-                    Some(dispatch.context),
-                    event_sources,
-                    failure,
-                );
-            }
-        };
-    BidiDevToolsCommandOutput {
-        response,
-        event_sources: event_sources.into_sources(),
-        post_response_event_sources: post_response_event_sources.into_sources(),
-        post_response_background_navigation_drain: BidiBackgroundNavigationDrain::None,
-        event_context: Some(dispatch.context),
     }
 }
 
@@ -2617,32 +2357,6 @@ fn parse_bidi_set_files_params(params: &Value) -> Result<(String, Vec<String>), 
 enum BidiInputPreparationError {
     Classic(ClassicError),
     DevTools(DevToolsError),
-}
-
-async fn bidi_input_classic_params_and_element_origins(
-    scheduler: &mut CdpScheduler,
-    receivers: &mut CdpSchedulerEventReceivers,
-    session_id: &str,
-    context_id: &str,
-    params: Value,
-    event_sources: &mut BidiDevToolsEventSources,
-) -> Result<(Value, ClassicElementOriginViewportPoints), BidiInputPreparationError> {
-    let mut params = params;
-    let shared_origins = rewrite_bidi_element_origins_for_classic_actions(&mut params)?;
-    let mut element_origins = ClassicElementOriginViewportPoints::new();
-    for (shared_id, classic_id) in shared_origins {
-        let point = bidi_input_element_origin_viewport_point(
-            scheduler,
-            receivers,
-            session_id,
-            context_id,
-            &shared_id,
-            event_sources,
-        )
-        .await?;
-        element_origins.insert(classic_id, point);
-    }
-    Ok((params, element_origins))
 }
 
 fn rewrite_bidi_element_origins_for_classic_actions(
@@ -2680,7 +2394,19 @@ fn rewrite_bidi_element_origins_for_classic_actions(
             let Some(origin) = action.get_mut("origin").and_then(Value::as_object_mut) else {
                 continue;
             };
-            let Some(shared_id) = origin.get("sharedId") else {
+            if origin.contains_key("element")
+                && origin.get("type").and_then(Value::as_str) != Some("element")
+            {
+                return Err(BidiInputPreparationError::Classic(ClassicError::new(
+                    ClassicErrorCode::InvalidArgument,
+                    "BiDi input element origin type must be element",
+                )));
+            }
+            let element = origin
+                .get("element")
+                .and_then(Value::as_object)
+                .unwrap_or(origin);
+            let Some(shared_id) = element.get("sharedId") else {
                 continue;
             };
             let Some(shared_id) = shared_id.as_str() else {
@@ -2701,80 +2427,26 @@ fn rewrite_bidi_element_origins_for_classic_actions(
     Ok(shared_origins)
 }
 
-async fn bidi_input_element_origin_viewport_point(
+fn bidi_resolve_subscribe_context(
     scheduler: &mut CdpScheduler,
-    receivers: &mut CdpSchedulerEventReceivers,
-    session_id: &str,
-    context_id: &str,
-    shared_id: &str,
     event_sources: &mut BidiDevToolsEventSources,
-) -> Result<moli_protocol_webdriver_classic::ClassicViewportPoint, BidiInputPreparationError> {
-    let command = DevToolsCommand::DomObjectReference(DevToolsDomObjectReferenceCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
-            session_id: Some(DevToolsSessionId::from(session_id)),
-            target_id: Some(DevToolsTargetId::from(context_id)),
-            browser_context_id: None,
-        },
-        object_id: DevToolsRemoteHandleId::from(shared_id),
-        operation: DevToolsDomObjectReferenceOperation::GetBoxModel,
-    });
-    let execution = scheduler
-        .execute_devtools_command_with_external_load_wait_and_protocol_messages(receivers, command)
-        .await;
-    event_sources.extend_protocol_output(execution.protocol_output);
-    match execution.result {
-        Ok(DevToolsCommandResult::DomGeometry(geometry)) => {
-            element_center_from_geometry(&geometry).map_err(BidiInputPreparationError::Classic)
-        }
-        Ok(_) => Err(BidiInputPreparationError::DevTools(DevToolsError::new(
-            DevToolsErrorKind::Internal,
-            "input element origin geometry returned an unexpected result",
-        ))),
-        Err(error) => Err(BidiInputPreparationError::DevTools(error)),
-    }
-}
-
-async fn bidi_resolve_subscribe_context(
-    scheduler: &mut CdpScheduler,
     session_id: &str,
     context_id: &str,
 ) -> Option<BidiValidatedSubscribeContext> {
-    if let Some(info) = bidi_target_info_for_target(scheduler, session_id, context_id).await {
-        let user_context = info
-            .browser_context_id
-            .as_ref()
-            .map(|browser_context_id| browser_context_id.as_str().to_owned());
+    if let Some(owner) = scheduler.browsing_context_owner(context_id) {
         return Some(BidiValidatedSubscribeContext {
-            context: context_id.to_owned(),
-            top_level_context: context_id.to_owned(),
-            user_context,
+            context: owner.id,
+            top_level_context: owner.page,
+            user_context: owner.browser_context_id,
         });
     }
-    let top_level_context =
-        bidi_top_level_context_for_frame_tree_context(scheduler, session_id, context_id).await?;
-    let user_context = bidi_target_info_for_target(scheduler, session_id, &top_level_context)
-        .await
-        .and_then(|info| {
-            info.browser_context_id
-                .as_ref()
-                .map(|browser_context_id| browser_context_id.as_str().to_owned())
-        });
+    // Worker contexts retain their existing Target-based validation.
+    let info = bidi_target_info_for_target(scheduler, event_sources, session_id, context_id)?;
     Some(BidiValidatedSubscribeContext {
         context: context_id.to_owned(),
-        top_level_context,
-        user_context,
+        top_level_context: context_id.to_owned(),
+        user_context: info.browser_context_id.map(|id| id.into_string()),
     })
-}
-
-async fn bidi_context_exists(
-    scheduler: &mut CdpScheduler,
-    session_id: &str,
-    context_id: &str,
-) -> bool {
-    bidi_resolve_subscribe_context(scheduler, session_id, context_id)
-        .await
-        .is_some()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2789,7 +2461,9 @@ impl BidiValidatedSubscribeTargets {
             bidi.record_known_bidi_subscription_context(
                 &context.context,
                 &context.top_level_context,
-                context.user_context.as_deref(),
+                Some(bidi_user_context_from_browser_context_id(
+                    context.user_context.as_deref(),
+                )),
             );
         }
         for user_context in self.user_contexts {
@@ -2810,8 +2484,9 @@ enum BidiSessionSubscribeTargetValidation {
     Error(Value),
 }
 
-async fn validate_bidi_session_subscribe_targets(
+fn validate_bidi_session_subscribe_targets(
     scheduler: &mut CdpScheduler,
+    event_sources: &mut BidiDevToolsEventSources,
     bidi: &BidiConnectionState,
     message: &Value,
 ) -> Option<BidiSessionSubscribeTargetValidation> {
@@ -2823,9 +2498,10 @@ async fn validate_bidi_session_subscribe_targets(
         return None;
     }
     let mut validated = BidiValidatedSubscribeTargets::default();
+    let discover_contexts = contexts.is_empty();
     for context in contexts {
         let Some(resolved_context) =
-            bidi_resolve_subscribe_context(scheduler, session_id, &context).await
+            bidi_resolve_subscribe_context(scheduler, event_sources, session_id, &context)
         else {
             return Some(BidiSessionSubscribeTargetValidation::Error(error_response(
                 id,
@@ -2835,21 +2511,49 @@ async fn validate_bidi_session_subscribe_targets(
         };
         validated.contexts.push(resolved_context);
     }
-    if user_contexts.is_empty() {
-        return Some(BidiSessionSubscribeTargetValidation::Valid(validated));
-    }
-    let existing_user_contexts = bidi_existing_user_context_ids(scheduler, session_id).await;
-    for user_context in user_contexts {
-        if !existing_user_contexts.contains(&user_context) {
-            return Some(BidiSessionSubscribeTargetValidation::Error(error_response(
-                id,
-                BidiErrorCode::NoSuchUserContext,
-                "user context not found",
-            )));
+    if !user_contexts.is_empty() {
+        let existing_user_contexts =
+            bidi_existing_user_context_ids(scheduler, event_sources, session_id);
+        for user_context in user_contexts {
+            if !existing_user_contexts.contains(&user_context) {
+                return Some(BidiSessionSubscribeTargetValidation::Error(error_response(
+                    id,
+                    BidiErrorCode::NoSuchUserContext,
+                    "user context not found",
+                )));
+            }
+            validated.user_contexts.push(user_context);
         }
-        validated.user_contexts.push(user_context);
+    }
+    if discover_contexts {
+        let contexts = bidi_existing_top_level_contexts(scheduler);
+        validated
+            .contexts
+            .extend(contexts.into_iter().filter(|context| {
+                validated.user_contexts.is_empty()
+                    || validated.user_contexts.iter().any(|user_context| {
+                        user_context
+                            == bidi_user_context_from_browser_context_id(
+                                context.user_context.as_deref(),
+                            )
+                    })
+            }));
     }
     Some(BidiSessionSubscribeTargetValidation::Valid(validated))
+}
+
+fn bidi_existing_top_level_contexts(
+    scheduler: &CdpScheduler,
+) -> Vec<BidiValidatedSubscribeContext> {
+    scheduler
+        .frame_index_snapshot()
+        .roots()
+        .map(|record| BidiValidatedSubscribeContext {
+            context: record.id.clone(),
+            top_level_context: record.page.clone(),
+            user_context: record.browser_context_id.clone(),
+        })
+        .collect()
 }
 
 fn bidi_session_subscribe_protocol_shape_is_valid(
@@ -2909,24 +2613,24 @@ fn bidi_optional_non_empty_string_array_for_validation(
     Some(Some(result))
 }
 
-async fn bidi_existing_user_context_ids(
+fn bidi_existing_user_context_ids(
     scheduler: &mut CdpScheduler,
+    event_sources: &mut BidiDevToolsEventSources,
     session_id: &str,
 ) -> BTreeSet<String> {
     let mut user_contexts = BTreeSet::from(["default".to_owned()]);
-    let command = DevToolsCommand::GetBrowserContexts(DevToolsGetBrowserContextsCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
+    let command = AutomationCommand::GetBrowserContexts(DevToolsGetBrowserContextsCommand {
+        context: AutomationContext {
+            protocol: FrontendProtocol::WebDriverBidi,
             session_id: Some(DevToolsSessionId::from(session_id)),
             target_id: None,
             browser_context_id: None,
         },
     });
-    let result = scheduler
-        .execute_devtools_command_with_protocol_messages(command)
-        .await
-        .result;
-    if let Ok(DevToolsCommandResult::GetBrowserContexts(result)) = result {
+    let execution = scheduler.execute_immediate_automation_command(command);
+    event_sources.extend_protocol_output(execution.protocol_output);
+    let result = execution.result;
+    if let Ok(AutomationResult::GetBrowserContexts(result)) = result {
         user_contexts.extend(
             result
                 .browser_context_ids
@@ -2935,36 +2639,6 @@ async fn bidi_existing_user_context_ids(
         );
     }
     user_contexts
-}
-
-async fn bidi_input_viewport_bounds(
-    scheduler: &mut CdpScheduler,
-    session_id: &str,
-    context_id: &str,
-) -> Result<ClassicViewportBounds, DevToolsError> {
-    let command = DevToolsCommand::GetLayoutMetrics(DevToolsGetLayoutMetricsCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
-            session_id: Some(DevToolsSessionId::from(session_id)),
-            target_id: Some(DevToolsTargetId::from(context_id)),
-            browser_context_id: None,
-        },
-    });
-    match scheduler
-        .execute_devtools_command_with_protocol_messages(command)
-        .await
-        .result
-    {
-        Ok(DevToolsCommandResult::LayoutMetrics(result)) => Ok(ClassicViewportBounds::new(
-            result.layout_viewport_width,
-            result.layout_viewport_height,
-        )),
-        Ok(_) => Err(DevToolsError::new(
-            DevToolsErrorKind::Internal,
-            "layout metrics returned an unexpected result",
-        )),
-        Err(error) => Err(error),
-    }
 }
 
 fn bidi_response_from_classic_input_error(id: u64, error: ClassicError) -> serde_json::Value {
@@ -2977,6 +2651,7 @@ fn bidi_response_from_classic_input_error(id: u64, error: ClassicError) -> serde
         ClassicErrorCode::InvalidArgument
         | ClassicErrorCode::MoveTargetOutOfBounds
         | ClassicErrorCode::ElementNotInteractable
+        | ClassicErrorCode::ElementClickIntercepted
         | ClassicErrorCode::InvalidElementState
         | ClassicErrorCode::StaleElementReference
         | ClassicErrorCode::NoSuchFrame
@@ -2996,27 +2671,30 @@ fn bidi_response_from_classic_input_error(id: u64, error: ClassicError) -> serde
     error_response(Some(id), code, &error.message)
 }
 
-async fn validate_bidi_top_level_context_command(
+fn validate_bidi_top_level_context_command(
     scheduler: &mut CdpScheduler,
+    event_sources: &mut BidiDevToolsEventSources,
     session_id: &str,
-    command: &DevToolsCommand,
+    command: &AutomationCommand,
 ) -> Option<DevToolsError> {
     let target_id = match command {
-        DevToolsCommand::CreateTarget(command) => command.context.target_id.as_ref()?,
-        DevToolsCommand::CloseTarget(command) => &command.target_id,
-        DevToolsCommand::ActivateTarget(command) => &command.target_id,
-        DevToolsCommand::TraverseHistory(command) => command.context.target_id.as_ref()?,
+        AutomationCommand::CreateTarget(command) => command.context.target_id.as_ref()?,
+        AutomationCommand::CloseTarget(command) => &command.target_id,
+        AutomationCommand::ActivateTarget(command) => &command.target_id,
+        AutomationCommand::TraverseHistory(command) => command.context.target_id.as_ref()?,
         _ => return None,
     };
-    let target_info = bidi_target_info_for_target(scheduler, session_id, target_id.as_str()).await;
+    let target_info =
+        bidi_target_info_for_target(scheduler, event_sources, session_id, target_id.as_str());
     match target_info {
         Some(info) if matches!(info.kind, DevToolsTargetKind::Frame) => Some(DevToolsError::new(
             DevToolsErrorKind::InvalidArgument,
             "ChildFrameContextNotSupported",
         )),
         Some(_) => None,
-        None if bidi_frame_tree_contains_target(scheduler, session_id, target_id.as_str())
-            .await =>
+        None if scheduler
+            .browsing_context_owner(target_id.as_str())
+            .is_some() =>
         {
             Some(DevToolsError::new(
                 DevToolsErrorKind::InvalidArgument,
@@ -3030,122 +2708,36 @@ async fn validate_bidi_top_level_context_command(
     }
 }
 
-async fn bidi_frame_tree_contains_target(
+fn bidi_target_info_for_target(
     scheduler: &mut CdpScheduler,
-    session_id: &str,
-    target_id: &str,
-) -> bool {
-    bidi_top_level_context_for_frame_tree_context(scheduler, session_id, target_id)
-        .await
-        .is_some()
-}
-
-async fn bidi_top_level_context_for_frame_tree_context(
-    scheduler: &mut CdpScheduler,
-    session_id: &str,
-    target_id: &str,
-) -> Option<String> {
-    let command = DevToolsCommand::GetFrameTrees(DevToolsGetFrameTreesCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
-            session_id: Some(DevToolsSessionId::from(session_id)),
-            target_id: None,
-            browser_context_id: None,
-        },
-        max_depth: None,
-    });
-    let execution = scheduler
-        .execute_devtools_command_with_protocol_messages(command)
-        .await;
-    let Ok(DevToolsCommandResult::GetFrameTrees(result)) = execution.result else {
-        return None;
-    };
-    result
-        .frame_trees
-        .iter()
-        .find_map(|tree| frame_tree_top_level_context_for_target(&tree.frame_tree, target_id))
-}
-
-fn frame_tree_top_level_context_for_target(
-    frame_tree: &serde_json::Value,
-    target_id: &str,
-) -> Option<String> {
-    let top_level_context = frame_tree
-        .get("frame")
-        .and_then(|frame| frame.get("id"))
-        .and_then(serde_json::Value::as_str)?;
-    if top_level_context == target_id {
-        return Some(top_level_context.to_owned());
-    }
-    frame_tree_contains_target(frame_tree, target_id).then(|| top_level_context.to_owned())
-}
-
-fn frame_tree_contains_target(frame_tree: &serde_json::Value, target_id: &str) -> bool {
-    frame_tree
-        .get("frame")
-        .and_then(|frame| frame.get("id"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|id| id == target_id)
-        || frame_tree
-            .get("childFrames")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|child| frame_tree_contains_target(child, target_id))
-}
-
-async fn bidi_target_lifecycle_event_for_target(
-    scheduler: &mut CdpScheduler,
-    session_id: &str,
-    target_id: &str,
-) -> Option<TargetLifecycleEvent> {
-    let result = bidi_target_info_for_target(scheduler, session_id, target_id).await?;
-    target_lifecycle_event_from_target_info(result)
-}
-
-async fn bidi_target_info_for_target(
-    scheduler: &mut CdpScheduler,
+    event_sources: &mut BidiDevToolsEventSources,
     session_id: &str,
     target_id: &str,
 ) -> Option<DevToolsTargetInfo> {
-    let command = DevToolsCommand::GetTargetInfo(DevToolsGetTargetInfoCommand {
-        context: DevToolsCommandContext {
-            protocol: DevToolsProtocol::WebDriverBidi,
+    let command = AutomationCommand::GetTargetInfo(DevToolsGetTargetInfoCommand {
+        context: AutomationContext {
+            protocol: FrontendProtocol::WebDriverBidi,
             session_id: Some(DevToolsSessionId::from(session_id)),
             target_id: Some(DevToolsTargetId::from(target_id)),
             browser_context_id: None,
         },
         target_id: Some(DevToolsTargetId::from(target_id)),
     });
-    let execution = scheduler
-        .execute_devtools_command_with_protocol_messages(command)
-        .await;
-    let Ok(DevToolsCommandResult::GetTargetInfo(result)) = execution.result else {
+    let execution = scheduler.execute_immediate_automation_command(command);
+    event_sources.extend_protocol_output(execution.protocol_output);
+    let Ok(AutomationResult::GetTargetInfo(result)) = execution.result else {
         return None;
     };
     Some(result.target_info)
 }
 
-fn target_lifecycle_event_from_target_info(
-    info: DevToolsTargetInfo,
-) -> Option<TargetLifecycleEvent> {
-    let target_id = info.target_id.clone()?;
-    Some(TargetLifecycleEvent {
-        target_id,
-        browser_context_id: info.browser_context_id.clone(),
-        kind: info.kind,
-        url: info.url.clone(),
-        target_info: Some(info),
-    })
-}
-
-fn bidi_event_context_from_devtools_command(command: &DevToolsCommand) -> Option<String> {
+fn bidi_event_context_from_automation_command(command: &AutomationCommand) -> Option<String> {
     match command {
-        DevToolsCommand::Navigate(command) => command.context.target_id.as_ref(),
-        DevToolsCommand::Reload(command) => command.context.target_id.as_ref(),
-        DevToolsCommand::EvaluateScript(command) => command.context.target_id.as_ref(),
-        DevToolsCommand::CallFunction(command) => command.context.target_id.as_ref(),
-        DevToolsCommand::GetRealms(command) => command.context.target_id.as_ref(),
+        AutomationCommand::Navigate(command) => command.context.target_id.as_ref(),
+        AutomationCommand::Reload(command) => command.context.target_id.as_ref(),
+        AutomationCommand::EvaluateScript(command) => command.context.target_id.as_ref(),
+        AutomationCommand::CallFunction(command) => command.context.target_id.as_ref(),
+        AutomationCommand::GetRealms(command) => command.context.target_id.as_ref(),
         _ => None,
     }
     .map(|target_id| target_id.as_str().to_owned())
@@ -3156,37 +2748,9 @@ async fn complete_bidi_post_response_protocol_residences(
     receivers: &mut CdpSchedulerEventReceivers,
 ) -> Result<BidiDevToolsEventSources, BidiRendererOutputTransportFailure> {
     let mut event_sources = BidiDevToolsEventSources::from_protocol_output(
-        scheduler
-            .complete_ready_protocol_residences_after_command()
-            .await,
+        scheduler.complete_ready_protocol_residences_after_command(),
     );
     event_sources.append(drain_ready_bidi_background_navigation(scheduler, receivers).await?);
-    Ok(event_sources)
-}
-
-async fn drain_bidi_background_navigation_before_command(
-    scheduler: &mut CdpScheduler,
-    receivers: &mut CdpSchedulerEventReceivers,
-) -> Result<BidiDevToolsEventSources, BidiRendererOutputTransportFailure> {
-    let mut event_sources = drain_ready_bidi_background_navigation(scheduler, receivers).await?;
-    while scheduler.has_inflight_background_navigation() {
-        let Some(completion) = receivers.background_navigation_completion_rx.recv().await else {
-            return Ok(event_sources);
-        };
-        match scheduler
-            .drain_background_navigation_completion_with_progress_barrier(completion, receivers)
-            .await
-        {
-            Ok(output) => event_sources.extend_protocol_output(output),
-            Err(failure) => {
-                return Err(BidiRendererOutputTransportFailure::from_renderer(
-                    event_sources,
-                    failure,
-                ));
-            }
-        }
-        event_sources.append(drain_ready_bidi_background_navigation(scheduler, receivers).await?);
-    }
     Ok(event_sources)
 }
 
@@ -3231,10 +2795,172 @@ impl SharedBidiSessionRegistry {
 
 #[cfg(test)]
 mod tests {
-    use moli_protocol::devtools_runtime::RuntimeConsoleEvent;
+    use moli_protocol::automation::{PageJavaScriptDialogOpeningEvent, RuntimeConsoleEvent};
     use serde_json::json;
 
     use super::*;
+
+    fn bidi_with_prompt_subscription() -> (BidiConnectionState, BidiSessionRegistry) {
+        let mut bidi = BidiConnectionState::new();
+        let mut registry = BidiSessionRegistry::new();
+        for (id, method, params) in [
+            (1, "session.new", json!({})),
+            (
+                2,
+                "session.subscribe",
+                json!({"events": ["browsingContext.userPromptOpened"]}),
+            ),
+        ] {
+            let outcome = bidi.handle_message_with_session_registry(
+                json!({"id": id, "method": method, "params": params}),
+                &mut registry,
+            );
+            assert_eq!(outcome.response["type"], "success", "{method}");
+        }
+        (bidi, registry)
+    }
+
+    #[test]
+    fn protocol_output_hook_delivers_one_native_dialog_opening_with_two_cdp_projections() {
+        let (mut bidi, _registry) = bidi_with_prompt_subscription();
+        let opening = PageJavaScriptDialogOpeningEvent {
+            frame_id: Some("TID-prompt".into()),
+            url: "https://example.test/".to_owned(),
+            message: "one physical prompt".to_owned(),
+            dialog_type: "prompt".to_owned(),
+            has_browser_handler: false,
+            default_prompt: "default prompt".to_owned(),
+        };
+        let mut sources = BidiDevToolsEventSources::default();
+        sources.push_automation_event(AutomationEvent::PageJavaScriptDialogOpening(
+            opening.clone(),
+        ));
+        for session in ["SID-first", "SID-peer"] {
+            sources.push_background_event(BackgroundProtocolEvent::page_javascript_dialog_opening(
+                Some(session),
+                opening.clone(),
+            ));
+        }
+        let events = subscribed_bidi_events_from_devtools_event_sources(
+            None,
+            &mut bidi,
+            &sources.into_sources(),
+            None,
+        );
+        assert_eq!(
+            events,
+            vec![json!({
+                "type": "event",
+                "method": "browsingContext.userPromptOpened",
+                "params": {
+                    "context": "TID-prompt", "type": "prompt", "message": "one physical prompt",
+                    "handler": "dismiss", "defaultValue": "default prompt",
+                }
+            })]
+        );
+    }
+
+    #[test]
+    fn protocol_output_hook_preserves_raw_dialog_opening_bridge() {
+        let (mut bidi, _registry) = bidi_with_prompt_subscription();
+        let output = ProtocolOutputSequence::from_background_event(
+            BackgroundProtocolEvent::inspector_message(
+                json!({
+                    "sessionId": "SID-raw",
+                    "method": "Page.javascriptDialogOpening",
+                    "params": {
+                        "frameId": "TID-raw", "type": "alert", "message": "raw CDP input",
+                    }
+                }),
+                None,
+            ),
+        );
+        let mut events = Vec::new();
+        extend_bidi_events_from_protocol_output(None, &mut bidi, &mut events, output, None);
+        assert_eq!(
+            events,
+            vec![json!({
+                "type": "event",
+                "method": "browsingContext.userPromptOpened",
+                "params": {"context": "TID-raw", "type": "alert", "message": "raw CDP input", "handler": "dismiss"}
+            })]
+        );
+    }
+
+    #[test]
+    fn bidi_dialog_handler_follows_successful_session_creation_and_end() {
+        let (mut scheduler, _) = CdpScheduler::new(moli_protocol::CdpConnection::new());
+        let mut bidi = BidiConnectionState::new();
+        let mut registry = BidiSessionRegistry::new();
+        for (id, method, params, expected_available) in [
+            (1, "session.status", json!({}), false),
+            (2, "session.new", json!({"capabilities": false}), false),
+            (3, "session.new", json!({}), true),
+            (4, "session.new", json!({}), true),
+            (5, "session.end", json!({}), false),
+            (6, "session.end", json!({}), false),
+        ] {
+            let outcome = bidi.handle_message_with_session_registry(
+                json!({"id": id, "method": method, "params": params}),
+                &mut registry,
+            );
+            let _ =
+                apply_bidi_dialog_handler_lifecycle(&mut scheduler, &bidi, Some(method), &outcome);
+            assert_eq!(
+                scheduler.has_automation_javascript_dialog_handler(),
+                expected_available,
+                "{method}: {:?}",
+                outcome.response
+            );
+        }
+    }
+
+    #[test]
+    fn bidi_session_end_keeps_an_independent_classic_dialog_handler() {
+        let (mut scheduler, _) = CdpScheduler::new(moli_protocol::CdpConnection::new());
+        assert!(scheduler.register_automation_javascript_dialog_handler(
+            FrontendProtocol::WebDriverClassic,
+            true
+        ));
+        let mut bidi = BidiConnectionState::new();
+        let mut registry = BidiSessionRegistry::new();
+        for (id, method) in [(1, "session.new"), (2, "session.end")] {
+            let outcome = bidi.handle_message_with_session_registry(
+                json!({"id": id, "method": method, "params": {}}),
+                &mut registry,
+            );
+            assert_eq!(outcome.response["type"], "success");
+            let _ =
+                apply_bidi_dialog_handler_lifecycle(&mut scheduler, &bidi, Some(method), &outcome);
+            assert!(scheduler.has_automation_javascript_dialog_handler());
+        }
+        let _ = scheduler
+            .unregister_automation_javascript_dialog_handler(FrontendProtocol::WebDriverClassic);
+        assert!(!scheduler.has_automation_javascript_dialog_handler());
+    }
+
+    #[test]
+    fn webdriver_classic_click_errors_use_existing_bidi_input_error_mapping() {
+        for (classic, expected) in [
+            (
+                ClassicErrorCode::ElementClickIntercepted,
+                "invalid argument",
+            ),
+            (ClassicErrorCode::ElementNotInteractable, "invalid argument"),
+            (ClassicErrorCode::InvalidArgument, "invalid argument"),
+            (ClassicErrorCode::NoSuchElement, "no such node"),
+            (ClassicErrorCode::UnknownError, "unknown error"),
+        ] {
+            let response = bidi_response_from_classic_input_error(
+                42,
+                ClassicError::new(classic, "input diagnostic"),
+            );
+            assert_eq!(response["type"], json!("error"));
+            assert_eq!(response["id"], json!(42));
+            assert_eq!(response["error"], json!(expected));
+            assert_eq!(response["message"], json!("input diagnostic"));
+        }
+    }
 
     #[test]
     fn protocol_output_hook_prefers_automation_sidecar_over_protocol_message_parse() {
@@ -3281,7 +3007,7 @@ mod tests {
             timestamp: Some(1.0),
         });
         let output = ProtocolOutputSequence::from_background_event(
-            BackgroundProtocolEvent::immediate_automation_event(protocol_message, sidecar),
+            BackgroundProtocolEvent::inspector_message(protocol_message, Some(sidecar)),
         );
         let mut events = Vec::new();
 
@@ -3295,12 +3021,12 @@ mod tests {
 
     #[test]
     fn pending_navigation_response_consumes_typed_command_response() {
-        let mut pending = Some(BidiPendingNavigationResponse {
+        let mut pending = vec![BidiPendingNavigationResponse {
             id: 5,
             url: "https://example.test/auth".to_owned(),
             channel: Some("chan".to_owned()),
             background_command_id: 42,
-        });
+        }];
         let sources = vec![
             BidiDevToolsEventSource::ProtocolMessage(json!({
                 "id": 42_u64,
@@ -3319,9 +3045,10 @@ mod tests {
         ];
 
         let response = take_pending_navigation_response_from_sources(&mut pending, &sources)
+            .pop()
             .expect("typed command response should complete pending navigation");
 
-        assert!(pending.is_none());
+        assert!(pending.is_empty());
         assert_eq!(response["type"], json!("success"));
         assert_eq!(response["id"], json!(5_u64));
         assert_eq!(response["goog:channel"], json!("chan"));
@@ -3337,12 +3064,12 @@ mod tests {
 
     #[test]
     fn pending_navigation_response_falls_back_to_raw_protocol_error() {
-        let mut pending = Some(BidiPendingNavigationResponse {
+        let mut pending = vec![BidiPendingNavigationResponse {
             id: 7,
             url: "https://example.test/error".to_owned(),
             channel: Some("chan".to_owned()),
             background_command_id: 42,
-        });
+        }];
         let sources = vec![BidiDevToolsEventSource::ProtocolMessage(json!({
             "id": 42_u64,
             "error": {
@@ -3352,9 +3079,10 @@ mod tests {
         }))];
 
         let response = take_pending_navigation_response_from_sources(&mut pending, &sources)
+            .pop()
             .expect("raw protocol error should complete pending navigation as a fallback");
 
-        assert!(pending.is_none());
+        assert!(pending.is_empty());
         assert_eq!(response["type"], json!("error"));
         assert_eq!(response["id"], json!(7_u64));
         assert_eq!(response["goog:channel"], json!("chan"));
@@ -3362,6 +3090,40 @@ mod tests {
         assert_eq!(
             response["message"],
             json!("navigation failed before typed response")
+        );
+    }
+    #[test]
+    fn pending_navigation_responses_keep_independent_command_owners() {
+        let mut pending = [41, 42, 43]
+            .map(|id| BidiPendingNavigationResponse {
+                id,
+                background_command_id: id + 100,
+                url: format!("https://example.test/{id}"),
+                channel: Some(format!("channel-{id}")),
+            })
+            .to_vec();
+        let sources = [42, 41].map(|id| BidiDevToolsEventSource::CommandResponse {
+            command_id: Some(id + 100),
+            response: BackgroundCommandResponsePayload::Success {
+                result: json!({"navigation":format!("navigation-{id}")}),
+            },
+        });
+        let responses = take_pending_navigation_response_from_sources(&mut pending, &sources);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, 43);
+        for response in responses {
+            let id = response["id"].as_u64().unwrap();
+            assert_eq!(response["goog:channel"], format!("channel-{id}"));
+            assert_eq!(
+                response["result"]["url"],
+                format!("https://example.test/{id}")
+            );
+            assert_eq!(response["result"]["navigation"], format!("navigation-{id}"));
+        }
+        assert!(
+            take_pending_navigation_response_from_sources(&mut pending, &sources).is_empty(),
+            "duplicate notification has no completion owner"
         );
     }
 }

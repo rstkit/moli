@@ -323,6 +323,49 @@ fn child_window_same_realm_alias_boundary_is_explicit() {
 }
 
 #[test]
+fn window_status_uses_native_accessors_and_preserves_dom_strings() {
+    let mut vm = new_parsed_test_vm("https://window-status.test/", "<!doctype html><body>");
+    vm.eval("globalThis.frame = document.body.appendChild(document.createElement('iframe'))")
+        .unwrap();
+    materialize_single_child_default_realm_for_test(&mut vm, "Window.status child Realm");
+    assert_eq!(
+        vm.eval(
+            r#"(() => {
+      const check = (value, label) => { if (!value) throw new Error(label); };
+      const other = frame.contentWindow;
+      const descriptor = Object.getOwnPropertyDescriptor(other, 'status');
+      check(typeof descriptor.get === 'function' && typeof descriptor.set === 'function' &&
+        descriptor.enumerable && descriptor.configurable && !('value' in descriptor), 'descriptor');
+      check(status === '' && other.status === '', 'defaults');
+      status = 'parent';
+      descriptor.set.call(other, '\ud800');
+      check(other.status === '\ud800' && status === 'parent', 'separate UTF-16 state');
+      descriptor.set.call(self, null);
+      check(status === 'null', 'borrowed setter conversion');
+      let conversions = 0;
+      const value = {toString() { conversions++; return 'converted'; }};
+      for (const receiver of [{}, Object.create(other), new Proxy(other, {})]) {
+        let error;
+        try { descriptor.set.call(receiver, value); } catch (caught) { error = caught; }
+        check(error instanceof other.TypeError, 'callee realm receiver error');
+      }
+      check(conversions === 0, 'validation before conversion');
+      const sentinel = {};
+      let error;
+      try { other.status = {toString() { throw sentinel; }}; } catch (caught) { error = caught; }
+      check(error === sentinel && other.status === '\ud800', 'conversion exception');
+      descriptor.set.call(null, 'child');
+      check(descriptor.get.call(undefined) === 'child', 'global interface receiver');
+      frame.remove();
+      return true;
+    })()"#
+        )
+        .expect("Window.status fixture should evaluate"),
+        "true"
+    );
+}
+
+#[test]
 fn window_global_accessors_use_the_borrowed_window_receiver() {
     let mut vm = new_storage_test_vm("https://window-accessor-receiver.test/");
 
@@ -368,6 +411,122 @@ fn window_global_accessors_use_the_borrowed_window_receiver() {
     assert_eq!(
         result,
         "true|true|false||get frameElement|0|true|true|true|true|TypeError"
+    );
+}
+
+#[test]
+fn cross_realm_window_members_apply_global_interface_receiver_semantics() {
+    let mut vm = new_storage_test_vm("https://window-global-receiver.test/");
+
+    vm.eval(
+        r#"
+(() => {
+  const root = document.documentElement ||
+    document.appendChild(document.createElement("html"));
+  const body = document.body || root.appendChild(document.createElement("body"));
+  const frame = document.createElement("iframe");
+  frame.id = "global-receiver-frame";
+  frame.name = "dummy";
+  body.appendChild(frame);
+})()
+"#,
+    )
+    .expect("cross-realm Window receiver child frame should be created");
+    materialize_single_child_default_realm_for_test(
+        &mut vm,
+        "cross-realm Window receiver child Realm",
+    );
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const frame = document.getElementById("global-receiver-frame");
+  const other = frame.contentWindow;
+  const notWindow = Object.create(Object.getPrototypeOf(other));
+  const throwsOtherTypeError = callback => {
+    try {
+      callback();
+      return false;
+    } catch (error) {
+      return error instanceof other.TypeError && !(error instanceof TypeError);
+    }
+  };
+
+  const invalidGetters = [
+    () => { Object.create(other).window; },
+    () => Object.getOwnPropertyDescriptor(other, "history").get.call(notWindow),
+    () => Reflect.get(other, "screen", notWindow),
+    () => new Proxy(other, {}).onclick
+  ].every(throwsOtherTypeError);
+
+  let conversions = 0;
+  const nameValue = {toString() {conversions++; return "ignored";}};
+  const timerValue = {valueOf() {conversions++; return 0;}};
+  const invalidSetters = [
+    () => { Object.create(other).name = nameValue; },
+    () => Object.getOwnPropertyDescriptor(other, "status").set.call(notWindow, "ignored"),
+    () => Reflect.set(other, "parent", window, notWindow),
+    () => { new Proxy(other, {}).location = location; }
+  ].every(throwsOtherTypeError);
+
+  const invalidOperations = [
+    () => other.clearInterval.call(notWindow, timerValue),
+    () => new Proxy(other, {}).removeEventListener("foo", () => {})
+  ].every(throwsOtherTypeError);
+
+  const nameGetter = Object.getOwnPropertyDescriptor(other, "name").get;
+  const statusDescriptor = Object.getOwnPropertyDescriptor(other, "status");
+  const nullGetters =
+    Reflect.get(other, "self", null) === other &&
+    Reflect.get(other, "document", undefined) === other.document &&
+    nameGetter.call(null) === "dummy";
+
+  const newSelf = {};
+  const nullSetters =
+    Reflect.set(other, "self", newSelf, null) &&
+    Reflect.set(other, "name", "newName", undefined);
+  statusDescriptor.set.call(null, "ready");
+
+  let caughtEvent;
+  const eventListener = event => {
+    caughtEvent = event;
+  };
+  other.addEventListener.call(null, "global-receiver", eventListener);
+  const dispatchedEvent = new other.Event("global-receiver");
+  const extractedDispatch = other.dispatchEvent;
+  const dispatchResult = extractedDispatch(dispatchedEvent);
+  frame.remove();
+  let detachedCleanup = true;
+  try {
+    other.removeEventListener("global-receiver", eventListener);
+  } catch (error) {
+    detachedCleanup = false;
+  }
+
+  return [
+    invalidGetters,
+    invalidSetters,
+    invalidOperations && conversions === 0,
+    nullGetters,
+    nullSetters,
+    other.self === newSelf,
+    other.name === "newName",
+    statusDescriptor.get.call(null) === "ready",
+    dispatchResult,
+    caughtEvent === dispatchedEvent,
+    detachedCleanup
+  ].join("|");
+})()
+"#,
+        )
+        .expect("cross-realm Window receiver semantics should evaluate");
+
+    assert_eq!(
+        result,
+        std::iter::repeat_n("true", 11)
+            .collect::<Vec<_>>()
+            .join("|")
     );
 }
 
@@ -466,29 +625,93 @@ fn detached_document_shadow_root_inner_html_setter_updates_query_surface() {
 #[test]
 fn child_document_content_type_uses_resource_mime() {
     let mut vm = new_storage_test_vm("https://child-content-type.test/");
+    vm.eval(r#"
+        const root = document.documentElement || document.appendChild(document.createElement('html'));
+        const body = document.body || root.appendChild(document.createElement('body'));
+        for (const [id, src] of [
+          ['html', 'data:text/html;charset=utf-8,<p>ok</p>'],
+          ['image', 'data:image/png;base64,AA==']
+        ]) {
+          body.appendChild(Object.assign(document.createElement('iframe'), {id, src}));
+        }
+        'created'
+    "#).unwrap();
+    vm.drain_pending_child_frame_work_for_test();
+    let frames = vm.child_browsing_context_frame_tree_snapshot();
+    let mut content_types = Vec::new();
+    for id in ["html", "image"] {
+        let frame = frames
+            .iter()
+            .find(|frame| frame.owner_element_id.as_deref() == Some(id))
+            .unwrap();
+        // These data URLs have opaque origins. Inspect their own Document in
+        // an isolated world rather than exposing it through the parent page.
+        let world = vm
+            .create_isolated_world_for_frame(&frame.frame_id, "mime-probe", false)
+            .unwrap();
+        content_types.push(
+            vm.eval_in_isolated_context(world, "document.contentType")
+                .unwrap(),
+        );
+    }
+    assert_eq!(content_types, ["text/html", "image/png"]);
+    assert_eq!(vm.eval("document.getElementById('html').contentDocument === null && document.getElementById('image').contentDocument === null").unwrap(), "true");
+}
+
+#[test]
+fn child_plain_text_document_uses_pre_and_standards_mode() {
+    let mut vm = new_storage_test_vm("https://child-plain-text-document.test/");
+
+    vm.eval(
+        r#"
+(() => {
+  const root = document.documentElement || document.appendChild(document.createElement('html'));
+  const body = document.body || root.appendChild(document.createElement('body'));
+  const frame = document.createElement('iframe');
+  frame.id = 'plain';
+  frame.src = 'data:text/plain,%0Aalpha%3Cb%3E%26amp%3B%3C%2Fb%3E%0D%0Abeta';
+  body.appendChild(frame);
+})()
+"#,
+    )
+    .expect("plain-text child document setup should evaluate");
+    vm.drain_pending_child_frame_work_for_test();
+    let child_context_id = vm
+        .live_child_default_runtime_realm_inventory()
+        .into_iter()
+        .map(|realm| realm.context_id)
+        .next()
+        .expect("plain-text child default realm should materialize");
 
     let result = vm
-        .eval(
+        .eval_in_child_default_context(
+            child_context_id,
             r#"
 (() => {
-  const parsed = new DOMParser().parseFromString(
-    '<iframe id="html" src="data:text/html;charset=utf-8,<p>ok</p>"></iframe>' +
-    '<iframe id="image" src="data:image/png;base64,AA=="></iframe>',
-    'text/html'
-  );
-  const htmlFrame = parsed.getElementById('html');
-  const imageFrame = parsed.getElementById('image');
-
+  const doc = document;
+  const pre = doc.body.firstChild;
   return [
-    htmlFrame.contentDocument && htmlFrame.contentDocument.contentType,
-    imageFrame.contentDocument && imageFrame.contentDocument.contentType
+    doc.compatMode,
+    doc.contentType,
+    doc.doctype === null,
+    doc.childNodes.length,
+    doc.documentElement.children.length,
+    doc.head.tagName,
+    doc.body.tagName,
+    doc.body.childNodes.length,
+    pre.tagName,
+    pre.children.length,
+    pre.firstChild.data
   ].join('|');
 })()
 "#,
         )
-        .expect("child document contentType should evaluate");
+        .expect("plain-text child document should evaluate");
 
-    assert_eq!(result, "text/html|image/png");
+    assert_eq!(
+        result,
+        "CSS1Compat|text/plain|true|1|2|HEAD|BODY|1|PRE|0|\nalpha<b>&amp;</b>\nbeta"
+    );
 }
 #[test]
 fn node_move_before_parent_node_surface_and_validation() {
@@ -548,7 +771,7 @@ fn node_move_before_parent_node_surface_and_validation() {
 }
 #[test]
 fn node_move_before_preserves_nonce_content_attribute() {
-    let mut vm = new_storage_test_vm("https://node-move-before-nonce.test/");
+    let mut vm = new_storage_html_test_vm("https://node-move-before-nonce.test/");
 
     let result = vm
         .eval(
@@ -774,12 +997,11 @@ fn node_move_before_dispatches_custom_element_move_reactions() {
 #[test]
 fn node_move_before_updates_shadow_flat_tree_geometry() {
     let mut vm = new_storage_test_vm("https://node-move-before-shadow-geometry.test/");
-    vm.force_fresh_layout_reads_for_test();
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -796,9 +1018,11 @@ fn node_move_before_updates_shadow_flat_tree_geometry() {
   const span = document.createElement('span');
   span.textContent = 'Text in light DOM';
   document.body.append(host, span);
-  const beforeSlotWidth = span.getBoundingClientRect().width;
+  yield; // Publish this scene before reading its geometry.
+const beforeSlotWidth = span.getBoundingClientRect().width;
   host.moveBefore(span, null);
-  const afterSlotWidth = span.getBoundingClientRect().width;
+  yield; // Publish this scene before reading its geometry.
+const afterSlotWidth = span.getBoundingClientRect().width;
 
   const style = document.createElement('style');
   style.textContent = `
@@ -822,7 +1046,8 @@ fn node_move_before_updates_shadow_flat_tree_geometry() {
     <div></div>
   `;
   section2.moveBefore(item, null);
-  const innerWidth = itemShadow.querySelector('div').getBoundingClientRect().width;
+  yield; // Publish this scene before reading its geometry.
+const innerWidth = itemShadow.querySelector('div').getBoundingClientRect().width;
   return [
     beforeSlotWidth > 0,
     afterSlotWidth,
@@ -832,8 +1057,8 @@ fn node_move_before_updates_shadow_flat_tree_geometry() {
   ].join('|');
 })()
 "#,
-        )
-        .expect("moveBefore shadow flat-tree geometry should evaluate");
+    )
+    .expect("moveBefore shadow flat-tree geometry should evaluate");
 
     assert_eq!(result, "true|0|300|300|300");
 }
@@ -1103,16 +1328,14 @@ fn offscreen_canvas_webgl_surface_matches_html_canvas_surface() {
 }
 #[test]
 fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
-    let mut vm = new_parsed_test_vm(
+    let mut vm = new_rendered_test_vm(
         "https://shadow-offset-parent.test/",
         r#"<html><body><div id="container" style="position: relative"></div></body></html>"#,
     );
-    vm.force_fresh_layout_reads_for_test();
 
-    let result = vm
-        .eval(
+    let result = eval_with_layout_publications(&mut vm,
             r#"
-(() => {
+(function* () {
   const container = document.getElementById('container');
 
   const internalHost = document.createElement('div');
@@ -1124,7 +1347,8 @@ fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
     '</div>';
   const relativeParent = internalShadow.getElementById('relativeParent');
   const internalTarget = internalShadow.getElementById('target');
-  const internalResult = [
+  yield; // Publish this scene before reading its geometry.
+const internalResult = [
     internalTarget.offsetParent === relativeParent,
     internalTarget.offsetLeft,
     internalTarget.offsetTop
@@ -1140,7 +1364,8 @@ fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
       '<slot></slot>' +
     '</div>';
   const slottedTarget = slottedHost.querySelector('#target');
-  const slottedResult = [
+  yield; // Publish this scene before reading its geometry.
+const slottedResult = [
     slottedTarget.offsetParent === container,
     slottedTarget.offsetLeft,
     slottedTarget.offsetTop
@@ -1157,7 +1382,8 @@ fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
     '</div>';
   const fixedTarget = fixedHost.querySelector('#target');
   const fixed = fixedShadow.getElementById('fixed');
-  const fixedResult = [
+  yield; // Publish this scene before reading its geometry.
+const fixedResult = [
     fixedTarget.offsetParent === null,
     fixedTarget.offsetLeft,
     85 + fixed.offsetLeft,
@@ -1177,7 +1403,8 @@ fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
       '</div>' +
     '</div>';
   const transformedFixedTarget = transformedFixedHost.querySelector('#target');
-  const transformedFixedResult = [
+  yield; // Publish this scene before reading its geometry.
+const transformedFixedResult = [
     transformedFixedTarget.offsetParent === container,
     transformedFixedTarget.offsetLeft,
     transformedFixedTarget.offsetTop
@@ -1195,7 +1422,8 @@ fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
       '<div style="position: absolute; top: 10px; left: 10px;"><slot></slot></div>' +
     '</section>';
   const nestedTarget = nestedHost.querySelector('#target');
-  const nestedResult = [
+  yield; // Publish this scene before reading its geometry.
+const nestedResult = [
     nestedTarget.offsetParent === container,
     nestedTarget.offsetLeft,
     nestedTarget.offsetTop
@@ -1208,7 +1436,8 @@ fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
   unassignedHost.attachShadow({ mode: 'open' }).innerHTML =
     '<section style="position: absolute; top: 50px; left: 50px;">content</section>';
   const unassignedTarget = unassignedHost.querySelector('#target');
-  const unassignedResult = [
+  yield; // Publish this scene before reading its geometry.
+const unassignedResult = [
     unassignedTarget.offsetParent === null,
     unassignedTarget.offsetLeft,
     unassignedTarget.offsetTop
@@ -1237,10 +1466,10 @@ fn offset_parent_and_offsets_cross_shadow_scopes_like_chromium() {
 fn shadow_host_unassigned_children_are_empty_and_slotted_text_has_layout() {
     let mut vm = new_storage_test_vm("https://shadow-unassigned-geometry.test/");
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -1262,6 +1491,7 @@ fn shadow_host_unassigned_children_are_empty_and_slotted_text_has_layout() {
   slottedHost.appendChild(slotted);
   document.body.appendChild(slottedHost);
   slottedHost.attachShadow({mode: 'open'}).innerHTML = '<slot></slot>';
+yield; // Publish this scene before reading its geometry.
   const hiddenRect = hidden.getBoundingClientRect();
   const slottedRect = slotted.getBoundingClientRect();
 
@@ -1274,8 +1504,8 @@ fn shadow_host_unassigned_children_are_empty_and_slotted_text_has_layout() {
   });
 })()
 "#,
-        )
-        .expect("shadow unassigned light geometry should evaluate");
+    )
+    .expect("shadow unassigned light geometry should evaluate");
 
     let result: serde_json::Value =
         serde_json::from_str(&result).expect("shadow geometry should be JSON");
@@ -1298,9 +1528,10 @@ fn shadow_host_unassigned_children_are_empty_and_slotted_text_has_layout() {
 fn shadow_flat_tree_offsets_match_chromium_layout_order() {
     let mut vm = new_storage_test_vm("https://shadow-offset-wpt.test/");
 
-    let result = vm
-        .eval(
-            r#"
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
 if (!document.documentElement) {
   document.appendChild(document.createElement('html'));
 }
@@ -1385,14 +1616,16 @@ body.setHTMLUnsafe(`
   <div id=target3 style="position: absolute" class=box></div>
 </div>
 `);
-[
+yield; // Publish this scene before reading its geometry.
+return [
   target1.offsetTop,
   target2.offsetLeft,
   target3.offsetTop
-].join('|')
+].join('|');
+})()
 "#,
-        )
-        .expect("headless mock shadow boundary offsets should evaluate");
+    )
+    .expect("headless mock shadow boundary offsets should evaluate");
 
     assert_eq!(result, "38|8|88");
 }
@@ -1407,10 +1640,10 @@ fn geometry_getters_reuse_latest_layout_across_nodes_and_mutation() {
         .1;
     let cache_before = vm.layout_snapshot_cache_observability_for_test();
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -1425,6 +1658,7 @@ fn geometry_getters_reuse_latest_layout_across_nodes_and_mutation() {
     targets.push(target);
   }
 
+yield; // Publish this scene before reading its geometry.
   const initialLast = targets[3].offsetTop;
   const first = targets.map(target => target.offsetTop);
   const second = targets.map(target => target.offsetTop);
@@ -1444,8 +1678,8 @@ fn geometry_getters_reuse_latest_layout_across_nodes_and_mutation() {
   ].join('|');
 })()
 "#,
-        )
-        .expect("latest layout snapshot reads should evaluate");
+    )
+    .expect("latest layout snapshot reads should evaluate");
 
     assert_eq!(result, "38|8|38|8|38|38|0");
     let passes = vm
@@ -1454,10 +1688,13 @@ fn geometry_getters_reuse_latest_layout_across_nodes_and_mutation() {
         .layout_pass_observability_for_test()
         .1
         .saturating_sub(passes_before);
-    assert_eq!(passes, 1, "only the cold getter may build layout");
+    assert_eq!(
+        passes, 1,
+        "only the explicit fixture publication builds layout"
+    );
     let cache_after = vm.layout_snapshot_cache_observability_for_test();
-    assert_eq!(cache_after.0, cache_before.0 + 10);
-    assert_eq!(cache_after.1, cache_before.1 + 1);
+    assert_eq!(cache_after.0, cache_before.0 + 11);
+    assert_eq!(cache_after.1, cache_before.1);
     assert_eq!(cache_after.2, cache_before.2 + 1);
     assert!(cache_after.3.is_some());
 }
@@ -1469,8 +1706,8 @@ fn switching_to_mock_geometry_drops_the_latest_real_layout_snapshot() {
         "document.appendChild(document.createElement('html')).appendChild(document.createElement('body')); 'installed'",
     )
     .expect("the geometry fixture should initialize");
-    vm.eval("document.body.offsetTop")
-        .expect("the real geometry read should populate the latest snapshot");
+    vm.publish_layout_for_test()
+        .expect("publish the real geometry fixture");
     assert!(
         vm.layout_snapshot_cache_observability_for_test()
             .3
@@ -1585,10 +1822,10 @@ fn body_default_geometry_tracks_each_css_margin_axis() {
 fn child_content_document_created_elements_expose_geometry_methods() {
     let mut vm = new_storage_test_vm("https://child-created-geometry.test/");
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   const frame = document.createElement('iframe');
   (document.body || document.documentElement || document).appendChild(frame);
   const doc = frame.contentDocument;
@@ -1596,7 +1833,8 @@ fn child_content_document_created_elements_expose_geometry_methods() {
   const item = doc.createElement('div');
   item.id = 'item';
   doc.body.append(item);
-  const rect = item.getBoundingClientRect();
+  yield; // Publish this scene before reading its geometry.
+const rect = item.getBoundingClientRect();
   return [
     typeof item.getBoundingClientRect,
     typeof item.getClientRects,
@@ -1605,14 +1843,14 @@ fn child_content_document_created_elements_expose_geometry_methods() {
   ].join('|');
 })()
 "#,
-        )
-        .expect("child document created geometry should evaluate");
+    )
+    .expect("child document created geometry should evaluate");
 
     assert_eq!(result, "function|function|0|true");
 }
 #[test]
-fn geometry_rect_objects_expose_domrect_to_json() {
-    let mut vm = new_parsed_test_vm(
+fn geometry_rect_objects_and_lists_expose_their_webidl_shapes() {
+    let mut vm = new_rendered_test_vm(
         "https://geometry-domrect-shape.test/",
         "<!doctype html><body><div id='node'>text</div></body>",
     );
@@ -1642,14 +1880,18 @@ fn geometry_rect_objects_expose_domrect_to_json() {
     [
       'x', 'y', 'width', 'height', 'top', 'right', 'bottom', 'left'
     ].every(name => json[name] === rect[name]),
+    rects instanceof DOMRectList,
     Array.isArray(rects),
+    Object.prototype.toString.call(rects),
     rects.length,
     rects[0] instanceof DOMRect,
+    rects.item(0) === rects[0],
     typeof rects[0].toJSON,
     rangeRect instanceof DOMRect,
     typeof rangeRect.toJSON,
+    rangeRects instanceof DOMRectList,
     rangeRects[0] instanceof DOMRect,
-    contentRect instanceof DOMRect,
+    Object.getPrototypeOf(contentRect) === DOMRectReadOnly.prototype,
     typeof contentRect.toJSON,
     Object.hasOwn(DOMRectReadOnly.prototype, 'toJSON'),
     Object.hasOwn(DOMRect.prototype, 'toJSON')
@@ -1661,7 +1903,205 @@ fn geometry_rect_objects_expose_domrect_to_json() {
 
     assert_eq!(
         result,
-        "true|true||function|x,y,width,height,top,right,bottom,left|true|true|1|true|function|true|function|true|true|function|true|false"
+        concat!(
+            "true|true||function|x,y,width,height,top,right,bottom,left|true|",
+            "true|false|[object DOMRectList]|1|true|true|function|true|function|",
+            "true|true|true|function|true|false"
+        )
+    );
+}
+
+#[test]
+fn dom_rect_list_has_readonly_indexed_semantics_and_rejects_structured_clone() {
+    let mut vm = new_parsed_test_vm(
+        "https://domrect-list.test/",
+        "<!doctype html><body><div id='node'>text</div></body>",
+    );
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const probe = callback => {
+    try {
+      callback();
+      return "ok";
+    } catch (error) {
+      return error.name;
+    }
+  };
+  const node = document.getElementById("node");
+  const list = node.getClientRects();
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const rangeList = range.getClientRects();
+  const indexDescriptor = Object.getOwnPropertyDescriptor(list, "0");
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(
+    DOMRectList.prototype,
+    "length"
+  );
+  const itemDescriptor = Object.getOwnPropertyDescriptor(
+    DOMRectList.prototype,
+    "item"
+  );
+  const fake = Object.create(DOMRectList.prototype);
+  return JSON.stringify({
+    constructor: [typeof DOMRectList, DOMRectList.length,
+      probe(() => DOMRectList()), probe(() => new DOMRectList())].join("|"),
+    instance: [list instanceof DOMRectList, list instanceof Array,
+      Object.getPrototypeOf(list) === DOMRectList.prototype,
+      Object.prototype.toString.call(list), list.constructor === DOMRectList].join("|"),
+    values: [list.length, list[-1], list[1], list.item(-1), list.item(1),
+      list.item(0) === list[0], list[0] instanceof DOMRect,
+      Object.keys(list).join(",")].join("|"),
+    indexDescriptor: [indexDescriptor.value === list[0], indexDescriptor.writable,
+      indexDescriptor.enumerable, indexDescriptor.configurable].join("|"),
+    prototypeDescriptors: [typeof lengthDescriptor.get, lengthDescriptor.get.name,
+      lengthDescriptor.get.length, lengthDescriptor.set === undefined,
+      lengthDescriptor.enumerable, lengthDescriptor.configurable,
+      itemDescriptor.value.name, itemDescriptor.value.length,
+      itemDescriptor.enumerable, itemDescriptor.writable,
+      itemDescriptor.configurable].join("|"),
+    brands: [probe(() => lengthDescriptor.get.call(fake)),
+      probe(() => itemDescriptor.value.call(fake, 0))].join("|"),
+    range: [rangeList instanceof DOMRectList,
+      Object.prototype.toString.call(rangeList), rangeList.item(0) === rangeList[0]].join("|"),
+    clone: probe(() => structuredClone(list)),
+    visibleSlots: Object.getOwnPropertyNames(list)
+      .filter(name => name.startsWith("__moliDomRectList")).join(",")
+  });
+})()
+"#,
+        )
+        .expect("DOMRectList WebIDL probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"constructor":"function|0|TypeError|TypeError","instance":"true|false|true|[object DOMRectList]|true","values":"1|||||true|true|0","indexDescriptor":"true|false|true|true","prototypeDescriptors":"function|get length|0|true|true|true|item|1|true|true|true","brands":"TypeError|TypeError","range":"true|[object DOMRectList]|true","clone":"DataCloneError","visibleSlots":""}"#
+    );
+}
+
+#[test]
+fn dom_rect_list_item_checks_bounds_before_reading_inherited_array_properties() {
+    let mut vm = new_rendered_test_vm(
+        "https://domrect-list-item-bounds.test/",
+        "<!doctype html><body><div id='node'>text</div><div id='hidden' style='display:none'>hidden</div></body>",
+    );
+
+    // Calibrated against /usr/bin/chromium 145.0.7632.116.
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const node = document.getElementById('node');
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const emptyRange = document.createRange();
+  const lists = [node.getClientRects(), range.getClientRects(),
+    document.getElementById('hidden').getClientRects(), emptyRange.getClientRects()];
+  const probe = list => [list.length > 0,
+    list.item(0) === (list.length === 0 ? null : list[0]),
+    list.item(list.length) === null,
+    list.item(20) === null,
+    list.item(-1) === null];
+  const baseline = lists.map(probe);
+  const indices = [0, 1, 20, 4294967295];
+  const saved = indices.map(index => Object.getOwnPropertyDescriptor(Array.prototype, index));
+  let inheritedValues;
+  try {
+    for (const index of indices) {
+      Object.defineProperty(Array.prototype, index, {
+        value: 'inherited rectangle', writable: true, configurable: true
+      });
+    }
+    inheritedValues = lists.map(probe);
+  } finally {
+    indices.forEach((index, i) => {
+      if (saved[i]) Object.defineProperty(Array.prototype, index, saved[i]);
+      else delete Array.prototype[index];
+    });
+  }
+  let getterReads = 0;
+  let inheritedGetter;
+  try {
+    Object.defineProperty(Array.prototype, '20', {configurable: true,
+      get() { getterReads++; return 'inherited getter rectangle'; }});
+    inheritedGetter = lists.map(list => list.item(20) === null);
+  } finally {
+    if (saved[2]) Object.defineProperty(Array.prototype, '20', saved[2]);
+    else delete Array.prototype[20];
+  }
+  let conversions = 0;
+  const convertedIndices = lists.map(list =>
+    list.item({valueOf() { conversions++; return 20; }}) === null);
+  return JSON.stringify({baseline, inheritedValues, inheritedGetter, getterReads,
+    convertedIndices, conversions});
+})()
+"#,
+        )
+        .expect("DOMRectList.item should check bounds before reading the backing array");
+
+    let result: serde_json::Value =
+        serde_json::from_str(&result).expect("DOMRectList.item bounds probe should return JSON");
+    let expected_rows = serde_json::json!([
+        [true, true, true, true, true],
+        [true, true, true, true, true],
+        [false, true, true, true, true],
+        [false, true, true, true, true],
+    ]);
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "baseline": expected_rows,
+            "inheritedValues": expected_rows,
+            "inheritedGetter": [true, true, true, true],
+            "getterReads": 0,
+            "convertedIndices": [true, true, true, true],
+            "conversions": 4,
+        })
+    );
+}
+
+#[test]
+fn dom_rect_lists_support_iteration_for_element_and_range_geometry() {
+    let mut vm = new_rendered_test_vm(
+        "https://domrect-list-iteration.test/",
+        "<!doctype html><body><div id='node'>text</div><div id='hidden' style='display:none'>hidden</div></body>",
+    );
+
+    // Calibrated against /usr/bin/chromium 145.0.7632.116.
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const node = document.getElementById('node');
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const emptyRange = document.createRange();
+  const lists = [node.getClientRects(), range.getClientRects(),
+    document.getElementById('hidden').getClientRects(), emptyRange.getClientRects()];
+  const descriptor = Object.getOwnPropertyDescriptor(DOMRectList.prototype, Symbol.iterator);
+  return JSON.stringify({
+    prototype: [typeof descriptor.value, descriptor.value === Array.prototype.values,
+      descriptor.writable, descriptor.enumerable, descriptor.configurable],
+    iteration: lists.map(list => {
+      const spread = [...list];
+      const iterated = [];
+      for (const rect of list) iterated.push(rect);
+      return [list.length > 0,
+        spread.length === list.length && spread.every((rect, index) => rect === list[index]),
+        iterated.length === list.length && iterated.every((rect, index) => rect === list[index])];
+    }),
+    generic: [...descriptor.value.call({0: 'first', 1: 'second', length: 2})],
+  });
+})()
+"#,
+        )
+        .expect("Element and Range DOMRectLists should be iterable");
+
+    assert_eq!(
+        result,
+        r#"{"prototype":["function",true,true,false,true],"iteration":[[true,true,true],[true,true,true],[false,true,true],[false,true,true]],"generic":["first","second"]}"#
     );
 }
 
@@ -1904,12 +2344,11 @@ fn geometry_domrect_private_slots_ignore_reflection_and_spoofing() {
 #[test]
 fn fragment_anchor_scroll_ignores_shadow_tree_targets() {
     let mut vm = new_storage_test_vm("https://fragment-shadow-scroll.test/");
-    vm.force_fresh_layout_reads_for_test();
 
-    let result = vm
-        .eval(
-            r##"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r##"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -1923,13 +2362,15 @@ fn fragment_anchor_scroll_ignores_shadow_tree_targets() {
   }
 
   container.innerHTML = tall('doc-target') + '<div id="doc-target">target</div>';
-  container.querySelector('a').click();
+  yield; // Publish this scene before reading its geometry.
+container.querySelector('a').click();
   const documentTargetScrolls = window.pageYOffset > 0;
 
   window.scrollTo(0, 0);
   container.innerHTML = tall('shadow-target') + '<div id="host"></div>';
   container.querySelector('#host').attachShadow({ mode: 'open' }).innerHTML =
     '<div id="shadow-target">shadow</div>';
+  yield;
   container.querySelector('a').click();
   const shadowTargetIgnored = window.pageYOffset === 0;
 
@@ -1942,14 +2383,103 @@ fn fragment_anchor_scroll_ignores_shadow_tree_targets() {
   const host = container.querySelector('#host');
   host.attachShadow({ mode: 'open' }).innerHTML =
     '<div id="duplicate-target">shadow</div>';
+  yield;
   container.querySelector('a').click();
   const duplicateUsesDocumentTree = window.pageYOffset > host.offsetTop;
 
   return [documentTargetScrolls, shadowTargetIgnored, duplicateUsesDocumentTree].join('|');
 })()
 "##,
-        )
-        .expect("fragment anchor scroll should evaluate");
+    )
+    .expect("fragment anchor scroll should evaluate");
 
     assert_eq!(result, "true|true|true");
+}
+#[test]
+fn window_closed_reflects_top_popup_and_popup_child_liveness() {
+    let mut vm = new_storage_test_vm("https://window-closed.test/");
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const popup = open();
+  popup.document.body.appendChild(popup.document.createElement("iframe"));
+  const child = popup[0];
+  const descriptor = Object.getOwnPropertyDescriptor(window, "closed");
+  const before = [window.closed, popup.closed, child.closed];
+  popup.close();
+  return JSON.stringify({
+    descriptor: [
+      descriptor.get.name,
+      descriptor.get.length,
+      typeof descriptor.set,
+      descriptor.enumerable,
+      descriptor.configurable
+    ],
+    before,
+    after: [
+      popup.closed,
+      child.closed,
+      descriptor.get.call(popup),
+      descriptor.get.call(child)
+    ]
+  });
+})()
+"#,
+        )
+        .expect("Window.closed liveness probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"descriptor":["get closed",0,"undefined",true,true],"before":[false,false,false],"after":[true,false,true,false]}"#
+    );
+}
+
+#[test]
+fn window_closed_reflects_removed_iframe_state() {
+    let mut vm = new_parsed_test_vm("https://child-window-closed.test/", "<!doctype html><body>");
+    let result = vm
+        .eval(
+            r#"(() => {
+      const frame = document.body.appendChild(document.createElement('iframe'));
+      const child = frame.contentWindow;
+      const getter = Object.getOwnPropertyDescriptor(window, 'closed').get;
+      const states = [child.closed, getter.call(child)];
+      frame.remove();
+      states.push(child.closed, getter.call(child));
+      return JSON.stringify(states);
+    })()"#,
+        )
+        .expect("closed should reflect iframe removal through the native getter");
+    assert_eq!(result, "[false,false,true,true]");
+}
+
+#[test]
+fn media_volume_rejects_out_of_range_values_without_mutating_state() {
+    let mut vm = new_storage_test_vm("https://media-volume.test/");
+    assert_eq!(
+        vm.eval(
+            r#"(() => {
+        const media = document.createElement('audio');
+        media.volume = 0.25;
+        for (const [value, name] of [[-1, 'IndexSizeError'], [1.01, 'IndexSizeError'],
+            [NaN, 'TypeError'], [Infinity, 'TypeError'], [Symbol(), 'TypeError']]) {
+            let error;
+            try { media.volume = value; } catch (caught) { error = caught; }
+            if (error?.name !== name || media.volume !== 0.25) throw Error('volume validation');
+        }
+        const sentinel = {};
+        let error;
+        try { media.volume = { valueOf() { throw sentinel; } }; } catch (caught) { error = caught; }
+        if (error !== sentinel || media.volume !== 0.25) throw Error('conversion exception');
+        media.volume = 0;
+        if (media.volume !== 0) throw Error('zero boundary');
+        media.volume = 1;
+        return media.volume === 1;
+    })()"#
+        )
+        .unwrap(),
+        "true"
+    );
 }

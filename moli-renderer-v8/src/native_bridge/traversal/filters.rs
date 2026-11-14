@@ -1,3 +1,4 @@
+use crate::v8_traced_webidl_callback::V8TracedWebIdlCallbackInterface;
 use crate::webidl::{PreparedWebIdlCallbackInterface, WebIdlCallbackInterface};
 use crate::{
     callback_invocation::{
@@ -6,9 +7,7 @@ use crate::{
     dom::native::NodeType,
     {
         document_runtime::DomHandle,
-        native_bridge::{
-            JsContextHost, WindowExecutionContextIdentity, bridge::wrapped_handle_value,
-        },
+        native_bridge::{PageScriptHost, WindowExecutionContextIdentity},
         util::throw_type_error,
         webidl,
     },
@@ -30,37 +29,44 @@ pub(super) enum TraversalFilterResult {
 
 /// The callback-interface value owned by one TreeWalker or NodeIterator.
 ///
-/// Traversal owns registration lifetime and reentrancy. The callback kernel
-/// owns the rooted callback plus its relevant/incumbent contexts. The renderer
+/// The wrapper owns a V8-traced callback carrier; the native registry only
+/// observes it weakly. The callback kernel roots invocation snapshots. The renderer
 /// identity is deliberately kept beside those engine-neutral facts so a
 /// detached or replaced Window cannot re-enter through a still-reachable
 /// traversal wrapper.
 pub(in crate::native_bridge) struct TraversalFilter {
-    callback: WebIdlCallbackInterface,
+    callback: v8::Weak<v8::Object>,
     execution_context: Option<WindowExecutionContextIdentity>,
 }
 
 impl TraversalFilter {
-    pub(super) fn new(
-        scope: &mut v8::PinScope<'_, '_>,
-        runtime_ptr: *mut JsContextHost,
+    pub(super) fn new<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        runtime_ptr: *mut PageScriptHost,
+        wrapper: v8::Local<'s, v8::Object>,
         callback: WebIdlCallbackInterface,
     ) -> Self {
         let prepared = callback.prepare(scope);
         let relevant_context = prepared.relevant_context(scope);
         let execution_context = unsafe { &*runtime_ptr }
             .window_execution_context_identity_for_v8_context(scope, relevant_context);
+        let carrier = V8TracedWebIdlCallbackInterface::new(scope, callback).into_object();
+        crate::util::set_private_value(scope, wrapper, "__lmTraversalFilter", carrier.into());
         Self {
-            callback,
+            callback: v8::Weak::new(scope, carrier),
             execution_context,
         }
     }
 
-    pub(super) fn prepare(&self, scope: &mut v8::PinScope<'_, '_>) -> PreparedTraversalFilter {
-        PreparedTraversalFilter {
-            callback: self.callback.prepare(scope),
+    pub(super) fn prepare(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+    ) -> Option<PreparedTraversalFilter> {
+        let carrier = self.callback.to_local(scope)?;
+        Some(PreparedTraversalFilter {
+            callback: V8TracedWebIdlCallbackInterface::from_object(carrier).prepare(scope),
             execution_context: self.execution_context,
-        }
+        })
     }
 }
 
@@ -91,7 +97,7 @@ impl PreparedTraversalFilter {
 
 pub(super) fn traversal_filter_result(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     filter: Option<&PreparedTraversalFilter>,
     node: DomHandle,
     what_to_show: u32,
@@ -103,7 +109,7 @@ pub(super) fn traversal_filter_result(
 }
 
 fn accepts_what_to_show(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     node: DomHandle,
     what_to_show: u32,
 ) -> bool {
@@ -130,7 +136,7 @@ fn node_type_show_mask(node: &crate::dom::native::Node) -> u32 {
 
 fn call_traversal_filter(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     filter: Option<&PreparedTraversalFilter>,
     node: DomHandle,
 ) -> TraversalFilterResult {
@@ -146,7 +152,8 @@ fn call_traversal_filter(
         );
         return TraversalFilterResult::Exception;
     }
-    let Some(node_wrapper) = wrapped_handle_value(scope, runtime_ptr, node) else {
+    let Some(node_wrapper) = super::wrapped_traversal_node_value(scope, runtime_ptr, node, node)
+    else {
         return TraversalFilterResult::Accept;
     };
     let callback_this = v8::undefined(scope).into();

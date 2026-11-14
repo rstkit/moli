@@ -1,8 +1,8 @@
 use crate::{
     context_bootstrap::dispatch_window_error_event_with_details,
     document_runtime::DomHandle,
-    exception_reporting::build_event_handler_exception_report,
-    native_bridge::{JsContextHost, OwnerDispatchScope},
+    exception_reporting::build_exception_report_without_stack,
+    native_bridge::{OwnerDispatchScope, PageScriptHost},
     util::{create_script_origin_with_base_url, v8_string},
 };
 
@@ -14,7 +14,7 @@ pub(crate) enum EventAttributeHandlerScope {
 
 pub(super) fn compile_event_attribute_handler<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: DomHandle,
     source: &str,
     arguments: &[v8::Local<'s, v8::String>],
@@ -38,7 +38,7 @@ pub(super) fn compile_event_attribute_handler<'s>(
 
 pub(crate) fn compile_event_attribute_handler_for_owner<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     owner: OwnerDispatchScope,
     source: &str,
     handler_scope: EventAttributeHandlerScope,
@@ -68,7 +68,7 @@ pub(crate) fn compile_event_attribute_handler_for_owner<'s>(
 
 fn compile_event_attribute_handler_for_owner_with_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     owner: OwnerDispatchScope,
     base_url: &url::Url,
     source: &str,
@@ -99,7 +99,7 @@ fn compile_event_attribute_handler_for_owner_with_context<'s>(
 
 fn compile_event_attribute_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     base_url: &url::Url,
     source: &str,
     arguments: &[v8::Local<'s, v8::String>],
@@ -126,8 +126,9 @@ fn compile_event_attribute_function<'s>(
 
     let exception = scope.exception();
     let message = scope.message();
-    let stack_trace = scope.stack_trace();
-    let report = build_event_handler_exception_report(&mut scope, exception, message, stack_trace);
+    // Reporting a parse error must not invoke an author's Error.prepareStackTrace
+    // hook. ErrorEvent only needs the exception and its native source location.
+    let report = build_exception_report_without_stack(&mut scope, exception, message);
     scope.reset();
 
     let error_value = report

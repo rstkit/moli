@@ -284,6 +284,104 @@ fn main_frame_identity_uses_reserved_owner_records() {
 }
 
 #[test]
+fn initial_main_document_commit_prepares_owners_before_replacement_without_turn_exit_replay() {
+    let mut store = FrameOwnerStore::default();
+    store.ensure_main_frame(
+        handle(1),
+        url("about:blank"),
+        url("https://example.test/"),
+        "https://example.test".to_owned(),
+        policy_container(),
+        policy_context(),
+        None,
+    );
+    let original = store.current_main_owner_snapshot().unwrap();
+    let transition = store
+        .prepare_initial_main_document_owner_transition()
+        .unwrap();
+    assert!(store.document_task_owner_is_current(transition.retired_owner()));
+    assert!(!store.document_task_owner_is_current(transition.current_owner()));
+    let prepared_snapshot = store.current_main_owner_snapshot().unwrap();
+    assert_eq!(prepared_snapshot.document_id, original.document_id);
+    assert_eq!(prepared_snapshot.document_handle, original.document_handle);
+    assert_eq!(prepared_snapshot.realm_id, original.realm_id);
+    assert!(
+        store
+            .take_pending_main_document_owner_transitions()
+            .is_empty()
+    );
+    assert_eq!(
+        transition.context_transition().inspector_binding(),
+        DocumentInspectorBindingTransition::Replaced,
+    );
+    assert_eq!(
+        transition
+            .context_transition()
+            .local_window_owner_transition(),
+        FrameLocalWindowOwnerTransition::Preserved {
+            current: original.local_window_id
+        },
+    );
+
+    assert_eq!(
+        store.replace_initial_main_document(
+            transition,
+            handle(2),
+            url("https://example.test/child"),
+            url("https://example.test/child"),
+        ),
+        Some(transition),
+    );
+    let current = store.current_main_owner_snapshot().unwrap();
+    assert_eq!(current.document_id, transition.current_owner().document_id);
+    assert_eq!(current.local_window_id, original.local_window_id);
+    assert_eq!(current.realm_id, original.realm_id);
+    assert_eq!(current.document_handle, handle(2));
+    assert!(!store.document_task_owner_is_current(transition.retired_owner()));
+    assert!(
+        store
+            .take_pending_main_document_owner_transitions()
+            .is_empty()
+    );
+
+    let stale = store
+        .prepare_initial_main_document_owner_transition()
+        .unwrap();
+    let opened = store
+        .replace_main_document(
+            handle(2),
+            url("https://example.test/child"),
+            url("https://example.test/child"),
+        )
+        .unwrap();
+    assert_eq!(
+        opened.context_transition().inspector_binding(),
+        DocumentInspectorBindingTransition::Preserved,
+    );
+    let opened_snapshot = store.current_main_owner_snapshot().unwrap();
+    assert_eq!(
+        store.replace_initial_main_document(
+            stale,
+            handle(3),
+            url("https://example.test/stale"),
+            url("https://example.test/stale"),
+        ),
+        None
+    );
+    let rejected_snapshot = store.current_main_owner_snapshot().unwrap();
+    assert_eq!(rejected_snapshot.document_id, opened_snapshot.document_id);
+    assert_eq!(
+        rejected_snapshot.document_handle,
+        opened_snapshot.document_handle
+    );
+    assert_eq!(rejected_snapshot.document_url, opened_snapshot.document_url);
+    assert_eq!(
+        store.take_pending_main_document_owner_transitions(),
+        vec![opened]
+    );
+}
+
+#[test]
 fn main_document_replacement_rotates_document_owner_without_replacing_window_or_realm() {
     let mut store = FrameOwnerStore::default();
     store.ensure_main_frame(
@@ -731,7 +829,7 @@ fn main_modulepreload_owner_never_allocates_a_load_event_delay() {
     );
 
     let event_owner = store
-        .accept_current_main_modulepreload_event_owner(owner, handle(10))
+        .accept_current_main_link_event_owner(owner, handle(10))
         .expect("current modulepreload should retain exact event ownership");
     assert_eq!(event_owner.owner(), owner);
     assert_eq!(event_owner.element(), handle(10));
@@ -1781,6 +1879,65 @@ fn stale_realm_clear_does_not_clear_replacement_child_realm() {
 }
 
 #[test]
+fn borrowed_child_document_tracks_current_owner_without_retaining_a_snapshot() {
+    let mut store = FrameOwnerStore::default();
+    let child = handle(403);
+    let owner = commit_test_child_document(
+        &mut store,
+        child,
+        handle(404),
+        "borrowed-document",
+        Some("main"),
+    );
+    let (document, document_url) = store.current_child_document(child).unwrap();
+    let record = store.documents.get(&owner.document_id).unwrap();
+    assert_eq!(document, record.document_handle);
+    assert!(std::ptr::eq(document_url, &record.url));
+
+    assert!(store.update_current_child_document_urls(
+        child,
+        url("https://borrowed-document.test/updated"),
+        url("https://borrowed-document.test/base/"),
+    ));
+    assert_eq!(
+        store.current_child_document(child).unwrap().1.as_str(),
+        "https://borrowed-document.test/updated",
+    );
+    store
+        .scheduler_lanes
+        .get_mut(&owner.scheduler_lane_id)
+        .unwrap()
+        .lifecycle = FrameSchedulerLaneLifecycleState::Detached;
+    assert!(store.current_child_document(child).is_none());
+    store
+        .scheduler_lanes
+        .get_mut(&owner.scheduler_lane_id)
+        .unwrap()
+        .lifecycle = FrameSchedulerLaneLifecycleState::Active;
+    assert!(store.current_child_document(child).is_some());
+
+    let realm = materialize_test_child_realm(&mut store, child, 403);
+    let valid_document = store.realms.get(&realm).unwrap().document_id;
+    store.realms.get_mut(&realm).unwrap().document_id = main_document_id();
+    assert!(store.current_child_document(child).is_none());
+    store.realms.get_mut(&realm).unwrap().document_id = valid_document;
+    assert!(store.current_child_document(child).is_some());
+    store.detach_current_child_document(child);
+    assert!(store.current_child_document(child).is_none());
+    commit_test_child_document(
+        &mut store,
+        child,
+        handle(405),
+        "borrowed-replacement",
+        Some("main"),
+    );
+    assert_eq!(
+        store.current_child_document(child),
+        Some((handle(405), &url("https://borrowed-replacement.test/"))),
+    );
+}
+
+#[test]
 fn frame_scheduler_lane_is_required_for_current_owner_snapshot() {
     let mut store = FrameOwnerStore::default();
     let child_handle = handle(29);
@@ -1970,6 +2127,139 @@ fn child_document_owner_token_tracks_current_child_document() {
     assert_eq!(store.current_child_document_task_owner(child_handle), None);
     assert!(!store.child_document_owner_is_current(child_handle, second_owner));
     assert!(!store.child_document_task_owner_is_current(child_handle, second_task_owner));
+}
+
+#[test]
+fn child_module_integrity_preparation_needs_a_current_document_without_a_realm() {
+    let mut store = FrameOwnerStore::default();
+    let child_handle = handle(920);
+    let document_handle = handle(921);
+    let first_owner = commit_test_child_document(
+        &mut store,
+        child_handle,
+        document_handle,
+        "integrity-frame",
+        None,
+    );
+    let module_url = url("https://integrity-frame.test/module.mjs");
+    store
+        .register_current_child_document_import_map(
+            child_handle,
+            document_handle,
+            r#"{"integrity":{"/module.mjs":"sha384-first"}}"#,
+            &module_url,
+        )
+        .unwrap();
+    assert!(
+        store
+            .current_child_document_task_owner_materialized_realm(child_handle)
+            .is_none()
+    );
+    assert_eq!(
+        store.resolve_current_child_document_module_integrity(
+            child_handle,
+            first_owner,
+            &module_url,
+        ),
+        Some("sha384-first".to_owned())
+    );
+
+    let second_owner = commit_test_child_document(
+        &mut store,
+        child_handle,
+        handle(922),
+        "integrity-frame",
+        None,
+    );
+    for owner in [first_owner, second_owner] {
+        assert_eq!(
+            store
+                .resolve_current_child_document_module_integrity(child_handle, owner, &module_url,),
+            None,
+            "retired and replacement Documents must not reuse the old map"
+        );
+    }
+}
+
+#[test]
+fn child_import_map_settings_survive_document_open_without_reviving_old_document_authority() {
+    let mut store = FrameOwnerStore::default();
+    let child_handle = handle(930);
+    let document_handle = handle(931);
+    let first_owner = commit_test_child_document(
+        &mut store,
+        child_handle,
+        document_handle,
+        "map-settings-frame",
+        None,
+    );
+    let base = url("https://map-settings-frame.test/");
+    let module_url = base.join("module.mjs").unwrap();
+    store
+        .register_current_child_document_import_map(
+            child_handle,
+            document_handle,
+            r#"{"imports":{"key":"/module.mjs"},"integrity":{"/module.mjs":"sha384-retained"}}"#,
+            &base,
+        )
+        .unwrap();
+    let plan = store
+        .plan_child_document_open_replacement(
+            child_handle,
+            document_handle,
+            base.clone(),
+            base.clone(),
+        )
+        .unwrap();
+    let opened = store
+        .commit_child_document_open_replacement(plan)
+        .current_owner()
+        .unwrap();
+    assert_eq!(opened.local_window_id, first_owner.local_window_id);
+    assert_ne!(opened.document_id, first_owner.document_id);
+    assert_eq!(
+        store.resolve_current_child_document_module_integrity(
+            child_handle,
+            first_owner,
+            &module_url,
+        ),
+        None
+    );
+    assert_eq!(
+        store.resolve_current_child_document_module_integrity(child_handle, opened, &module_url,),
+        Some("sha384-retained".to_owned())
+    );
+    assert_eq!(
+        store
+            .resolve_local_window_module_specifier(first_owner.local_window_id, "key", &base,)
+            .unwrap(),
+        module_url
+    );
+
+    let navigated = commit_test_child_document(
+        &mut store,
+        child_handle,
+        handle(932),
+        "map-settings-frame",
+        None,
+    );
+    assert_ne!(navigated.local_window_id, first_owner.local_window_id);
+    assert_eq!(
+        store
+            .resolve_current_child_document_module_integrity(child_handle, navigated, &module_url,),
+        None
+    );
+    assert!(
+        store
+            .resolve_local_window_module_specifier(navigated.local_window_id, "key", &base,)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .resolve_local_window_module_specifier(first_owner.local_window_id, "key", &base,)
+            .unwrap(),
+        module_url
+    );
 }
 
 #[test]

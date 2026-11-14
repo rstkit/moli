@@ -3,14 +3,16 @@ use super::super::script_preloads::{ServiceWorkerScriptPreloadContext, admit_pen
 use super::parser_blocking_pending::main_parser_blocking_classic_script_item;
 use super::scaffold::continue_phase_one_until_streaming_boundary_on_execution_context;
 use super::*;
-use moli_encoding::HtmlDocumentStreamingDecoder;
-use moli_encoding_detector::detect_legacy_html_encoding;
+use crate::document_response_decoder::{decode_document_response, new_document_response_decoder};
+#[cfg(test)]
+use crate::types::SubresourceInterceptionClasses;
+use moli_encoding::DocumentStreamingDecoder;
 use moli_web_mime::response_headers_indicate_attachment_download;
 use tokio::sync::{mpsc, oneshot};
 
 pub(in crate::runtime) struct StreamingHtmlPageCreationResult {
     pub(in crate::runtime) response_status: u16,
-    pub(in crate::runtime) response_headers: Vec<(String, String)>,
+    pub(in crate::runtime) response_headers: Vec<(String, Vec<u8>)>,
     pub(in crate::runtime) outcome: ParseTimePageVmCreationOutcome,
 }
 
@@ -94,10 +96,8 @@ impl ConcurrentParseTimeRuntime {
         env.apply_navigation_response_headers(&response_final_url, &response_headers);
 
         let mut body_source = RawDocumentBodySource::fetch_response(response);
-        let mut state = ParseTimeDriverState::new_with_scripting_enabled(
-            response_final_url,
-            main_document_parser_scripting_enabled(&env),
-        );
+        let (mut state, mut decoder) =
+            response_document_parser(response_final_url, &response_headers, &env);
         state
             .buffered_document_preloads
             .set_script_fetch_requires_owner_admission(script_preloads_require_owner_admission(
@@ -124,11 +124,6 @@ impl ConcurrentParseTimeRuntime {
                 )
             });
         state.service_worker_preload_context = service_worker_preload_context.clone();
-        let mut decoder = HtmlDocumentStreamingDecoder::new_with_legacy_encoding_detector(
-            &response_headers,
-            state.final_url.as_str(),
-            detect_legacy_html_encoding,
-        );
         // Raw navigation bodies are decoded during prebootstrap scan. The decoder
         // is carried forward so split multibyte sequences are not decoded twice or
         // lost between the scan and parser handoff.
@@ -179,7 +174,7 @@ impl ConcurrentParseTimeRuntime {
         started: Instant,
         final_url: Url,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         raw_body: ExternalRawDocumentBodyStream,
         reply_boundary: crate::RendererReplyBoundary,
     ) -> Result<StreamingNavigationPageCreationResult> {
@@ -233,7 +228,7 @@ impl ConcurrentParseTimeRuntime {
         started: Instant,
         final_url: Url,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         raw_body: ExternalRawDocumentBodyStream,
     ) -> Result<StreamingNavigationPageCreationResult> {
         Self::create_from_committed_external_raw_document_response(
@@ -263,7 +258,7 @@ impl ConcurrentParseTimeRuntime {
         started: Instant,
         final_url: Url,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         raw_body: ExternalRawDocumentBodyStream,
     ) -> Result<StreamingNavigationPageCreationResult> {
         Self::create_from_committed_external_raw_document_response(
@@ -293,7 +288,7 @@ impl ConcurrentParseTimeRuntime {
         started: Instant,
         final_url: Url,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         raw_body: ExternalRawDocumentBodyStream,
         boundary: CommittedNavigationBootstrapBoundary,
     ) -> Result<StreamingNavigationPageCreationResult> {
@@ -308,9 +303,15 @@ impl ConcurrentParseTimeRuntime {
         let mut body_source = RawDocumentBodySource::External(raw_body);
         if response_headers_indicate_xml_document(&response_headers) {
             let body = collect_streaming_raw_body(&mut body_source).await?;
-            let source = String::from_utf8_lossy(&body).into_owned();
             let content_type = moli_web_mime::response_document_content_type(&response_headers)
                 .unwrap_or_else(|| "application/xml".to_owned());
+            let (source, character_set) = decode_document_response(
+                &body,
+                &response_headers,
+                Some(&content_type),
+                &final_url,
+                None,
+            );
             let outcome = Self::finish_creation_from_xml_bootstrap(
                 page_id,
                 local_executor,
@@ -319,6 +320,7 @@ impl ConcurrentParseTimeRuntime {
                 runtime_hooks,
                 final_url,
                 content_type,
+                character_set,
                 stage,
                 source,
                 started,
@@ -332,10 +334,7 @@ impl ConcurrentParseTimeRuntime {
                 },
             )));
         }
-        let mut state = ParseTimeDriverState::new_with_scripting_enabled(
-            final_url,
-            main_document_parser_scripting_enabled(&env),
-        );
+        let (mut state, mut decoder) = response_document_parser(final_url, &response_headers, &env);
         state
             .buffered_document_preloads
             .set_script_fetch_requires_owner_admission(script_preloads_require_owner_admission(
@@ -362,11 +361,6 @@ impl ConcurrentParseTimeRuntime {
                 )
             });
         state.service_worker_preload_context = service_worker_preload_context.clone();
-        let mut decoder = HtmlDocumentStreamingDecoder::new_with_legacy_encoding_detector(
-            &response_headers,
-            state.final_url.as_str(),
-            detect_legacy_html_encoding,
-        );
         // External raw bodies replay captured chunks. Pre-scan only what is already
         // buffered before bootstrap so the producer's backpressure boundary still
         // controls how far ahead the parser can get.
@@ -451,6 +445,10 @@ impl ConcurrentParseTimeRuntime {
         chunk: String,
         service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
     ) {
+        if self.state.is_text_document {
+            self.state.parser_session.queue_arrived_chunk(chunk);
+            return;
+        }
         self.state
             .buffered_document_preloads
             .append_to_main_document_scan_with_service_worker_context(
@@ -480,9 +478,9 @@ impl ConcurrentParseTimeRuntime {
     }
 }
 
-fn response_headers_indicate_xml_document(headers: &[(String, String)]) -> bool {
+fn response_headers_indicate_xml_document(headers: &[(String, Vec<u8>)]) -> bool {
     moli_web_mime::response_document_content_type(headers)
-        .is_some_and(|mime| moli_web_mime::is_dom_parser_xml_mime(&mime))
+        .is_some_and(|mime| moli_web_mime::is_xml_document_mime(&mime))
 }
 
 const EXTERNAL_RAW_DOCUMENT_BODY_BUFFERED_CHUNKS: usize = 8;
@@ -607,6 +605,9 @@ fn scan_prebootstrap_html_chunk_into_state(
     chunk: &str,
     service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
 ) {
+    if state.is_text_document {
+        return;
+    }
     state
         .buffered_document_preloads
         .append_to_main_document_prebootstrap_scan_with_service_worker_context(
@@ -617,9 +618,34 @@ fn scan_prebootstrap_html_chunk_into_state(
         );
 }
 
+fn response_document_parser(
+    final_url: Url,
+    headers: &[(String, Vec<u8>)],
+    env: &PageVmEnvConfig,
+) -> (ParseTimeDriverState, DocumentStreamingDecoder) {
+    let content_type = moli_web_mime::response_document_content_type(headers);
+    let text_type = content_type
+        .as_deref()
+        .filter(|mime| moli_web_mime::is_text_document_mime(mime));
+    let mut state = if let Some(mime) = text_type {
+        ParseTimeDriverState::new_text(final_url, mime)
+    } else {
+        ParseTimeDriverState::new_with_scripting_enabled(
+            final_url,
+            main_document_parser_scripting_enabled(env),
+        )
+    };
+    let decoder =
+        new_document_response_decoder(headers, content_type.as_deref(), &state.final_url, None);
+    // Headers/defaults are observable even when no body chunk is ready yet.
+    // A later BOM or decoder decision can still replace this tentative value.
+    sync_state_document_character_set_from_decoder(&mut state, &decoder);
+    (state, decoder)
+}
+
 pub(super) fn enqueue_streaming_raw_chunk(
     runtime: &mut ConcurrentParseTimeRuntime,
-    decoder: &mut HtmlDocumentStreamingDecoder,
+    decoder: &mut DocumentStreamingDecoder,
     chunk: Vec<u8>,
     service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
 ) {
@@ -635,7 +661,7 @@ pub(super) fn enqueue_streaming_raw_chunk(
 
 fn scan_prebootstrap_raw_chunk_into_state(
     state: &mut ParseTimeDriverState,
-    decoder: &mut HtmlDocumentStreamingDecoder,
+    decoder: &mut DocumentStreamingDecoder,
     loader: &ResourceRequestClient,
     chunk: Vec<u8>,
     service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
@@ -653,7 +679,7 @@ fn scan_prebootstrap_raw_chunk_into_state(
 fn preload_scan_ready_streaming_raw_chunks(
     runtime: &mut ConcurrentParseTimeRuntime,
     response: &mut RawDocumentBodySource,
-    decoder: &mut HtmlDocumentStreamingDecoder,
+    decoder: &mut DocumentStreamingDecoder,
     service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
 ) {
     // Chromium keeps parser-visible tree construction paused while allowing the
@@ -668,7 +694,7 @@ fn preload_scan_ready_streaming_raw_chunks(
 fn prebootstrap_scan_ready_streaming_raw_chunks(
     state: &mut ParseTimeDriverState,
     response: &mut RawDocumentBodySource,
-    decoder: &mut HtmlDocumentStreamingDecoder,
+    decoder: &mut DocumentStreamingDecoder,
     loader: &ResourceRequestClient,
     service_worker_context: Option<&ServiceWorkerScriptPreloadContext>,
 ) -> Vec<String> {
@@ -700,7 +726,7 @@ async fn settle_streaming_raw_response_at_boundary(
     bootstrap_outcome: ParseTimePageVmStreamingBootstrapOutcome,
     response: RawDocumentBodySource,
     prebootstrap_chunks: Vec<String>,
-    decoder: HtmlDocumentStreamingDecoder,
+    decoder: DocumentStreamingDecoder,
     service_worker_context: Option<ServiceWorkerScriptPreloadContext>,
     started: Instant,
     boundary: CommittedNavigationBootstrapBoundary,
@@ -734,7 +760,7 @@ fn park_streaming_raw_response_at_document_commit(
     bootstrap_outcome: ParseTimePageVmStreamingBootstrapOutcome,
     response: RawDocumentBodySource,
     prebootstrap_chunks: Vec<String>,
-    decoder: HtmlDocumentStreamingDecoder,
+    decoder: DocumentStreamingDecoder,
     service_worker_context: Option<ServiceWorkerScriptPreloadContext>,
     started: Instant,
 ) -> Result<ParseTimePageVmCreationOutcome> {
@@ -779,7 +805,7 @@ async fn drive_streaming_raw_response_through_phase_one(
     bootstrap_outcome: ParseTimePageVmStreamingBootstrapOutcome,
     mut response: RawDocumentBodySource,
     prebootstrap_chunks: Vec<String>,
-    mut decoder: HtmlDocumentStreamingDecoder,
+    mut decoder: DocumentStreamingDecoder,
     service_worker_context: Option<ServiceWorkerScriptPreloadContext>,
     started: Instant,
 ) -> Result<ParseTimePageVmCreationOutcome> {
@@ -876,7 +902,7 @@ async fn drive_streaming_raw_response_through_phase_one(
 
 pub(super) fn sync_document_character_set_from_decoder(
     runtime: &mut ConcurrentParseTimeRuntime,
-    decoder: &HtmlDocumentStreamingDecoder,
+    decoder: &DocumentStreamingDecoder,
 ) {
     let encoding = decoder.document_encoding_name();
     runtime.state.document_character_set = encoding.to_owned();
@@ -889,7 +915,7 @@ pub(super) fn sync_document_character_set_from_decoder(
 
 fn sync_state_document_character_set_from_decoder(
     state: &mut ParseTimeDriverState,
-    decoder: &HtmlDocumentStreamingDecoder,
+    decoder: &DocumentStreamingDecoder,
 ) {
     let encoding = decoder.document_encoding_name();
     state.document_character_set = encoding.to_owned();
@@ -898,7 +924,9 @@ fn sync_state_document_character_set_from_decoder(
         .set_document_character_set(encoding);
 }
 
-pub(in crate::runtime) fn response_headers_indicate_download(headers: &[(String, String)]) -> bool {
+pub(in crate::runtime) fn response_headers_indicate_download(
+    headers: &[(String, Vec<u8>)],
+) -> bool {
     response_headers_indicate_attachment_download(headers)
 }
 
@@ -907,6 +935,105 @@ mod tests {
     use super::*;
     use crate::parser::ScriptSource;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn text_document_charset_is_visible_to_document_start_before_body_arrives() {
+        let _js_runtime_owner = crate::JsRuntime::initialize();
+        tokio::task::LocalSet::new().run_until(async {
+            for (mime, chunk, expected) in [
+                ("text/plain; charset=gbk", None, "GBK"),
+                ("application/json", None, "UTF-8"),
+                ("text/plain; charset=gbk", Some(b"\xef\xbb\xbfready".as_slice()), "UTF-8"),
+            ] {
+                let loader_owner = ResourceRequestClient::new(&FetchConfig::default()).unwrap();
+                let loader = loader_owner.handle();
+                let mut env = default_test_page_vm_env_config();
+                env.document_start_scripts.push(crate::DocumentStartScript {
+                    registry_key: None,
+                    devtools_session: None,
+                    source: "document.title = document.characterSet".to_owned(),
+                    world_name: None,
+                    has_bidi_channel_argument: false,
+                    bidi_channel_handoffs: Vec::new(),
+                });
+                let (mut state, mut decoder) = response_document_parser(
+                    Url::parse("https://example.test/data").unwrap(),
+                    &[("Content-Type".to_owned(), mime.as_bytes().to_vec())], &env,
+                );
+                if let Some(chunk) = chunk {
+                    let chunks = decoder.push(chunk);
+                    sync_state_document_character_set_from_decoder(&mut state, &decoder);
+                    for chunk in chunks {
+                        state.parser_session.queue_arrived_chunk(chunk);
+                    }
+                }
+                assert_eq!(state.document_character_set, expected);
+                let (_, page_vm, navigated) = ConcurrentParseTimeRuntime::bootstrap_page_vm_from_state_on_fresh_local_task(
+                    PageId::new_for_testing(1), JsLocalExecutor::new(), loader, env,
+                    PageVmRuntimeHooks::standalone_without_owner_reservation_for_test(), state,
+                    Instant::now(), "charset test bootstrap closed",
+                ).await.unwrap();
+                assert!(!navigated);
+                assert_eq!(page_vm.vm().snapshot_live_document().document_title(), expected, "{mime}");
+            }
+        }).await;
+    }
+
+    #[test]
+    fn response_document_dispatch_distinguishes_text_from_html_and_xml() {
+        for (mime, text) in [
+            ("application/json", true),
+            ("application/problem+json", true),
+            ("text/plain; charset=gbk", true),
+            ("text/javascript", true),
+            ("text/html", false),
+            ("application/xhtml+xml", false),
+            ("application/xml", false),
+            ("text/xml", false),
+        ] {
+            let (state, _) = response_document_parser(
+                Url::parse("https://example.test/data").unwrap(),
+                &[("Content-Type".to_owned(), mime.as_bytes().to_vec())],
+                &default_test_page_vm_env_config(),
+            );
+            assert_eq!(state.is_text_document, text, "{mime}");
+        }
+    }
+
+    #[tokio::test]
+    async fn text_document_does_not_preload_literal_script_tags() {
+        let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default())
+            .expect("default loader");
+        let runtime_hooks = PageVmRuntimeHooks::standalone_without_owner_reservation_for_test();
+        for (mime, expected_preload) in [
+            ("text/plain", false),
+            ("application/json", false),
+            ("text/html", true),
+        ] {
+            let (mut state, _) = response_document_parser(
+                Url::parse("https://example.test/data").unwrap(),
+                &[("Content-Type".to_owned(), mime.as_bytes().to_vec())],
+                &default_test_page_vm_env_config(),
+            );
+            state.buffered_document_preloads.bind_resource_runtime(
+                runtime_hooks.owner_wake(),
+                runtime_hooks.resource_task_runner(),
+            );
+            scan_prebootstrap_html_chunk_into_state(
+                &mut state,
+                &loader,
+                "<script defer src='/literal.js'></script>",
+                None,
+            );
+            assert_eq!(
+                state.buffered_document_preloads.entries.contains_key(
+                    &classic_preload_key_for_streaming_test("https://example.test/literal.js")
+                ),
+                expected_preload,
+                "{mime}",
+            );
+        }
+    }
 
     #[tokio::test]
     async fn external_raw_document_body_source_collects_chunks_and_completion() {
@@ -930,6 +1057,7 @@ mod tests {
 
     fn default_test_page_vm_env_config() -> PageVmEnvConfig {
         PageVmEnvConfig {
+            window_identity: Default::default(),
             web_storage: crate::RendererWebStorageHandles::ephemeral(),
             root_frame_id: None,
             main_document_commit: None,
@@ -939,27 +1067,21 @@ mod tests {
             runtime_inspector_session_restore_snapshots: vec![],
             runtime_isolated_worlds: vec![],
             permission_overrides: vec![],
-            extra_http_headers: vec![],
+            extra_http_headers: Default::default(),
             navigator_identity: Default::default(),
             document_policy_container: Default::default(),
             document_default_language: None,
             document_last_modified: None,
-            locale_override: None,
-            timezone_override: None,
-            script_execution_disabled: false,
-            bypass_content_security_policy: false,
-            cpu_throttling_rate: 1.0,
-            emulated_media: crate::protocol_types::EmulatedMediaOverrides::default(),
-            idle_override: None,
-            navigator_overrides: Default::default(),
-            viewport_surface: None,
+            document_settings: Default::default(),
             network_offline: false,
             blocked_url_patterns: Vec::new(),
             indexed_db_manager: None,
             storage_bucket_store: None,
-            fetch_subresource_interception_enabled: false,
-            fetch_subresource_interception_resource_type: None,
-            layout_policy: moli_page_types::LayoutPolicy::default(),
+            fetch_subresource_interception_classes: SubresourceInterceptionClasses::NONE,
+            layout_configuration: moli_page_types::LayoutConfiguration {
+                policy: moli_page_types::LayoutPolicy::default(),
+                scrollbars_hidden: false,
+            },
             wpt_extensions_enabled: false,
             navigation_bootstrap_entry: None,
             reserved_service_worker_client_id: None,
@@ -1088,7 +1210,7 @@ mod tests {
             runtime_hooks.owner_wake(),
             runtime_hooks.resource_task_runner(),
         );
-        let page_vm = PageVm::new(
+        let mut page_vm = PageVm::new(
             PageId::new_for_testing(1),
             local_executor,
             &loader,
@@ -1104,21 +1226,21 @@ mod tests {
             .vm()
             .current_main_document_task_owner()
             .expect("main parser test owner");
-        state.pending_parsing_blocking_script =
-            PendingParsingBlockingClassicScriptRunner::from_parser_blocking_script(
-                main_parser_blocking_classic_script_item(
-                    parser_document_owner,
-                    crate::parser_script::payload::ParserPreparedClassicScript::new(
-                        crate::parser_script::payload::ParserClassicScriptMetadata::new(
-                            script.node_id,
-                            1,
-                        ),
-                        script,
+        page_vm
+            .vm_mut()
+            .document_runtime
+            .install_pending_main_parser_script(main_parser_blocking_classic_script_item(
+                parser_document_owner,
+                crate::parser_script::payload::ParserPreparedClassicScript::new(
+                    crate::parser_script::payload::ParserClassicScriptMetadata::new(
+                        script.node_id,
+                        1,
                     ),
-                    HashSet::new(),
-                    Some(PendingParserBlockingSourceLoad::ReusablePreload(load)),
+                    script,
                 ),
-            );
+                HashSet::new(),
+                Some(PendingParserBlockingSourceLoad::ReusablePreload(load)),
+            ));
         TestConcurrentParseTimeRuntime {
             runtime: ConcurrentParseTimeRuntime::new_parser_owner(
                 loader,
@@ -1129,6 +1251,28 @@ mod tests {
             _js_runtime_owner: js_runtime_owner,
             _loader_owner: loader_owner,
         }
+    }
+
+    #[tokio::test]
+    async fn main_resource_failure_retires_the_document_owned_parser_script() {
+        let load = crate::planning::SharedScriptSourceLoad::spawn_for_test(std::future::pending());
+        let fixture = streaming_runtime_with_pending_parser_blocking_source_load(load);
+        assert!(fixture.has_pending_parser_blocking_source_load());
+        let page_vm = fixture.runtime.into_main_resource_load_failed_page_vm();
+        assert!(
+            page_vm
+                .vm()
+                .document_runtime
+                .pending_main_parser_script()
+                .is_none()
+        );
+        assert!(
+            page_vm
+                .vm()
+                .document_runtime
+                .main_parser_continuation_producer()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1200,11 +1344,11 @@ mod tests {
         drop(body_tx);
         completion_tx.send(Ok(())).unwrap();
         let mut source = RawDocumentBodySource::External(raw_body);
-        let headers = vec![(
+        let headers: Vec<(String, Vec<u8>)> = vec![(
             "Content-Type".to_owned(),
-            "text/html; charset=utf-8".to_owned(),
+            b"text/html; charset=utf-8".to_vec(),
         )];
-        let mut decoder = HtmlDocumentStreamingDecoder::new(&headers);
+        let mut decoder = DocumentStreamingDecoder::new(&headers);
 
         preload_scan_ready_streaming_raw_chunks(&mut runtime, &mut source, &mut decoder, None);
 
@@ -1275,11 +1419,11 @@ mod tests {
         drop(body_tx);
         completion_tx.send(Ok(())).unwrap();
         let mut source = RawDocumentBodySource::External(raw_body);
-        let headers = vec![(
+        let headers: Vec<(String, Vec<u8>)> = vec![(
             "Content-Type".to_owned(),
-            "text/html; charset=utf-8".to_owned(),
+            b"text/html; charset=utf-8".to_vec(),
         )];
-        let mut decoder = HtmlDocumentStreamingDecoder::new(&headers);
+        let mut decoder = DocumentStreamingDecoder::new(&headers);
 
         preload_scan_ready_streaming_raw_chunks(
             &mut runtime,
@@ -1336,11 +1480,11 @@ mod tests {
         let mut state = ParseTimeDriverState::new_with_scripting_enabled_for_test(
             Url::parse("https://example.test/").expect("test url"),
         );
-        let headers = vec![(
+        let headers: Vec<(String, Vec<u8>)> = vec![(
             "Content-Type".to_owned(),
-            "text/html; charset=utf-8".to_owned(),
+            b"text/html; charset=utf-8".to_vec(),
         )];
-        let mut decoder = HtmlDocumentStreamingDecoder::new(&headers);
+        let mut decoder = DocumentStreamingDecoder::new(&headers);
 
         let chunks = prebootstrap_scan_ready_streaming_raw_chunks(
             &mut state,
@@ -1361,12 +1505,12 @@ mod tests {
     fn streaming_navigation_download_detection_uses_content_disposition_type() {
         assert!(response_headers_indicate_download(&[(
             "Content-Disposition".to_owned(),
-            "attachment; filename=report.html".to_owned(),
+            b"attachment; filename=report.html".to_vec(),
         )]));
 
         assert!(!response_headers_indicate_download(&[(
             "Content-Disposition".to_owned(),
-            "inline; filename=attachment.html".to_owned(),
+            b"inline; filename=attachment.html".to_vec(),
         )]));
     }
 }

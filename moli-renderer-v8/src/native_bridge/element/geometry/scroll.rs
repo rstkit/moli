@@ -1,9 +1,9 @@
-use crate::{document_runtime::DomHandle, dom::native::Node, native_bridge::JsContextHost};
+use crate::{document_runtime::DomHandle, dom::native::Node, native_bridge::PageScriptHost};
 
 use super::super::{queue_revealed_lazy_image_loads, queue_revealed_lazy_media_loads};
-use super::provider::{observable_element_metrics, observable_scroll_into_view_geometry};
+use super::provider::{read_element_metrics, read_scroll_into_view_geometry};
 
-pub(super) fn node_scroll_position(runtime: &JsContextHost, handle: DomHandle) -> (f64, f64) {
+pub(super) fn node_scroll_position(runtime: &PageScriptHost, handle: DomHandle) -> (f64, f64) {
     runtime
         .dom_host()
         .node(handle)
@@ -13,7 +13,7 @@ pub(super) fn node_scroll_position(runtime: &JsContextHost, handle: DomHandle) -
 }
 
 pub(super) fn resolve_scroll_target(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
     let node = runtime.dom_host().node(handle)?;
@@ -25,7 +25,7 @@ pub(super) fn resolve_scroll_target(
 
 pub(super) fn set_node_scroll_position(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     left: f64,
     top: f64,
@@ -54,7 +54,7 @@ pub(super) fn set_node_scroll_position(
 
 pub(super) fn apply_observable_window_scroll(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     scrolling_element: DomHandle,
     target_x: f64,
     target_y: f64,
@@ -85,7 +85,7 @@ pub(super) fn apply_observable_window_scroll(
 
 pub(crate) fn perform_scrollbar_scroll_default_action(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     source: DomHandle,
     axis: moli_layout::LayoutScrollbarAxis,
     target: f64,
@@ -122,7 +122,7 @@ pub(crate) fn perform_scrollbar_scroll_default_action(
 
 pub(crate) fn queue_scroll_observable_effects(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document: Option<DomHandle>,
     queue_document_events: bool,
 ) {
@@ -142,17 +142,16 @@ pub(crate) fn queue_scroll_observable_effects(
 
 pub(crate) fn apply_scroll_observable_effects(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     effects: impl IntoIterator<Item = crate::native_bridge::PendingScrollObservableEffects>,
 ) {
     let effects = effects.into_iter().collect::<Vec<_>>();
     if effects.is_empty() {
         return;
     }
-    // Native lazy loading deliberately combines the retained pre-scroll
-    // projection with live element offsets, so admit those requests before
-    // retiring the sampled projection. Observable geometry and author
-    // IntersectionObservers, on the other hand, must see a fresh projection.
+    // Native lazy loading combines the retained projection with live scroll
+    // offsets. Geometry and input retain that projection until fresh visual
+    // publication replaces it.
     for effects in &effects {
         if let Some(document) = effects.document() {
             queue_revealed_lazy_image_loads(scope, runtime_ptr, document);
@@ -190,7 +189,7 @@ fn consume_wheel_axis(
 /// chain, matching the scroll chaining users expect from a trackpad or wheel.
 pub(crate) fn perform_wheel_scroll_default_action(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     delta_x: f64,
     delta_y: f64,
@@ -205,23 +204,15 @@ pub(crate) fn perform_wheel_scroll_default_action(
     let Some(target) = resolve_scroll_target(runtime, handle) else {
         return Ok(false);
     };
-    let Some(mut geometry) = observable_scroll_into_view_geometry(
-        runtime,
-        target,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    )?
-    else {
+    let Some(mut geometry) = read_scroll_into_view_geometry(runtime, target)? else {
         return Ok(false);
     };
 
     // ScrollIntoView geometry begins at the target's parent. Include the
     // target itself so an empty overflow scroller still responds when its own
     // background is the hit-test result.
-    if let Some(metrics) = observable_element_metrics(
-        runtime,
-        target,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    )? && metrics.is_scroll_container
+    if let Some(metrics) = read_element_metrics(runtime, target)?
+        && metrics.is_scroll_container
         && geometry
             .scroll_containers
             .iter()

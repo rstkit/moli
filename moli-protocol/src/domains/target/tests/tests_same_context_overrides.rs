@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn same_context_targets_restore_their_own_page_session_overrides_after_switching() {
+async fn same_context_targets_keep_local_network_policy_but_share_process_locale() {
     let mut ctx = TestContext::new();
     load_bc_with_titled_page_async(
         &mut ctx,
@@ -10,11 +10,12 @@ async fn same_context_targets_restore_their_own_page_session_overrides_after_swi
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
 
     ctx.process_async(json!({
         "id": 104158,
@@ -80,7 +81,7 @@ async fn same_context_targets_restore_their_own_page_session_overrides_after_swi
     .await;
     ctx.expect_result(1041621, json!({}), Some(&second_session_id));
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 104163,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -117,7 +118,10 @@ async fn same_context_targets_restore_their_own_page_session_overrides_after_swi
         "params": { "locale": "fr-FR" }
     }))
     .await;
-    ctx.expect_result(104165, json!({}), Some(&second_session_id));
+    assert_eq!(
+        take_response_by_id(&mut ctx, 104165)["error"]["message"],
+        "Another locale override is already in effect"
+    );
 
     ctx.process_async(json!({
         "id": 104166,
@@ -128,23 +132,31 @@ async fn same_context_targets_restore_their_own_page_session_overrides_after_swi
     ctx.expect_result(104166, json!({}), None);
 
     {
-        let bc = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
-        assert_eq!(
-            bc.active_page_target().effective_policy().extra_headers(),
-            vec![("X-Target".into(), "A".into())]
-        );
-        assert_eq!(
-            bc.active_page_target().effective_policy().locale_override(),
-            Some("en-GB")
-        );
+        ctx.with_fixture(|conn| {
+            let bc = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
+            assert_eq!(
+                bc.active_page_target()
+                    .effective_policy()
+                    .extra_headers()
+                    .to_byte_strings(),
+                vec![("X-Target".into(), "A".into())]
+            );
+            assert_eq!(
+                bc.active_page_target()
+                    .devtools_sessions
+                    .effective_locale_override()
+                    .as_deref(),
+                Some("en-GB")
+            );
+        });
     }
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 104167,
         "method": "Page.navigate",
         "sessionId": "SID-active",
@@ -189,23 +201,32 @@ async fn same_context_targets_restore_their_own_page_session_overrides_after_swi
     ctx.expect_result(104168, json!({}), None);
 
     {
-        let bc = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_eq!(bc.active_target_id(), Some(second_target_id.as_str()));
-        assert_eq!(
-            bc.active_page_target().effective_policy().extra_headers(),
-            vec![("X-Target".into(), "B".into())]
-        );
-        assert_eq!(
-            bc.active_page_target().effective_policy().locale_override(),
-            Some("fr-FR")
-        );
+        ctx.with_fixture(|conn| {
+            let bc = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert_eq!(bc.active_target_id(), Some(second_target_id.as_str()));
+            assert_eq!(
+                bc.active_page_target()
+                    .effective_policy()
+                    .extra_headers()
+                    .to_byte_strings(),
+                vec![("X-Target".into(), "B".into())]
+            );
+            assert_eq!(
+                bc.active_page_target()
+                    .devtools_sessions
+                    .effective_locale_override()
+                    .as_deref(),
+                None,
+                "a rejected process claim must not become target-local policy"
+            );
+        });
     }
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 104169,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -239,7 +260,7 @@ async fn same_context_targets_restore_their_own_page_session_overrides_after_swi
         serde_json::from_str(second_payload).expect("second payload should be valid json");
     assert_eq!(second_payload["title"], json!("second-restored"));
     assert_eq!(second_payload["lang"], json!("en-US"));
-    assert_eq!(second_payload["locale"], json!("fr-FR"));
+    assert_eq!(second_payload["locale"], json!("en-GB"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -253,11 +274,12 @@ async fn same_context_targets_restore_their_own_network_conditions_after_session
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
 
     ctx.process_async(json!({
         "id": 104169267,
@@ -265,10 +287,9 @@ async fn same_context_targets_restore_their_own_network_conditions_after_session
         "sessionId": "SID-active",
         "params": {
             "offline": false,
-            "latency": 150,
-            "downloadThroughput": 1024,
-            "uploadThroughput": 512,
-            "connectionType": "cellular3g"
+            "latency": 0,
+            "downloadThroughput": -1,
+            "uploadThroughput": -1,
         }
     }))
     .await;
@@ -300,7 +321,7 @@ async fn same_context_targets_restore_their_own_network_conditions_after_session
         .to_owned();
     ctx.expect_event("Target.attachedToTarget", None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 104169270,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -323,10 +344,9 @@ async fn same_context_targets_restore_their_own_network_conditions_after_session
         "sessionId": second_session_id,
         "params": {
             "offline": true,
-            "latency": 25,
-            "downloadThroughput": 2048,
-            "uploadThroughput": 256,
-            "connectionType": "wifi"
+            "latency": 0,
+            "downloadThroughput": -1,
+            "uploadThroughput": -1,
         }
     }))
     .await;
@@ -340,7 +360,7 @@ async fn same_context_targets_restore_their_own_network_conditions_after_session
     .await;
     ctx.expect_result(104169272, json!({}), None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 104169273,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -349,36 +369,32 @@ async fn same_context_targets_restore_their_own_network_conditions_after_session
     .await;
     consume_main_document_navigation_start(&mut ctx);
     let second_error = take_response_by_id(&mut ctx, 104169273);
+    assert!(
+        second_error.get("error").is_none(),
+        "offline navigation must not return a protocol error; got {second_error}"
+    );
     assert_eq!(
-        second_error["error"]["message"],
-        json!("Network emulation offline")
+        second_error["result"]["errorText"],
+        json!("net::ERR_INTERNET_DISCONNECTED")
     );
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context after direct background navigation");
-        assert_eq!(active.active_target_id(), Some("TID-000000000NA"));
-        let background = active
-            .background_target(&second_target_id)
-            .filter(|target| target.has_non_default_session_state())
-            .expect("second target should keep background network state");
-        assert!(background.network_policy.network_offline());
-        assert_eq!(background.network_policy.emulated_network_latency(), 25.0);
-        assert_eq!(
-            background.network_policy.emulated_download_throughput(),
-            2048.0
-        );
-        assert_eq!(
-            background.network_policy.emulated_upload_throughput(),
-            256.0
-        );
-        assert_eq!(
-            background.network_policy.emulated_connection_type(),
-            Some("wifi")
-        );
+        ctx.with_fixture(|conn| {
+            let background = {
+                let active = {
+                    conn.browser_context
+                        .as_ref()
+                        .expect("active browser context after direct background navigation")
+                };
+                assert_eq!(active.active_target_id(), Some("TID-000000000NA"));
+
+                active
+                    .background_target(&second_target_id)
+                    .filter(|target| target.has_non_default_session_state())
+                    .expect("second target should keep background network state")
+            };
+            assert!(background.network_policy.network_offline());
+        });
     }
 
     ctx.process_async(json!({
@@ -392,41 +408,15 @@ async fn same_context_targets_restore_their_own_network_conditions_after_session
     assert_eq!(first_eval["result"]["result"]["value"], json!("first"));
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context after restoring first target");
-        assert_eq!(active.active_target_id(), Some("TID-000000000NA"));
-        assert!(!active.active_page_target().network_policy.network_offline());
-        assert_eq!(
-            active
-                .active_page_target()
-                .network_policy
-                .emulated_network_latency(),
-            150.0
-        );
-        assert_eq!(
-            active
-                .active_page_target()
-                .network_policy
-                .emulated_download_throughput(),
-            1024.0
-        );
-        assert_eq!(
-            active
-                .active_page_target()
-                .network_policy
-                .emulated_upload_throughput(),
-            512.0
-        );
-        assert_eq!(
-            active
-                .active_page_target()
-                .network_policy
-                .emulated_connection_type(),
-            Some("cellular3g")
-        );
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context after restoring first target")
+            };
+            assert_eq!(active.active_target_id(), Some("TID-000000000NA"));
+            assert!(!active.active_page_target().network_policy.network_offline());
+        });
     }
 }
 
@@ -440,17 +430,28 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_swi
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .set_cookie_manager_policy_cookies_enabled_override_async(false)
-        .await;
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
+    {
+        let (owner, updates) = ctx.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::capture(conn, None);
+            let updates = conn
+                .browser_context
+                .as_mut()
+                .unwrap()
+                .start_cookie_manager_policy_mutation_for_test(|surface| {
+                    surface.set_policy_cookies_enabled_override(false)
+                });
+            (owner, updates)
+        });
+        ctx.finish_fixture_page_updates(owner, updates)
+            .await
+            .expect("cookie policy should reach the original Page");
+    };
 
     ctx.process_async(json!({
         "id": 1041692,
@@ -491,7 +492,7 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_swi
         .to_owned();
     ctx.expect_event("Target.attachedToTarget", None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 1041695,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -516,31 +517,61 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_swi
     .await;
     ctx.expect_result(10416951, json!({}), None);
 
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("second target should be active after attach")
-        .set_cookie_manager_policy_cookies_enabled_override_async(true)
-        .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("second target should still be active after cookies enabled override")
-        .set_cookie_manager_policy_browser_context_overrides_async(
-            &moli_cookie_jar::BrowserCookieFacadeContextOverrides::default()
-                .with_site_for_cookies_url(
-                    &url::Url::parse("https://target-b.example/root")
-                        .expect("target-b site-for-cookies url"),
-                ),
-        )
-        .await;
-    let second_surface = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("active browser context after second navigation")
-        .document_cookie_facade_snapshot_async()
-        .await;
+    {
+        let (owner, updates) = ctx.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::capture(conn, None);
+            let updates = conn
+                .browser_context
+                .as_mut()
+                .expect("second target should be active after attach")
+                .start_cookie_manager_policy_mutation_for_test(|surface| {
+                    surface.set_policy_cookies_enabled_override(true)
+                });
+            (owner, updates)
+        });
+        ctx.finish_fixture_page_updates(owner, updates)
+            .await
+            .expect("cookie policy should reach the original Page");
+    };
+    {
+        let (owner, updates) = ctx.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::capture(conn, None);
+            let updates = conn
+                .browser_context
+                .as_mut()
+                .expect("second target should still be active after cookies enabled override")
+                .start_cookie_manager_policy_mutation_for_test(|surface| {
+                    surface.set_policy_browser_context_overrides(
+                        &moli_cookie_jar::BrowserCookieFacadeContextOverrides::default()
+                            .with_site_for_cookies_url(
+                                &url::Url::parse("https://target-b.example/root")
+                                    .expect("target-b site-for-cookies url"),
+                            ),
+                    )
+                });
+            (owner, updates)
+        });
+        ctx.finish_fixture_page_updates(owner, updates)
+            .await
+            .expect("cookie policy should reach the original Page");
+    };
+    let second_surface = {
+        let owner = ctx
+            .run_fixture_page_query(
+                None,
+                "fixture document cookie owner snapshot",
+                |page| page.start_document_cookie_owner_snapshot(),
+                |page, completed| page.finish_document_cookie_owner_snapshot(completed),
+            )
+            .await
+            .ok();
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .expect("active browser context after second navigation")
+                .document_cookie_facade_snapshot_from_owner_for_test(owner.as_ref())
+        })
+    };
     assert_eq!(
         second_surface
             .capability_surface
@@ -581,13 +612,23 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_swi
         first_after_restore["result"]["result"]["value"],
         json!(false)
     );
-    let first_surface = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("restored first target")
-        .document_cookie_facade_snapshot_async()
-        .await;
+    let first_surface = {
+        let owner = ctx
+            .run_fixture_page_query(
+                None,
+                "fixture document cookie owner snapshot",
+                |page| page.start_document_cookie_owner_snapshot(),
+                |page, completed| page.finish_document_cookie_owner_snapshot(completed),
+            )
+            .await
+            .ok();
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .expect("restored first target")
+                .document_cookie_facade_snapshot_from_owner_for_test(owner.as_ref())
+        })
+    };
     assert_eq!(
         first_surface
             .capability_surface
@@ -613,13 +654,23 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_swi
     .await;
     ctx.expect_result(1041699, json!({}), None);
 
-    let second_surface = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("restored second target")
-        .document_cookie_facade_snapshot_async()
-        .await;
+    let second_surface = {
+        let owner = ctx
+            .run_fixture_page_query(
+                None,
+                "fixture document cookie owner snapshot",
+                |page| page.start_document_cookie_owner_snapshot(),
+                |page, completed| page.finish_document_cookie_owner_snapshot(completed),
+            )
+            .await
+            .ok();
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .expect("restored second target")
+                .document_cookie_facade_snapshot_from_owner_for_test(owner.as_ref())
+        })
+    };
     assert_eq!(
         second_surface
             .capability_surface
@@ -652,17 +703,28 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_clo
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .set_cookie_manager_policy_cookies_enabled_override_async(false)
-        .await;
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
+    {
+        let (owner, updates) = ctx.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::capture(conn, None);
+            let updates = conn
+                .browser_context
+                .as_mut()
+                .unwrap()
+                .start_cookie_manager_policy_mutation_for_test(|surface| {
+                    surface.set_policy_cookies_enabled_override(false)
+                });
+            (owner, updates)
+        });
+        ctx.finish_fixture_page_updates(owner, updates)
+            .await
+            .expect("cookie policy should reach the original Page");
+    };
 
     ctx.process_async(json!({
         "id": 10416997,
@@ -690,7 +752,7 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_clo
         .to_owned();
     ctx.expect_event("Target.attachedToTarget", None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 10416999,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -715,32 +777,62 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_clo
     .await;
     ctx.expect_result(104169990, json!({}), None);
 
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("second target should be active after attach")
-        .set_cookie_manager_policy_cookies_enabled_override_async(true)
-        .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .expect("second target should still be active after cookies enabled override")
-        .set_cookie_manager_policy_browser_context_overrides_async(
-            &moli_cookie_jar::BrowserCookieFacadeContextOverrides::default()
-                .with_site_for_cookies_url(
-                    &url::Url::parse("https://target-b-close.example/root")
-                        .expect("target-b close site-for-cookies url"),
-                ),
-        )
-        .await;
+    {
+        let (owner, updates) = ctx.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::capture(conn, None);
+            let updates = conn
+                .browser_context
+                .as_mut()
+                .expect("second target should be active after attach")
+                .start_cookie_manager_policy_mutation_for_test(|surface| {
+                    surface.set_policy_cookies_enabled_override(true)
+                });
+            (owner, updates)
+        });
+        ctx.finish_fixture_page_updates(owner, updates)
+            .await
+            .expect("cookie policy should reach the original Page");
+    };
+    {
+        let (owner, updates) = ctx.with_fixture(|conn| {
+            let owner = crate::conn::CommandOwnerScope::capture(conn, None);
+            let updates = conn
+                .browser_context
+                .as_mut()
+                .expect("second target should still be active after cookies enabled override")
+                .start_cookie_manager_policy_mutation_for_test(|surface| {
+                    surface.set_policy_browser_context_overrides(
+                        &moli_cookie_jar::BrowserCookieFacadeContextOverrides::default()
+                            .with_site_for_cookies_url(
+                                &url::Url::parse("https://target-b-close.example/root")
+                                    .expect("target-b close site-for-cookies url"),
+                            ),
+                    )
+                });
+            (owner, updates)
+        });
+        ctx.finish_fixture_page_updates(owner, updates)
+            .await
+            .expect("cookie policy should reach the original Page");
+    };
 
-    let second_surface = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("active browser context after second target navigation")
-        .document_cookie_facade_snapshot_async()
-        .await;
+    let second_surface = {
+        let owner = ctx
+            .run_fixture_page_query(
+                None,
+                "fixture document cookie owner snapshot",
+                |page| page.start_document_cookie_owner_snapshot(),
+                |page, completed| page.finish_document_cookie_owner_snapshot(completed),
+            )
+            .await
+            .ok();
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .expect("active browser context after second target navigation")
+                .document_cookie_facade_snapshot_from_owner_for_test(owner.as_ref())
+        })
+    };
     assert_eq!(
         second_surface
             .capability_surface
@@ -771,21 +863,33 @@ async fn same_context_targets_restore_their_own_cookie_manager_surface_after_clo
     assert_eq!(close_response["result"]["success"], json!(true));
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context after close activation");
-        assert_eq!(active.active_target_id(), Some("TID-000000000CKC"));
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context after close activation")
+            };
+            assert_eq!(active.active_target_id(), Some("TID-000000000CKC"));
+        });
     }
 
-    let first_surface = ctx
-        .conn
-        .browser_context
-        .as_mut()
-        .expect("restored first target")
-        .document_cookie_facade_snapshot_async()
-        .await;
+    let first_surface = {
+        let owner = ctx
+            .run_fixture_page_query(
+                None,
+                "fixture document cookie owner snapshot",
+                |page| page.start_document_cookie_owner_snapshot(),
+                |page, completed| page.finish_document_cookie_owner_snapshot(completed),
+            )
+            .await
+            .ok();
+        ctx.with_fixture(|conn| {
+            conn.browser_context
+                .as_mut()
+                .expect("restored first target")
+                .document_cookie_facade_snapshot_from_owner_for_test(owner.as_ref())
+        })
+    };
     assert_eq!(
         first_surface
             .capability_surface
@@ -814,11 +918,12 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_switching
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
 
     ctx.process_async(json!({
         "id": 104170,
@@ -838,11 +943,12 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_switching
     .await;
     ctx.expect_result(104171, json!({}), Some("SID-active"));
 
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("loader for target A");
-    assert_eq!(ctx.conn.user_agent(), "Moli/Target-A");
-    assert!(!ctx.conn.tls_verify_host());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("loader for target A")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.user_agent(), "Moli/Target-A"));
+    ctx.with_fixture(|conn| assert!(!conn.tls_verify_host()));
 
     ctx.process_async(json!({
         "id": 104172,
@@ -870,7 +976,7 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_switching
         .to_owned();
     ctx.expect_event("Target.attachedToTarget", None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 104174,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -914,35 +1020,40 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_switching
     ctx.expect_result(104176, json!({}), Some(&second_session_id));
 
     {
-        let browser_context = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_ne!(
-            browser_context.active_target_id(),
-            Some(second_target_id.as_str()),
-            "the second target must still be in the background"
-        );
-        let background = browser_context
-            .page_target(&second_target_id)
-            .expect("background target");
-        assert_eq!(
-            background
-                .effective_policy()
-                .browser_identity_override()
-                .map(|identity| identity.user_agent()),
-            Some("Moli/Target-B")
-        );
-        assert_eq!(background.tls_verify_host_override, Some(true));
-        assert!(
-            background
-                .navigation_engine()
-                .expect("background navigation engine")
-                .fetch_config()
-                .tls_verify_host(),
-            "the exact background engine must be rebuilt before activation"
-        );
+        ctx.with_fixture(|conn| {
+            let background = {
+                let browser_context = {
+                    conn.browser_context
+                        .as_ref()
+                        .expect("active browser context")
+                };
+                assert_ne!(
+                    browser_context.active_target_id(),
+                    Some(second_target_id.as_str()),
+                    "the second target must still be in the background"
+                );
+
+                browser_context
+                    .page_target(&second_target_id)
+                    .expect("background target")
+            };
+            assert_eq!(
+                background
+                    .effective_policy()
+                    .browser_identity_override()
+                    .map(|identity| identity.user_agent()),
+                Some("Moli/Target-B")
+            );
+            assert_eq!(background.tls_verify_host_override, Some(true));
+            assert!(
+                background
+                    .navigation_engine()
+                    .expect("background navigation engine")
+                    .fetch_config()
+                    .tls_verify_host(),
+                "the exact background engine must be rebuilt before activation"
+            );
+        });
     }
 
     ctx.process_async(json!({
@@ -954,30 +1065,33 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_switching
     ctx.expect_result(1041741, json!({}), None);
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_eq!(active.active_target_id(), Some(second_target_id.as_str()));
-        assert_eq!(
-            active
-                .active_page_target()
-                .effective_policy()
-                .browser_identity_override()
-                .map(|identity| identity.user_agent()),
-            Some("Moli/Target-B")
-        );
-        assert_eq!(
-            active.active_page_target().tls_verify_host_override,
-            Some(true)
-        );
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert_eq!(active.active_target_id(), Some(second_target_id.as_str()));
+            assert_eq!(
+                active
+                    .active_page_target()
+                    .effective_policy()
+                    .browser_identity_override()
+                    .map(|identity| identity.user_agent()),
+                Some("Moli/Target-B")
+            );
+            assert_eq!(
+                active.active_page_target().tls_verify_host_override,
+                Some(true)
+            );
+        });
     }
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("loader for target B");
-    assert_eq!(ctx.conn.user_agent(), "Moli/Target-B");
-    assert!(ctx.conn.tls_verify_host());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("loader for target B")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.user_agent(), "Moli/Target-B"));
+    ctx.with_fixture(|conn| assert!(conn.tls_verify_host()));
 
     ctx.process_async(json!({
         "id": 104177,
@@ -988,30 +1102,33 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_switching
     ctx.expect_result(104177, json!({}), None);
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_eq!(active.active_target_id(), Some("TID-000000000UA"));
-        assert_eq!(
-            active
-                .active_page_target()
-                .effective_policy()
-                .browser_identity_override()
-                .map(|identity| identity.user_agent()),
-            Some("Moli/Target-A")
-        );
-        assert_eq!(
-            active.active_page_target().tls_verify_host_override,
-            Some(false)
-        );
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert_eq!(active.active_target_id(), Some("TID-000000000UA"));
+            assert_eq!(
+                active
+                    .active_page_target()
+                    .effective_policy()
+                    .browser_identity_override()
+                    .map(|identity| identity.user_agent()),
+                Some("Moli/Target-A")
+            );
+            assert_eq!(
+                active.active_page_target().tls_verify_host_override,
+                Some(false)
+            );
+        });
     }
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("restored loader for target A");
-    assert_eq!(ctx.conn.user_agent(), "Moli/Target-A");
-    assert!(!ctx.conn.tls_verify_host());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("restored loader for target A")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.user_agent(), "Moli/Target-A"));
+    ctx.with_fixture(|conn| assert!(!conn.tls_verify_host()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1024,28 +1141,33 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_swi
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_mut()
-            .expect("active browser context");
-        active.active_page_target_mut().http_proxy_override =
-            Some("http://proxy-a.test:8080".into());
-        active.active_page_target_mut().http_no_proxy_override = Some("localhost,127.0.0.1".into());
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_mut()
+                    .expect("active browser context")
+            };
+            active.active_page_target_mut().http_proxy_override =
+                Some("http://proxy-a.test:8080".into());
+            active.active_page_target_mut().http_no_proxy_override =
+                Some("localhost,127.0.0.1".into());
+        });
     }
-    ctx.conn.invalidate_resource_runtime_async().await;
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("loader for target A");
-    assert_eq!(ctx.conn.http_proxy(), Some("http://proxy-a.test:8080"));
-    assert_eq!(ctx.conn.http_no_proxy(), Some("localhost,127.0.0.1"));
+    ctx.with_fixture(|conn| conn.invalidate_resource_runtime());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("loader for target A")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.http_proxy(), Some("http://proxy-a.test:8080")));
+    ctx.with_fixture(|conn| assert_eq!(conn.http_no_proxy(), Some("localhost,127.0.0.1")));
 
     ctx.process_async(json!({
         "id": 1041770,
@@ -1073,7 +1195,7 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_swi
         .to_owned();
     ctx.expect_event("Target.attachedToTarget", None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 1041772,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -1099,22 +1221,26 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_swi
     ctx.expect_result(10417721, json!({}), None);
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_mut()
-            .expect("active browser context");
-        assert_eq!(active.active_target_id(), Some(second_target_id.as_str()));
-        active.active_page_target_mut().http_proxy_override =
-            Some("http://proxy-b.test:8080".into());
-        active.active_page_target_mut().http_no_proxy_override = Some("::1,.example.com".into());
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_mut()
+                    .expect("active browser context")
+            };
+            assert_eq!(active.active_target_id(), Some(second_target_id.as_str()));
+            active.active_page_target_mut().http_proxy_override =
+                Some("http://proxy-b.test:8080".into());
+            active.active_page_target_mut().http_no_proxy_override =
+                Some("::1,.example.com".into());
+        });
     }
-    ctx.conn.invalidate_resource_runtime_async().await;
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("loader for target B");
-    assert_eq!(ctx.conn.http_proxy(), Some("http://proxy-b.test:8080"));
-    assert_eq!(ctx.conn.http_no_proxy(), Some("::1,.example.com"));
+    ctx.with_fixture(|conn| conn.invalidate_resource_runtime());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("loader for target B")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.http_proxy(), Some("http://proxy-b.test:8080")));
+    ctx.with_fixture(|conn| assert_eq!(conn.http_no_proxy(), Some("::1,.example.com")));
 
     ctx.process_async(json!({
         "id": 1041773,
@@ -1125,29 +1251,32 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_swi
     ctx.expect_result(1041773, json!({}), None);
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_eq!(active.active_target_id(), Some("TID-000000000PX"));
-        assert_eq!(
-            active.active_page_target().http_proxy_override.as_deref(),
-            Some("http://proxy-a.test:8080")
-        );
-        assert_eq!(
-            active
-                .active_page_target()
-                .http_no_proxy_override
-                .as_deref(),
-            Some("localhost,127.0.0.1")
-        );
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert_eq!(active.active_target_id(), Some("TID-000000000PX"));
+            assert_eq!(
+                active.active_page_target().http_proxy_override.as_deref(),
+                Some("http://proxy-a.test:8080")
+            );
+            assert_eq!(
+                active
+                    .active_page_target()
+                    .http_no_proxy_override
+                    .as_deref(),
+                Some("localhost,127.0.0.1")
+            );
+        });
     }
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("restored loader for target A");
-    assert_eq!(ctx.conn.http_proxy(), Some("http://proxy-a.test:8080"));
-    assert_eq!(ctx.conn.http_no_proxy(), Some("localhost,127.0.0.1"));
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("restored loader for target A")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.http_proxy(), Some("http://proxy-a.test:8080")));
+    ctx.with_fixture(|conn| assert_eq!(conn.http_no_proxy(), Some("localhost,127.0.0.1")));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1160,11 +1289,12 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_close_tar
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
 
     ctx.process_async(json!({
         "id": 104178,
@@ -1210,7 +1340,7 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_close_tar
         .to_owned();
     ctx.expect_event("Target.attachedToTarget", None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 104182,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -1255,30 +1385,33 @@ async fn same_context_targets_restore_their_own_loader_overrides_after_close_tar
     assert_eq!(close_response["result"]["success"], json!(true));
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_eq!(active.active_target_id(), Some("TID-000000000UC"));
-        assert_eq!(
-            active
-                .active_page_target()
-                .effective_policy()
-                .browser_identity_override()
-                .map(|identity| identity.user_agent()),
-            Some("Moli/Close-A")
-        );
-        assert_eq!(
-            active.active_page_target().tls_verify_host_override,
-            Some(false)
-        );
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert_eq!(active.active_target_id(), Some("TID-000000000UC"));
+            assert_eq!(
+                active
+                    .active_page_target()
+                    .effective_policy()
+                    .browser_identity_override()
+                    .map(|identity| identity.user_agent()),
+                Some("Moli/Close-A")
+            );
+            assert_eq!(
+                active.active_page_target().tls_verify_host_override,
+                Some(false)
+            );
+        });
     }
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("restored loader after close activation");
-    assert_eq!(ctx.conn.user_agent(), "Moli/Close-A");
-    assert!(!ctx.conn.tls_verify_host());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("restored loader after close activation")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.user_agent(), "Moli/Close-A"));
+    ctx.with_fixture(|conn| assert!(!conn.tls_verify_host()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1292,31 +1425,33 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_clo
         "<title>first</title><div id='ok'>first target</div>",
     )
     .await;
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .attach_active_session("SID-active");
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .attach_active_session("SID-active")
+    });
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_mut()
-            .expect("active browser context");
-        active.active_page_target_mut().http_proxy_override =
-            Some("http://proxy-close-a.test:8080".into());
-        active.active_page_target_mut().http_no_proxy_override = Some("localhost,127.0.0.1".into());
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_mut()
+                    .expect("active browser context")
+            };
+            active.active_page_target_mut().http_proxy_override =
+                Some("http://proxy-close-a.test:8080".into());
+            active.active_page_target_mut().http_no_proxy_override =
+                Some("localhost,127.0.0.1".into());
+        });
     }
-    ctx.conn.invalidate_resource_runtime_async().await;
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("loader for target A");
-    assert_eq!(
-        ctx.conn.http_proxy(),
-        Some("http://proxy-close-a.test:8080")
-    );
-    assert_eq!(ctx.conn.http_no_proxy(), Some("localhost,127.0.0.1"));
+    ctx.with_fixture(|conn| conn.invalidate_resource_runtime());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("loader for target A")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.http_proxy(), Some("http://proxy-close-a.test:8080")));
+    ctx.with_fixture(|conn| assert_eq!(conn.http_no_proxy(), Some("localhost,127.0.0.1")));
 
     ctx.process_async(json!({
         "id": 1041860,
@@ -1344,7 +1479,7 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_clo
         .to_owned();
     ctx.expect_event("Target.attachedToTarget", None);
 
-    ctx.process_async(json!({
+    ctx.navigate_with_page_events(json!({
         "id": 1041862,
         "method": "Page.navigate",
         "sessionId": second_session_id,
@@ -1370,24 +1505,25 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_clo
     ctx.expect_result(10418620, json!({}), None);
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_mut()
-            .expect("active browser context");
-        active.active_page_target_mut().http_proxy_override =
-            Some("http://proxy-close-b.test:8080".into());
-        active.active_page_target_mut().http_no_proxy_override = Some("::1,.example.com".into());
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_mut()
+                    .expect("active browser context")
+            };
+            active.active_page_target_mut().http_proxy_override =
+                Some("http://proxy-close-b.test:8080".into());
+            active.active_page_target_mut().http_no_proxy_override =
+                Some("::1,.example.com".into());
+        });
     }
-    ctx.conn.invalidate_resource_runtime_async().await;
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("loader for target B");
-    assert_eq!(
-        ctx.conn.http_proxy(),
-        Some("http://proxy-close-b.test:8080")
-    );
-    assert_eq!(ctx.conn.http_no_proxy(), Some("::1,.example.com"));
+    ctx.with_fixture(|conn| conn.invalidate_resource_runtime());
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("loader for target B")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.http_proxy(), Some("http://proxy-close-b.test:8080")));
+    ctx.with_fixture(|conn| assert_eq!(conn.http_no_proxy(), Some("::1,.example.com")));
 
     ctx.process_async(json!({
         "id": 1041863,
@@ -1399,30 +1535,30 @@ async fn same_context_targets_restore_their_own_proxy_loader_overrides_after_clo
     assert_eq!(close_response["result"]["success"], json!(true));
 
     {
-        let active = ctx
-            .conn
-            .browser_context
-            .as_ref()
-            .expect("active browser context");
-        assert_eq!(active.active_target_id(), Some("TID-000000000PC"));
-        assert_eq!(
-            active.active_page_target().http_proxy_override.as_deref(),
-            Some("http://proxy-close-a.test:8080")
-        );
-        assert_eq!(
-            active
-                .active_page_target()
-                .http_no_proxy_override
-                .as_deref(),
-            Some("localhost,127.0.0.1")
-        );
+        ctx.with_fixture(|conn| {
+            let active = {
+                conn.browser_context
+                    .as_ref()
+                    .expect("active browser context")
+            };
+            assert_eq!(active.active_target_id(), Some("TID-000000000PC"));
+            assert_eq!(
+                active.active_page_target().http_proxy_override.as_deref(),
+                Some("http://proxy-close-a.test:8080")
+            );
+            assert_eq!(
+                active
+                    .active_page_target()
+                    .http_no_proxy_override
+                    .as_deref(),
+                Some("localhost,127.0.0.1")
+            );
+        });
     }
-    ctx.conn
-        .ensure_resource_request_client()
-        .expect("restored loader after close activation");
-    assert_eq!(
-        ctx.conn.http_proxy(),
-        Some("http://proxy-close-a.test:8080")
-    );
-    assert_eq!(ctx.conn.http_no_proxy(), Some("localhost,127.0.0.1"));
+    ctx.with_fixture(|conn| {
+        conn.ensure_resource_request_client()
+            .expect("restored loader after close activation")
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.http_proxy(), Some("http://proxy-close-a.test:8080")));
+    ctx.with_fixture(|conn| assert_eq!(conn.http_no_proxy(), Some("localhost,127.0.0.1")));
 }

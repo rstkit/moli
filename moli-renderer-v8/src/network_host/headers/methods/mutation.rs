@@ -1,7 +1,7 @@
 use super::super::store::{
-    HeadersGuard, header_allowed_by_guard, headers_are_immutable, headers_entries, headers_guard,
-    normalized_header_name_or_throw, normalized_header_value_or_throw, normalized_headers_entries,
-    set_headers_entries,
+    header_allowed_by_guard, header_append_allowed_by_guard, headers_are_immutable, headers_guard,
+    headers_list, normalized_header_value_or_throw, set_headers_entries,
+    validated_header_name_or_throw,
 };
 use super::*;
 use crate::webidl;
@@ -33,20 +33,6 @@ fn reject_immutable_headers<'s>(
     true
 }
 
-fn candidate_allowed_by_guard(
-    guard: HeadersGuard,
-    target_name: &str,
-    candidate_entries: &[(String, String)],
-) -> bool {
-    if guard != HeadersGuard::RequestNoCors {
-        return true;
-    }
-    normalized_headers_entries(candidate_entries)
-        .into_iter()
-        .filter(|(name, _)| name == target_name)
-        .all(|(name, value)| header_allowed_by_guard(guard, &name, &value))
-}
-
 pub(in crate::network_host::headers) fn headers_set_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -63,27 +49,26 @@ pub(in crate::network_host::headers) fn headers_set_callback<'s>(
     };
     let name = parsed.name;
     let value = parsed.value;
-    let Some(lower) = normalized_header_name_or_throw(scope, &name) else {
+    let Some(name) = validated_header_name_or_throw(scope, &name) else {
         return;
     };
     let Some(value) = normalized_header_value_or_throw(scope, &value) else {
         return;
     };
     let guard = headers_guard(scope, this);
-    if !header_allowed_by_guard(guard, &lower, &value) {
+    if !header_allowed_by_guard(guard, name, &value) {
         return;
     }
-    let mut entries = headers_entries(scope, this);
+    let mut entries = headers_list(scope, this);
     let insert_at = entries
         .iter()
-        .position(|(entry_name, _)| *entry_name == lower)
+        .position(|(entry_name, _)| entry_name.eq_ignore_ascii_case(name))
         .unwrap_or(entries.len());
-    entries.retain(|(entry_name, _)| *entry_name != lower);
-    let target_name = lower.clone();
-    entries.insert(insert_at.min(entries.len()), (lower, value));
-    if !candidate_allowed_by_guard(guard, &target_name, &entries) {
-        return;
-    }
+    let name = entries
+        .get(insert_at)
+        .map_or_else(|| name.to_owned(), |(entry_name, _)| entry_name.clone());
+    entries.retain(|(entry_name, _)| !entry_name.eq_ignore_ascii_case(&name));
+    entries.insert(insert_at.min(entries.len()), (name, value));
     set_headers_entries(scope, this, &entries);
 }
 
@@ -102,11 +87,11 @@ pub(in crate::network_host::headers) fn headers_delete_callback<'s>(
         return;
     };
     let name = parsed.name;
-    let Some(lower) = normalized_header_name_or_throw(scope, &name) else {
+    let Some(name) = validated_header_name_or_throw(scope, &name) else {
         return;
     };
-    let mut entries = headers_entries(scope, this);
-    entries.retain(|(entry_name, _)| *entry_name != lower);
+    let mut entries = headers_list(scope, this);
+    entries.retain(|(entry_name, _)| !entry_name.eq_ignore_ascii_case(name));
     set_headers_entries(scope, this, &entries);
 }
 
@@ -126,20 +111,17 @@ pub(in crate::network_host::headers) fn headers_append_callback<'s>(
     };
     let name = parsed.name;
     let value = parsed.value;
-    let Some(name) = normalized_header_name_or_throw(scope, &name) else {
+    let Some(name) = validated_header_name_or_throw(scope, &name) else {
         return;
     };
     let Some(value) = normalized_header_value_or_throw(scope, &value) else {
         return;
     };
     let guard = headers_guard(scope, this);
-    if !header_allowed_by_guard(guard, &name, &value) {
+    let mut entries = headers_list(scope, this);
+    if !header_append_allowed_by_guard(guard, name, &value, &entries) {
         return;
     }
-    let mut entries = headers_entries(scope, this);
-    entries.push((name.clone(), value));
-    if !candidate_allowed_by_guard(guard, &name, &entries) {
-        return;
-    }
+    entries.push((name.to_owned(), value));
     set_headers_entries(scope, this, &entries);
 }

@@ -1,8 +1,8 @@
 use super::location_runtime::{
     is_same_document_fragment_navigation, location_href_slot, resolve_location_navigation_target,
-    sync_location_object,
+    sync_location_object, urls_equal_ignoring_fragment,
 };
-use super::navigation_activation::{clear_navigation_transition, install_navigation_transition};
+use super::navigation_activation::install_navigation_transition;
 use super::navigation_callbacks::cancel_active_intercepted_same_document_navigation;
 use super::navigation_entry::history_state_value;
 use super::navigation_entry::{
@@ -13,15 +13,10 @@ use super::navigation_events::{
     NavigationDispatchOutcome, cancel_active_navigation_event,
     dispatch_cross_document_navigation_navigate_event_for_window_with_type_and_form_data,
     dispatch_navigation_navigate_event_with_form_data_and_outcome,
-    dispatch_navigation_navigate_event_with_outcome, dispatch_navigation_success,
-    dispatch_popstate_event, queue_hash_change_for_runtime_owner,
-    run_navigation_precommit_deferred_handlers,
+    dispatch_navigation_navigate_event_with_outcome, dispatch_popstate_event,
+    queue_hash_change_for_runtime_owner,
 };
-use super::navigation_lifecycle::{
-    begin_navigation_attempt, cancel_navigation_attempt, complete_navigation_attempt,
-    finish_navigation_error_events, navigation_attempt_id_from_slot, navigation_attempt_is_active,
-    settle_navigation_transition_finished_local,
-};
+use super::navigation_lifecycle::finish_navigation_error_events;
 use super::navigation_mutation::{
     apply_local_window_location_navigation, apply_navigation_navigate_same_document,
     sync_local_document_front_from_window, update_navigation_current_entry_for_same_document,
@@ -42,18 +37,33 @@ use super::navigation_window::{
 };
 use super::*;
 use crate::native_bridge::NavigationHistoryEntrySeed;
-use crate::util::{context_host_ptr_from_window_object, get_private_value, set_private_value};
+use crate::util::context_host_ptr_for_navigation_owner;
 use crate::webidl;
-use moli_page_types::{
-    NavigationHistoryMutation, SameDocumentHistoryUpdate, cross_document_navigation_seed,
-};
-use moli_webapi_declare::WebApiObject;
+use moli_page_types::{NavigationHistoryMutation, cross_document_navigation_seed};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocationNavigationKind {
     Assign,
     Replace,
     Reload,
+}
+
+pub(crate) fn resolve_cross_window_location_target(
+    scope: &mut v8::PinScope<'_, '_>,
+    raw: &str,
+) -> Option<String> {
+    let entry = scope.get_entered_or_microtask_context();
+    let host = crate::util::context_host_ptr_from_context_slot(entry)
+        .or_else(|| {
+            scope
+                .get_incumbent_context()
+                .and_then(crate::util::context_host_ptr_from_context_slot)
+        })
+        .or_else(|| context_host_ptr_from_global_bridge(scope))?;
+    super::window_runtime::entered_window_api_base_url(scope, unsafe { &*host })
+        .join(raw)
+        .ok()
+        .map(|url| url.to_string())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, strum::EnumString, webidl::WebIdlEnum)]
@@ -87,7 +97,13 @@ pub(crate) fn navigate_location_object<'s>(
 pub(crate) fn navigate_top_level_same_document_from_browser(
     scope: &mut v8::PinScope<'_, '_>,
     target: String,
+    replace_current: bool,
 ) -> bool {
+    let kind = if replace_current {
+        LocationNavigationKind::Replace
+    } else {
+        LocationNavigationKind::Assign
+    };
     let owner = scope.get_current_context().global(scope);
     let Some(location) = window_location_for_holder(scope, owner) else {
         return false;
@@ -95,12 +111,9 @@ pub(crate) fn navigate_top_level_same_document_from_browser(
     let Some(current_href) = location_href_slot(scope, location) else {
         return false;
     };
-    let Some(resolved) = resolve_location_navigation_target(
-        scope,
-        &current_href,
-        LocationNavigationKind::Assign,
-        Some(target.clone()),
-    ) else {
+    let Some(resolved) =
+        resolve_location_navigation_target(scope, &current_href, kind, Some(target.clone()))
+    else {
         return false;
     };
     let current = url::Url::parse(&current_href).ok();
@@ -115,7 +128,7 @@ pub(crate) fn navigate_top_level_same_document_from_browser(
     navigate_location_object_with_source_element_and_child_navigate_event(
         scope,
         location,
-        LocationNavigationKind::Assign,
+        kind,
         Some(target),
         None,
         false,
@@ -129,11 +142,7 @@ pub(crate) fn meta_refresh_navigation_kind(
     target_url: &url::Url,
     delay_ms: u32,
 ) -> LocationNavigationKind {
-    let mut current_without_fragment = current_url.clone();
-    current_without_fragment.set_fragment(None);
-    let mut target_without_fragment = target_url.clone();
-    target_without_fragment.set_fragment(None);
-    if current_without_fragment == target_without_fragment {
+    if urls_equal_ignoring_fragment(current_url, target_url) {
         if target_url.fragment().is_some() {
             LocationNavigationKind::Assign
         } else {
@@ -182,6 +191,34 @@ pub(crate) fn navigate_top_level_meta_refresh(
             && location_href_slot(scope, location).as_deref() == Some(target.as_str()))
 }
 
+/// Classify a delayed child refresh against the URL at execution time, including
+/// exact fragment targets that must keep the current Document.
+pub(crate) fn navigate_child_meta_refresh<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    location: v8::Local<'s, v8::Object>,
+    target: &url::Url,
+    delay_ms: u32,
+) {
+    let Some(current_href) = location_href_slot(scope, location) else {
+        return;
+    };
+    let Ok(current_url) = url::Url::parse(&current_href) else {
+        return;
+    };
+    let kind = meta_refresh_navigation_kind(&current_url, target, delay_ms);
+    let same_document_fragment = kind == LocationNavigationKind::Assign
+        && is_same_document_fragment_navigation(Some(&current_url), target);
+    navigate_location_object_with_source_element_and_child_navigate_event(
+        scope,
+        location,
+        kind,
+        Some(target.to_string()),
+        None,
+        true,
+        same_document_fragment,
+    );
+}
+
 pub(crate) fn navigate_location_object_with_source_element<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     location: v8::Local<'s, v8::Object>,
@@ -220,6 +257,19 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
     dispatch_child_navigate_event_for_all_kinds: bool,
     force_exact_same_document_navigation: bool,
 ) {
+    let owner = runtime_window_owner(scope, location);
+    if let Some(context) = location.get_creation_context(scope)
+        && let Some(host_ptr) = crate::util::context_host_ptr_from_context_slot(context)
+    {
+        let host = unsafe { &*host_ptr };
+        if host
+            .window_execution_context_identity_for_access_check(context)
+            .is_none_or(|identity| !host.window_execution_context_identity_is_current(identity))
+        {
+            return;
+        }
+    }
+    let location = window_location_for_holder(scope, owner).unwrap_or(location);
     let current_href = location_href_slot(scope, location).unwrap_or_default();
     let current_url = url::Url::parse(&current_href).ok();
     let raw_target_is_fragment_only = raw_target
@@ -242,6 +292,34 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
             return;
         }
     };
+    // Entering the destination realm must not turn it into the initiator.
+    // Freeze the incumbent Document before navigation events can run script.
+    let navigation_source = if matches!(kind, LocationNavigationKind::Reload) {
+        None
+    } else {
+        capture_location_navigation_source(scope, owner, &resolved)
+    };
+    if resolved.scheme() == "javascript" {
+        let source_context = scope
+            .get_incumbent_context()
+            .unwrap_or_else(|| scope.get_entered_or_microtask_context());
+        let source_context = v8::Local::new(scope, source_context);
+        if let Some(source_host) = crate::util::context_host_ptr_from_context_slot(source_context) {
+            let host = unsafe { &mut *source_host };
+            let dispatch = host
+                .window_execution_context_identity_for_access_check(source_context)
+                .map(|identity| identity.dispatch_scope())
+                .unwrap_or(crate::native_bridge::OwnerDispatchScope::Top);
+            let scope = &mut v8::ContextScope::new(scope, source_context);
+            if !host.allows_inline_javascript_navigation_by_csp(
+                scope,
+                dispatch,
+                &crate::javascript_url::csp_source(&resolved),
+            ) {
+                return;
+            }
+        }
+    }
     let exact_same_href = current_href == resolved.as_str();
     if !matches!(kind, LocationNavigationKind::Reload)
         && exact_same_href
@@ -266,7 +344,7 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
     if matches!(kind, LocationNavigationKind::Reload)
         && matches!(
             navigation_reload_admission(scope, owner),
-            NavigationReloadAdmission::NoCommittedHistoryItem
+            NavigationReloadAdmission::PendingInitialAttributeNavigation
         )
     {
         return;
@@ -304,7 +382,22 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
         } else {
             super::navigation_window::window_navigation_for_holder(scope, owner)
         };
+        let child_handle = if runtime_window_is_global(scope, owner) {
+            None
+        } else {
+            child_browsing_context_handle_for_runtime_owner(scope, owner)
+        };
+        let replaces_initial_about_blank =
+            super::navigation_window::navigation_document_is_initial_empty(scope, owner)
+                || child_handle.is_some_and(|handle| {
+                    context_host_ptr_for_navigation_owner(scope, owner).is_some_and(|host_ptr| {
+                        unsafe { &*host_ptr }.child_current_document_is_initial_empty(handle)
+                    })
+                });
         let effective_kind = match kind {
+            LocationNavigationKind::Assign if replaces_initial_about_blank => {
+                LocationNavigationKind::Replace
+            }
             LocationNavigationKind::Assign if source_element.is_some() && exact_same_href => {
                 LocationNavigationKind::Replace
             }
@@ -330,7 +423,6 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
         let mut navigate_outcome = navigation.map(|navigation| {
             let _ = cancel_active_navigation_event(scope, navigation);
             cancel_active_intercepted_same_document_navigation(scope, navigation);
-            cancel_active_location_intercepted_same_document_navigation(scope, navigation);
             cancel_pending_same_document_navigation_finishes_including_reentrant(scope, navigation);
             dispatch_navigation_navigate_event_with_outcome(
                 scope,
@@ -361,6 +453,27 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
             .as_ref()
             .is_some_and(|outcome| !outcome.proceed)
         {
+            return;
+        }
+        // Hyperlink fragment activation runs after navigate accepts it.
+        // Intercepted navigation controls its own scroll timing.
+        if source_element.is_some()
+            && runtime_window_is_global(scope, owner)
+            && !navigate_outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.intercepted)
+            && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
+            && let Err(error) = crate::native_bridge::element::scroll_to_document_fragment_target(
+                scope, host_ptr, &resolved,
+            )
+        {
+            if let Some(message) = v8_string(
+                scope,
+                &format!("Layout failed while scrolling to fragment: {error}"),
+            ) {
+                let exception = v8::Exception::error(scope, message);
+                scope.throw_exception(exception);
+            }
             return;
         }
         if let Some(navigation) = navigation {
@@ -402,11 +515,6 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
                 effective_kind,
             );
         }
-        let child_handle = if runtime_window_is_global(scope, owner) {
-            None
-        } else {
-            child_browsing_context_handle_for_runtime_owner(scope, owner)
-        };
         if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
             let state = window_history_for_holder(scope, owner)
                 .map(|history| history_state_value(scope, history))
@@ -423,13 +531,7 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
             if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
                 let host = unsafe { &mut *host_ptr };
                 host.set_document_url(resolved.clone());
-                let history_update = match effective_kind {
-                    LocationNavigationKind::Assign => SameDocumentHistoryUpdate::Push,
-                    LocationNavigationKind::Replace | LocationNavigationKind::Reload => {
-                        SameDocumentHistoryUpdate::Replace
-                    }
-                };
-                host.record_same_document_navigation(&resolved, "fragment", history_update);
+                host.record_same_document_navigation(&resolved, "fragment");
             }
         } else {
             sync_local_document_front_from_window(scope, owner);
@@ -439,15 +541,9 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
                 .as_ref()
                 .is_some_and(|outcome| outcome.intercepted)
             {
-                let mut outcome = navigate_outcome
+                let outcome = navigate_outcome
                     .take()
                     .expect("checked intercepted outcome");
-                if let Some(precommit_event) = outcome.precommit_event {
-                    let (intercept_error, intercept_result) =
-                        run_navigation_precommit_deferred_handlers(scope, precommit_event);
-                    outcome.intercept_error = intercept_error;
-                    outcome.intercept_result = intercept_result.or(outcome.intercept_result);
-                }
                 settle_location_intercepted_same_document_navigation(
                     scope,
                     navigation,
@@ -460,7 +556,7 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
                     scope,
                     navigation,
                     navigate_outcome.as_ref().and_then(|outcome| outcome.signal),
-                    resolved.as_str(),
+                    Some(resolved.as_str()),
                 );
             }
         }
@@ -478,7 +574,6 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
     {
         let _ = cancel_active_navigation_event(scope, navigation);
         cancel_active_intercepted_same_document_navigation(scope, navigation);
-        cancel_active_location_intercepted_same_document_navigation(scope, navigation);
         cancel_pending_same_document_navigation_finishes_including_reentrant(scope, navigation);
         let navigation_type = match kind {
             LocationNavigationKind::Assign if source_element.is_some() && exact_same_href => {
@@ -494,7 +589,7 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
         } else {
             None
         };
-        let mut outcome = dispatch_navigation_navigate_event_with_outcome(
+        let outcome = dispatch_navigation_navigate_event_with_outcome(
             scope,
             navigation,
             resolved.as_str(),
@@ -517,63 +612,12 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
         }
         cancel_pending_same_document_navigation_finishes(scope, navigation);
         if outcome.intercepted {
-            let effective_href = outcome
-                .redirected_url
-                .as_deref()
-                .unwrap_or(resolved.as_str())
-                .to_owned();
-            let effective_kind = outcome
-                .redirected_history
-                .as_deref()
-                .map(|history| match history {
-                    "replace" => LocationNavigationKind::Replace,
-                    _ => LocationNavigationKind::Assign,
-                })
-                .unwrap_or(kind);
-            let transition_resolver = navigation_current_entry(scope, owner).and_then(|from| {
-                install_navigation_transition(
-                    scope,
-                    navigation,
-                    from,
-                    outcome.destination,
-                    match effective_kind {
-                        LocationNavigationKind::Assign => "push",
-                        LocationNavigationKind::Replace => "replace",
-                        LocationNavigationKind::Reload => "reload",
-                    },
-                )
-            });
-            sync_location_object(scope, location, &effective_href);
-            update_navigation_current_entry_for_same_document(
-                scope,
-                owner,
-                &effective_href,
-                effective_kind,
-            );
-            if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
-                && let Ok(url) = url::Url::parse(&effective_href)
-            {
-                let host = unsafe { &mut *host_ptr };
-                host.set_document_url(url.clone());
-                let history_update = match effective_kind {
-                    LocationNavigationKind::Assign => SameDocumentHistoryUpdate::Push,
-                    LocationNavigationKind::Replace | LocationNavigationKind::Reload => {
-                        SameDocumentHistoryUpdate::Replace
-                    }
-                };
-                host.record_same_document_navigation(&url, "fragment", history_update);
-            }
-            if let Some(precommit_event) = outcome.precommit_event {
-                let (intercept_error, intercept_result) =
-                    run_navigation_precommit_deferred_handlers(scope, precommit_event);
-                outcome.intercept_error = intercept_error;
-                outcome.intercept_result = intercept_result.or(outcome.intercept_result);
-            }
-            settle_location_intercepted_same_document_navigation(
+            commit_intercepted_location_navigation(
                 scope,
                 navigation,
                 outcome,
-                transition_resolver,
+                resolved.as_str(),
+                kind,
                 &current_href,
             );
             return;
@@ -582,6 +626,17 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
 
     if let Some(handle) = child_handle {
         let is_javascript_url = resolved.scheme() == "javascript";
+        let host_ptr = context_host_ptr_for_navigation_owner(scope, owner);
+        let replaces_initial_empty_document = !is_javascript_url
+            && matches!(kind, LocationNavigationKind::Assign)
+            && host_ptr.is_some_and(|host_ptr| {
+                unsafe { &*host_ptr }.child_current_document_is_initial_empty(handle)
+            });
+        let kind = if replaces_initial_empty_document {
+            LocationNavigationKind::Replace
+        } else {
+            kind
+        };
         if (matches!(kind, LocationNavigationKind::Assign)
             || dispatch_child_navigate_event_for_all_kinds)
             && !is_javascript_url
@@ -607,11 +662,8 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
             sync_location_object(scope, location, resolved.as_str());
             apply_local_window_location_navigation(scope, owner, &resolved, kind);
         }
-        if let Some(host_ptr) = context_host_ptr_for_navigation_owner(scope, owner) {
+        if let Some(host_ptr) = host_ptr {
             let host = unsafe { &mut *host_ptr };
-            if matches!(kind, LocationNavigationKind::Assign) && !is_javascript_url {
-                host.mark_child_browsing_context_top_level_history_increment(handle);
-            }
             if matches!(kind, LocationNavigationKind::Reload) {
                 host.queue_child_browsing_context_reload_from_existing_seed(
                     handle,
@@ -648,6 +700,112 @@ fn navigate_location_object_with_source_element_and_child_navigate_event<'s>(
             moli_fetch::BrowserNavigationRequestKind::Navigate
         },
     );
+    if let Some((initiator, environment)) = navigation_source {
+        unsafe { &mut *host_ptr }.set_pending_location_navigation_source(initiator, environment);
+    }
+}
+
+/// Cross-origin Location functions are borrowable onto any concrete Location.
+/// Validate the native wrapper instead of the function's original receiver.
+pub(crate) fn is_native_location<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+) -> bool {
+    crate::util::get_private_value(scope, receiver, WINDOW_LOCATION_HREF_SLOT).is_some()
+}
+
+pub(crate) fn navigate_borrowed_location<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+    value: v8::Local<'s, v8::Value>,
+    kind: LocationNavigationKind,
+) -> bool {
+    if !is_native_location(scope, receiver) {
+        return false;
+    }
+    let raw = match crate::webidl::convert::<crate::webidl::UsvString>(
+        scope,
+        value,
+        crate::webidl::Context::member("Location", "href"),
+    ) {
+        Ok(value) => value.0,
+        Err(error) => {
+            crate::webidl::throw_error(scope, &error);
+            return true;
+        }
+    };
+    let Some(context) = receiver.get_creation_context(scope) else {
+        return true;
+    };
+    let scope = &mut v8::ContextScope::new(scope, context);
+    navigate_location_object_with_child_navigate_event(scope, receiver, kind, Some(raw));
+    true
+}
+
+fn capture_location_navigation_source<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<'s, v8::Object>,
+    url: &url::Url,
+) -> Option<(
+    crate::runtime::RendererNavigationInitiator,
+    Option<crate::runtime::RendererCapturedDocumentEnvironment>,
+)> {
+    let source_context = scope.get_incumbent_context()?;
+    let source_host = crate::util::context_host_ptr_from_context_slot(source_context)?;
+    let target_host = crate::util::context_host_ptr_from_window_object(scope, target)?;
+    // The ordinary same-realm path already carries its Document environment.
+    if source_host == target_host {
+        return None;
+    }
+    let source = source_context.global(scope);
+    // Only the browsing context's fixed restrictions survive navigation.
+    // Sandbox CSP from its old response belongs to the retiring Document.
+    let target_sandbox = unsafe { &*target_host }
+        .auxiliary_window()
+        .map(|window| window.frame_sandbox());
+    let scope = &mut v8::ContextScope::new(scope, source_context);
+    let host = unsafe { &mut *source_host };
+    let dispatch = host
+        .window_execution_context_identity_for_access_check(source_context)?
+        .dispatch_scope();
+    let loader = host.document_resource_loader_for_dispatch_scope(dispatch)?;
+    let initiator_url = host
+        .document_referrer_source_url_for_dispatch_scope(dispatch)
+        .unwrap_or_else(|| host.document_url().clone());
+    let mut policy = match dispatch {
+        crate::native_bridge::OwnerDispatchScope::Child(handle) => {
+            host.child_browsing_context_policy_container_snapshot(handle)?
+        }
+        _ => host.document_policy_container().clone(),
+    };
+    policy.referrer_policy =
+        current_document_referrer_policy(scope, source).or(policy.referrer_policy);
+    let initiator = crate::runtime::RendererNavigationInitiator::new(
+        initiator_url,
+        loader.fetch_context().request_origin(),
+        policy.referrer_policy.clone(),
+    );
+    policy.document_referrer = initiator.outgoing_referrer();
+    let base_url = super::window_runtime::entered_window_api_base_url(scope, host);
+    let child = match dispatch {
+        crate::native_bridge::OwnerDispatchScope::Child(handle) => Some(handle),
+        _ => None,
+    };
+    match host.capture_blank_navigation_environment(
+        scope,
+        source,
+        child,
+        url.as_str(),
+        base_url,
+        policy,
+        target_sandbox,
+    ) {
+        Ok(environment) => Some((initiator, environment)),
+        Err(error) => {
+            tracing::debug!(%error, "Location initiator environment capture failed");
+            None
+        }
+    }
 }
 
 fn sandbox_blocks_ancestor_or_top_location_navigation<'s>(
@@ -659,6 +817,14 @@ fn sandbox_blocks_ancestor_or_top_location_navigation<'s>(
     else {
         return false;
     };
+    sandbox_blocks_ancestor_or_top_navigation_from_source(scope, source_handle, owner)
+}
+
+pub(crate) fn sandbox_blocks_ancestor_or_top_navigation_from_source<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source_handle: crate::document_runtime::DomHandle,
+    owner: v8::Local<'s, v8::Object>,
+) -> bool {
     let Some(host_ptr) = context_host_ptr_for_navigation_owner(scope, owner)
         .or_else(|| context_host_ptr_from_global_bridge(scope))
     else {
@@ -682,7 +848,7 @@ fn sandbox_blocks_ancestor_or_top_location_navigation<'s>(
 }
 
 fn child_browsing_context_is_ancestor(
-    host: &JsContextHost,
+    host: &PageScriptHost,
     ancestor: crate::document_runtime::DomHandle,
     child: crate::document_runtime::DomHandle,
 ) -> bool {
@@ -708,8 +874,11 @@ fn window_for_child_cross_document_location_navigation<'s>(
     unsafe { &mut *host_ptr }.existing_child_browsing_context_window_wrapper(scope, handle)
 }
 
+/// Returns whether the caller should queue a cross-document navigation.
+/// Intercepted navigations commit and settle here without redispatching the event.
 pub(crate) fn dispatch_top_level_navigation_event_with_source_element<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    owner: v8::Local<'s, v8::Object>,
     href: &str,
     navigation_type: &str,
     source_element: Option<v8::Local<'s, v8::Object>>,
@@ -717,19 +886,15 @@ pub(crate) fn dispatch_top_level_navigation_event_with_source_element<'s>(
     user_initiated: bool,
     download_request: Option<&str>,
 ) -> bool {
-    let global = scope.get_current_context().global(scope);
-    let Some(navigation) = super::navigation_window::window_navigation_for_holder(scope, global)
+    let Some(navigation) = super::navigation_window::window_navigation_for_holder(scope, owner)
     else {
         return true;
     };
-    let current_href = global
-        .get(scope, v8str(scope, "location").into())
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+    let current_href = window_location_for_holder(scope, owner)
         .and_then(|location| location_href_slot(scope, location))
         .unwrap_or_default();
     let _ = cancel_active_navigation_event(scope, navigation);
     cancel_active_intercepted_same_document_navigation(scope, navigation);
-    cancel_active_location_intercepted_same_document_navigation(scope, navigation);
     cancel_pending_same_document_navigation_finishes_including_reentrant(scope, navigation);
     let outcome = dispatch_navigation_navigate_event_with_outcome(
         scope,
@@ -753,30 +918,43 @@ pub(crate) fn dispatch_top_level_navigation_event_with_source_element<'s>(
         return false;
     }
     cancel_pending_same_document_navigation_finishes(scope, navigation);
-    !outcome.intercepted
+    if outcome.intercepted {
+        let kind = match navigation_type {
+            "replace" => LocationNavigationKind::Replace,
+            "reload" => LocationNavigationKind::Reload,
+            _ => LocationNavigationKind::Assign,
+        };
+        commit_intercepted_location_navigation(
+            scope,
+            navigation,
+            outcome,
+            href,
+            kind,
+            &current_href,
+        );
+        return false;
+    }
+    true
 }
 
 pub(crate) fn dispatch_top_level_form_navigation_event<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    owner: v8::Local<'s, v8::Object>,
     href: &str,
     navigation_type: &str,
     source_element: Option<v8::Local<'s, v8::Object>>,
     user_initiated: bool,
     form_data: v8::Local<'s, v8::Value>,
 ) -> bool {
-    let global = scope.get_current_context().global(scope);
-    let Some(navigation) = super::navigation_window::window_navigation_for_holder(scope, global)
+    let Some(navigation) = super::navigation_window::window_navigation_for_holder(scope, owner)
     else {
         return true;
     };
-    let current_href = global
-        .get(scope, v8str(scope, "location").into())
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+    let current_href = window_location_for_holder(scope, owner)
         .and_then(|location| location_href_slot(scope, location))
         .unwrap_or_default();
     let _ = cancel_active_navigation_event(scope, navigation);
     cancel_active_intercepted_same_document_navigation(scope, navigation);
-    cancel_active_location_intercepted_same_document_navigation(scope, navigation);
     cancel_pending_same_document_navigation_finishes_including_reentrant(scope, navigation);
     let outcome = dispatch_navigation_navigate_event_with_form_data_and_outcome(
         scope,
@@ -811,79 +989,6 @@ fn top_level_document_is_before_load_complete(scope: &mut v8::PinScope<'_, '_>) 
     })
 }
 
-const LOCATION_INTERCEPT_SETTLEMENT_NAVIGATION_SLOT: &str = "__lmLocationInterceptNavigation";
-const LOCATION_INTERCEPT_SETTLEMENT_SIGNAL_SLOT: &str = "__lmLocationInterceptSignal";
-const LOCATION_INTERCEPT_SETTLEMENT_FILENAME_SLOT: &str = "__lmLocationInterceptFilename";
-const LOCATION_INTERCEPT_SETTLEMENT_PROMISE_SLOT: &str = "__lmLocationInterceptPromise";
-const LOCATION_INTERCEPT_SETTLEMENT_TRANSITION_RESOLVER_SLOT: &str =
-    "__lmLocationInterceptTransitionResolver";
-const LOCATION_INTERCEPT_SETTLEMENT_ACTIVE_SLOT: &str = "__lmLocationInterceptActive";
-const LOCATION_INTERCEPT_SETTLEMENT_ATTEMPT_ID_SLOT: &str = "__lmLocationInterceptAttemptId";
-const NAVIGATION_ACTIVE_LOCATION_INTERCEPT_SETTLEMENT_SLOT: &str =
-    "__lmNavigationActiveLocationInterceptSettlement";
-
-#[derive(WebApiObject)]
-#[webapi(interface = "Object")]
-struct LocationInterceptSettlementDataDeclaration<'scope> {
-    #[webapi(slot = LOCATION_INTERCEPT_SETTLEMENT_ACTIVE_SLOT)]
-    active: bool,
-
-    #[webapi(slot = LOCATION_INTERCEPT_SETTLEMENT_ATTEMPT_ID_SLOT)]
-    attempt_id: Option<v8::Local<'scope, v8::BigInt>>,
-
-    #[webapi(slot = LOCATION_INTERCEPT_SETTLEMENT_PROMISE_SLOT)]
-    promise: Option<v8::Local<'scope, v8::Value>>,
-
-    #[webapi(slot = LOCATION_INTERCEPT_SETTLEMENT_NAVIGATION_SLOT)]
-    navigation: v8::Local<'scope, v8::Object>,
-
-    #[webapi(slot = LOCATION_INTERCEPT_SETTLEMENT_SIGNAL_SLOT)]
-    signal: Option<v8::Local<'scope, v8::Object>>,
-
-    #[webapi(slot = LOCATION_INTERCEPT_SETTLEMENT_TRANSITION_RESOLVER_SLOT)]
-    transition_resolver: Option<v8::Local<'scope, v8::PromiseResolver>>,
-
-    #[webapi(slot = LOCATION_INTERCEPT_SETTLEMENT_FILENAME_SLOT)]
-    filename: v8::Local<'scope, v8::String>,
-}
-
-fn navigation_active_location_intercept_settlement<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    navigation: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Object>> {
-    get_private_value(
-        scope,
-        navigation,
-        NAVIGATION_ACTIVE_LOCATION_INTERCEPT_SETTLEMENT_SLOT,
-    )
-    .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-}
-
-fn set_navigation_active_location_intercept_settlement<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    navigation: v8::Local<'s, v8::Object>,
-    data: v8::Local<'s, v8::Object>,
-) {
-    set_private_value(
-        scope,
-        navigation,
-        NAVIGATION_ACTIVE_LOCATION_INTERCEPT_SETTLEMENT_SLOT,
-        data.into(),
-    );
-}
-
-fn clear_navigation_active_location_intercept_settlement<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    navigation: v8::Local<'s, v8::Object>,
-) {
-    set_private_value(
-        scope,
-        navigation,
-        NAVIGATION_ACTIVE_LOCATION_INTERCEPT_SETTLEMENT_SLOT,
-        v8::undefined(scope).into(),
-    );
-}
-
 fn finish_location_navigation_canceled<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     navigation: v8::Local<'s, v8::Object>,
@@ -891,12 +996,70 @@ fn finish_location_navigation_canceled<'s>(
     href: &str,
 ) {
     let error = navigation_dom_exception(scope, "Navigation was canceled", "AbortError");
-    if let Some(signal) = outcome.signal
-        && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
-    {
-        unsafe { &mut *host_ptr }.abort_signal(scope, signal, error);
+    if let Some(signal) = outcome.signal {
+        crate::native_bridge::abort::abort_signal(scope, signal, error);
     }
     finish_navigation_error_events(scope, navigation, error, href);
+}
+
+fn commit_intercepted_location_navigation<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    navigation: v8::Local<'s, v8::Object>,
+    outcome: NavigationDispatchOutcome<'s>,
+    href: &str,
+    kind: LocationNavigationKind,
+    current_href: &str,
+) {
+    let context = navigation
+        .get_creation_context(scope)
+        .unwrap_or_else(|| scope.get_current_context());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let owner = runtime_window_owner(scope, navigation);
+    let effective_href = outcome.redirected_url.as_deref().unwrap_or(href).to_owned();
+    let effective_kind = outcome
+        .redirected_history
+        .as_deref()
+        .map(|history| match history {
+            "replace" => LocationNavigationKind::Replace,
+            _ => LocationNavigationKind::Assign,
+        })
+        .unwrap_or(kind);
+    let transition_resolver = navigation_current_entry(scope, owner).and_then(|from| {
+        install_navigation_transition(
+            scope,
+            navigation,
+            from,
+            outcome.destination,
+            match effective_kind {
+                LocationNavigationKind::Assign => "push",
+                LocationNavigationKind::Replace => "replace",
+                LocationNavigationKind::Reload => "reload",
+            },
+        )
+    });
+    if let Some(location) = window_location_for_holder(scope, owner) {
+        sync_location_object(scope, location, &effective_href);
+    }
+    update_navigation_current_entry_for_same_document(
+        scope,
+        owner,
+        &effective_href,
+        effective_kind,
+    );
+    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
+        && let Ok(url) = url::Url::parse(&effective_href)
+    {
+        let host = unsafe { &mut *host_ptr };
+        host.set_document_url(url.clone());
+        host.record_same_document_navigation(&url, "fragment");
+    }
+    settle_location_intercepted_same_document_navigation(
+        scope,
+        navigation,
+        outcome,
+        transition_resolver,
+        current_href,
+    );
 }
 
 fn settle_location_intercepted_same_document_navigation<'s>(
@@ -906,283 +1069,21 @@ fn settle_location_intercepted_same_document_navigation<'s>(
     transition_resolver: Option<v8::Local<'s, v8::PromiseResolver>>,
     filename: &str,
 ) {
-    if let Some(error) = outcome.intercept_error {
-        finish_location_intercepted_navigation_rejected(
-            scope,
-            navigation,
-            outcome.signal,
-            transition_resolver,
-            error,
-            filename,
-        );
-        return;
-    }
-    let Some(result) = outcome.intercept_result else {
-        dispatch_navigation_success(scope, navigation);
-        settle_navigation_transition_finished_local(scope, navigation, transition_resolver, None);
-        return;
-    };
-    let Some(result_object) = v8::Local::<v8::Object>::try_from(result).ok() else {
-        dispatch_navigation_success(scope, navigation);
-        settle_navigation_transition_finished_local(scope, navigation, transition_resolver, None);
-        return;
-    };
-    let Some(then) = result_object
-        .get(scope, v8str(scope, "then").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-    else {
-        dispatch_navigation_success(scope, navigation);
-        settle_navigation_transition_finished_local(scope, navigation, transition_resolver, None);
-        return;
-    };
-    let attempt_id = begin_navigation_attempt(scope, "location-intercept-settlement")
-        .map(|attempt_id| v8::BigInt::new_from_u64(scope, attempt_id.raw()));
-    let promise = v8::Local::<v8::Promise>::try_from(result)
-        .is_ok()
-        .then_some(result);
-    let filename = v8_string(scope, filename).unwrap_or_else(|| v8::String::empty(scope));
-    let data = LocationInterceptSettlementDataDeclaration::new(
-        true,
-        attempt_id,
-        promise,
+    let owner = runtime_window_owner(scope, navigation);
+    let resolved_value = navigation_current_entry(scope, owner)
+        .map(v8::Local::<v8::Value>::from)
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    super::navigation_callbacks::settle_intercepted_same_document_navigation(
+        scope,
         navigation,
-        outcome.signal,
+        outcome,
+        None,
+        None,
+        None,
         transition_resolver,
+        resolved_value,
         filename,
-    )
-    .bind(scope)
-    .expect("location intercept settlement data should bind");
-    set_navigation_active_location_intercept_settlement(scope, navigation, data);
-    let Some(on_fulfilled) =
-        v8::Function::builder(location_intercept_settlement_fulfilled_callback)
-            .data(data.into())
-            .build(scope)
-    else {
-        complete_location_intercept_settlement_attempt(scope, data);
-        set_location_intercept_settlement_active(scope, navigation, data, false);
-        dispatch_navigation_success(scope, navigation);
-        settle_navigation_transition_finished_local(scope, navigation, transition_resolver, None);
-        return;
-    };
-    let Some(on_rejected) = v8::Function::builder(location_intercept_settlement_rejected_callback)
-        .data(data.into())
-        .build(scope)
-    else {
-        complete_location_intercept_settlement_attempt(scope, data);
-        set_location_intercept_settlement_active(scope, navigation, data, false);
-        dispatch_navigation_success(scope, navigation);
-        settle_navigation_transition_finished_local(scope, navigation, transition_resolver, None);
-        return;
-    };
-    if then
-        .call(scope, result, &[on_fulfilled.into(), on_rejected.into()])
-        .is_none()
-    {
-        cancel_location_intercept_settlement_attempt(scope, data);
-        set_location_intercept_settlement_active(scope, navigation, data, false);
-    }
-}
-
-fn location_intercept_settlement_data<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Value>,
-) -> Option<(
-    v8::Local<'s, v8::Object>,
-    Option<v8::Local<'s, v8::Object>>,
-    Option<v8::Local<'s, v8::Promise>>,
-    Option<v8::Local<'s, v8::PromiseResolver>>,
-    String,
-)> {
-    let data = v8::Local::<v8::Object>::try_from(data).ok()?;
-    let navigation = get_private_value(scope, data, LOCATION_INTERCEPT_SETTLEMENT_NAVIGATION_SLOT)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let signal = get_private_value(scope, data, LOCATION_INTERCEPT_SETTLEMENT_SIGNAL_SLOT)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok());
-    let promise = get_private_value(scope, data, LOCATION_INTERCEPT_SETTLEMENT_PROMISE_SLOT)
-        .and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok());
-    let transition_resolver = get_private_value(
-        scope,
-        data,
-        LOCATION_INTERCEPT_SETTLEMENT_TRANSITION_RESOLVER_SLOT,
-    )
-    .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-    .map(|object| unsafe { v8::Local::<v8::PromiseResolver>::cast_unchecked(object) });
-    let filename = get_private_value(scope, data, LOCATION_INTERCEPT_SETTLEMENT_FILENAME_SLOT)
-        .and_then(|value| value.to_string(scope))
-        .map(|value| value.to_rust_string_lossy(scope))
-        .unwrap_or_default();
-    Some((navigation, signal, promise, transition_resolver, filename))
-}
-
-fn location_intercept_settlement_fulfilled_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    if !location_intercept_settlement_is_active(scope, args.data()) {
-        return;
-    }
-    let Some((navigation, _, _, transition_resolver, _)) =
-        location_intercept_settlement_data(scope, args.data())
-    else {
-        return;
-    };
-    if let Ok(data) = v8::Local::<v8::Object>::try_from(args.data()) {
-        complete_location_intercept_settlement_attempt(scope, data);
-        set_location_intercept_settlement_active(scope, navigation, data, false);
-    }
-    dispatch_navigation_success(scope, navigation);
-    settle_navigation_transition_finished_local(scope, navigation, transition_resolver, None);
-}
-
-fn location_intercept_settlement_rejected_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    if !location_intercept_settlement_is_active(scope, args.data()) {
-        return;
-    }
-    let Some((navigation, signal, promise, transition_resolver, filename)) =
-        location_intercept_settlement_data(scope, args.data())
-    else {
-        return;
-    };
-    if let Ok(data) = v8::Local::<v8::Object>::try_from(args.data()) {
-        complete_location_intercept_settlement_attempt(scope, data);
-        set_location_intercept_settlement_active(scope, navigation, data, false);
-    }
-    let error = promise
-        .filter(|promise| promise.state() == v8::PromiseState::Rejected)
-        .map(|promise| promise.result(scope))
-        .unwrap_or_else(|| args.get(0));
-    finish_location_intercepted_navigation_rejected(
-        scope,
-        navigation,
-        signal,
-        transition_resolver,
-        error,
-        &filename,
     );
-}
-
-fn finish_location_intercepted_navigation_rejected<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    navigation: v8::Local<'s, v8::Object>,
-    signal: Option<v8::Local<'s, v8::Object>>,
-    transition_resolver: Option<v8::Local<'s, v8::PromiseResolver>>,
-    error: v8::Local<'s, v8::Value>,
-    filename: &str,
-) {
-    if let Some(signal) = signal
-        && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
-    {
-        unsafe { &mut *host_ptr }.abort_signal(scope, signal, error);
-    }
-    finish_navigation_error_events(scope, navigation, error, filename);
-    settle_navigation_transition_finished_local(
-        scope,
-        navigation,
-        transition_resolver,
-        Some(error),
-    );
-}
-
-fn cancel_active_location_intercepted_same_document_navigation<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    navigation: v8::Local<'s, v8::Object>,
-) -> bool {
-    let Some(data) = navigation_active_location_intercept_settlement(scope, navigation) else {
-        return false;
-    };
-    if !location_intercept_settlement_is_active(scope, data.into()) {
-        return false;
-    }
-    cancel_location_intercept_settlement_attempt(scope, data);
-    set_location_intercept_settlement_active(scope, navigation, data, false);
-    let Some((navigation, signal, _, transition_resolver, filename)) =
-        location_intercept_settlement_data(scope, data.into())
-    else {
-        return false;
-    };
-    let error = navigation_dom_exception(scope, "Navigation was canceled", "AbortError");
-    if let Some(signal) = signal
-        && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
-    {
-        unsafe { &mut *host_ptr }.abort_signal(scope, signal, error);
-    }
-    finish_navigation_error_events(scope, navigation, error, &filename);
-    if transition_resolver.is_some() {
-        clear_navigation_transition(scope, navigation);
-    }
-    if let Some(transition_resolver) = transition_resolver {
-        let _ = transition_resolver.reject(scope, error);
-    }
-    true
-}
-
-fn location_intercept_settlement_is_active<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Value>,
-) -> bool {
-    v8::Local::<v8::Object>::try_from(data)
-        .ok()
-        .is_some_and(|data| {
-            location_intercept_settlement_active(scope, data)
-                && navigation_attempt_id_from_slot(
-                    scope,
-                    data,
-                    LOCATION_INTERCEPT_SETTLEMENT_ATTEMPT_ID_SLOT,
-                )
-                .is_some_and(|attempt_id| navigation_attempt_is_active(scope, attempt_id))
-        })
-}
-
-fn location_intercept_settlement_active<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, data, LOCATION_INTERCEPT_SETTLEMENT_ACTIVE_SLOT)
-        .is_some_and(|value| value.is_boolean() && value.boolean_value(scope))
-}
-
-fn complete_location_intercept_settlement_attempt<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Object>,
-) {
-    if let Some(attempt_id) =
-        navigation_attempt_id_from_slot(scope, data, LOCATION_INTERCEPT_SETTLEMENT_ATTEMPT_ID_SLOT)
-    {
-        complete_navigation_attempt(scope, attempt_id);
-    }
-}
-
-fn cancel_location_intercept_settlement_attempt<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Object>,
-) {
-    if let Some(attempt_id) =
-        navigation_attempt_id_from_slot(scope, data, LOCATION_INTERCEPT_SETTLEMENT_ATTEMPT_ID_SLOT)
-    {
-        cancel_navigation_attempt(scope, attempt_id);
-    }
-}
-
-fn set_location_intercept_settlement_active<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    navigation: v8::Local<'s, v8::Object>,
-    data: v8::Local<'s, v8::Object>,
-    active: bool,
-) {
-    set_private_value(
-        scope,
-        data,
-        LOCATION_INTERCEPT_SETTLEMENT_ACTIVE_SLOT,
-        v8::Boolean::new(scope, active).into(),
-    );
-    if !active {
-        clear_navigation_active_location_intercept_settlement(scope, navigation);
-    }
 }
 
 fn history_entry_seed_for_cross_document_location<'s>(
@@ -1199,27 +1100,15 @@ fn history_entry_seed_for_cross_document_location<'s>(
         LocationNavigationKind::Replace => NavigationHistoryMutation::Replace,
         LocationNavigationKind::Reload => return None,
     };
-    Some(cross_document_navigation_seed(
+    let mut seed = cross_document_navigation_seed(
         serialize_history_entries(scope, history),
         current_index,
         current_navigation_index,
         resolved,
         mutation,
-    ))
-}
-
-fn context_host_ptr_for_navigation_owner(
-    scope: &mut v8::PinScope<'_, '_>,
-    owner: v8::Local<'_, v8::Object>,
-) -> Option<*mut JsContextHost> {
-    context_host_ptr_from_global_bridge(scope)
-        .or_else(|| context_host_ptr_from_window_object(scope, owner))
-        .or_else(|| {
-            owner
-                .get(scope, v8str(scope, "parent").into())
-                .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-                .and_then(|parent| context_host_ptr_from_window_object(scope, parent))
-        })
+    );
+    super::session_history::capture_for_navigation(scope, owner, &mut seed);
+    Some(seed)
 }
 
 #[cfg(test)]

@@ -1,6 +1,11 @@
+use anyhow::Result;
+
+pub(crate) mod native;
+
 use crate::conn::{CdpConnection, Cmd, CommandOwnerScope};
 use crate::domains::actions::CssAction;
 use crate::domains::command_output::CommandOutputPlan;
+use crate::domains::native::NodeReferenceParams;
 use chromiumoxide_cdp::cdp::browser_protocol::css::{
     GetStyleSheetTextParams as StyleSheetIdParams, SetStyleSheetTextParams,
 };
@@ -8,22 +13,9 @@ use moli_core::page::{
     CompletedPageCommand, Page, PendingPageCommand, RendererDocumentNodeAttributesResolution,
 };
 use moli_css_parse::{DeclarationParseOptions, parse_declaration_list};
-use serde::Deserialize;
 use serde_json::{Value, json};
 
-mod node_references;
 mod style_sheets;
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NodeReferenceParams {
-    #[serde(default)]
-    node_id: Option<u32>,
-    #[serde(default)]
-    backend_node_id: Option<u32>,
-    #[serde(default)]
-    object_id: Option<String>,
-}
 
 pub(crate) struct PendingCssCommandDispatch {
     command_id: Option<u64>,
@@ -36,7 +28,7 @@ pub(crate) struct CompletedCssCommandDispatch {
     command_id: Option<u64>,
     owner_scope: CommandOwnerScope,
     kind: PendingCssCommandKind,
-    completed: Result<CompletedPageCommand, String>,
+    completed: Result<CompletedPageCommand>,
 }
 
 pub(crate) enum CssCommandDispatchStep {
@@ -49,10 +41,6 @@ enum PendingCssCommandKind {
         frame_id: String,
     },
     Disable,
-    ResolveFrontendNodeForComputedStyle,
-    ResolveFrontendNodeForInlineStyle {
-        kind: InlineStyleQueryKind,
-    },
     SetStyleSheetText {
         style_sheet_id: String,
     },
@@ -97,7 +85,7 @@ impl PendingCssCommandDispatch {
             command_id: self.command_id,
             owner_scope: self.owner_scope,
             kind: self.kind,
-            completed: self.pending.wait().await.map_err(|error| error.to_string()),
+            completed: self.pending.wait().await,
         }
     }
 }
@@ -139,12 +127,6 @@ impl PendingCssCommandStartError {
             code: -32000,
             message: error.to_string(),
         }
-    }
-}
-
-impl CssAction {
-    fn requires_document_access(self) -> bool {
-        !matches!(self, Self::Enable | Self::Disable)
     }
 }
 
@@ -216,7 +198,7 @@ fn start_pending_css_command(
     {
         return Err(PendingCssCommandStartError {
             code: -32000,
-            message,
+            message: format!("{message:#}"),
         });
     }
     match action {
@@ -326,22 +308,23 @@ fn start_pending_get_computed_style_for_node_command(
             pending,
         ));
     }
-    if let Some(cdp_node_id) = params.node_id {
-        return node_references::start_frontend_node_binding_for_computed_style(
-            conn,
-            cmd,
-            cdp_node_id,
-        );
-    }
+    let session = conn.target_renderer_runtime_inspector_session_id_for_session(cmd.session_id);
     let Some(page) = loaded_page_mut_for_session(conn, cmd.session_id) else {
         return Err(PendingCssCommandStartError::no_document_loaded());
     };
-    let pending = if let Some(backend_node_id) = params.backend_node_id {
-        page.start_computed_style_properties_for_backend_node_id(backend_node_id)
+    let reference = if let Some(node_id) = params.node_id {
+        moli_core::page::RendererDomNodeReference::FrontendNodeId {
+            inspector_session_id: session,
+            frontend_node_id: node_id,
+        }
+    } else if let Some(id) = params.backend_node_id {
+        moli_core::page::RendererDomNodeReference::BackendNodeId(id)
     } else {
         return Err(PendingCssCommandStartError::node_not_found());
-    }
-    .map_err(PendingCssCommandStartError::renderer_error)?;
+    };
+    let pending = page
+        .start_computed_style_properties(reference)
+        .map_err(PendingCssCommandStartError::renderer_error)?;
     Ok(PendingCssCommandDispatch::from_command(
         conn,
         cmd,
@@ -362,23 +345,22 @@ fn start_pending_inline_style_command(
     if params.object_id.is_some() {
         return Ok(None);
     }
-    if let Some(cdp_node_id) = params.node_id {
-        return node_references::start_frontend_node_binding_for_inline_style(
-            conn,
-            cmd,
-            cdp_node_id,
-            kind,
-        );
-    }
+    let reference = params
+        .node_id
+        .map(crate::automation::DevToolsDomNodeReference::FrontendNodeId)
+        .or_else(|| {
+            params
+                .backend_node_id
+                .map(crate::automation::DevToolsDomNodeReference::BackendNodeId)
+        });
+    let session = conn.target_renderer_runtime_inspector_session_id_for_session(cmd.session_id);
     let Some(page) = loaded_page_mut_for_session(conn, cmd.session_id) else {
         return Err(PendingCssCommandStartError::no_document_loaded());
     };
-    let pending = if let Some(backend_node_id) = params.backend_node_id {
-        page.start_document_node_attributes_for_backend_node_id(backend_node_id)
-    } else {
-        return Err(PendingCssCommandStartError::node_not_found());
-    }
-    .map_err(PendingCssCommandStartError::renderer_error)?;
+    let reference = reference.ok_or_else(PendingCssCommandStartError::node_not_found)?;
+    let pending = page
+        .start_document_node_attributes(reference.into_renderer_reference(session))
+        .map_err(PendingCssCommandStartError::renderer_error)?;
     Ok(Some(PendingCssCommandDispatch::from_command(
         conn,
         cmd,
@@ -392,7 +374,7 @@ pub(crate) fn complete_pending_css_command(
     completed: CompletedCssCommandDispatch,
 ) -> CssCommandDispatchStep {
     let CompletedCssCommandDispatch {
-        command_id,
+        command_id: _,
         owner_scope,
         kind,
         completed,
@@ -442,96 +424,6 @@ pub(crate) fn complete_pending_css_command(
                 },
             )
         }
-        PendingCssCommandKind::ResolveFrontendNodeForComputedStyle => {
-            let completion = match completed {
-                Ok(completion) => completion,
-                Err(error) => {
-                    return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                        -32000, error,
-                    ));
-                }
-            };
-            let backend_node_id = match page.finish_document_frontend_node_binding(completion) {
-                Ok(resolution) => {
-                    match node_references::backend_node_id_from_frontend_resolution(resolution) {
-                        Some(backend_node_id) => backend_node_id,
-                        None => {
-                            return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                                -32000,
-                                "Could not find node with given id",
-                            ));
-                        }
-                    }
-                }
-                Err(error) => {
-                    return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                        -32000,
-                        format!("Could not resolve frontend node binding: {error}"),
-                    ));
-                }
-            };
-            let pending =
-                match page.start_computed_style_properties_for_backend_node_id(backend_node_id) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                            -32000,
-                            error.to_string(),
-                        ));
-                    }
-                };
-            CssCommandDispatchStep::Pending(PendingCssCommandDispatch {
-                command_id,
-                owner_scope,
-                kind: PendingCssCommandKind::GetComputedStyleForNode,
-                pending,
-            })
-        }
-        PendingCssCommandKind::ResolveFrontendNodeForInlineStyle { kind } => {
-            let completion = match completed {
-                Ok(completion) => completion,
-                Err(error) => {
-                    return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                        -32000, error,
-                    ));
-                }
-            };
-            let backend_node_id = match page.finish_document_frontend_node_binding(completion) {
-                Ok(resolution) => {
-                    match node_references::backend_node_id_from_frontend_resolution(resolution) {
-                        Some(backend_node_id) => backend_node_id,
-                        None => {
-                            return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                                -32000,
-                                "Could not find node with given id",
-                            ));
-                        }
-                    }
-                }
-                Err(error) => {
-                    return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                        -32000,
-                        format!("Could not resolve frontend node binding: {error}"),
-                    ));
-                }
-            };
-            let pending =
-                match page.start_document_node_attributes_for_backend_node_id(backend_node_id) {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        return CssCommandDispatchStep::Complete(CommandOutputPlan::error(
-                            -32000,
-                            error.to_string(),
-                        ));
-                    }
-                };
-            CssCommandDispatchStep::Pending(PendingCssCommandDispatch {
-                command_id,
-                owner_scope,
-                kind: PendingCssCommandKind::GetInlineStyleForNode { kind },
-                pending,
-            })
-        }
         PendingCssCommandKind::GetStyleSheet {
             style_sheet_id,
             frame_id,
@@ -545,10 +437,8 @@ pub(crate) fn complete_pending_css_command(
                 }
             };
             CssCommandDispatchStep::Complete(match page.finish_style_sheet_payload(completion) {
-                Ok(Some(payload)) => style_sheets::get_style_sheet_command_output_plan(
-                    &style_sheet_id,
-                    &frame_id,
-                    payload,
+                Ok(Some(payload)) => CommandOutputPlan::result(
+                    style_sheets::get_style_sheet_result(&style_sheet_id, &frame_id, payload),
                 ),
                 Ok(None) => {
                     CommandOutputPlan::error(-32000, "Could not find stylesheet with given id")
@@ -589,7 +479,9 @@ pub(crate) fn complete_pending_css_command(
             };
             CssCommandDispatchStep::Complete(
                 match page.finish_computed_style_properties(completion) {
-                    Ok(Some(properties)) => computed_style_command_output_plan(properties),
+                    Ok(Some(properties)) => {
+                        CommandOutputPlan::result(computed_style_result(properties))
+                    }
                     Ok(None) => {
                         CommandOutputPlan::error(-32000, "Could not find node with given id")
                     }
@@ -625,13 +517,14 @@ pub(crate) fn complete_pending_css_command(
     }
 }
 
-fn computed_style_command_output_plan(properties: Vec<(String, String)>) -> CommandOutputPlan {
-    CommandOutputPlan::result(json!({
+fn computed_style_result(properties: Vec<(String, String)>) -> Value {
+    json!({
                     "computedStyle": properties
                         .into_iter()
                         .map(|(name, value)| json!({ "name": name, "value": value }))
-                        .collect::<Vec<_>>()
-    }))
+                        .collect::<Vec<_>>(),
+        "extraFields": { "isAppearanceBase": false }
+    })
 }
 
 fn inline_style_result_from_attributes_resolution(
@@ -755,7 +648,7 @@ mod tests {
     use crate::domains::page::LOADER_ID;
     use crate::testing::{TestContext, wait_until_renderer_document_load};
     use moli_core::page::{
-        CompletedPageCommand, Page, RENDERER_BACKEND_NODE_ID_START, is_renderer_backend_node_id,
+        CompletedPageCommand, RENDERER_BACKEND_NODE_ID_START, is_renderer_backend_node_id,
     };
     use serde_json::Value;
     use serde_json::json;
@@ -771,35 +664,21 @@ mod tests {
 
     async fn complete_pending_command_task_for_test(
         ctx: &mut TestContext,
-        mut pending: crate::conn::PendingCdpCommandDispatch,
+        pending: crate::conn::PendingCdpCommandDispatch,
     ) -> (Vec<Value>, Vec<CdpSchedulerEvent>) {
-        loop {
-            let completed = pending.wait().await;
-            match ctx.conn.complete_pending_command_dispatch(completed).await {
-                CdpCommandTaskStep::Pending(next) => pending = *next,
-                CdpCommandTaskStep::Complete(outcome) => return outcome.into_parts(),
-            }
-        }
+        ctx.complete_command_task_step_with_events_for_test(CdpCommandTaskStep::Pending(Box::new(
+            pending,
+        )))
+        .await
     }
 
     async fn with_loaded_document_async(ctx: &mut TestContext, html: &str) {
         let mut bc = crate::conn::BrowserContext::new("BID-1".into());
         bc.set_active_target_id("TID-1");
-        ctx.conn.install_browser_context_fixture_for_test(bc);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
         ctx.install_navigation_fixture_for_session_owner(&format!("data:text/html,{html}"), None)
             .await;
         wait_until_renderer_document_load(ctx, None, "TID-1", LOADER_ID).await;
-    }
-
-    fn loaded_page_mut_for_test(ctx: &mut TestContext) -> &mut Page {
-        ctx.conn
-            .browser_context
-            .as_mut()
-            .expect("browser context")
-            .active_page_target_mut()
-            .runtime_slot
-            .loaded_page_mut()
-            .expect("loaded page")
     }
 
     async fn append_live_css_target_without_refreshing_page_snapshot(
@@ -819,18 +698,19 @@ mod tests {
             }})()"#
         );
         let completion = {
-            let page = loaded_page_mut_for_test(ctx);
-            let mutation = json!({
-                "id": 910,
-                "method": "Runtime.evaluate",
-                "params": {
-                    "expression": expression,
-                    "returnByValue": true
-                }
+            let pending = ctx.with_fixture_page(None, |page| {
+                let mutation = json!({
+                    "id": 910,
+                    "method": "Runtime.evaluate",
+                    "params": {
+                        "expression": expression,
+                        "returnByValue": true
+                    }
+                });
+
+                page.start_runtime_protocol_message(mutation.to_string())
+                    .expect("runtime mutation should start")
             });
-            let pending = page
-                .start_runtime_protocol_message(mutation.to_string())
-                .expect("runtime mutation should start");
             pending
                 .wait()
                 .await
@@ -840,15 +720,17 @@ mod tests {
     }
 
     fn start_pending_document_navigation_for_active_session(ctx: &mut TestContext) {
-        let browser_context = ctx
-            .conn
-            .browser_context
-            .as_mut()
-            .expect("browser context should exist");
-        browser_context.attach_active_session("SID-1".to_owned());
-        browser_context
-            .start_document_navigation_for_active_target("PENDING-LOADER".to_owned())
-            .expect("active navigation should start");
+        ctx.with_fixture(|conn| {
+            let browser_context = {
+                conn.browser_context
+                    .as_mut()
+                    .expect("browser context should exist")
+            };
+            browser_context.attach_active_session("SID-1".to_owned());
+            browser_context
+                .start_document_navigation_for_active_target("PENDING-LOADER".to_owned())
+                .expect("active navigation should start");
+        });
         ctx.sent.clear();
     }
 
@@ -1020,7 +902,7 @@ mod tests {
         bc.set_active_target_id("TID-active".to_owned());
         bc.attach_active_session("SID-active".to_owned());
         bc.insert_page_target_host(background);
-        ctx.conn.install_browser_context_fixture_for_test(bc);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
         ctx.install_navigation_fixture_for_session_owner(
             "data:text/html,<html><head><style title='owner'>body { color: red; }</style></head><body><div id='target' style='display:flex;width:123px;color:blue'></div></body></html>",
             Some("SID-background"),
@@ -1088,6 +970,10 @@ mod tests {
         .await;
         let computed = take_response_by_id(&mut ctx, 204);
         assert_eq!(computed["sessionId"], "SID-background");
+        assert_eq!(
+            computed["result"]["extraFields"],
+            json!({ "isAppearanceBase": false })
+        );
         let computed_properties = computed["result"]["computedStyle"]
             .as_array()
             .expect("computedStyle array");
@@ -1129,13 +1015,14 @@ mod tests {
             json!("123px")
         );
 
-        assert_eq!(
-            ctx.conn
-                .browser_context
-                .as_ref()
-                .and_then(BrowserContext::active_target_id),
-            Some("TID-active")
-        );
+        ctx.with_fixture(|conn| {
+            assert_eq!(
+                conn.browser_context
+                    .as_ref()
+                    .and_then(BrowserContext::active_target_id),
+                Some("TID-active")
+            )
+        });
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1144,14 +1031,13 @@ mod tests {
         let mut active = BrowserContext::new("BID-active".to_owned());
         active.set_active_target_id("TID-active".to_owned());
         active.attach_active_session("SID-active".to_owned());
-        ctx.conn.install_browser_context_fixture_for_test(active);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(active));
 
         let mut inactive = BrowserContext::new("BID-inactive".to_owned());
         inactive.set_active_target_id("TID-inactive".to_owned());
         inactive.set_target_url("about:blank".to_owned());
         inactive.attach_active_session("SID-inactive".to_owned());
-        ctx.conn
-            .push_inactive_browser_context_fixture_for_test(inactive);
+        ctx.with_fixture(|conn| conn.push_inactive_browser_context_fixture_for_test(inactive));
         ctx.install_navigation_fixture_for_session_owner(
             "data:text/html,<html><head><style title='inactive'>main { color: red; }</style></head><body><main id='target' style='display:block;height:77px'></main></body></html>",
             Some("SID-inactive"),
@@ -1189,10 +1075,12 @@ mod tests {
             .as_array()
             .expect("computedStyle array");
         assert_eq!(computed_style_property(properties, "height"), Some("77px"));
-        assert_eq!(
-            ctx.conn.browser_context.as_ref().map(|bc| bc.id.as_str()),
-            Some("BID-active")
-        );
+        ctx.with_fixture(|conn| {
+            assert_eq!(
+                conn.browser_context.as_ref().map(|bc| bc.id.as_str()),
+                Some("BID-active")
+            )
+        });
     }
 
     #[test]
@@ -1223,32 +1111,39 @@ mod tests {
     #[tokio::test]
     async fn css_enable_and_disable_toggle_browser_context_state() {
         let mut ctx = TestContext::new();
-        ctx.conn.browser_context = Some(crate::conn::BrowserContext::new_with_page_for_test(
-            "BID-1", "TID-1",
-        ));
+        {
+            let fixture_value = Some(crate::conn::BrowserContext::new_with_page_for_test(
+                "BID-1", "TID-1",
+            ));
+            ctx.with_fixture(|conn| {
+                conn.browser_context = fixture_value;
+            });
+        }
 
         ctx.process_async(json!({"id": 101, "method": "CSS.enable"}))
             .await;
-        assert!(
-            ctx.conn
-                .browser_context
-                .as_ref()
-                .unwrap()
-                .active_page_target()
-                .css_enabled
-        );
+        ctx.with_fixture(|conn| {
+            assert!({
+                conn.browser_context
+                    .as_ref()
+                    .unwrap()
+                    .active_page_target()
+                    .css_enabled
+            })
+        });
         ctx.expect_result(101, json!({}), None);
 
         ctx.process_async(json!({"id": 102, "method": "CSS.disable"}))
             .await;
-        assert!(
-            !ctx.conn
-                .browser_context
-                .as_ref()
-                .unwrap()
-                .active_page_target()
-                .css_enabled
-        );
+        ctx.with_fixture(|conn| {
+            assert!(!{
+                conn.browser_context
+                    .as_ref()
+                    .unwrap()
+                    .active_page_target()
+                    .css_enabled
+            })
+        });
         ctx.expect_result(102, json!({}), None);
     }
 
@@ -1276,8 +1171,8 @@ mod tests {
             .position(|message| message["method"] == json!("CSS.styleSheetAdded"))
             .expect("CSS.styleSheetAdded event");
         assert!(
-            response_pos < first_event_pos,
-            "stylesheet event should follow CSS.enable response: {:?}",
+            first_event_pos < response_pos,
+            "stylesheet event should precede CSS.enable response: {:?}",
             ctx.sent
         );
 
@@ -1438,14 +1333,15 @@ mod tests {
         }))
         .await;
         ctx.expect_result(116, json!({}), Some("SID-1"));
-        assert!(
-            ctx.conn
-                .browser_context
-                .as_ref()
-                .unwrap()
-                .active_page_target()
-                .css_enabled
-        );
+        ctx.with_fixture(|conn| {
+            assert!({
+                conn.browser_context
+                    .as_ref()
+                    .unwrap()
+                    .active_page_target()
+                    .css_enabled
+            })
+        });
 
         ctx.process_async(json!({
             "id": 117,
@@ -1454,14 +1350,15 @@ mod tests {
         }))
         .await;
         ctx.expect_result(117, json!({}), Some("SID-1"));
-        assert!(
-            !ctx.conn
-                .browser_context
-                .as_ref()
-                .unwrap()
-                .active_page_target()
-                .css_enabled
-        );
+        ctx.with_fixture(|conn| {
+            assert!(!{
+                conn.browser_context
+                    .as_ref()
+                    .unwrap()
+                    .active_page_target()
+                    .css_enabled
+            })
+        });
     }
 
     #[tokio::test]
@@ -1533,10 +1430,10 @@ mod tests {
             "params": { "styleSheetId": style_sheet_id }
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .expect("CSS.getStyleSheet should start as a pending command");
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw)
+                .expect("CSS.getStyleSheet should start as a pending command")
+        });
         let (messages, scheduler_events) =
             complete_pending_command_task_for_test(&mut ctx, pending).await;
         assert!(
@@ -1630,10 +1527,10 @@ mod tests {
             }
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .expect("CSS.setStyleSheetText should start as a pending command");
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw)
+                .expect("CSS.setStyleSheetText should start as a pending command")
+        });
         let (messages, scheduler_events) =
             complete_pending_command_task_for_test(&mut ctx, pending).await;
         assert!(
@@ -1668,21 +1565,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn pending_css_command_keeps_background_owner_route_across_completion() {
         let mut ctx = TestContext::new();
-        let active_page = ctx
-            .conn
-            .load_page_via_runtime_async(
+        let active_page = ctx.build_fixture_page(
                 "data:text/html,<html><head><style>body { color: red; }</style></head><body></body></html>",
             )
             .await
             .expect("active page should load");
-        let background_page = ctx
-            .conn
-            .load_page_via_runtime_async(
+        let background_page = ctx.build_fixture_page(
                 "data:text/html,<html><head><style>body { color: green; }</style></head><body></body></html>",
             )
             .await
             .expect("background page should load");
 
+        let active_renderer = crate::conn::RendererPageResidenceIdentity::from_page(&active_page);
+        let background_renderer =
+            crate::conn::RendererPageResidenceIdentity::from_page(&background_page);
         let mut browser_context = BrowserContext::new("BID-css-owner-route".to_owned());
         browser_context.set_active_target_id("TID-css-active".to_owned());
         browser_context
@@ -1700,8 +1596,26 @@ mod tests {
             .background_target_mut("TID-css-background")
             .expect("background target")
             .replace_loaded_page(Some(background_page));
-        ctx.conn
-            .install_browser_context_fixture_for_test(browser_context);
+        ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser_context));
+        // These fixture Pages bypass production attachment. Preserve their
+        // exact stream owners before any command publishes a native response.
+        for (target, renderer) in [
+            ("TID-css-active", active_renderer),
+            ("TID-css-background", background_renderer),
+        ] {
+            let owner = crate::conn::CommandOwnerScope::for_route(
+                crate::conn::CdpSessionRoute::PageTarget {
+                    browser_context_id: "BID-css-owner-route".to_owned(),
+                    target_id: target.to_owned(),
+                    session_key: moli_page_types::DevToolsSessionKey::Primary,
+                },
+            );
+            let residence = ctx.with_fixture(|conn| {
+                conn.target_page_residence_identity_for_owner(&owner)
+                    .unwrap()
+            });
+            ctx.with_fixture(|conn| conn.bind_renderer_page_output_owner(renderer, residence));
+        }
 
         let background_session = attach_page_session_async(&mut ctx, "TID-css-background").await;
         let active_style_sheet_id = inline_style_sheet_id_for_session_async(&mut ctx, None).await;
@@ -1717,10 +1631,10 @@ mod tests {
             "sessionId": background_session
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .expect("background CSS.setStyleSheetText should start pending");
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw)
+                .expect("background CSS.setStyleSheetText should start pending")
+        });
         let (messages, scheduler_events) =
             complete_pending_command_task_for_test(&mut ctx, pending).await;
 
@@ -1838,10 +1752,10 @@ mod tests {
             "params": { "nodeId": node_id }
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .expect("CSS.getComputedStyleForNode should start as a pending command");
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw)
+                .expect("CSS.getComputedStyleForNode should start as a pending command")
+        });
         let (messages, scheduler_events) =
             complete_pending_command_task_for_test(&mut ctx, pending).await;
         assert!(
@@ -1875,10 +1789,11 @@ mod tests {
             "params": { "nodeId": node_id }
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .expect("CSS.getComputedStyleForNode should query the renderer for stale low nodeId");
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw).expect(
+                "CSS.getComputedStyleForNode should query the renderer for stale low nodeId",
+            )
+        });
         let (messages, scheduler_events) =
             complete_pending_command_task_for_test(&mut ctx, pending).await;
         assert!(
@@ -1897,10 +1812,11 @@ mod tests {
             })
         );
 
-        let page = loaded_page_mut_for_test(&mut ctx);
-        let _ = page
-            .finish_runtime_protocol_message(mutation_completion)
-            .expect("runtime mutation completion should finish");
+        ctx.with_fixture_page(None, |page| {
+            let _ = page
+                .finish_runtime_protocol_message(mutation_completion)
+                .expect("runtime mutation completion should finish");
+        });
     }
 
     #[tokio::test]
@@ -1918,14 +1834,15 @@ mod tests {
             create_response["result"]["targetId"].as_str().is_some(),
             "Target.createTarget should return target id: {create_response}"
         );
-        assert!(
-            ctx.conn
-                .browser_context
-                .as_ref()
-                .expect("browser context")
-                .has_loaded_page(),
-            "Target.createTarget should install initial about:blank page before CSS observation"
-        );
+        ctx.with_fixture(|conn| {
+            assert!(
+                conn.browser_context
+                    .as_ref()
+                    .expect("browser context")
+                    .has_loaded_page(),
+                "Target.createTarget should install initial about:blank page before CSS observation"
+            )
+        });
 
         let body_node_id = query_selector_node_id_async(&mut ctx, "body").await;
         ctx.process_async(json!({
@@ -1995,10 +1912,10 @@ mod tests {
             "params": { "backendNodeId": backend_node_id }
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .expect("CSS.getInlineStylesForNode should still complete through the renderer");
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw)
+                .expect("CSS.getInlineStylesForNode should still complete through the renderer")
+        });
         let (messages, scheduler_events) =
             complete_pending_command_task_for_test(&mut ctx, pending).await;
         assert!(
@@ -2017,10 +1934,11 @@ mod tests {
             })
         );
 
-        let page = loaded_page_mut_for_test(&mut ctx);
-        let _ = page
-            .finish_runtime_protocol_message(mutation_completion)
-            .expect("runtime mutation completion should finish");
+        ctx.with_fixture_page(None, |page| {
+            let _ = page
+                .finish_runtime_protocol_message(mutation_completion)
+                .expect("runtime mutation completion should finish");
+        });
     }
 
     #[tokio::test]
@@ -2056,73 +1974,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_inline_and_matched_styles_complete_through_pending_renderer_command() {
-        let mut ctx = TestContext::new();
-        with_loaded_document_async(
-            &mut ctx,
-            "<html><body><main id='target' style='width: 12px; --token: yes'></main></body></html>",
-        )
-        .await;
-        let node_id = query_selector_node_id_async(&mut ctx, "#target").await;
-        let backend_node_id =
-            backend_node_id_for_frontend_node_id_async(&mut ctx, 210, node_id).await;
+    async fn get_node_styles_complete_through_pending_renderer_command() {
+        use moli_page_types::RendererInspectorResponseDelivery::{AdapterReply, SessionSink};
 
-        let inline_raw = json!({
-            "id": 211,
-            "method": "CSS.getInlineStylesForNode",
-            "params": { "nodeId": node_id }
-        })
-        .to_string();
-        let inline_pending = match ctx.conn.start_command_dispatch(&inline_raw) {
-            CdpCommandTaskStep::Pending(pending) => pending,
-            CdpCommandTaskStep::Complete(_) => {
-                panic!("CSS.getInlineStylesForNode should start as a pending command")
+        for delivery in [SessionSink, AdapterReply] {
+            let mut ctx = TestContext::new();
+            with_loaded_document_async(
+                &mut ctx,
+                "<html><body><main id='target' style='width: 12px; --token: yes'></main></body></html>",
+            )
+            .await;
+            let node_id = query_selector_node_id_async(&mut ctx, "#target").await;
+            let backend_node_id =
+                backend_node_id_for_frontend_node_id_async(&mut ctx, 210, node_id).await;
+            let references = [
+                (json!({ "nodeId": node_id }), true),
+                (json!({ "backendNodeId": backend_node_id }), true),
+                (
+                    json!({ "nodeId": node_id, "backendNodeId": u32::MAX }),
+                    true,
+                ),
+                (
+                    json!({ "nodeId": u32::MAX, "backendNodeId": backend_node_id }),
+                    false,
+                ),
+            ];
+            let mut id = 211;
+            for method in [
+                "CSS.getInlineStylesForNode",
+                "CSS.getMatchedStylesForNode",
+                "CSS.getComputedStyleForNode",
+            ] {
+                for (params, found) in &references {
+                    let command = crate::conn::ParsedCdpCommand::parse_value(json!({
+                        "id": id,
+                        "method": method,
+                        "params": params,
+                    }))
+                    .expect("style command should parse");
+                    let mut context = crate::conn::CommandDispatchContext::default();
+                    context.set_terminal_response_delivery_override(delivery);
+                    let mut step = ctx.with_fixture(|conn| {
+                        conn.start_parsed_command_dispatch_with_context(&command, &mut context)
+                    });
+                    assert!(matches!(step, CdpCommandTaskStep::Pending(_)));
+                    let outcome = loop {
+                        match step {
+                            CdpCommandTaskStep::Complete(outcome) => break outcome,
+                            CdpCommandTaskStep::Pending(pending) => {
+                                let completed = Box::pin(pending.wait()).await;
+                                step = ctx
+                                    .state
+                                    .with_state(|state| {
+                                        state.complete_command_dispatch_with_context(
+                                            completed,
+                                            &mut context,
+                                        )
+                                    })
+                                    .unwrap();
+                            }
+                        }
+                    };
+                    let (messages, events) =
+                        ctx.route_completed_command_outcome_for_test(outcome).await;
+                    assert!(
+                        events.is_empty(),
+                        "style lookup scheduler events: {events:?}"
+                    );
+                    let responses = messages
+                        .iter()
+                        .filter(|message| message["id"] == json!(id))
+                        .collect::<Vec<_>>();
+                    assert_eq!(responses.len(), 1, "{delivery:?} {method}: {messages:?}");
+                    let response = responses[0];
+                    if *found {
+                        assert!(response["error"].is_null(), "{response}");
+                        let result = &response["result"];
+                        if method == "CSS.getComputedStyleForNode" {
+                            let properties = result["computedStyle"]
+                                .as_array()
+                                .expect("computed style properties");
+                            assert_eq!(computed_style_property(properties, "width"), Some("12px"));
+                        } else {
+                            assert_eq!(
+                                css_property(&result["inlineStyle"], "width")["value"],
+                                json!("12px")
+                            );
+                            assert_eq!(
+                                css_property(&result["inlineStyle"], "--token")["value"],
+                                json!("yes")
+                            );
+                            if method == "CSS.getMatchedStylesForNode" {
+                                assert_eq!(result["matchedCSSRules"], json!([]));
+                                assert_eq!(result["cssKeyframesRules"], json!([]));
+                            }
+                        }
+                    } else {
+                        assert_eq!(
+                            response["error"],
+                            json!({
+                                "code": -32000,
+                                "message": "Could not find node with given id",
+                            })
+                        );
+                    }
+                    id += 1;
+                }
             }
-        };
-        let (inline_messages, inline_events) =
-            complete_pending_command_task_for_test(&mut ctx, *inline_pending).await;
-        assert!(
-            inline_events.is_empty(),
-            "inline style pending lookup should not enqueue scheduler events: {inline_events:?}"
-        );
-        let inline_response = inline_messages
-            .iter()
-            .find(|message| message["id"] == json!(211))
-            .expect("CSS.getInlineStylesForNode response");
-        assert_eq!(
-            css_property(&inline_response["result"]["inlineStyle"], "width")["value"],
-            json!("12px")
-        );
-
-        let matched_raw = json!({
-            "id": 212,
-            "method": "CSS.getMatchedStylesForNode",
-            "params": { "backendNodeId": backend_node_id }
-        })
-        .to_string();
-        let matched_pending = match ctx.conn.start_command_dispatch(&matched_raw) {
-            CdpCommandTaskStep::Pending(pending) => pending,
-            CdpCommandTaskStep::Complete(_) => {
-                panic!("CSS.getMatchedStylesForNode should start as a pending command")
-            }
-        };
-        let (matched_messages, matched_events) =
-            complete_pending_command_task_for_test(&mut ctx, *matched_pending).await;
-        assert!(
-            matched_events.is_empty(),
-            "matched style pending lookup should not enqueue scheduler events: {matched_events:?}"
-        );
-        let matched_response = matched_messages
-            .iter()
-            .find(|message| message["id"] == json!(212))
-            .expect("CSS.getMatchedStylesForNode response");
-        let matched_result = &matched_response["result"];
-        assert_eq!(
-            css_property(&matched_result["inlineStyle"], "--token")["value"],
-            json!("yes")
-        );
-        assert_eq!(matched_result["matchedCSSRules"], json!([]));
-        assert_eq!(matched_result["cssKeyframesRules"], json!([]));
+        }
     }
 
     #[tokio::test]
@@ -2361,16 +2320,26 @@ mod tests {
             "params": { "objectId": object_id }
         })
         .to_string();
-        let pending = ctx
-            .conn
-            .try_start_pending_command_dispatch(&raw)
-            .expect("CSS.getComputedStyleForNode objectId should start as a pending command");
+        let pending = ctx.with_fixture(|conn| {
+            conn.try_start_pending_command_dispatch(&raw)
+                .expect("CSS.getComputedStyleForNode objectId should start as a pending command")
+        });
         let completed = pending.wait().await;
-        let step = ctx.conn.complete_pending_command_dispatch(completed).await;
+        let step = {
+            ctx.state
+                .with_state(|state| {
+                    state.complete_command_dispatch_with_context(
+                        completed,
+                        &mut crate::conn::CommandDispatchContext::default(),
+                    )
+                })
+                .expect("live test owner")
+        };
         let CdpCommandTaskStep::Complete(outcome) = step else {
             panic!("CSS objectId computed style should complete after one renderer command");
         };
-        let (messages, scheduler_events) = outcome.into_parts();
+        let (messages, scheduler_events) =
+            ctx.route_completed_command_outcome_for_test(outcome).await;
         assert!(
             scheduler_events.is_empty(),
             "computed style objectId lookup should not enqueue scheduler events: {scheduler_events:?}"

@@ -2,14 +2,14 @@ use super::super::*;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct ProgressEventTargetDeclaration<'scope> {
     target: v8::Local<'scope, v8::Object>,
     current_target: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct ProgressEventInitDeclaration {
     length_computable: bool,
     loaded: f64,
@@ -32,8 +32,9 @@ pub(crate) fn make_progress_event<'s>(
             .bind(scope)
             .expect("XHR progress event target declaration should bind"),
     };
+    let state = crate::context_bootstrap::event_backing(scope, event);
     ProgressEventTargetDeclaration::new(target, target)
-        .initialize(scope, event)
+        .initialize(scope, state)
         .expect("XHR progress event target declaration should initialize");
     event
 }

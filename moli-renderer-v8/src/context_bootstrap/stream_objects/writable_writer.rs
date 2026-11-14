@@ -1,17 +1,15 @@
 use super::*;
-use crate::util::{get_private_value, v8str};
+use crate::util::v8str;
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_streams::writable::{AcquireWriterPlan, DesiredSizePlan, WriterWriteEntryPlan};
 use moli_webapi_declare::WebApiObject;
 
 const WRITER_LOCK_RELEASED_MESSAGE: &str = "WritableStreamDefaultWriter lock released";
-const WRITABLE_STREAM_WRITER_BRAND_SLOT: &str = "__moliWritableStreamWriterBrand";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "WritableStreamDefaultWriter")]
+#[webapi(interface = web_api_interfaces::WritableStreamDefaultWriter)]
 struct WritableStreamWriterObjectDeclaration<'scope> {
-    #[webapi(slot = WRITABLE_STREAM_WRITER_BRAND_SLOT, init = true)]
-    brand: (),
     #[webapi(slot = WRITABLE_STREAM_WRITER_STREAM_SLOT)]
     stream: v8::Local<'scope, v8::Object>,
     #[webapi(slot = WRITABLE_STREAM_WRITER_READY_PROMISE_SLOT, init = "undefined")]
@@ -23,7 +21,7 @@ struct WritableStreamWriterObjectDeclaration<'scope> {
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "WritableStreamDefaultWriter")]
 struct WritableStreamWriterConstructorArgs<'s> {
-    #[webidl(required)]
+    #[webidl(required, interface = web_api_interfaces::WritableStream)]
     stream: v8::Local<'s, v8::Object>,
 }
 
@@ -57,14 +55,9 @@ pub(in crate::context_bootstrap) fn writable_stream_default_writer_constructor_c
     else {
         return;
     };
-    if !is_writable_stream_object(scope, parsed.stream) {
-        throw_type_error(
-            scope,
-            "WritableStreamDefaultWriter constructor requires a WritableStream",
-        );
-        return;
-    }
-    if writable_stream_snapshot(scope, parsed.stream).plan_acquire_writer()
+    let stream = moli_webapi_declare::web_api_object_target(scope, parsed.stream)
+        .expect("converted WritableStream argument");
+    if writable_stream_snapshot(scope, stream).plan_acquire_writer()
         == AcquireWriterPlan::RejectLocked
     {
         throw_type_error(
@@ -73,10 +66,10 @@ pub(in crate::context_bootstrap) fn writable_stream_default_writer_constructor_c
         );
         return;
     }
-    WritableStreamWriterObjectDeclaration::new(parsed.stream)
+    WritableStreamWriterObjectDeclaration::new(stream)
         .initialize(scope, args.this())
         .expect("WritableStreamDefaultWriter declaration should initialize constructed object");
-    acquire_writable_stream_writer(scope, args.this(), parsed.stream);
+    acquire_writable_stream_writer(scope, args.this(), stream);
     rv.set(args.this().into());
 }
 
@@ -282,6 +275,5 @@ fn writable_stream_writer_is_branded<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     writer: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, writer, WRITABLE_STREAM_WRITER_BRAND_SLOT)
-        .is_some_and(|value| value.is_true())
+    web_api_interfaces::WritableStreamDefaultWriter::is_instance(scope, writer)
 }

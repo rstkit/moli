@@ -5,7 +5,7 @@
 #   "fonttools==4.59.0",
 # ]
 # ///
-"""Generate the deterministic fixed fonts used by Phase 3 layout tests."""
+"""Generate deterministic fonts for layout and system font matching tests."""
 
 import hashlib
 import os
@@ -20,6 +20,7 @@ from fontTools.ttLib import TTFont
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "moli-layout" / "tests" / "fixtures"
 TTF_PATH = FIXTURES / "moli-ahem.ttf"
+SYSTEM_FONT_TTF_PATH = ROOT / "moli-system-fonts" / "tests" / "fixtures" / "moli-ahem.ttf"
 HEBREW_EMOJI_PATH = FIXTURES / "moli-hebrew-emoji.ttf"
 CJK_PATH = FIXTURES / "moli-cjk.ttf"
 DEJAVU_SOURCE = Path(
@@ -56,7 +57,7 @@ def box_glyph():
     return pen.glyph()
 
 
-def build_ttf() -> None:
+def build_ttf(output: Path = TTF_PATH, advance: int = 600) -> None:
     builder = FontBuilder(1000, isTTF=True)
     codepoints = list(range(0x21, 0x7F))
     codepoints += [0x00A0, 0x00DF]
@@ -78,7 +79,7 @@ def build_ttf() -> None:
     glyphs = {name: box_glyph() for name in glyph_names.values()}
     glyphs.update({".notdef": box_glyph(), "space": empty_glyph()})
     builder.setupGlyf(glyphs)
-    builder.setupHorizontalMetrics({glyph: (600, 0) for glyph in glyph_order})
+    builder.setupHorizontalMetrics({glyph: (advance, 0) for glyph in glyph_order})
     builder.setupHorizontalHeader(ascent=800, descent=-200, lineGap=0)
     builder.setupNameTable(
         {
@@ -103,7 +104,7 @@ def build_ttf() -> None:
     builder.setupPost()
     builder.setupMaxp()
     builder.setupHead(created=OPEN_TYPE_UNIX_EPOCH, modified=OPEN_TYPE_UNIX_EPOCH)
-    builder.save(TTF_PATH)
+    builder.save(output)
 
 
 def verify_source(source: Path, expected_sha256: str) -> None:
@@ -142,6 +143,10 @@ def main() -> None:
     verify_source(DEJAVU_SOURCE, DEJAVU_SOURCE_SHA256)
     verify_source(DROID_CJK_SOURCE, DROID_CJK_SOURCE_SHA256)
     build_ttf()
+    build_ttf(FIXTURES / "moli-ahem-narrow.ttf", 500)
+    build_ttf(FIXTURES / "moli-ahem-wide.ttf", 1000)
+    SYSTEM_FONT_TTF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SYSTEM_FONT_TTF_PATH.write_bytes(TTF_PATH.read_bytes())
     convert("woff")
     convert("woff2")
     subset_font(DEJAVU_SOURCE, HEBREW_EMOJI_PATH, [0x20, 0x05D0, 0x05D1, 0x1F600])

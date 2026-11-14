@@ -1,3 +1,4 @@
+use crate::web_api_interfaces;
 use std::collections::HashSet;
 
 use super::super::element::{
@@ -5,7 +6,7 @@ use super::super::element::{
 };
 use super::super::node::{node_is_document, node_runtime_and_handle_from_args};
 use crate::document_runtime::DomHandle;
-use crate::native_bridge::JsContextHost;
+use crate::native_bridge::{PageScriptHost, set_wrapped_handle_or_null_for_receiver};
 use crate::util::{
     context_host_ptr_from_global_bridge, get_private_value, node_wrapper_from_handle,
     serialize_v8_array, throw_type_error, v8_string, v8str,
@@ -21,7 +22,7 @@ const CARET_POSITION_RECT_WIDTH_SLOT: &str = "__moliCaretPositionRectWidth";
 const CARET_POSITION_RECT_HEIGHT_SLOT: &str = "__moliCaretPositionRectHeight";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CaretPosition")]
+#[webapi(interface = web_api_interfaces::CaretPosition)]
 struct CaretPositionDeclaration<'scope> {
     #[webapi(slot = CARET_POSITION_OFFSET_NODE_SLOT)]
     offset_node: v8::Local<'scope, v8::Object>,
@@ -38,7 +39,7 @@ struct CaretPositionDeclaration<'scope> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CaretPosition", enumerable)]
+#[webapi(interface = web_api_interfaces::CaretPosition, enumerable)]
 struct CaretPositionPrototypeDeclaration {
     #[webapi(accessor_property, getter = caret_position_offset_node_getter)]
     offset_node: (),
@@ -68,7 +69,7 @@ struct DocumentElementsFromPointArgs {
 
 fn parse_caret_shadow_roots_argument(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     args: &v8::FunctionCallbackArguments<'_>,
 ) -> Option<Vec<DomHandle>> {
     if args.length() < 3 || args.get(2).is_null_or_undefined() {
@@ -134,7 +135,7 @@ fn visual_line_starts(text: &str, cols: usize) -> Vec<usize> {
 }
 
 fn textarea_caret_offset_and_rect(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     rect: ClientRect,
     x: f64,
@@ -212,20 +213,8 @@ fn textarea_caret_offset_and_rect(
     )
 }
 
-fn child_offset(runtime: &JsContextHost, parent: DomHandle, child: DomHandle) -> u32 {
+fn child_offset(runtime: &PageScriptHost, parent: DomHandle, child: DomHandle) -> u32 {
     runtime.dom_host().child_index(parent, child).unwrap_or(0) as u32
-}
-
-fn client_rect_from_quad(quad: moli_layout::LayoutQuad) -> ClientRect {
-    let rect = quad.bounding_rect();
-    ClientRect {
-        left: f64::from(rect.x),
-        top: f64::from(rect.y),
-        right: f64::from(rect.right()),
-        bottom: f64::from(rect.bottom()),
-        width: f64::from(rect.width),
-        height: f64::from(rect.height),
-    }
 }
 
 fn box_rect_for_source(
@@ -233,17 +222,17 @@ fn box_rect_for_source(
     ancestor_boxes: &[(DomHandle, moli_layout::LayoutBoxModel)],
 ) -> Option<ClientRect> {
     ancestor_boxes.iter().find_map(|(candidate, model)| {
-        (*candidate == source).then(|| client_rect_from_quad(model.border))
+        (*candidate == source).then(|| ClientRect::from(model.border))
     })
 }
 
 fn caret_candidate_from_layout(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     position: &moli_layout::LayoutCaretPosition<DomHandle>,
     x: f64,
     y: f64,
 ) -> (DomHandle, u32, ClientRect) {
-    let caret_rect = client_rect_from_quad(position.rect);
+    let caret_rect = ClientRect::from(position.rect);
     if let Some(offset) = position.utf16_offset {
         return (
             position.source,
@@ -282,7 +271,7 @@ fn caret_candidate_from_layout(
 }
 
 fn shadow_host_parent_caret(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     shadow_root: DomHandle,
     ancestor_boxes: &[(DomHandle, moli_layout::LayoutBoxModel)],
     fallback_rect: ClientRect,
@@ -305,7 +294,7 @@ fn shadow_host_parent_caret(
 }
 
 fn retarget_caret_position(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     mut node: DomHandle,
     mut offset: u32,
     mut rect: ClientRect,
@@ -418,10 +407,13 @@ pub(crate) fn install_caret_position_template_bindings<'s>(
 
 fn build_caret_position_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
     node: DomHandle,
     offset: u32,
     rect: ClientRect,
 ) -> Option<v8::Local<'s, v8::Object>> {
+    let context = receiver.get_creation_context(scope)?;
+    let scope = &mut v8::ContextScope::new(scope, context);
     let wrapper = node_wrapper_from_handle(scope, node)?;
     CaretPositionDeclaration::new(
         wrapper,
@@ -438,7 +430,7 @@ fn build_caret_position_object<'s>(
 fn document_runtime_and_handle_from_args<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
-) -> std::result::Result<(*mut JsContextHost, DomHandle), String> {
+) -> anyhow::Result<(*mut PageScriptHost, DomHandle)> {
     node_runtime_and_handle_from_args(scope, args).or_else(|error| {
         let Some(runtime_ptr) = context_host_ptr_from_global_bridge(scope) else {
             return Err(error);
@@ -449,7 +441,7 @@ fn document_runtime_and_handle_from_args<'s>(
     })
 }
 
-fn element_for_hit_source(runtime: &JsContextHost, mut handle: DomHandle) -> Option<DomHandle> {
+fn element_for_hit_source(runtime: &PageScriptHost, mut handle: DomHandle) -> Option<DomHandle> {
     loop {
         let node = runtime.dom_host().node(handle)?;
         if node.is_element() {
@@ -463,7 +455,7 @@ fn element_for_hit_source(runtime: &JsContextHost, mut handle: DomHandle) -> Opt
     }
 }
 
-fn list_hit_accepts_non_element_source(runtime: &JsContextHost, source: DomHandle) -> bool {
+fn list_hit_accepts_non_element_source(runtime: &PageScriptHost, source: DomHandle) -> bool {
     let Some(parent) = runtime
         .dom_host()
         .node(source)
@@ -486,7 +478,7 @@ fn list_hit_accepts_non_element_source(runtime: &JsContextHost, source: DomHandl
     parent.is_html_element("slot") || parent.is_svg_text_content_element()
 }
 
-fn element_for_list_hit_source(runtime: &JsContextHost, source: DomHandle) -> Option<DomHandle> {
+fn element_for_list_hit_source(runtime: &PageScriptHost, source: DomHandle) -> Option<DomHandle> {
     let node = runtime.dom_host().node(source)?;
     if !node.is_element() && !list_hit_accepts_non_element_source(runtime, source) {
         return None;
@@ -495,7 +487,7 @@ fn element_for_list_hit_source(runtime: &JsContextHost, source: DomHandle) -> Op
 }
 
 fn retarget_element_to_tree_scope(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     mut element: DomHandle,
     tree_scope: DomHandle,
 ) -> Option<DomHandle> {
@@ -518,7 +510,7 @@ fn point_is_inside_viewport(metrics: moli_layout::LayoutDocumentMetrics, x: f64,
 }
 
 fn element_at_point(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     document: DomHandle,
     tree_scope: DomHandle,
     x: f64,
@@ -527,13 +519,16 @@ fn element_at_point(
     // A single-point query intentionally keeps a foremost text hit and maps
     // it to its web-exposed parent element. This is observably different from
     // the penetrating-list filtering performed by `elements_at_point`.
-    let (metrics, hit) = observable_hit_test(
+    let (metrics, hit) = match observable_hit_test(
         runtime,
         document,
         moli_layout::LayoutPoint::new(x as f32, y as f32),
         false,
-        moli_layout::LayoutFlushReason::HitTest,
-    )?;
+    ) {
+        Ok(answer) => answer,
+        Err(moli_layout::LayoutError::NoLayoutSnapshot) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if !point_is_inside_viewport(metrics, x, y) {
         return Ok(None);
     }
@@ -543,19 +538,22 @@ fn element_at_point(
 }
 
 fn elements_at_point(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     document: DomHandle,
     tree_scope: DomHandle,
     x: f64,
     y: f64,
 ) -> Result<Vec<DomHandle>, moli_layout::LayoutError> {
-    let (metrics, hits) = observable_hit_test_all(
+    let (metrics, hits) = match observable_hit_test_all(
         runtime,
         document,
         moli_layout::LayoutPoint::new(x as f32, y as f32),
         false,
-        moli_layout::LayoutFlushReason::HitTest,
-    )?;
+    ) {
+        Ok(answer) => answer,
+        Err(moli_layout::LayoutError::NoLayoutSnapshot) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     if !point_is_inside_viewport(metrics, x, y) {
         return Ok(Vec::new());
     }
@@ -594,8 +592,11 @@ fn throw_hit_test_layout_error(scope: &mut v8::PinScope<'_, '_>, error: moli_lay
 
 fn element_array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
     elements: impl IntoIterator<Item = DomHandle>,
 ) -> Option<v8::Local<'s, v8::Array>> {
+    let context = receiver.get_creation_context(scope)?;
+    let scope = &mut v8::ContextScope::new(scope, context);
     let wrappers = elements
         .into_iter()
         .filter_map(|handle| node_wrapper_from_handle(scope, handle))
@@ -622,13 +623,13 @@ pub(in crate::native_bridge) fn node_document_element_from_point_callback<'s>(
     let runtime = unsafe { &*runtime_ptr };
     match element_at_point(runtime, handle, handle, parsed.x, parsed.y) {
         Ok(element) => {
-            if let Some(element) =
-                element.and_then(|element| node_wrapper_from_handle(scope, element))
-            {
-                rv.set(element.into());
-            } else {
-                rv.set_null();
-            }
+            set_wrapped_handle_or_null_for_receiver(
+                scope,
+                &mut rv,
+                runtime_ptr,
+                args.this(),
+                element,
+            );
         }
         Err(error) => {
             throw_hit_test_layout_error(scope, error);
@@ -656,7 +657,8 @@ pub(in crate::native_bridge) fn node_document_elements_from_point_callback<'s>(
     let runtime = unsafe { &*runtime_ptr };
     match elements_at_point(runtime, handle, handle, parsed.x, parsed.y) {
         Ok(elements) => {
-            let array = element_array(scope, elements).unwrap_or_else(|| v8::Array::new(scope, 0));
+            let array = element_array(scope, args.this(), elements)
+                .unwrap_or_else(|| v8::Array::new(scope, 0));
             rv.set(array.into());
         }
         Err(error) => {
@@ -691,7 +693,6 @@ pub(in crate::native_bridge) fn node_document_caret_position_from_point_callback
         runtime,
         handle,
         moli_layout::LayoutPoint::new(parsed.x as f32, parsed.y as f32),
-        moli_layout::LayoutFlushReason::HitTest,
     ) {
         Ok(Some(position)) => {
             let (node, offset, rect) =
@@ -704,13 +705,14 @@ pub(in crate::native_bridge) fn node_document_caret_position_from_point_callback
                 &shadow_roots,
                 &position.ancestor_boxes,
             );
-            if let Some(caret) = build_caret_position_object(scope, node, offset, rect) {
+            if let Some(caret) = build_caret_position_object(scope, args.this(), node, offset, rect)
+            {
                 rv.set(caret.into());
             } else {
                 rv.set_null();
             }
         }
-        Ok(None) => rv.set_null(),
+        Ok(None) | Err(moli_layout::LayoutError::NoLayoutSnapshot) => rv.set_null(),
         Err(error) => {
             throw_hit_test_layout_error(scope, error);
             rv.set_null();
@@ -741,13 +743,13 @@ pub(in crate::native_bridge) fn node_shadow_root_element_from_point_callback<'s>
     };
     match element_at_point(runtime, document, handle, parsed.x, parsed.y) {
         Ok(element) => {
-            if let Some(element) =
-                element.and_then(|element| node_wrapper_from_handle(scope, element))
-            {
-                rv.set(element.into());
-            } else {
-                rv.set_null();
-            }
+            set_wrapped_handle_or_null_for_receiver(
+                scope,
+                &mut rv,
+                runtime_ptr,
+                args.this(),
+                element,
+            );
         }
         Err(error) => {
             throw_hit_test_layout_error(scope, error);
@@ -779,7 +781,8 @@ pub(in crate::native_bridge) fn node_shadow_root_elements_from_point_callback<'s
     };
     match elements_at_point(runtime, document, handle, parsed.x, parsed.y) {
         Ok(elements) => {
-            let array = element_array(scope, elements).unwrap_or_else(|| v8::Array::new(scope, 0));
+            let array = element_array(scope, args.this(), elements)
+                .unwrap_or_else(|| v8::Array::new(scope, 0));
             rv.set(array.into());
         }
         Err(error) => {

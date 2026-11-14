@@ -4,19 +4,23 @@ use super::super::node::{
     remove_child_in_reaction_scope,
 };
 use super::{
-    JsContextHost, detached_document_content_type_value, detached_native_handle_for_runtime,
-    is_html_document, throw_dom_exception,
+    PageScriptHost, detached_native_handle_for_runtime, is_html_document, throw_dom_exception,
 };
 use crate::native_bridge::element::{
-    char_offset_to_byte_index, contenteditable_editing_host, dispatch_text_control_event,
-    is_text_control, queue_text_control_document_selection_change_event,
-    replace_contenteditable_selection, replace_text_control_selection, text_control_value,
+    TextEditInputType, contenteditable_editing_host, dispatch_text_control_event,
+    form_control_is_effectively_disabled, is_text_control,
+    queue_text_control_document_selection_change_event, replace_contenteditable_selection,
+    replace_text_control_selection, replace_text_control_selection_for_insert_html,
+    text_control_value,
 };
 use crate::{
-    context_bootstrap::WINDOW_EVENT_HANDLER_PROPERTIES,
     custom_elements,
     document_runtime::DomHandle,
-    util::{call_object_method, node_wrapper_from_handle, v8str},
+    util::{
+        call_object_method, node_wrapper_from_handle, utf16_next_scalar_boundary,
+        utf16_previous_scalar_boundary, utf16_replace_units_range_lossy,
+        utf16_scalar_boundary_at_or_after, utf16_units, v8str,
+    },
     webidl,
 };
 
@@ -98,20 +102,19 @@ fn node_document_write_or_writeln_callback<'s>(
         return;
     }
     if implicit_replacement_session {
-        clear_window_event_handlers(scope);
-        runtime.prepare_root_document_replacement(scope, runtime_ptr, handle);
+        PageScriptHost::prepare_root_document_replacement(scope, runtime_ptr, handle);
     }
     for chunk in parsed.text {
-        let _ = runtime.write_html(scope, runtime_ptr, handle, &chunk);
+        let _ = unsafe { &mut *runtime_ptr }.write_html(scope, runtime_ptr, handle, &chunk);
     }
     if append_newline {
-        let _ = runtime.write_html(scope, runtime_ptr, handle, "\n");
+        let _ = unsafe { &mut *runtime_ptr }.write_html(scope, runtime_ptr, handle, "\n");
     }
     rv.set_undefined();
 }
 
 fn current_script_ignores_document_write_without_parser_insertion_point(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
 ) -> bool {
     let Some(current_script) = runtime.current_script_handle() else {
         return false;
@@ -181,30 +184,29 @@ pub(in crate::native_bridge) fn node_document_open_callback<'s>(
         }
         let runtime = unsafe { &mut *runtime_ptr };
         if !runtime.has_active_parser_write_insertion_point() {
-            clear_window_event_handlers(scope);
-            runtime.prepare_root_document_replacement(scope, runtime_ptr, handle);
+            PageScriptHost::prepare_root_document_replacement(scope, runtime_ptr, handle);
         }
     }
     rv.set(args.this().into());
 }
 
-fn clear_window_event_handlers(scope: &mut v8::PinScope<'_, '_>) {
-    let global = scope.get_current_context().global(scope);
-    let null = v8::null(scope).into();
-    for name in WINDOW_EVENT_HANDLER_PROPERTIES {
-        let _ = global.set(scope, v8str(scope, name).into(), null);
-    }
-}
-
-impl JsContextHost {
+impl PageScriptHost {
     fn prepare_root_document_replacement(
-        &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         document_handle: DomHandle,
     ) {
-        self.dispatch_document_open_descendant_frame_unload_lifecycle(scope, document_handle);
-        self.clear_event_callbacks_for_document_replacement(document_handle, true);
+        let owner = unsafe { &*host_ptr }.current_main_document_task_owner();
+        Self::dispatch_document_open_descendant_frame_unload_lifecycle(
+            scope,
+            host_ptr,
+            document_handle,
+        );
+        if unsafe { &*host_ptr }.current_main_document_task_owner() != owner {
+            return;
+        }
+        unsafe { &mut *host_ptr }
+            .clear_event_callbacks_for_document_replacement(document_handle, true);
         custom_elements::with_custom_element_reaction_scope(scope, host_ptr, |scope| {
             let _ = unsafe { &mut *host_ptr }.remove_all_children_for_document_replacement(
                 scope,
@@ -212,25 +214,23 @@ impl JsContextHost {
                 document_handle,
             );
         });
-        self.open_root_document(scope);
+        if unsafe { &*host_ptr }.current_main_document_task_owner() == owner {
+            Self::open_root_document(scope, host_ptr);
+        }
     }
 
     /// Replaces the active root document through the native document stream.
-    ///
-    /// This is the internal equivalent of Blink's `Document::SetContent`: it
-    /// deliberately bypasses the page-visible `document.open/write/close`
-    /// properties, which may have been replaced by page script.
+    /// Bypasses page-visible document methods without retaining a host borrow
+    /// across descendant retirement callbacks.
     pub(crate) fn set_root_document_content(
-        &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         html: &str,
     ) {
-        let document_handle = self.document_handle();
-        clear_window_event_handlers(scope);
-        self.prepare_root_document_replacement(scope, host_ptr, document_handle);
-        let _ = self.write_html(scope, host_ptr, document_handle, html);
-        self.close_document(scope, host_ptr);
+        let document_handle = unsafe { &*host_ptr }.document_handle();
+        Self::prepare_root_document_replacement(scope, host_ptr, document_handle);
+        let _ = unsafe { &mut *host_ptr }.write_html(scope, host_ptr, document_handle, html);
+        unsafe { &mut *host_ptr }.close_document(scope, host_ptr);
     }
 }
 
@@ -303,7 +303,7 @@ pub(in crate::native_bridge) fn node_document_close_callback<'s>(
 }
 
 fn detached_html_document_body_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     document_handle: DomHandle,
 ) -> Option<DomHandle> {
     let dom = runtime.dom_host().dom();
@@ -314,7 +314,7 @@ fn detached_html_document_body_handle(
 
 pub(in crate::native_bridge) fn set_detached_html_document_body_html(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document_handle: DomHandle,
     html: &str,
 ) -> bool {
@@ -329,7 +329,7 @@ pub(in crate::native_bridge) fn set_detached_html_document_body_html(
 
 pub(in crate::native_bridge) fn append_detached_html_document_body_html(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document_handle: DomHandle,
     html: &str,
 ) -> bool {
@@ -358,36 +358,15 @@ fn normalized_editing_command<'s>(
         .unwrap_or_default()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 enum EditingCommand {
     Copy,
     Delete,
     ForwardDelete,
+    InsertHtml,
     InsertText,
     SelectAll,
-}
-
-impl EditingCommand {
-    fn parse(command: &str) -> Option<Self> {
-        match command {
-            "copy" => Some(Self::Copy),
-            "delete" => Some(Self::Delete),
-            "forwarddelete" => Some(Self::ForwardDelete),
-            "inserttext" => Some(Self::InsertText),
-            "selectall" => Some(Self::SelectAll),
-            _ => None,
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Copy => "copy",
-            Self::Delete => "delete",
-            Self::ForwardDelete => "forwarddelete",
-            Self::InsertText => "inserttext",
-            Self::SelectAll => "selectall",
-        }
-    }
 }
 
 fn editing_command_document<'s>(
@@ -395,7 +374,7 @@ fn editing_command_document<'s>(
     args: &v8::FunctionCallbackArguments<'s>,
     rv: &mut v8::ReturnValue<'s, v8::Value>,
     non_html_message: &'static str,
-) -> Option<(*mut JsContextHost, DomHandle)> {
+) -> Option<(*mut PageScriptHost, DomHandle)> {
     let Ok((runtime_ptr, document_handle)) =
         node_runtime_and_handle_from_object_or_detached(scope, args.this())
     else {
@@ -411,9 +390,7 @@ fn editing_command_document<'s>(
         || runtime
             .dom_host()
             .document_content_type_for_handle(document_handle)
-            .is_some_and(|content_type| content_type.eq_ignore_ascii_case("application/xhtml+xml"))
-        || detached_document_content_type_value(scope, args.this())
-            .eq_ignore_ascii_case("application/xhtml+xml");
+            .is_some_and(|content_type| content_type.eq_ignore_ascii_case("application/xhtml+xml"));
     if !supports_editing_commands {
         throw_dom_exception(scope, "InvalidStateError", 11, non_html_message);
         return None;
@@ -435,7 +412,7 @@ pub(in crate::native_bridge) fn node_document_exec_command_callback<'s>(
     ) else {
         return;
     };
-    let Some(command) = EditingCommand::parse(&command) else {
+    let Ok(command) = command.parse::<EditingCommand>() else {
         rv.set(v8::Boolean::new(scope, false).into());
         return;
     };
@@ -452,39 +429,55 @@ pub(in crate::native_bridge) fn node_document_exec_command_callback<'s>(
             return;
         }
         EditingCommand::InsertText => {
-            let replacement = if args.length() > 2 {
-                let Some(value) = args.get(2).to_string(scope) else {
-                    return;
-                };
-                value.to_rust_string_lossy(scope)
-            } else {
-                String::new()
+            let Some(value) = editing_command_value(scope, &args) else {
+                return;
             };
-            let inserted = exec_command_insert_text(scope, runtime_ptr, &replacement);
+            let inserted = exec_command_insert_text(scope, runtime_ptr, &value);
+            rv.set(v8::Boolean::new(scope, inserted).into());
+            return;
+        }
+        EditingCommand::InsertHtml => {
+            let Some(value) = editing_command_value(scope, &args) else {
+                return;
+            };
+            let inserted = exec_command_insert_html(scope, runtime_ptr, &value);
             rv.set(v8::Boolean::new(scope, inserted).into());
             return;
         }
         EditingCommand::Delete | EditingCommand::ForwardDelete => {}
     }
-    let removed = exec_command_delete_selection(scope, runtime_ptr, args.this(), command.name());
+    let command_name: &'static str = command.into();
+    let removed = exec_command_delete_selection(scope, runtime_ptr, args.this(), command_name);
     rv.set(v8::Boolean::new(scope, removed).into());
 }
 
 fn exec_command_insert_text(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     replacement: &str,
 ) -> bool {
     let Some(active) = unsafe { &*runtime_ptr }.active_element_handle() else {
         return false;
     };
     if is_text_control(unsafe { &*runtime_ptr }, active) {
-        return replace_text_control_selection(scope, runtime_ptr, active, replacement);
+        return replace_text_control_selection(
+            scope,
+            runtime_ptr,
+            active,
+            replacement,
+            TextEditInputType::InsertText,
+        );
     }
     let Some(editing_host) = contenteditable_editing_host(unsafe { &*runtime_ptr }, active) else {
         return false;
     };
-    replace_contenteditable_selection(scope, runtime_ptr, editing_host, replacement)
+    replace_contenteditable_selection(
+        scope,
+        runtime_ptr,
+        editing_host,
+        replacement,
+        TextEditInputType::InsertText,
+    )
 }
 
 pub(in crate::native_bridge) fn node_document_query_command_supported_callback<'s>(
@@ -501,7 +494,7 @@ pub(in crate::native_bridge) fn node_document_query_command_supported_callback<'
     ) else {
         return;
     };
-    rv.set(v8::Boolean::new(scope, EditingCommand::parse(&command).is_some()).into());
+    rv.set(v8::Boolean::new(scope, command.parse::<EditingCommand>().is_ok()).into());
 }
 
 pub(in crate::native_bridge) fn node_document_query_command_enabled_callback<'s>(
@@ -519,21 +512,20 @@ pub(in crate::native_bridge) fn node_document_query_command_enabled_callback<'s>
         return;
     };
     let runtime = unsafe { &*runtime_ptr };
-    let enabled = match EditingCommand::parse(&command) {
-        Some(
-            EditingCommand::Delete | EditingCommand::ForwardDelete | EditingCommand::InsertText,
-        ) => {
+    let enabled = match command.parse::<EditingCommand>() {
+        Ok(EditingCommand::Delete | EditingCommand::ForwardDelete | EditingCommand::InsertText) => {
             runtime.document_design_mode_enabled(document_handle)
                 || runtime.active_element_handle().is_some_and(|active| {
                     is_text_control(runtime, active)
                         || contenteditable_editing_host(runtime, active).is_some()
                 })
         }
-        Some(EditingCommand::SelectAll) => {
+        Ok(EditingCommand::InsertHtml) => exec_command_insert_html_target(runtime).is_some(),
+        Ok(EditingCommand::SelectAll) => {
             exec_command_select_all_target(runtime, document_handle).is_some()
         }
-        Some(EditingCommand::Copy) => current_protocol_user_gesture_activation(scope),
-        None => false,
+        Ok(EditingCommand::Copy) => current_protocol_user_gesture_activation(scope),
+        Err(_) => false,
     };
     rv.set(v8::Boolean::new(scope, enabled).into());
 }
@@ -596,7 +588,7 @@ pub(in crate::native_bridge) fn node_document_query_command_value_callback<'s>(
 
 fn exec_command_select_all<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document: v8::Local<'s, v8::Object>,
     document_handle: DomHandle,
 ) -> bool {
@@ -618,10 +610,12 @@ fn exec_command_select_all<'s>(
 }
 
 fn exec_command_select_all_target(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     document_handle: DomHandle,
 ) -> Option<DomHandle> {
-    let active_modal_dialog = current_modal_dialog(runtime);
+    let active_modal_dialog = runtime
+        .dom_host()
+        .active_modal_dialog_for_document(document_handle);
     if let Some(active) = runtime.active_element_handle()
         && let Some(editing_host) = contenteditable_editing_host(runtime, active)
         && active_modal_dialog
@@ -641,33 +635,53 @@ fn exec_command_select_all_target(
         .or(Some(document_handle))
 }
 
-fn current_modal_dialog(runtime: &JsContextHost) -> Option<DomHandle> {
-    runtime
-        .dom_host()
-        .dom()
-        .nodes()
-        .iter()
-        .rev()
-        .find_map(|node| {
-            if !node.is_connected() {
-                return None;
-            }
-            let element = node.as_element()?;
-            (element.is_html_element("dialog")
-                && element.dialog_modal()
-                && element.attribute("open").is_some())
-            .then_some(node.id())
-        })
-}
-
 fn current_protocol_user_gesture_activation(scope: &mut v8::PinScope<'_, '_>) -> bool {
     crate::util::context_host_ptr_from_global_bridge(scope)
         .is_some_and(|host_ptr| unsafe { (&*host_ptr).protocol_user_gesture_activation() })
 }
 
+fn editing_command_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+) -> Option<String> {
+    if args.length() < 3 {
+        return Some(String::new());
+    }
+    args.get(2)
+        .to_string(scope)
+        .map(|value| value.to_rust_string_lossy(scope))
+}
+
+fn exec_command_insert_html(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    value: &str,
+) -> bool {
+    let runtime = unsafe { &*runtime_ptr };
+    let Some(target) = exec_command_insert_html_target(runtime) else {
+        return false;
+    };
+    let insertion_text = super::insert_html::text_control_text_from_html(runtime, target, value);
+    replace_text_control_selection_for_insert_html(scope, runtime_ptr, target, &insertion_text)
+}
+
+fn exec_command_insert_html_target(runtime: &PageScriptHost) -> Option<DomHandle> {
+    let handle = runtime.active_element_handle()?;
+    let element = runtime.dom_host().node(handle)?.as_element()?;
+    let accepts_plain_text = element.is_html_textarea()
+        || (element.is_html_input() && element.input_type().supports_text_length_validation());
+    if !accepts_plain_text
+        || element.has_attribute("readonly")
+        || form_control_is_effectively_disabled(runtime, handle)
+    {
+        return None;
+    }
+    Some(handle)
+}
+
 fn exec_command_delete_selection<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document: v8::Local<'s, v8::Object>,
     command: &str,
 ) -> bool {
@@ -721,7 +735,7 @@ fn exec_command_delete_selection<'s>(
 
 fn exec_command_delete_text_control(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     command: &str,
 ) -> Option<bool> {
@@ -730,7 +744,8 @@ fn exec_command_delete_text_control(
         return None;
     }
     let value = text_control_value(runtime, handle);
-    let value_len = value.chars().count() as u32;
+    let value_units = utf16_units(&value);
+    let value_len = value_units.len() as u32;
     let (start, end) = runtime
         .dom_host()
         .node(handle)
@@ -745,24 +760,33 @@ fn exec_command_delete_text_control(
             }
         })
         .unwrap_or((value_len, value_len));
-    let (from, to, caret) = if start != end {
-        (start, end, start)
+    // Selection APIs expose code units, but native editing first resolves both
+    // endpoints to caret positions that cannot split a surrogate pair.
+    let start = utf16_scalar_boundary_at_or_after(&value_units, start as usize) as u32;
+    let end = utf16_scalar_boundary_at_or_after(&value_units, end as usize) as u32;
+    let (from, to) = if start != end {
+        (start, end)
     } else if command == "forwarddelete" {
-        if start >= value_len {
-            return Some(true);
-        }
-        (start, start + 1, start)
+        (
+            start,
+            utf16_next_scalar_boundary(&value_units, start as usize) as u32,
+        )
     } else {
-        if start == 0 {
-            return Some(true);
-        }
-        (start - 1, start, start - 1)
+        (
+            utf16_previous_scalar_boundary(&value_units, start as usize) as u32,
+            start,
+        )
     };
+    if from == to {
+        return Some(true);
+    }
+    let caret = from;
 
-    let next_value = format!(
-        "{}{}",
-        &value[..char_offset_to_byte_index(&value, from)],
-        &value[char_offset_to_byte_index(&value, to)..]
+    let next_value = utf16_replace_units_range_lossy(
+        &value_units,
+        from as usize,
+        to.saturating_sub(from) as usize,
+        &[],
     );
     let runtime = unsafe { &mut *runtime_ptr };
     let changed = runtime.set_input_value_from_user_edit(handle, &next_value);
@@ -780,7 +804,7 @@ fn exec_command_delete_text_control(
 
 fn exec_command_delete_non_collapsed_selection<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document: v8::Local<'s, v8::Object>,
     selection: v8::Local<'s, v8::Object>,
 ) -> bool {
@@ -916,7 +940,7 @@ fn exec_command_delete_range_part<'s>(
     true
 }
 
-fn inert_ancestor_or_self(runtime: &JsContextHost, handle: DomHandle) -> Option<DomHandle> {
+fn inert_ancestor_or_self(runtime: &PageScriptHost, handle: DomHandle) -> Option<DomHandle> {
     let mut current = Some(handle);
     while let Some(handle) = current {
         if runtime
@@ -932,7 +956,11 @@ fn inert_ancestor_or_self(runtime: &JsContextHost, handle: DomHandle) -> Option<
     None
 }
 
-fn dom_descendant_or_self(runtime: &JsContextHost, ancestor: DomHandle, handle: DomHandle) -> bool {
+fn dom_descendant_or_self(
+    runtime: &PageScriptHost,
+    ancestor: DomHandle,
+    handle: DomHandle,
+) -> bool {
     let mut current = Some(handle);
     while let Some(handle) = current {
         if handle == ancestor {
@@ -944,7 +972,7 @@ fn dom_descendant_or_self(runtime: &JsContextHost, ancestor: DomHandle, handle: 
 }
 
 fn boundary_before_protected_inert_root(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     protected_inert_root: DomHandle,
 ) -> Option<(DomHandle, u32)> {
     let parent = runtime.dom_host().parent_node(protected_inert_root)?;
@@ -956,7 +984,7 @@ fn boundary_before_protected_inert_root(
 }
 
 fn boundary_after_protected_inert_root(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     protected_inert_root: DomHandle,
 ) -> Option<(DomHandle, u32)> {
     let parent = runtime.dom_host().parent_node(protected_inert_root)?;

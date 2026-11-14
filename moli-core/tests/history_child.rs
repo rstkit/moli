@@ -72,7 +72,7 @@ async fn child_browsing_context_window_graph_uses_stable_live_proxies() -> Resul
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-window-graph"))
         .await?;
 
@@ -172,7 +172,7 @@ async fn child_browsing_context_window_wrapper_owns_runtime_backing() -> Result<
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-runtime-backing"))
         .await?;
 
@@ -302,11 +302,13 @@ async fn assert_child_location_navigation_stays_window_local(
         "{}",
         page.serialize_html_async().await.unwrap()
     );
+    // The iframe's src navigation has not committed when the fixture navigates
+    // its Window. Replacing the initial empty Document keeps joint history stable.
     assert!(
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-top-history-unchanged=\"false\""),
+            .contains("data-top-history-unchanged=\"true\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -314,13 +316,13 @@ async fn assert_child_location_navigation_stays_window_local(
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-history-advanced=\"true\"")
+            .contains("data-child-history-unchanged=\"true\"")
     );
     assert!(
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-current-entry-index=\"1\""),
+            .contains("data-child-current-entry-index=\"0\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -885,7 +887,7 @@ async fn child_browsing_context_attribute_navigation_preserves_local_history() -
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch_with_wait_until(
             &server.url("/compat/window-child-browsing-context-attribute-navigation-history"),
             RenderedDomWaitUntil::NetworkIdle,
@@ -913,7 +915,7 @@ async fn child_browsing_context_attribute_navigation_preserves_local_history() -
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-history-length=\"4\""),
+            .contains("data-child-history-length=\"3\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -983,7 +985,7 @@ async fn child_browsing_context_history_relative_urls_stay_child_local() -> Resu
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-history-length=\"3\""),
+            .contains("data-child-history-length=\"2\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -1089,7 +1091,7 @@ async fn child_browsing_context_history_relative_urls_stay_child_local() -> Resu
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-path-back-history-length=\"3\""),
+            .contains("data-child-path-back-history-length=\"2\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -1119,7 +1121,7 @@ async fn child_browsing_context_navigation_state_stays_window_local() -> Result<
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-navigation-state"))
         .await?;
 
@@ -1353,7 +1355,7 @@ async fn child_browsing_context_navigation_push_state_stays_window_local() -> Re
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-navigation-push-state"))
         .await?;
 
@@ -1527,7 +1529,7 @@ async fn child_browsing_context_navigation_push_state_stays_window_local() -> Re
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-history-length-after-load=\"3\""),
+            .contains("data-child-history-length-after-load=\"2\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -2103,7 +2105,7 @@ async fn child_browsing_context_navigation_noop_result_surface_matches_chromium(
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-navigation-noop-result-surface"))
         .await?;
 
@@ -2166,7 +2168,7 @@ async fn child_browsing_context_navigation_traverse_to_noop_result_surface_match
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url(
             "/compat/window-child-browsing-context-navigation-traverse-to-noop-result-surface",
         ))
@@ -2256,14 +2258,14 @@ async fn child_browsing_context_navigation_same_document_push_result_surface_mat
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-sync=\"hash=#dest|len=3|committed=false|finished=false|history=null|entry={{&quot;step&quot;:7}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=push|propertyNavType=push|order=cec:push:{child_url},popstate:#dest\""
+            "data-sync=\"hash=#dest|len=2|committed=false|finished=false|history=null|entry={{&quot;step&quot;:7}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=push|propertyNavType=push|order=cec:push:{child_url},popstate:#dest\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-timeout=\"hash=#dest|len=3|committed=true|finished=true|history=null|entry={{&quot;step&quot;:7}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=push|propertyNavType=push|order=cec:push:{child_url},popstate:#dest,cec-micro:#dest:null,committed:#dest:true,finished:#dest:true,hashchange:#dest\""
+            "data-timeout=\"hash=#dest|len=2|committed=true|finished=true|history=null|entry={{&quot;step&quot;:7}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=push|propertyNavType=push|order=cec:push:{child_url},popstate:#dest,cec-micro:#dest:null,committed:#dest:true,finished:#dest:true,hashchange:#dest\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
@@ -2305,14 +2307,14 @@ async fn child_browsing_context_navigation_same_document_replace_result_surface_
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-sync=\"hash=#dest|len=2|committed=false|finished=false|history=null|entry={{&quot;step&quot;:9}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=replace|propertyNavType=replace|order=cec:replace:{child_url},popstate:#dest\""
+            "data-sync=\"hash=#dest|len=1|committed=false|finished=false|history=null|entry={{&quot;step&quot;:9}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=replace|propertyNavType=replace|order=cec:replace:{child_url},popstate:#dest\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-timeout=\"hash=#dest|len=2|committed=true|finished=true|history=null|entry={{&quot;step&quot;:9}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=replace|propertyNavType=replace|order=cec:replace:{child_url},popstate:#dest,cec-micro:#dest:null,committed:#dest:true,finished:#dest:true,hashchange:#dest\""
+            "data-timeout=\"hash=#dest|len=1|committed=true|finished=true|history=null|entry={{&quot;step&quot;:9}}|listener=1|property=1|from={child_url}|propertyFrom={child_url}|navType=replace|propertyNavType=replace|order=cec:replace:{child_url},popstate:#dest,cec-micro:#dest:null,committed:#dest:true,finished:#dest:true,hashchange:#dest\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
@@ -2327,7 +2329,7 @@ async fn child_browsing_context_navigation_result_surface_exists_in_child_script
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page =
+    let mut page =
         browser
             .fetch(&server.url(
                 "/compat/window-child-browsing-context-navigation-result-surface-in-child-script",
@@ -2366,14 +2368,14 @@ async fn child_browsing_context_navigation_result_surface_exists_in_child_script
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-source-sync=\"false|false|{child_source_url}|2|0|{child_source_url}||replace|true|0|0\""
+            "data-source-sync=\"false|false|{child_source_url}|1|0|{child_source_url}||replace|true|0|0\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-source-timeout=\"false|false|{child_source_url}|2|0|{child_source_url}||replace|true|0|0\""
+            "data-source-timeout=\"false|false|{child_source_url}|1|0|{child_source_url}||replace|true|0|0\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
@@ -2760,14 +2762,14 @@ async fn child_browsing_context_navigation_push_result_surface_exists_in_child_s
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-source-sync=\"false|false|{child_source_url}|2|0|{child_source_url}||replace|true|0|0\""
+            "data-source-sync=\"false|false|{child_source_url}|1|0|{child_source_url}||replace|true|0|0\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
     assert!(
         page.serialize_html_async().await.unwrap().contains(&format!(
-            "data-source-timeout=\"false|false|{child_source_url}|2|0|{child_source_url}||replace|true|0|0\""
+            "data-source-timeout=\"false|false|{child_source_url}|1|0|{child_source_url}||replace|true|0|0\""
         )),
         "{}",
         page.serialize_html_async().await.unwrap()
@@ -2803,7 +2805,7 @@ async fn child_browsing_context_navigation_push_result_surface_exists_in_child_s
             .await
             .unwrap()
             .contains(&format!(
-                "data-dest-current=\"{child_destination_url}|3|1\""
+                "data-dest-current=\"{child_destination_url}|2|1\""
             )),
         "{}",
         page.serialize_html_async().await.unwrap()
@@ -2844,7 +2846,7 @@ async fn child_browsing_context_reload_result_surface_exists_in_child_script() -
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(
             &server
                 .url("/compat/window-child-browsing-context-reload-result-surface-in-child-script"),
@@ -3781,7 +3783,7 @@ async fn child_browsing_context_current_entry_same_document_uses_child_owner() -
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url(
             "/compat/window-child-browsing-context-current-entry-same-document-uses-child-owner",
         ))
@@ -3903,7 +3905,7 @@ async fn child_browsing_context_fragment_navigation_persists_through_attribute_n
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-fragment-navigation-history"))
         .await?;
 
@@ -3934,7 +3936,7 @@ async fn child_browsing_context_fragment_navigation_persists_through_attribute_n
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-history-length-initial=\"2\""),
+            .contains("data-child-history-length-initial=\"1\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -3953,7 +3955,7 @@ async fn child_browsing_context_fragment_navigation_persists_through_attribute_n
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-history-length-after-push=\"3\""),
+            .contains("data-child-history-length-after-push=\"2\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -3972,7 +3974,7 @@ async fn child_browsing_context_fragment_navigation_persists_through_attribute_n
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-history-length=\"4\""),
+            .contains("data-child-history-length=\"3\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -4015,12 +4017,12 @@ async fn child_browsing_context_fragment_navigation_persists_through_attribute_n
 }
 
 #[tokio::test]
-async fn child_browsing_context_initial_joint_history_length_updates_before_following_parent_script()
--> Result<()> {
+async fn child_browsing_context_initial_navigation_keeps_joint_history_length_stable() -> Result<()>
+{
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-initial-joint-history-timing"))
         .await?;
 
@@ -4028,7 +4030,7 @@ async fn child_browsing_context_initial_joint_history_length_updates_before_foll
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-top-sync-history-length=\"2\""),
+            .contains("data-top-sync-history-length=\"1\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -4036,7 +4038,7 @@ async fn child_browsing_context_initial_joint_history_length_updates_before_foll
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-top-load-history-length=\"2\""),
+            .contains("data-top-load-history-length=\"1\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -4044,7 +4046,7 @@ async fn child_browsing_context_initial_joint_history_length_updates_before_foll
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-child-load-history-length=\"2\""),
+            .contains("data-child-load-history-length=\"1\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -4071,9 +4073,7 @@ async fn child_browsing_context_fragment_traversal_events_stay_window_local() ->
             "/compat/window-child-browsing-context-fragment-traversal-events-are-window-local",
         ))
         .await?;
-    browser
-        .wait_for_page_delay(&mut page, Duration::from_millis(250))
-        .await?;
+    wait_for_body_attribute(&browser, &mut page, "data-child-timeout-hash", "#one").await?;
 
     assert!(
         page.serialize_html_async()
@@ -4136,7 +4136,7 @@ async fn child_browsing_context_location_hash_assignment_dispatches_local_popsta
         page.serialize_html_async()
             .await
             .unwrap()
-            .contains("data-top-history-unchanged=\"true\""),
+            .contains("data-top-history-unchanged=\"false\""),
         "{}",
         page.serialize_html_async().await.unwrap()
     );
@@ -4275,7 +4275,11 @@ async fn child_browsing_context_history_go_one_fragment_traversal_events_stay_wi
         ))
         .await?;
     browser
-        .wait_for_page_delay(&mut page, Duration::from_millis(250))
+        .wait_for_selector(
+            &mut page,
+            "body[data-child-traversal-complete='true']",
+            Duration::from_secs(5),
+        )
         .await?;
 
     assert!(
@@ -4417,7 +4421,11 @@ async fn child_browsing_context_navigation_forward_result_promises_stay_window_l
         ))
         .await?;
     browser
-        .wait_for_page_delay(&mut page, Duration::from_millis(250))
+        .wait_for_script_truthy(
+            &mut page,
+            r#"document.body.dataset.childTimeoutFinished === "true""#,
+            Duration::from_secs(2),
+        )
         .await?;
 
     assert!(
@@ -4558,7 +4566,7 @@ async fn document_has_focus_reports_top_level_true_and_child_false_initially() -
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/document-has-focus-top-level-true-child-false"))
         .await?;
 
@@ -4858,7 +4866,7 @@ async fn child_browsing_context_external_scripts_use_subresource_cookie_context(
         .url("/compat/window-child-browsing-context-external-script-cookie-parent")
         .replace("127.0.0.1", "localhost");
 
-    let page = browser.fetch(&parent_url).await?;
+    let mut page = browser.fetch(&parent_url).await?;
 
     assert!(
         page.serialize_html_async()
@@ -5109,7 +5117,10 @@ async fn cross_origin_window_proxy_exposes_standard_noop_shape() -> Result<()> {
                   'replace',\
                   '__moliChildBrowsingContextHandle',\
                   'unknownCrossOriginProbe'\
-                ].map((name) => `${name}:${name in win.location}:${Object.prototype.hasOwnProperty.call(win.location, name)}`);\
+                ].map((name) => {\
+                  try { return `${name}:${name in win.location}:${Object.prototype.hasOwnProperty.call(win.location, name)}`; }\
+                  catch (error) { return `${name}:${error.name}:${error instanceof DOMException}`; }\
+                });\
                 const calls = ['blur', 'focus', 'close'].map((name) => {\
                   try {\
                     return `${name}:${String(win[name]())}`;\
@@ -5146,14 +5157,18 @@ async fn cross_origin_window_proxy_exposes_standard_noop_shape() -> Result<()> {
                 const lengthDescriptor = Object.getOwnPropertyDescriptor(win, 'length');\
                 const locationDescriptor = Object.getOwnPropertyDescriptor(win, 'location');\
                 const locationHrefDescriptor = Object.getOwnPropertyDescriptor(win.location, 'href');\
-                const locationHashDescriptor = Object.getOwnPropertyDescriptor(win.location, 'hash');\
+                const deniedDescriptor = (object, name) => {\
+                  try { Object.getOwnPropertyDescriptor(object, name); return { error: 'accepted' }; }\
+                  catch (error) { return { error: `${error.name}:${error instanceof DOMException}` }; }\
+                };\
+                const locationHashDescriptor = deniedDescriptor(win.location, 'hash');\
                 const postMessageDescriptor = Object.getOwnPropertyDescriptor(win, 'postMessage');\
                 const noopDescriptors = ['blur', 'focus', 'close'].map((name) => {\
                   const descriptor = Object.getOwnPropertyDescriptor(win, name);\
                   return `${name}:${descriptor?.enumerable}:${descriptor?.configurable}:${descriptor?.writable}:${typeof descriptor?.value}:${descriptor?.value?.name}:${descriptor?.value?.length}`;\
                 });\
                 const locationReplaceDescriptor = Object.getOwnPropertyDescriptor(win.location, 'replace');\
-                const setTimeoutDescriptor = Object.getOwnPropertyDescriptor(win, 'setTimeout');\
+                const setTimeoutDescriptor = deniedDescriptor(win, 'setTimeout');\
                 let locationReplaceInvalidReceiver;\
                 try {\
                   win.location.replace.call({}, '/compat/window-child-browsing-context-target-name-a?via=bad-replace-receiver');\
@@ -5229,8 +5244,9 @@ async fn cross_origin_window_proxy_exposes_standard_noop_shape() -> Result<()> {
                   selfDescriptor: {\
                     enumerable: selfDescriptor?.enumerable,\
                     configurable: selfDescriptor?.configurable,\
-                    writable: selfDescriptor?.writable,\
-                    valueIsSelf: selfDescriptor?.value === win\
+                    getterType: typeof selfDescriptor?.get,\
+                    setterType: typeof selfDescriptor?.set,\
+                    getterIsSelf: selfDescriptor?.get.call(win) === win\
                   },\
                   lengthDescriptor: {\
                     enumerable: lengthDescriptor?.enumerable,\
@@ -5250,12 +5266,7 @@ async fn cross_origin_window_proxy_exposes_standard_noop_shape() -> Result<()> {
                     getterType: typeof locationHrefDescriptor?.get,\
                     setterType: typeof locationHrefDescriptor?.set\
                   },\
-                  locationHashDescriptor: {\
-                    enumerable: locationHashDescriptor?.enumerable,\
-                    configurable: locationHashDescriptor?.configurable,\
-                    getterType: typeof locationHashDescriptor?.get,\
-                    setterType: typeof locationHashDescriptor?.set\
-                  },\
+                  locationHashDescriptor,\
                   postMessageDescriptor: {\
                     enumerable: postMessageDescriptor?.enumerable,\
                     configurable: postMessageDescriptor?.configurable,\
@@ -5277,12 +5288,7 @@ async fn cross_origin_window_proxy_exposes_standard_noop_shape() -> Result<()> {
                   locationReplaceForgedReceiver,\
                   locationHrefSetterInvalidReceiver,\
                   locationGetterInvalidReceiver,\
-                  setTimeoutDescriptor: {\
-                    enumerable: setTimeoutDescriptor?.enumerable,\
-                    configurable: setTimeoutDescriptor?.configurable,\
-                    getterType: typeof setTimeoutDescriptor?.get,\
-                    setterType: typeof setTimeoutDescriptor?.set\
-                  },\
+                  setTimeoutDescriptor,\
                   documentDescriptor: documentDescriptorShape,\
                   windowLocationAssignResult,\
                   locationStableAfterWindowAssign: win.location === locationBeforeWindowAssign,\
@@ -5300,7 +5306,7 @@ async fn cross_origin_window_proxy_exposes_standard_noop_shape() -> Result<()> {
     assert_eq!(
         result,
         Some(
-            r#"{"self":true,"window":true,"frames":true,"parent":true,"top":true,"opener":true,"thenType":"undefined","length":3,"closed":false,"blurType":"function","focusType":"function","closeType":"function","postMessageType":"function","restrictedMutationProbe":["deleteDocument:SecurityError","deleteSetTimeout:SecurityError","defineDocument:SecurityError","definePostMessage:SecurityError","deleteLocationHref:SecurityError","defineLocationHref:SecurityError"],"hasProbe":["document:true:true","setTimeout:true:true","postMessage:true:true","location:true:true","self:true:true","window:true:true","frames:true:true","parent:true:true","top:true:true","closed:true:true","opener:true:true","then:true:true","__moliChildBrowsingContextHandle:SecurityError:true","__moliCrossOriginWindowLocation:SecurityError:true","unknownCrossOriginProbe:SecurityError:true"],"locationHasProbe":["href:true:true","hash:true:true","replace:true:true","__moliChildBrowsingContextHandle:false:false","unknownCrossOriginProbe:false:false"],"calls":["blur:undefined","focus:undefined","close:undefined"],"invalidNoopReceivers":["blur:TypeError:true","focus:TypeError:true","close:TypeError:true"],"postMessageWindowReceiver":"ok","postMessageInvalidReceiver":"TypeError:true","ownNamesLeakInternal":false,"ownKeysLeakInternal":false,"locationOwnNamesLeakInternal":false,"selfDescriptor":{"enumerable":false,"configurable":false,"writable":false,"valueIsSelf":true},"lengthDescriptor":{"enumerable":false,"configurable":false,"getterType":"function","setterType":"function"},"locationDescriptor":{"enumerable":false,"configurable":false,"getterType":"function","setterType":"function"},"locationHrefDescriptor":{"enumerable":false,"configurable":false,"getterType":"undefined","setterType":"function"},"locationHashDescriptor":{"enumerable":false,"configurable":false,"getterType":"function","setterType":"function"},"postMessageDescriptor":{"enumerable":false,"configurable":false,"writable":false,"valueType":"function","valueName":"postMessage","valueLength":1},"noopDescriptors":["blur:false:false:false:function:blur:0","focus:false:false:false:function:focus:0","close:false:false:false:function:close:0"],"locationReplaceDescriptor":{"enumerable":false,"configurable":false,"writable":false,"valueType":"function","valueName":"replace","valueLength":1},"locationReplaceInvalidReceiver":"TypeError:true","locationReplaceForgedReceiver":"TypeError:true","locationHrefSetterInvalidReceiver":"TypeError:true","locationGetterInvalidReceiver":"TypeError:true","setTimeoutDescriptor":{"enumerable":false,"configurable":false,"getterType":"function","setterType":"function"},"documentDescriptor":{"enumerable":false,"configurable":false,"getterType":"function","setterType":"function"},"windowLocationAssignResult":"ok","locationStableAfterWindowAssign":true,"deniedWindowProbe":["document:SecurityError:true","frameElement:SecurityError:true","history:SecurityError:true","navigation:SecurityError:true","localStorage:SecurityError:true","sessionStorage:SecurityError:true","indexedDB:SecurityError:true","customElements:SecurityError:true","navigator:SecurityError:true","performance:SecurityError:true","console:SecurityError:true","screen:SecurityError:true","visualViewport:SecurityError:true","crypto:SecurityError:true","caches:SecurityError:true","clientInformation:SecurityError:true","cookieStore:SecurityError:true","credentialless:SecurityError:true","crossOriginIsolated:SecurityError:true","documentPictureInPicture:SecurityError:true","fetch:SecurityError:true","isSecureContext:SecurityError:true","origin:SecurityError:true","originAgentCluster:SecurityError:true","scheduler:SecurityError:true","speechSynthesis:SecurityError:true","structuredClone:SecurityError:true","trustedTypes:SecurityError:true","setTimeout:SecurityError:true","clearImmediate:SecurityError:true","addEventListener:SecurityError:true","dispatchEvent:SecurityError:true","queueMicrotask:SecurityError:true","requestAnimationFrame:SecurityError:true","getComputedStyle:SecurityError:true","getSelection:SecurityError:true","matchMedia:SecurityError:true","event:SecurityError:true","onerror:SecurityError:true","innerWidth:SecurityError:true","innerHeight:SecurityError:true","devicePixelRatio:SecurityError:true","scrollX:SecurityError:true","pageYOffset:SecurityError:true","scrollTo:SecurityError:true","open:SecurityError:true","stop:SecurityError:true","print:SecurityError:true","find:SecurityError:true","alert:SecurityError:true","confirm:SecurityError:true","prompt:SecurityError:true","reportError:SecurityError:true","btoa:SecurityError:true","atob:SecurityError:true"],"documentAccess":"SecurityError:true"}"#.to_owned(),
+            r#"{"self":true,"window":true,"frames":true,"parent":true,"top":true,"opener":true,"thenType":"undefined","length":3,"closed":false,"blurType":"function","focusType":"function","closeType":"function","postMessageType":"function","restrictedMutationProbe":["deleteDocument:SecurityError","deleteSetTimeout:SecurityError","defineDocument:SecurityError","definePostMessage:SecurityError","deleteLocationHref:SecurityError","defineLocationHref:SecurityError"],"hasProbe":["document:true:true","setTimeout:SecurityError:true","postMessage:true:true","location:true:true","self:true:true","window:true:true","frames:true:true","parent:true:true","top:true:true","closed:true:true","opener:true:true","then:true:true","__moliChildBrowsingContextHandle:SecurityError:true","__moliCrossOriginWindowLocation:SecurityError:true","unknownCrossOriginProbe:SecurityError:true"],"locationHasProbe":["href:true:true","hash:SecurityError:true","replace:true:true","__moliChildBrowsingContextHandle:SecurityError:true","unknownCrossOriginProbe:SecurityError:true"],"calls":["blur:undefined","focus:undefined","close:undefined"],"invalidNoopReceivers":["blur:TypeError:true","focus:TypeError:true","close:TypeError:true"],"postMessageWindowReceiver":"ok","postMessageInvalidReceiver":"TypeError:true","ownNamesLeakInternal":false,"ownKeysLeakInternal":false,"locationOwnNamesLeakInternal":false,"selfDescriptor":{"enumerable":false,"configurable":true,"getterType":"function","setterType":"undefined","getterIsSelf":true},"lengthDescriptor":{"enumerable":false,"configurable":true,"getterType":"function","setterType":"undefined"},"locationDescriptor":{"enumerable":false,"configurable":true,"getterType":"function","setterType":"function"},"locationHrefDescriptor":{"enumerable":false,"configurable":true,"getterType":"undefined","setterType":"function"},"locationHashDescriptor":{"error":"SecurityError:true"},"postMessageDescriptor":{"enumerable":false,"configurable":true,"writable":false,"valueType":"function","valueName":"postMessage","valueLength":1},"noopDescriptors":["blur:false:true:false:function:blur:0","focus:false:true:false:function:focus:0","close:false:true:false:function:close:0"],"locationReplaceDescriptor":{"enumerable":false,"configurable":true,"writable":false,"valueType":"function","valueName":"replace","valueLength":1},"locationReplaceInvalidReceiver":"TypeError:true","locationReplaceForgedReceiver":"TypeError:true","locationHrefSetterInvalidReceiver":"TypeError:true","locationGetterInvalidReceiver":"TypeError:true","setTimeoutDescriptor":{"error":"SecurityError:true"},"documentDescriptor":{"enumerable":false,"configurable":true,"getterType":"undefined","setterType":"undefined"},"windowLocationAssignResult":"ok","locationStableAfterWindowAssign":true,"deniedWindowProbe":["document:read","frameElement:SecurityError:true","history:SecurityError:true","navigation:SecurityError:true","localStorage:SecurityError:true","sessionStorage:SecurityError:true","indexedDB:SecurityError:true","customElements:SecurityError:true","navigator:SecurityError:true","performance:SecurityError:true","console:SecurityError:true","screen:SecurityError:true","visualViewport:SecurityError:true","crypto:SecurityError:true","caches:SecurityError:true","clientInformation:SecurityError:true","cookieStore:SecurityError:true","credentialless:SecurityError:true","crossOriginIsolated:SecurityError:true","documentPictureInPicture:SecurityError:true","fetch:SecurityError:true","isSecureContext:SecurityError:true","origin:SecurityError:true","originAgentCluster:SecurityError:true","scheduler:SecurityError:true","speechSynthesis:SecurityError:true","structuredClone:SecurityError:true","trustedTypes:SecurityError:true","setTimeout:SecurityError:true","clearImmediate:SecurityError:true","addEventListener:SecurityError:true","dispatchEvent:SecurityError:true","queueMicrotask:SecurityError:true","requestAnimationFrame:SecurityError:true","getComputedStyle:SecurityError:true","getSelection:SecurityError:true","matchMedia:SecurityError:true","event:SecurityError:true","onerror:SecurityError:true","innerWidth:SecurityError:true","innerHeight:SecurityError:true","devicePixelRatio:SecurityError:true","scrollX:SecurityError:true","pageYOffset:SecurityError:true","scrollTo:SecurityError:true","open:SecurityError:true","stop:SecurityError:true","print:SecurityError:true","find:SecurityError:true","alert:SecurityError:true","confirm:SecurityError:true","prompt:SecurityError:true","reportError:SecurityError:true","btoa:SecurityError:true","atob:SecurityError:true"],"documentAccess":"read"}"#.to_owned(),
         ),
         "{}",
         page.serialize_html_async().await.unwrap()
@@ -5450,7 +5456,7 @@ async fn cross_origin_window_proxy_exposes_named_child_frames() -> Result<()> {
     assert_eq!(
         before,
         Some(
-            r#"{"hasNamed":true,"ownNamed":true,"hasDocumentCollision":true,"hasFocusCollision":true,"sameAsIndexed":true,"documentDescriptor":{"enumerable":false,"configurable":false,"getterType":"function","setterType":"function","valueType":"undefined"},"focusDescriptor":{"enumerable":false,"configurable":false,"writable":false,"valueType":"function"},"documentAccess":"SecurityError:true","focusType":"function","namedSelf":true,"namedWindow":true,"namedFrames":true,"namedParent":true,"namedTop":true,"namedLength":0,"descriptor":{"enumerable":false,"configurable":true,"writable":false,"valueType":"object"}}"#
+            r#"{"hasNamed":true,"ownNamed":true,"hasDocumentCollision":true,"hasFocusCollision":true,"sameAsIndexed":true,"documentDescriptor":{"enumerable":false,"configurable":true,"getterType":"undefined","setterType":"undefined","valueType":"object"},"focusDescriptor":{"enumerable":false,"configurable":true,"writable":false,"valueType":"function"},"documentAccess":"read","focusType":"function","namedSelf":true,"namedWindow":true,"namedFrames":true,"namedParent":true,"namedTop":true,"namedLength":0,"descriptor":{"enumerable":false,"configurable":true,"writable":false,"valueType":"object"}}"#
                 .to_owned(),
         ),
         "{}",
@@ -5493,7 +5499,7 @@ async fn cross_origin_window_proxy_exposes_named_child_frames() -> Result<()> {
                 afterOwnNamed: probe(() => Object.prototype.hasOwnProperty.call(refreshed, 'nestedNamed')),\
                 afterNamedType: probe(() => typeof refreshed.nestedNamed),\
                 afterLength: refreshed.length,\
-                afterDocumentDescriptorGetter: typeof Object.getOwnPropertyDescriptor(refreshed, 'document')?.get,\
+                afterDocumentDescriptorGetter: probe(() => typeof Object.getOwnPropertyDescriptor(refreshed, 'document')?.get),\
                 afterFocusType: typeof refreshed.focus\
               });\
             })()",
@@ -5504,7 +5510,7 @@ async fn cross_origin_window_proxy_exposes_named_child_frames() -> Result<()> {
     assert_eq!(
         after,
         Some(
-            r#"{"afterHasNamed":"SecurityError:true","afterOwnNamed":"SecurityError:true","afterNamedType":"SecurityError:true","afterLength":0,"afterDocumentDescriptorGetter":"function","afterFocusType":"function"}"#
+            r#"{"afterHasNamed":"SecurityError:true","afterOwnNamed":"SecurityError:true","afterNamedType":"SecurityError:true","afterLength":0,"afterDocumentDescriptorGetter":"SecurityError:true","afterFocusType":"function"}"#
                 .to_owned(),
         ),
         "{}",
@@ -5521,7 +5527,7 @@ async fn child_browsing_context_iframe_host_load_events_fire_for_live_context_up
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-iframe-load"))
         .await?;
 
@@ -5611,7 +5617,7 @@ async fn child_browsing_context_redirect_updates_window_document_and_navigation_
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-redirect-coherence"))
         .await?;
     let final_url = server.url("/compat/window-child-browsing-context-redirect-child-final");
@@ -5683,7 +5689,7 @@ async fn child_browsing_context_delayed_document_load_does_not_block_parent_runt
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-delayed-async-navigation"))
         .await?;
 
@@ -5946,7 +5952,7 @@ async fn child_browsing_context_delayed_external_script_does_not_block_parent_ru
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/window-child-browsing-context-delayed-external-script"))
         .await?;
 

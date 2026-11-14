@@ -1,10 +1,12 @@
+pub(super) use self::parse_html_integer_prefix as parse_tab_index_attribute;
 use crate::document_runtime::DomHandle;
 use crate::dom::{forms::InputType, native::Node};
 use crate::util::v8_string;
 use crate::webidl;
 
 use super::super::{
-    JsContextHost,
+    PageScriptHost,
+    document::{MATHML_NS, SVG_NS, XHTML_NS},
     node::{
         node_is_element, node_runtime_and_handle_from_object_or_detached,
         throw_incompatible_getter_receiver, throw_incompatible_setter_receiver,
@@ -12,15 +14,17 @@ use super::super::{
     throw_dom_exception,
 };
 
+use super::details_dialog::main_summary_child;
 use super::reflection::{
     DomStringReflection, ElementReflectionInterface, NullToEmptyDomStringReflection,
-    UnsignedLongReflection, UsvStringReflection, remove_reflected_attribute,
+    UnsignedLongReflection, UsvStringReflection, element_reflection_receiver_or_throw,
+    remove_reflected_attribute,
 };
 use super::{
     attribute_property_getter_from_object_or_detached,
     boolean_attribute_property_getter_from_object_or_detached, element_attribute,
-    form_associated_form_owner, html_element_getter_receiver, html_element_setter_receiver,
-    property_dom_string_value, resolve_url_like_attribute,
+    element_has_attribute, form_associated_form_owner, html_element_getter_receiver,
+    html_element_setter_receiver, property_dom_string_value, resolve_url_like_attribute,
     set_attribute_property_on_object_or_detached,
     set_boolean_attribute_property_on_object_or_detached,
     set_dom_string_attribute_property_on_object, set_reflected_attribute,
@@ -837,7 +841,7 @@ fn content_editable_state_from_attr(raw: &str) -> Option<bool> {
     }
 }
 
-fn element_content_editable_state(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn element_content_editable_state(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     let mut current = Some(handle);
     while let Some(candidate) = current {
         let Some(node) = runtime.dom_host().node(candidate) else {
@@ -1079,7 +1083,7 @@ pub(in crate::native_bridge) fn node_sandbox_setter_function<'s>(
     rv.set_undefined();
 }
 
-fn set_dom_string_treat_null_as_empty_on_object<'s>(
+pub(super) fn set_dom_string_treat_null_as_empty_on_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     attribute: &str,
@@ -1087,6 +1091,9 @@ fn set_dom_string_treat_null_as_empty_on_object<'s>(
     owner: &'static str,
     property: &'static str,
 ) {
+    let Some((runtime_ptr, handle)) = element_reflection_receiver_or_throw(scope, object) else {
+        return;
+    };
     let options = webidl::StringOptions {
         treat_null_as_empty_string: true,
     };
@@ -1101,10 +1108,6 @@ fn set_dom_string_treat_null_as_empty_on_object<'s>(
             webidl::throw_error(scope, &error);
             return;
         }
-    };
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, object)
-    else {
-        return;
     };
     set_reflected_attribute(scope, runtime_ptr, handle, attribute, &value);
 }
@@ -1168,21 +1171,7 @@ pub(in crate::native_bridge) fn html_rel_setter_function<'s>(
 // the template). The per-element installers in accessors_forms/ still wire
 // these for HTMLInputElement and HTMLButtonElement.
 
-fn set_boolean_attribute_on_object_or_detached<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-    name: &str,
-    value: v8::Local<'s, v8::Value>,
-) {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, object)
-    else {
-        return;
-    };
-    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
-        return;
-    }
-    set_reflected_boolean_attribute(scope, runtime_ptr, handle, name, value.boolean_value(scope));
-}
+use super::reflection::set_boolean_attribute_property_on_object_or_detached as set_boolean_attribute_on_object_or_detached;
 
 pub(in crate::native_bridge) fn html_compact_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1215,6 +1204,117 @@ pub(in crate::native_bridge) fn html_no_shade_setter_function<'s>(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     set_boolean_attribute_on_object_or_detached(scope, args.this(), "noshade", args.get(0));
+    rv.set_undefined();
+}
+
+fn html_boolean_attribute_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+    interface: &'static str,
+    member: &'static str,
+    local_name: &'static str,
+    attribute: &'static str,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Some((runtime_ptr, handle)) =
+        html_element_getter_receiver(scope, receiver, interface, member, local_name)
+    else {
+        rv.set_bool(false);
+        return;
+    };
+    rv.set_bool(element_has_attribute(
+        unsafe { &*runtime_ptr },
+        handle,
+        attribute,
+    ));
+}
+
+fn html_boolean_attribute_setter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+    value: v8::Local<'s, v8::Value>,
+    interface: &'static str,
+    member: &'static str,
+    local_name: &'static str,
+    attribute: &'static str,
+) {
+    let Some((runtime_ptr, handle)) =
+        html_element_setter_receiver(scope, receiver, interface, member, local_name)
+    else {
+        return;
+    };
+    set_reflected_boolean_attribute(
+        scope,
+        runtime_ptr,
+        handle,
+        attribute,
+        value.boolean_value(scope),
+    );
+}
+
+pub(in crate::native_bridge) fn html_no_resize_getter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    html_boolean_attribute_getter(
+        scope,
+        args.this(),
+        "HTMLFrameElement",
+        "noResize",
+        "frame",
+        "noresize",
+        rv,
+    );
+}
+
+pub(in crate::native_bridge) fn html_no_resize_setter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    html_boolean_attribute_setter(
+        scope,
+        args.this(),
+        args.get(0),
+        "HTMLFrameElement",
+        "noResize",
+        "frame",
+        "noresize",
+    );
+    rv.set_undefined();
+}
+
+pub(in crate::native_bridge) fn html_true_speed_getter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    html_boolean_attribute_getter(
+        scope,
+        args.this(),
+        "HTMLMarqueeElement",
+        "trueSpeed",
+        "marquee",
+        "truespeed",
+        rv,
+    );
+}
+
+pub(in crate::native_bridge) fn html_true_speed_setter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    html_boolean_attribute_setter(
+        scope,
+        args.this(),
+        args.get(0),
+        "HTMLMarqueeElement",
+        "trueSpeed",
+        "marquee",
+        "truespeed",
+    );
     rv.set_undefined();
 }
 
@@ -1671,7 +1771,7 @@ pub(in crate::native_bridge) fn canonical_preload_value(raw: &str) -> &'static s
     }
 }
 
-fn canonical_fetch_priority_value(raw: &str) -> &'static str {
+pub(super) fn canonical_fetch_priority_value(raw: &str) -> &'static str {
     if raw.eq_ignore_ascii_case("low") {
         "low"
     } else if raw.eq_ignore_ascii_case("high") {
@@ -1991,7 +2091,7 @@ pub(in crate::native_bridge) fn node_translate_getter_function<'s>(
     rv.set_bool(element_translate_mode(runtime, handle));
 }
 
-fn element_translate_mode(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn element_translate_mode(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     let mut current = Some(handle);
     while let Some(candidate) = current {
         if let Some(value) = element_attribute(runtime, candidate, "translate") {
@@ -2164,7 +2264,7 @@ pub(in crate::native_bridge) fn node_spellcheck_setter_function<'s>(
     rv.set_undefined();
 }
 
-fn computed_writing_suggestions_value(runtime: &JsContextHost, handle: DomHandle) -> &'static str {
+fn computed_writing_suggestions_value(runtime: &PageScriptHost, handle: DomHandle) -> &'static str {
     let mut current = Some(handle);
     while let Some(candidate) = current {
         if let Some(value) = runtime
@@ -2371,13 +2471,8 @@ pub(in crate::native_bridge) fn node_hidden_getter_function<'s>(
     let Ok((runtime_ptr, handle)) =
         node_runtime_and_handle_from_object_or_detached(scope, args.this())
     else {
-        rv.set_undefined();
         return;
     };
-    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
-        rv.set_undefined();
-        return;
-    }
     match element_attribute(unsafe { &*runtime_ptr }, handle, "hidden") {
         Some(value) if value.eq_ignore_ascii_case("until-found") => {
             if let Some(value) = v8_string(scope, "until-found") {
@@ -2397,13 +2492,8 @@ pub(in crate::native_bridge) fn node_hidden_setter_function<'s>(
     let Ok((runtime_ptr, handle)) =
         node_runtime_and_handle_from_object_or_detached(scope, args.this())
     else {
-        rv.set_undefined();
         return;
     };
-    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
-        rv.set_undefined();
-        return;
-    }
     let value = args.get(0);
     if value.is_null_or_undefined() || value.is_boolean() || value.is_number() {
         set_reflected_boolean_attribute(
@@ -2430,15 +2520,79 @@ pub(in crate::native_bridge) fn node_hidden_setter_function<'s>(
     rv.set_undefined();
 }
 
-fn default_tab_index_for(runtime: &JsContextHost, handle: DomHandle) -> i32 {
+pub(in crate::native_bridge) fn node_inert_getter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.this())
+    else {
+        throw_incompatible_getter_receiver(scope, "HTMLElement", "inert");
+        return;
+    };
+    let runtime = unsafe { &*runtime_ptr };
+    let is_html_element = runtime
+        .dom_host()
+        .node(handle)
+        .and_then(Node::as_element)
+        .is_some_and(|element| element.namespace() == XHTML_NS);
+    if !is_html_element {
+        throw_incompatible_getter_receiver(scope, "HTMLElement", "inert");
+        return;
+    }
+    rv.set_bool(element_has_attribute(runtime, handle, "inert"));
+}
+
+pub(in crate::native_bridge) fn node_inert_setter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.this())
+    else {
+        throw_incompatible_setter_receiver(scope, "HTMLElement", "inert");
+        return;
+    };
+    let is_html_element = unsafe { &*runtime_ptr }
+        .dom_host()
+        .node(handle)
+        .and_then(Node::as_element)
+        .is_some_and(|element| element.namespace() == XHTML_NS);
+    if !is_html_element {
+        throw_incompatible_setter_receiver(scope, "HTMLElement", "inert");
+        return;
+    }
+    set_reflected_boolean_attribute(
+        scope,
+        runtime_ptr,
+        handle,
+        "inert",
+        args.get(0).boolean_value(scope),
+    );
+    rv.set_undefined();
+}
+
+fn default_tab_index_for(runtime: &PageScriptHost, handle: DomHandle) -> i32 {
     let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
         return -1;
     };
-    if element.namespace() != "http://www.w3.org/1999/xhtml" {
-        return -1;
-    }
-    match element.local_name() {
-        "a" | "button" | "input" | "select" | "textarea" => 0,
+    match (element.namespace(), element.local_name()) {
+        (
+            XHTML_NS,
+            "a" | "area" | "button" | "frame" | "iframe" | "input" | "object" | "select"
+            | "textarea",
+        )
+        | (SVG_NS | MATHML_NS, "a") => 0,
+        (XHTML_NS, "summary")
+            if runtime
+                .dom_host()
+                .parent_node(handle)
+                .is_some_and(|parent| main_summary_child(runtime, parent) == Some(handle)) =>
+        {
+            0
+        }
         _ => -1,
     }
 }
@@ -2486,7 +2640,7 @@ pub(in crate::native_bridge) fn node_tab_index_setter_function<'s>(
     rv.set_undefined();
 }
 
-fn parse_tab_index_attribute(value: &str) -> Option<i32> {
+pub(super) fn parse_html_integer_prefix(value: &str) -> Option<i32> {
     let value = value.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
     let mut chars = value.chars();
     let (sign, rest) = match chars.next() {
@@ -2513,6 +2667,10 @@ mod tests {
     #[test]
     fn parses_tab_index_attribute_like_html_signed_integer() {
         assert_eq!(parse_tab_index_attribute(""), None);
+        assert_eq!(parse_tab_index_attribute("invalid"), None);
+        assert_eq!(parse_tab_index_attribute("\u{b}0"), None);
+        assert_eq!(parse_tab_index_attribute("\u{a0}0"), None);
+        assert_eq!(parse_tab_index_attribute(" \t\n\r\u{c}+0tail"), Some(0));
         assert_eq!(parse_tab_index_attribute(" 5abc"), Some(5));
         assert_eq!(parse_tab_index_attribute("+5"), Some(5));
         assert_eq!(parse_tab_index_attribute("-5"), Some(-5));

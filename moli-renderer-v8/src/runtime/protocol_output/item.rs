@@ -35,6 +35,13 @@ pub enum RendererOwnerAction {
     Download(RendererPendingDownloadActivation),
     JavaScriptDialog(RendererPendingJavaScriptDialog),
     Popup(RendererPendingPopupActivation),
+    CloseAuxiliaryWindow(crate::runtime::RendererAuxiliaryWindow),
+    NavigateAuxiliaryWindow {
+        window: crate::runtime::RendererAuxiliaryWindow,
+        url: String,
+        kind: crate::runtime::RendererAuxiliaryNavigationKind,
+        document_response: Option<super::super::RendererAuxiliaryDocumentResponse>,
+    },
     ChildFrameTree {
         source_document: RendererDocumentLifecycleIdentity,
         event: ChildFrameTreeEventSnapshot,
@@ -47,18 +54,35 @@ pub enum RendererOwnerAction {
         source_document: RendererDocumentLifecycleIdentity,
         event: ChildFrameDocumentNetworkActivitySnapshot,
     },
+    /// The new Document is installed, before its parser can attach child Frames.
+    ChildFrameCommit {
+        source_document: RendererDocumentLifecycleIdentity,
+        event: ChildFrameNavigationSnapshot,
+    },
+    /// Load delivery finished, including any descendant Document blockers.
+    /// This must not be projected as another navigation commit.
     ChildFrameLoad {
         source_document: RendererDocumentLifecycleIdentity,
         event: ChildFrameNavigationSnapshot,
     },
     SameDocumentNavigation(RendererDocumentSourcedSameDocumentNavigation),
+    SessionHistoryUpdate {
+        source_document: RendererDocumentLifecycleIdentity,
+        update: moli_page_types::SessionHistoryUpdate,
+    },
     TopLevelLocationNavigation(RendererDocumentSourcedTopLevelLocationNavigation),
     TopLevelHistoryTraversal(RendererPendingTopLevelHistoryTraversal),
     SubresourceFetchPause {
+        network_pause: Option<crate::network::ResourceInterceptionPause>,
         source_document: RendererDocumentLifecycleIdentity,
         info: Box<PendingSubresourceFetchInfo>,
+        /// Set for a child frame navigation, whose Network request id is the
+        /// loader id of the Document it creates.
+        child_document: Option<Box<crate::protocol_types::ChildDocumentFetchRequest>>,
+        redirect: Option<Box<crate::protocol_types::NavigationRedirect>>,
     },
     SubresourceContinue {
+        network_pause: Option<crate::network::ResourceInterceptionPause>,
         source_document: RendererDocumentLifecycleIdentity,
         event: Box<PendingSubresourceContinueEvent>,
     },
@@ -79,7 +103,11 @@ pub enum RendererOwnerAction {
 /// protocol-boundary responsibility.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RendererProtocolObservation {
-    MainDocumentCommit(RendererMainDocumentCommit),
+    WebMcp(moli_page_types::RendererWebMcpObservation),
+    MainDocumentCommit {
+        source_document: RendererDocumentLifecycleIdentity,
+        commit: RendererMainDocumentCommit,
+    },
     DocumentTitleChanged(RendererDocumentTitleChanged),
     DocumentLifecycle(RendererDocumentLifecycleEvent),
     Network {
@@ -105,6 +133,7 @@ pub enum RendererProtocolObservation {
 pub enum RendererOutputItem {
     OwnerAction(RendererOwnerAction),
     Observation(RendererProtocolObservation),
+    NativeTerminal(super::RendererNativeCommandTerminal),
 }
 
 /// One record in exact producer append order.
@@ -160,7 +189,6 @@ impl PendingRendererOutputRecord {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn item(&self) -> &RendererOutputItem {
         &self.item
     }
@@ -200,7 +228,9 @@ impl PendingRendererOutputRecord {
                 crate::runtime::RendererRuntimeInspectorMessage::has_resolved_source_identity,
             ))
             .then_some(RendererOutputResolutionError::DedicatedWorkerRuntimeInspector),
-            RendererOutputItem::OwnerAction(_) | RendererOutputItem::Observation(_) => None,
+            RendererOutputItem::OwnerAction(_)
+            | RendererOutputItem::Observation(_)
+            | RendererOutputItem::NativeTerminal(_) => None,
         }
     }
 

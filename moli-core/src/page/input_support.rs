@@ -95,6 +95,7 @@ pub trait PageInputExt {
         delta_y: f64,
         pointer: RendererPointerEventProperties,
         modifiers: u8,
+        intercept_drags: bool,
     ) -> Result<PendingPageCommand>;
     fn finish_dispatch_mouse_event_at_point_with_outcome(
         &mut self,
@@ -161,6 +162,7 @@ pub trait PageInputExt {
     ) -> Result<RendererInputDispatchOutcome>;
     async fn clear_active_drag_data_transfer_async(&mut self) -> Result<()>;
     fn start_clear_active_drag_data_transfer(&self) -> Result<PendingPageCommand>;
+    fn start_cancel_dragging(&self) -> Result<PendingPageCommand>;
     fn finish_clear_active_drag_data_transfer(
         &mut self,
         completion: CompletedPageCommand,
@@ -261,6 +263,7 @@ impl PageInputExt for Page {
             delta_y,
             RendererPointerEventProperties::default(),
             0,
+            false,
         )
     }
 
@@ -276,6 +279,7 @@ impl PageInputExt for Page {
         delta_y: f64,
         pointer: RendererPointerEventProperties,
         modifiers: u8,
+        intercept_drags: bool,
     ) -> Result<PendingPageCommand> {
         self.start_page_command(RendererPageCommand::DispatchMouseEventAtPoint {
             x,
@@ -288,6 +292,7 @@ impl PageInputExt for Page {
             delta_y,
             pointer,
             modifiers,
+            intercept_drags,
         })
     }
 
@@ -413,6 +418,10 @@ impl PageInputExt for Page {
         self.start_page_command(RendererPageCommand::ClearActiveDragDataTransfer)
     }
 
+    fn start_cancel_dragging(&self) -> Result<PendingPageCommand> {
+        self.start_page_command(RendererPageCommand::CancelDragging)
+    }
+
     fn finish_clear_active_drag_data_transfer(
         &mut self,
         completion: CompletedPageCommand,
@@ -518,4 +527,40 @@ impl PageInputExt for Page {
         )
         .await
     }
+}
+
+impl Page {
+    pub fn start_prepare_element_click(
+        &self,
+        inspector_session_id: Option<String>,
+        object_id: String,
+    ) -> Result<PendingPageCommand> {
+        self.start_page_command(RendererPageCommand::prepare_element_click(
+            inspector_session_id,
+            object_id,
+        ))
+    }
+
+    pub fn start_dispatch_prepared_element_click(
+        &self,
+        click: super::RendererPreparedPointerClick,
+    ) -> Result<PendingPageCommand> {
+        self.start_page_command(RendererPageCommand::DispatchPreparedElementClick(click))
+    }
+}
+
+#[doc(hidden)]
+pub fn decode_element_click_preparation_completion(
+    completion: RendererCommandTurnCompletion,
+) -> Result<Result<super::RendererElementClickTarget, super::RendererElementClickError>> {
+    expect_page_reply!(settled_input_reply(completion)?, "prepare element click", "element click preparation",
+        RendererPageReply::ElementClickPreparation(preparation) => Ok(preparation))
+}
+
+#[doc(hidden)]
+pub fn decode_element_click_dispatch_completion(
+    completion: RendererCommandTurnCompletion,
+) -> Result<Result<RendererInputDispatchOutcome, super::RendererElementClickError>> {
+    expect_page_reply!(settled_input_reply(completion)?, "dispatch element click", "element click dispatch",
+        RendererPageReply::ElementClickDispatch(outcome) => Ok(outcome))
 }

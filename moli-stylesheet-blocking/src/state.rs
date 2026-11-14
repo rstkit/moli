@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::discovery::{
     DocumentBlockingStylesheetSignature, DocumentOwnedBlockingStylesheet,
-    DocumentOwnedBlockingStylesheetDiscoveryInput, StylesheetBlockingReadView,
+    DocumentOwnedStylesheetDiscoveryInput, StylesheetBlockingReadView,
     collect_document_owned_blocking_stylesheets,
     collect_document_owned_blocking_stylesheets_before, document_node_precedes,
 };
@@ -28,7 +28,7 @@ use crate::types::{
 pub struct StylesheetBlockingState {
     owner_fetches: HashMap<NodeId, StylesheetFetchEntry>,
     blocking_entries: HashMap<NodeId, StylesheetBlockingEntry>,
-    url_fetches: HashMap<(Url, StylesheetResourceKey), StylesheetFetch>,
+    url_fetches: HashMap<(u64, Url, StylesheetResourceKey), StylesheetFetch>,
     completion_source: OwnerTaskSource<StylesheetCompletion>,
     ready_network_results: VecDeque<StylesheetFetchNetworkResult>,
     // The stylesheet queue is local to document processing, not the renderer
@@ -59,15 +59,17 @@ impl StylesheetBlockingState {
         self.discover_from_blockers(fetcher, &document_url, blockers.iter());
     }
 
+    /// Admit script gates. The embedding runtime separately loads inputs that
+    /// do not block scripts, retaining their ordinary Document-load lifetime.
     pub fn discover_from_inputs<'a, F>(
         &mut self,
         fetcher: &F,
         document_url: &Url,
-        inputs: impl IntoIterator<Item = &'a DocumentOwnedBlockingStylesheetDiscoveryInput>,
+        inputs: impl IntoIterator<Item = &'a DocumentOwnedStylesheetDiscoveryInput>,
     ) where
         F: StylesheetFetcher,
     {
-        for input in inputs {
+        for input in inputs.into_iter().filter(|input| input.blocks_scripts()) {
             self.discover_input(
                 fetcher,
                 document_url,
@@ -222,6 +224,7 @@ impl StylesheetBlockingState {
             options: options.clone(),
         };
         if let Some(entry) = self.owner_fetches.get(&node_id)
+            && entry.resource_cache_scope == fetcher.resource_cache_scope()
             && entry.signature == signature
         {
             return entry.fetch.clone();
@@ -325,14 +328,17 @@ impl StylesheetBlockingState {
             options: options.clone(),
         };
         if let Some(entry) = self.owner_fetches.get(&node_id)
+            && entry.resource_cache_scope == fetcher.resource_cache_scope()
             && entry.signature == signature
         {
             return entry.fetch.clone();
         }
+        let resource_cache_scope = fetcher.resource_cache_scope();
         let fetch = self.ensure_resource(fetcher, document_url, url, options);
         self.owner_fetches.insert(
             node_id,
             StylesheetFetchEntry {
+                resource_cache_scope,
                 signature,
                 fetch: fetch.clone(),
             },
@@ -350,11 +356,13 @@ impl StylesheetBlockingState {
     where
         F: StylesheetFetcher,
     {
+        let resource_cache_scope = fetcher.resource_cache_scope();
         let resource_key = options.resource_key(url.clone());
-        if let Some(url_fetch) = self
-            .url_fetches
-            .get(&(document_url.clone(), resource_key.clone()))
-        {
+        if let Some(url_fetch) = self.url_fetches.get(&(
+            resource_cache_scope,
+            document_url.clone(),
+            resource_key.clone(),
+        )) {
             return url_fetch.clone();
         }
         let start_unix_millis = moli_time::unix_epoch_millis();
@@ -369,8 +377,10 @@ impl StylesheetBlockingState {
         let completion_wake = self.completion_wake.clone();
         let completion_publisher = self.completion_publisher.clone();
         let completion_fetch = fetch.clone();
-        self.url_fetches
-            .insert((document_url.clone(), resource_key), fetch.clone());
+        self.url_fetches.insert(
+            (resource_cache_scope, document_url.clone(), resource_key),
+            fetch.clone(),
+        );
         let task_fetcher = fetcher.clone();
         fetcher.spawn_stylesheet_task(Box::pin(async move {
             let terminal = task_fetcher
@@ -733,6 +743,13 @@ mod tests {
     }
 
     impl StylesheetBlockingReadView for TestStylesheetDocument {
+        fn media_query_matches(&self, media: &str) -> bool {
+            crate::discovery::default_screen_media_query_matches(
+                media,
+                self.document_is_quirks_mode(),
+            )
+        }
+
         fn stylesheet_element(&self, node_id: NativeNodeId) -> Option<StylesheetElementRead> {
             match node_id.index() {
                 1 => Some(StylesheetElementRead::parser_created_html_link_for_test(
@@ -767,6 +784,10 @@ mod tests {
             NativeNodeId::new(0)
         }
 
+        fn document_is_quirks_mode(&self) -> bool {
+            false
+        }
+
         fn document_order_stylesheet_candidate_ids_before(
             &self,
             _target_node_id: Option<NodeId>,
@@ -798,7 +819,7 @@ mod tests {
                     moli_page_types::NavigationResponse::from_text_body(
                         url,
                         200,
-                        vec![("content-type".to_owned(), "text/css".to_owned())],
+                        vec![("content-type".to_owned(), b"text/css".to_vec())],
                         "body { color: black; }".to_owned(),
                     ),
                     true,
@@ -854,7 +875,7 @@ mod tests {
                     moli_page_types::NavigationResponse::from_text_body(
                         url,
                         200,
-                        vec![("content-type".to_owned(), "text/css".to_owned())],
+                        vec![("content-type".to_owned(), b"text/css".to_vec())],
                         "body { color: black; }".to_owned(),
                     ),
                     true,
@@ -886,7 +907,7 @@ mod tests {
                     moli_page_types::NavigationResponse::from_text_body(
                         url,
                         200,
-                        vec![("content-type".to_owned(), "text/css".to_owned())],
+                        vec![("content-type".to_owned(), b"text/css".to_vec())],
                         "body { color: black; }".to_owned(),
                     ),
                     true,
@@ -1129,7 +1150,7 @@ mod tests {
                     moli_page_types::NavigationResponse::from_text_body(
                         first_url,
                         200,
-                        vec![("content-type".to_owned(), "text/css".to_owned())],
+                        vec![("content-type".to_owned(), b"text/css".to_vec())],
                         "body { color: red; }".to_owned(),
                     ),
                     true,
@@ -1148,15 +1169,15 @@ mod tests {
     async fn stale_style_import_completion_cannot_resolve_same_signature_aba() {
         use crate::discovery::{
             DocumentOwnedBlockingStylesheet, DocumentOwnedBlockingStylesheetCandidate,
-            DocumentOwnedBlockingStylesheetDiscoveryInput,
+            DocumentOwnedStylesheetDiscoveryInput,
         };
 
-        fn input(node_id: NodeId, url: Url) -> DocumentOwnedBlockingStylesheetDiscoveryInput {
+        fn input(node_id: NodeId, url: Url) -> DocumentOwnedStylesheetDiscoveryInput {
             let candidate = DocumentOwnedBlockingStylesheetCandidate::ParserCreatedStyleImport {
                 node_id,
                 urls: vec![url],
             };
-            DocumentOwnedBlockingStylesheetDiscoveryInput::from(
+            DocumentOwnedStylesheetDiscoveryInput::from(
                 &DocumentOwnedBlockingStylesheet::from_candidate(&candidate),
             )
         }
@@ -1498,6 +1519,31 @@ mod tests {
         );
 
         assert!(!plain_fetch.ptr_eq(&anonymous_fetch));
+    }
+
+    #[tokio::test]
+    async fn physical_key_keeps_mime_processing_compatibility_boundary() {
+        let mut state = StylesheetBlockingState::default();
+        let document_url = Url::parse("https://example.com/").expect("static document url");
+        let stylesheet_url =
+            Url::parse("https://example.com/shared.css").expect("static stylesheet url");
+        let standard = StylesheetFetchOptions::default();
+        let quirks = StylesheetFetchOptions::default().with_quirks_mode_mime_compatibility(true);
+
+        let standard_fetch = state.preload_stylesheet(
+            &PendingStylesheetFetcher,
+            document_url.clone(),
+            stylesheet_url.clone(),
+            standard,
+        );
+        let quirks_fetch = state.preload_stylesheet(
+            &PendingStylesheetFetcher,
+            document_url,
+            stylesheet_url,
+            quirks,
+        );
+
+        assert!(!standard_fetch.ptr_eq(&quirks_fetch));
     }
 
     #[tokio::test]

@@ -52,6 +52,12 @@ impl<'a> QueryElement<'a> {
         if element.autofilled() {
             state |= ElementState::AUTOFILL;
         }
+        if element.web_mcp_form_active() {
+            state |= ElementState::TOOL_FORM_ACTIVE;
+        }
+        if element.web_mcp_submit_active() {
+            state |= ElementState::TOOL_SUBMIT_ACTIVE;
+        }
         if self.matches_validity_pseudo() {
             if self.is_invalid() {
                 state |= ElementState::INVALID;
@@ -182,15 +188,11 @@ impl<'a> QueryElement<'a> {
                     }
                     return self.element().input_value().is_empty();
                 }
-                if self.element().local_name() == "input"
+                self.element().local_name() == "input"
                     && self.input_type() == InputType::Number
                     && !self.element().input_value().is_empty()
                     && parse_input_numeric_value(InputType::Number, &self.element().input_value())
                         .is_none()
-                {
-                    return true;
-                }
-                false
             }
             _ => false,
         }
@@ -369,13 +371,19 @@ impl<'a> QueryElement<'a> {
     pub(super) fn is_editable(self) -> bool {
         let mut current = Some(self.handle);
         while let Some(handle) = current {
-            if let Some(element) = self.host.node(handle).and_then(Node::as_element)
+            let Some(node) = self.host.node(handle) else {
+                return false;
+            };
+            if let Some(document) = node.as_document() {
+                return document.design_mode_enabled();
+            }
+            if let Some(element) = node.as_element()
                 && let Some(value) = element.attribute("contenteditable")
                 && let Some(is_editable) = contenteditable_value_is_editable(value)
             {
                 return is_editable;
             }
-            current = self.host.node(handle).and_then(Node::parent_node);
+            current = node.parent_node();
         }
         false
     }
@@ -441,7 +449,7 @@ impl<'a> QueryElement<'a> {
             self.element()
                 .is_html_input()
                 .then(|| self.element().input_type()),
-            self.element().attribute("type"),
+            self.host.button_is_submit_button(self.handle),
         )
     }
 
@@ -618,10 +626,18 @@ pub(crate) fn html_directionality(host: &DomHost, handle: NodeId) -> CssDirectio
 }
 
 fn auto_direction_for_element(host: &DomHost, root: NodeId) -> Option<CssDirection> {
-    if let Some(element) = host.node(root).and_then(Node::as_element)
-        && element.is_html_input()
-    {
-        return input_auto_direction(element);
+    if let Some(element) = host.node(root).and_then(Node::as_element) {
+        if element.is_html_textarea() {
+            let value = if element.input_value_dirty() {
+                element.input_value()
+            } else {
+                host.direct_text_content(root).unwrap_or_default()
+            };
+            return first_strong_text_direction(&value);
+        }
+        if element.is_html_input() {
+            return input_auto_direction(element);
+        }
     }
 
     let mut stack = host.child_handles(root).collect::<Vec<_>>();
@@ -650,7 +666,11 @@ fn auto_direction_for_element(host: &DomHost, root: NodeId) -> Option<CssDirecti
 }
 
 fn descendant_is_directionally_isolated_for_auto(element: &Element) -> bool {
-    if element.is_html_element("bdi") {
+    if matches!(
+        element.local_name(),
+        "bdi" | "script" | "style" | "textarea"
+    ) && element.namespace() == "http://www.w3.org/1999/xhtml"
+    {
         return true;
     }
     element.attribute("dir").is_some_and(|value| {

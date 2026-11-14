@@ -6,7 +6,6 @@ use crate::host::{
 use crate::planning::ScriptSource;
 use crate::script_vm::perform_microtask_checkpoint_and_report_pending_promise_rejections;
 use crate::types::ScriptKind;
-use crate::util::create_script_origin;
 use crate::v8_execution_watchdog::{
     SCRIPT_TURN_WATCHDOG_TIMEOUT, V8ExecutionWatchdog, V8ExecutionWatchdogKind,
     V8ExecutionWatchdogOutcome,
@@ -27,7 +26,7 @@ impl DocumentRuntime {
     pub(in crate::document_runtime) fn run_prepared_document_write_connected_script(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         node: DomHandle,
         mut script: PreparedScript,
         parser_bridge: Option<ParserConnectedScriptBridge>,
@@ -44,7 +43,7 @@ impl DocumentRuntime {
             return DocumentWriteScriptRunOutcome::Complete;
         }
         unsafe { &mut *host_ptr }
-            .sync_owner_style_sheet_texts_for_document_tree_scopes(self.document_handle());
+            .install_prepared_style_sheets_for_document(self.document_handle());
 
         let Some(wrapper) = unsafe { &mut *host_ptr }
             .native_bridge_mut()
@@ -110,6 +109,7 @@ impl DocumentRuntime {
                 node,
                 &host_script_handle,
                 source,
+                &script,
                 parser_bridge,
                 DocumentWriteCurrentScriptEventBehavior::Skip,
             );
@@ -129,10 +129,11 @@ impl DocumentRuntime {
     pub(in crate::document_runtime) fn execute_document_write_immediate_script(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         node: DomHandle,
         host_script_handle: &str,
         source: String,
+        script: &PreparedScript,
         parser_bridge: Option<ParserConnectedScriptBridge>,
         current_script_event_behavior: DocumentWriteCurrentScriptEventBehavior,
     ) {
@@ -149,31 +150,28 @@ impl DocumentRuntime {
             "parser-created top-level script execution requires the page main-world context",
         );
         let scope = &mut v8::ContextScope::new(scope, default_context);
-        let watchdog = V8ExecutionWatchdog::arm(
-            V8ExecutionWatchdogKind::ScriptTurn,
-            scope.thread_safe_handle(),
-            SCRIPT_TURN_WATCHDOG_TIMEOUT,
-        );
         let run_result = {
             let _parser_script_nesting = self.enter_parser_script_nesting();
-            (|| {
-                let source = v8::String::new(scope, &source)?;
-                let origin = create_script_origin(scope, self.document_url().as_str(), 0);
-                let script = v8::Script::compile(scope, source, Some(&origin))?;
-                script.run(scope)
-            })()
+            // A written script is an independent script execution. Report its
+            // exception to its Window, then continue the caller's write and
+            // parser completion, including load for a fetched classic script.
+            crate::script_vm::execute_source_text_on_current_stack(
+                scope,
+                &source,
+                Some(&script.url),
+                Some(&script.base_url),
+                0,
+                script.fetch_metadata.nonce.as_deref(),
+                true,
+            )
         };
-        let script_timed_out = watchdog.disarm() == V8ExecutionWatchdogOutcome::TimedOut;
         self.clear_current_script_handle();
-        if run_result.is_none() {
-            if script_timed_out {
-                tracing::warn!(
-                    host_script_handle,
-                    timeout = ?SCRIPT_TURN_WATCHDOG_TIMEOUT,
-                    "document.write script execution exceeded its deadline and was terminated"
-                );
-            }
-            return;
+        if let Err(error) = run_result {
+            debug!(
+                host_script_handle,
+                %error,
+                "document.write immediate script execution failed"
+            );
         }
         match current_script_event_behavior {
             DocumentWriteCurrentScriptEventBehavior::Skip => {}
@@ -207,7 +205,7 @@ impl DocumentRuntime {
     fn execute_document_write_prepared_script(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         node: DomHandle,
         host_script_handle: &str,
         script: PreparedScript,
@@ -288,6 +286,7 @@ impl DocumentRuntime {
             node,
             host_script_handle,
             source,
+            &script,
             parser_bridge,
             DocumentWriteCurrentScriptEventBehavior::DispatchImmediately(ScriptEventKind::Load),
         );

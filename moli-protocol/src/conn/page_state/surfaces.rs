@@ -1,38 +1,44 @@
+use crate::automation::DevToolsPreloadScriptId;
+
 use super::super::cookie_manager_surface::BrowserContextCookieManagerSurfaceSnapshot;
 use super::super::{
-    BrowserContext, CdpConnection, DocumentStartScript, EmulatedDeviceMetrics,
-    EmulatedGeolocationOverrideState, EmulatedNetworkConditions, EmulatedViewportSurface,
-    PageTargetHost, viewport_surface_install_script,
+    BrowserContext, CdpConnection, DocumentStartScript, EmulatedGeolocationOverrideState,
+    EmulatedNetworkConditions, EmulatedViewportSurface, PageTargetHost,
 };
 #[cfg(test)]
 use moli_cookie_jar::{BrowserCookieFacadeContextOverrides, BrowserCookieFacadeOverrides};
-use serde_json::json;
 
 struct SurfaceOverrideInputs {
     network_conditions: Option<EmulatedNetworkConditions>,
     geolocation_override: Option<EmulatedGeolocationOverrideState>,
-    emulated_device_metrics: Option<EmulatedDeviceMetrics>,
-    touch_emulation_enabled: bool,
+    max_touch_points: u32,
+    navigator_queries: moli_page_types::NavigatorQueryOverrides,
     focus_emulation_enabled: bool,
     active_target_surface: bool,
+    window_is_focused: bool,
     window_document_hidden: bool,
 }
 
 impl SurfaceOverrideInputs {
     fn from_active(browser_context: &BrowserContext) -> Self {
         Self {
+            navigator_queries: browser_context
+                .active_page_target()
+                .devtools_sessions
+                .navigator_emulation
+                .effective(),
             network_conditions: browser_context.effective_active_network_conditions(),
             geolocation_override: browser_context.effective_active_geolocation_override(),
-            emulated_device_metrics: browser_context.effective_active_emulated_device_metrics(),
-            touch_emulation_enabled: browser_context
+            max_touch_points: browser_context
                 .active_page_target()
                 .effective_emulation_state
-                .touch_emulation_enabled,
+                .max_touch_points,
             focus_emulation_enabled: browser_context
                 .active_page_target()
                 .effective_emulation_state
                 .focus_emulation_enabled,
             active_target_surface: true,
+            window_is_focused: browser_context.window_is_focused,
             window_document_hidden: browser_context
                 .active_page_target()
                 .owner_state
@@ -44,7 +50,7 @@ impl SurfaceOverrideInputs {
         state: &PageTargetHost,
         default_network_conditions: Option<EmulatedNetworkConditions>,
         default_geolocation_override: Option<EmulatedGeolocationOverrideState>,
-        default_emulated_device_metrics: Option<EmulatedDeviceMetrics>,
+        selected_tab: bool,
     ) -> Self {
         Self {
             network_conditions: state
@@ -56,20 +62,17 @@ impl SurfaceOverrideInputs {
                 .geolocation_override
                 .clone()
                 .or(default_geolocation_override),
-            emulated_device_metrics: state
-                .effective_emulation_state
-                .emulated_device_metrics
-                .clone()
-                .or(default_emulated_device_metrics),
-            touch_emulation_enabled: state.effective_emulation_state.touch_emulation_enabled,
+            max_touch_points: state.effective_emulation_state.max_touch_points,
+            navigator_queries: state.devtools_sessions.navigator_emulation.effective(),
             focus_emulation_enabled: state.effective_emulation_state.focus_emulation_enabled,
-            active_target_surface: false,
-            window_document_hidden: false,
+            active_target_surface: selected_tab,
+            window_is_focused: false,
+            window_document_hidden: state.owner_state.window_document_hidden(),
         }
     }
 
     fn max_touch_points(&self) -> u32 {
-        if self.touch_emulation_enabled { 1 } else { 0 }
+        self.max_touch_points
     }
 
     fn document_has_focus(&self) -> bool {
@@ -88,12 +91,20 @@ impl SurfaceOverrideInputs {
         }
     }
 
+    fn document_activity(&self) -> moli_page_types::DocumentActivity {
+        moli_page_types::DocumentActivity::new(
+            self.document_is_focused(),
+            self.document_is_visible(),
+        )
+    }
+
     fn navigator_overrides(&self) -> moli_page_types::NavigatorOverrides {
         moli_page_types::NavigatorOverrides {
             online: self
                 .network_conditions
                 .map(|conditions| conditions.navigator_online()),
             max_touch_points: self.max_touch_points(),
+            queries: self.navigator_queries,
             geolocation: self
                 .geolocation_override
                 .as_ref()
@@ -111,7 +122,7 @@ impl SurfaceOverrideInputs {
     }
 
     fn document_is_visible(&self) -> bool {
-        self.document_is_focused() && !self.window_document_hidden
+        (self.active_target_surface || self.focus_emulation_enabled) && !self.window_document_hidden
     }
 
     fn document_is_focused(&self) -> bool {
@@ -120,7 +131,8 @@ impl SurfaceOverrideInputs {
         // report focused and visible by default; background targets
         // stay unfocused/hidden unless CDP explicitly asks to simulate a
         // focused and active page.
-        (self.active_target_surface && !self.window_document_hidden) || self.focus_emulation_enabled
+        (self.active_target_surface && self.window_is_focused && !self.window_document_hidden)
+            || self.focus_emulation_enabled
     }
 }
 
@@ -138,7 +150,7 @@ impl BrowserContext {
                 self.default_geolocation_override
                     .clone()
                     .or_else(|| self.global_geolocation_override.clone()),
-                self.default_emulated_device_metrics.clone(),
+                self.page_targets.is_selected_tab(target_id),
             )
             .navigator_overrides(),
         )
@@ -147,6 +159,67 @@ impl BrowserContext {
     pub(crate) fn active_navigator_overrides(&self) -> moli_page_types::NavigatorOverrides {
         SurfaceOverrideInputs::from_active(self).navigator_overrides()
     }
+
+    pub(crate) fn document_activity_for_target(
+        &self,
+        target_id: &str,
+    ) -> Option<moli_page_types::DocumentActivity> {
+        let target = self.page_target(target_id)?;
+        Some(
+            if self.is_active_target(target_id) {
+                SurfaceOverrideInputs::from_active(self)
+            } else {
+                SurfaceOverrideInputs::from_background(
+                    target,
+                    self.default_network_conditions
+                        .or(self.global_network_conditions),
+                    self.default_geolocation_override
+                        .clone()
+                        .or_else(|| self.global_geolocation_override.clone()),
+                    self.page_targets.is_selected_tab(target_id),
+                )
+            }
+            .document_activity(),
+        )
+    }
+
+    pub(crate) fn active_document_activity(&self) -> moli_page_types::DocumentActivity {
+        self.page_targets
+            .active()
+            .map(|_| SurfaceOverrideInputs::from_active(self).document_activity())
+            .unwrap_or_default()
+    }
+    #[cfg(test)]
+    pub(crate) fn start_cookie_manager_policy_mutation_for_test(
+        &mut self,
+        mutate: impl FnOnce(
+            &mut super::super::cookie_manager_surface::BrowserContextCookieManagerSurface,
+        ) -> bool,
+    ) -> crate::conn::SessionPageUpdates {
+        let mut updates = crate::conn::SessionPageUpdates::default();
+        let Some(host) = self.page_targets.active_mut() else {
+            mutate(&mut self.default_document_cookie_manager_surface);
+            return updates;
+        };
+        if !mutate(&mut host.document_cookie_manager_surface) {
+            return updates;
+        }
+        let overrides = host
+            .document_cookie_manager_surface
+            .snapshot()
+            .policy
+            .overrides;
+        if let Some(page) = host.runtime_slot.loaded_page_mut() {
+            let pending = if overrides == BrowserCookieFacadeOverrides::default() {
+                page.start_clear_document_cookie_facade_overrides()
+            } else {
+                page.start_apply_document_cookie_facade_overrides(&overrides)
+            };
+            updates.push(page, "fixture cookie manager policy update", pending);
+        }
+        updates
+    }
+
     #[cfg(test)]
     async fn mutate_document_cookie_manager_surface_async(
         &mut self,
@@ -179,11 +252,7 @@ impl BrowserContext {
     }
 
     pub fn document_start_script_descriptors(&self) -> Vec<DocumentStartScript> {
-        let mut scripts = Vec::new();
-        if let Some(script) = self.generated_surface_override_script() {
-            scripts.push(script);
-        }
-        scripts.extend(self.default_document_start_script_descriptors());
+        let mut scripts = self.context_document_start_script_descriptors();
         let target_id = self.active_target_id();
         scripts.extend(
             self.active_page_target()
@@ -197,18 +266,31 @@ impl BrowserContext {
         scripts
     }
 
-    pub(crate) fn default_document_start_script_descriptors(&self) -> Vec<DocumentStartScript> {
-        self.default_document_start_scripts
+    /// Startup scripts followed by protocol preloads for new Documents in this Context.
+    pub(crate) fn context_document_start_script_descriptors(&self) -> Vec<DocumentStartScript> {
+        self.startup_document_start_scripts
             .iter()
-            .map(|(identifier, script)| {
-                script
-                    .with_registry_key(Self::default_document_start_script_registry_key(identifier))
-            })
+            .cloned()
+            .chain(
+                self.context_preload_scripts
+                    .iter()
+                    .map(|(identifier, script)| {
+                        Self::context_preload_script_descriptor(identifier, script)
+                    }),
+            )
             .collect()
     }
 
-    pub(crate) fn default_document_start_script_registry_key(identifier: &str) -> String {
+    fn context_preload_script_registry_key(identifier: &DevToolsPreloadScriptId) -> String {
+        // Preserve the namespace used by existing renderer registrations.
         format!("default:{identifier}")
+    }
+
+    pub(crate) fn context_preload_script_descriptor(
+        identifier: &DevToolsPreloadScriptId,
+        script: &DocumentStartScript,
+    ) -> DocumentStartScript {
+        script.with_registry_key(Self::context_preload_script_registry_key(identifier))
     }
 
     pub(crate) fn target_document_start_script_registry_key(
@@ -247,73 +329,67 @@ impl BrowserContext {
         ))
     }
 
-    pub(crate) fn has_default_bidi_channel_preload_script(&self) -> bool {
-        self.default_document_start_scripts
+    pub(crate) fn has_context_bidi_channel_preload_script(&self) -> bool {
+        self.context_preload_scripts
             .iter()
             .any(|(_, script)| script.has_bidi_channel_argument)
     }
 
-    pub(crate) fn record_default_document_start_script(
+    pub(crate) fn record_context_preload_script(
         &mut self,
         script: &DocumentStartScript,
-    ) -> String {
-        let identifier = self.reserve_default_document_start_script_id();
-        self.record_default_document_start_script_with_identifier(identifier.clone(), script);
+    ) -> DevToolsPreloadScriptId {
+        let identifier = self.reserve_context_preload_script_id();
+        self.record_context_preload_script_with_identifier(identifier.clone(), script);
         identifier
     }
 
-    pub(crate) fn reserve_default_document_start_script_id(&mut self) -> String {
-        self.next_default_document_start_script_id =
-            self.next_default_document_start_script_id.wrapping_add(1);
-        self.next_default_document_start_script_id.to_string()
+    pub(crate) fn reserve_context_preload_script_id(&mut self) -> DevToolsPreloadScriptId {
+        self.next_context_preload_script_id = self.next_context_preload_script_id.wrapping_add(1);
+        self.next_context_preload_script_id.to_string().into()
     }
 
-    pub(crate) fn record_default_document_start_script_with_identifier(
+    pub(crate) fn record_context_preload_script_with_identifier(
         &mut self,
-        identifier: String,
+        identifier: DevToolsPreloadScriptId,
         script: &DocumentStartScript,
     ) {
-        let script = script.with_registry_key(Self::default_document_start_script_registry_key(
-            &identifier,
-        ));
-        self.default_document_start_scripts
-            .push((identifier, script));
+        let mut script = script.clone();
+        // Renderer keys are derived at publication, never kept as a second identity.
+        script.registry_key = None;
+        self.context_preload_scripts.push((identifier, script));
     }
 
-    pub(crate) fn remove_default_document_start_script(
+    pub(crate) fn remove_context_preload_script(
         &mut self,
-        script_id: &str,
+        script_id: &DevToolsPreloadScriptId,
     ) -> Option<String> {
         let index = self
-            .default_document_start_scripts
+            .context_preload_scripts
             .iter()
             .position(|(identifier, _)| identifier == script_id)?;
-        let (_, script) = self.default_document_start_scripts.remove(index);
-        Some(
-            script
-                .registry_key
-                .unwrap_or_else(|| Self::default_document_start_script_registry_key(script_id)),
-        )
+        let (identifier, _) = self.context_preload_scripts.remove(index);
+        Some(Self::context_preload_script_registry_key(&identifier))
     }
 
-    pub(crate) fn has_default_document_start_script(&self, script_id: &str) -> bool {
-        self.default_document_start_scripts
+    pub(crate) fn has_context_preload_script(&self, script_id: &DevToolsPreloadScriptId) -> bool {
+        self.context_preload_scripts
             .iter()
             .any(|(identifier, _)| identifier == script_id)
     }
 
     pub(crate) fn merged_extra_headers_for_target_policy(
         &self,
-        target_headers: &[(String, String)],
-    ) -> Vec<(String, String)> {
+        target_headers: &moli_fetch::RequestHeaders,
+    ) -> moli_fetch::RequestHeaders {
         merge_extra_header_layers(&[
-            self.global_extra_headers.as_slice(),
-            self.default_extra_headers.as_slice(),
+            &self.global_extra_headers,
+            &self.default_extra_headers,
             target_headers,
         ])
     }
 
-    pub fn effective_extra_headers(&self) -> Vec<(String, String)> {
+    pub fn effective_extra_headers(&self) -> moli_fetch::RequestHeaders {
         let target_headers = self
             .page_targets
             .active()
@@ -325,7 +401,7 @@ impl BrowserContext {
     pub(crate) fn effective_extra_headers_for_target(
         &self,
         target_id: &str,
-    ) -> Vec<(String, String)> {
+    ) -> moli_fetch::RequestHeaders {
         let target_headers = self
             .page_target(target_id)
             .map(PageTargetHost::effective_policy)
@@ -363,19 +439,16 @@ impl BrowserContext {
 
     pub(crate) fn viewport_surface(&self) -> EmulatedViewportSurface {
         let metrics = self.effective_active_emulated_device_metrics();
-        EmulatedViewportSurface::from_metrics(metrics.as_ref())
+        (metrics.as_ref()).map_or_else(
+            EmulatedViewportSurface::default,
+            crate::conn::EmulatedDeviceMetrics::viewport_surface,
+        )
     }
 
     pub fn max_touch_points(&self) -> u32 {
-        if self
-            .active_page_target()
+        self.active_page_target()
             .effective_emulation_state
-            .touch_emulation_enabled
-        {
-            1
-        } else {
-            0
-        }
+            .max_touch_points
     }
 
     pub fn document_has_focus(&self) -> bool {
@@ -390,139 +463,32 @@ impl BrowserContext {
         SurfaceOverrideInputs::from_active(self).document_visibility_state()
     }
 
-    fn generated_surface_override_script(&self) -> Option<DocumentStartScript> {
-        Self::generated_surface_override_script_from_inputs(&SurfaceOverrideInputs::from_active(
-            self,
-        ))
-    }
-
-    pub(crate) fn generated_surface_override_script_for_background_target(
-        &self,
-        target_id: &str,
-    ) -> Option<DocumentStartScript> {
-        let target = self.background_target(target_id)?;
-        self.generated_surface_override_script_for_background_state(target)
-    }
-
-    pub(crate) fn generated_surface_override_script_for_background_state(
-        &self,
-        state: &PageTargetHost,
-    ) -> Option<DocumentStartScript> {
-        Self::generated_surface_override_script_from_inputs(
-            &SurfaceOverrideInputs::from_background(
-                state,
-                self.default_network_conditions
-                    .or(self.global_network_conditions),
-                self.default_geolocation_override
-                    .clone()
-                    .or_else(|| self.global_geolocation_override.clone()),
-                self.default_emulated_device_metrics.clone(),
-            ),
-        )
-    }
-
-    pub(crate) async fn apply_background_target_surface_overrides_async(
+    pub(crate) fn start_session_surface_restoration(
         &mut self,
         target_id: &str,
-    ) -> anyhow::Result<bool> {
-        let Some(script) = self.generated_surface_override_script_for_background_target(target_id)
-        else {
-            return Ok(false);
+        updates: &mut crate::conn::SessionPageUpdates,
+    ) {
+        let Some(overrides) = self.navigator_overrides_for_target(target_id) else {
+            return;
         };
-        let overrides = self
-            .navigator_overrides_for_target(target_id)
-            .expect("resolved background target retains navigator state");
-        let Some(page) = self
-            .background_target_mut(target_id)
+        let Some(activity) = self.document_activity_for_target(target_id) else {
+            return;
+        };
+        if let Some(page) = self
+            .page_target_mut(target_id)
             .and_then(|target| target.runtime_slot.loaded_page_mut())
-        else {
-            return Ok(false);
-        };
-        page.set_navigator_overrides_async(&overrides).await?;
-        page.run_page_surface_override_script_async(&script.source)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to hide background page surface: {error}"))?;
-        Ok(true)
-    }
-
-    pub(crate) fn generated_surface_override_script_for_active_target(
-        &self,
-    ) -> Option<DocumentStartScript> {
-        self.generated_surface_override_script()
-    }
-
-    fn generated_surface_override_script_from_inputs(
-        inputs: &SurfaceOverrideInputs,
-    ) -> Option<DocumentStartScript> {
-        // Preserve the renderer's native Window/Screen descriptors unless a
-        // client explicitly enabled device emulation. Installing the default
-        // profile as JS getters makes otherwise native attributes observable
-        // as closure-backed properties and can mask child-frame dimensions.
-        // An explicit override retains the original descriptors so a later
-        // CDP clear can restore the native WebIDL surface.
-        let viewport_surface_script = inputs
-            .emulated_device_metrics
-            .as_ref()
-            .map(|metrics| viewport_surface_install_script(&metrics.viewport_surface(), true))
-            .unwrap_or_default();
-        let document_has_focus = inputs.document_has_focus();
-        let document_hidden = inputs.document_hidden();
-        let document_visibility_state = inputs.document_visibility_state();
-
-        let source = format!(
-            "(function() {{
-                const defineGetter = (obj, key, getter) => {{
-                    if (!obj) return;
-                    try {{
-                        Object.defineProperty(obj, key, {{ configurable: true, get: getter }});
-                    }} catch (_error) {{}}
-                }};
-                {viewport_surface_script}
-                if (document) {{
-                    // The renderer's Document bridge currently installs these
-                    // surfaces as own accessors, so CDP emulation must shadow
-                    // the document object directly for staged/background
-                    // overrides to win in the same realm.
-                    defineGetter(document, 'hidden', () => {document_hidden});
-                    defineGetter(document, 'visibilityState', () => {document_visibility_state});
-                    try {{
-                        Object.defineProperty(document, 'hasFocus', {{
-                            configurable: true,
-                            value: () => {document_has_focus}
-                        }});
-                    }} catch (_error) {{}}
-                }}
-            }})();",
-            viewport_surface_script = viewport_surface_script,
-            document_hidden = document_hidden,
-            document_visibility_state = json!(document_visibility_state),
-            document_has_focus = document_has_focus,
-        );
-
-        Some(DocumentStartScript {
-            registry_key: None,
-            devtools_session: None,
-            source,
-            world_name: None,
-            has_bidi_channel_argument: false,
-            bidi_channel_handoffs: Vec::new(),
-        })
-    }
-
-    pub(crate) async fn apply_surface_overrides_to_loaded_page_async(
-        &mut self,
-    ) -> anyhow::Result<()> {
-        let Some(script) = self.generated_surface_override_script() else {
-            return Ok(());
-        };
-        let overrides = self.active_navigator_overrides();
-        let Some(page) = self.active_page_target_mut().runtime_slot.loaded_page_mut() else {
-            return Ok(());
-        };
-        page.set_navigator_overrides_async(&overrides).await?;
-        page.run_page_surface_override_script_async(&script.source)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to apply page surface overrides: {error}"))
+        {
+            updates.push(
+                page,
+                "failed to restore detached session navigator surface",
+                page.start_set_navigator_overrides(&overrides),
+            );
+            updates.push(
+                page,
+                "failed to restore detached session document activity",
+                page.start_set_document_activity(activity),
+            );
+        }
     }
 
     #[cfg(test)]
@@ -583,121 +549,13 @@ impl BrowserContext {
     }
 }
 
-impl CdpConnection {
-    pub(crate) async fn remove_document_start_scripts_for_detached_session_async(
-        &mut self,
-        session_id: &str,
-    ) -> anyhow::Result<()> {
-        let renderer_inspector_session_id =
-            self.target_renderer_runtime_inspector_session_id_for_session(Some(session_id));
-        let devtools_session = moli_page_types::DevToolsSessionKey::from_wire_session_id(
-            renderer_inspector_session_id.as_deref(),
-        );
-        let registry_keys = self
-            .target_owner_state_for_session(Some(session_id))
-            .map(|owner_state| {
-                owner_state.document_start_script_registry_keys_for_session(&devtools_session)
-            })
-            .unwrap_or_default();
-        let has_loaded_page = self
-            .runtime_session_owner_slot_mut(Some(session_id))
-            .ok()
-            .is_some_and(|slot| slot.loaded_page().is_some());
-        if !has_loaded_page {
-            let _ = self.with_target_owner_state_for_session_mut(Some(session_id), |owner_state| {
-                owner_state.remove_document_start_scripts_for_session(&devtools_session)
-            });
-            return Ok(());
-        }
+impl CdpConnection {}
 
-        let mut first_error = None;
-        for registry_key in registry_keys {
-            let result: anyhow::Result<()> = async {
-                let pending = self
-                    .runtime_session_owner_slot_mut(Some(session_id))
-                    .ok()
-                    .and_then(|slot| slot.loaded_page_mut())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "page disappeared while removing detached-session document-start scripts"
-                        )
-                    })?
-                    .start_remove_document_start_script_by_registry_key(&registry_key)
-                    .map_err(|error| {
-                        anyhow::anyhow!(
-                            "failed to start detached-session document-start script cleanup: {error}"
-                        )
-                    })?;
-                let completion = pending.wait().await.map_err(|error| {
-                    anyhow::anyhow!(
-                        "detached-session document-start script cleanup was canceled: {error}"
-                    )
-                })?;
-                let page = self
-                    .runtime_session_owner_slot_mut(Some(session_id))
-                    .ok()
-                    .and_then(|slot| slot.loaded_page_mut())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "page disappeared while finishing detached-session document-start script cleanup"
-                        )
-                    })?;
-                page.finish_unit_runtime_page_command(
-                    completion,
-                    "remove detached-session document-start script",
-                )
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "failed to finish detached-session document-start script cleanup: {error}"
-                    )
-                })?;
-                self.with_target_owner_state_for_session_mut(
-                    Some(session_id),
-                    |owner_state| {
-                        owner_state.remove_document_start_script_registry_key_for_session(
-                            &devtools_session,
-                            &registry_key,
-                        )
-                    },
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "session owner disappeared during document-start script cleanup"
-                    )
-                })?;
-                Ok(())
-            }
-            .await;
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
-            }
-        }
-
-        // Keep unresolved registry keys as cleanup authority. The centralized
-        // session disposer will either retry after the renderer disappears or
-        // keep the session binding alive; clearing them here would orphan a
-        // script that may still execute in a later Document.
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-
-        // Scripts without a renderer registry key never require a renderer
-        // round trip. Successful keyed removals have already been committed.
-        self.with_target_owner_state_for_session_mut(Some(session_id), |owner_state| {
-            owner_state.remove_document_start_scripts_for_session(&devtools_session)
-        })
-        .ok_or_else(|| {
-            anyhow::anyhow!("session owner disappeared during document-start script cleanup")
-        })?;
-        Ok(())
-    }
-}
-
-fn merge_extra_header_layers(layers: &[&[(String, String)]]) -> Vec<(String, String)> {
-    let mut headers = Vec::new();
+fn merge_extra_header_layers(layers: &[&moli_fetch::RequestHeaders]) -> moli_fetch::RequestHeaders {
+    let mut headers = moli_fetch::RequestHeaders::default();
     for layer in layers {
         for (name, value) in *layer {
-            headers.retain(|(existing, _)| existing != name);
+            headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
             headers.push((name.clone(), value.clone()));
         }
     }

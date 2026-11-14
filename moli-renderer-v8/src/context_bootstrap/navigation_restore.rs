@@ -1,19 +1,89 @@
 use super::navigation_activation::{
-    bind_navigation_entry_runtime_owner, install_navigation_activation_runtime_state,
-    set_navigation_current_entry,
+    install_navigation_activation_runtime_state, set_navigation_current_entry,
 };
 use super::navigation_entry::{
-    create_navigation_entry, set_history_entries, set_history_index, set_history_state,
-    set_navigation_entry_document_id,
+    cache_current_history_state, set_history_entries, set_history_index,
 };
 use super::navigation_entry_state::clone_history_entry_state;
-use super::navigation_projection::set_history_length_from_visible_entries;
 use super::navigation_result::clear_active_cross_document_navigation_if_matches;
-use super::navigation_window::{window_history_for_holder, window_navigation_for_holder};
-use crate::native_bridge::NavigationHistoryEntrySeed;
-use moli_page_types::{
-    NavigationHistoryDocumentId, NavigationHistoryEntryId, NavigationHistoryEntryKey,
+use super::navigation_seed::{
+    build_current_navigation_entry_from_seed, build_history_entries_from_seed,
 };
+use super::navigation_window::{window_history_for_holder, window_navigation_for_holder};
+use crate::context_bootstrap::navigation_entry::wrappers as entry_wrappers;
+use crate::native_bridge::NavigationHistoryEntrySeed;
+
+/// Preserve committed inherited-origin entries when a browser navigation
+/// replaces their Document. The browser's position determines the history
+/// operation; unsupported joint-history positions keep the existing path.
+pub(crate) fn capture_inherited_history_for_browser_commit(
+    scope: &mut v8::PinScope<'_, '_>,
+    url: &url::Url,
+    position: moli_session_history::SessionHistoryPosition,
+) -> Option<NavigationHistoryEntrySeed> {
+    let owner = scope.get_current_context().global(scope);
+    let history = window_history_for_holder(scope, owner)?;
+    let entries = super::navigation_serialize::serialize_history_entries(scope, history);
+    let current = super::navigation_entry::history_index(scope, history);
+    let navigation_index =
+        super::navigation_entry::navigation_current_entry_index(scope, owner).unwrap_or(0);
+    let mut seed = inherited_history_seed_for_browser_commit(
+        entries,
+        current,
+        navigation_index,
+        url,
+        position,
+    )?;
+    super::session_history::capture_for_navigation(scope, owner, &mut seed);
+    Some(seed)
+}
+
+pub(crate) fn inherited_history_seed_for_browser_commit(
+    entries: Vec<moli_page_types::NavigationHistorySerializedEntry>,
+    current: u32,
+    navigation_index: u32,
+    url: &url::Url,
+    position: moli_session_history::SessionHistoryPosition,
+) -> Option<NavigationHistoryEntrySeed> {
+    if !entries.iter().any(|entry| {
+        entry
+            .inherited_origin
+            .as_deref()
+            .is_some_and(|origin| origin != "null")
+    }) {
+        return None;
+    }
+    let target = u32::try_from(position.index()).ok()?;
+    let seed = if position.length() == entries.len()
+        && entries
+            .iter()
+            .any(|entry| entry.history_index == target && entry.url == url.as_str())
+    {
+        if current == target {
+            moli_page_types::reload_navigation_seed(entries, current)?
+        } else {
+            moli_page_types::traversal_navigation_seed_candidate(entries, current, target)?.seed
+        }
+    } else {
+        let mutation = if target == current && position.length() == entries.len() {
+            moli_page_types::NavigationHistoryMutation::Replace
+        } else if target == current.checked_add(1)?
+            && position.length() == position.index().checked_add(1)?
+        {
+            moli_page_types::NavigationHistoryMutation::Push
+        } else {
+            return None;
+        };
+        moli_page_types::cross_document_navigation_seed(
+            entries,
+            current,
+            navigation_index,
+            url,
+            mutation,
+        )
+    };
+    Some(seed)
+}
 
 pub(crate) fn install_navigation_bootstrap_entry(
     scope: &mut v8::PinScope<'_, '_>,
@@ -28,63 +98,59 @@ pub(crate) fn install_navigation_bootstrap_entry_for_holder<'s>(
     owner: v8::Local<'s, v8::Object>,
     entry_seed: &NavigationHistoryEntrySeed,
 ) {
+    if super::history_runtime::state::window_has_shared_history(scope, owner) {
+        return;
+    }
+    install_navigation_entry_view_for_holder(scope, owner, entry_seed);
+    commit_navigation_history_for_document(scope, owner, entry_seed);
+}
+
+/// Document installation is the authoritative boundary, including commits
+/// that reuse an initial Window and therefore do not initialize a new realm.
+pub(crate) fn commit_navigation_history_for_document<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    owner: v8::Local<'s, v8::Object>,
+    entry_seed: &NavigationHistoryEntrySeed,
+) {
+    super::session_history::initialize(scope, owner, entry_seed);
+    super::session_history::restore(scope, owner, entry_seed);
+}
+
+/// Refresh a Document's projection without mutating the shared traversable.
+/// During an accepted cross-Document traversal this can still be the outgoing
+/// Document's view. Only document bootstrap or an explicit history operation
+/// may commit a session history transition.
+pub(crate) fn install_navigation_entry_view_for_holder<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    owner: v8::Local<'s, v8::Object>,
+    entry_seed: &NavigationHistoryEntrySeed,
+) {
+    if super::history_runtime::state::window_has_shared_history(scope, owner) {
+        return;
+    }
     let Some(history) = window_history_for_holder(scope, owner) else {
         return;
     };
     let Some(navigation) = window_navigation_for_holder(scope, owner) else {
         return;
     };
-    let entries = v8::Array::new(scope, entry_seed.entries.len() as i32);
-    let mut current_entry = None;
-    let mut current_state: Option<v8::Local<'_, v8::Value>> = None;
-    for snapshot in &entry_seed.entries {
-        let entry = create_navigation_entry(
-            scope,
-            &snapshot.url,
-            snapshot.history_state_json.as_deref(),
-            snapshot.navigation_state_json.as_deref(),
-            snapshot.referrer_policy.as_deref(),
-            snapshot.index,
-            &snapshot.id,
-            &snapshot.key,
-        );
-        set_navigation_entry_document_id(scope, entry, snapshot.document_id.as_str());
-        bind_navigation_entry_runtime_owner(scope, entry, owner);
-        let _ = entries.set_index(scope, snapshot.history_index, entry.into());
-        if snapshot.history_index == entry_seed.current_index {
-            current_entry = Some(entry);
-            current_state = Some(
-                clone_history_entry_state(scope, entry).unwrap_or_else(|| v8::null(scope).into()),
-            );
-        }
-    }
-    let current_entry = current_entry.unwrap_or_else(|| {
-        current_state = Some(v8::null(scope).into());
-        let entry_id = NavigationHistoryEntryId::allocate();
-        let entry_key = NavigationHistoryEntryKey::allocate();
-        let entry = create_navigation_entry(
-            scope,
-            "about:blank",
-            None,
-            None,
-            None,
-            0,
-            entry_id.as_str(),
-            entry_key.as_str(),
-        );
-        let document_id = NavigationHistoryDocumentId::allocate();
-        set_navigation_entry_document_id(scope, entry, document_id.as_str());
-        bind_navigation_entry_runtime_owner(scope, entry, owner);
-        entry
-    });
+    let entries = build_history_entries_from_seed(entry_seed);
+    let current_entry = entries
+        .get(entry_seed.current_index as usize)
+        .map(|entry| entry_wrappers::for_window(scope, owner, entry.clone()))
+        .unwrap_or_else(|| {
+            build_current_navigation_entry_from_seed(
+                scope,
+                owner,
+                entry_seed,
+                v8::null(scope).into(),
+            )
+        });
+    let current_state =
+        clone_history_entry_state(scope, current_entry).unwrap_or_else(|| v8::null(scope).into());
     set_history_entries(scope, history, entries);
     set_history_index(scope, history, entry_seed.current_index);
-    set_history_length_from_visible_entries(scope, history, entries);
-    set_history_state(
-        scope,
-        history,
-        current_state.unwrap_or_else(|| v8::null(scope).into()),
-    );
+    cache_current_history_state(scope, history, current_state);
     set_navigation_current_entry(scope, navigation, current_entry);
     if let Some(snapshot) = entry_seed
         .entries

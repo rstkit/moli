@@ -1,17 +1,35 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 use indexmap::IndexMap;
 use moli_core::network::SharedWebStorageStore;
 use moli_core::runtime::NavigationEngine;
-use serde_json::Value;
 
 use super::{
     devtools_session::DevToolsSessionRegistry, emulation::EffectiveTargetEmulationState,
-    fetch::TargetFetchOwner, identity::TargetIdentityState, page_slot::TargetPageSlot,
+    fetch::TargetFetchOwner, identity::TargetIdentityState,
+    javascript_dialog::TargetJavaScriptDialogState, page_slot::TargetPageSlot,
     runtime_slot::TargetRuntimeSlot, session::TargetNetworkPolicyState,
     session_storage::TargetSessionStorageNamespace, target_state::TargetOwnerState,
 };
 use crate::conn::cookie_manager_surface::BrowserContextCookieManagerSurface;
+
+/// Identifies a target host across Document replacements without retaining it.
+#[derive(Clone, Debug)]
+pub(crate) struct PageTargetHostIdentity(Weak<()>);
+
+impl PartialEq for PageTargetHostIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.matches(other)
+    }
+}
+impl Eq for PageTargetHostIdentity {}
+
+impl PageTargetHostIdentity {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
 
 /// The stable owner of all state that belongs to one page target.
 ///
@@ -21,21 +39,25 @@ use crate::conn::cookie_manager_surface::BrowserContextCookieManagerSurface;
 #[derive(Debug)]
 pub struct PageTargetHost {
     target_id: String,
+    window_identity: moli_core::page::RendererPageWindowIdentity,
+    lifetime: Arc<()>,
+    pub(crate) closing: bool,
+    /// Complete publication that announces this host. This is a delivery
+    /// predecessor, never partial completion or initialization ownership.
+    pub(crate) creation_output_predecessor: Option<moli_core::RendererOutputCursor>,
+    pub(crate) window_id: u32,
     navigation_engine: Option<NavigationEngine>,
     pub(crate) target_identity: TargetIdentityState,
     pub(crate) devtools_sessions: DevToolsSessionRegistry,
+    pub(crate) javascript_dialog_state: TargetJavaScriptDialogState,
     pub(crate) network_policy: TargetNetworkPolicyState,
     pub(crate) http_proxy_override: Option<String>,
     pub(crate) http_no_proxy_override: Option<String>,
     pub(crate) tls_verify_host_override: Option<bool>,
-    pub(crate) base_locale_override: Option<String>,
-    pub(crate) base_timezone_override: Option<String>,
+    pub(crate) environment_owner: moli_core::ProcessEnvironmentOwner,
     pub(crate) effective_emulation_state: EffectiveTargetEmulationState,
-    pub(crate) input_intercept_drags_enabled: bool,
-    pub(crate) input_drag_intercepted: bool,
     pub(crate) css_enabled: bool,
     pub(crate) document_cookie_manager_surface: BrowserContextCookieManagerSurface,
-    pub(crate) dom_remote_object_node_cache: HashMap<String, Value>,
     pub(crate) runtime_slot: TargetRuntimeSlot,
     pub(crate) fetch_owner: TargetFetchOwner,
     pub(crate) owner_state: TargetOwnerState,
@@ -43,44 +65,67 @@ pub struct PageTargetHost {
 }
 
 impl PageTargetHost {
-    pub(crate) fn empty(target_id: String) -> Self {
+    fn from_parts(
+        target_id: String,
+        primary_session_id: Option<String>,
+        target_identity: TargetIdentityState,
+        window_identity: moli_core::page::RendererPageWindowIdentity,
+        runtime_slot: TargetRuntimeSlot,
+    ) -> Self {
+        let mut devtools_sessions = DevToolsSessionRegistry::default();
+        if let Some(session_id) = primary_session_id {
+            devtools_sessions.attach_primary(session_id);
+        }
         Self {
             target_id,
+            window_identity,
+            lifetime: Arc::new(()),
+            closing: false,
+            creation_output_predecessor: None,
+            window_id: 0,
             navigation_engine: None,
-            target_identity: TargetIdentityState::about_blank(),
-            devtools_sessions: DevToolsSessionRegistry::default(),
+            target_identity,
+            devtools_sessions,
+            javascript_dialog_state: TargetJavaScriptDialogState::default(),
             network_policy: TargetNetworkPolicyState::default(),
             http_proxy_override: None,
             http_no_proxy_override: None,
             tls_verify_host_override: None,
-            base_locale_override: None,
-            base_timezone_override: None,
+            environment_owner: Default::default(),
             effective_emulation_state: EffectiveTargetEmulationState::default(),
-            input_intercept_drags_enabled: false,
-            input_drag_intercepted: false,
             css_enabled: false,
             document_cookie_manager_surface: BrowserContextCookieManagerSurface::default(),
-            dom_remote_object_node_cache: HashMap::new(),
-            runtime_slot: TargetRuntimeSlot::default(),
+            runtime_slot,
             fetch_owner: TargetFetchOwner::default(),
             owner_state: TargetOwnerState::default(),
             session_storage_namespace: TargetSessionStorageNamespace::default(),
         }
     }
 
+    pub(crate) fn empty(target_id: String) -> Self {
+        Self::from_parts(
+            target_id,
+            None,
+            TargetIdentityState::about_blank(),
+            Default::default(),
+            TargetRuntimeSlot::default(),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(
         target_id: String,
         primary_session_id: Option<String>,
         target_identity: TargetIdentityState,
         target_page_slot: TargetPageSlot,
     ) -> Self {
-        let mut host = Self::empty(target_id);
-        host.target_identity = target_identity;
-        host.runtime_slot = TargetRuntimeSlot::from_page_slot(target_page_slot);
-        if let Some(session_id) = primary_session_id {
-            host.devtools_sessions.attach_primary(session_id);
-        }
-        host
+        Self::from_parts(
+            target_id,
+            primary_session_id,
+            target_identity,
+            Default::default(),
+            TargetRuntimeSlot::from_page_slot(target_page_slot),
+        )
     }
 
     #[cfg(test)]
@@ -101,17 +146,29 @@ impl PageTargetHost {
         target_id: String,
         primary_session_id: Option<String>,
         target_identity: TargetIdentityState,
+        window_identity: moli_core::page::RendererPageWindowIdentity,
     ) -> Self {
-        Self::new(
+        Self::from_parts(
             target_id,
             primary_session_id,
             target_identity,
-            TargetPageSlot::empty_for_initial_document_page_build(),
+            window_identity,
+            TargetRuntimeSlot::from_page_slot(
+                TargetPageSlot::empty_for_initial_document_page_build(),
+            ),
         )
+    }
+
+    pub(crate) fn window_identity(&self) -> &moli_core::page::RendererPageWindowIdentity {
+        &self.window_identity
     }
 
     pub(crate) fn target_id(&self) -> &str {
         &self.target_id
+    }
+
+    pub(crate) fn host_identity(&self) -> PageTargetHostIdentity {
+        PageTargetHostIdentity(Arc::downgrade(&self.lifetime))
     }
 
     fn replace_target_id(&mut self, target_id: String) {
@@ -205,33 +262,6 @@ impl PageTargetHost {
     pub(crate) fn pending_inspector_await_count(&self) -> usize {
         self.devtools_sessions.pending_inspector_await_count()
     }
-
-    pub(crate) fn has_runtime_remote_object_id(&self, object_id: &str) -> bool {
-        self.devtools_sessions
-            .states()
-            .any(|session| session.has_runtime_remote_object_id(object_id))
-    }
-
-    pub(crate) fn has_runtime_remote_object_id_for_different_session(
-        &self,
-        devtools_session_id: Option<&str>,
-        object_id: &str,
-    ) -> bool {
-        if devtools_session_id.is_some()
-            && self
-                .devtools_sessions
-                .primary()
-                .has_runtime_remote_object_id(object_id)
-        {
-            return true;
-        }
-        self.devtools_sessions
-            .attached_entries()
-            .any(|(session_id, session_state)| {
-                Some(session_id) != devtools_session_id
-                    && session_state.has_runtime_remote_object_id(object_id)
-            })
-    }
 }
 
 /// All page hosts in one browser context plus the foreground selector.
@@ -242,6 +272,8 @@ impl PageTargetHost {
 pub(crate) struct PageTargetRegistry {
     active_target_id: Option<String>,
     hosts: IndexMap<String, PageTargetHost>,
+    selected_tabs: HashMap<u32, String>,
+    next_window_id: u32,
 }
 
 impl PageTargetRegistry {
@@ -274,31 +306,102 @@ impl PageTargetRegistry {
         self.hosts.get_mut(target_id)
     }
 
-    pub(crate) fn insert(&mut self, host: PageTargetHost) -> bool {
+    pub(crate) fn insert(&mut self, mut host: PageTargetHost, window_id: u32) -> bool {
         let target_id = host.target_id().to_owned();
         if self.hosts.contains_key(&target_id) {
             return false;
         }
+        host.window_id = window_id;
         self.hosts.insert(target_id, host);
         true
     }
 
     pub(crate) fn remove(&mut self, target_id: &str) -> Option<PageTargetHost> {
+        let window_id = self.get(target_id)?.window_id;
+        if self.is_selected_tab(target_id) {
+            let neighbor = self.adjacent_tab_id(target_id).map(str::to_owned);
+            self.selected_tabs.remove(&window_id);
+            if let Some(neighbor) = neighbor {
+                self.selected_tabs.insert(window_id, neighbor);
+            }
+        }
         if self.active_target_id() == Some(target_id) {
             self.active_target_id = None;
         }
         self.hosts.shift_remove(target_id)
     }
 
+    /// Preserve tab-strip order when an active target closes: prefer its right
+    /// neighbor, then the left neighbor at the end of the strip. Compute this
+    /// before removal, while the closing target still identifies its position.
+    pub(crate) fn adjacent_target_id(&self, target_id: &str) -> Option<&str> {
+        self.adjacent_tab_id(target_id).or_else(|| {
+            self.hosts
+                .values()
+                .rev()
+                .find(|host| {
+                    host.target_id() != target_id && self.is_selected_tab(host.target_id())
+                })
+                .map(PageTargetHost::target_id)
+        })
+    }
+
+    fn adjacent_tab_id(&self, target_id: &str) -> Option<&str> {
+        let index = self.hosts.get_index_of(target_id)?;
+        let window_id = self.get(target_id)?.window_id;
+        self.hosts
+            .values()
+            .skip(index + 1)
+            .find(|host| host.window_id == window_id)
+            .or_else(|| {
+                self.hosts
+                    .values()
+                    .take(index)
+                    .rev()
+                    .find(|host| host.window_id == window_id)
+            })
+            .map(PageTargetHost::target_id)
+    }
+
+    pub(crate) fn is_selected_tab(&self, target_id: &str) -> bool {
+        self.get(target_id).is_some_and(|host| {
+            self.selected_tabs
+                .get(&host.window_id)
+                .is_some_and(|selected| selected == target_id)
+        })
+    }
+
+    pub(crate) fn default_window_id(&mut self) -> u32 {
+        self.active()
+            .or_else(|| self.hosts.values().next())
+            .map(|host| host.window_id)
+            .unwrap_or_else(|| self.allocate_window_id())
+    }
+
+    pub(crate) fn allocate_window_id(&mut self) -> u32 {
+        let id = self.next_window_id;
+        self.next_window_id = id.checked_add(1).expect("window id space exhausted");
+        id
+    }
+
+    pub(crate) fn select_tab(&mut self, target_id: &str) -> bool {
+        let Some(host) = self.get(target_id) else {
+            return false;
+        };
+        self.selected_tabs
+            .insert(host.window_id, target_id.to_owned());
+        true
+    }
+
     pub(crate) fn select(&mut self, target_id: &str) -> bool {
-        if self.get(target_id).is_none() {
+        if !self.select_tab(target_id) {
             return false;
         }
         self.active_target_id = Some(target_id.to_owned());
         true
     }
 
-    pub(crate) fn rekey_active(&mut self, target_id: String) -> bool {
+    pub(crate) fn rekey_active(&mut self, target_id: String, window_id: u32) -> bool {
         if self.hosts.contains_key(&target_id) {
             return false;
         }
@@ -310,7 +413,11 @@ impl PageTargetRegistry {
         else {
             return false;
         };
+        self.selected_tabs.remove(&active.window_id);
+        active.window_id = window_id;
         active.replace_target_id(target_id.clone());
+        self.selected_tabs
+            .insert(active.window_id, target_id.clone());
         self.hosts.shift_insert(index, target_id.clone(), active);
         self.active_target_id = Some(target_id);
         true
@@ -338,19 +445,30 @@ impl PageTargetRegistry {
             .filter(move |host| Some(host.target_id()) != active_target_id.as_deref())
     }
 
-    pub(crate) fn background_at(&self, index: usize) -> Option<&PageTargetHost> {
-        self.background().nth(index)
-    }
-
-    pub(crate) fn background_at_mut(&mut self, index: usize) -> Option<&mut PageTargetHost> {
-        self.background_mut().nth(index)
-    }
-
     pub(crate) fn background_len(&self) -> usize {
         self.background().count()
     }
 
     pub(crate) fn background_is_empty(&self) -> bool {
         self.background().next().is_none()
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn reopening_after_the_last_tab_closes_uses_a_new_window_identity() {
+        let mut targets = PageTargetRegistry::default();
+        let window_id = targets.default_window_id();
+        targets.insert(PageTargetHost::empty("first".into()), window_id);
+        targets.select("first");
+        let first_window = targets.remove("first").unwrap().window_id;
+        let window_id = targets.default_window_id();
+        targets.insert(PageTargetHost::empty("second".into()), window_id);
+        targets.select("second");
+        assert_ne!(targets.get("second").unwrap().window_id, first_window);
+        assert!(targets.is_selected_tab("second"));
     }
 }

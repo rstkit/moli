@@ -1,3 +1,4 @@
+use crate::web_api_interfaces;
 use crate::{
     callback_invocation::invoke_synchronous_webidl_callback_function,
     util::{
@@ -18,6 +19,7 @@ const NATIVE_SET_KEYS_INTRINSIC_SLOT: &str = "__moliSetKeysIntrinsic";
 const NATIVE_SET_VALUES_INTRINSIC_SLOT: &str = "__moliSetValuesIntrinsic";
 const NATIVE_SET_ITERATOR_NEXT_INTRINSIC_SLOT: &str = "__moliSetIteratorNextIntrinsic";
 const NATIVE_REFLECT_APPLY_INTRINSIC_SLOT: &str = "__moliReflectApplyIntrinsic";
+const NATIVE_REFLECT_CONSTRUCT_INTRINSIC_SLOT: &str = "__moliReflectConstructIntrinsic";
 const STYLE_PROPERTY_MAP_ITERATOR_PROTOTYPE_SLOT: &str = "__moliStylePropertyMapIteratorPrototype";
 const EVENT_COUNTS_ITERATOR_PROTOTYPE_SLOT: &str = "__moliEventCountsIteratorPrototype";
 const FONT_FACE_SET_ITERATOR_PROTOTYPE_SLOT: &str = "__moliFontFaceSetIteratorPrototype";
@@ -36,6 +38,15 @@ pub(crate) enum SnapshotWebIdlIteratorKind {
 }
 
 impl SnapshotWebIdlIteratorKind {
+    const fn interface(self) -> &'static str {
+        match self {
+            Self::StylePropertyMapReadOnly => "StylePropertyMapReadOnly Iterator",
+            Self::EventCounts => "EventCounts Iterator",
+            Self::FontFaceSet => "FontFaceSet Iterator",
+            Self::CssFontFeatureValuesMap => "CSSFontFeatureValuesMap Iterator",
+        }
+    }
+
     const fn prototype_slot(self) -> &'static str {
         match self {
             Self::StylePropertyMapReadOnly => STYLE_PROPERTY_MAP_ITERATOR_PROTOTYPE_SLOT,
@@ -69,6 +80,13 @@ pub(crate) enum SetlikeWebIdlIteratorKind {
 }
 
 impl SetlikeWebIdlIteratorKind {
+    const fn interface(self) -> &'static str {
+        match self {
+            Self::ViewTransitionTypeSet => "ViewTransitionTypeSet Iterator",
+            Self::CustomStateSet => "CustomStateSet Iterator",
+        }
+    }
+
     const fn prototype_slot(self) -> &'static str {
         match self {
             Self::ViewTransitionTypeSet => VIEW_TRANSITION_TYPE_SET_ITERATOR_PROTOTYPE_SLOT,
@@ -114,7 +132,7 @@ pub(crate) enum MaplikeWebIdlIteratorMethod {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct SnapshotWebIdlIteratorDeclaration<'s> {
     #[webapi(slot = SNAPSHOT_ITERATOR_VALUES_SLOT)]
     values: v8::Local<'s, v8::Array>,
@@ -123,7 +141,7 @@ struct SnapshotWebIdlIteratorDeclaration<'s> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NativeCollectionWebIdlIteratorDeclaration<'s> {
     #[webapi(slot = NATIVE_COLLECTION_ITERATOR_SLOT)]
     iterator: v8::Local<'s, v8::Object>,
@@ -132,7 +150,7 @@ struct NativeCollectionWebIdlIteratorDeclaration<'s> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct SnapshotWebIdlIteratorResultDeclaration<'s> {
     value: v8::Local<'s, v8::Value>,
     done: bool,
@@ -140,7 +158,7 @@ struct SnapshotWebIdlIteratorResultDeclaration<'s> {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "StylePropertyMapReadOnly Iterator",
+    interface = web_api_interfaces::StylePropertyMapReadOnlyIterator,
     intrinsic_prototype_parent = v8::Intrinsic::IteratorPrototype,
     prototype_to_string_tag = "StylePropertyMapReadOnly Iterator",
     readonly_prototype,
@@ -153,7 +171,7 @@ struct StylePropertyMapReadOnlyIteratorPrototypeDeclaration {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "EventCounts Iterator",
+    interface = web_api_interfaces::EventCountsIterator,
     intrinsic_prototype_parent = v8::Intrinsic::MapIteratorPrototype,
     prototype_to_string_tag = "EventCounts Iterator",
     readonly_prototype,
@@ -166,7 +184,7 @@ struct EventCountsIteratorPrototypeDeclaration {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "FontFaceSet Iterator",
+    interface = web_api_interfaces::FontFaceSetIterator,
     intrinsic_prototype_parent = v8::Intrinsic::SetIteratorPrototype,
     prototype_to_string_tag = "FontFaceSet Iterator",
     readonly_prototype,
@@ -179,7 +197,7 @@ struct FontFaceSetIteratorPrototypeDeclaration {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "ViewTransitionTypeSet Iterator",
+    interface = web_api_interfaces::ViewTransitionTypeSetIterator,
     intrinsic_prototype_parent = v8::Intrinsic::SetIteratorPrototype,
     prototype_to_string_tag = "ViewTransitionTypeSet Iterator",
     readonly_prototype,
@@ -196,7 +214,7 @@ struct ViewTransitionTypeSetIteratorPrototypeDeclaration {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "CustomStateSet Iterator",
+    interface = web_api_interfaces::CustomStateSetIterator,
     intrinsic_prototype_parent = v8::Intrinsic::SetIteratorPrototype,
     prototype_to_string_tag = "CustomStateSet Iterator",
     readonly_prototype,
@@ -213,7 +231,7 @@ struct CustomStateSetIteratorPrototypeDeclaration {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "CSSFontFeatureValuesMap Iterator",
+    interface = web_api_interfaces::CSSFontFeatureValuesMapIterator,
     intrinsic_prototype_parent = v8::Intrinsic::MapIteratorPrototype,
     prototype_to_string_tag = "CSSFontFeatureValuesMap Iterator",
     readonly_prototype,
@@ -271,16 +289,16 @@ pub(crate) fn install_webidl_collection_iterator_intrinsics<'s>(
         .get(scope, v8str(scope, "Reflect").into())
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
         .ok_or_else(|| anyhow!("missing intrinsic Reflect object"))?;
-    let apply = reflect
-        .get(scope, v8str(scope, "apply").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-        .ok_or_else(|| anyhow!("missing intrinsic Reflect.apply"))?;
-    set_private_value(
-        scope,
-        global,
-        NATIVE_REFLECT_APPLY_INTRINSIC_SLOT,
-        apply.into(),
-    );
+    for (name, slot) in [
+        ("apply", NATIVE_REFLECT_APPLY_INTRINSIC_SLOT),
+        ("construct", NATIVE_REFLECT_CONSTRUCT_INTRINSIC_SLOT),
+    ] {
+        let function = reflect
+            .get(scope, v8str(scope, name).into())
+            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+            .ok_or_else(|| anyhow!("missing intrinsic Reflect.{name}"))?;
+        set_private_value(scope, global, slot, function.into());
+    }
 
     Ok(())
 }
@@ -291,6 +309,12 @@ pub(crate) fn webidl_collection_reflect_apply_intrinsic<'s>(
     native_collection_intrinsic(scope, NATIVE_REFLECT_APPLY_INTRINSIC_SLOT)
 }
 
+pub(crate) fn reflect_construct_intrinsic<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    native_collection_intrinsic(scope, NATIVE_REFLECT_CONSTRUCT_INTRINSIC_SLOT)
+}
+
 pub(crate) fn new_snapshot_webidl_iterator<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     values: v8::Local<'s, v8::Array>,
@@ -299,6 +323,7 @@ pub(crate) fn new_snapshot_webidl_iterator<'s>(
     let iterator = SnapshotWebIdlIteratorDeclaration::new(values, 0)
         .bind(scope)
         .ok()?;
+    web_api_interfaces::initialize(scope, iterator, kind.interface()).ok()?;
     let prototype = snapshot_webidl_iterator_prototype(scope, kind)?;
     (iterator.set_prototype(scope, prototype.into()) == Some(true)).then_some(iterator)
 }
@@ -313,6 +338,7 @@ pub(crate) fn new_setlike_webidl_iterator<'s>(
     let iterator = NativeCollectionWebIdlIteratorDeclaration::new(native_iterator, next)
         .bind(scope)
         .ok()?;
+    web_api_interfaces::initialize(scope, iterator, kind.interface()).ok()?;
     let prototype = setlike_webidl_iterator_prototype(scope, kind)?;
     (iterator.set_prototype(scope, prototype.into()) == Some(true)).then_some(iterator)
 }

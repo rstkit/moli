@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_bridge::OwnerDispatchScope;
 use crate::util::get_private_value;
 use crate::webidl;
 
@@ -48,6 +49,19 @@ pub(in crate::context_bootstrap) fn window_child_context_handle<'s>(
     if marked_handle.is_some() {
         return marked_handle;
     }
+    // A callback can run promise reactions from another realm before its
+    // legacy dispatch marker is restored. The holder's native realm remains
+    // authoritative for WindowProperties, including a top-level holder.
+    if let Some(context) = receiver.get_creation_context(scope)
+        && let Some(host_ptr) = context_host_ptr_from_context_slot(context)
+        && let Some(identity) =
+            unsafe { &*host_ptr }.window_execution_context_identity_for_access_check(context)
+    {
+        return unsafe { &*host_ptr }
+            .window_execution_context_identity_is_current(identity)
+            .then(|| identity.dispatch_scope().child_window())
+            .flatten();
+    }
     if let Some(handle) = crate::native_bridge::active_child_window_handle(scope) {
         if receiver_is_current_global {
             return Some(handle);
@@ -76,30 +90,33 @@ pub(in crate::context_bootstrap) fn window_child_context_handle<'s>(
         }
     }
 
-    // WindowProperties is a per-realm prototype-chain object rather than the
-    // global proxy, so it has no child-handle marker of its own. Resolve its
-    // native Window identity through the creation context, mirroring Blink's
-    // native DOMWindow association on WindowProperties.
-    let receiver_context = receiver.get_creation_context(scope)?;
-    let host_ptr = context_host_ptr_from_context_slot(receiver_context)?;
-    let host = unsafe { &*host_ptr };
-    let identity = host.window_execution_context_identity_for_access_check(receiver_context)?;
-    if !host.window_execution_context_identity_is_current(identity) {
-        return None;
-    }
-    match identity.dispatch_scope() {
-        crate::native_bridge::OwnerDispatchScope::Child(handle) => Some(handle),
-        crate::native_bridge::OwnerDispatchScope::Top
-        | crate::native_bridge::OwnerDispatchScope::LightweightPopup(_) => None,
-    }
+    None
 }
 
-pub(super) fn window_host_ptr(
+pub(crate) fn window_host_ptr(
     scope: &mut v8::PinScope<'_, '_>,
     receiver: v8::Local<'_, v8::Object>,
-) -> Option<*mut JsContextHost> {
-    context_host_ptr_from_window_object(scope, receiver)
+) -> Option<*mut PageScriptHost> {
+    // A borrowed or cross-origin accessor executes in another realm. Resolve
+    // its receiver's native owner before consulting legacy or ambient bridges.
+    receiver
+        .get_creation_context(scope)
+        .and_then(context_host_ptr_from_context_slot)
+        .or_else(|| context_host_ptr_from_window_object(scope, receiver))
         .or_else(|| context_host_ptr_from_global_bridge(scope))
+}
+
+pub(in crate::context_bootstrap) fn window_current_dispatch_scope<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+    host: &PageScriptHost,
+) -> Option<OwnerDispatchScope> {
+    // The receiver's concrete realm identifies its LocalWindow. An iframe
+    // element's marker survives removal and can belong to a replacement Window.
+    let context = receiver.get_creation_context(scope)?;
+    let identity = host.window_execution_context_identity_for_access_check(context)?;
+    host.window_execution_context_identity_is_current(identity)
+        .then(|| identity.dispatch_scope())
 }
 
 pub(super) fn window_receiver<'s>(
@@ -112,4 +129,53 @@ pub(super) fn window_receiver<'s>(
     }
     webidl::throw_type_error(scope, "Window getter called on incompatible receiver.");
     None
+}
+
+pub(crate) fn current_window_style_viewport(
+    scope: &mut v8::PinScope<'_, '_>,
+    host: &crate::native_bridge::PageScriptHost,
+) -> crate::style_engine::StyleViewport {
+    let global = scope.get_current_context().global(scope);
+    window_child_context_handle(scope, global)
+        .and_then(|frame_handle| {
+            crate::native_bridge::element::iframe_handle_viewport(host, frame_handle)
+        })
+        .unwrap_or_else(|| host.style_viewport())
+}
+
+pub(in crate::context_bootstrap) fn window_has_discarded_child_browsing_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+) -> bool {
+    let Some(handle) = window_child_context_handle(scope, receiver) else {
+        return false;
+    };
+    let Some(host_ptr) = window_host_ptr(scope, receiver) else {
+        return true;
+    };
+    let host = unsafe { &*host_ptr };
+    // Container removal disconnects the DOM node before its unload callbacks.
+    // The captured LocalWindow remains current until those callbacks finish;
+    // checking its identity also keeps reattachment from reviving an old realm.
+    window_current_dispatch_scope(scope, receiver, host)
+        .is_none_or(|owner| owner != OwnerDispatchScope::Child(handle))
+}
+
+pub(super) fn window_is_closed<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+) -> bool {
+    if let Some(popup_id) = crate::native_bridge::lightweight_popup_id_from_window(scope, receiver)
+        .or_else(|| crate::native_bridge::cross_origin_lightweight_popup_id(scope, receiver))
+    {
+        return window_host_ptr(scope, receiver)
+            .is_none_or(|host| !unsafe { &*host }.lightweight_popup_is_open(popup_id));
+    }
+    if window_child_context_handle(scope, receiver).is_some() {
+        return window_has_discarded_child_browsing_context(scope, receiver);
+    }
+    receiver
+        .get_creation_context(scope)
+        .and_then(context_host_ptr_from_context_slot)
+        .is_none_or(|host| unsafe { &*host }.browsing_context_is_closed())
 }

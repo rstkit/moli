@@ -1,6 +1,6 @@
 use std::io::{BufRead, Write};
 
-use crate::cookie::{Cookie, CookiePriority};
+use crate::cookie::{Cookie, CookiePartitionKey, CookiePriority};
 
 use super::policy::{canonical_cookie_domain, domains_overlap, path_overlap};
 use super::*;
@@ -8,7 +8,10 @@ use super::*;
 impl CookieStore {
     /// Clear the contents of the store
     pub fn clear(&mut self) {
-        self.cookies.clear()
+        if !self.cookies.is_empty() {
+            self.cookies.clear();
+            self.notify(CookieStoreMutation::Clear);
+        }
     }
 
     /// An iterator visiting all the __unexpired__ cookies in the store
@@ -114,8 +117,9 @@ impl CookieStore {
         let mut next_creation_index = 0;
         let mut next_access_index = 0;
         for cookie in iter {
-            let cookie = cookie?;
+            let mut cookie = cookie?;
             if include_expired || !cookie.is_expired() {
+                cookie.restore_creation_time();
                 next_creation_index =
                     next_creation_index.max(cookie.creation_index().saturating_add(1));
                 next_access_index =
@@ -133,6 +137,7 @@ impl CookieStore {
             next_creation_index,
             next_access_index,
             limits: CookieStoreLimits::default(),
+            observer: None,
             #[cfg(feature = "public_suffix")]
             public_suffix_list: None,
         })
@@ -144,6 +149,7 @@ impl CookieStore {
             next_creation_index: 0,
             next_access_index: 0,
             limits: CookieStoreLimits::default(),
+            observer: None,
             #[cfg(feature = "public_suffix")]
             public_suffix_list: None,
         }
@@ -180,28 +186,36 @@ impl CookieStore {
     pub(super) fn make_room_for_cookie(
         &mut self,
         domain: &str,
+        partition_key: Option<&CookiePartitionKey>,
         incoming_secure_cookie: bool,
         replacing_existing: bool,
     ) -> bool {
-        while self
-            .iter_unexpired()
-            .count()
-            .saturating_sub(usize::from(replacing_existing))
-            >= self.limits.total_cookies
+        // The global quota covers only unpartitioned cookies. CHIPS cookies
+        // have independent domain quotas within each complete partition key.
+        while partition_key.is_none()
+            && self
+                .iter_unexpired()
+                .filter(|cookie| cookie.partition_key().is_none())
+                .count()
+                .saturating_sub(usize::from(replacing_existing))
+                >= self.limits.total_cookies
         {
-            if !self.evict_one_cookie(None, incoming_secure_cookie) {
+            if !self.evict_one_cookie(None, None, incoming_secure_cookie) {
                 return false;
             }
         }
 
         while self
             .iter_unexpired()
-            .filter(|existing| canonical_cookie_domain(existing) == domain)
+            .filter(|existing| {
+                existing.partition_key() == partition_key
+                    && canonical_cookie_domain(existing) == domain
+            })
             .count()
             .saturating_sub(usize::from(replacing_existing))
             >= self.limits.per_domain_cookies
         {
-            if !self.evict_one_cookie(Some(domain), incoming_secure_cookie) {
+            if !self.evict_one_cookie(Some(domain), partition_key, incoming_secure_cookie) {
                 return false;
             }
         }
@@ -209,14 +223,19 @@ impl CookieStore {
         true
     }
 
-    fn evict_one_cookie(&mut self, domain: Option<&str>, incoming_secure_cookie: bool) -> bool {
+    fn evict_one_cookie(
+        &mut self,
+        domain: Option<&str>,
+        partition_key: Option<&CookiePartitionKey>,
+        incoming_secure_cookie: bool,
+    ) -> bool {
         for priority in [
             CookiePriority::Low,
             CookiePriority::Medium,
             CookiePriority::High,
         ] {
             if let Some((name, domain, path, partition_key)) =
-                self.oldest_accessed_cookie_key(domain, false, priority)
+                self.oldest_accessed_cookie_key(domain, partition_key, false, priority)
             {
                 self.remove_with_partition_key(&domain, &path, &name, partition_key.as_ref());
                 return true;
@@ -233,7 +252,7 @@ impl CookieStore {
             CookiePriority::High,
         ] {
             if let Some((name, domain, path, partition_key)) =
-                self.oldest_accessed_cookie_key(domain, true, priority)
+                self.oldest_accessed_cookie_key(domain, partition_key, true, priority)
             {
                 self.remove_with_partition_key(&domain, &path, &name, partition_key.as_ref());
                 return true;
@@ -246,12 +265,14 @@ impl CookieStore {
     fn oldest_accessed_cookie_key(
         &self,
         domain: Option<&str>,
+        partition_key: Option<&CookiePartitionKey>,
         secure: bool,
         priority: CookiePriority,
     ) -> Option<(String, String, String, Option<crate::CookiePartitionKey>)> {
         self.iter_unexpired()
             .filter(|cookie| {
-                cookie.secure().unwrap_or(false) == secure
+                cookie.partition_key() == partition_key
+                    && cookie.secure().unwrap_or(false) == secure
                     && cookie.effective_priority() == priority
                     && domain.is_none_or(|domain| canonical_cookie_domain(cookie) == domain)
             })

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import asyncio
 import json
 import re
@@ -7,8 +8,16 @@ import urllib.parse
 
 from playwright.async_api import Error as PlaywrightError, expect
 
+from ..diagnostics import new_cdp_session
 from . import SmokeState
+from ..helpers import capture_layout
+from ..config import is_moli_browser
+from .drop_input import run_drop_input_workflow
 from ..assertions import SmokeError, assert_equal, wait_until
+from ..progress import await_with_progress
+from .drag_interception import run_drag_interception_workflows
+from .keyboard_modifiers import run_keyboard_modifier_workflow
+from .native_drag_semantics import run_native_drag_semantics
 
 
 async def run_dom_input_group(state: SmokeState) -> None:
@@ -17,12 +26,14 @@ async def run_dom_input_group(state: SmokeState) -> None:
     temp_dir = state.temp_dir
 
     await page.set_content('<main id="set-content">set content ok</main>')
+    await capture_layout(page)
     assert_equal(await page.text_content("#set-content"), "set content ok", "setContent text")
     state.record("set_content_static_dom")
 
     await page.set_content(
         '<main id="set-content-inline">inline content ok</main><script>window.__moliSetContentInlineRan = (window.__moliSetContentInlineRan || 0) + 1;</script>'
     )
+    await capture_layout(page)
     assert_equal(await page.text_content("#set-content-inline"), "inline content ok", "setContent inline text")
     assert_equal(await page.evaluate("() => window.__moliSetContentInlineRan"), 1, "setContent inline script ran")
     state.record("set_content_inline_script")
@@ -43,15 +54,17 @@ async def run_dom_input_group(state: SmokeState) -> None:
         </script>
         """
     )
+    await capture_layout(page)
     await page.set_input_files("#upload", str(upload_file))
     uploaded = await page.evaluate(
         """() => {
           const file = document.querySelector('#upload')?.files?.[0];
-          return file ? { name: file.name, size: file.size } : null;
+          return file ? { name: file.name, size: file.size, type: file.type } : null;
         }"""
     )
     assert_equal(uploaded.get("name"), "upload.txt", "uploaded file name")
     assert_equal(uploaded.get("size"), len("upload contents"), "uploaded file size")
+    assert_equal(uploaded.get("type"), "text/plain", "uploaded file MIME type")
     upload_text = await page.evaluate(
         """async () => {
           const file = document.querySelector('#upload')?.files?.[0];
@@ -89,7 +102,35 @@ async def run_dom_input_group(state: SmokeState) -> None:
     )
     state.record("set_input_files")
 
+    # Remote Playwright uploads supply an explicit MIME type. Use native
+    # disk-file selection to verify the browser's own extension lookup.
+    document = await state.cdp.send("DOM.getDocument", {})
+    upload_node = await state.cdp.send(
+        "DOM.querySelector",
+        {"nodeId": document["root"]["nodeId"], "selector": "#upload"},
+    )
+    for name, contents, expected_type in [
+        ("upload.TXT", b"\x89PNG\r\n\x1a\n", "text/plain"),
+        ("upload.json", b"{}", "application/json"),
+        ("upload.pdf", b"%PDF-1.7\n", "application/pdf"),
+        ("upload.moli_unknown", b"\x89PNG\r\n\x1a\n", ""),
+        ("upload_without_extension", b"%PDF-1.7\n", ""),
+    ]:
+        selected_file = temp_dir / name
+        selected_file.write_bytes(contents)
+        await state.cdp.send(
+            "DOM.setFileInputFiles",
+            {"nodeId": upload_node["nodeId"], "files": [str(selected_file)]},
+        )
+        assert_equal(
+            await page.locator("#upload").evaluate("input => input.files[0].type"),
+            expected_type,
+            f"native file MIME type: {name}",
+        )
+    state.record("cdp_file_input_mime_types")
+
     await page.set_content('<input id="chooser" type="file" multiple>')
+    await capture_layout(page)
     surface = await page.locator("#chooser").evaluate(
         """input => [
           input instanceof HTMLInputElement,
@@ -105,11 +146,12 @@ async def run_dom_input_group(state: SmokeState) -> None:
     chooser = await chooser_info.value
     await chooser.set_files(str(upload_file))
     chooser_files = await page.evaluate(
-        """() => Array.from(document.querySelector('#chooser')?.files || []).map(file => ({ name: file.name, size: file.size }))"""
+        """() => Array.from(document.querySelector('#chooser')?.files || []).map(file => ({ name: file.name, size: file.size, type: file.type }))"""
     )
     assert_equal(len(chooser_files), 1, "file chooser selected file count")
     assert_equal(chooser_files[0].get("name"), "upload.txt", "file chooser selected file name")
     assert_equal(chooser_files[0].get("size"), len("upload contents"), "file chooser selected file size")
+    assert_equal(chooser_files[0].get("type"), "text/plain", "file chooser selected file MIME type")
     chooser_text = await page.evaluate(
         """async () => {
           const file = document.querySelector('#chooser')?.files?.[0];
@@ -130,26 +172,37 @@ async def run_dom_input_group(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     async with page.expect_file_chooser(timeout=10_000) as scripted_chooser_info:
         await page.locator("#open-chooser").evaluate("button => button.click()")
     scripted_chooser = await scripted_chooser_info.value
     await scripted_chooser.set_files(str(upload_file))
     scripted_files = await page.evaluate(
-        """() => Array.from(document.querySelector('#picker-script')?.files || []).map(file => ({ name: file.name, size: file.size }))"""
+        """() => Array.from(document.querySelector('#picker-script')?.files || []).map(file => ({ name: file.name, size: file.size, type: file.type }))"""
     )
     assert_equal(len(scripted_files), 1, "scripted file chooser selected file count")
     assert_equal(scripted_files[0].get("name"), "upload.txt", "scripted file chooser selected file name")
     assert_equal(scripted_files[0].get("size"), len("upload contents"), "scripted file chooser selected file size")
+    assert_equal(scripted_files[0].get("type"), "text/plain", "scripted file chooser selected file MIME type")
     state.record("file_chooser_show_picker")
 
     await page.set_content(f'<a id="go" href="{fixture}/plain">go</a>')
+    await capture_layout(page)
     assert_equal(await page.get_attribute("#go", "href"), f"{fixture}/plain", "link navigation href")
+    assert_equal(
+        await page.locator("#go").evaluate(
+            "link => [getComputedStyle(link).color, getComputedStyle(link).textDecorationLine]"
+        ),
+        ["rgb(0, 0, 238)", "underline"],
+        "link user-agent color and decoration",
+    )
     await _navigate_until_dom_ready(state, f"{fixture}/plain")
     assert_equal(await page.text_content("main"), "plain ok", "click navigation target text")
     state.record("click_navigation")
 
     quoted_email = "agent'quoted@example.test"
     await _navigate_until_dom_ready(state, f"{fixture}/auth-email")
+    await capture_layout(page)
     await page.fill("#email", quoted_email)
     await _navigate_until_dom_ready(state, f"{fixture}/auth-password?email={urllib.parse.quote(quoted_email)}")
     assert_equal(
@@ -187,12 +240,24 @@ async def run_dom_input_group(state: SmokeState) -> None:
     state.record("auth_style_hydrated_click_redirect")
 
     await run_locator_input_workflows(state)
+    await run_drag_interception_workflows(state)
+    await run_native_drag_semantics(state)
     await run_user_facing_locator_workflows(state)
     await run_role_selector_state_workflows(state)
     await run_playwright_expect_matcher_workflows(state)
     await run_locator_composition_workflows(state)
     await run_keyboard_editing_workflows(state)
-    await run_keypress_dispatch_workflow(state)
+    await await_with_progress(
+        "scenario/playwright-and-cdp-keypress",
+        run_keypress_dispatch_workflow(state),
+        timeout_seconds=30,
+    )
+    await await_with_progress(
+        "scenario/keyboard-modifiers",
+        run_keyboard_modifier_workflow(state),
+        timeout_seconds=30,
+    )
+    await run_drop_input_workflow(state)
     await run_cdp_control_key_name_workflow(state)
     await run_cdp_input_navigation_replacement_workflows(state)
     await run_mouse_event_workflows(state)
@@ -203,6 +268,7 @@ async def run_dom_input_group(state: SmokeState) -> None:
     await run_element_handle_state_workflows(state)
     await run_dom_handle_workflows(state)
     await run_touch_input_workflows(state)
+    await run_touch_tap_activation_workflow(state)
 
 
 async def run_add_script_and_style_tag_workflows(state: SmokeState) -> None:
@@ -303,6 +369,7 @@ async def run_locator_input_workflows(state: SmokeState) -> None:
             <div id="drop">drop</div>
           `;
           window.__keys = [];
+          window.__dragEvents = [];
           const textInput = document.getElementById('text');
           const hoverTarget = document.getElementById('hover');
           const hoverChild = document.getElementById('hover-child');
@@ -311,14 +378,20 @@ async def run_locator_input_workflows(state: SmokeState) -> None:
           textInput.addEventListener('keydown', event => window.__keys.push(`${event.key}:${event.shiftKey}:${event.ctrlKey || event.metaKey}`));
           hoverTarget.addEventListener('mouseenter', () => window.__hovered = true);
           hoverChild.addEventListener('click', () => window.__hoverChildClicked = true);
-          dragSource.addEventListener('dragstart', event => event.dataTransfer.setData('text/plain', 'dragged-value'));
+          dragSource.addEventListener('dragstart', event => {
+            window.__dragEvents.push('start');
+            event.dataTransfer.setData('text/plain', 'dragged-value');
+          });
+          dragSource.addEventListener('dragend', () => window.__dragEvents.push('end'));
           dropTarget.addEventListener('dragover', event => event.preventDefault());
           dropTarget.addEventListener('drop', event => {
             event.preventDefault();
+            window.__dragEvents.push('drop');
             dropTarget.textContent = event.dataTransfer.getData('text/plain');
           });
         }"""
     )
+    await capture_layout(page)
 
     await page.locator("#text").fill("alpha")
     await page.locator("#text").press("End")
@@ -360,11 +433,13 @@ async def run_locator_input_workflows(state: SmokeState) -> None:
         {"target": True, "ancestor": True, "childDisplay": "block"},
         "locator hover persists in Stylo and exposes the dropdown",
     )
+    # Hover updates live style; publish the dropdown's geometry before input.
+    await capture_layout(page)
     await page.locator("#hover-child").click(timeout=1_000)
     assert_equal(
         await page.evaluate("() => window.__hoverChildClicked === true"),
         True,
-        "hover dropdown child is clickable without waiting for a screencast frame",
+        "hover dropdown child is clickable in the newly published snapshot",
     )
 
     await page.locator("#check").evaluate("input => input.checked = true")
@@ -379,11 +454,13 @@ async def run_locator_input_workflows(state: SmokeState) -> None:
     )
     assert_equal(form_state, {"checked": True, "radio": "b", "select": "two"}, "checkbox/radio/select state")
 
-    await _expect_drag_interception_boundary(
-        page.locator("#drag").drag_to(page.locator("#drop"), timeout=1_000),
-        "Playwright locator.drag_to drag interception boundary",
+    await page.locator("#drag").drag_to(page.locator("#drop"), timeout=1_000)
+    assert_equal(await page.text_content("#drop"), "dragged-value", "drag/drop transfers the native payload")
+    assert_equal(
+        await page.evaluate("() => window.__dragEvents"),
+        ["start", "drop", "end"],
+        "drag/drop dispatches dragend on the source after drop",
     )
-    assert_equal(await page.text_content("#drop"), "drop", "unsupported drag/drop does not dispatch")
     state.record("locator_input_workflows")
 
 
@@ -416,6 +493,7 @@ ye  </div>
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
 
     assert_equal(await page.get_by_test_id("Hello").text_content(), "Hello world", "Playwright get_by_test_id text")
     assert_equal(
@@ -562,6 +640,7 @@ async def run_role_selector_state_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await page.evaluate("() => { document.getElementById('check-mixed').indeterminate = true; }")
 
     async def ids(locator) -> list[str]:
@@ -702,6 +781,7 @@ async def run_playwright_expect_matcher_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
 
     await expect(page.locator("#node")).to_have_text("Text                        content")
     await expect(page.locator("#node")).to_contain_text("ext        cont")
@@ -730,6 +810,7 @@ async def run_playwright_expect_matcher_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await expect(page.locator("#eventual li")).to_have_count(2, timeout=5_000)
     await expect(page.locator("#eventual li")).to_have_text(["One", "Two"])
 
@@ -762,6 +843,7 @@ async def run_locator_composition_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
 
     assert_equal(await page.locator(".box >> p").count(), 4, "Playwright locator chained selector count")
     assert_equal(await page.locator(".box").locator("p").count(), 4, "Playwright locator.locator count")
@@ -848,10 +930,12 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
     page = state.page
 
     await page.set_content("<input id='plain' type='text'>")
+    await capture_layout(page)
     await page.type("#plain", "hello")
     assert_equal(await page.eval_on_selector("#plain", "input => input.value"), "hello", "Playwright page.type basic")
 
     await page.set_content("<input id='prefilled' type='text' value='hello'>")
+    await capture_layout(page)
     await page.type("#prefilled", "world")
     assert_equal(
         await page.eval_on_selector("#prefilled", "input => input.value"),
@@ -860,6 +944,7 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
     )
 
     await page.set_content("<input id='reset' type='text' value='hello'><div id='other' tabindex='2'>other</div>")
+    await capture_layout(page)
     await page.eval_on_selector(
         "#reset",
         """input => {
@@ -876,6 +961,7 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
     )
 
     await page.set_content("<input id='focused' type='text' value='hello'>")
+    await capture_layout(page)
     await page.eval_on_selector(
         "#focused",
         """input => {
@@ -892,6 +978,7 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
     )
 
     await page.set_content("<input id='number' type='number' value='2'>")
+    await capture_layout(page)
     await page.type("#number", "13")
     assert_equal(
         await page.eval_on_selector("#number", "input => input.value"),
@@ -912,6 +999,7 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await page.type("#cancel", "Hello World!")
     assert_equal(
         await page.eval_on_selector("#cancel", "textarea => textarea.value"),
@@ -932,6 +1020,7 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await page.focus("#guarded")
     await page.eval_on_selector(
         "#guarded",
@@ -957,6 +1046,7 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await page.focus("#repeat")
     await page.keyboard.down("a")
     await page.keyboard.press("a")
@@ -976,24 +1066,33 @@ async def run_keyboard_editing_workflows(state: SmokeState) -> None:
 
 
 async def run_keypress_dispatch_workflow(state: SmokeState) -> None:
-    page = await state.context.new_page()
+    page = await await_with_progress("keypress/new-page", state.context.new_page())
     session = None
     try:
-        await page.set_content("""
+        await await_with_progress("keypress/set-content", page.set_content("""
             <input id="field">
             <script>
               window.__keyEvents = [];
+              window.__editEvents = [];
               window.__cancelAt = false;
               for (const type of ['keydown', 'keypress', 'beforeinput', 'input', 'keyup']) {
                 document.getElementById('field').addEventListener(type, event => {
                   __keyEvents.push({type, trusted: event.isTrusted});
+                  if (type === 'beforeinput' || type === 'input') {
+                    __editEvents.push({type, data: event.data, inputType: event.inputType,
+                      isComposing: event.isComposing, native: event instanceof InputEvent,
+                      trusted: event.isTrusted, bubbles: event.bubbles,
+                      cancelable: event.cancelable, composed: event.composed});
+                  }
                   if (__cancelAt && type === 'keypress' && event.key === '@')
                     event.preventDefault();
                 });
               }
             </script>
-        """)
-        session = await state.context.new_cdp_session(page)
+        """))
+        session = await await_with_progress(
+            "keypress/new-cdp-session", new_cdp_session(state.context, page),
+        )
         full_sequence = ["keydown", "keypress", "beforeinput", "input", "keyup"]
 
         async def reset(cancel_at: bool = False) -> None:
@@ -1002,6 +1101,7 @@ async def run_keypress_dispatch_workflow(state: SmokeState) -> None:
               field.value = '';
               field.focus();
               window.__keyEvents = [];
+              window.__editEvents = [];
               window.__cancelAt = cancelAt;
             }""", cancel_at)
 
@@ -1042,11 +1142,53 @@ async def run_keypress_dispatch_workflow(state: SmokeState) -> None:
         await reset()
         await session.send("Input.insertText", {"text": "a"})
         await check("a", ["beforeinput", "input"], "insertText does not synthesize keyboard events")
+
+        async def check_edit(input_type: str, data: str | None) -> None:
+            assert_equal(
+                await page.evaluate("__editEvents"),
+                [{"type": kind, "data": data, "inputType": input_type,
+                  "isComposing": False, "native": True, "trusted": True,
+                  "bubbles": True, "cancelable": kind == "beforeinput", "composed": True}
+                 for kind in ["beforeinput", "input"]],
+                f"native InputEvent payload for {input_type}",
+            )
+
+        await check_edit("insertText", "a")
+        for key, input_type, expected in [
+            ("Backspace", "deleteContentBackward", "ac"),
+            ("Delete", "deleteContentForward", "ab"),
+        ]:
+            await reset()
+            await page.evaluate("field.value = 'abc'; field.setSelectionRange(2, 2)")
+            await page.keyboard.press(key)
+            await check(expected, ["keydown", "beforeinput", "input", "keyup"], f"{key} editing")
+            await check_edit(input_type, None)
+
+        for control in ['<textarea id="field"></textarea>', '<div id="field" contenteditable="true"></div>']:
+            await page.set_content(control)
+            await page.evaluate("""() => {
+              window.__editEvents = [];
+              for (const type of ['beforeinput', 'input']) field.addEventListener(type, event => {
+                __editEvents.push({type, data: event.data, inputType: event.inputType,
+                  isComposing: event.isComposing, native: event instanceof InputEvent,
+                  trusted: event.isTrusted, bubbles: event.bubbles,
+                  cancelable: event.cancelable, composed: event.composed});
+              });
+              field.focus();
+            }""")
+            await session.send("Input.insertText", {"text": "hello"})
+            await check_edit("insertText", "hello")
+            if control.startswith('<textarea'):
+                await page.evaluate("__editEvents = []")
+                await page.keyboard.press("Enter")
+                await check_edit("insertLineBreak", None)
+
         state.record("playwright_and_cdp_keypress_dispatch")
+        state.record("native_text_input_event_payloads")
     finally:
         if session is not None:
-            await session.detach()
-        await page.close()
+            await await_with_progress("keypress/detach", session.detach(), timeout_seconds=5)
+        await await_with_progress("keypress/close-page", page.close(), timeout_seconds=5)
 
 
 async def run_cdp_control_key_name_workflow(state: SmokeState) -> None:
@@ -1054,6 +1196,7 @@ async def run_cdp_control_key_name_workflow(state: SmokeState) -> None:
     session = None
     try:
         await page.goto(f"{state.fixture}/plain?cdp-control-key-name")
+        await capture_layout(page)
         await page.evaluate(
             """() => {
               document.body.innerHTML = '<input id="control-key">';
@@ -1072,7 +1215,8 @@ async def run_cdp_control_key_name_workflow(state: SmokeState) -> None:
               }
             }"""
         )
-        session = await state.context.new_cdp_session(page)
+        await capture_layout(page)
+        session = await new_cdp_session(state.context, page)
 
         # Rod encodes Enter as a carriage-return CDP key string. Chromium
         # converts that spelling to the canonical DOM key before dispatching.
@@ -1124,6 +1268,7 @@ async def run_cdp_input_navigation_replacement_workflows(state: SmokeState) -> N
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await page.focus("#navigation-field")
     async with page.expect_navigation(
         url=key_destination,
@@ -1168,6 +1313,8 @@ async def run_cdp_input_navigation_replacement_workflows(state: SmokeState) -> N
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
+    await capture_layout(page)
     async with page.expect_navigation(
         url=mouse_destination,
         wait_until="domcontentloaded",
@@ -1244,6 +1391,7 @@ async def run_mouse_event_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
 
     async def events() -> list[dict[str, object]]:
         return await page.evaluate("() => window.__mouseEvents")
@@ -1260,6 +1408,7 @@ async def run_mouse_event_workflows(state: SmokeState) -> None:
         if missing:
             raise SmokeError(f"missing mouse events {missing!r}: {log!r}")
 
+    await capture_layout(page)
     await reset()
     await page.mouse.click(50, 60)
     click_events = await events()
@@ -1354,6 +1503,7 @@ async def run_fill_input_type_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await page.fill("#field", "some value")
     assert_equal(await page.locator("#field").input_value(), "some value", "Playwright page.fill input")
     await page.fill("#area", "line one\nline two")
@@ -1373,6 +1523,7 @@ async def run_fill_input_type_workflows(state: SmokeState) -> None:
         raise SmokeError(f"Playwright locator.clear should dispatch composed input for text input: {clear_events}")
 
     await page.set_content('<input id="typed">', wait_until="domcontentloaded")
+    await capture_layout(page)
     for input_type in ["password", "search", "tel", "text", "url", "invalid-type"]:
         await page.locator("#typed").evaluate(
             """(input, inputType) => {
@@ -1392,6 +1543,7 @@ async def run_fill_input_type_workflows(state: SmokeState) -> None:
         await page.set_content(
             f'<input id="unsupported" type="{input_type}" style="width:32px;height:24px">'
         )
+        await capture_layout(page)
         error = await _expect_playwright_error(page.fill("#unsupported", ""))
         if f'Input of type "{input_type}" cannot be filled' not in error:
             raise SmokeError(f"Playwright page.fill unsupported {input_type} error mismatch: {error}")
@@ -1408,6 +1560,7 @@ async def run_fill_input_type_workflows(state: SmokeState) -> None:
     ]
     for input_type, fill_value, expected in value_cases:
         await page.set_content(f'<input id="typed" type="{input_type}" min="0" max="100" value="">')
+        await capture_layout(page)
         await page.fill("#typed", fill_value)
         assert_equal(
             await page.locator("#typed").input_value(),
@@ -1426,6 +1579,7 @@ async def run_fill_input_type_workflows(state: SmokeState) -> None:
     ]
     for input_type, fill_value, expected_error in invalid_cases:
         await page.set_content(f'<input id="typed" type="{input_type}">')
+        await capture_layout(page)
         error = await _expect_playwright_error(page.fill("#typed", fill_value))
         if expected_error not in error:
             raise SmokeError(f"Playwright page.fill invalid {input_type} error mismatch: {error}")
@@ -1455,6 +1609,7 @@ async def run_fill_input_type_workflows(state: SmokeState) -> None:
             shadow_fill_fixture.replace("__INPUT_TYPE__", input_type),
             wait_until="domcontentloaded",
         )
+        await capture_layout(page)
         await page.locator("input").fill(fill_value)
         assert_equal(
             await page.evaluate("() => window.__shadowFillEvents"),
@@ -1473,12 +1628,14 @@ async def run_fill_input_type_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
     await page.fill("#delayed-disabled", "enabled", timeout=5_000)
     await page.fill("#delayed-readonly", "editable", timeout=5_000)
     assert_equal(await page.locator("#delayed-disabled").input_value(), "enabled", "Playwright page.fill waits for enabled")
     assert_equal(await page.locator("#delayed-readonly").input_value(), "editable", "Playwright page.fill waits for editable")
 
     await page.set_content("<select><option>value1</option></select>")
+    await capture_layout(page)
     error = await _expect_playwright_error(page.fill("select", ""))
     if "Element is not an <input>, <textarea> or [contenteditable] element" not in error:
         raise SmokeError(f"Playwright page.fill non-fillable error mismatch: {error}")
@@ -1490,6 +1647,7 @@ async def run_check_input_workflows(state: SmokeState) -> None:
     page = state.page
 
     await page.set_content("<input id='checkbox' type='checkbox'>", wait_until="domcontentloaded")
+    await capture_layout(page)
     assert_equal(await page.locator("input").is_checked(), False, "Playwright is_checked reads unchecked checkbox")
     await page.check("input", timeout=1_000)
     assert_equal(await page.locator("input").is_checked(), True, "Playwright is_checked reads checked checkbox")
@@ -1497,15 +1655,18 @@ async def run_check_input_workflows(state: SmokeState) -> None:
     assert_equal(await page.locator("input").is_checked(), False, "Playwright page.uncheck toggles checkbox")
 
     await page.set_content("<div>Check me</div>", wait_until="domcontentloaded")
+    await capture_layout(page)
     check_error = await _expect_playwright_error(page.check("div"))
     if "Not a checkbox or radio button" not in check_error:
         raise SmokeError(f"Playwright page.check non-checkbox error mismatch: {check_error}")
     await page.set_content("<div role='button'>Check me</div>", wait_until="domcontentloaded")
+    await capture_layout(page)
     role_button_error = await _expect_playwright_error(page.check("div"))
     if "Not a checkbox or radio button" not in role_button_error:
         raise SmokeError(f"Playwright page.check role=button error mismatch: {role_button_error}")
 
     await page.set_content("<input id='trial' type='checkbox'>", wait_until="domcontentloaded")
+    await capture_layout(page)
     await page.check("#trial", trial=True, timeout=1_000)
     assert_equal(await page.locator("#trial").is_checked(), False, "Playwright page.check trial does not check")
     await page.locator("#trial").evaluate("input => input.checked = true")
@@ -1513,6 +1674,7 @@ async def run_check_input_workflows(state: SmokeState) -> None:
     assert_equal(await page.locator("#trial").is_checked(), True, "Playwright page.uncheck trial does not uncheck")
 
     await page.set_content("<input id='set-checked' type='checkbox'>", wait_until="domcontentloaded")
+    await capture_layout(page)
     await page.set_checked("#set-checked", True, timeout=1_000)
     assert_equal(await page.locator("#set-checked").is_checked(), True, "Playwright page.set_checked toggles")
 
@@ -1558,6 +1720,7 @@ async def run_select_option_workflows(state: SmokeState) -> None:
         """,
         wait_until="domcontentloaded",
     )
+    await capture_layout(page)
 
     async def reset_select() -> None:
         await page.evaluate("() => window.__resetSelectEvents()")
@@ -1663,17 +1826,6 @@ async def _expect_playwright_error(awaitable: object) -> str:
     raise SmokeError("expected Playwright command to fail")
 
 
-async def _expect_drag_interception_boundary(awaitable: object, label: str) -> str:
-    error = await _expect_playwright_error(awaitable)
-    explicit_unsupported = "Input.setInterceptDrags" in error and "not supported" in error
-    bounded_drag_interception = (
-        "Timeout 1000ms exceeded" in error and "performing move and up action" in error
-    )
-    if not explicit_unsupported and not bounded_drag_interception:
-        raise SmokeError(f"{label}: expected drag interception boundary, got: {error}")
-    return error
-
-
 async def run_selector_eval_and_handle_conversion_workflows(state: SmokeState) -> None:
     # Reduced from Playwright eval-on-selector*.spec.ts,
     # elementhandle-content-frame.spec.ts, and jshandle-as-element.spec.ts.
@@ -1687,6 +1839,7 @@ async def run_selector_eval_and_handle_conversion_workflows(state: SmokeState) -
         <div class="list">hello</div><div class="list">beautiful</div><div class="list">world!</div>
         """
     )
+    await capture_layout(page)
     assert_equal(
         await page.eval_on_selector("css=section", "element => element.id"),
         "testAttribute",
@@ -1778,6 +1931,7 @@ async def run_dom_handle_workflows(state: SmokeState) -> None:
         </main>
         """,
     )
+    await capture_layout(page)
     evaluated = await page.locator("#handle-target").evaluate(
         "node => `${node.tagName}:${node.dataset.kind}:${node.querySelectorAll('.item').length}`"
     )
@@ -1878,6 +2032,7 @@ async def _wait_for_child_frame(page) -> object:
 async def _goto_iframe_for_playwright_frame_model(page, url: str) -> object:
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+        await capture_layout(page)
     except PlaywrightError as error:
         if "Timeout" not in str(error):
             raise
@@ -1925,18 +2080,30 @@ async def run_element_handle_state_workflows(state: SmokeState) -> None:
         </script>
         """
     )
+    await capture_layout(page)
     visible_later = await page.query_selector("#visible-later")
     hide_later = await page.query_selector("#hide-later")
     enable_later = await page.query_selector("#enable-later span")
     editable_later = await page.query_selector("#editable-later")
     if visible_later is None or hide_later is None or enable_later is None or editable_later is None:
         raise SmokeError("missing element-handle state fixture")
-    await visible_later.wait_for_element_state("visible", timeout=5_000)
-    await hide_later.wait_for_element_state("hidden", timeout=5_000)
-    await enable_later.wait_for_element_state("enabled", timeout=5_000)
-    await editable_later.wait_for_element_state("editable", timeout=5_000)
+    async def publish_timer_changes() -> None:
+        await page.wait_for_function(
+            """() => document.getElementById('visible-later').style.display === 'block'
+                && document.getElementById('hide-later').style.display === 'none'"""
+        )
+        await capture_layout(page)
+
+    await asyncio.gather(
+        visible_later.wait_for_element_state("visible", timeout=5_000),
+        hide_later.wait_for_element_state("hidden", timeout=5_000),
+        enable_later.wait_for_element_state("enabled", timeout=5_000),
+        editable_later.wait_for_element_state("editable", timeout=5_000),
+        publish_timer_changes(),
+    )
 
     await page.set_content("<div id='timeout-state' style='display:none'>never visible</div>")
+    await capture_layout(page)
     timeout_handle = await page.query_selector("#timeout-state")
     if timeout_handle is None:
         raise SmokeError("missing element-handle timeout fixture")
@@ -1945,6 +2112,7 @@ async def run_element_handle_state_workflows(state: SmokeState) -> None:
         raise SmokeError(f"unexpected element handle state timeout error: {timeout_error}")
 
     await page.set_content("<button id='detach-state' disabled>Target</button>")
+    await capture_layout(page)
     detach_handle = await page.query_selector("#detach-state")
     if detach_handle is None:
         raise SmokeError("missing element-handle detach fixture")
@@ -1955,6 +2123,7 @@ async def run_element_handle_state_workflows(state: SmokeState) -> None:
         raise SmokeError(f"unexpected element handle detached state error: {detach_error}")
 
     await page.set_content("<div id='detach-hidden'>detach hidden</div>")
+    await capture_layout(page)
     hidden_handle = await page.query_selector("#detach-hidden")
     if hidden_handle is None:
         raise SmokeError("missing element-handle detached-hidden fixture")
@@ -1969,9 +2138,32 @@ async def run_touch_input_workflows(state: SmokeState) -> None:
     cdp = state.cdp
 
     async def expect_invalid_params(method: str, params: dict[str, object]) -> None:
+        if not is_moli_browser() and (
+            params.get("modifiers") == 256 or params.get("button") == "middle"
+        ):
+            assert_equal(await cdp.send(method, params), {}, "Chromium accepts this input range")
+            return
         error = await _expect_playwright_error(cdp.send(method, params))
-        if "InvalidParams" not in error:
-            raise SmokeError(f"{method}: expected InvalidParams, got: {error}")
+        expected = "InvalidParams"
+        if not is_moli_browser():
+            expected = "Invalid parameters"
+            event_type = str(params.get("type", ""))
+            if event_type[:1].isupper():
+                expected = f"Unexpected event type '{event_type}'"
+            elif params.get("gestureSourceType") == "Touch":
+                expected = "Unknown gestureSourceType"
+            elif event_type == "mouseWheel":
+                expected = "'deltaX' and 'deltaY' are expected for mouseWheel event"
+            elif params.get("force") == 2:
+                expected = "'force' should be in the range of [0,1]"
+            elif method == "Input.dispatchTouchEvent":
+                expected = {
+                    "touchStart": "TouchStart and TouchMove must have at least one touch point." if not params.get("touchPoints") else "All or none of the provided TouchPoints must supply ids.",
+                    "touchCancel": "TouchCancel must not have any touch points.",
+                    "touchEnd": "Must send a TouchStart first to start a new touch.",
+                }.get(event_type, expected)
+        if expected not in error:
+            raise SmokeError(f"{method}: expected {expected!r}, got: {error}")
 
     await page.evaluate(
         """html => {
@@ -1986,6 +2178,7 @@ async def run_touch_input_workflows(state: SmokeState) -> None:
         <div id="tap-target" draggable="true" style="position:absolute;left:0;top:0;width:120px;height:80px">tap</div>
         """,
     )
+    await capture_layout(page)
 
     for method in [
         "Input.dispatchMouseEvent",
@@ -2095,6 +2288,7 @@ async def run_touch_input_workflows(state: SmokeState) -> None:
             },
         ),
     ]
+    await capture_layout(page)
     for method, params in valid_commands:
         await cdp.send(method, params)
 
@@ -2105,3 +2299,39 @@ async def run_touch_input_workflows(state: SmokeState) -> None:
                 f"coordinate input did not dispatch {event_type}: {coordinate_events!r}"
             )
     state.record("coordinate_input_layout_hit_test_workflows")
+
+
+async def run_touch_tap_activation_workflow(state: SmokeState) -> None:
+    context = await state.browser.new_context(has_touch=True)
+    try:
+        page = await context.new_page()
+        await page.set_content("""<!doctype html>
+            <style>body{margin:0}button{width:120px;height:80px}</style>
+            <button id="tap">0</button><script>
+            window.tapClicks=0;window.tapEvents=[];window.lastTap=null;
+            const target=document.getElementById('tap');
+            for(const name of ['pointerdown','touchstart','pointerup','touchend','mousedown','mouseup','click'])
+                target.addEventListener(name,e=>{
+                    tapEvents.push(e.type);
+                    if(name==='click'){
+                        tapClicks++;target.textContent=String(tapClicks);
+                        window.lastTap=[e instanceof PointerEvent,e.pointerType,e.isTrusted];
+                    }
+                });
+            </script>""")
+        await capture_layout(page)
+        for _ in range(40):
+            await page.touchscreen.tap(20, 20)
+        assert_equal(
+            await page.evaluate("() => [tapClicks,document.getElementById('tap').textContent,lastTap]"),
+            [40, "40", [True, "touch", True]],
+            "Playwright touch taps must activate exactly once",
+        )
+        assert_equal(
+            await page.evaluate("() => tapEvents.slice(0,7)"),
+            ["pointerdown", "touchstart", "pointerup", "touchend", "mousedown", "mouseup", "click"],
+            "touch compatibility events precede the click",
+        )
+        state.record("touch_tap_click_activation")
+    finally:
+        await context.close()

@@ -3,6 +3,33 @@ use crate::support::char;
 use std::ffi::CString;
 
 unsafe extern "C" {
+  fn ucal_open_78(
+    zone: *const u16,
+    length: i32,
+    locale: *const char,
+    kind: i32,
+    error: *mut i32,
+  ) -> *mut std::ffi::c_void;
+  fn ucal_setMillis_78(
+    calendar: *mut std::ffi::c_void,
+    millis: f64,
+    error: *mut i32,
+  );
+  fn ucal_get_78(
+    calendar: *const std::ffi::c_void,
+    field: i32,
+    error: *mut i32,
+  ) -> i32;
+  fn ucal_close_78(calendar: *mut std::ffi::c_void);
+  fn uloc_getDefault_78() -> *const char;
+  fn uloc_getLanguage_78(
+    locale: *const char,
+    language: *mut char,
+    capacity: i32,
+    error: *mut i32,
+  ) -> i32;
+  fn uloc_setDefault_78(locale: *const char, error: *mut i32);
+  fn ucal_setDefaultTimeZone_78(time_zone_id: *const u16, error: *mut i32);
   fn icu_get_default_locale(output: *mut char, output_len: usize) -> usize;
   fn icu_set_default_locale(locale: *const char);
   fn icu_get_default_time_zone(output: *mut char, output_len: usize) -> usize;
@@ -69,6 +96,84 @@ pub fn set_default_locale(locale: &str) {
   unsafe {
     let c_str = CString::new(locale).expect("Invalid locale");
     icu_set_default_locale(c_str.as_ptr());
+  }
+}
+
+/// Returns the exact ICU locale ID, including legacy variants/keywords. Use
+/// this, not a BCP47 serialization, when saving a default for later restoration.
+/// Callers must serialize access with changes to ICU's process-wide default.
+pub fn get_default_locale_name() -> String {
+  // SAFETY: ICU returns a NUL-terminated default locale name.
+  unsafe { std::ffi::CStr::from_ptr(uloc_getDefault_78()) }
+    .to_string_lossy()
+    .into_owned()
+}
+
+/// Validates the language component and sets ICU's default without panicking
+/// on untrusted protocol input. Like Blink, this accepts ICU locale IDs rather
+/// than requiring a BCP47 tag. A rejected value leaves the default unchanged.
+pub fn try_set_default_locale(locale: &str) -> bool {
+  let Ok(locale) = CString::new(locale) else {
+    return false;
+  };
+  let mut error = 0;
+  let mut language = [0u8; 128];
+  // SAFETY: the input and output buffers are live for the call.
+  let length = unsafe {
+    uloc_getLanguage_78(
+      locale.as_ptr(),
+      language.as_mut_ptr().cast(),
+      language.len() as i32,
+      &mut error,
+    )
+  };
+  if error > 0 || length <= 0 {
+    return false;
+  }
+  // SAFETY: locale is NUL-terminated; ICU copies the locale ID.
+  unsafe {
+    uloc_setDefault_78(locale.as_ptr(), &mut error);
+  }
+  error <= 0
+}
+
+/// Restores a previously saved default, including ICU's valid fallback state
+/// `Etc/Unknown`. Unlike the public override setter this must accept that state.
+pub fn restore_default_time_zone(time_zone_id: &str) -> bool {
+  if time_zone_id.contains('\0') {
+    return false;
+  }
+  let mut id: Vec<u16> = time_zone_id.encode_utf16().collect();
+  id.push(0);
+  let mut error = 0;
+  // SAFETY: id is a live, NUL-terminated UTF-16 string; ICU copies it.
+  unsafe {
+    ucal_setDefaultTimeZone_78(id.as_ptr(), &mut error);
+  }
+  error <= 0
+}
+
+/// Timestamp-sensitive offset from the same default ICU zone V8 uses. This
+/// serves host Web APIs such as Document.lastModified without a second tzdb.
+pub fn default_time_zone_offset_seconds(timestamp_ms: f64) -> Option<i32> {
+  if !timestamp_ms.is_finite() {
+    return None;
+  }
+  let mut error = 0;
+  // ICU: null zone selects the process default, UCAL_GREGORIAN = 1.
+  // SAFETY: ICU copies the locale. Every non-null calendar is closed below,
+  // including errors from setMillis/get; no borrowed ICU pointer escapes.
+  unsafe {
+    let calendar =
+      ucal_open_78(std::ptr::null(), 0, c"en_US_POSIX".as_ptr(), 1, &mut error);
+    if calendar.is_null() {
+      return None;
+    }
+    ucal_setMillis_78(calendar, timestamp_ms, &mut error);
+    let standard = ucal_get_78(calendar, 15, &mut error); // UCAL_ZONE_OFFSET
+    let daylight = ucal_get_78(calendar, 16, &mut error); // UCAL_DST_OFFSET
+    ucal_close_78(calendar);
+    (error <= 0).then(|| standard.saturating_add(daylight) / 1000)
   }
 }
 

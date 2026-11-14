@@ -9,11 +9,11 @@ use super::{CustomElementRegistryAssociation, CustomElementRegistryKey};
 use super::{
     dispatch_form_association_callback_if_needed, dispatch_form_disabled_callback_if_needed,
 };
-use crate::{document_runtime::DomHandle, native_bridge::JsContextHost};
+use crate::{document_runtime::DomHandle, native_bridge::PageScriptHost};
 
 pub(crate) fn upgrade_subtree_if_defined(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     root: DomHandle,
 ) -> bool {
     let mut stack = vec![root];
@@ -29,50 +29,58 @@ pub(crate) fn upgrade_subtree_if_defined(
 
 pub(crate) fn upgrade_subtree_if_defined_for_registry(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     root: DomHandle,
     registry_key: CustomElementRegistryKey,
 ) -> bool {
     let target_association = CustomElementRegistryAssociation::Registry(registry_key);
-    let mut stack = vec![root];
-    while let Some(handle) = stack.pop() {
-        let children = shadow_including_child_handles(host_ptr, handle);
-        if unsafe { &*host_ptr }.effective_custom_element_registry_association(handle)
-            == target_association
-            && !upgrade_handle_with_immediate_form_lifecycle_if_defined(scope, host_ptr, handle)
-        {
-            return false;
-        }
-        stack.extend(children.into_iter().rev());
-    }
-    true
-}
-
-pub(crate) fn enqueue_upgrade_reactions_for_subtree(
-    scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
-    root: DomHandle,
-) -> bool {
     let mut handles = Vec::new();
     collect_shadow_including_subtree_handles(host_ptr, root, &mut handles);
-    let mut enqueued = false;
     for handle in handles {
-        if can_upgrade_handle(host_ptr, handle) {
+        if unsafe { &*host_ptr }.effective_custom_element_registry_association(handle)
+            == target_association
+            && can_upgrade_handle(host_ptr, handle)
+        {
             enqueue_custom_element_reaction(
                 scope,
                 host_ptr,
                 handle,
                 CustomElementReaction::Upgrade,
             );
-            enqueued = true;
         }
+    }
+    true
+}
+
+pub(crate) fn enqueue_upgrade_reaction_if_defined(
+    scope: &mut v8::PinScope<'_, '_>,
+    host_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+) -> bool {
+    if !can_upgrade_handle(host_ptr, handle) {
+        return false;
+    }
+    enqueue_custom_element_reaction(scope, host_ptr, handle, CustomElementReaction::Upgrade);
+    true
+}
+
+pub(crate) fn enqueue_upgrade_reactions_for_subtree(
+    scope: &mut v8::PinScope<'_, '_>,
+    host_ptr: *mut PageScriptHost,
+    root: DomHandle,
+) -> bool {
+    let mut handles = Vec::new();
+    collect_shadow_including_subtree_handles(host_ptr, root, &mut handles);
+    let mut enqueued = false;
+    for handle in handles {
+        enqueued |= enqueue_upgrade_reaction_if_defined(scope, host_ptr, handle);
     }
     enqueued
 }
 
 pub(crate) fn upgrade_late_defined_connected_tree_after_parser_sync(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     root: DomHandle,
 ) -> bool {
     // This checkpoint exists only to observe definitions or lifecycle state
@@ -88,7 +96,7 @@ pub(crate) fn upgrade_late_defined_connected_tree_after_parser_sync(
 
 fn upgrade_late_defined_connected_tree_after_parser_sync_non_quiescent(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     root: DomHandle,
 ) -> bool {
     // Parser-created custom elements whose definitions are already known must

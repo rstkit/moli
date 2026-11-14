@@ -1,5 +1,4 @@
 use super::devtools_session::DevToolsNetworkSessionState;
-use super::javascript_dialog::TargetJavaScriptDialogState;
 use super::page_target_host::PageTargetHost;
 use crate::domains::audits_output_state::TargetAuditsSessionState;
 use moli_core::page::V8InspectorSessionState;
@@ -87,16 +86,6 @@ impl PageTargetHost {
                 .devtools_sessions
                 .effective_renderer_browser_identity_override()
                 .or_else(|| self.network_policy.base_browser_identity.profile_owned()),
-            locale_override: self
-                .devtools_sessions
-                .effective_locale_override()
-                .map(str::to_owned)
-                .or_else(|| self.base_locale_override.clone()),
-            timezone_override: self
-                .devtools_sessions
-                .effective_timezone_override()
-                .map(str::to_owned)
-                .or_else(|| self.base_timezone_override.clone()),
         }
     }
 
@@ -129,7 +118,7 @@ impl PageTargetHost {
         &mut self,
         session_key: &moli_page_types::DevToolsSessionKey,
         locale_override: Option<String>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), moli_v8_platform::ProcessEnvironmentError> {
         self.devtools_sessions
             .set_locale_override(session_key, locale_override)
     }
@@ -138,17 +127,25 @@ impl PageTargetHost {
         &mut self,
         session_key: &moli_page_types::DevToolsSessionKey,
         timezone_override: Option<String>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), moli_v8_platform::ProcessEnvironmentError> {
         self.devtools_sessions
             .set_timezone_override(session_key, timezone_override)
     }
 
-    pub(crate) fn set_base_locale_override(&mut self, locale_override: Option<String>) {
-        self.base_locale_override = locale_override;
+    pub(crate) fn set_base_locale_override(
+        &mut self,
+        locale_override: Option<String>,
+    ) -> Result<(), moli_v8_platform::ProcessEnvironmentError> {
+        self.environment_owner
+            .set_locale(locale_override.as_deref())
     }
 
-    pub(crate) fn set_base_timezone_override(&mut self, timezone_override: Option<String>) {
-        self.base_timezone_override = timezone_override;
+    pub(crate) fn set_base_timezone_override(
+        &mut self,
+        timezone_override: Option<String>,
+    ) -> Result<(), moli_v8_platform::ProcessEnvironmentError> {
+        self.environment_owner
+            .set_timezone(timezone_override.as_deref())
     }
 
     pub(crate) fn clear_devtools_network_state(
@@ -167,26 +164,23 @@ impl PageTargetHost {
     }
 
     pub(crate) fn has_pending_javascript_dialog(&self) -> bool {
-        self.devtools_sessions.states().any(|session| {
-            !session
-                .page_session_state
-                .javascript_dialog_state
-                .is_empty()
-        })
+        !self.javascript_dialog_state.is_empty()
+    }
+
+    pub(crate) fn clear_loaded_document_context_state(&mut self) {
+        self.javascript_dialog_state.clear();
     }
 
     pub(crate) fn has_non_default_session_state(&self) -> bool {
         self.devtools_sessions.has_non_default_state()
+            || self.has_pending_javascript_dialog()
             || self.runtime_slot.primary_network_events_enabled()
             || self.network_policy != TargetNetworkPolicyState::default()
             || self.http_proxy_override.is_some()
             || self.http_no_proxy_override.is_some()
             || self.tls_verify_host_override.is_some()
-            || self.base_locale_override.is_some()
-            || self.base_timezone_override.is_some()
+            || self.environment_owner.has_override()
             || self.effective_emulation_state != super::EffectiveTargetEmulationState::default()
-            || self.input_intercept_drags_enabled
-            || self.input_drag_intercepted
             || self.css_enabled
             || self.fetch_owner.config_snapshot() != super::fetch::TargetFetchConfig::default()
     }
@@ -201,13 +195,14 @@ impl PageTargetHost {
         self.http_proxy_override = None;
         self.http_no_proxy_override = None;
         self.tls_verify_host_override = None;
-        self.input_intercept_drags_enabled = false;
-        self.input_drag_intercepted = false;
         self.css_enabled = false;
     }
 }
 
-fn overlay_extra_headers(effective: &mut Vec<(String, String)>, layer: &[(String, String)]) {
+fn overlay_extra_headers(
+    effective: &mut moli_fetch::RequestHeaders,
+    layer: &moli_fetch::RequestHeaders,
+) {
     for (name, value) in layer {
         effective.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         effective.push((name.clone(), value.clone()));
@@ -222,11 +217,9 @@ pub(crate) struct EffectiveTargetPolicy {
     cache_disabled: bool,
     bypass_service_worker: bool,
     blocked_url_patterns: Vec<String>,
-    extra_headers: Vec<(String, String)>,
+    extra_headers: moli_fetch::RequestHeaders,
     browser_identity_override: Option<moli_browser_profile::BrowserIdentityProfile>,
     renderer_browser_identity_override: Option<moli_browser_profile::BrowserIdentityProfile>,
-    locale_override: Option<String>,
-    timezone_override: Option<String>,
 }
 
 impl EffectiveTargetPolicy {
@@ -239,8 +232,6 @@ impl EffectiveTargetPolicy {
             browser_identity: self.browser_identity_override != next.browser_identity_override,
             renderer_browser_identity: self.renderer_browser_identity_override
                 != next.renderer_browser_identity_override,
-            locale: self.locale_override != next.locale_override,
-            timezone: self.timezone_override != next.timezone_override,
         }
     }
 
@@ -256,7 +247,7 @@ impl EffectiveTargetPolicy {
         &self.blocked_url_patterns
     }
 
-    pub(crate) fn extra_headers(&self) -> &[(String, String)] {
+    pub(crate) fn extra_headers(&self) -> &moli_fetch::RequestHeaders {
         &self.extra_headers
     }
 
@@ -271,14 +262,6 @@ impl EffectiveTargetPolicy {
     ) -> Option<moli_browser_profile::BrowserIdentityProfile> {
         self.renderer_browser_identity_override.clone()
     }
-
-    pub(crate) fn locale_override(&self) -> Option<&str> {
-        self.locale_override.as_deref()
-    }
-
-    pub(crate) fn timezone_override(&self) -> Option<&str> {
-        self.timezone_override.as_deref()
-    }
 }
 
 /// Renderer surfaces that must be replayed after an effective policy change.
@@ -287,8 +270,6 @@ pub(crate) struct EffectiveTargetPolicyDelta {
     pub(crate) network_request: bool,
     pub(crate) browser_identity: bool,
     pub(crate) renderer_browser_identity: bool,
-    pub(crate) locale: bool,
-    pub(crate) timezone: bool,
 }
 
 impl EffectiveTargetPolicyDelta {
@@ -297,11 +278,7 @@ impl EffectiveTargetPolicyDelta {
     }
 
     pub(crate) fn is_empty(self) -> bool {
-        !self.network_request
-            && !self.browser_identity
-            && !self.renderer_browser_identity
-            && !self.locale
-            && !self.timezone
+        !self.network_request && !self.browser_identity && !self.renderer_browser_identity
     }
 }
 
@@ -448,6 +425,7 @@ impl PageScreencastSessionState {
 #[derive(Debug, Clone)]
 pub(crate) struct TargetPageSessionState {
     pub(crate) input_events_ignored: bool,
+    pub(crate) input_intercept_drags_enabled: bool,
     pub(crate) page_domain_enabled: bool,
     pub(crate) page_domain_subscription_generation: u64,
     pub(crate) page_lifecycle_events: bool,
@@ -459,13 +437,13 @@ pub(crate) struct TargetPageSessionState {
     pub(crate) page_file_chooser_opened_event_enabled: bool,
     pub(crate) page_intercept_file_chooser_dialog_enabled: bool,
     pub(crate) page_screencast: PageScreencastSessionState,
-    pub(crate) javascript_dialog_state: TargetJavaScriptDialogState,
 }
 
 impl Default for TargetPageSessionState {
     fn default() -> Self {
         Self {
             input_events_ignored: false,
+            input_intercept_drags_enabled: false,
             page_domain_enabled: false,
             page_domain_subscription_generation: 0,
             page_lifecycle_events: false,
@@ -477,7 +455,6 @@ impl Default for TargetPageSessionState {
             page_file_chooser_opened_event_enabled: false,
             page_intercept_file_chooser_dialog_enabled: false,
             page_screencast: PageScreencastSessionState::default(),
-            javascript_dialog_state: TargetJavaScriptDialogState::default(),
         }
     }
 }
@@ -502,15 +479,12 @@ impl TargetPageSessionState {
     pub(crate) fn page_domain_subscription_is_current(&self, generation: u64) -> bool {
         self.page_domain_enabled && self.page_domain_subscription_generation == generation
     }
-
-    pub(crate) fn clear_loaded_document_context_state(&mut self) {
-        self.javascript_dialog_state.clear();
-    }
 }
 
 impl PartialEq for TargetPageSessionState {
     fn eq(&self, other: &Self) -> bool {
         self.input_events_ignored == other.input_events_ignored
+            && self.input_intercept_drags_enabled == other.input_intercept_drags_enabled
             && self.page_domain_enabled == other.page_domain_enabled
             && self.page_lifecycle_events == other.page_lifecycle_events
             && self.audits == other.audits
@@ -523,7 +497,6 @@ impl PartialEq for TargetPageSessionState {
             && self.page_intercept_file_chooser_dialog_enabled
                 == other.page_intercept_file_chooser_dialog_enabled
             && self.page_screencast == other.page_screencast
-            && self.javascript_dialog_state == other.javascript_dialog_state
     }
 }
 
@@ -559,33 +532,14 @@ pub(crate) struct InspectorSessionState {
     pub(crate) v8_state: Option<V8InspectorSessionState>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct TargetNetworkPolicyState {
     // Target-wide policy contributed by WebDriver BiDi or connection defaults.
     base_cache_disabled: bool,
     network_offline: bool,
-    emulated_network_latency: f64,
-    emulated_download_throughput: f64,
-    emulated_upload_throughput: f64,
-    emulated_connection_type: Option<String>,
     base_browser_identity: super::BaseBrowserIdentityOverrideState,
     // Target-scoped headers contributed by WebDriver BiDi.
-    base_extra_headers: Vec<(String, String)>,
-}
-
-impl Default for TargetNetworkPolicyState {
-    fn default() -> Self {
-        Self {
-            base_cache_disabled: false,
-            network_offline: false,
-            emulated_network_latency: 0.0,
-            emulated_download_throughput: -1.0,
-            emulated_upload_throughput: -1.0,
-            emulated_connection_type: None,
-            base_browser_identity: super::BaseBrowserIdentityOverrideState::default(),
-            base_extra_headers: Vec::new(),
-        }
-    }
+    base_extra_headers: moli_fetch::RequestHeaders,
 }
 
 impl TargetNetworkPolicyState {
@@ -607,19 +561,18 @@ impl TargetNetworkPolicyState {
         self.network_offline
     }
 
-    #[cfg(test)]
     pub(crate) fn set_network_offline(&mut self, network_offline: bool) {
         self.network_offline = network_offline;
     }
 
-    pub(crate) fn replace_base_extra_headers(&mut self, extra_headers: Vec<(String, String)>) {
+    pub(crate) fn replace_base_extra_headers(&mut self, extra_headers: moli_fetch::RequestHeaders) {
         self.base_extra_headers = extra_headers;
     }
 
     #[cfg(test)]
     pub(crate) fn push_extra_header(&mut self, header: (String, String)) {
         let mut headers = self.base_extra_headers.clone();
-        headers.push(header);
+        headers.push((header.0, header.1.into_bytes()));
         self.replace_base_extra_headers(headers);
     }
 
@@ -659,42 +612,6 @@ impl TargetNetworkPolicyState {
         self.base_browser_identity
             .set_accept_language(accept_language, fallback);
     }
-
-    #[cfg(test)]
-    pub(crate) fn emulated_network_latency(&self) -> f64 {
-        self.emulated_network_latency
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emulated_download_throughput(&self) -> f64 {
-        self.emulated_download_throughput
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emulated_upload_throughput(&self) -> f64 {
-        self.emulated_upload_throughput
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emulated_connection_type(&self) -> Option<&str> {
-        self.emulated_connection_type.as_deref()
-    }
-
-    pub(crate) fn set_emulated_network_conditions(
-        &mut self,
-        offline: bool,
-        latency: f64,
-        download_throughput: f64,
-        upload_throughput: f64,
-        connection_type: Option<String>,
-    ) -> bool {
-        self.network_offline = offline;
-        self.emulated_network_latency = latency;
-        self.emulated_download_throughput = download_throughput;
-        self.emulated_upload_throughput = upload_throughput;
-        self.emulated_connection_type = connection_type;
-        self.network_offline
-    }
 }
 
 #[cfg(test)]
@@ -706,8 +623,6 @@ mod tests {
     #[test]
     fn devtools_emulation_overrides_reveal_target_base_state_when_cleared() {
         let mut state = PageTargetHost::empty("TID-policy-test".to_owned());
-        state.set_base_locale_override(Some("en-GB".to_owned()));
-        state.set_base_timezone_override(Some("Europe/London".to_owned()));
         state.network_policy.set_browser_identity_override(
             moli_browser_profile::BrowserIdentityProfile::new("Moli/Base", "en-GB"),
         );
@@ -735,10 +650,8 @@ mod tests {
             .devtools_sessions
             .primary_mut()
             .emulation_session_state
-            .cpu_throttling_rate = 4.0;
+            .max_touch_points = 4;
         let effective = state.effective_policy();
-        assert_eq!(effective.locale_override(), Some("fr-FR"));
-        assert_eq!(effective.timezone_override(), Some("Europe/Paris"));
         assert_eq!(
             effective
                 .browser_identity_override()
@@ -749,15 +662,13 @@ mod tests {
         state.clear_devtools_network_state(&DevToolsSessionKey::Primary);
         state.clear_devtools_emulation_policy_state(&DevToolsSessionKey::Primary);
         let effective = state.effective_policy();
-        assert_eq!(effective.locale_override(), Some("en-GB"));
-        assert_eq!(effective.timezone_override(), Some("Europe/London"));
         assert_eq!(
             state
                 .devtools_sessions
                 .primary()
                 .emulation_session_state
-                .cpu_throttling_rate,
-            4.0,
+                .max_touch_points,
+            4,
             "clearing policy contributions must leave the handler's renderer state intact"
         );
         assert_eq!(

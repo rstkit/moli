@@ -72,6 +72,21 @@ async fn worker_console_capture_does_not_serialize_or_coerce_page_objects() {
 }
 
 #[tokio::test]
+async fn worker_does_not_expose_window_only_webrtc_event_interfaces() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        r#"postMessage([typeof RTCPeerConnectionIceEvent, typeof RTCDataChannelEvent]); close();"#
+            .into(),
+        "test://webrtc-event-exposure".into(),
+    );
+    let msg = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("timed out waiting for worker WebRTC event exposure")
+        .expect("channel closed");
+    assert_eq!(expect_post_json(msg), r#"["undefined","undefined"]"#);
+}
+
+#[tokio::test]
 async fn worker_postmessage_to_parent() {
     ensure_v8();
     let mut handle = spawn_worker(
@@ -768,6 +783,48 @@ async fn worker_postmessage_cryptokey_to_nonsecure_worker_fires_messageerror() {
         expect_post_json(msg),
         r#"["messageerror","messageerror",true,"false","undefined"]"#
     );
+}
+
+#[tokio::test]
+async fn worker_postmessage_cryptokey_exposure_ignores_public_constructor_overrides() {
+    ensure_v8();
+    for (url, setup, expected) in [
+        (
+            "https://worker-crypto.test/receive-cryptokey-override.js",
+            "Object.defineProperty(globalThis, 'CryptoKey', {get() {throw new Error('public constructor read');}, configurable: true});",
+            r#"["message","[object CryptoKey]"]"#,
+        ),
+        (
+            "http://worker-crypto.test/receive-cryptokey-override.js",
+            "globalThis.CryptoKey = function FakeCryptoKey() {};",
+            r#"["messageerror",true]"#,
+        ),
+    ] {
+        let callbacks = r#"
+            onmessage = event => {
+                postMessage([event.type, Object.prototype.toString.call(event.data.key)]);
+            };
+            onmessageerror = event => {
+                postMessage([event.type, event.data === null]);
+            };
+        "#;
+        let mut handle = spawn_worker(format!("{setup}\n{callbacks}"), url.into());
+        let payload = serialize_test_crypto_value(
+            r#"
+            (async () => ({key: await crypto.subtle.importKey(
+                "raw", new Uint8Array([1, 2, 3, 4]),
+                {name: "HMAC", hash: "SHA-256"}, true, ["sign"]
+            )}))()
+            "#,
+        );
+        handle.post_message(payload);
+
+        let msg = timeout(TIMEOUT, handle.recv())
+            .await
+            .expect("timed out")
+            .expect("channel closed");
+        assert_eq!(expect_post_json(msg), expected, "receiver {url}");
+    }
 }
 
 #[tokio::test]
@@ -1875,6 +1932,24 @@ async fn worker_self_close() {
 // ─── Error propagation ──────────────────────────────────────────────
 
 #[tokio::test]
+async fn worker_does_not_expose_window_worklet_interfaces() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        "postMessage({Worklet: 'Worklet' in self, AudioWorklet: 'AudioWorklet' in self}); close();"
+            .to_owned(),
+        "https://worklet-worker.test/worker.js".into(),
+    );
+    let message = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+    assert_eq!(
+        expect_post_json(message),
+        r#"{"Worklet":false,"AudioWorklet":false}"#
+    );
+}
+
+#[tokio::test]
 async fn worker_error_propagation() {
     ensure_v8();
     let mut handle = spawn_worker(
@@ -1901,22 +1976,177 @@ async fn worker_error_propagation() {
 }
 
 #[tokio::test]
+async fn worker_origin_is_replaceable_across_worker_global_kinds() {
+    ensure_v8();
+    let storage_key = moli_storage_key::MoliStorageKey::new(
+        "https://origin.test".to_owned(),
+        "https://origin.test".to_owned(),
+        None,
+        moli_storage_key::StoragePartitionRelation::FirstParty,
+    );
+    let dedicated = super::super::WorkerGlobalKind::Dedicated {
+        name: String::new(),
+    };
+    let cases = [
+        (
+            dedicated.clone(),
+            "https://origin.test/worker.js",
+            "https://origin.test",
+        ),
+        (dedicated.clone(), "data:text/javascript,", "null"),
+        (
+            dedicated,
+            "blob:https://origin.test/worker-script",
+            "https://origin.test",
+        ),
+        (
+            super::super::WorkerGlobalKind::Shared {
+                name: "origin".to_owned(),
+                storage_key,
+            },
+            "https://origin.test/shared.js",
+            "https://origin.test",
+        ),
+        (
+            super::super::WorkerGlobalKind::Service {
+                registration_id: ServiceWorkerRegistrationId::from_u64_for_test(1),
+                version_id: ServiceWorkerVersionId::from_u64_for_test(1),
+                scope_url: url::Url::parse("https://origin.test/").unwrap(),
+            },
+            "https://origin.test/sw.js",
+            "https://origin.test",
+        ),
+    ];
+    let probe = r#"
+        function check(value, message) {
+            if (!value) throw new Error(message);
+        }
+        function throwsTypeError(callback) {
+            try { callback(); } catch (error) { return error instanceof TypeError; }
+            return false;
+        }
+        function checkRequestReferrer() {
+            const allowed = 'https://origin.test/referrer';
+            const expected = expectedOrigin === 'null' ? 'about:client' : allowed;
+            check(new Request('https://origin.test/resource', {referrer: allowed}).referrer === expected,
+                  'Request referrer uses the internal worker origin');
+            check(new Request('https://origin.test/resource', {referrer: 'https://other.test/referrer'}).referrer === 'about:client',
+                  'Request rejects a cross-origin referrer');
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(WorkerGlobalScope.prototype, 'origin');
+        check(typeof descriptor?.get === 'function' && typeof descriptor.set === 'function', 'prototype accessor');
+        check(descriptor.enumerable && descriptor.configurable, 'accessor flags');
+        check(descriptor.get.length === 0 && descriptor.set.length === 1, 'accessor lengths');
+        check(descriptor.get.name === 'get origin' && descriptor.set.name === 'set origin', 'accessor names');
+        check(!Object.hasOwn(self, 'origin'), 'no initial own origin');
+        check(self.origin === expectedOrigin && location.origin === expectedOrigin, 'initial origin');
+        checkRequestReferrer();
+        check(descriptor.get.call(null) === expectedOrigin && descriptor.get.call(undefined) === expectedOrigin, 'default getter receiver');
+
+        const replacement = { [Symbol.toPrimitive]() { throw new Error('must not convert'); } };
+        check(Reflect.set(WorkerGlobalScope.prototype, 'origin', replacement, self), 'replace through prototype');
+        const own = Object.getOwnPropertyDescriptor(self, 'origin');
+        check(own.value === replacement && own.writable && own.enumerable && own.configurable, 'replacement descriptor');
+        check(descriptor.get.call(self) === expectedOrigin && location.origin === expectedOrigin, 'internal origin survives replacement');
+        checkRequestReferrer();
+        self.origin = 'https://other.test';
+        check(self.origin === 'https://other.test', 'replace with a different origin');
+        checkRequestReferrer();
+        const symbol = Symbol('replacement');
+        (() => { 'use strict'; self.origin = symbol; })();
+        check(self.origin === symbol, 'strict assignment preserves value');
+        check(delete self.origin, 'delete replacement');
+        check(self.origin === expectedOrigin, 'deletion restores internal origin');
+
+        for (const receiver of [{}, Object.create(self), WorkerGlobalScope.prototype, new Proxy(self, {})]) {
+            const before = Object.getOwnPropertyDescriptor(receiver, 'origin');
+            check(throwsTypeError(() => descriptor.get.call(receiver)), 'getter receiver check');
+            check(throwsTypeError(() => descriptor.set.call(receiver, replacement)), 'setter receiver check');
+            const after = Object.getOwnPropertyDescriptor(receiver, 'origin');
+            check(after?.get === before?.get && after?.set === before?.set && after?.value === before?.value, 'invalid receiver not mutated');
+            check(Object.hasOwn(receiver, 'origin') === (before !== undefined), 'invalid receiver own property unchanged');
+        }
+        descriptor.set.call(null, replacement);
+        check(self.origin === replacement, 'default setter receiver');
+        delete self.origin;
+        descriptor.set.call(self);
+        check(Object.hasOwn(self, 'origin') && self.origin === undefined, 'missing setter value');
+        delete self.origin;
+
+        const observed = (0, eval)("var origin; var originValues = []; for (origin of ['same-origin', 'cross-origin']) originValues.push(origin); originValues;");
+        check(observed.join('|') === 'same-origin|cross-origin', 'global var assignments');
+        delete self.origin;
+        check(self.origin === expectedOrigin, 'origin survives global var assignments');
+
+        Object.defineProperty(self, 'origin', {value: 'locked', writable: false, enumerable: true, configurable: false});
+        check(throwsTypeError(() => descriptor.set.call(self, 'new')), 'failed replacement throws');
+        check(self.origin === 'locked' && descriptor.get.call(self) === expectedOrigin, 'failed replacement preserves values');
+        checkRequestReferrer();
+    "#;
+    for (kind, script_url, expected_origin) in cases {
+        let (bootstrap_tx, mut bootstrap_rx) = tokio::sync::mpsc::unbounded_channel();
+        let source = format!(
+            "const expectedOrigin = {};\n{probe}",
+            serde_json::to_string(expected_origin).unwrap(),
+        );
+        let handle = spawn_test_worker_with_options(
+            WorkerSpawnOptions::new(source, script_url.to_owned())
+                .with_global_kind(kind)
+                .with_bootstrap_completion_sender(bootstrap_tx),
+        );
+        let bootstrap = timeout(TIMEOUT, bootstrap_rx.recv())
+            .await
+            .expect("origin probe should finish")
+            .expect("origin probe should report completion");
+        handle.terminate_and_join();
+        bootstrap.result.unwrap_or_else(|error| {
+            panic!("Worker origin probe failed for {script_url}: {error:?}")
+        });
+    }
+}
+
+#[tokio::test]
 async fn worker_performance_now_uses_readonly_monotonic_time_origin() {
     ensure_v8();
     let mut handle = spawn_worker(
         r#"
-        const descriptor = Object.getOwnPropertyDescriptor(performance, "timeOrigin");
-        const before = performance.timeOrigin;
-        try { performance.timeOrigin = before + 1000000; } catch (_) {}
-        const after = performance.timeOrigin;
-        const first = performance.now();
-        const second = performance.now();
+        const original = performance;
+        const globalDescriptor = Object.getOwnPropertyDescriptor(
+            WorkerGlobalScope.prototype,
+            "performance"
+        );
+        const timeOriginDescriptor = Object.getOwnPropertyDescriptor(
+            Performance.prototype,
+            "timeOrigin"
+        );
+        const before = original.timeOrigin;
+        try { original.timeOrigin = before + 1000000; } catch (_) {}
+        const after = original.timeOrigin;
+        const first = original.now();
+        const second = original.now();
+        const replacement = {};
+        self.performance = replacement;
         postMessage({
-            readonly: descriptor && descriptor.writable === false,
+            interfaceShape:
+                original instanceof Performance
+                && original instanceof EventTarget
+                && Object.getPrototypeOf(original) === Performance.prototype,
+            globalAccessor:
+                typeof globalDescriptor?.get === "function"
+                && typeof globalDescriptor?.set === "function"
+                && globalDescriptor.enumerable === true,
+            timeOriginAccessor:
+                typeof timeOriginDescriptor?.get === "function"
+                && timeOriginDescriptor?.set === undefined
+                && timeOriginDescriptor.enumerable === true,
             unchanged: after === before,
             numeric: typeof first === "number" && typeof second === "number",
             monotonic: second >= first,
-            noLegacyMemory: !("memory" in performance) && !("MemoryInfo" in self)
+            replaceable:
+                performance === replacement
+                && Object.prototype.hasOwnProperty.call(self, "performance"),
+            originalStillWorks: typeof original.now() === "number",
+            noLegacyMemory: !("memory" in original) && !("MemoryInfo" in self)
         });
         close();
         "#
@@ -1930,7 +2160,209 @@ async fn worker_performance_now_uses_readonly_monotonic_time_origin() {
         .expect("channel closed");
     assert_eq!(
         expect_post_json(msg),
-        r#"{"readonly":true,"unchanged":true,"numeric":true,"monotonic":true,"noLegacyMemory":true}"#
+        r#"{"interfaceShape":true,"globalAccessor":true,"timeOriginAccessor":true,"unchanged":true,"numeric":true,"monotonic":true,"replaceable":true,"originalStillWorks":true,"noLegacyMemory":true}"#
+    );
+}
+
+#[tokio::test]
+async fn worker_user_timing_uses_shared_mark_measure_runtime() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        r#"
+        const capture = callback => {
+            try {
+                callback();
+                return "none";
+            } catch (error) {
+                return error.name;
+            }
+        };
+        const timingNames = [
+            "navigationStart",
+            "unloadEventStart",
+            "unloadEventEnd",
+            "redirectStart",
+            "redirectEnd",
+            "fetchStart",
+            "domainLookupStart",
+            "domainLookupEnd",
+            "connectStart",
+            "connectEnd",
+            "secureConnectionStart",
+            "requestStart",
+            "responseStart",
+            "responseEnd",
+            "domLoading",
+            "domInteractive",
+            "domContentLoadedEventStart",
+            "domContentLoadedEventEnd",
+            "domComplete",
+            "loadEventStart",
+            "loadEventEnd"
+        ];
+        const timingNamesAccepted = timingNames.every(name => {
+            const mark = performance.mark(name, { startTime: 1 });
+            performance.clearMarks(name);
+            const measure = performance.measure(name);
+            performance.clearMeasures(name);
+            return mark.name === name && measure.name === name;
+        });
+
+        const sourceDetail = { state: "before" };
+        const mark = performance.mark("worker-mark", {
+            startTime: 2,
+            detail: sourceDetail
+        });
+        sourceDetail.state = "after";
+        const measure = performance.measure("worker-measure", {
+            start: "worker-mark",
+            end: 5,
+            detail: { kind: "measure" }
+        });
+        const detached = new PerformanceMark("detached", {
+            startTime: 3,
+            detail: { kind: "detached" }
+        });
+        const reservedBoundary = capture(() => {
+            performance.mark("navigationStart", { startTime: 4 });
+            performance.measure("reserved", "navigationStart", "navigationStart");
+        });
+
+        postMessage({
+            timingNamesAccepted,
+            interfaces:
+                performance instanceof Performance
+                && mark instanceof PerformanceMark
+                && mark instanceof PerformanceEntry
+                && measure instanceof PerformanceMeasure
+                && measure instanceof PerformanceEntry
+                && detached instanceof PerformanceMark,
+            inheritance:
+                Object.getPrototypeOf(Performance) === EventTarget
+                && Object.getPrototypeOf(PerformanceMark) === PerformanceEntry
+                && Object.getPrototypeOf(PerformanceMeasure) === PerformanceEntry,
+            mark: [
+                mark.name,
+                mark.entryType,
+                mark.startTime,
+                mark.duration,
+                mark.detail.state,
+                mark.detail === sourceDetail
+            ].join(":"),
+            measure: [
+                measure.name,
+                measure.entryType,
+                measure.startTime,
+                measure.duration,
+                measure.detail.kind
+            ].join(":"),
+            entryIds:
+                Number.isSafeInteger(mark.id)
+                && mark.id > 0
+                && Number.isSafeInteger(measure.id)
+                && measure.id > mark.id
+                && mark.navigationId === 0
+                && measure.navigationId === 0
+                && detached.id === 0
+                && detached.navigationId === 0
+                && mark.toJSON().id === mark.id
+                && mark.toJSON().navigationId === 0,
+            detachedTimelineCount:
+                performance.getEntriesByName("detached", "mark").length,
+            bufferedTypes: performance.getEntries()
+                .map(entry => entry.entryType)
+                .join(","),
+            reservedBoundary,
+            missingBoundary: capture(() =>
+                performance.measure("missing", "not-a-mark")),
+            markBrand: capture(() => performance.mark.call({}, "bad")),
+            nowBrand: capture(() => performance.now.call({}))
+        });
+        close();
+        "#
+        .into(),
+        "test://worker_user_timing".into(),
+    );
+
+    let msg = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+    assert_eq!(
+        expect_post_json(msg),
+        r#"{"timingNamesAccepted":true,"interfaces":true,"inheritance":true,"mark":"worker-mark:mark:2:0:before:false","measure":"worker-measure:measure:2:3:measure","entryIds":true,"detachedTimelineCount":0,"bufferedTypes":"mark,measure,mark","reservedBoundary":"TypeError","missingBoundary":"SyntaxError","markBrand":"TypeError","nowBrand":"TypeError"}"#
+    );
+}
+
+#[tokio::test]
+async fn worker_performance_observer_delivers_live_and_buffered_user_timing_entries() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        r#"
+        const firstObserver = new PerformanceObserver((list, observer) => {
+            const liveEntries = list.getEntries();
+            observer.disconnect();
+            const bufferedObserver = new PerformanceObserver(bufferedList => {
+                const bufferedEntries = bufferedList.getEntries();
+                postMessage({
+                    interfaces:
+                        firstObserver instanceof PerformanceObserver
+                        && list instanceof PerformanceObserverEntryList,
+                    prototypeMethods:
+                        typeof list.getEntries === "function"
+                        && typeof list.getEntriesByType === "function"
+                        && typeof list.getEntriesByName === "function",
+                    supportedEntryTypes: PerformanceObserver.supportedEntryTypes.join(","),
+                    live: liveEntries
+                        .map(entry => `${entry.name}:${entry.entryType}`)
+                        .join(","),
+                    liveMarks: list.getEntriesByType("mark").length,
+                    namedMeasure: list.getEntriesByName("worker-observed-measure", "measure").length,
+                    buffered: bufferedEntries
+                        .map(entry => `${entry.name}:${entry.entryType}`)
+                        .join(",")
+                });
+                bufferedObserver.disconnect();
+                close();
+            });
+            bufferedObserver.observe({ type: "mark", buffered: true });
+        });
+        firstObserver.observe({ entryTypes: ["mark", "measure"] });
+        performance.mark("worker-observed-mark", { startTime: 1 });
+        performance.measure("worker-observed-measure", {
+            start: 1,
+            end: 3
+        });
+        "#
+        .into(),
+        "test://worker_performance_observer".into(),
+    );
+
+    let msg = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+    assert_eq!(
+        expect_post_json(msg),
+        r#"{"interfaces":true,"prototypeMethods":true,"supportedEntryTypes":"mark,measure,resource","live":"worker-observed-mark:mark,worker-observed-measure:measure","liveMarks":1,"namedMeasure":1,"buffered":"worker-observed-mark:mark"}"#
+    );
+}
+
+#[tokio::test]
+async fn worker_webgl_interfaces_share_native_value_and_event_bindings() {
+    ensure_v8();
+    let source = format!(
+        "({}).then(passed => {{ postMessage({{ passed, failures: __nodeReplacementResults.failures }}); close(); }}, error => {{ postMessage({{ passed: false, failures: [String(error)] }}); close(); }});",
+        include_str!("../../../script_vm/tests/webgl_interfaces.js")
+    );
+    let mut handle = spawn_worker(source, "test://worker-webgl-interfaces".into());
+    let message = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+    assert_eq!(
+        expect_post_json(message),
+        r#"{"passed":true,"failures":[]}"#
     );
 }
 
@@ -2072,6 +2504,7 @@ async fn shared_worker_navigator_exposes_canonical_user_agent_data() {
                         sameObject: uaData === navigator.userAgentData,
                         userAgent: navigator.userAgent,
                         languages: Array.from(navigator.languages),
+                        languagesFrozen: Object.isFrozen(navigator.languages),
                         brands: uaData.brands,
                         emptyKeys: Object.keys(empty),
                         selectedKeys: Object.keys(selected),
@@ -2103,7 +2536,7 @@ async fn shared_worker_navigator_exposes_canonical_user_agent_data() {
             "JSON.stringify(__wire)",
         )
         .await,
-        r#"{"constructorType":"function","dataType":"object","instance":true,"sameObject":true,"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.1.2.3 Safari/537.36","languages":["de-DE","de"],"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"emptyKeys":["brands","mobile","platform"],"selectedKeys":["architecture","brands","mobile","platform"],"architecture":"x86"}"#
+        r#"{"constructorType":"function","dataType":"object","instance":true,"sameObject":false,"userAgent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.1.2.3 Safari/537.36","languages":["de-DE","de"],"languagesFrozen":true,"brands":[{"brand":"Chromium","version":"146"},{"brand":"Not-A.Brand","version":"24"},{"brand":"Google Chrome","version":"146"}],"emptyKeys":["brands","mobile","platform"],"selectedKeys":["architecture","brands","mobile","platform"],"architecture":"x86"}"#
     );
 }
 
@@ -2385,7 +2818,9 @@ async fn read_message_port_value(
                 if let Some(payload) = registry.take_pending_message_port_message(target_port_id) {
                     return inspect_payload(&payload, expression);
                 }
-                if registry.take_pending_message_port_close(target_port_id) {
+                if registry.take_pending_message_port_close(target_port_id)
+                    == Some(crate::message_port_runtime::MessagePortCloseKind::PeerClosed)
+                {
                     continue;
                 }
                 panic!("MessagePort woke without message or close");
@@ -2445,7 +2880,9 @@ async fn connect_shared_worker_test_port_and_read_now(
                         .parse()
                         .expect("performance.now payload should be numeric");
                 }
-                if registry.take_pending_message_port_close(client_port_id) {
+                if registry.take_pending_message_port_close(client_port_id)
+                    == Some(crate::message_port_runtime::MessagePortCloseKind::PeerClosed)
+                {
                     continue;
                 }
                 panic!("SharedWorker client port woke without message or close");
@@ -2804,4 +3241,184 @@ async fn worker_postmessage_workernavigator_throws_datacloneerror() {
         .expect("timed out")
         .expect("channel closed");
     assert_eq!(expect_post_json(msg), r#""DataCloneError""#);
+}
+
+#[tokio::test]
+async fn worker_fallback_message_events_are_native_platform_objects() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        r#"
+        MessageEvent = undefined;
+        onmessage = event => {
+          let cloneResult = 'accepted';
+          try { structuredClone({event}); }
+          catch (error) { cloneResult = error.name; }
+          postMessage({data: event.data, cloneResult});
+          close();
+        };
+        postMessage('ready');
+        "#
+        .into(),
+        "https://worker-fallback-identity.test/worker.js".into(),
+    );
+    let ready = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+    assert_eq!(expect_post_json(ready), r#""ready""#);
+    handle.post_message(serialize_test_string("ping"));
+    let result = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+    assert_eq!(
+        expect_post_json(result),
+        r#"{"data":"ping","cloneResult":"DataCloneError"}"#
+    );
+}
+
+#[tokio::test]
+async fn worker_does_not_expose_window_media_device_interfaces() {
+    ensure_v8();
+    let mut handle = spawn_worker("postMessage({MediaDeviceInfo:'MediaDeviceInfo' in self,InputDeviceInfo:'InputDeviceInfo' in self});close();".to_owned(), "https://media-device-worker.test/worker.js".into());
+    let message = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+    assert_eq!(
+        expect_post_json(message),
+        r#"{"MediaDeviceInfo":false,"InputDeviceInfo":false}"#
+    );
+}
+
+#[tokio::test]
+async fn worker_rectangle_clones_use_native_prototypes_and_message_channel_delivery() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        r#"
+        (async () => {
+            const check = (ok, label) => { if (!ok) throw Error(label); };
+            for (const name of ['DOMRect', 'DOMRectReadOnly']) {
+                const C = self[name];
+                const prototype = C.prototype;
+                const rect = new C(-0, NaN, Infinity, -Infinity);
+                Object.defineProperty(rect, 'x', {get() { throw Error('must read native state'); }});
+                self[name] = () => { throw Error('must not call public constructor'); };
+                try {
+                    const clone = structuredClone({rect, again: rect});
+                    check(clone.rect === clone.again, name + ' graph alias');
+                    check(Object.getPrototypeOf(clone.rect) === prototype, name + ' intrinsic prototype');
+                    check(Object.is(clone.rect.x, -0) && Number.isNaN(clone.rect.y) &&
+                        clone.rect.width === Infinity && clone.rect.height === -Infinity, name + ' values');
+                    const channel = new MessageChannel();
+                    const received = new Promise(resolve => { channel.port2.onmessage = event => resolve(event.data); });
+                    channel.port1.postMessage({rect, again: rect});
+                    const message = await received;
+                    check(message.rect === message.again && message.rect !== rect, name + ' message graph');
+                    check(Object.getPrototypeOf(message.rect) === prototype, name + ' message receiver prototype');
+                    check(Object.is(message.rect.x, -0) && Number.isNaN(message.rect.y) &&
+                        message.rect.width === Infinity && message.rect.height === -Infinity, name + ' message values');
+                    channel.port1.close();
+                    channel.port2.close();
+                } finally { self[name] = C; }
+            }
+            postMessage('passed');
+            close();
+        })().catch(error => { postMessage(String(error)); close(); });
+        "#
+        .into(),
+        "https://worker-rectangle.test/clone.js".into(),
+    );
+    assert_eq!(recv_post_json(&mut handle).await, r#""passed""#);
+}
+
+#[tokio::test]
+async fn worker_does_not_expose_window_audio_node_interface() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        "postMessage({AudioNode:'AudioNode' in self});close();".to_owned(),
+        "https://audio-node-worker.test/worker.js".into(),
+    );
+    let message = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("timed out")
+        .expect("channel closed");
+    assert_eq!(expect_post_json(message), r#"{"AudioNode":false}"#);
+}
+
+#[tokio::test]
+async fn worker_navigator_languages_are_frozen() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        format!(
+            "try {{ postMessage({}); }} catch (error) {{ postMessage(String(error)); }} close();",
+            include_str!("../../../../tests/fixtures/navigator-languages.js")
+        ),
+        "https://navigator-languages.test/worker.js".into(),
+    );
+    let message = timeout(TIMEOUT, handle.recv())
+        .await
+        .expect("worker language contract must settle")
+        .expect("worker must return a language contract result");
+    assert_eq!(expect_post_json(message), r#""ok""#);
+}
+
+#[tokio::test]
+async fn worker_postmessage_encoded_video_chunk_preserves_native_slots_and_aliases() {
+    ensure_v8();
+    let mut handle = spawn_worker(
+        r#"
+        const buffer = new Uint8Array([9, 4, 5, 6, 8]).buffer;
+        const chunk = new EncodedVideoChunk({
+            type: 'delta', timestamp: -123, duration: 27,
+            data: new Uint8Array(buffer, 1, 3), transfer: [buffer]
+        });
+        if (buffer.byteLength !== 0) throw Error('transfer did not detach');
+        postMessage([chunk, chunk]);
+        "#
+        .into(),
+        "https://encoded-video-chunk.test/worker.js".into(),
+    );
+    let message = timeout(TIMEOUT, handle.recv()).await.unwrap().unwrap();
+    match message {
+        WorkerToParentMessage::Post(payload) => {
+            // This helper installs the native DedicatedWorker interface registry
+            // in a fresh destination context before deserializing.
+            let description = inspect_payload_with_image_data(
+                &payload,
+                r#"(() => {
+                    const chunk = __wire[0], bytes = new Uint8Array(chunk.byteLength);
+                    chunk.copyTo(bytes);
+                    return [chunk instanceof EncodedVideoChunk, __wire[0] === __wire[1],
+                        chunk.type, chunk.timestamp, chunk.duration, Array.from(bytes).join(',')].join('|');
+                })()"#,
+            );
+            assert_eq!(description, "true|true|delta|-123|27|4,5,6");
+            for realm in [
+                crate::context_bootstrap::exposed_interfaces::RealmKind::SharedWorker,
+                crate::context_bootstrap::exposed_interfaces::RealmKind::ServiceWorker,
+            ] {
+                let mut isolate = v8::Isolate::new(Default::default());
+                let scope = pin!(v8::HandleScope::new(&mut isolate));
+                let scope = &mut scope.init();
+                let context = v8::Context::new(scope, Default::default());
+                let scope = &mut v8::ContextScope::new(scope, context);
+                let global = context.global(scope);
+                crate::context_bootstrap::install_worker_lazy_exposed_interfaces(
+                    scope, global, realm, true,
+                )
+                .unwrap();
+                let source = v8::String::new(scope, "Object.defineProperty(globalThis, 'EncodedVideoChunk', {get() {throw Error('public constructor lookup');}})").unwrap();
+                let script = v8::Script::compile(scope, source, None).unwrap();
+                crate::script_execution::execute_compiled_script(scope, script).unwrap();
+                let try_catch = pin!(v8::TryCatch::new(scope));
+                let scope = &mut try_catch.init();
+                assert!(structured_deserialize_value(scope, &payload).is_none());
+                let error = scope.exception().unwrap().to_object(scope).unwrap();
+                let name = crate::util::v8str(scope, "name");
+                assert_eq!(
+                    error
+                        .get(scope, name.into())
+                        .unwrap()
+                        .to_rust_string_lossy(scope),
+                    "DataCloneError"
+                );
+            }
+        }
+        other => panic!("expected Post, got {other:?}"),
+    }
 }

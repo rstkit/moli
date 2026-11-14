@@ -7,13 +7,14 @@ use serde_json::{Map, Value};
 use tracing::debug;
 
 use crate::{
-    DevToolsBrowserContextId, DevToolsCommandContext, DevToolsProtocol, DevToolsSessionId,
-    DevToolsTargetId,
+    AutomationContext, DevToolsBrowserContextId, DevToolsSessionId, DevToolsTargetId,
+    FrontendProtocol,
 };
 
 /// Ephemeral view of the current in-flight protocol command.
 /// Passed to every domain handler.
 pub struct Cmd<'a> {
+    abandoned_object_group: Option<&'a str>,
     pub id: Option<u64>,
     pub method: &'a str,
     /// The part of the method after the first dot, e.g. "getVersion".
@@ -37,6 +38,23 @@ pub struct Cmd<'a> {
     terminal_response_delivery_override: Option<RendererInspectorResponseDelivery>,
 }
 
+// Every typed params parser reports the same concrete error type. Keep the
+// diagnostic event on the failing path without copying it for each T.
+#[cold]
+#[inline(never)]
+fn invalid_params(
+    method: &str,
+    error: serde_path_to_error::Error<serde_json::Error>,
+) -> &'static str {
+    debug!(
+        method,
+        params_path = %error.path(),
+        error = %error.inner(),
+        "invalid CDP params"
+    );
+    "InvalidParams"
+}
+
 impl<'a> Cmd<'a> {
     /// Build the only production command view from one validated ingress
     /// command.
@@ -52,7 +70,26 @@ impl<'a> Cmd<'a> {
             json: command.json(),
             renderer_policy: command.renderer_policy(),
             terminal_response_delivery_override: None,
+            abandoned_object_group: None,
         })
+    }
+
+    pub(crate) fn with_abandoned_object_group_cleanup(mut self, group: Option<&'a str>) -> Self {
+        self.abandoned_object_group = group;
+        self
+    }
+
+    pub(crate) fn renderer_command_descriptor(
+        &self,
+        json: String,
+        delivery: RendererInspectorResponseDelivery,
+    ) -> crate::conn::RendererCommandDescriptor {
+        crate::conn::RendererCommandDescriptor::from_frontend_policy(
+            json,
+            self.renderer_policy(),
+            delivery,
+        )
+        .with_abandoned_object_group_cleanup(self.abandoned_object_group.map(str::to_owned))
     }
 
     pub(crate) fn with_terminal_response_delivery_override(
@@ -99,6 +136,7 @@ impl<'a> Cmd<'a> {
             json,
             renderer_policy: parsed.renderer_policy(),
             terminal_response_delivery_override: None,
+            abandoned_object_group: None,
         }
     }
 
@@ -114,13 +152,13 @@ impl<'a> Cmd<'a> {
     /// Build the protocol-neutral command context for shared DevTools command
     /// dispatch. Existing domain handlers still own target/browser-context
     /// resolution; those IDs can be filled by the caller once resolved.
-    pub fn devtools_command_context(
+    pub fn automation_context(
         &self,
         target_id: Option<impl Into<DevToolsTargetId>>,
         browser_context_id: Option<impl Into<DevToolsBrowserContextId>>,
-    ) -> DevToolsCommandContext {
-        DevToolsCommandContext {
-            protocol: DevToolsProtocol::Cdp,
+    ) -> AutomationContext {
+        AutomationContext {
+            protocol: FrontendProtocol::Cdp,
             session_id: self.session_id.map(DevToolsSessionId::from),
             target_id: target_id.map(Into::into),
             browser_context_id: browser_context_id.map(Into::into),
@@ -135,15 +173,7 @@ impl<'a> Cmd<'a> {
         };
         serde_path_to_error::deserialize(params)
             .map(Some)
-            .map_err(|error| {
-                debug!(
-                    method = self.method,
-                    params_path = %error.path(),
-                    error = %error.inner(),
-                    "invalid CDP params"
-                );
-                "InvalidParams"
-            })
+            .map_err(|error| invalid_params(self.method, error))
     }
 
     /// Parse the action part into a domain-owned enum.
@@ -175,9 +205,9 @@ mod tests {
             r#"{"id":7,"method":"Runtime.evaluate"}"#,
         );
 
-        let context = cmd.devtools_command_context(Some("target-1"), Some("context-1"));
+        let context = cmd.automation_context(Some("target-1"), Some("context-1"));
 
-        assert_eq!(context.protocol, DevToolsProtocol::Cdp);
+        assert_eq!(context.protocol, FrontendProtocol::Cdp);
         assert_eq!(
             context.session_id.as_ref().map(DevToolsSessionId::as_str),
             Some("session-1")

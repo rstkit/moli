@@ -382,7 +382,11 @@ async fn image_fetch_enabled_rejects_http_success_with_corrupt_image_bytes() {
         "https://corrupt-image.test/page.html",
         &loader,
     );
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
 
     vm.eval(
         r#"
@@ -404,7 +408,7 @@ async fn image_fetch_enabled_rejects_http_success_with_corrupt_image_bytes() {
     vm.fulfill_pending_subresource_fetch(
         pending[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/jpeg".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/jpeg".to_vec())],
         crate::runtime::RendererSyntheticResponseBody::from_bytes(
             b"<html>not an image</html>".to_vec(),
         ),
@@ -434,7 +438,11 @@ async fn inserting_completed_detached_image_does_not_restart_request() {
         "https://image-insertion.test/page.html",
         &loader,
     );
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
 
     vm.eval(
         r#"
@@ -454,7 +462,7 @@ async fn inserting_completed_detached_image_does_not_restart_request() {
     vm.fulfill_pending_subresource_fetch(
         pending[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/gif".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/gif".to_vec())],
         one_by_one_gif_response_body(),
     )
     .expect("detached image response should complete");
@@ -496,7 +504,11 @@ async fn removed_lazy_image_suppresses_in_flight_terminal_event() {
         "https://removed-lazy-image.test/page.html",
         &loader,
     );
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
 
     vm.eval(
         r#"
@@ -525,7 +537,7 @@ async fn removed_lazy_image_suppresses_in_flight_terminal_event() {
     vm.fulfill_pending_subresource_fetch(
         pending[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/gif".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/gif".to_vec())],
         one_by_one_gif_response_body(),
     )
     .expect("removed lazy image response should complete");
@@ -692,7 +704,11 @@ async fn replacing_image_source_discards_queued_stale_decode_pixels() {
         "https://example.test/page.html",
         &loader,
     );
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
     vm.eval(
         r#"
         (() => {
@@ -719,7 +735,7 @@ async fn replacing_image_source_discards_queued_stale_decode_pixels() {
     vm.fulfill_pending_subresource_fetch(
         old_request[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/png".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/png".to_vec())],
         crate::runtime::RendererSyntheticResponseBody::from_bytes(old_png.bytes),
     )
     .expect("old image response should fulfill");
@@ -763,7 +779,7 @@ async fn replacing_image_source_discards_queued_stale_decode_pixels() {
     vm.fulfill_pending_subresource_fetch(
         new_request[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/png".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/png".to_vec())],
         crate::runtime::RendererSyntheticResponseBody::from_bytes(new_png.bytes),
     )
     .expect("replacement image response should fulfill");
@@ -791,8 +807,14 @@ async fn image_request_interception_fulfills_through_image_continuation() {
         "https://example.test/page.html",
         &loader,
     );
-    vm.set_extra_http_headers(&[("X-Image-Request".to_owned(), "intercepted".to_owned())]);
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_extra_http_headers(
+        &vec![("X-Image-Request".to_owned(), "intercepted".to_owned())].into(),
+    );
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
     vm.eval(
         r#"
         (() => {
@@ -823,13 +845,13 @@ async fn image_request_interception_fulfills_through_image_continuation() {
     assert_eq!(pending.url.as_str(), "https://example.test/paused.png");
     assert_eq!(
         pending.request_headers,
-        vec![("X-Image-Request".to_owned(), "intercepted".to_owned())],
+        vec![("X-Image-Request".to_owned(), "intercepted".to_owned())].into(),
         "interception must observe the request headers frozen at request start"
     );
     vm.fulfill_pending_subresource_fetch(
         pending.internal_id,
         404,
-        vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+        vec![("Content-Type".to_owned(), b"text/plain".to_vec())],
         crate::runtime::RendererSyntheticResponseBody::empty(),
     )
     .expect("intercepted image request should fulfill");
@@ -857,7 +879,11 @@ async fn image_decode_waits_for_in_flight_pixels_and_reuses_the_ready_resource()
         "https://example.test/page.html",
         &loader,
     );
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
 
     vm.eval(
         r#"
@@ -887,7 +913,7 @@ async fn image_decode_waits_for_in_flight_pixels_and_reuses_the_ready_resource()
     vm.fulfill_pending_subresource_fetch(
         pending[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/gif".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/gif".to_vec())],
         one_by_one_gif_response_body(),
     )
     .expect("in-flight image response should fulfill");
@@ -960,7 +986,11 @@ async fn changing_image_cross_origin_restarts_intercepted_request() {
         "https://example.test/page.html",
         &loader,
     );
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
     vm.eval(
         r#"
         (() => {
@@ -994,7 +1024,7 @@ async fn changing_image_cross_origin_restarts_intercepted_request() {
         vm.fulfill_pending_subresource_fetch(
             first[0].internal_id,
             200,
-            vec![("Content-Type".to_owned(), "image/png".to_owned())],
+            vec![("Content-Type".to_owned(), b"image/png".to_vec())],
             crate::runtime::RendererSyntheticResponseBody::empty(),
         )
         .is_err(),
@@ -1011,7 +1041,7 @@ async fn changing_image_cross_origin_restarts_intercepted_request() {
     vm.fulfill_pending_subresource_fetch(
         second[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/gif".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/gif".to_vec())],
         one_by_one_gif_response_body(),
     )
     .expect("replacement image request should fulfill");
@@ -1036,7 +1066,11 @@ async fn changing_picture_source_restarts_intercepted_image_request() {
         "https://example.test/page.html",
         &loader,
     );
-    vm.set_fetch_subresource_interception(true, Some(crate::types::SubresourceResourceType::Image));
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
     vm.eval(
         r#"
         (() => {
@@ -1076,7 +1110,7 @@ async fn changing_picture_source_restarts_intercepted_image_request() {
     vm.fulfill_pending_subresource_fetch(
         second[0].internal_id,
         200,
-        vec![("Content-Type".to_owned(), "image/gif".to_owned())],
+        vec![("Content-Type".to_owned(), b"image/gif".to_vec())],
         one_by_one_gif_response_body(),
     )
     .expect("replacement picture image request should fulfill");
@@ -1091,4 +1125,473 @@ async fn changing_picture_source_restarts_intercepted_image_request() {
             .expect("replacement picture image event should evaluate"),
         "load:https://example.test/second.png:1"
     );
+}
+
+#[tokio::test]
+async fn picture_source_and_image_tree_mutations_reselect_requests() {
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).expect("loader");
+    loader.set_image_fetch_enabled(true);
+    let mut vm = new_storage_page_task_executor_test_vm_with_loader(
+        "https://picture-source-removal.test/page.html",
+        &loader,
+    );
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
+
+    vm.eval(
+        r#"
+        (() => {
+          if (!document.documentElement) {
+            document.append(document.createElement("html"));
+          }
+          if (!document.body) {
+            document.documentElement.append(document.createElement("body"));
+          }
+          const picture = document.createElement("picture");
+          const source1 = document.createElement("source");
+          const source2 = document.createElement("source");
+          const source3 = document.createElement("source");
+          const source4 = document.createElement("source");
+          const source5 = document.createElement("source");
+          const middleSource = document.createElement("source");
+          const image1 = document.createElement("img");
+          const image2 = document.createElement("img");
+          source1.srcset = "s1.png";
+          source2.srcset = "s2.png";
+          source3.srcset = "s3.png";
+          source4.srcset = "s4.png";
+          source5.srcset = "s5.png";
+          middleSource.srcset = "middle.png";
+          image1.src = "img1.png";
+          image2.src = "img2.png";
+          picture.append(source1, source2, source3, image1, middleSource, image2, source4, source5);
+          const host = document.body;
+          host.append(picture);
+          globalThis.__pictureSourceMutation = {
+            host,
+            picture,
+            source1,
+            source2,
+            source3,
+            source4,
+            source5,
+            middleSource,
+            image1,
+            image2
+          };
+        })()
+        "#,
+    )
+    .expect("picture source mutation setup should evaluate");
+
+    let cases: &[(&str, &[&str])] = &[
+        ("", &["s1.png", "s1.png"]),
+        ("source1.remove()", &["s2.png", "s2.png"]),
+        ("source2.remove()", &["s3.png", "s3.png"]),
+        (
+            "host.append(__pictureSourceMutation.source3)",
+            &["img1.png", "middle.png"],
+        ),
+        ("middleSource.remove()", &["img2.png"]),
+        ("source4.remove()", &[]),
+        ("host.append(__pictureSourceMutation.source5)", &[]),
+        (
+            "picture.prepend(__pictureSourceMutation.source2)",
+            &["s2.png", "s2.png"],
+        ),
+        (
+            "picture.prepend(__pictureSourceMutation.source1)",
+            &["s1.png", "s1.png"],
+        ),
+        (
+            "source1.replaceWith(document.createElement('div'))",
+            &["s2.png", "s2.png"],
+        ),
+        ("image1.remove()", &["img1.png"]),
+    ];
+    for (mutation, expected_sources) in cases {
+        if !mutation.is_empty() {
+            vm.eval(&format!("__pictureSourceMutation.{mutation}"))
+                .expect("picture tree mutation should evaluate");
+        }
+        let mut requested_sources = vm
+            .take_pending_subresource_fetch_infos()
+            .into_iter()
+            .map(|request| {
+                assert_eq!(
+                    request.resource_type,
+                    crate::types::SubresourceResourceType::Image
+                );
+                request.url.to_string()
+            })
+            .collect::<Vec<_>>();
+        requested_sources.sort();
+        let mut expected_sources = expected_sources
+            .iter()
+            .map(|source| format!("https://picture-source-removal.test/{source}"))
+            .collect::<Vec<_>>();
+        expected_sources.sort();
+        assert_eq!(
+            requested_sources, expected_sources,
+            "mutation: {mutation:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn svg_image_decode_preserves_href_precedence_and_mutation_cancellation() {
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+    loader.set_image_fetch_enabled(true);
+    let mut vm = new_storage_page_task_executor_test_vm_with_loader(
+        "https://svg-decode-mutations.test/page.html",
+        &loader,
+    );
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
+    vm.eval(
+        r#"
+        globalThis.__svgDecodeImage = document.createElementNS('http://www.w3.org/2000/svg', 'image');
+        __svgDecodeImage.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', '/fallback.gif');
+        __svgDecodeImage.setAttribute('href', '/preferred.gif');
+        globalThis.__svgPreferredDecode = 'pending';
+        const first = __svgDecodeImage.decode(), second = __svgDecodeImage.decode();
+        globalThis.__svgDecodePromisesDistinct = first !== second;
+        Promise.all([first, second]).then(values => {
+          __svgPreferredDecode = values.every(value => value === undefined) ? 'fulfilled' : 'invalid';
+        }, error => __svgPreferredDecode = error.name);
+        "#,
+    )
+    .unwrap();
+    let preferred = vm.take_pending_subresource_fetch_infos();
+    assert_eq!(preferred.len(), 1);
+    assert_eq!(
+        preferred[0].url.as_str(),
+        "https://svg-decode-mutations.test/preferred.gif"
+    );
+    assert_eq!(vm.eval("__svgDecodePromisesDistinct").unwrap(), "true");
+    assert_eq!(vm.eval("__svgPreferredDecode").unwrap(), "pending");
+    vm.fulfill_pending_subresource_fetch(
+        preferred[0].internal_id,
+        200,
+        vec![("Content-Type".into(), b"image/gif".to_vec())],
+        one_by_one_gif_response_body(),
+    )
+    .unwrap();
+    run_next_image_event_task(&mut vm, &loader, "preferred SVG image decode").await;
+    assert_eq!(vm.eval("__svgPreferredDecode").unwrap(), "fulfilled");
+
+    vm.eval(
+        r#"
+        globalThis.__svgReplacedDecode = 'pending';
+        globalThis.__svgFallbackDecode = 'pending';
+        __svgDecodeImage.setAttribute('href', '/replacement.gif');
+        const replaced = __svgDecodeImage.decode();
+        replaced.then(() => __svgReplacedDecode = 'fulfilled', error => __svgReplacedDecode = error.name);
+        __svgDecodeImage.removeAttribute('href');
+        const fallback = __svgDecodeImage.decode();
+        fallback.then(() => __svgFallbackDecode = 'fulfilled', error => __svgFallbackDecode = error.name);
+        "#,
+    )
+    .unwrap();
+    let fallback = vm.take_pending_subresource_fetch_infos();
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(
+        fallback[0].url.as_str(),
+        "https://svg-decode-mutations.test/fallback.gif"
+    );
+    assert_eq!(vm.eval("__svgReplacedDecode").unwrap(), "EncodingError");
+    assert_eq!(vm.eval("__svgFallbackDecode").unwrap(), "pending");
+    vm.fulfill_pending_subresource_fetch(
+        fallback[0].internal_id,
+        200,
+        vec![("Content-Type".into(), b"image/gif".to_vec())],
+        one_by_one_gif_response_body(),
+    )
+    .unwrap();
+    run_next_image_event_task(&mut vm, &loader, "fallback SVG image decode").await;
+    assert_eq!(vm.eval("__svgFallbackDecode").unwrap(), "fulfilled");
+    assert_eq!(vm.eval("__svgReplacedDecode").unwrap(), "EncodingError");
+    assert_eq!(
+        vm.eval("__svgDecodeImage.href.baseVal").unwrap(),
+        "/fallback.gif"
+    );
+    assert!(vm.take_pending_subresource_fetch_infos().is_empty());
+}
+
+fn image_decode_receiver_test_vm() -> crate::runtime::PageVmTaskExecutorTestHarness {
+    let mut vm = new_storage_page_task_executor_test_vm("https://image-decode-receivers.test/");
+    vm.eval(
+        r#"
+        document.body.innerHTML = '<iframe id="decode-receiver-frame"></iframe>';
+        globalThis.__imageDecodeReceiverOtherWindow = document.getElementById('decode-receiver-frame').contentWindow;
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.eval_after_selected_page_tasks("typeof __imageDecodeReceiverOtherWindow.Promise")
+            .unwrap(),
+        "function"
+    );
+    vm
+}
+
+#[test]
+fn image_decode_bindings_validate_receivers_and_promise_realms() {
+    let mut vm = image_decode_receiver_test_vm();
+    vm.eval(include_str!("image_decode_receivers.js")).unwrap();
+    assert_eq!(
+        vm.eval_after_selected_page_tasks("__imageDecodeReceiverResults.complete")
+            .unwrap(),
+        "true"
+    );
+    assert_eq!(
+        vm.eval("__imageDecodeReceiverResults.checks.length")
+            .unwrap(),
+        "76"
+    );
+    assert_eq!(
+        vm.eval("JSON.stringify(__imageDecodeReceiverResults.checks.filter(row => !row.passed))")
+            .unwrap(),
+        "[]"
+    );
+}
+
+#[test]
+fn image_decode_registered_native_proxies_preserve_target_realms() {
+    let mut vm = image_decode_receiver_test_vm();
+    vm.eval(
+        r#"
+        globalThis.__nativeHtmlSource = document.createElement('img');
+        globalThis.__nativeSvgSource = document.createElementNS('http://www.w3.org/2000/svg', 'image');
+        globalThis.__foreignHtmlSource = __imageDecodeReceiverOtherWindow.document.createElement('img');
+        globalThis.__foreignSvgSource = __imageDecodeReceiverOtherWindow.document.createElementNS('http://www.w3.org/2000/svg', 'image');
+        "#,
+    )
+    .unwrap();
+    vm.with_default_context_scope_and_checkpoint_for_test(|scope, _| {
+        let global = scope.get_current_context().global(scope);
+        for (source, alias) in [
+            ("__nativeHtmlSource", "nativeHtml"),
+            ("__nativeSvgSource", "nativeSvg"),
+            ("__foreignHtmlSource", "foreignHtml"),
+            ("__foreignSvgSource", "foreignSvg"),
+        ] {
+            let key = crate::util::v8str(scope, source);
+            let object =
+                v8::Local::<v8::Object>::try_from(global.get(scope, key.into()).unwrap()).unwrap();
+            let target = moli_webapi_declare::web_api_object_target(scope, object).unwrap();
+            let handler = crate::util::new_null_prototype_object(scope);
+            let proxy = v8::Proxy::new(scope, target, handler).unwrap();
+            moli_webapi_declare::register_web_api_proxy(scope, proxy).unwrap();
+            let registered: v8::Local<v8::Object> = proxy.into();
+            assert!(
+                crate::web_api_interfaces::HTMLImageElement::is_instance(scope, registered)
+                    || crate::web_api_interfaces::SVGImageElement::is_instance(scope, registered)
+            );
+            let key = crate::util::v8str(scope, alias);
+            assert_eq!(
+                global.create_data_property(scope, key.into(), proxy.into()),
+                Some(true)
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    vm.eval(
+        r#"
+        globalThis.__nativeImageDecodeResult = 'pending';
+        (async () => {
+          const assert = (ok, message) => { if (!ok) throw Error(message); };
+          const other = __imageDecodeReceiverOtherWindow;
+          let traps = 0;
+          const trap = () => { traps++; throw Error('author Proxy trap'); };
+          for (const [receiver, owner, name] of [
+            [nativeHtml, window, 'HTMLImageElement'], [nativeSvg, window, 'SVGImageElement'],
+            [foreignHtml, other, 'HTMLImageElement'], [foreignSvg, other, 'SVGImageElement']
+          ]) for (const callee of [window, other]) {
+            const method = callee[name].prototype.decode;
+            const promise = method.call(receiver);
+            assert(Object.getPrototypeOf(promise) === owner.Promise.prototype, 'native target Promise realm');
+            let error; try { await promise; } catch (caught) { error = caught; }
+            assert(error?.name === 'EncodingError' && Object.getPrototypeOf(error) === owner.DOMException.prototype, 'native target accepted');
+            const revoked = Proxy.revocable(receiver, {}); revoked.revoke();
+            for (const invalid of [Object.create(receiver), new Proxy(receiver, {get: trap, getPrototypeOf: trap}), revoked.proxy]) {
+              const rejected = method.call(invalid);
+              assert(Object.getPrototypeOf(rejected) === callee.Promise.prototype, 'invalid receiver Promise realm');
+              let failure; try { await rejected; } catch (caught) { failure = caught; }
+              assert(failure && Object.getPrototypeOf(failure) === callee.TypeError.prototype, 'author receiver rejection');
+            }
+          }
+          assert(traps === 0, 'receiver validation must not execute author traps');
+          __nativeImageDecodeResult = 'ok';
+        })().catch(error => __nativeImageDecodeResult = String(error));
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.eval_after_selected_page_tasks("__nativeImageDecodeResult")
+            .unwrap(),
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn image_decode_cross_realm_loads_settle_in_the_receiver_realm() {
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+    loader.set_image_fetch_enabled(true);
+    let mut vm = new_storage_page_task_executor_test_vm_with_loader(
+        "https://image-decode-load-realms.test/page.html",
+        &loader,
+    );
+    vm.set_fetch_subresource_interception(
+        crate::types::SubresourceInterceptionClasses::for_resource_type(
+            crate::types::SubresourceResourceType::Image,
+        ),
+    );
+    vm.eval(
+        r#"
+        document.body.innerHTML = '<iframe id="decode-load-frame"></iframe>';
+        globalThis.__decodeLoadOther = document.getElementById('decode-load-frame').contentWindow;
+        "#,
+    )
+    .unwrap();
+    for _ in 0..32 {
+        if !vm
+            .run_one_oldest_ready_page_task_executor_turn(&loader)
+            .await
+            .unwrap()
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        vm.eval("typeof __decodeLoadOther.SVGImageElement").unwrap(),
+        "function"
+    );
+    for name in ["HTMLImageElement", "SVGImageElement"] {
+        for owner_child in [false, true] {
+            let url = format!("https://image-decode-load-realms.test/{name}-{owner_child}.gif");
+            let case = serde_json::json!({"name":name,"ownerChild":owner_child,"url":url});
+            vm.eval(&format!("globalThis.__decodeRealmCase = {case}"))
+                .unwrap();
+            vm.eval(
+                r#"
+                (() => {
+                  const spec = __decodeRealmCase;
+                  const owner = spec.ownerChild ? __decodeLoadOther : window;
+                  const callee = spec.ownerChild ? window : __decodeLoadOther;
+                  const image = spec.name === 'HTMLImageElement' ? owner.document.createElement('img') :
+                    owner.document.createElementNS('http://www.w3.org/2000/svg', 'image');
+                  image.setAttribute(spec.name === 'HTMLImageElement' ? 'src' : 'href', spec.url);
+                  const promise = callee[spec.name].prototype.decode.call(image);
+                  globalThis.__decodeLoadPromiseRealm = Object.getPrototypeOf(promise) === owner.Promise.prototype;
+                  globalThis.__decodeLoadOutcome = 'pending';
+                  promise.then(value => __decodeLoadOutcome = `fulfilled:${value === undefined}`,
+                    error => __decodeLoadOutcome = error.name);
+                  globalThis.__decodeLoadImage = image;
+                })();
+                "#,
+            )
+            .unwrap();
+            assert_eq!(vm.eval("__decodeLoadPromiseRealm").unwrap(), "true");
+            assert_eq!(vm.eval("__decodeLoadOutcome").unwrap(), "pending");
+            let requests = vm.take_pending_subresource_fetch_infos();
+            assert_eq!(requests.len(), 1, "{name}, child receiver: {owner_child}");
+            assert_eq!(requests[0].url.as_str(), url);
+            vm.fulfill_pending_subresource_fetch(
+                requests[0].internal_id,
+                200,
+                vec![("Content-Type".into(), b"image/gif".to_vec())],
+                one_by_one_gif_response_body(),
+            )
+            .unwrap();
+            run_next_image_event_task(&mut vm, &loader, "cross-realm image decode load").await;
+            assert_eq!(vm.eval("__decodeLoadOutcome").unwrap(), "fulfilled:true");
+            assert!(vm.take_pending_subresource_fetch_infos().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn available_image_reuse_does_not_start_another_fetch_or_timing_entry() {
+    for policy in [
+        moli_page_types::LayoutPolicy::Mock,
+        moli_page_types::LayoutPolicy::OnDemand,
+    ] {
+        let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+        loader.set_image_fetch_enabled(true);
+        let mut vm = new_storage_page_task_executor_test_vm_with_loader(
+            "https://image-reuse-timing.test/page.html",
+            &loader,
+        );
+        vm.set_layout_policy(policy);
+        vm.set_fetch_subresource_interception(
+            crate::types::SubresourceInterceptionClasses::for_resource_type(
+                crate::types::SubresourceResourceType::Image,
+            ),
+        );
+        vm.eval(
+            r#"
+            globalThis.__reuseLoads = [];
+            globalThis.__reuseTimeline = 'pending';
+            (async () => {
+              for (const path of ['/shared.gif', '/shared.gif', '/canary.gif']) {
+                await new Promise(resolve => {
+                  const image = document.createElement('img');
+                  image.onload = () => { __reuseLoads.push(path); resolve(); };
+                  image.onerror = () => { __reuseLoads.push('error'); resolve(); };
+                  image.src = path;
+                  document.body.appendChild(image);
+                });
+              }
+              __reuseTimeline = performance.getEntriesByType('resource')
+                .map(entry => new URL(entry.name).pathname).join('|');
+            })();
+            "#,
+        )
+        .unwrap();
+        let first = vm.take_pending_subresource_fetch_infos();
+        assert_eq!(first.len(), 1, "{policy:?}: initial fetch");
+        vm.fulfill_pending_subresource_fetch(
+            first[0].internal_id,
+            200,
+            vec![("Content-Type".into(), b"image/gif".to_vec())],
+            one_by_one_gif_response_body(),
+        )
+        .unwrap();
+        run_next_image_event_task(&mut vm, &loader, "first shared image load").await;
+        assert_eq!(vm.eval("__reuseLoads.join('|')").unwrap(), "/shared.gif");
+        assert!(
+            vm.take_pending_subresource_fetch_infos().is_empty(),
+            "{policy:?}: an available image must not start another fetch"
+        );
+        run_next_image_event_task(&mut vm, &loader, "reused shared image load").await;
+        let canary = vm.take_pending_subresource_fetch_infos();
+        assert_eq!(canary.len(), 1, "{policy:?}: distinct URL must fetch");
+        assert_eq!(canary[0].url.path(), "/canary.gif");
+        vm.fulfill_pending_subresource_fetch(
+            canary[0].internal_id,
+            200,
+            vec![("Content-Type".into(), b"image/gif".to_vec())],
+            one_by_one_gif_response_body(),
+        )
+        .unwrap();
+        run_next_image_event_task(&mut vm, &loader, "canary image load").await;
+        assert_eq!(
+            vm.eval("__reuseLoads.join('|')").unwrap(),
+            "/shared.gif|/shared.gif|/canary.gif",
+            "{policy:?}"
+        );
+        assert_eq!(
+            vm.eval("__reuseTimeline").unwrap(),
+            "/shared.gif|/canary.gif",
+            "{policy:?}"
+        );
+    }
 }

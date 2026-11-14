@@ -15,7 +15,11 @@ impl PageStateCache {
     }
 
     pub(super) fn replace(&mut self, state: Arc<RendererPageState>) {
-        self.state = state;
+        // Renderer completions retain their own frozen replies even when the
+        // caller consumes them after a newer capture of this Page.
+        if state.snapshot_revision >= self.state.snapshot_revision {
+            self.state = state;
+        }
     }
 
     pub(super) fn state(&self) -> &RendererPageState {
@@ -54,7 +58,7 @@ impl PageStateCache {
         &self.state().navigation_redirect_chain
     }
 
-    pub(super) fn headers(&self) -> &[(String, String)] {
+    pub(super) fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.state().headers
     }
 

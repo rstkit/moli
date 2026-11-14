@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     io::{Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,6 +13,128 @@ use std::{
 
 use crate::FetchClientHandle;
 use parking_lot::Mutex;
+
+pub(super) fn spawn_socks5_proxy(
+    upstream_addr: std::net::SocketAddr,
+) -> (
+    String,
+    std_mpsc::Receiver<(String, u16)>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fetch SOCKS proxy");
+    let addr = listener.local_addr().expect("fetch SOCKS proxy address");
+    let (request_tx, request_rx) = std_mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut client, _) = listener.accept().expect("accept fetch SOCKS client");
+        let mut greeting = [0u8; 2];
+        client
+            .read_exact(&mut greeting)
+            .expect("read fetch SOCKS greeting");
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0; usize::from(greeting[1])];
+        client
+            .read_exact(&mut methods)
+            .expect("read fetch SOCKS methods");
+        assert!(methods.contains(&0), "SOCKS client must offer no-auth");
+        client
+            .write_all(&[5, 0])
+            .expect("write fetch SOCKS method selection");
+
+        let mut request_head = [0u8; 4];
+        client
+            .read_exact(&mut request_head)
+            .expect("read fetch SOCKS request head");
+        assert_eq!(&request_head[..3], &[5, 1, 0]);
+        let host = match request_head[3] {
+            3 => {
+                let mut length = [0u8; 1];
+                client
+                    .read_exact(&mut length)
+                    .expect("read fetch SOCKS domain length");
+                let mut domain = vec![0; usize::from(length[0])];
+                client
+                    .read_exact(&mut domain)
+                    .expect("read fetch SOCKS domain");
+                String::from_utf8(domain).expect("fetch SOCKS domain should be UTF-8")
+            }
+            atyp => panic!("SOCKS5 must send a domain target, got address type {atyp}"),
+        };
+        let mut port = [0u8; 2];
+        client
+            .read_exact(&mut port)
+            .expect("read fetch SOCKS target port");
+        let port = u16::from_be_bytes(port);
+        let _ = request_tx.send((host, port));
+
+        let upstream = TcpStream::connect(upstream_addr).expect("connect fetch SOCKS upstream");
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("write fetch SOCKS success response");
+        relay_proxy_streams(client, upstream);
+    });
+    (format!("socks5://{addr}"), request_rx, handle)
+}
+
+pub(super) fn spawn_socks4_proxy(
+    upstream_addr: std::net::SocketAddr,
+) -> (
+    String,
+    std_mpsc::Receiver<(String, u16)>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fetch SOCKS4 proxy");
+    let addr = listener.local_addr().expect("fetch SOCKS4 proxy address");
+    let (request_tx, request_rx) = std_mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut client, _) = listener.accept().expect("accept fetch SOCKS4 client");
+        let mut request_head = [0u8; 8];
+        client
+            .read_exact(&mut request_head)
+            .expect("read fetch SOCKS4 request head");
+        assert_eq!(&request_head[..2], &[4, 1]);
+        assert_eq!(&request_head[4..7], &[0, 0, 0]);
+        assert_ne!(request_head[7], 0, "SOCKS4a must use a synthetic IP");
+        let port = u16::from_be_bytes([request_head[2], request_head[3]]);
+        let _user_id = read_socks4_string(&mut client, "user id");
+        let domain = read_socks4_string(&mut client, "domain");
+        let host = String::from_utf8(domain).expect("fetch SOCKS4 domain should be UTF-8");
+        let _ = request_tx.send((host, port));
+
+        let upstream = TcpStream::connect(upstream_addr).expect("connect fetch SOCKS4 upstream");
+        client
+            .write_all(&[0, 0x5a, 0, 0, 0, 0, 0, 0])
+            .expect("write fetch SOCKS4 success response");
+        relay_proxy_streams(client, upstream);
+    });
+    (format!("socks4://{addr}"), request_rx, handle)
+}
+
+fn read_socks4_string(stream: &mut TcpStream, label: &str) -> Vec<u8> {
+    let mut value = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        stream
+            .read_exact(&mut byte)
+            .unwrap_or_else(|error| panic!("read fetch SOCKS4 {label}: {error}"));
+        if byte[0] == 0 {
+            return value;
+        }
+        assert!(value.len() < 255, "fetch SOCKS4 {label} is too long");
+        value.push(byte[0]);
+    }
+}
+
+fn relay_proxy_streams(mut client: TcpStream, mut upstream: TcpStream) {
+    let mut client_read = client.try_clone().expect("clone fetch proxy client");
+    let mut upstream_write = upstream.try_clone().expect("clone fetch proxy upstream");
+    let upload = thread::spawn(move || {
+        let _ = std::io::copy(&mut client_read, &mut upstream_write);
+    });
+    let _ = std::io::copy(&mut upstream, &mut client);
+    let _ = client.shutdown(std::net::Shutdown::Both);
+    let _ = upstream.shutdown(std::net::Shutdown::Both);
+    let _ = upload.join();
+}
 
 pub(super) struct ScriptedH2Server {
     addr: std::net::SocketAddr,
@@ -115,6 +237,20 @@ impl ScriptedHttps11Server {
 
 impl ScriptedH2Server {
     pub(super) fn spawn(responses: Vec<ScriptedResponse>) -> Self {
+        Self::spawn_with_gate(responses, None)
+    }
+
+    pub(super) fn spawn_with_response_barrier(
+        responses: Vec<ScriptedResponse>,
+        barrier: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        Self::spawn_with_gate(responses, Some(barrier))
+    }
+
+    fn spawn_with_gate(
+        responses: Vec<ScriptedResponse>,
+        barrier: Option<Arc<tokio::sync::Barrier>>,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener
             .set_nonblocking(true)
@@ -136,6 +272,7 @@ impl ScriptedH2Server {
                 requests_for_thread,
                 connection_stream_counts_for_thread,
                 responses,
+                barrier,
             );
         });
 
@@ -294,6 +431,7 @@ fn run_h2_server(
     requests: Arc<Mutex<Vec<String>>>,
     connection_stream_counts: Arc<Mutex<Vec<usize>>>,
     responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
+    barrier: Option<Arc<tokio::sync::Barrier>>,
 ) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -316,6 +454,7 @@ fn run_h2_server(
             let requests = Arc::clone(&requests);
             let connection_stream_counts = Arc::clone(&connection_stream_counts);
             let responses = Arc::clone(&responses);
+            let barrier = barrier.clone();
             tokio::spawn(async move {
                 let Ok(stream) = tls_acceptor.accept(stream).await else {
                     return;
@@ -348,7 +487,11 @@ fn run_h2_server(
                             .or_else(|| responses.back().cloned())
                             .expect("scripted h2 responses should not be empty")
                     };
+                    let barrier = barrier.clone();
                     tokio::spawn(async move {
+                        if let Some(barrier) = barrier {
+                            barrier.wait().await;
+                        }
                         if response_spec.delay_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(response_spec.delay_ms)).await;
                         }
@@ -701,7 +844,7 @@ fn http2_and_http11_tls_acceptor() -> tokio_rustls::TlsAcceptor {
     tokio_rustls::TlsAcceptor::from(Arc::new(config))
 }
 
-fn http11_tls_acceptor() -> tokio_rustls::TlsAcceptor {
+pub(super) fn http11_tls_acceptor() -> tokio_rustls::TlsAcceptor {
     use tokio_rustls::rustls::{
         ServerConfig,
         pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
@@ -881,14 +1024,85 @@ impl ScriptedHttpServer {
     }
 }
 
+#[test]
+fn scripted_server_waits_for_request_on_nonblocking_accepted_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    // macOS may inherit this mode from the listening socket.
+    stream.set_nonblocking(true).unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let responses = Arc::new(Mutex::new(VecDeque::from([ScriptedResponse::ok("ready")])));
+    let (done_tx, done_rx) = std_mpsc::channel();
+    let handler = {
+        let hits = Arc::clone(&hits);
+        let requests = Arc::clone(&requests);
+        thread::spawn(move || {
+            handle_scripted_connection(stream, hits, requests, responses);
+            done_tx.send(()).unwrap();
+        })
+    };
+    assert!(
+        matches!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ),
+        "a connection without HTTP bytes must not receive a scripted response"
+    );
+    client
+        .write_all(b"GET /delayed HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    handler.join().unwrap();
+    assert!(response.ends_with("ready"));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(requests.lock()[0].starts_with("GET /delayed HTTP/1.1\r\n"));
+}
+
+#[test]
+fn scripted_server_does_not_consume_response_for_closed_unused_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    drop(client);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let responses = Arc::new(Mutex::new(VecDeque::from([ScriptedResponse::ok("ready")])));
+    handle_scripted_connection(
+        stream,
+        Arc::clone(&hits),
+        Arc::clone(&requests),
+        Arc::clone(&responses),
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(requests.lock().is_empty());
+    assert_eq!(responses.lock().len(), 1);
+}
+
 fn handle_scripted_connection(
     mut stream: std::net::TcpStream,
     hits: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
     responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
 ) {
+    stream
+        .set_nonblocking(false)
+        .expect("scripted HTTP connection should use blocking reads");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("scripted HTTP connection should have a bounded read");
     let mut request = [0; 1024];
-    let bytes_read = stream.read(&mut request).unwrap_or(0);
+    let bytes_read = stream
+        .read(&mut request)
+        .expect("read scripted HTTP request");
+    if bytes_read == 0 {
+        return;
+    }
     let request_text = String::from_utf8_lossy(&request[..bytes_read]).into_owned();
     requests.lock().push(request_text);
     let _ = hits.fetch_add(1, Ordering::SeqCst) + 1;

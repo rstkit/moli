@@ -14,6 +14,9 @@ fn foreign_live_script_already_started(
 ) -> bool {
     let object = v8::Global::new(scope, object);
     let object = v8::Local::new(scope, object);
+    let Some(object) = node_backing_object(scope, object) else {
+        return false;
+    };
     if let Some(state) = get_private_object(scope, object, DETACHED_STATE_SLOT) {
         let local_name = object_defined_string_property(scope, state, "localName")
             .or_else(|| object_defined_string_property(scope, object, "localName"));
@@ -35,7 +38,7 @@ fn foreign_live_script_already_started(
 }
 
 fn append_cloned_child_without_mutation_effects(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
 ) -> bool {
@@ -46,7 +49,7 @@ fn append_cloned_child_without_mutation_effects(
 
 pub(super) fn clone_js_node_like_into_document(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document_handle: DomHandle,
     object: v8::Local<'_, v8::Object>,
     deep: bool,
@@ -154,7 +157,7 @@ pub(super) fn clone_js_node_like_into_document(
 
 fn clone_js_element_into_document(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document_handle: DomHandle,
     object: v8::Local<'_, v8::Object>,
     deep: bool,
@@ -252,13 +255,13 @@ mod tests {
     use moli_webapi_declare::WebApiObject;
 
     #[derive(WebApiObject)]
-    #[webapi(interface = "Object", data_properties)]
+    #[webapi(plain, data_properties)]
     struct TestForeignElementDeclaration {
         local_name: String,
     }
 
     #[derive(WebApiObject)]
-    #[webapi(interface = "Object", data_properties)]
+    #[webapi(plain, data_properties)]
     struct TestForeignDocumentDeclaration<'scope> {
         node_name: &'static str,
         document_element: v8::Local<'scope, v8::Object>,

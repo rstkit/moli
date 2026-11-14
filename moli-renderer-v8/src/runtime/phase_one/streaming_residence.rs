@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use moli_encoding::HtmlDocumentStreamingDecoder;
+use moli_encoding::DocumentStreamingDecoder;
 use std::time::Instant;
 
 use super::streaming::{
@@ -21,7 +21,7 @@ use super::{
 pub(in crate::runtime) struct PendingStreamingPhaseOneContinuation {
     runtime: Box<ConcurrentParseTimeRuntime>,
     input: StreamingDocumentInputSource,
-    decoder: HtmlDocumentStreamingDecoder,
+    decoder: DocumentStreamingDecoder,
     service_worker_preload_context: Option<ServiceWorkerScriptPreloadContext>,
     started: Instant,
     deferred_main_resource_failure: Option<anyhow::Error>,
@@ -35,7 +35,7 @@ impl PendingStreamingPhaseOneContinuation {
     pub(super) fn bridge(
         runtime: ConcurrentParseTimeRuntime,
         raw_body: RawDocumentBodySource,
-        decoder: HtmlDocumentStreamingDecoder,
+        decoder: DocumentStreamingDecoder,
         service_worker_preload_context: Option<ServiceWorkerScriptPreloadContext>,
         started: Instant,
     ) -> Result<Self> {
@@ -70,8 +70,12 @@ impl PendingStreamingPhaseOneContinuation {
         self.runtime.owner_wake_token()
     }
 
-    pub(in crate::runtime) fn has_ready_input(&mut self) -> bool {
-        self.input.has_ready_input()
+    pub(super) fn retire_for_committed_navigation(self) -> PageVm {
+        let Self { runtime, input, .. } = self;
+        // Dropping the input receiver cancels the old body bridge without
+        // waiting for its response to finish.
+        drop(input);
+        (*runtime).into_navigation_triggered_page_vm()
     }
 
     pub(in crate::runtime) async fn resume(self) -> Result<PendingPhaseOneResumeOutcome> {
@@ -87,7 +91,16 @@ impl PendingStreamingPhaseOneContinuation {
         let mut runtime = *runtime;
         let mut input_finished = false;
         let mut observed_input = deferred_main_resource_failure.is_some();
-        if deferred_main_resource_failure.is_none() {
+        if deferred_main_resource_failure.is_none()
+            && runtime.page_vm().document_loading_was_stopped()
+        {
+            // Page.stopLoading stops the parser: input received after the stop
+            // is discarded, and `input` is dropped with this closed
+            // continuation, which cancels the rest of the body.
+            runtime.close_streaming_html_input();
+            observed_input = true;
+            input_finished = true;
+        } else if deferred_main_resource_failure.is_none() {
             while let Some(event) = input.try_next()? {
                 observed_input = true;
                 match event {
@@ -102,8 +115,8 @@ impl PendingStreamingPhaseOneContinuation {
                         }
                     }
                     StreamingDocumentInputEvent::Finished(result) => {
-                        if let Err(message) = result {
-                            deferred_main_resource_failure = Some(anyhow!(message));
+                        if let Err(error) = result {
+                            deferred_main_resource_failure = Some(error);
                             break;
                         }
                         if let Some(tail) = decoder.finish() {

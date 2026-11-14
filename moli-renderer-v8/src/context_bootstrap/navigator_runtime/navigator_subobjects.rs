@@ -22,11 +22,13 @@ pub(super) enum NavigatorSubobject {
     StorageBuckets,
     Geolocation,
     MediaCapabilities,
+    MediaSession,
+    Credentials,
 }
 
 impl NavigatorSubobject {
     #[cfg(test)]
-    pub(super) const ALL: [Self; 16] = [
+    pub(super) const ALL: [Self; 18] = [
         Self::Languages,
         Self::MimeTypes,
         Self::Plugins,
@@ -43,6 +45,8 @@ impl NavigatorSubobject {
         Self::StorageBuckets,
         Self::Geolocation,
         Self::MediaCapabilities,
+        Self::MediaSession,
+        Self::Credentials,
     ];
 
     pub(super) fn from_key(key: &str) -> Option<Self> {
@@ -63,6 +67,8 @@ impl NavigatorSubobject {
             "storageBuckets" => Some(Self::StorageBuckets),
             "geolocation" => Some(Self::Geolocation),
             "mediaCapabilities" => Some(Self::MediaCapabilities),
+            "mediaSession" => Some(Self::MediaSession),
+            "credentials" => Some(Self::Credentials),
             _ => None,
         }
     }
@@ -85,6 +91,8 @@ impl NavigatorSubobject {
             Self::StorageBuckets => "storageBuckets",
             Self::Geolocation => "geolocation",
             Self::MediaCapabilities => "mediaCapabilities",
+            Self::MediaSession => "mediaSession",
+            Self::Credentials => "credentials",
         }
     }
 }

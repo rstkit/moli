@@ -1,5 +1,6 @@
 use super::*;
-use crate::util::{get_private_value, v8str};
+use crate::util::v8str;
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_streams::readable::{
     AcquireReaderPlan, ReadableKind, ReaderKind, ReaderReleaseSnapshot, ReleaseReaderPlan,
@@ -8,22 +9,17 @@ use moli_streams::readable::{
 use moli_webapi_declare::WebApiObject;
 
 const READER_LOCK_RELEASED_MESSAGE: &str = "ReadableStreamDefaultReader lock released";
-const READABLE_STREAM_READER_BRAND_SLOT: &str = "__moliReadableStreamReaderBrand";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ReadableStreamDefaultReader")]
+#[webapi(interface = web_api_interfaces::ReadableStreamDefaultReader)]
 struct ReadableStreamReaderObjectDeclaration<'scope> {
-    #[webapi(slot = READABLE_STREAM_READER_BRAND_SLOT, init = true)]
-    brand: (),
     #[webapi(slot = READABLE_STREAM_READER_STREAM_SLOT)]
     stream: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "ReadableStreamBYOBReader")]
+#[webapi(interface = web_api_interfaces::ReadableStreamBYOBReader)]
 struct ReadableStreamByobReaderObjectDeclaration<'scope> {
-    #[webapi(slot = READABLE_STREAM_READER_BRAND_SLOT, init = true)]
-    brand: (),
     #[webapi(slot = READABLE_STREAM_READER_STREAM_SLOT)]
     stream: v8::Local<'scope, v8::Object>,
 }
@@ -520,6 +516,6 @@ fn readable_stream_reader_is_branded<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     reader: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, reader, READABLE_STREAM_READER_BRAND_SLOT)
-        .is_some_and(|value| value.is_true())
+    web_api_interfaces::ReadableStreamDefaultReader::is_instance(scope, reader)
+        || web_api_interfaces::ReadableStreamBYOBReader::is_instance(scope, reader)
 }

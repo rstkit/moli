@@ -1,3 +1,5 @@
+use crate::css_style::compress_box_components;
+use crate::web_api_interfaces;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -13,7 +15,7 @@ use super::{
         CssStyleDeclarationSetPropertyArgs, CssStyleEntry as StyleEntry,
         camel_case_style_property_name, canonical_style_property_identifier,
         canonical_style_property_name, mask_compat_property_name, mask_compat_value_is_supported,
-        parse_css_declaration_list, serialize_css_style_entries,
+        parse_css_declaration_list, parse_css_style_shell_keyword, serialize_css_style_entries,
         serialize_css_style_entries_with_pdb_block, stylo_declaration_block_property_names,
         stylo_mask_property_name, top_level_comma_separated_component_values,
         webkit_transform_origin_compat_property_name,
@@ -145,7 +147,7 @@ pub(crate) fn set_lightweight_css_style_stylo_declaration_block_id<'s>(
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "CSSStyleProperties",
+    interface = web_api_interfaces::CSSStyleProperties,
     own_to_string_tag = "CSSStyleProperties"
 )]
 struct LightweightCssStylePropertiesDeclaration<'scope> {
@@ -157,7 +159,7 @@ struct LightweightCssStylePropertiesDeclaration<'scope> {
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "CSSFontFaceDescriptors",
+    interface = web_api_interfaces::CSSFontFaceDescriptors,
     own_to_string_tag = "CSSFontFaceDescriptors"
 )]
 struct LightweightCssFontFaceDescriptorsDeclaration<'scope> {
@@ -169,7 +171,7 @@ struct LightweightCssFontFaceDescriptorsDeclaration<'scope> {
 
 #[derive(WebApiObject)]
 #[webapi(
-    interface = "CSSPageDescriptors",
+    interface = web_api_interfaces::CSSPageDescriptors,
     own_to_string_tag = "CSSPageDescriptors"
 )]
 struct LightweightCssPageDescriptorsDeclaration<'scope> {
@@ -180,7 +182,7 @@ struct LightweightCssPageDescriptorsDeclaration<'scope> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CSSStyleProperties")]
+#[webapi(interface = web_api_interfaces::CSSStyleProperties)]
 struct LightweightCssStylePrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -312,6 +314,7 @@ const LIGHTWEIGHT_STYLE_PROPERTIES: &[&str] = &[
     "container-name",
     "container-type",
     "content",
+    "content-visibility",
     "cursor",
     "direction",
     "display",
@@ -542,6 +545,79 @@ const CSS_STYLE_DECLARATION_WEBKIT_ALIASES: &[&str] = &[
     "webkitUserSelect",
 ];
 
+// CSSOM shells accept CSS-wide keywords through the shared token parser.
+// Property-specific value grammars and layout behavior remain pending.
+const CSS_STYLE_DECLARATION_SHELL_PROPERTIES: &[&str] = &[
+    "-webkit-app-region",
+    "-webkit-border-before",
+    "-webkit-border-horizontal-spacing",
+    "-webkit-border-vertical-spacing",
+    "-webkit-box-reflect",
+    "-webkit-column-break-after",
+    "-webkit-column-break-before",
+    "-webkit-column-break-inside",
+    "-webkit-locale",
+    "-webkit-logical-height",
+    "-webkit-logical-width",
+    "-webkit-max-logical-height",
+    "-webkit-max-logical-width",
+    "-webkit-min-logical-height",
+    "-webkit-min-logical-width",
+    "-webkit-perspective-origin-x",
+    "-webkit-perspective-origin-y",
+    "-webkit-rtl-ordering",
+    "-webkit-tap-highlight-color",
+    "-webkit-text-combine",
+    "-webkit-text-decorations-in-effect",
+    "-webkit-transform-origin-x",
+    "-webkit-transform-origin-y",
+    "-webkit-transform-origin-z",
+    "-webkit-user-drag",
+    "animation-trigger",
+    "buffered-rendering",
+    "caret-shape",
+    "column-rule-break",
+    "column-rule-inset",
+    "column-rule-inset-cap-end",
+    "column-rule-inset-cap-start",
+    "column-rule-inset-junction",
+    "column-rule-inset-junction-end",
+    "column-rule-inset-start",
+    "column-wrap",
+    "dynamic-range-limit",
+    "interactivity",
+    "interest-delay-end",
+    "interest-delay-start",
+    "object-view-box",
+    "row-rule-break",
+    "row-rule-color",
+    "row-rule-inset-cap",
+    "row-rule-inset-cap-start",
+    "row-rule-inset-end",
+    "row-rule-inset-junction-end",
+    "row-rule-inset-junction-start",
+    "row-rule-style",
+    "row-rule-width",
+    "rule",
+    "rule-color",
+    "rule-inset-cap",
+    "rule-inset-end",
+    "rule-inset-start",
+    "rule-overlap",
+    "rule-visibility-items",
+    "rule-width",
+    "scroll-marker-group",
+    "speak",
+    "text-fit",
+    "text-spacing-trim",
+    "timeline-trigger",
+    "timeline-trigger-activation-range-end",
+    "timeline-trigger-active-range",
+    "timeline-trigger-active-range-end",
+    "timeline-trigger-name",
+    "timeline-trigger-source",
+];
+
 static CSS_STYLE_DECLARATION_EXPOSED_PROPERTY_NAMES: LazyLock<HashSet<String>> =
     LazyLock::new(|| {
         let mut names = HashSet::new();
@@ -557,18 +633,12 @@ static CSS_STYLE_DECLARATION_STANDARD_PROPERTY_NAMES: LazyLock<Vec<&'static str>
         let mut names = Vec::from(LIGHTWEIGHT_STYLE_PROPERTIES);
         let mut seen = names.iter().copied().collect::<HashSet<_>>();
         for name in moli_css_parse::stylo_enabled_style_rule_property_names() {
-            if stylo_property_is_chromium_exposed(name) && seen.insert(name) {
+            if crate::css_style::stylo_property_is_chromium_exposed(name) && seen.insert(name) {
                 names.push(name);
             }
         }
         names
     });
-
-fn stylo_property_is_chromium_exposed(name: &str) -> bool {
-    !name.starts_with("-moz-")
-        && !name.starts_with("-x-")
-        && !matches!(name, "mask-position-x" | "mask-position-y")
-}
 
 pub(crate) fn css_style_declaration_exposes_property_name(property: &str) -> bool {
     CSS_STYLE_DECLARATION_EXPOSED_PROPERTY_NAMES.contains(property)
@@ -579,6 +649,18 @@ pub(crate) fn css_style_declaration_standard_property_names() -> &'static [&'sta
 }
 
 fn for_each_css_style_declaration_exposed_property_name(visit: &mut impl FnMut(&str)) {
+    for_each_css_style_declaration_implemented_property_name(visit);
+    for property in CSS_STYLE_DECLARATION_SHELL_PROPERTIES {
+        for_each_css_property_accessor_name(property, visit);
+    }
+}
+
+pub(crate) fn css_style_declaration_is_shell_property(property: &str) -> bool {
+    CSS_STYLE_DECLARATION_SHELL_PROPERTIES.contains(&property)
+        && !css_style_declaration_standard_property_names().contains(&property)
+}
+
+fn for_each_css_style_declaration_implemented_property_name(visit: &mut impl FnMut(&str)) {
     let mut seen = HashSet::new();
     for name in css_style_declaration_standard_property_names() {
         for_each_css_property_accessor_name(name, &mut |name| {
@@ -668,44 +750,21 @@ fn uppercase_ascii_head(input: &str) -> String {
     out
 }
 
-fn lowercase_ascii_head(input: &str) -> String {
-    let mut chars = input.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    let mut out = String::new();
-    out.push(first.to_ascii_lowercase());
-    out.extend(chars);
-    out
-}
+use moli_css_parse::decapitalize_ascii_head as lowercase_ascii_head;
 
 fn all_shorthand_applies_to(property: &str) -> bool {
     !property.starts_with("--")
         && !matches!(property, "all" | "direction" | "unicode-bidi")
-        && css_style_declaration_standard_property_names().contains(&property)
+        && (css_style_declaration_standard_property_names().contains(&property)
+            || css_style_declaration_is_shell_property(property))
 }
 
-fn css_wide_keyword(value: &str) -> Option<String> {
-    let lowered = value.trim().to_ascii_lowercase();
-    matches!(
-        lowered.as_str(),
-        "initial" | "inherit" | "unset" | "revert" | "revert-layer" | "revert-rule"
-    )
-    .then_some(lowered)
-}
+use crate::css_style::css_wide_keyword;
 
 pub(crate) fn build_lightweight_css_style_declaration<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> v8::Local<'s, v8::Object> {
     build_lightweight_css_style_declaration_with_interface(scope, "CSSStyleProperties", true)
-}
-
-pub(crate) fn build_lightweight_detached_css_style_declaration<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> v8::Local<'s, v8::Object> {
-    let style = build_lightweight_css_style_declaration(scope);
-    set_style_uses_stylo_declaration_block(scope, style);
-    style
 }
 
 pub(crate) fn build_lightweight_css_rule_style_declaration<'s>(
@@ -786,6 +845,13 @@ pub(crate) fn install_css_style_declaration_template_bindings<'s>(
         }
         "CSSStyleProperties" => {
             install_lightweight_css_style_prototype_template(scope, prototype, true);
+            for property in CSS_STYLE_DECLARATION_SHELL_PROPERTIES {
+                for_each_css_property_accessor_name(property, &mut |name| {
+                    install_lightweight_style_named_property_template_accessor(
+                        scope, prototype, name,
+                    );
+                });
+            }
         }
         "CSSFontFaceDescriptors" => {
             install_lightweight_css_style_prototype_template(scope, prototype, true);
@@ -1015,7 +1081,7 @@ fn install_lightweight_style_property_template_accessors<'s>(
     scope: &mut v8::PinScope<'s, '_, ()>,
     target: v8::Local<'s, v8::ObjectTemplate>,
 ) {
-    for_each_css_style_declaration_exposed_property_name(&mut |name| {
+    for_each_css_style_declaration_implemented_property_name(&mut |name| {
         install_lightweight_style_named_property_template_accessor(scope, target, name);
     });
 }
@@ -1852,22 +1918,6 @@ fn box_shorthand_property_value<'s>(
     compress_box_components(&values).unwrap_or_default()
 }
 
-fn compress_box_components(values: &[String]) -> Option<String> {
-    match values {
-        [start, end] if start == end => Some(start.clone()),
-        [start, end] => Some(format!("{start} {end}")),
-        [top, right, bottom, left] if top == right && top == bottom && top == left => {
-            Some(top.clone())
-        }
-        [top, right, bottom, left] if top == bottom && right == left => {
-            Some(format!("{top} {right}"))
-        }
-        [top, right, bottom, left] if right == left => Some(format!("{top} {right} {bottom}")),
-        [top, right, bottom, left] => Some(format!("{top} {right} {bottom} {left}")),
-        _ => None,
-    }
-}
-
 fn raw_style_property_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     style: v8::Local<'s, v8::Object>,
@@ -2421,7 +2471,11 @@ fn normalize_style_entry_value<'s>(
         if keyframe_style_property_write_is_ignored(scope, style, name) {
             return None;
         }
-        if name == "all" {
+        if css_style_declaration_is_shell_property(name) && !value.is_empty() {
+            return parse_css_style_shell_keyword(value).map(str::to_owned);
+        }
+        // Empty text removes the declaration; it is not a keyword to parse.
+        if name == "all" && !value.is_empty() {
             return css_wide_keyword(value);
         }
         if !name.starts_with("--") && moli_css_parse::css_value_may_contain_env_function(value) {
@@ -2694,19 +2748,15 @@ fn style_css_text_setter_callback<'s>(
         crate::native_bridge::element::style_css_text_setter_callback(scope, args, _rv);
         return;
     }
-    let value = args.get(0);
     let Some(style) = lightweight_style_receiver(scope, args.this()) else {
         return;
     };
-    let css_text = if value.is_null_or_undefined() {
-        String::new()
-    } else {
-        value
-            .to_string(scope)
-            .map(|value| value.to_rust_string_lossy(scope))
-            .unwrap_or_default()
+    let Some(parsed) =
+        webidl::parse_args::<crate::css_style::CssStyleDeclarationCssTextArgs>(scope, &args)
+    else {
+        return;
     };
-    let _ = set_lightweight_css_style_css_text(scope, style, &css_text);
+    let _ = set_lightweight_css_style_css_text(scope, style, &parsed.value);
 }
 
 fn style_named_property_getter_callback<'s>(
@@ -2772,15 +2822,10 @@ fn style_named_property_setter_callback<'s>(
         );
         return;
     }
-    let value = if value.is_null_or_undefined() {
-        String::new()
-    } else {
-        value
-            .to_string(scope)
-            .map(|value| value.to_rust_string_lossy(scope))
-            .unwrap_or_default()
-    };
     let Some(style) = lightweight_style_receiver(scope, args.this()) else {
+        return;
+    };
+    let Some(value) = crate::css_style::css_style_declaration_property_value(scope, value) else {
         return;
     };
     set_style_entry(scope, style, &name, &value, false);
@@ -2798,9 +2843,6 @@ fn style_set_property_callback<'s>(
     }
     if crate::native_bridge::element::is_live_style_declaration_object(scope, args.this()) {
         crate::native_bridge::element::style_set_property_callback(scope, args, _rv);
-        return;
-    }
-    if args.length() > 1 && args.get(1).is_undefined() {
         return;
     }
     let Some(parsed) = webidl::parse_args::<CssStyleDeclarationSetPropertyArgs>(scope, &args)
@@ -3080,6 +3122,7 @@ mod tests {
     fn scanned_css_style_declaration_exposes_property_name(property: &str) -> bool {
         css_style_declaration_standard_property_names()
             .iter()
+            .chain(CSS_STYLE_DECLARATION_SHELL_PROPERTIES)
             .any(|name| scanned_css_property_accessor_exposes_name(name, property))
             || CSS_STYLE_DECLARATION_PROPERTY_ALIASES
                 .iter()
@@ -3113,6 +3156,7 @@ mod tests {
         let mut probes = HashSet::new();
         for property in css_style_declaration_standard_property_names()
             .iter()
+            .chain(CSS_STYLE_DECLARATION_SHELL_PROPERTIES)
             .chain(CSS_STYLE_DECLARATION_PROPERTY_ALIASES)
         {
             add_accessor_name_probes(&mut probes, property);

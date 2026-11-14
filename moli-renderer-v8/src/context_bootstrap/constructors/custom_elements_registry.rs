@@ -1,10 +1,10 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::webidl;
-use anyhow::Result;
 use moli_webapi_declare::WebApiFunctionTemplate;
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CustomElementRegistry", enumerable)]
+#[webapi(interface = web_api_interfaces::CustomElementRegistry, enumerable, receiver)]
 struct CustomElementRegistryPrototypeMethodsDeclaration {
     #[webapi(method, enumerable, length = 2, callback = custom_elements_define_callback)]
     define: (),
@@ -19,6 +19,7 @@ struct CustomElementRegistryPrototypeMethodsDeclaration {
         method,
         enumerable,
         length = 1,
+        returns_promise,
         callback = custom_elements_when_defined_callback
     )]
     when_defined: (),
@@ -48,7 +49,7 @@ struct CustomElementsDefineArgs<'s> {
         missing_message = "customElements.define(name, constructor) requires a constructor function"
     )]
     constructor: v8::Local<'s, v8::Function>,
-    #[webidl(with = parse_element_definition_options_arg)]
+    #[webidl(dictionary)]
     options: ElementDefinitionOptions,
 }
 
@@ -132,6 +133,7 @@ pub(in crate::context_bootstrap) fn custom_elements_registry_constructor_callbac
         return;
     };
     let registry = args.this();
+    custom_elements::mark_custom_elements_registry_owner(scope, registry);
     let scoped_id =
         unsafe { &mut *host_ptr }.create_scoped_custom_elements_registry(scope, registry);
     custom_elements::mark_scoped_custom_elements_registry(scope, registry, scoped_id);
@@ -146,7 +148,7 @@ pub(in crate::context_bootstrap) fn custom_elements_define_callback<'s>(
     let Some(parsed) = webidl::parse_args::<CustomElementsDefineArgs>(scope, &args) else {
         return;
     };
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+    let Some(host_ptr) = custom_elements::registry_owner_host(scope, args.this()) else {
         throw_type_error(
             scope,
             "Missing native bridge host for customElements.define",
@@ -224,18 +226,6 @@ pub(in crate::context_bootstrap) fn custom_elements_define_callback<'s>(
     }
 }
 
-fn parse_element_definition_options_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<ElementDefinitionOptions, webidl::WebIdlError> {
-    let context = webidl::Context::argument("CustomElementRegistry.define", (index + 1) as usize);
-    webidl::dictionary_arg(args, index, context)?
-        .map(|object| webidl::parse_dictionary_object::<ElementDefinitionOptions>(scope, object))
-        .transpose()
-        .map(|options| options.unwrap_or_default())
-}
-
 pub(in crate::context_bootstrap) fn custom_elements_get_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -245,7 +235,7 @@ pub(in crate::context_bootstrap) fn custom_elements_get_callback<'s>(
         rv.set_undefined();
         return;
     };
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+    let Some(host_ptr) = custom_elements::registry_owner_host(scope, args.this()) else {
         rv.set_undefined();
         return;
     };
@@ -267,7 +257,7 @@ pub(in crate::context_bootstrap) fn custom_elements_get_name_callback<'s>(
     let Some(parsed) = webidl::parse_args::<CustomElementsGetNameArgs>(scope, &args) else {
         return;
     };
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+    let Some(host_ptr) = custom_elements::registry_owner_host(scope, args.this()) else {
         rv.set(v8::null(scope).into());
         return;
     };
@@ -299,22 +289,26 @@ pub(in crate::context_bootstrap) fn custom_elements_upgrade_callback<'s>(
         parsed.root,
     ) {
         let registry_key = custom_elements::registry_store_key(scope, args.this());
-        let _ = custom_elements::upgrade_subtree_if_defined_for_registry(
-            scope,
-            host_ptr,
-            root_handle,
-            registry_key,
-        );
+        custom_elements::with_custom_element_reaction_scope(scope, host_ptr, |scope| {
+            let _ = custom_elements::upgrade_subtree_if_defined_for_registry(
+                scope,
+                host_ptr,
+                root_handle,
+                registry_key,
+            );
+        });
         return;
     }
     if let Ok((host_ptr, root_handle)) = node_runtime_and_handle_from_object(scope, parsed.root) {
         let registry_key = custom_elements::registry_store_key(scope, args.this());
-        let _ = custom_elements::upgrade_subtree_if_defined_for_registry(
-            scope,
-            host_ptr,
-            root_handle,
-            registry_key,
-        );
+        custom_elements::with_custom_element_reaction_scope(scope, host_ptr, |scope| {
+            let _ = custom_elements::upgrade_subtree_if_defined_for_registry(
+                scope,
+                host_ptr,
+                root_handle,
+                registry_key,
+            );
+        });
         return;
     }
     throw_type_error(scope, "customElements.upgrade(root) requires a Node root");
@@ -368,7 +362,7 @@ pub(in crate::context_bootstrap) fn custom_elements_initialize_callback<'s>(
         scope.throw_exception(exception);
         return;
     };
-    if !custom_elements::registry_association_matches_document_default(
+    if !custom_elements::registry_association_matches_document(
         unsafe { &*host_ptr },
         root_document,
         registry_association,
@@ -381,12 +375,14 @@ pub(in crate::context_bootstrap) fn custom_elements_initialize_callback<'s>(
         scope.throw_exception(exception);
         return;
     }
-    let _ = custom_elements::initialize_registry_for_subtree(
-        scope,
-        host_ptr,
-        root_handle,
-        registry_key,
-    );
+    custom_elements::with_custom_element_reaction_scope(scope, host_ptr, |scope| {
+        let _ = custom_elements::initialize_registry_for_subtree(
+            scope,
+            host_ptr,
+            root_handle,
+            registry_key,
+        );
+    });
 }
 
 fn invalid_custom_element_name_promise<'s>(
@@ -418,7 +414,7 @@ pub(in crate::context_bootstrap) fn custom_elements_when_defined_callback<'s>(
         }
         return;
     }
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+    let Some(host_ptr) = custom_elements::registry_owner_host(scope, args.this()) else {
         rv.set_undefined();
         return;
     };

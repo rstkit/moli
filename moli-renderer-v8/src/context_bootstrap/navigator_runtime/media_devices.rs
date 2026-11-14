@@ -1,36 +1,30 @@
-use super::super::window_runtime::{
-    MEDIA_DEVICES_BRAND_SLOT, navigator_media_devices_get_user_media_callback,
-};
+use super::super::window_runtime::navigator_media_devices_get_user_media_callback;
 use super::super::*;
-use crate::util::{get_private_value, set_private_value, throw_type_error};
+use crate::util::{get_private_value, throw_type_error};
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
-const MEDIA_DEVICES_LISTENERS_SLOT: &str = "__moliMediaDevicesListeners";
+mod info;
+
 const MEDIA_DEVICES_ONDEVICECHANGE_SLOT: &str = "__moliMediaDevicesOndevicechange";
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "MediaDevices")]
+#[webapi(interface = web_api_interfaces::MediaDevices)]
 struct MediaDevicesObjectDeclaration {
-    #[webapi(slot = MEDIA_DEVICES_BRAND_SLOT, init = true)]
-    brand: (),
-
-    #[webapi(slot = SIMPLE_EVENT_TARGET_SLOT, value = MEDIA_DEVICES_LISTENERS_SLOT)]
-    event_target_slot: (),
-
-    #[webapi(slot = SIMPLE_EVENT_TARGET_ORDERED_HANDLERS_SLOT, init = true)]
-    ordered_handlers: (),
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
 
     #[webapi(slot = MEDIA_DEVICES_ONDEVICECHANGE_SLOT, init = "null")]
     ondevicechange: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MediaDevices", enumerable)]
+#[webapi(interface = web_api_interfaces::MediaDevices, enumerable)]
 struct MediaDevicesPrototypeDeclaration {
     #[webapi(method, length = 0, callback = enumerate_devices_callback)]
     enumerate_devices: (),
 
-    #[webapi(method, length = 1, callback = navigator_media_devices_get_user_media_callback)]
+    #[webapi(method, length = 1, callback = navigator_media_devices_get_user_media_callback, receiver = web_api_interfaces::MediaDevices::is_instance, returns_promise)]
     get_user_media: (),
 
     #[webapi(accessor_property, getter = ondevicechange_getter, setter = ondevicechange_setter)]
@@ -46,17 +40,23 @@ pub(super) fn build_media_devices_object<'s>(
 pub(super) fn install_media_devices_template_bindings<'s>(
     scope: &mut v8::PinScope<'s, '_, ()>,
     template: v8::Local<'s, v8::FunctionTemplate>,
+    name: &str,
 ) {
-    let prototype = template.prototype_template(scope);
-    MediaDevicesPrototypeDeclaration::initialize_prototype_template(scope, prototype);
+    if name == "MediaDevices" {
+        MediaDevicesPrototypeDeclaration::initialize_prototype_template(
+            scope,
+            template.prototype_template(scope),
+        );
+    } else {
+        info::install(scope, template, name);
+    }
 }
 
 fn receiver_is_media_devices<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, receiver, MEDIA_DEVICES_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
+    web_api_interfaces::MediaDevices::is_instance(scope, receiver)
 }
 
 fn enumerate_devices_callback<'s>(
@@ -122,24 +122,11 @@ fn ondevicechange_setter<'s>(
         throw_type_error(scope, "Illegal invocation");
         return;
     }
-    let value = args.get(0);
-    let stored = if value.is_function() {
-        value
-    } else {
-        v8::null(scope).into()
-    };
-    set_private_value(
+    simple_object_event_set_handler(
         scope,
         args.this(),
-        MEDIA_DEVICES_ONDEVICECHANGE_SLOT,
-        stored,
-    );
-    simple_object_event_set_ordered_handler(
-        scope,
-        args.this(),
-        MEDIA_DEVICES_LISTENERS_SLOT,
         "devicechange",
         MEDIA_DEVICES_ONDEVICECHANGE_SLOT,
-        stored.is_function(),
+        args.get(0),
     );
 }

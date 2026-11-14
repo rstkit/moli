@@ -30,6 +30,7 @@ impl WorkerIsolateState {
         inspector_task_runner: WorkerInspectorTaskRunner,
         parent_tx: mpsc::UnboundedSender<WorkerToParentMessage>,
         shared_worker: bool,
+        debugger_enabled: bool,
     ) -> Self {
         let mut isolate = v8::Isolate::new(Default::default());
         crate::context_bootstrap::install_agent_microtask_checkpoint_tasks(&mut isolate);
@@ -43,17 +44,19 @@ impl WorkerIsolateState {
             worker_dynamic_import_with_phase_callback,
         );
         isolate.set_modify_code_generation_from_strings_callback(
-            crate::context_bootstrap::trusted_types_code_generation_check_callback,
+            crate::script_vm::string_code_generation_check_callback,
         );
         let runtime_inspector = WorkerRuntimeInspector::new(
             &mut isolate,
-            inspector_task_runner,
+            inspector_task_runner.clone(),
             parent_tx,
             shared_worker,
+            debugger_enabled,
         );
         let platform_registration = V8PlatformIsolateRegistration::register(
             &mut isolate,
             platform_wake.into_platform_wake(),
+            inspector_task_runner.environment_notifier(),
         );
 
         Self {

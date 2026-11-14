@@ -1,6 +1,4 @@
-use moli_core::page::{
-    RendererDevToolsAgentToken, RendererDomMutationEvent, RendererDomMutationEventBatch,
-};
+use moli_core::page::{RendererDomMutationEvent, RendererDomMutationEventBatch};
 
 use crate::conn::{BackgroundProtocolEvent, CdpConnection, CommandOwnerScope};
 use crate::domains::activity::{
@@ -26,13 +24,13 @@ pub(crate) struct DomPreparedOutputSlot {
 pub(in crate::domains) const SLOT_DOM_MUTATIONS: ProtocolOutputSlot =
     ProtocolOutputSlot::DomMutations;
 
-pub(in crate::domains) async fn project_dom_mutations_async(
+pub(in crate::domains) fn project_dom_mutations(
     conn: &mut CdpConnection,
     context: &mut ProtocolOutputProjectionContext<'_>,
-    prepared_outputs: Option<&mut ProtocolOutputPayloads>,
+    prepared_outputs: &mut ProtocolOutputPayloads,
 ) {
     let Some(batches) = prepared_outputs
-        .and_then(ProtocolOutputPayloads::dom_mut)
+        .dom_mut()
         .and_then(DomPreparedOutputSlot::take_batches)
     else {
         return;
@@ -66,29 +64,13 @@ fn append_dom_mutation_batches_to_background_events(
 }
 
 impl DomPreparedOutputs {
-    pub(in crate::domains) fn from_renderer_dom_mutation_event_batches_for_stream(
+    pub(in crate::domains) fn from_renderer_dom_mutation_event_batches(
         conn: &CdpConnection,
         source_owner: &CommandOwnerScope,
-        source_renderer_agent: RendererDevToolsAgentToken,
-        batches: &[RendererDomMutationEventBatch],
-    ) -> Self {
-        Self::from_renderer_dom_mutation_event_batches_with_source_agent(
-            conn,
-            source_owner,
-            source_renderer_agent,
-            batches,
-        )
-    }
-
-    fn from_renderer_dom_mutation_event_batches_with_source_agent(
-        conn: &CdpConnection,
-        source_owner: &CommandOwnerScope,
-        source_renderer_agent: RendererDevToolsAgentToken,
         batches: &[RendererDomMutationEventBatch],
     ) -> Self {
         let current_attachment = conn
             .runtime_session_owner_slot_for_owner(source_owner)
-            .ok()
             .and_then(|slot| slot.current_renderer_attachment());
         Self {
             batches: batches
@@ -96,9 +78,8 @@ impl DomPreparedOutputs {
                 .cloned()
                 .filter_map(|mut batch| {
                     if batch.renderer_agent_attachment_id().is_none()
-                        && current_attachment.is_some_and(|attachment| {
-                            attachment.agent_token() == source_renderer_agent
-                        })
+                        && current_attachment
+                            .is_some_and(|attachment| attachment.agent_token() == batch.agent_token)
                     {
                         batch.bind_renderer_agent_attachment(
                             current_attachment

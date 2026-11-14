@@ -1,11 +1,12 @@
 use super::*;
+use crate::web_api_interfaces;
 
 pub(crate) fn subtle_crypto_receiver_is_valid<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
 ) -> bool {
-    if get_private_value(scope, args.this(), CRYPTO_SUBTLE_BRAND_SLOT).is_some() {
+    if web_api_interfaces::SubtleCrypto::is_instance(scope, args.this()) {
         true
     } else {
         set_rejected_webcrypto_promise(scope, rv, WebCryptoRejection::Type);
@@ -412,7 +413,7 @@ pub(crate) fn run_symmetric_cipher_operation(
     }
 }
 
-pub(crate) fn crypto_key_hmac_hash_algorithm<'s>(
+pub(crate) fn crypto_key_hash_algorithm<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'s, v8::Object>,
 ) -> Option<WebCryptoHashAlgorithm> {
@@ -423,16 +424,9 @@ pub(crate) fn crypto_key_hmac_hash_algorithm<'s>(
     hash.parse::<WebCryptoHashAlgorithm>().ok()
 }
 
-pub(crate) fn crypto_key_rsa_hash_algorithm<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    key: v8::Local<'s, v8::Object>,
-) -> Option<WebCryptoHashAlgorithm> {
-    let algorithm = crypto_key_algorithm_object(scope, key)?;
-    let hash = algorithm
-        .get(scope, v8str(scope, "hash").into())
-        .and_then(|value| crypto_algorithm_name(scope, value))?;
-    hash.parse::<WebCryptoHashAlgorithm>().ok()
-}
+pub(crate) use self::crypto_key_hash_algorithm as crypto_key_hmac_hash_algorithm;
+
+pub(crate) use self::crypto_key_hash_algorithm as crypto_key_rsa_hash_algorithm;
 
 pub(crate) fn crypto_key_ec_named_curve<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1025,7 +1019,7 @@ pub(crate) fn subtle_key_usages_arg<'s>(
     Ok(usages)
 }
 
-pub(crate) fn required_hmac_hash_algorithm(
+pub(crate) fn required_webcrypto_hash_parameter(
     scope: &mut v8::PinScope<'_, '_>,
     algorithm_object: v8::Local<'_, v8::Object>,
 ) -> Result<WebCryptoHashAlgorithm, WebCryptoRejection> {
@@ -1042,6 +1036,8 @@ pub(crate) fn required_hmac_hash_algorithm(
         .parse::<WebCryptoHashAlgorithm>()
         .map_err(|_| WebCryptoRejection::NotSupported)
 }
+
+pub(crate) use self::required_webcrypto_hash_parameter as required_hmac_hash_algorithm;
 
 pub(crate) fn optional_hmac_length_bits(
     scope: &mut v8::PinScope<'_, '_>,

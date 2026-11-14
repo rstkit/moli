@@ -1,7 +1,9 @@
-use super::helpers::{window_child_context_handle, window_host_ptr};
+use super::helpers::{window_current_dispatch_scope, window_host_ptr};
+use crate::document_runtime::DomHandle;
 use crate::native_bridge::named_access::{
     build_window_named_items_collection, window_named_item_handles,
 };
+use crate::native_bridge::{OwnerDispatchScope, PageScriptHost};
 use crate::util::serialize_v8_iter_array;
 use moli_webapi_declare::DataPropertyDescriptorDeclaration;
 
@@ -13,22 +15,19 @@ fn window_indexed_child_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     holder: v8::Local<'s, v8::Object>,
     index: u32,
-) -> Option<(
-    *mut crate::native_bridge::JsContextHost,
-    crate::document_runtime::DomHandle,
-)> {
+) -> Option<(*mut PageScriptHost, DomHandle, OwnerDispatchScope)> {
     let host_ptr = window_host_ptr(scope, holder)?;
     let host = unsafe { &mut *host_ptr };
-    let handle = if let Some(parent) = window_child_context_handle(scope, holder) {
-        if let Some(document) = host.child_browsing_context_document_handle(parent) {
-            host.sync_child_browsing_context_subtree(scope, document);
-        }
+    let owner = window_current_dispatch_scope(scope, holder, host)?;
+    let handle = if let Some(parent) = owner.child_window() {
+        let document = host.child_browsing_context_document_handle(parent)?;
+        host.sync_child_browsing_context_subtree(scope, document);
         host.child_browsing_context_child_frame_handle_by_index(parent, index as usize)
     } else {
         host.sync_child_browsing_context_subtree(scope, host.document_handle());
         host.child_browsing_context_handle_by_index(index as usize)
     }?;
-    Some((host_ptr, handle))
+    Some((host_ptr, handle, owner))
 }
 
 pub(in crate::context_bootstrap) fn window_indexed_property_getter<'s>(
@@ -38,18 +37,21 @@ pub(in crate::context_bootstrap) fn window_indexed_property_getter<'s>(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) -> v8::Intercepted {
     let holder = args.holder();
-    let Some((host_ptr, handle)) = window_indexed_child_handle(scope, holder, index) else {
+    let Some((host_ptr, handle, owner)) = window_indexed_child_handle(scope, holder, index) else {
         return v8::Intercepted::kNo;
     };
     let host = unsafe { &mut *host_ptr };
-    let window = if window_child_context_handle(scope, holder).is_none() {
-        host.child_browsing_context_window_proxy_for_top(scope, handle)
+    let window = if owner.child_window().is_none() {
+        host.child_browsing_context_window_proxy_for_accessing_context(scope, handle)
     } else {
         host.child_browsing_context_window_wrapper(scope, handle)
     };
     let Some(window) = window else {
         return v8::Intercepted::kNo;
     };
+    let context = scope.get_current_context();
+    let window = super::super::shared_event_targets::window_target_in_realm(scope, window, context)
+        .unwrap_or(window);
     rv.set(window.into());
     v8::Intercepted::kYes
 }
@@ -67,6 +69,19 @@ pub(in crate::context_bootstrap) fn window_indexed_property_query<'s>(
     v8::Intercepted::kYes
 }
 
+pub(in crate::context_bootstrap) fn window_indexed_property_deleter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    index: u32,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Boolean>,
+) -> v8::Intercepted {
+    if window_indexed_child_handle(scope, args.holder(), index).is_none() {
+        return v8::Intercepted::kNo;
+    }
+    rv.set_bool(false);
+    v8::Intercepted::kYes
+}
+
 pub(in crate::context_bootstrap) fn window_indexed_property_enumerator<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::PropertyCallbackArguments<'s>,
@@ -78,7 +93,11 @@ pub(in crate::context_bootstrap) fn window_indexed_property_enumerator<'s>(
         return;
     };
     let host = unsafe { &mut *host_ptr };
-    let count = if let Some(parent) = window_child_context_handle(scope, holder) {
+    let Some(owner) = window_current_dispatch_scope(scope, holder, host) else {
+        rv.set(v8::Array::new(scope, 0));
+        return;
+    };
+    let count = if let Some(parent) = owner.child_window() {
         if let Some(document) = host.child_browsing_context_document_handle(parent) {
             host.sync_child_browsing_context_subtree(scope, document);
         }
@@ -99,19 +118,22 @@ pub(in crate::context_bootstrap) fn window_indexed_property_descriptor<'s>(
     args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) -> v8::Intercepted {
-    let Some((host_ptr, handle)) = window_indexed_child_handle(scope, args.holder(), index) else {
+    let Some((host_ptr, handle, owner)) = window_indexed_child_handle(scope, args.holder(), index)
+    else {
         return v8::Intercepted::kNo;
     };
-    let holder = args.holder();
     let host = unsafe { &mut *host_ptr };
-    let window = if window_child_context_handle(scope, holder).is_none() {
-        host.child_browsing_context_window_proxy_for_top(scope, handle)
+    let window = if owner.child_window().is_none() {
+        host.child_browsing_context_window_proxy_for_accessing_context(scope, handle)
     } else {
         host.child_browsing_context_window_wrapper(scope, handle)
     };
     let Some(window) = window else {
         return v8::Intercepted::kNo;
     };
+    let context = scope.get_current_context();
+    let window = super::super::shared_event_targets::window_target_in_realm(scope, window, context)
+        .unwrap_or(window);
     let Ok(descriptor) =
         DataPropertyDescriptorDeclaration::new(window.into(), false, true).bind(scope)
     else {
@@ -187,22 +209,36 @@ fn window_named_access_value<'s>(
         return None;
     }
     let host_ptr = window_host_ptr(scope, holder)?;
-    let child_handle = window_child_context_handle(scope, holder);
+    let host = unsafe { &*host_ptr };
+    let child_handle = window_current_dispatch_scope(scope, holder, host)?.child_window();
     // Browsing-context names win over document id/name exposure, matching the
     // Window named access ordering. Both paths are fast miss paths now: child
     // contexts return immediately when empty, and document name lookup is indexed.
-    if let Some(handle) =
-        unsafe { &*host_ptr }.child_browsing_context_named_child_handle(child_handle, &key_name)
+    let named_child = host.child_browsing_context_named_object_handle(child_handle, &key_name);
+    if let Some(handle) = named_child
+        && host.child_browsing_context_child_is_same_origin(child_handle, handle)
+        && let Some(window) =
+            unsafe { &mut *host_ptr }.child_browsing_context_window_wrapper(scope, handle)
+    {
+        let context = scope.get_current_context();
+        let window =
+            super::super::shared_event_targets::window_target_in_realm(scope, window, context)
+                .unwrap_or(window);
+        return Some(window.into());
+    }
+    let host = unsafe { &*host_ptr };
+    let document = match child_handle {
+        Some(handle) => host.child_browsing_context_document_handle(handle)?,
+        None => host.document_handle(),
+    };
+    let handles = window_named_item_handles(host.dom_host(), document, &key_name);
+    if !handles.is_empty()
+        && let Some(handle) = named_child
         && let Some(window) =
             unsafe { &mut *host_ptr }.child_browsing_context_window_wrapper(scope, handle)
     {
         return Some(window.into());
     }
-    let host = unsafe { &*host_ptr };
-    let document = child_handle
-        .and_then(|child_handle| host.child_browsing_context_document_handle(child_handle))
-        .unwrap_or_else(|| host.document_handle());
-    let handles = window_named_item_handles(host.dom_host(), document, &key_name);
     if moli_trace::window_message_trace_enabled() {
         tracing::info!(
             target: "moli_window_message_trace",
@@ -216,6 +252,8 @@ fn window_named_access_value<'s>(
             stage = "window_named_property_lookup",
         );
     }
+    let context = holder.get_creation_context(scope)?;
+    let scope = &mut v8::ContextScope::new(scope, context);
     match handles.as_slice() {
         [] => None,
         [handle] => unsafe { &mut *host_ptr }

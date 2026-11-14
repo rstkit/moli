@@ -52,9 +52,6 @@ impl<'vm> ChildReadyDocumentScriptOwner<'vm> {
                 }
                 FrameDocumentScriptReadyTaskWork::DocumentScriptExecution(work) => {
                     let work = match *work {
-                        FrameDocumentRealmBoundScriptWork::DynamicClassic(work) => {
-                            PendingChildDocumentScriptExecutionWork::DynamicClassic(work)
-                        }
                         FrameDocumentRealmBoundScriptWork::ExternalClassic(work) => {
                             PendingChildDocumentScriptExecutionWork::ExternalClassic(work)
                         }
@@ -341,8 +338,6 @@ mod tests {
                     script_url: url::Url::parse("https://child-ready-route.test/missing.js")
                         .expect("classic script URL should parse"),
                     error: "network error".to_owned(),
-                    prepared_script: None,
-                    source_network_result: None,
                 },
                 None,
             ),

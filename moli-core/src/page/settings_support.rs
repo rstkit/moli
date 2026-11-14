@@ -5,7 +5,7 @@ use super::document_cookie_diagnostics::{
 };
 use super::protocol_support::{
     EmulatedIdleOverride, EmulatedMediaOverrides, PermissionOverrideRegistration,
-    SubresourceResourceType, ViewportSurface,
+    SubresourceInterceptionClasses, ViewportSurface,
 };
 use super::{CompletedPageCommand, Page, PendingDevToolsIoCommandDispatch, PendingPageCommand};
 use crate::renderer::{
@@ -17,14 +17,10 @@ use moli_renderer_v8::network::BrowserResourceRuntime;
 impl Page {
     pub async fn set_fetch_subresource_interception_async(
         &mut self,
-        enabled: bool,
-        resource_type: Option<SubresourceResourceType>,
+        classes: SubresourceInterceptionClasses,
     ) -> Result<()> {
         self.dispatch_unit_page_command_async(
-            RendererPageCommand::SetFetchSubresourceInterception {
-                enabled,
-                resource_type,
-            },
+            RendererPageCommand::SetFetchSubresourceInterception { classes },
             "set fetch subresource interception",
         )
         .await
@@ -32,13 +28,9 @@ impl Page {
 
     pub fn start_set_fetch_subresource_interception(
         &self,
-        enabled: bool,
-        resource_type: Option<SubresourceResourceType>,
+        classes: SubresourceInterceptionClasses,
     ) -> Result<PendingPageCommand> {
-        self.start_page_command(RendererPageCommand::SetFetchSubresourceInterception {
-            enabled,
-            resource_type,
-        })
+        self.start_page_command(RendererPageCommand::SetFetchSubresourceInterception { classes })
     }
 
     pub fn finish_set_fetch_subresource_interception(
@@ -52,15 +44,6 @@ impl Page {
             "a unit reply",
             RendererPageReply::Unit => Ok(()),
         )
-    }
-
-    pub fn start_set_javascript_dialog_handler_enabled(
-        &self,
-        enabled: bool,
-    ) -> Result<PendingPageCommand> {
-        self.start_page_command(RendererPageCommand::SetJavaScriptDialogHandlerEnabled(
-            enabled,
-        ))
     }
 
     pub(crate) async fn replace_browser_resource_runtime_async(
@@ -113,10 +96,10 @@ impl Page {
 
     pub async fn set_extra_http_headers_async(
         &mut self,
-        headers: &[(String, String)],
+        headers: &moli_fetch::RequestHeaders,
     ) -> Result<()> {
         self.dispatch_unit_page_command_async(
-            RendererPageCommand::SetExtraHttpHeaders(headers.to_vec()),
+            RendererPageCommand::SetExtraHttpHeaders(headers.clone()),
             "set extra HTTP headers",
         )
         .await
@@ -124,9 +107,9 @@ impl Page {
 
     pub fn start_set_extra_http_headers(
         &self,
-        headers: &[(String, String)],
+        headers: &moli_fetch::RequestHeaders,
     ) -> Result<PendingPageCommand> {
-        self.start_page_command(RendererPageCommand::SetExtraHttpHeaders(headers.to_vec()))
+        self.start_page_command(RendererPageCommand::SetExtraHttpHeaders(headers.clone()))
     }
 
     pub fn finish_set_extra_http_headers(
@@ -144,14 +127,14 @@ impl Page {
 
     pub async fn set_network_request_policy_async(
         &mut self,
-        extra_http_headers: &[(String, String)],
+        extra_http_headers: &moli_fetch::RequestHeaders,
         bypass_service_worker: bool,
         cache_disabled: bool,
         blocked_url_patterns: &[String],
     ) -> Result<()> {
         self.dispatch_unit_page_command_async(
             RendererPageCommand::SetNetworkRequestPolicy {
-                extra_http_headers: extra_http_headers.to_vec(),
+                extra_http_headers: extra_http_headers.clone(),
                 bypass_service_worker,
                 cache_disabled,
                 blocked_url_patterns: blocked_url_patterns.to_vec(),
@@ -163,13 +146,13 @@ impl Page {
 
     pub fn start_set_network_request_policy(
         &self,
-        extra_http_headers: &[(String, String)],
+        extra_http_headers: &moli_fetch::RequestHeaders,
         bypass_service_worker: bool,
         cache_disabled: bool,
         blocked_url_patterns: &[String],
     ) -> Result<PendingPageCommand> {
         self.start_page_command(RendererPageCommand::SetNetworkRequestPolicy {
-            extra_http_headers: extra_http_headers.to_vec(),
+            extra_http_headers: extra_http_headers.clone(),
             bypass_service_worker,
             cache_disabled,
             blocked_url_patterns: blocked_url_patterns.to_vec(),
@@ -228,12 +211,18 @@ impl Page {
     ) -> Result<PendingPageCommand> {
         let pending =
             self.start_page_command(RendererPageCommand::SetIdleOverride(idle_override))?;
+        self.record_admitted_idle_override(idle_override);
+        Ok(pending)
+    }
+
+    /// Records frame-host state after either a typed or frontend command has
+    /// been admitted. It belongs to this Page, not the target's replay policy.
+    pub fn record_admitted_idle_override(&mut self, idle_override: Option<EmulatedIdleOverride>) {
         // SetIdleOverride is synchronous browser-side state in Chromium. Make
         // it visible at command admission so a navigation from another CDP
         // session cannot observe an older protocol snapshot after the renderer
         // has already accepted the command.
         self.idle_override = idle_override;
-        Ok(pending)
     }
 
     pub fn finish_set_idle_override(&mut self, completion: CompletedPageCommand) -> Result<()> {
@@ -246,63 +235,19 @@ impl Page {
         )
     }
 
-    pub async fn set_locale_override_async(&mut self, locale: Option<&str>) -> Result<()> {
-        self.dispatch_unit_page_command_async(
-            RendererPageCommand::SetLocaleOverride(locale.map(str::to_owned)),
-            "set locale override",
-        )
-        .await
-    }
-
-    pub fn start_set_locale_override(&self, locale: Option<&str>) -> Result<PendingPageCommand> {
-        self.start_page_command(RendererPageCommand::SetLocaleOverride(
-            locale.map(str::to_owned),
-        ))
-    }
-
-    pub fn finish_set_locale_override(&mut self, completion: CompletedPageCommand) -> Result<()> {
-        let reply = self.finish_page_command(completion);
-        expect_page_reply!(
-            reply,
-            "set locale override",
-            "a unit reply",
-            RendererPageReply::Unit => Ok(()),
-        )
-    }
-
-    pub async fn set_timezone_override_async(&mut self, timezone: Option<&str>) -> Result<()> {
-        self.dispatch_unit_page_command_async(
-            RendererPageCommand::SetTimezoneOverride(timezone.map(str::to_owned)),
-            "set timezone override",
-        )
-        .await
-    }
-
-    pub fn start_set_timezone_override(
-        &self,
-        timezone: Option<&str>,
-    ) -> Result<PendingPageCommand> {
-        self.start_page_command(RendererPageCommand::SetTimezoneOverride(
-            timezone.map(str::to_owned),
-        ))
-    }
-
-    pub fn finish_set_timezone_override(&mut self, completion: CompletedPageCommand) -> Result<()> {
-        let reply = self.finish_page_command(completion);
-        expect_page_reply!(
-            reply,
-            "set timezone override",
-            "a unit reply",
-            RendererPageReply::Unit => Ok(()),
-        )
-    }
-
     pub async fn set_script_execution_disabled_async(&mut self, disabled: bool) -> Result<()> {
         self.dispatch_unit_page_command_async(
             RendererPageCommand::SetScriptExecutionDisabled(disabled),
             "set script execution disabled",
         )
         .await
+    }
+
+    pub fn start_set_script_execution_disabled(
+        &self,
+        disabled: bool,
+    ) -> Result<PendingPageCommand> {
+        self.start_page_command(RendererPageCommand::SetScriptExecutionDisabled(disabled))
     }
 
     /// Admits the DevTools IO-agent setting through the target's shared IO
@@ -371,26 +316,24 @@ impl Page {
         )
     }
 
-    pub async fn set_cpu_throttling_rate_async(&mut self, rate: f64) -> Result<()> {
+    /// Updates the DevTools hiding override; the browser startup flag remains effective.
+    pub async fn set_scrollbars_hidden_async(&mut self, hidden: bool) -> Result<()> {
         self.dispatch_unit_page_command_async(
-            RendererPageCommand::SetCpuThrottlingRate(rate),
-            "set CPU throttling rate",
+            RendererPageCommand::SetScrollbarsHidden(hidden),
+            "set scrollbars hidden",
         )
         .await
     }
 
-    pub fn start_set_cpu_throttling_rate(&self, rate: f64) -> Result<PendingPageCommand> {
-        self.start_page_command(RendererPageCommand::SetCpuThrottlingRate(rate))
+    pub fn start_set_scrollbars_hidden(&self, hidden: bool) -> Result<PendingPageCommand> {
+        self.start_page_command(RendererPageCommand::SetScrollbarsHidden(hidden))
     }
 
-    pub fn finish_set_cpu_throttling_rate(
-        &mut self,
-        completion: CompletedPageCommand,
-    ) -> Result<()> {
+    pub fn finish_set_scrollbars_hidden(&mut self, completion: CompletedPageCommand) -> Result<()> {
         let reply = self.finish_page_command(completion);
         expect_page_reply!(
             reply,
-            "set CPU throttling rate",
+            "set scrollbars hidden",
             "a unit reply",
             RendererPageReply::Unit => Ok(()),
         )
@@ -460,23 +403,36 @@ impl Page {
         .await
     }
 
+    pub fn start_apply_document_cookie_facade_overrides(
+        &self,
+        overrides: &moli_cookie_jar::BrowserCookieFacadeOverrides,
+    ) -> Result<PendingPageCommand> {
+        self.start_full_page_command(RendererPageCommand::ApplyDocumentCookieFacadeOverrides(
+            overrides.clone(),
+        ))
+    }
+
     pub async fn apply_document_cookie_facade_overrides_async(
         &mut self,
         overrides: &moli_cookie_jar::BrowserCookieFacadeOverrides,
     ) -> Result<()> {
-        self.dispatch_unit_page_command_async(
-            RendererPageCommand::ApplyDocumentCookieFacadeOverrides(overrides.clone()),
+        let pending = self.start_apply_document_cookie_facade_overrides(overrides)?;
+        self.finish_unit_runtime_page_command(
+            pending.wait().await?,
             "apply document cookie facade overrides",
         )
-        .await
+    }
+
+    pub fn start_clear_document_cookie_facade_overrides(&self) -> Result<PendingPageCommand> {
+        self.start_full_page_command(RendererPageCommand::ClearDocumentCookieFacadeOverrides)
     }
 
     pub async fn clear_document_cookie_facade_overrides_async(&mut self) -> Result<()> {
-        self.dispatch_unit_page_command_async(
-            RendererPageCommand::ClearDocumentCookieFacadeOverrides,
+        let pending = self.start_clear_document_cookie_facade_overrides()?;
+        self.finish_unit_runtime_page_command(
+            pending.wait().await?,
             "clear document cookie facade overrides",
         )
-        .await
     }
 
     pub async fn document_cookie_telemetry_snapshot_async(
@@ -571,6 +527,55 @@ impl Page {
         expect_page_reply!(
             reply,
             "set navigator overrides",
+            "a unit reply",
+            RendererPageReply::Unit => Ok(()),
+        )
+    }
+
+    /// Apply one captured target policy in a single renderer owner turn.
+    pub fn start_set_navigator_and_document_activity(
+        &self,
+        navigator_overrides: moli_page_types::NavigatorOverrides,
+        document_activity: moli_page_types::DocumentActivity,
+    ) -> Result<PendingPageCommand> {
+        let pending =
+            self.start_page_command(RendererPageCommand::SetNavigatorAndDocumentActivity {
+                navigator_overrides,
+                document_activity,
+            })?;
+        self.requested_document_activity.set(document_activity);
+        Ok(pending)
+    }
+
+    /// Last activity policy admitted by this Page. It includes queued updates,
+    /// so a focus reversal cannot be skipped while its renderer is busy.
+    pub fn document_activity(&self) -> moli_page_types::DocumentActivity {
+        self.requested_document_activity.get()
+    }
+
+    pub async fn set_document_activity_async(
+        &mut self,
+        activity: moli_page_types::DocumentActivity,
+    ) -> Result<()> {
+        let pending = self.start_set_document_activity(activity)?;
+        self.finish_set_document_activity(pending.wait().await?)
+    }
+
+    pub fn start_set_document_activity(
+        &self,
+        activity: moli_page_types::DocumentActivity,
+    ) -> Result<PendingPageCommand> {
+        let pending =
+            self.start_page_command(RendererPageCommand::SetDocumentActivity(activity))?;
+        self.requested_document_activity.set(activity);
+        Ok(pending)
+    }
+
+    pub fn finish_set_document_activity(&mut self, completion: CompletedPageCommand) -> Result<()> {
+        let reply = self.finish_page_command(completion);
+        expect_page_reply!(
+            reply,
+            "set document activity",
             "a unit reply",
             RendererPageReply::Unit => Ok(()),
         )

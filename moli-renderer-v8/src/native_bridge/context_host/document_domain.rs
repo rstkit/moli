@@ -3,7 +3,23 @@ use crate::dom::native::Node;
 use std::net::IpAddr;
 use url::{Host, Url};
 
-impl JsContextHost {
+impl PageScriptHost {
+    pub(crate) fn inherit_document_domain_override(&mut self, domain: Rc<RefCell<Option<String>>>) {
+        self.document_domain_override = domain;
+    }
+
+    pub(crate) fn inherited_document_domain(
+        &self,
+        child: Option<DomHandle>,
+    ) -> Rc<RefCell<Option<String>>> {
+        match child.and_then(|handle| self.child_browsing_context_security_origin_owner(handle)) {
+            Some(ChildSecurityOriginOwner::Child(owner)) => {
+                self.child_browsing_contexts[&owner].shared_document_domain_override()
+            }
+            Some(ChildSecurityOriginOwner::Main) | None => self.document_domain_override.clone(),
+        }
+    }
+
     pub(crate) fn document_domain_value_for_document_handle(
         &self,
         document_handle: DomHandle,
@@ -11,8 +27,9 @@ impl JsContextHost {
         if document_handle == self.document_handle() {
             return self
                 .document_domain_override
+                .borrow()
                 .clone()
-                .unwrap_or_else(|| url_host_domain(self.document_url()).unwrap_or_default());
+                .unwrap_or_else(|| self.main_document_domain_host().unwrap_or_default());
         }
         if let Some(child_handle) =
             self.child_browsing_context_handle_for_stored_document(document_handle)
@@ -39,7 +56,7 @@ impl JsContextHost {
             if self.document_sandbox_policy().sandboxes_document_domain {
                 return false;
             }
-            let Some(current_host) = url_host_domain(self.document_url()) else {
+            let Some(current_host) = self.main_document_domain_host() else {
                 return false;
             };
             let Some(domain) = normalize_document_domain_value(value) else {
@@ -48,7 +65,7 @@ impl JsContextHost {
             if !document_domain_is_allowed_for_host(&current_host, &domain) {
                 return false;
             }
-            self.document_domain_override = Some(domain);
+            *self.document_domain_override.borrow_mut() = Some(domain);
             return true;
         }
         let Some(child_handle) =
@@ -68,7 +85,7 @@ impl JsContextHost {
         handle: DomHandle,
     ) -> Option<String> {
         match self.child_browsing_context_security_origin_owner(handle)? {
-            ChildSecurityOriginOwner::Main => self.document_domain_override.clone(),
+            ChildSecurityOriginOwner::Main => self.document_domain_override.borrow().clone(),
             ChildSecurityOriginOwner::Child(owner) => self
                 .child_browsing_contexts
                 .get(&owner)
@@ -88,8 +105,9 @@ impl JsContextHost {
         if let Some(domain) = self.lightweight_popup_document_domain_override(popup_id) {
             return domain;
         }
-        self.lightweight_popup_document_url_for_domain(popup_id)
-            .and_then(|url| url_host_domain(&url))
+        self.lightweight_popup_origin(popup_id)
+            .and_then(|origin| Url::parse(&origin).ok())
+            .and_then(|origin| url_host_domain(&origin))
             .unwrap_or_default()
     }
 
@@ -114,7 +132,9 @@ impl JsContextHost {
             return false;
         };
         match origin_owner {
-            ChildSecurityOriginOwner::Main => self.document_domain_override = Some(domain),
+            ChildSecurityOriginOwner::Main => {
+                *self.document_domain_override.borrow_mut() = Some(domain);
+            }
             ChildSecurityOriginOwner::Child(owner) => {
                 let Some(entry) = self.child_browsing_contexts.get_mut(&owner) else {
                     return false;
@@ -135,9 +155,13 @@ impl JsContextHost {
             return false;
         }
         let Some(current_host) = self
-            .lightweight_popup_document_url_for_domain(popup_id)
-            .and_then(|url| url_host_domain(&url))
-            .or_else(|| {
+            .lightweight_popup_origin(popup_id)
+            .map(|origin| {
+                Url::parse(&origin)
+                    .ok()
+                    .and_then(|origin| url_host_domain(&origin))
+            })
+            .unwrap_or_else(|| {
                 self.dom_host()
                     .dom()
                     .node(document_handle)
@@ -156,8 +180,10 @@ impl JsContextHost {
         self.set_lightweight_popup_document_domain_override(popup_id, domain)
     }
 
-    fn lightweight_popup_document_url_for_domain(&self, popup_id: u64) -> Option<Url> {
-        self.lightweight_popup_document_url(popup_id)
+    fn main_document_domain_host(&self) -> Option<String> {
+        Url::parse(&self.main_document_security_origin())
+            .ok()
+            .and_then(|origin| url_host_domain(&origin))
     }
 
     fn child_browsing_context_document_domain_host(&self, handle: DomHandle) -> Option<String> {
@@ -165,6 +191,18 @@ impl JsContextHost {
         Url::parse(&origin)
             .ok()
             .and_then(|origin| url_host_domain(&origin))
+    }
+
+    pub(in crate::native_bridge::context_host) fn child_document_domain_owner_document(
+        &self,
+        handle: DomHandle,
+    ) -> Option<DomHandle> {
+        match self.child_browsing_context_security_origin_owner(handle)? {
+            ChildSecurityOriginOwner::Main => Some(self.document_handle()),
+            ChildSecurityOriginOwner::Child(owner) => {
+                self.child_browsing_context_document_handle(owner)
+            }
+        }
     }
 
     fn child_browsing_context_security_origin_owner(
@@ -218,38 +256,39 @@ enum ChildSecurityOriginOwner {
 
 fn url_host_domain(url: &Url) -> Option<String> {
     match url.host()? {
-        Host::Domain(domain) => Some(domain.trim_end_matches('.').to_ascii_lowercase()),
+        Host::Domain(domain) => Some(domain.to_ascii_lowercase()),
         Host::Ipv4(ip) => Some(ip.to_string()),
         Host::Ipv6(ip) => Some(ip.to_string()),
     }
 }
 
 fn normalize_document_domain_value(value: &str) -> Option<String> {
-    let value = value.trim_end_matches('.');
     if value.is_empty() {
         return None;
     }
     if let Ok(ip) = value.parse::<IpAddr>() {
         return Some(ip.to_string());
     }
+    // Keep the parsed host's trailing dot: it is significant for origin-domain
+    // comparisons, including dots produced by percent-decoding or IDNA.
     match Host::parse(value).ok()? {
-        Host::Domain(domain) => Some(domain.trim_end_matches('.').to_ascii_lowercase()),
+        Host::Domain(domain) => Some(domain.to_ascii_lowercase()),
         Host::Ipv4(ip) => Some(ip.to_string()),
         Host::Ipv6(ip) => Some(ip.to_string()),
     }
 }
 
 fn document_domain_is_allowed_for_host(current_host: &str, domain: &str) -> bool {
-    if host_is_ip_literal(current_host) {
-        return domain == current_host;
+    if domain == current_host {
+        return true;
     }
-    if !host_matches_document_domain(current_host, domain) {
+    if host_is_ip_literal(current_host) || !host_matches_document_domain(current_host, domain) {
         return false;
     }
-    if domain != current_host && moli_cookie_jar::host_is_public_suffix(domain) {
-        return false;
-    }
-    domain == current_host || domain == "localhost" || domain.contains('.')
+    // A parent must stay within the original host's registrable domain. Checking
+    // only the candidate's PSL entry misses implicit single-label suffixes and
+    // parents above a public suffix selected by a wildcard rule.
+    host_matches_document_domain(domain, moli_site::registrable_site_host(current_host))
 }
 
 fn host_is_ip_literal(host: &str) -> bool {
@@ -271,6 +310,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn document_domain_validation_respects_the_original_hosts_public_suffix() {
+        for (host, domain, allowed) in [
+            ("www1.localhost", "localhost", false),
+            ("localhost", "localhost", true),
+            (
+                "www1.web-platform.localhost",
+                "web-platform.localhost",
+                true,
+            ),
+            (
+                "example.compute.amazonaws.com",
+                "compute.amazonaws.com",
+                false,
+            ),
+            (
+                "www.example.compute.amazonaws.com",
+                "example.compute.amazonaws.com",
+                false,
+            ),
+            ("www.example.compute.amazonaws.com", "amazonaws.com", false),
+            ("test.amazonaws.com", "amazonaws.com", true),
+            (
+                "example.compute.amazonaws.com",
+                "example.compute.amazonaws.com",
+                true,
+            ),
+            ("www.city.kawasaki.jp", "city.kawasaki.jp", true),
+            ("www.foo.kawasaki.jp", "kawasaki.jp", false),
+        ] {
+            assert_eq!(
+                document_domain_is_allowed_for_host(host, domain),
+                allowed,
+                "{host} must {}relax to {domain}",
+                if allowed { "" } else { "not " }
+            );
+        }
+    }
+
+    #[test]
     fn document_domain_validation_allows_current_or_parent_domain() {
         assert_eq!(
             normalize_document_domain_value("::1").as_deref(),
@@ -288,7 +366,7 @@ mod tests {
             "example.test",
             "example.test"
         ));
-        assert!(document_domain_is_allowed_for_host(
+        assert!(!document_domain_is_allowed_for_host(
             "www1.localhost",
             "localhost"
         ));

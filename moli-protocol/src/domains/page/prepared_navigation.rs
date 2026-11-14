@@ -1,10 +1,18 @@
-use moli_core::RendererRuntimeCommandCausalIdentity;
 use moli_core::page::{
     RendererDocumentLifecycleIdentity, RendererDocumentSourcedSameDocumentNavigation,
     RendererDocumentSourcedTopLevelLocationNavigation, RendererPendingSameDocumentNavigation,
 };
 
 use crate::conn::TargetPageResidenceIdentity;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PagePreparedAuxiliaryWindowNavigation {
+    pub(super) browser_context_id: String,
+    pub(super) window: moli_core::page::RendererAuxiliaryWindow,
+    pub(super) url: String,
+    pub(super) kind: moli_core::page::RendererAuxiliaryNavigationKind,
+    pub(super) document_response: Option<moli_core::page::RendererAuxiliaryDocumentResponse>,
+}
 
 /// A same-Document protocol handoff bound to the exact target-local Page
 /// residence from which it was captured.
@@ -66,9 +74,5 @@ impl PagePreparedTopLevelLocationNavigation {
         RendererDocumentSourcedTopLevelLocationNavigation,
     ) {
         (self.owner, self.navigation)
-    }
-
-    pub(super) fn runtime_command_cause(&self) -> Option<&RendererRuntimeCommandCausalIdentity> {
-        self.navigation.runtime_command_cause()
     }
 }

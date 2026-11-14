@@ -1,6 +1,146 @@
 use super::*;
 
 #[test]
+fn trusted_types_csp_policy_creation_matches_only_valid_name_tokens() {
+    for (policy, name, expected) in [
+        ("trusted-types valid policy*name", "valid", "allowed"),
+        (
+            "trusted-types valid policy*name",
+            "policy*name",
+            "TypeError",
+        ),
+        ("trusted-types none allow-duplicates", "none", "allowed"),
+        (
+            "trusted-types none allow-duplicates",
+            "allow-duplicates",
+            "allowed",
+        ),
+        (
+            "trusted-types ignored política; trusted-types valid",
+            "valid",
+            "allowed",
+        ),
+        (
+            "trusted-types ignored política; trusted-types valid",
+            "ignored",
+            "allowed",
+        ),
+        (
+            "trusted-types valid; trusted-types ignored política",
+            "ignored",
+            "TypeError",
+        ),
+        (
+            "trusted-types valid; trusted-types ignored política",
+            "valid",
+            "allowed",
+        ),
+        ("trusted-types \u{000b}*", "arbitrary", "allowed"),
+        ("trusted-types *\u{000b}", "arbitrary", "allowed"),
+        (
+            "trusted-types valid \u{000b}'allow-duplicates'",
+            "arbitrary",
+            "allowed",
+        ),
+        ("trusted-types *", "name with spaces", "allowed"),
+        ("", "name with spaces", "allowed"),
+        ("trusted-types valid", "policy$name", "TypeError"),
+    ] {
+        let mut vm = new_storage_test_vm("https://trusted-types-name-grammar.test/");
+        vm.set_response_content_security_policies(&[policy.to_owned()]);
+        let script = format!(
+            "(() => {{ try {{ trustedTypes.createPolicy({}, {{createHTML: value => value}}); return 'allowed'; }} catch (error) {{ return error.name; }} }})()",
+            serde_json::to_string(name).unwrap(),
+        );
+        assert_eq!(vm.eval(&script).unwrap(), expected, "{policy:?}, {name:?}");
+    }
+}
+
+#[test]
+fn trusted_type_policy_callbacks_follow_webidl_dictionary_and_callback_rules() {
+    let mut vm = new_storage_test_vm("https://trusted-type-policy-webidl.test/");
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const errorName = callback => {
+    try {
+      callback();
+      return "none";
+    } catch (error) {
+      return error.constructor.name;
+    }
+  };
+  const methodTypes = policy => [
+    typeof policy.createHTML,
+    typeof policy.createScript,
+    typeof policy.createScriptURL
+  ];
+
+  const emptyFromNull = trustedTypes.createPolicy("empty-null", null);
+  const emptyFromOmission = trustedTypes.createPolicy("empty-omitted");
+  const extra = { marker: "extra" };
+  let observed;
+  class NullCallbacks {
+    createHTML(input, ...rest) {
+      observed = [this === undefined, input, rest.length, rest[0] === extra, rest[1]];
+      return null;
+    }
+    createScript() {
+      return null;
+    }
+    createScriptURL() {
+      return null;
+    }
+  }
+  const nullPolicy = trustedTypes.createPolicy("null-results", new NullCallbacks());
+  const nullResults = [
+    String(nullPolicy.createHTML({ toString: () => "converted" }, extra, 42)),
+    String(nullPolicy.createScript("script")),
+    String(nullPolicy.createScriptURL("script-url"))
+  ];
+
+  const variadicPolicy = trustedTypes.createPolicy("variadic", {
+    createHTML: (a, b, c) => a + b + c,
+    createScript: (a, b, c) => a + b + c,
+    createScriptURL: (a, b, c) => a + b + c
+  });
+  const variadicResults = [
+    String(variadicPolicy.createHTML("a", "b", "c")),
+    String(variadicPolicy.createScript("a", "b")),
+    String(variadicPolicy.createScriptURL("a", 123, null))
+  ];
+
+  return JSON.stringify({
+    emptyMethods: [methodTypes(emptyFromNull), methodTypes(emptyFromOmission)],
+    missingCallbacks: [emptyFromNull, emptyFromOmission].map(policy =>
+      ['createHTML', 'createScript', 'createScriptURL'].map(method =>
+        errorName(() => policy[method]('input')))),
+    nullResults,
+    observed,
+    variadicResults,
+    errors: [
+      errorName(() => trustedTypes.createPolicy("primitive-options", 1)),
+      errorName(() => trustedTypes.createPolicy("non-callable", { createHTML: null })),
+      errorName(() => trustedTypes.createPolicy("throwing-getter", {
+        get createHTML() { throw new RangeError("getter"); }
+      })),
+      errorName(() => nullPolicy.createHTML())
+    ]
+  });
+})()
+"#,
+        )
+        .expect("TrustedTypePolicy WebIDL callback probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"emptyMethods":[["function","function","function"],["function","function","function"]],"missingCallbacks":[["TypeError","TypeError","TypeError"],["TypeError","TypeError","TypeError"]],"nullResults":["","",""],"observed":[true,"converted",2,true,42],"variadicResults":["abc","abundefined","a123null"],"errors":["TypeError","TypeError","RangeError","TypeError"]}"#
+    );
+}
+
+#[test]
 fn element_markup_sinks_enforce_trusted_html_and_standard_sink_names() {
     let mut vm = new_storage_test_vm("https://element-markup-trusted-types.test/");
     vm.set_response_content_security_policies(&["require-trusted-types-for 'script'".to_owned()]);
@@ -354,7 +494,7 @@ fn trusted_types_default_policy_can_make_changed_empty_script_sources_executable
         assert!(
             vm.document_runtime
                 .dom_host_mut()
-                .finish_parsing_script_children(script)
+                .set_script_text_internal_slot(script, ";")
         );
         assert!(
             vm.document_runtime
@@ -403,6 +543,70 @@ fn trusted_types_default_policy_can_make_changed_empty_script_sources_executable
         result,
         r#"{"defaultCalls":[["","TrustedScript","HTMLScriptElement text"],["","TrustedScript","SVGScriptElement text"]],"runs":["HTMLScriptElement text","SVGScriptElement text"]}"#
     );
+}
+
+#[test]
+fn trusted_types_default_policy_prepares_runtime_import_maps_before_registration() {
+    let mut vm = new_storage_test_vm("https://runtime-import-map-trusted-types.test/");
+    vm.set_response_content_security_policies(&["require-trusted-types-for 'script'".to_owned()]);
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const root = document.body ||
+    (document.documentElement || document.appendChild(document.createElement("html")))
+      .appendChild(document.createElement("body"));
+  const calls = [];
+  trustedTypes.createPolicy("default", {
+    createScript(value, type, sink) {
+      calls.push([value, type, sink]);
+      const specifier = sink === "SVGScriptElement text" ? "svg-mapped" : "html-mapped";
+      return JSON.stringify({ imports: { [specifier]: `/${specifier}.mjs` } });
+    }
+  });
+
+  const htmlScript = document.createElement("script");
+  htmlScript.type = "importmap";
+  htmlScript.appendChild(document.createTextNode("html-map"));
+  root.appendChild(htmlScript);
+
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  root.appendChild(svg);
+  const svgScript = document.createElementNS("http://www.w3.org/2000/svg", "script");
+  svgScript.setAttribute("type", "importmap");
+  svgScript.appendChild(document.createTextNode("svg-map"));
+  svg.appendChild(svgScript);
+
+  return JSON.stringify(calls);
+})()
+"#,
+        )
+        .expect("runtime import maps should pass through the Trusted Types source gate");
+
+    assert_eq!(
+        result,
+        r#"[["html-map","TrustedScript","HTMLScriptElement text"],["svg-map","TrustedScript","SVGScriptElement text"]]"#
+    );
+    let base_url = vm.document_runtime.document_url().clone();
+    for (specifier, expected) in [
+        (
+            "html-mapped",
+            "https://runtime-import-map-trusted-types.test/html-mapped.mjs",
+        ),
+        (
+            "svg-mapped",
+            "https://runtime-import-map-trusted-types.test/svg-mapped.mjs",
+        ),
+    ] {
+        assert_eq!(
+            vm.document_runtime
+                .resolve_module_specifier(specifier, &base_url)
+                .expect("default-policy import map entry should resolve")
+                .as_str(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -496,6 +700,138 @@ trustedTypes.createPolicy("default", {
             .expect("inline-module default-policy calls should remain observable"),
         r#"[["postMessage('original', '*');","TrustedScript","HTMLScriptElement text"],["postMessage('original', '*');","TrustedScript","SVGScriptElement text"]]"#
     );
+}
+
+#[test]
+fn inline_module_csp_hashes_use_prepared_source_without_duplicate_url_checks() {
+    use crate::module_runtime::NativeModuleGraphJobAdvance;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    const ORIGINAL: &str = "globalThis.__inlineModuleRuns.push('old')";
+    const PREPARED: &str = "globalThis.__inlineModuleRuns.push('new')";
+    for namespace in ["http://www.w3.org/1999/xhtml", "http://www.w3.org/2000/svg"] {
+        for runtime_owned in [false, true] {
+            for (allowed_source, report_only) in
+                [(PREPARED, false), (ORIGINAL, false), (ORIGINAL, true)]
+            {
+                let mut vm = new_storage_test_vm("https://inline-module-csp.test/page");
+                vm.eval(&format!(r#"
+                    globalThis.__inlineModuleRuns = [];
+                    globalThis.__inlineModuleCalls = [];
+                    globalThis.__inlineModuleViolations = [];
+                    addEventListener('securitypolicyviolation', event => {{
+                        __inlineModuleViolations.push([event.blockedURI, event.disposition, event.sample]);
+                    }});
+                    const root = document.appendChild(document.createElement('html'));
+                    const body = root.appendChild(document.createElement('body'));
+                    const element = document.createElementNS({namespace:?}, 'script');
+                    element.id = 'inline-module';
+                    element.setAttribute('type', 'application/json');
+                    element.appendChild(document.createTextNode({ORIGINAL:?}));
+                    body.appendChild(element);
+                    trustedTypes.createPolicy('default', {{
+                        createScript(input, type, sink) {{
+                            __inlineModuleCalls.push([input, type, sink]);
+                            return {PREPARED:?};
+                        }}
+                    }});
+                "#)).expect("install inert script and rewriting policy");
+                let hash = STANDARD.encode(
+                    moli_crypto::DigestAlgorithm::Sha256.digest_bytes(allowed_source.as_bytes()),
+                );
+                let policy = format!("script-src 'sha256-{hash}' 'report-sample'");
+                let mut enforced = vec!["require-trusted-types-for 'script'".to_owned()];
+                if report_only {
+                    vm.set_response_content_security_report_only_policies(&[policy]);
+                } else {
+                    enforced.push(policy);
+                }
+                vm.set_response_content_security_policies(&enforced);
+
+                let document_url = vm.document_runtime.document_url().clone();
+                let node_id = vm
+                    .document_runtime
+                    .get_element_by_id("inline-module")
+                    .unwrap();
+                let script = PreparedScript {
+                    position: 1,
+                    node_id,
+                    kind: ScriptKind::Module,
+                    mode: ScriptMode::ModuleInOrder,
+                    source_kind: ScriptSourceKind::Inline,
+                    fetch_metadata: crate::planning::ScriptFetchMetadata::default(),
+                    source: ScriptSource::Inline(ORIGINAL.to_owned()),
+                    url: document_url.clone(),
+                    base_url: document_url.clone(),
+                    initiator_url: document_url.clone(),
+                    host_script_handle: None,
+                };
+                let source = vm.inline_module_script_source_for_graph_start(&script, ORIGINAL);
+                let should_run = allowed_source == PREPARED || report_only;
+                assert_eq!(
+                    source.text_source(),
+                    Some(if should_run { PREPARED } else { "" })
+                );
+                let prepare_graph = if runtime_owned {
+                    crate::module_runtime::runtime_owned_loaded_module_script_graph_job
+                } else {
+                    crate::module_runtime::parser_owned_loaded_module_script_graph_job
+                };
+                let mut job = prepare_graph(
+                    &mut vm,
+                    source,
+                    &document_url,
+                    &document_url,
+                    &script.fetch_metadata,
+                    false,
+                )
+                .expect("a prepared inline module must not be checked as an external URL");
+                let NativeModuleGraphJobAdvance::Complete(graph) =
+                    job.advance_module_script_owner_lane(&mut vm).unwrap()
+                else {
+                    panic!("an import-free inline module must not fetch");
+                };
+                vm.instantiate_native_module_graph(&graph).unwrap();
+                vm.evaluate_native_module_graph(graph.root_entry).unwrap();
+                drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm);
+
+                assert_eq!(
+                    vm.eval("JSON.stringify(__inlineModuleRuns)").unwrap(),
+                    if should_run { r#"["new"]"# } else { "[]" }
+                );
+                let sink = if namespace == "http://www.w3.org/2000/svg" {
+                    "SVGScriptElement text"
+                } else {
+                    "HTMLScriptElement text"
+                };
+                assert_eq!(
+                    vm.eval("JSON.stringify(__inlineModuleCalls)").unwrap(),
+                    serde_json::json!([[ORIGINAL, "TrustedScript", sink]]).to_string()
+                );
+                let violations = if allowed_source == PREPARED {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([[
+                        "inline",
+                        if report_only { "report" } else { "enforce" },
+                        PREPARED.chars().take(40).collect::<String>()
+                    ]])
+                };
+                assert_eq!(
+                    vm.eval("JSON.stringify(__inlineModuleViolations)").unwrap(),
+                    violations.to_string()
+                );
+                // The graph consumes the prepared copy without rewriting the DOM.
+                assert_eq!(
+                    vm.document_runtime
+                        .dom_host()
+                        .text_content(node_id)
+                        .as_deref(),
+                    Some(ORIGINAL)
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -666,6 +1002,176 @@ fn empty_default_policy_report_only_allows_and_reports_each_element_sink() {
 }
 
 #[test]
+fn report_only_trusted_types_eval_runs_reports_and_applies_the_default_policy() {
+    let mut vm = new_storage_test_vm("https://trusted-types-eval-report-only.test/");
+    vm.set_response_content_security_policies(&["script-src 'unsafe-eval'".to_owned()]);
+    vm.set_response_content_security_report_only_policies(&[
+        "require-trusted-types-for 'script'".to_owned()
+    ]);
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const violations = [];
+  const defaultPolicyCalls = [];
+  document.addEventListener("securitypolicyviolation", event => {
+    if (event.blockedURI === "trusted-types-sink") {
+      violations.push({ sample: event.sample, disposition: event.disposition });
+    }
+  });
+  globalThis.__reportOnlyEvalViolations = violations;
+
+  eval("globalThis.__reportOnlyEval = 1");
+  const explicit = trustedTypes.createPolicy("explicit-report-only-eval", {
+    createScript: value => value
+  });
+  eval(explicit.createScript("globalThis.__reportOnlyEval = 2"));
+  trustedTypes.createPolicy("default", {
+    createScript: (...args) => {
+      defaultPolicyCalls.push(args);
+      return args[0];
+    }
+  });
+  eval("globalThis.__reportOnlyEval = 3");
+
+  return JSON.stringify({ value: globalThis.__reportOnlyEval, defaultPolicyCalls, violations });
+})()
+"#,
+        )
+        .expect("report-only Trusted Types eval probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"value":3,"defaultPolicyCalls":[["globalThis.__reportOnlyEval = 3","TrustedScript","eval"]],"violations":[]}"#
+    );
+    assert_eq!(
+        drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm),
+        1
+    );
+    assert_eq!(
+        vm.eval("JSON.stringify(globalThis.__reportOnlyEvalViolations)")
+            .expect("queued report-only eval violation should be observable"),
+        r#"[{"sample":"eval|globalThis.__reportOnlyEval = 1","disposition":"report"}]"#
+    );
+}
+
+#[test]
+fn javascript_url_navigation_default_policy_is_silent_and_disposition_aware() {
+    let policy = "require-trusted-types-for 'script'".to_owned();
+
+    let mut rewritten = new_storage_test_vm("https://javascript-url-rewritten.test/");
+    rewritten.set_response_content_security_policies(std::slice::from_ref(&policy));
+    rewritten
+        .eval(
+            r#"
+globalThis.__javascriptUrlOriginal = 0;
+globalThis.__javascriptUrlModified = 0;
+globalThis.__javascriptUrlDefaultCalls = [];
+trustedTypes.createPolicy("default", {
+  createScript: (...args) => {
+    globalThis.__javascriptUrlDefaultCalls.push(args);
+    return args[0].replace("Original", "Modified");
+  }
+});
+"ready"
+"#,
+        )
+        .expect("install javascript URL rewriting default policy");
+    assert_eq!(
+        rewritten
+            .eval_javascript_url_runtime_turn(
+                "globalThis.__javascriptUrlOriginal++",
+                &Url::parse("https://javascript-url-rewritten.test/").expect("test URL"),
+            )
+            .expect("rewritten javascript URL should execute"),
+        None
+    );
+    assert_eq!(
+        rewritten
+            .eval(
+                "JSON.stringify({ original: __javascriptUrlOriginal, modified: __javascriptUrlModified, calls: __javascriptUrlDefaultCalls })"
+            )
+            .expect("read rewritten javascript URL result"),
+        r#"{"original":0,"modified":1,"calls":[["globalThis.__javascriptUrlOriginal++","TrustedScript","Location href"]]}"#
+    );
+    assert_eq!(
+        drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut rewritten),
+        0
+    );
+
+    for (name, callback, report_only, expected_runs, expected_disposition) in [
+        (
+            "throw-enforce",
+            "throw new RangeError('default policy failure')",
+            false,
+            0,
+            "enforce",
+        ),
+        (
+            "invalid-enforce",
+            "return '//make:invalid/'",
+            false,
+            0,
+            "enforce",
+        ),
+        (
+            "throw-report",
+            "throw new RangeError('default policy failure')",
+            true,
+            1,
+            "report",
+        ),
+    ] {
+        let base_url =
+            Url::parse(&format!("https://javascript-url-{name}.test/")).expect("test URL");
+        let mut vm = new_storage_test_vm(base_url.as_str());
+        if report_only {
+            vm.set_response_content_security_report_only_policies(std::slice::from_ref(&policy));
+        } else {
+            vm.set_response_content_security_policies(std::slice::from_ref(&policy));
+        }
+        vm.eval(&format!(
+            r#"
+globalThis.__javascriptUrlRuns = 0;
+globalThis.__javascriptUrlViolations = [];
+document.addEventListener("securitypolicyviolation", event => {{
+  globalThis.__javascriptUrlViolations.push({{
+    sample: event.sample,
+    disposition: event.disposition,
+  }});
+}});
+trustedTypes.createPolicy("default", {{
+  createScript: () => {{ {callback} }}
+}});
+"ready"
+"#
+        ))
+        .expect("install failing javascript URL default policy");
+
+        assert_eq!(
+            vm.eval_javascript_url_runtime_turn("globalThis.__javascriptUrlRuns++", &base_url)
+                .expect("default policy failure must not escape the navigation turn"),
+            None
+        );
+        assert_eq!(
+            drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm),
+            1
+        );
+        assert_eq!(
+            vm.eval(
+                "JSON.stringify({ runs: __javascriptUrlRuns, violations: __javascriptUrlViolations })"
+            )
+            .expect("read javascript URL failure result"),
+            format!(
+                r#"{{"runs":{expected_runs},"violations":[{{"sample":"Location href|globalThis.__javascriptUrlRuns++","disposition":"{expected_disposition}"}}]}}"#
+            ),
+            "case {name}"
+        );
+    }
+}
+
+#[test]
 fn report_only_default_policy_transforms_or_preserves_by_callback_outcome() {
     let mut vm = new_storage_test_vm("https://default-policy-report-only.test/");
     vm.set_response_content_security_report_only_policies(&[
@@ -786,6 +1292,68 @@ fn rejected_default_policy_reports_both_dispositions_and_enforces_once() {
 }
 
 #[test]
+fn eval_csp_report_samples_use_trusted_types_compliant_source() {
+    let mut vm = new_storage_test_vm("https://eval-csp-report-sample.test/");
+    vm.set_response_content_security_policies(&[
+        "require-trusted-types-for 'script'".to_owned(),
+        "script-src 'nonce-test' 'report-sample'".to_owned(),
+    ]);
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const samples = [];
+  const defaultCalls = [];
+  document.addEventListener("securitypolicyviolation", event => {
+    if (event.effectiveDirective === "script-src") {
+      samples.push(event.sample);
+    }
+  });
+  globalThis.__evalCspReportSamples = samples;
+
+  const explicit = trustedTypes.createPolicy("explicit-eval", {
+    createScript: value => value
+  });
+  trustedTypes.createPolicy("default", {
+    createScript: value => {
+      defaultCalls.push(value);
+      return value;
+    }
+  });
+  const errors = [
+    () => eval(explicit.createScript("trusted-source")),
+    () => eval("default-source")
+  ].map(run => {
+    try {
+      run();
+      return "none";
+    } catch (error) {
+      return `${error.name}:${error instanceof EvalError}`;
+    }
+  });
+  return JSON.stringify({ errors, defaultCalls, samples });
+})()
+"#,
+        )
+        .expect("eval CSP report-sample probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"errors":["EvalError:true","EvalError:true"],"defaultCalls":["default-source"],"samples":[]}"#
+    );
+    assert_eq!(
+        drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm),
+        2
+    );
+    assert_eq!(
+        vm.eval("JSON.stringify(globalThis.__evalCspReportSamples)")
+            .expect("queued eval CSP samples should be observable"),
+        r#"["trusted-source","default-source"]"#
+    );
+}
+
+#[test]
 fn function_constructor_violations_sample_only_parameters_and_body() {
     let mut vm = new_storage_test_vm("https://function-constructor-violation.test/");
     vm.set_response_content_security_policies(&["require-trusted-types-for 'script'".to_owned()]);
@@ -900,27 +1468,19 @@ fn service_worker_register_gates_script_url_before_url_resolution() {
     let mut vm = new_storage_test_vm("https://service-worker-register-trusted-types.test/");
     vm.set_response_content_security_policies(&["require-trusted-types-for 'script'".to_owned()]);
 
-    let result = vm
-        .eval(
+    vm.eval(
             r#"
 (() => {
-  const errorName = callback => {
-    try {
-      callback();
-      return "none";
-    } catch (error) {
-      return error && error.name;
-    }
-  };
+  const errorName = promise => promise.then(() => 'resolved', error => error && error.name);
   const policy = trustedTypes.createPolicy("service-worker-register", {
     createHTML: value => value,
     createScriptURL: value => value
   });
-  const blockedString = errorName(() => navigator.serviceWorker.register("worker.js"));
-  const blockedWrongType = errorName(() =>
+  const blockedString = errorName(navigator.serviceWorker.register("worker.js"));
+  const blockedWrongType = errorName(
     navigator.serviceWorker.register(policy.createHTML("worker.js"))
   );
-  const missing = errorName(() => navigator.serviceWorker.register());
+  const missing = errorName(navigator.serviceWorker.register());
 
   const trustedPromise = navigator.serviceWorker.register(
     policy.createScriptURL("http://[")
@@ -937,19 +1497,24 @@ fn service_worker_register_gates_script_url_before_url_resolution() {
   const defaultPromise = navigator.serviceWorker.register("worker.potato");
   defaultPromise.catch(() => {});
 
-  return JSON.stringify({
-    blockedString,
-    blockedWrongType,
-    missing,
-    trustedPromise: trustedPromise instanceof Promise,
-    defaultPromise: defaultPromise instanceof Promise,
-    defaultCalls
+  Promise.all([blockedString, blockedWrongType, missing]).then(([blockedString, blockedWrongType, missing]) => {
+    globalThis.serviceWorkerTrustedUrlResult = {
+      blockedString,
+      blockedWrongType,
+      missing,
+      trustedPromise: trustedPromise instanceof Promise,
+      defaultPromise: defaultPromise instanceof Promise,
+      defaultCalls
+    };
   });
 })()
 "#,
         )
         .expect("ServiceWorkerContainer.register TrustedScriptURL probe should evaluate");
 
+    let result = vm
+        .eval("JSON.stringify(globalThis.serviceWorkerTrustedUrlResult)")
+        .expect("ServiceWorkerContainer.register errors should reject their Promises");
     assert_eq!(
         result,
         r#"{"blockedString":"TypeError","blockedWrongType":"TypeError","missing":"TypeError","trustedPromise":true,"defaultPromise":true,"defaultCalls":[["worker.potato","TrustedScriptURL","ServiceWorkerContainer register"]]}"#
@@ -1035,4 +1600,299 @@ fn dom_parser_gates_converted_union_source_after_webidl_argument_conversion() {
         result,
         r#"{"blocked":["TypeError","TypeError","TypeError"],"accepted":["trusted","root"],"defaultValues":["default","null","root"],"sourceConversions":2,"invalidType":"TypeError","invalidTypeSkippedPolicy":true,"symbolSource":"TypeError","defaultCalls":[["source","TrustedHTML","DOMParser parseFromString"],["null","TrustedHTML","DOMParser parseFromString"],["<root/>","TrustedHTML","DOMParser parseFromString"]]}"#
     );
+}
+
+#[test]
+fn service_worker_register_converts_options_before_the_default_policy() {
+    let mut vm = new_storage_test_vm("https://service-worker-register-options.test/");
+    vm.set_response_content_security_policies(&["require-trusted-types-for 'script'".to_owned()]);
+    vm.eval(
+        r#"
+(async () => {
+  const sw = navigator.serviceWorker;
+  const marker = {sentinel: true};
+  const rows = [];
+  async function probe(label, callback, log) {
+    const promise = callback();
+    log.push('returned');
+    try {
+      await promise;
+      rows.push([label, 'fulfilled']);
+    } catch (error) {
+      rows.push([label, promise instanceof Promise, error === marker ? 'sentinel' : error.name, [...log]]);
+    }
+  }
+  const options = log => ({
+    get scope() { log.push('scope'); return './'; },
+    get type() { log.push('type'); return 'classic'; },
+    get updateViaCache() { log.push('cache'); return 'imports'; }
+  });
+  let log = [];
+  await probe('blocked-after-options', () => sw.register(
+    {toString() { log.push('script'); return 'worker.js'; }}, options(log)
+  ), log);
+  log = [];
+  await probe('options-exception-before-policy', () => sw.register('worker.js', {
+    get scope() { log.push('scope'); throw marker; }
+  }), log);
+  log = [];
+  await probe('script-exception', () => sw.register(
+    {toString() { log.push('script'); throw marker; }}, options(log)
+  ), log);
+  const policy = trustedTypes.createPolicy('registration-tests', {createScriptURL: v => v});
+  const trusted = policy.createScriptURL('https://[');
+  trusted.toString = () => { throw marker; };
+  log = [];
+  await probe('trusted-input', () => sw.register(trusted, options(log)), log);
+  let defaultThrows = false;
+  let policyLog = [];
+  trustedTypes.createPolicy('default', {
+    createScriptURL(value, type, sink) {
+      policyLog.push(['policy', value, type, sink]);
+      if (defaultThrows) throw marker;
+      return 'https://[';
+    }
+  });
+  log = []; policyLog = log;
+  await probe('default-after-options', () => sw.register(
+    {toString() { log.push('script'); return 'worker\ud800.js'; }}, options(log)
+  ), log);
+  log = []; policyLog = log; defaultThrows = true;
+  await probe('default-exception', () => sw.register('worker.js', options(log)), log);
+  log = []; policyLog = log;
+  await probe('invalid-options-before-default', () => sw.register('worker.js', {
+    get type() { log.push('type'); return null; }
+  }), log);
+  return rows;
+})().then(rows => { globalThis.serviceWorkerOptionsResult = rows; });
+"#,
+    )
+    .expect("ServiceWorkerContainer.register argument and policy probes should evaluate");
+    let result = vm
+        .eval("JSON.stringify(globalThis.serviceWorkerOptionsResult)")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+        serde_json::json!([
+            [
+                "blocked-after-options",
+                true,
+                "TypeError",
+                ["script", "scope", "type", "cache", "returned"]
+            ],
+            [
+                "options-exception-before-policy",
+                true,
+                "sentinel",
+                ["scope", "returned"]
+            ],
+            ["script-exception", true, "sentinel", ["script", "returned"]],
+            [
+                "trusted-input",
+                true,
+                "TypeError",
+                ["scope", "type", "cache", "returned"]
+            ],
+            [
+                "default-after-options",
+                true,
+                "TypeError",
+                [
+                    "script",
+                    "scope",
+                    "type",
+                    "cache",
+                    [
+                        "policy",
+                        "worker�.js",
+                        "TrustedScriptURL",
+                        "ServiceWorkerContainer register"
+                    ],
+                    "returned"
+                ]
+            ],
+            [
+                "default-exception",
+                true,
+                "sentinel",
+                [
+                    "scope",
+                    "type",
+                    "cache",
+                    [
+                        "policy",
+                        "worker.js",
+                        "TrustedScriptURL",
+                        "ServiceWorkerContainer register"
+                    ],
+                    "returned"
+                ]
+            ],
+            [
+                "invalid-options-before-default",
+                true,
+                "TypeError",
+                ["type", "returned"]
+            ]
+        ])
+    );
+}
+
+#[test]
+fn svg_script_href_base_val_uses_the_owner_reflected_trusted_script_url_sink() {
+    let mut vm = new_storage_test_vm("https://svg-script-href-trusted-types.test/");
+    vm.set_response_content_security_policies(&["require-trusted-types-for 'script'".to_owned()]);
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const violations = [];
+  document.addEventListener("securitypolicyviolation", event => {
+    violations.push({
+      blockedURI: event.blockedURI,
+      effectiveDirective: event.effectiveDirective,
+      sample: event.sample
+    });
+  });
+  globalThis.__svgScriptHrefViolations = violations;
+
+  const svgScript = document.createElementNS("http://www.w3.org/2000/svg", "script");
+  const href = svgScript.href;
+  let illegalConstructor = false;
+  try {
+    new SVGAnimatedString();
+  } catch (error) {
+    illegalConstructor = error instanceof TypeError;
+  }
+  let plainRejected = false;
+  try {
+    href.baseVal = "plain.js";
+  } catch (error) {
+    plainRejected = error instanceof TypeError;
+  }
+  const rejectedAttribute = svgScript.getAttribute("href");
+
+  const explicit = trustedTypes.createPolicy("svg-script-href", {
+    createScriptURL: value => value
+  });
+  href.baseVal = explicit.createScriptURL("trusted.js");
+  const trustedValues = [
+    svgScript.getAttribute("href"),
+    href.baseVal,
+    href.animVal
+  ];
+  svgScript.setAttribute("href", explicit.createScriptURL("attribute.js"));
+  const externallySynced = [href.baseVal, href.animVal];
+  const className = svgScript.className;
+  className.baseVal = explicit.createScriptURL("trusted-class");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  const useHref = use.href;
+  useHref.baseVal = explicit.createScriptURL("trusted-use");
+
+  const defaultCalls = [];
+  trustedTypes.createPolicy("default", {
+    createScriptURL: (value, type, sink) => {
+      defaultCalls.push([value, type, sink]);
+      return `safe-${value}`;
+    }
+  });
+  href.baseVal = "default-input";
+  className.baseVal = "plain-class";
+  useHref.baseVal = "plain-use";
+
+  return JSON.stringify({
+    shape: [
+      href instanceof SVGAnimatedString,
+      Object.prototype.toString.call(href),
+      svgScript.href === href,
+      illegalConstructor
+    ],
+    plainRejected,
+    rejectedAttribute,
+    trustedValues,
+    externallySynced,
+    ordinaryAnimatedStrings: [
+      className instanceof SVGAnimatedString,
+      svgScript.className === className,
+      className.baseVal,
+      className.animVal,
+      svgScript.getAttribute("class"),
+      useHref instanceof SVGAnimatedString,
+      use.href === useHref,
+      useHref.baseVal,
+      useHref.animVal,
+      use.getAttribute("href")
+    ],
+    defaulted: [svgScript.getAttribute("href"), href.baseVal, href.animVal],
+    defaultCalls,
+    violations
+  });
+})()
+"#,
+        )
+        .expect("SVGScriptElement href Trusted Types sink probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"shape":[true,"[object SVGAnimatedString]",true,true],"plainRejected":true,"rejectedAttribute":null,"trustedValues":["trusted.js","trusted.js","trusted.js"],"externallySynced":["attribute.js","attribute.js"],"ordinaryAnimatedStrings":[true,true,"plain-class","plain-class","plain-class",true,true,"plain-use","plain-use","plain-use"],"defaulted":["safe-default-input","safe-default-input","safe-default-input"],"defaultCalls":[["default-input","TrustedScriptURL","SVGScriptElement href"]],"violations":[]}"#
+    );
+
+    assert_eq!(
+        drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm),
+        1
+    );
+    assert_eq!(
+        vm.eval("JSON.stringify(globalThis.__svgScriptHrefViolations)")
+            .expect("queued SVGScriptElement href violation should be observable"),
+        r#"[{"blockedURI":"trusted-types-sink","effectiveDirective":"require-trusted-types-for","sample":"SVGScriptElement href|plain.js"}]"#
+    );
+}
+
+#[test]
+fn transformed_trusted_script_rejection_does_not_report_a_sink_mismatch() {
+    let mut vm = new_storage_test_vm("https://trusted-script-compilation.test/");
+    vm.set_response_content_security_policies(&[
+        "script-src 'unsafe-eval'; require-trusted-types-for 'script'".to_owned(),
+    ]);
+    assert_eq!(vm.eval(r#"
+        globalThis.compilationReports = [];
+        document.addEventListener('securitypolicyviolation', e => compilationReports.push(e.blockedURI));
+        trustedTypes.createPolicy('default', {createScript: source => source + ' '});
+        (() => {
+            let rejected = 0;
+            for (const compile of [() => eval('1'), () => Function('return 1;')]) {
+                try { compile(); } catch (error) {
+                    if (!(error instanceof EvalError)) throw error;
+                    rejected++;
+                }
+            }
+            return rejected;
+        })()
+    "#).unwrap(), "2");
+    let _ = drain_pre_domcontentloaded_non_script_page_tasks_for_test(&mut vm);
+    assert_eq!(vm.eval("JSON.stringify(compilationReports)").unwrap(), "[]");
+}
+
+#[test]
+fn trusted_types_invalid_name_directives_preserve_sink_requirements() {
+    for invalid in ['\0', '\u{000b}', '\u{001f}', '\u{007f}', '\u{00a0}'] {
+        let mut vm = new_storage_test_vm("https://trusted-types-invalid-directive.test/");
+        let policy = format!("trusted-types *{invalid}; require-trusted-types-for 'script'");
+        vm.set_response_content_security_policies(std::slice::from_ref(&policy));
+        let result = vm
+            .eval(
+                r#"(() => {
+                const first = trustedTypes.createPolicy('unlisted', {createHTML: value => value});
+                const element = document.createElement('div');
+                let errorName = 'none';
+                try { element.innerHTML = '<i>untrusted</i>'; }
+                catch (error) { errorName = error.name; }
+                element.innerHTML = first.createHTML('<b>trusted</b>');
+                return [errorName, element.innerHTML].join('|');
+            })()"#,
+            )
+            .expect("discarding an invalid name directive must retain valid sink requirements");
+        assert_eq!(result, "TypeError|<b>trusted</b>", "{policy:?}");
+    }
 }

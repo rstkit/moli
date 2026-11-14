@@ -14,7 +14,7 @@ use moli_fetch::{
 
 pub(crate) fn send_content_security_policy_reports_for_window(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     document_owner: crate::frame_owner_model::FrameDocumentTaskOwner,
     owner_child_window: Option<DomHandle>,
     fields: &ContentSecurityPolicyViolationEventFields<'_>,
@@ -44,7 +44,7 @@ pub(crate) fn send_content_security_policy_reports_for_window(
 
 pub(crate) fn send_content_security_policy_reports_for_lightweight_popup(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     popup_id: u64,
     document_owner: crate::native_bridge::LightweightPopupDocumentOwner,
     fields: &ContentSecurityPolicyViolationEventFields<'_>,
@@ -101,6 +101,7 @@ pub(crate) struct WindowCspReportRequestContext {
     request_client: ResourceRequestClient,
     frame_id: Option<String>,
     document_url: url::Url,
+    request_origin: moli_url::WebOrigin,
     network_partition_key: Option<String>,
     policy_context: crate::types::SubresourcePolicyContext,
     client_id: crate::service_worker_runtime::ServiceWorkerClientId,
@@ -127,7 +128,7 @@ impl WindowCspReportRequestContext {
 
 pub(crate) fn capture_window_csp_report_request_context(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     dispatch_scope: crate::native_bridge::OwnerDispatchScope,
 ) -> Option<WindowCspReportRequestContext> {
     let document_owner = match dispatch_scope {
@@ -158,7 +159,7 @@ pub(crate) fn capture_window_csp_report_request_context(
 }
 
 pub(crate) fn send_content_security_policy_violation_report_from_window_context(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     request_context: &WindowCspReportRequestContext,
     violation: &crate::document_runtime::DocumentContentSecurityPolicyViolation,
 ) {
@@ -173,7 +174,7 @@ pub(crate) fn send_content_security_policy_violation_report_from_window_context(
 }
 
 fn send_content_security_policy_reports_from_window_context(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     request_context: &WindowCspReportRequestContext,
     fields: &ContentSecurityPolicyViolationEventFields<'_>,
     report_uri_endpoints: &[String],
@@ -187,7 +188,7 @@ fn send_content_security_policy_reports_from_window_context(
 }
 
 fn send_content_security_policy_report_request(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     request_context: &WindowCspReportRequestContext,
     request: Request,
 ) {
@@ -197,6 +198,7 @@ fn send_content_security_policy_report_request(
 
     let request = request
         .with_initiator_url(&request_context.document_url)
+        .with_request_origin(request_context.request_origin.clone())
         .with_network_partition_key(request_context.network_partition_key.clone())
         .with_subframe_context(request_context.frame_id.is_some());
     let info = report_subresource_fetch_info(
@@ -232,6 +234,7 @@ fn send_content_security_policy_report_request(
         let load = request_context.register_report_load(None);
         host.record_pending_subresource_csp_report(
             request_context.identity,
+            request_context.request_origin.clone(),
             request_context.client_id,
             load,
             request_context.network_partition_key.clone(),
@@ -269,7 +272,7 @@ fn send_content_security_policy_report_request(
 }
 
 fn dispatch_service_worker_content_security_policy_report(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     request_context: &WindowCspReportRequestContext,
     info: PendingSubresourceFetchInfo,
     request: Request,
@@ -289,6 +292,7 @@ fn dispatch_service_worker_content_security_policy_report(
     let load = request_context.register_report_load(Some(cancel_handle.clone()));
     let internal_id = host.record_async_subresource_csp_report(
         request_context.identity,
+        request_context.request_origin.clone(),
         request_context.client_id,
         load,
         request_context.network_partition_key.clone(),
@@ -307,15 +311,15 @@ fn dispatch_service_worker_content_security_policy_report(
             ServiceWorkerRequestDestination::Report,
             request.request_mode,
             request.credentials_mode,
-            request.redirect_mode,
+            request.redirect_mode(),
             request.priority_hints.fetch_priority,
             service_worker_fetch_request_metadata(&request),
         ),
-        request_body_text: request_body_text.clone(),
         cors_preflight_request_headers: Vec::new(),
         request_cookie_report: info.request_cookie_report.clone(),
         network_context: AsyncSubresourceNetworkContext {
             frame_id: info.frame_id.clone(),
+            request_origin: request_context.request_origin.clone(),
             document_url: info.document_url.clone(),
             resource_type: SubresourceResourceType::CspReport,
             policy_context: request_context.policy_context,
@@ -336,19 +340,19 @@ fn dispatch_service_worker_content_security_policy_report(
                 internal_id,
                 request_url: request.url,
                 request_method: request.method,
-                request_headers: request.request_headers,
+                request_headers: request.request_headers.clone(),
                 request_body: request_body_text,
                 response_status_text: None,
                 skip_fetch_security_validation: true,
                 response_filter: Default::default(),
                 network_error_text: None,
-                result: Err("service worker csp report fetch dispatch failed".to_owned()),
+                result: Err("service worker csp report fetch dispatch failed".to_owned()).into(),
             });
     true
 }
 
 fn spawn_content_security_policy_report_fetch(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     request_client: ResourceRequestClient,
     request_context: &WindowCspReportRequestContext,
     info: PendingSubresourceFetchInfo,
@@ -359,6 +363,7 @@ fn spawn_content_security_policy_report_fetch(
     let task_runner = load.task_runner();
     let internal_id = host.record_async_subresource_csp_report(
         request_context.identity,
+        request_context.request_origin.clone(),
         request_context.client_id,
         load,
         request_context.network_partition_key.clone(),
@@ -376,13 +381,14 @@ fn spawn_content_security_policy_report_fetch(
         internal_id,
         AsyncSubresourceNetworkContext {
             frame_id: info.frame_id,
+            request_origin: request_context.request_origin.clone(),
             document_url: info.document_url,
             resource_type: SubresourceResourceType::CspReport,
             policy_context: request_context.policy_context,
         },
         request.url,
         request.method,
-        request.request_headers,
+        request.request_headers.clone(),
         request_body_text,
     );
 }
@@ -408,6 +414,9 @@ fn report_subresource_fetch_info(
         request_cookie_report: observe_subresource_request_cookie_report(
             request_client,
             document_url,
+            request
+                .browser_origin()
+                .expect("CSP reports carry an explicit origin"),
             &request.url,
             &request.method,
             RequestCredentialsMode::SameOrigin,
@@ -417,7 +426,7 @@ fn report_subresource_fetch_info(
 
 fn window_csp_report_request_context_for_identity(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &JsContextHost,
+    host: &PageScriptHost,
     identity: crate::native_bridge::WindowDocumentNetworkRequestIdentity,
 ) -> Option<WindowCspReportRequestContext> {
     if !host.window_document_owner_is_current_for_dispatch_scope(
@@ -434,8 +443,14 @@ fn window_csp_report_request_context_for_identity(
     let resource_loader = host
         .document_resource_loader_for_window_owner(identity.owner())?
         .clone();
-    let (frame_id, document_url) =
-        subresource_request_scope_for_owner(scope, host, identity.dispatch_scope())?;
+    let environment =
+        host.subresource_request_environment(&resource_loader, identity.dispatch_scope())?;
+    let crate::network::context::SubresourceRequestEnvironment {
+        document_url,
+        request_origin,
+        frame_id,
+        ..
+    } = environment;
     let client_id = match identity.dispatch_scope() {
         crate::native_bridge::OwnerDispatchScope::Top => {
             host.service_worker_client_id_for_window_fetch(None)
@@ -454,6 +469,7 @@ fn window_csp_report_request_context_for_identity(
         resource_loader,
         frame_id,
         document_url,
+        request_origin,
         network_partition_key: active_subresource_network_partition_key(
             host,
             identity.dispatch_scope(),
@@ -475,7 +491,7 @@ fn report_request_body_text(request: &Request) -> Option<String> {
 }
 
 fn record_content_security_policy_report_failure(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     info: PendingSubresourceFetchInfo,
     message: String,
 ) {

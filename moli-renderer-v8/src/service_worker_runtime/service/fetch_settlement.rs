@@ -19,32 +19,37 @@ fn service_worker_redirect_target(
     job: &ServiceWorkerFetchJob,
     response: &ServiceWorkerFetchResponse,
 ) -> Result<Option<Url>, String> {
-    if !is_redirect_status(response.status) {
+    if !is_redirect_status(response.head.status) {
         return Ok(None);
     }
     let Some(location) = response
+        .head
         .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("location"))
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| moli_fetch::encode_redirect_location(value))
     else {
         return Ok(None);
     };
-    if job.redirect_count >= MAX_SERVICE_WORKER_SYNTHETIC_REDIRECTS {
+    if job.request.redirect_count() >= MAX_SERVICE_WORKER_SYNTHETIC_REDIRECTS {
         return Err(format!(
             "redirect limit exceeded for {}",
-            response.final_url.as_ref().unwrap_or(&job.request_url)
+            response
+                .head
+                .metadata
+                .final_url()
+                .unwrap_or(&job.request.url)
         ));
     }
-    if let Ok(url) = Url::parse(location) {
+    if let Ok(url) = Url::parse(&location) {
         return Ok(Some(url));
     }
-    let Some(base_url) = response.final_url.as_ref() else {
+    let Some(base_url) = response.head.metadata.final_url() else {
         return Err(format!(
             "failed to resolve redirect location `{location}` for a generated response without a response URL"
         ));
     };
-    base_url.join(location).map(Some).map_err(|error| {
+    base_url.join(&location).map(Some).map_err(|error| {
         format!("failed to resolve redirect location `{location}` from {base_url}: {error}")
     })
 }
@@ -53,59 +58,45 @@ fn fetch_request_for_job(job: &ServiceWorkerFetchJob) -> ServiceWorkerFetchReque
     ServiceWorkerFetchRequest {
         client_id: job.client_id,
         resulting_client_id: job.resulting_client_id,
-        url: job.request_url.clone(),
-        method: job.request_method.clone(),
-        headers: job.request_headers.clone(),
-        body: job.request_body_bytes.clone(),
+        url: job.request.url.clone(),
+        method: job.request.method.clone(),
+        headers: job.request.request_headers.to_byte_strings(),
+        body: job.request.body.clone(),
         destination: job.destination,
-        request_mode: job.request_mode,
-        credentials_mode: job.credentials_mode,
-        redirect_mode: job.redirect_mode,
-        priority: job.priority,
+        request_mode: job.request.request_mode,
+        credentials_mode: job.request.credentials_mode,
+        redirect_mode: job.request.redirect_mode(),
+        priority: job.request.priority_hints.fetch_priority,
         is_reload: job.is_reload,
         metadata: job.metadata.clone(),
     }
 }
 
-fn service_worker_network_fallback_request_for_job(
+pub(super) fn service_worker_network_fallback_request_for_job(
     job: &ServiceWorkerFetchJob,
-) -> Result<moli_fetch::Request, String> {
-    let request = moli_fetch::Request::new_bytes(
-        &job.request_method,
-        job.request_url.as_str(),
-        job.request_body_bytes.clone(),
-        job.request_headers.clone(),
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(configure_service_worker_network_fallback_request(
-        job, request,
-    ))
-}
-
-fn configure_service_worker_network_fallback_request(
-    job: &ServiceWorkerFetchJob,
-    request: moli_fetch::Request,
 ) -> moli_fetch::Request {
-    let mut request = request
-        .with_initiator_url(&job.network_context.document_url)
-        .with_request_mode(job.request_mode)
-        .with_credentials_mode(job.credentials_mode)
-        .with_redirect_mode(if service_worker_fetch_is_navigation_request(job) {
-            moli_fetch::RequestRedirectMode::Follow
-        } else {
-            job.redirect_mode
-        })
-        .with_fetch_priority_hint(job.priority)
+    // A worker may serve a response while offline or blocked. Enforce Page
+    // policy on the captured request only when falling back to the network.
+    let mut request = job
+        .request
+        .clone()
+        .with_page_network_policy()
+        .with_use_cors_preflight(job.metadata.use_cors_preflight)
         .with_browser_request_metadata(service_worker_fetch_browser_metadata(
             job.network_context.resource_type,
         ))
         .with_subframe_context(job.network_context.frame_id.is_some());
     if service_worker_fetch_is_navigation_request(job) {
+        let initiator_url = request.cookie_context.initiator_url.clone();
+        request = request.with_redirect_mode(moli_fetch::RequestRedirectMode::Follow);
         request = if job.network_context.frame_id.is_some() {
             request.with_subframe_navigation_cookie_context()
         } else {
             request.with_top_level_navigation_cookie_context()
         };
+        if let Some(initiator_url) = initiator_url {
+            request = request.with_initiator_url(&initiator_url);
+        }
     }
     if job.network_context.resource_type == crate::types::SubresourceResourceType::EventSource {
         request = request
@@ -120,17 +111,20 @@ fn service_worker_fetch_stream_response_head(
     response_head: &MaterializedServiceWorkerFetchResponseHead,
 ) -> moli_fetch::ResponseHead {
     moli_fetch::ResponseHead {
+        status_text: Some(response_head.status_text.clone()),
         final_url: response_head
-            .final_url
-            .clone()
-            .unwrap_or_else(|| job.request_url.clone()),
+            .metadata
+            .final_url()
+            .cloned()
+            .unwrap_or_else(|| job.request.url.clone()),
         status: response_head.status,
         headers: response_head.headers.clone(),
         request_cookie_report: job.request_cookie_report.clone(),
         cookie_set_reports: Vec::new(),
-        redirected: response_head.redirected || !job.redirect_chain.is_empty(),
-        redirect_chain: job.redirect_chain.clone(),
+        redirected: response_head.metadata.redirected || !job.request.redirect_chain().is_empty(),
+        redirect_chain: job.request.redirect_chain().to_vec(),
         from_cache: false,
+        cache_state: Default::default(),
         negotiated_http_version: None,
     }
 }
@@ -139,7 +133,10 @@ fn service_worker_fetch_can_forward_stream(
     job: &ServiceWorkerFetchJob,
     response_head: &MaterializedServiceWorkerFetchResponseHead,
 ) -> Result<bool, String> {
-    let final_url = response_head.final_url.as_ref().unwrap_or(&job.request_url);
+    let final_url = response_head
+        .metadata
+        .final_url()
+        .unwrap_or(&job.request.url);
     validate_service_worker_fetch_response_head_security_policy(
         job,
         final_url,
@@ -156,7 +153,10 @@ fn service_worker_fetch_can_forward_stream(
                 | crate::types::SubresourceResourceType::Video
         )
         && !is_redirect_status(response_head.status)
-        && matches!(response_head.response_type.as_str(), "default" | "basic")
+        && matches!(
+            response_head.metadata.response_type.as_str(),
+            "default" | "basic"
+        )
         && !service_worker_fetch_response_requires_body_security_policy(job))
 }
 
@@ -166,41 +166,30 @@ fn apply_service_worker_synthetic_redirect(
     next_url: Url,
 ) -> Result<(), String> {
     let from_url = response
-        .final_url
-        .unwrap_or_else(|| job.request_url.clone());
-    job.redirect_chain.push(moli_fetch::RedirectInfo {
-        from_url,
-        to_url: next_url.clone(),
-        status: response.status,
-        headers: response.headers,
-        network_extra_info_available: false,
-        request_extra_info: None,
-        response_extra_info: None,
-        redirect_has_extra_info: false,
-        request_cookie_report: job.request_cookie_report.take(),
-        cookie_set_reports: Vec::new(),
-        from_cache: false,
-        negotiated_http_version: None,
-    });
-    job.redirect_count += 1;
-
-    let mut request = moli_fetch::Request::new_bytes(
-        &job.request_method,
-        job.request_url.as_str(),
-        job.request_body_bytes.clone(),
-        job.request_headers.clone(),
-    )
-    .map_err(|error| error.to_string())?;
-    request.apply_redirect_status(response.status);
-    job.request_method = request.method;
-    job.request_headers = request.request_headers;
-    job.request_body_bytes = request.body;
-    job.request_body = job
-        .request_body_bytes
-        .as_ref()
-        .map(|body| String::from_utf8_lossy(body).into_owned());
-    job.cors_preflight_request_headers = job.request_headers.clone();
-    job.request_url = next_url;
+        .head
+        .metadata
+        .final_url()
+        .cloned()
+        .unwrap_or_else(|| job.request.url.clone());
+    job.request
+        .follow_redirect(moli_fetch::RedirectInfo {
+            source: moli_fetch::RedirectSource::ServiceWorker,
+            from_url,
+            to_url: next_url.clone(),
+            status: response.head.status,
+            headers: response.head.headers,
+            network_extra_info_available: false,
+            request_extra_info: None,
+            dispatched_request: None,
+            response_extra_info: None,
+            redirect_has_extra_info: false,
+            request_cookie_report: job.request_cookie_report.take(),
+            cookie_set_reports: Vec::new(),
+            from_cache: false,
+            negotiated_http_version: None,
+        })
+        .map_err(|error| error.to_string())?;
+    job.cors_preflight_request_headers = job.request.request_headers.to_byte_strings();
     Ok(())
 }
 
@@ -227,10 +216,6 @@ impl ServiceWorkerRuntimeService {
         let completion_tx =
             crate::page_task_queue::RendererResourceCompletionSender::direct_completion_only();
         let (direct_completion_tx, direct_completion_rx) = tokio::sync::oneshot::channel();
-        let request_body_text = request
-            .body
-            .as_ref()
-            .map(|body| String::from_utf8_lossy(body).into_owned());
         let dispatch = ServiceWorkerFetchDispatch {
             internal_id: 0,
             request: ServiceWorkerFetchRequest {
@@ -238,21 +223,24 @@ impl ServiceWorkerRuntimeService {
                 resulting_client_id: Some(client_id),
                 url: request.url.clone(),
                 method: request.method.clone(),
-                headers: request.request_headers.clone(),
+                headers: request.request_headers.to_byte_strings(),
                 body: request.body.clone(),
                 destination,
                 request_mode: request.request_mode,
                 credentials_mode: request.credentials_mode,
-                redirect_mode: request.redirect_mode,
+                redirect_mode: request.redirect_mode(),
                 priority: request.priority_hints.fetch_priority,
                 is_reload: false,
                 metadata: service_worker_fetch_request_metadata(request),
             },
-            request_body_text,
             cors_preflight_request_headers: Vec::new(),
             request_cookie_report: None,
             network_context: crate::types::AsyncSubresourceNetworkContext {
                 frame_id: None,
+                request_origin: request
+                    .browser_origin()
+                    .map_err(|error| error.to_string())?
+                    .clone(),
                 document_url: request.url.clone(),
                 resource_type: crate::types::SubresourceResourceType::Script,
                 policy_context: Default::default(),
@@ -281,7 +269,7 @@ impl ServiceWorkerRuntimeService {
     pub(super) fn dispatch_fetch_fallback(&self, mut job: ServiceWorkerFetchJob) {
         job.cancel_pending_navigation_preload();
         if let Some(completion_tx) = job.direct_completion_tx.take() {
-            if job.redirect_count != 0 {
+            if job.request.redirect_count() > job.initial_redirect_count {
                 self.dispatch_direct_fetch_network_fallback(job, completion_tx);
                 return;
             }
@@ -289,32 +277,20 @@ impl ServiceWorkerRuntimeService {
             return;
         }
         let request_client = job.request_client.clone();
-        let request = match moli_fetch::Request::new_bytes(
-            &job.request_method,
-            job.request_url.as_str(),
-            job.request_body_bytes.clone(),
-            job.request_headers.clone(),
-        ) {
-            Ok(request) => configure_service_worker_network_fallback_request(&job, request),
-            Err(error) => {
-                self.complete_fetch_with_failure(job, error.to_string());
-                return;
-            }
-        };
-        crate::network_host::spawn_async_subresource_fetch_with_redirect_chain(
+        let request = service_worker_network_fallback_request_for_job(&job);
+        crate::network_host::spawn_async_subresource_fetch(
             job.resource_task_runner.clone(),
             job.completion_tx,
             request_client,
             request,
             Some(job.cancel_handle),
             job.cors_preflight_request_headers,
-            job.redirect_chain,
             job.internal_id,
             job.network_context,
-            job.request_url,
-            job.request_method,
-            job.request_headers,
-            job.request_body,
+            job.request.url,
+            job.request.method,
+            job.request.request_headers.clone(),
+            request_body_text(&job.request.body),
         );
     }
 
@@ -324,15 +300,18 @@ impl ServiceWorkerRuntimeService {
         completion_tx: tokio::sync::oneshot::Sender<ServiceWorkerDirectFetchResult>,
     ) {
         let request_client = job.request_client.clone();
-        let request = match service_worker_network_fallback_request_for_job(&job) {
-            Ok(request) => request,
-            Err(message) => {
-                let _ = completion_tx.send(ServiceWorkerDirectFetchResult::Failure(message));
+        let request = service_worker_network_fallback_request_for_job(&job);
+        let cancel_handle = job.cancel_handle.clone();
+        let request_origin = match request.browser_origin() {
+            Ok(origin) => origin.clone(),
+            Err(error) => {
+                let _ =
+                    completion_tx.send(ServiceWorkerDirectFetchResult::Failure(error.to_string()));
                 return;
             }
         };
-        let cancel_handle = job.cancel_handle.clone();
-        let redirect_chain = job.redirect_chain.clone();
+        let request_mode = job.request.request_mode;
+        let credentials_mode = job.request.credentials_mode;
         job.resource_task_runner.spawn(async move {
             let result = match request_client
                 .fetch_raw_stream_with_cancel(request, cancel_handle)
@@ -343,13 +322,26 @@ impl ServiceWorkerRuntimeService {
             };
             let result = match result {
                 Ok(response) => {
-                    let mut head = response.head();
-                    if !redirect_chain.is_empty() {
-                        let mut combined_redirect_chain = redirect_chain;
-                        combined_redirect_chain.extend(head.redirect_chain);
-                        head.redirect_chain = combined_redirect_chain;
-                        head.redirected = true;
+                    let head = response.head();
+                    // This is a network response after a synthetic redirect,
+                    // not a worker-produced readable Response. Authorize CORS
+                    // before the direct consumer can trust an absent filter.
+                    if request_mode == moli_fetch::RequestMode::Cors
+                        && let Err(message) = crate::network_host::validate_cors_response_chain(
+                            &request_origin,
+                            &head,
+                            credentials_mode,
+                        )
+                    {
+                        let _ =
+                            completion_tx.send(ServiceWorkerDirectFetchResult::Failure(message));
+                        return;
                     }
+                    let response_filter = crate::network_host::network_response_filter(
+                        &request_origin,
+                        &head,
+                        request_mode,
+                    );
                     let body = response.clone_body_bytes();
                     let navigation_response =
                         crate::protocol_types::NavigationResponse::from_head_and_body(
@@ -359,7 +351,7 @@ impl ServiceWorkerRuntimeService {
                         );
                     ServiceWorkerDirectFetchResult::Response(ServiceWorkerDirectFetchResponse {
                         response: Box::new(navigation_response),
-                        response_filter: None,
+                        response_filter,
                     })
                 }
                 Err(error) => ServiceWorkerDirectFetchResult::Failure(error.to_string()),
@@ -408,11 +400,15 @@ impl ServiceWorkerRuntimeService {
                 job.completion_tx.clone(),
                 AsyncSubresourceFetchEvent::StreamingStarted(Box::new(
                     AsyncSubresourceStreamingStarted {
+                        skip_fetch_security_validation: true,
+                        response_filter: service_worker_response_type_filter(
+                            &started.response_head.metadata,
+                        ),
                         internal_id: job.internal_id,
-                        request_url: job.request_url.clone(),
-                        request_method: job.request_method.clone(),
-                        request_headers: job.request_headers.clone(),
-                        request_body: job.request_body.clone(),
+                        request_url: job.request.url.clone(),
+                        request_method: job.request.method.clone(),
+                        request_headers: job.request.request_headers.clone(),
+                        request_body: request_body_text(&job.request.body),
                         body_source_id: started.body_source_id,
                         network_request_headers: None,
                         head: service_worker_fetch_stream_response_head(
@@ -535,8 +531,9 @@ impl ServiceWorkerRuntimeService {
         response: ServiceWorkerFetchResponse,
     ) {
         job.cancel_pending_navigation_preload();
-        if is_redirect_status(response.status)
-            && response.response_type == "opaqueredirect"
+        if is_redirect_status(response.head.status)
+            && response.head.metadata.response_type
+                == crate::types::FetchResponseType::OpaqueRedirect
             && service_worker_fetch_is_navigation_request(&job)
         {
             match service_worker_redirect_target(&job, &response) {
@@ -564,11 +561,11 @@ impl ServiceWorkerRuntimeService {
                 }
             }
         }
-        if is_redirect_status(response.status)
-            && job.redirect_mode != moli_fetch::RequestRedirectMode::Manual
+        if is_redirect_status(response.head.status)
+            && job.request.redirect_mode() != moli_fetch::RequestRedirectMode::Manual
         {
             match service_worker_redirect_target(&job, &response) {
-                Ok(Some(next_url)) => match job.redirect_mode {
+                Ok(Some(next_url)) => match job.request.redirect_mode() {
                     moli_fetch::RequestRedirectMode::Error => {
                         self.complete_fetch_with_network_failure(
                             job,
@@ -614,9 +611,11 @@ impl ServiceWorkerRuntimeService {
             return;
         }
         let final_url = response
-            .final_url
-            .clone()
-            .unwrap_or_else(|| job.request_url.clone());
+            .head
+            .metadata
+            .final_url()
+            .cloned()
+            .unwrap_or_else(|| job.request.url.clone());
         if let Err(message) =
             validate_service_worker_fetch_response_security_policy(&job, &response, &final_url)
         {
@@ -626,14 +625,17 @@ impl ServiceWorkerRuntimeService {
         let response_filter = service_worker_fetch_response_filter(&response);
         let navigation_response = crate::protocol_types::NavigationResponse::from_head_and_body(
             moli_fetch::ResponseHead {
+                status_text: Some(response.head.status_text.clone()),
                 final_url,
-                status: response.status,
-                headers: response.headers,
+                status: response.head.status,
+                headers: response.head.headers,
                 request_cookie_report: job.request_cookie_report,
                 cookie_set_reports: Vec::new(),
-                redirected: response.redirected || !job.redirect_chain.is_empty(),
-                redirect_chain: job.redirect_chain,
+                redirected: response.head.metadata.redirected
+                    || !job.request.redirect_chain().is_empty(),
+                redirect_chain: job.request.redirect_chain().to_vec(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             String::from_utf8_lossy(&response.body).into_owned(),
@@ -662,15 +664,15 @@ impl ServiceWorkerRuntimeService {
             .completion_tx
             .send_async_subresource(AsyncSubresourceFetchCompletion {
                 internal_id: job.internal_id,
-                request_url: job.request_url,
-                request_method: job.request_method,
-                request_headers: job.request_headers,
-                request_body: job.request_body,
-                response_status_text: Some(response.status_text),
+                request_url: job.request.url,
+                request_method: job.request.method,
+                request_headers: job.request.request_headers.clone(),
+                request_body: request_body_text(&job.request.body),
+                response_status_text: Some(response.head.status_text),
                 skip_fetch_security_validation: true,
                 response_filter,
                 network_error_text: None,
-                result: Ok(navigation_response),
+                result: Ok(navigation_response).into(),
             });
     }
 
@@ -715,15 +717,15 @@ impl ServiceWorkerRuntimeService {
             .completion_tx
             .send_async_subresource(AsyncSubresourceFetchCompletion {
                 internal_id: job.internal_id,
-                request_url: job.request_url,
-                request_method: job.request_method,
-                request_headers: job.request_headers,
-                request_body: job.request_body,
+                request_url: job.request.url,
+                request_method: job.request.method,
+                request_headers: job.request.request_headers.clone(),
+                request_body: request_body_text(&job.request.body),
                 response_status_text: None,
                 skip_fetch_security_validation: false,
                 response_filter: None,
                 network_error_text,
-                result: Err(message),
+                result: Err(message).into(),
             });
     }
 }
@@ -749,7 +751,7 @@ fn matches_service_worker_respond_with_fetch_failure(message: &str) -> bool {
         || message.starts_with("failed to resolve redirect location `")
 }
 
-fn service_worker_fetch_browser_metadata(
+pub(super) fn service_worker_fetch_browser_metadata(
     resource_type: crate::types::SubresourceResourceType,
 ) -> moli_fetch::BrowserRequestMetadata {
     match resource_type {
@@ -767,6 +769,7 @@ fn service_worker_fetch_browser_metadata(
             moli_fetch::BrowserRequestMetadata::Manifest
         }
         crate::types::SubresourceResourceType::Xhr => moli_fetch::BrowserRequestMetadata::Xhr,
+        crate::types::SubresourceResourceType::Script => moli_fetch::BrowserRequestMetadata::Script,
         _ => moli_fetch::BrowserRequestMetadata::Fetch,
     }
 }
@@ -784,13 +787,17 @@ fn validate_service_worker_fetch_response_security_policy(
     final_url: &Url,
 ) -> Result<(), String> {
     validate_service_worker_fetch_response_body_security_policy(job, response, final_url)?;
-    validate_service_worker_fetch_response_head_security_policy(job, final_url, &response.headers)
+    validate_service_worker_fetch_response_head_security_policy(
+        job,
+        final_url,
+        &response.head.headers,
+    )
 }
 
 fn service_worker_fetch_response_requires_body_security_policy(
     job: &ServiceWorkerFetchJob,
 ) -> bool {
-    job.request_mode == moli_fetch::RequestMode::NoCors
+    job.request.request_mode == moli_fetch::RequestMode::NoCors
         && matches!(
             job.network_context.resource_type,
             crate::types::SubresourceResourceType::Fetch
@@ -803,7 +810,7 @@ fn validate_service_worker_fetch_response_body_security_policy(
     response: &ServiceWorkerFetchResponse,
     final_url: &Url,
 ) -> Result<(), String> {
-    if job.request_mode != moli_fetch::RequestMode::NoCors
+    if job.request.request_mode != moli_fetch::RequestMode::NoCors
         || !matches!(
             job.network_context.resource_type,
             crate::types::SubresourceResourceType::Fetch
@@ -813,23 +820,27 @@ fn validate_service_worker_fetch_response_body_security_policy(
         return Ok(());
     }
 
-    crate::network_host::validate_fetch_response_security_policy_with_body(
-        &job.network_context.document_url,
+    validate_service_worker_fetch_response_head_security_policy(
+        job,
         final_url,
-        &response.headers,
+        &response.head.headers,
+    )?;
+    crate::network_host::validate_opaque_response_blocking_with_body(
+        job.request
+            .browser_origin()
+            .map_err(|error| error.to_string())?,
+        final_url,
+        &response.head.headers,
         &response.body,
-        job.request_mode,
-        job.credentials_mode,
-        job.network_context.policy_context,
     )
 }
 
 fn validate_service_worker_fetch_response_head_security_policy(
     job: &ServiceWorkerFetchJob,
     final_url: &Url,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    if job.request_mode != moli_fetch::RequestMode::NoCors
+    if job.request.request_mode != moli_fetch::RequestMode::NoCors
         || matches!(
             job.network_context.resource_type,
             crate::types::SubresourceResourceType::WebSocket
@@ -838,17 +849,17 @@ fn validate_service_worker_fetch_response_head_security_policy(
         return Ok(());
     }
 
-    crate::network_host::validate_cross_origin_resource_policy(
-        &job.network_context.document_url,
-        final_url,
-        headers,
-    )?;
+    let origin = job
+        .request
+        .browser_origin()
+        .map_err(|error| error.to_string())?;
+    crate::network_host::validate_cross_origin_resource_policy(origin, final_url, headers)?;
     crate::network_host::validate_cross_origin_embedder_and_document_isolation_policy(
-        &job.network_context.document_url,
+        origin,
         final_url,
         headers,
-        job.request_mode,
-        job.credentials_mode,
+        job.request.request_mode,
+        job.request.credentials_mode,
         job.network_context
             .policy_context
             .cross_origin_embedder_policy,
@@ -860,11 +871,11 @@ fn service_worker_fetch_response_rejection(
     job: &ServiceWorkerFetchJob,
     response: &ServiceWorkerFetchResponse,
 ) -> Option<String> {
-    match response.response_type.as_str() {
+    match response.head.metadata.response_type.as_str() {
         "error" => {
             return Some("FetchEvent.respondWith rejected an error Response".to_owned());
         }
-        "cors" if job.request_mode == moli_fetch::RequestMode::SameOrigin => {
+        "cors" if job.request.request_mode == moli_fetch::RequestMode::SameOrigin => {
             return Some(
                 "FetchEvent.respondWith rejected a cors Response for a same-origin request"
                     .to_owned(),
@@ -873,14 +884,16 @@ fn service_worker_fetch_response_rejection(
         "opaque" => {
             if let Some(message) =
                 crate::service_worker_runtime::service_worker_opaque_response_rejection(
-                    job.request_mode,
+                    job.request.request_mode,
                     job.destination,
                 )
             {
                 return Some(message);
             }
         }
-        "opaqueredirect" if job.redirect_mode != moli_fetch::RequestRedirectMode::Manual => {
+        "opaqueredirect"
+            if job.request.redirect_mode() != moli_fetch::RequestRedirectMode::Manual =>
+        {
             return Some(
                 "FetchEvent.respondWith rejected an opaqueredirect Response for a request whose redirect mode is not manual"
                     .to_owned(),
@@ -888,7 +901,9 @@ fn service_worker_fetch_response_rejection(
         }
         _ => {}
     }
-    if response.redirected && job.redirect_mode != moli_fetch::RequestRedirectMode::Follow {
+    if response.head.metadata.redirected
+        && job.request.redirect_mode() != moli_fetch::RequestRedirectMode::Follow
+    {
         return Some(
             "FetchEvent.respondWith rejected a redirected Response for a request whose redirect mode is not follow"
                 .to_owned(),
@@ -900,14 +915,18 @@ fn service_worker_fetch_response_rejection(
 fn service_worker_fetch_response_filter(
     response: &ServiceWorkerFetchResponse,
 ) -> Option<AsyncSubresourceFetchResponseFilter> {
-    match response.response_type.as_str() {
-        "opaque" => Some(AsyncSubresourceFetchResponseFilter::Opaque),
-        "opaqueredirect" => Some(AsyncSubresourceFetchResponseFilter::OpaqueRedirect),
-        _ if is_redirect_status(response.status) => {
-            Some(AsyncSubresourceFetchResponseFilter::OpaqueRedirect)
-        }
-        _ => None,
+    let mut metadata = response.head.metadata.clone();
+    if is_redirect_status(response.head.status) && metadata.response_type.is_readable() {
+        metadata.response_type = crate::types::FetchResponseType::OpaqueRedirect;
     }
+    service_worker_response_type_filter(&metadata)
+}
+
+fn service_worker_response_type_filter(
+    metadata: &moli_fetch_types::FetchResponseMetadata,
+) -> Option<AsyncSubresourceFetchResponseFilter> {
+    (metadata.response_type != crate::types::FetchResponseType::Error)
+        .then(|| AsyncSubresourceFetchResponseFilter::service_worker(metadata.clone()))
 }
 
 #[cfg(test)]
@@ -1151,28 +1170,35 @@ mod tests {
         state.pending_fetch_jobs.insert(
             event_id,
             ServiceWorkerFetchJob {
+                initial_redirect_count: 0,
+                request: {
+                    let origin = moli_url::WebOrigin::from_url(&document_url);
+                    let initiator = (document_url).clone();
+                    moli_fetch::Request::new_browser(
+                        "GET",
+                        request_url.clone(),
+                        None,
+                        vec![("accept".to_owned(), "text/plain".to_owned())],
+                        origin,
+                    )
+                    .with_initiator_url(&initiator)
+                    .with_request_mode(request_mode)
+                    .with_credentials_mode(moli_fetch::RequestCredentialsMode::SameOrigin)
+                    .with_redirect_mode(redirect_mode)
+                    .with_fetch_priority_hint(None)
+                },
                 internal_id,
                 owner: Some(ServiceWorkerRunOwner::new(version_id, run.clone())),
-                request_url: request_url.clone(),
-                request_method: "GET".to_owned(),
-                request_headers: vec![("accept".to_owned(), "text/plain".to_owned())],
-                request_body: None,
-                request_body_bytes: None,
                 cors_preflight_request_headers: Vec::new(),
                 client_id,
                 resulting_client_id: None,
                 destination,
                 is_reload: false,
                 metadata: Default::default(),
-                request_mode,
-                credentials_mode: moli_fetch::RequestCredentialsMode::SameOrigin,
-                redirect_mode,
-                priority: None,
-                redirect_chain: Vec::new(),
-                redirect_count: 0,
                 request_cookie_report: None,
                 network_context: AsyncSubresourceNetworkContext {
                     frame_id: None,
+                    request_origin: moli_url::WebOrigin::from_url(&document_url),
                     document_url,
                     resource_type,
                     policy_context: Default::default(),
@@ -1231,8 +1257,7 @@ mod tests {
             .remove(&event_id)
             .expect("EventSource service worker fetch job");
 
-        let request = service_worker_network_fallback_request_for_job(&job)
-            .expect("EventSource fallback request");
+        let request = service_worker_network_fallback_request_for_job(&job);
         assert_eq!(
             request.browser_request_metadata(),
             Some(moli_fetch::BrowserRequestMetadata::EventSource)
@@ -1262,12 +1287,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(final_url.clone()),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 202,
-                status_text: "Accepted".to_owned(),
-                headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(final_url.clone())).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 202,
+                    status_text: "Accepted".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
+                },
                 body: b"service-worker-body".to_vec(),
             }),
         });
@@ -1278,7 +1308,16 @@ mod tests {
         assert_eq!(completion.request_method, "GET");
         assert_eq!(completion.response_status_text.as_deref(), Some("Accepted"));
         assert!(completion.skip_fetch_security_validation);
-        assert_eq!(completion.response_filter, None);
+        assert_eq!(
+            completion.response_filter.as_ref().map(|filter| (
+                filter.response_type(),
+                filter
+                    .service_worker_metadata()
+                    .expect("SW response metadata")
+                    .timing_allow_passed,
+            )),
+            Some((crate::types::FetchResponseType::Basic, true))
+        );
         let response = completion
             .result
             .expect("service worker response should resolve");
@@ -1287,9 +1326,52 @@ mod tests {
         assert!(!response.redirected);
         assert_eq!(
             response.headers,
-            vec![("content-type".to_owned(), "text/plain".to_owned())]
+            vec![("content-type".to_owned(), b"text/plain".to_vec())]
         );
         assert_eq!(response.body_text(), "service-worker-body");
+    }
+
+    #[test]
+    fn xhr_upload_listener_preflight_survives_service_worker_network_fallback() {
+        let service = new_service_worker_runtime_service();
+        let event_id = ServiceWorkerEventId(211);
+        let completion_queue = crate::page_task_queue::RendererResourceCompletionTestHarness::new();
+        insert_active_fetch_job(
+            &service,
+            event_id,
+            ServiceWorkerVersionId(1),
+            &RendererServiceWorkerRunIdentity::fresh(),
+            311,
+            completion_queue.sender(),
+        );
+        let mut job = service
+            .inner
+            .state
+            .lock()
+            .pending_fetch_jobs
+            .remove(&event_id)
+            .unwrap();
+        job.network_context.resource_type = crate::types::SubresourceResourceType::Xhr;
+        job.metadata.use_cors_preflight = true;
+        let request = service_worker_network_fallback_request_for_job(&job);
+        assert!(request.use_cors_preflight());
+        let request_origin = moli_url::WebOrigin::from_url(&job.network_context.document_url);
+        let request_url = url("https://other.test/upload");
+        let preflight_headers = crate::network_host::cors_preflight_request_headers(
+            !request_origin.same_origin(&moli_url::WebOrigin::from_url(&request_url)),
+            &request_url,
+            "POST",
+            &[],
+            request.use_cors_preflight(),
+        )
+        .expect("upload listener should force the fallback's simple POST through OPTIONS");
+        assert_eq!(
+            preflight_headers,
+            vec![(
+                "Access-Control-Request-Method".to_owned(),
+                "POST".to_owned()
+            )]
+        );
     }
 
     #[test]
@@ -1318,12 +1400,16 @@ mod tests {
                 run.clone(),
             ),
             body_source_id,
-            response_head: MaterializedServiceWorkerFetchResponseHead {
-                final_url: Some(final_url.clone()),
-                response_type: "default".to_owned(),
-                redirected: false,
+            response_head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: (Some(final_url.clone())).into_iter().collect(),
+                    redirected: false,
+                },
                 status: 202,
-                headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                status_text: "Accepted".to_owned(),
+                headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
             },
         });
 
@@ -1356,12 +1442,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(final_url),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 202,
-                status_text: "Accepted".to_owned(),
-                headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(final_url)).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 202,
+                    status_text: "Accepted".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
+                },
                 body: b"AB".to_vec(),
             }),
         });
@@ -1402,12 +1493,16 @@ mod tests {
                 run.clone(),
             ),
             body_source_id,
-            response_head: MaterializedServiceWorkerFetchResponseHead {
-                final_url: Some(final_url),
-                response_type: "default".to_owned(),
-                redirected: false,
+            response_head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: (Some(final_url)).into_iter().collect(),
+                    redirected: false,
+                },
                 status: 200,
-                headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+                status_text: "OK".to_owned(),
+                headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
             },
         });
         match pop_async_subresource_event(&mut completion_queue) {
@@ -1475,12 +1570,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "opaque".to_owned(),
-                redirected: false,
-                status: 0,
-                status_text: String::new(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Opaque,
+                        timing_allow_passed: false,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 0,
+                    status_text: String::new(),
+                    headers: Vec::new(),
+                },
                 body: Vec::new(),
             }),
         });
@@ -1488,8 +1588,14 @@ mod tests {
         let completion = pop_async_subresource_completion(&mut completion_queue);
         assert_eq!(completion.internal_id, 315);
         assert_eq!(
-            completion.response_filter,
-            Some(AsyncSubresourceFetchResponseFilter::Opaque)
+            completion.response_filter.as_ref().map(|filter| (
+                filter.response_type(),
+                filter
+                    .service_worker_metadata()
+                    .expect("SW response metadata")
+                    .timing_allow_passed,
+            )),
+            Some((crate::types::FetchResponseType::Opaque, false))
         );
         let response = completion
             .result
@@ -1520,12 +1626,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "opaqueredirect".to_owned(),
-                redirected: false,
-                status: 0,
-                status_text: String::new(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::OpaqueRedirect,
+                        timing_allow_passed: false,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 0,
+                    status_text: String::new(),
+                    headers: Vec::new(),
+                },
                 body: Vec::new(),
             }),
         });
@@ -1533,8 +1644,14 @@ mod tests {
         let completion = pop_async_subresource_completion(&mut completion_queue);
         assert_eq!(completion.internal_id, 316);
         assert_eq!(
-            completion.response_filter,
-            Some(AsyncSubresourceFetchResponseFilter::OpaqueRedirect)
+            completion.response_filter.as_ref().map(|filter| (
+                filter.response_type(),
+                filter
+                    .service_worker_metadata()
+                    .expect("SW response metadata")
+                    .timing_allow_passed,
+            )),
+            Some((crate::types::FetchResponseType::OpaqueRedirect, false))
         );
         let response = completion
             .result
@@ -1564,12 +1681,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(final_url.clone()),
-                response_type: "default".to_owned(),
-                redirected: true,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(final_url.clone())).into_iter().collect(),
+                        redirected: true,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: Vec::new(),
+                },
                 body: b"redirected-body".to_vec(),
             }),
         });
@@ -1607,12 +1729,19 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://example.test/app/manual-final.txt")),
-                response_type: "default".to_owned(),
-                redirected: true,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://example.test/app/manual-final.txt")))
+                            .into_iter()
+                            .collect(),
+                        redirected: true,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: Vec::new(),
+                },
                 body: b"manual-redirected-body".to_vec(),
             }),
         });
@@ -1655,15 +1784,20 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 302,
-                status_text: "Found".to_owned(),
-                headers: vec![(
-                    "location".to_owned(),
-                    "https://example.test/redirected.txt".to_owned(),
-                )],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 302,
+                    status_text: "Found".to_owned(),
+                    headers: vec![(
+                        "location".to_owned(),
+                        b"https://example.test/redirected.txt".to_vec(),
+                    )],
+                },
                 body: Vec::new(),
             }),
         });
@@ -1778,12 +1912,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 302,
-                status_text: "Found".to_owned(),
-                headers: vec![("location".to_owned(), "/manual-target.txt".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 302,
+                    status_text: "Found".to_owned(),
+                    headers: vec![("location".to_owned(), b"/manual-target.txt".to_vec())],
+                },
                 body: Vec::new(),
             }),
         });
@@ -1792,8 +1931,14 @@ mod tests {
         assert_eq!(completion.internal_id, 311);
         assert!(completion.skip_fetch_security_validation);
         assert_eq!(
-            completion.response_filter,
-            Some(AsyncSubresourceFetchResponseFilter::OpaqueRedirect)
+            completion.response_filter.as_ref().map(|filter| (
+                filter.response_type(),
+                filter
+                    .service_worker_metadata()
+                    .expect("SW response metadata")
+                    .timing_allow_passed,
+            )),
+            Some((crate::types::FetchResponseType::OpaqueRedirect, true))
         );
         let response = completion
             .result
@@ -1804,7 +1949,7 @@ mod tests {
         assert!(response.redirect_chain.is_empty());
         assert_eq!(
             response.headers,
-            vec![("location".to_owned(), "/manual-target.txt".to_owned())]
+            vec![("location".to_owned(), b"/manual-target.txt".to_vec())]
         );
     }
 
@@ -1839,15 +1984,20 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 302,
-                status_text: "Found".to_owned(),
-                headers: vec![(
-                    "Location".to_owned(),
-                    "https://example.test/app/next.txt".to_owned(),
-                )],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 302,
+                    status_text: "Found".to_owned(),
+                    headers: vec![(
+                        "Location".to_owned(),
+                        b"https://example.test/app/next.txt".to_vec(),
+                    )],
+                },
                 body: Vec::new(),
             }),
         });
@@ -1869,17 +2019,21 @@ mod tests {
             .expect("redirected fetch job should be pending");
         assert_eq!(redirected_job.internal_id, 312);
         assert_eq!(
-            redirected_job.request_url,
+            redirected_job.request.url,
             url("https://example.test/app/next.txt")
         );
-        assert_eq!(redirected_job.redirect_count, 1);
-        assert_eq!(redirected_job.redirect_chain.len(), 1);
+        assert_eq!(redirected_job.request.redirect_count(), 1);
+        assert_eq!(redirected_job.request.redirect_chain().len(), 1);
         assert_eq!(
-            redirected_job.redirect_chain[0].from_url,
+            redirected_job.request.redirect_chain()[0].source,
+            moli_fetch::RedirectSource::ServiceWorker
+        );
+        assert_eq!(
+            redirected_job.request.redirect_chain()[0].from_url,
             url("https://example.test/app/data.txt")
         );
         assert_eq!(
-            redirected_job.redirect_chain[0].to_url,
+            redirected_job.request.redirect_chain()[0].to_url,
             url("https://example.test/app/next.txt")
         );
     }
@@ -1890,31 +2044,38 @@ mod tests {
         let completion_queue = crate::page_task_queue::RendererResourceCompletionTestHarness::new();
         let request_url = url("https://example.test/app/post");
         let mut job = ServiceWorkerFetchJob {
+            initial_redirect_count: 0,
+            request: {
+                let origin = moli_url::WebOrigin::from_url(&request_url);
+                let initiator = request_url.clone();
+                moli_fetch::Request::new_browser(
+                    "POST",
+                    request_url.clone(),
+                    Some(bytes::Bytes::from_static(b"payload")),
+                    vec![
+                        ("content-type".to_owned(), "text/plain".to_owned()),
+                        ("x-keep".to_owned(), "yes".to_owned()),
+                    ],
+                    origin,
+                )
+                .with_initiator_url(&initiator)
+                .with_request_mode(moli_fetch::RequestMode::Cors)
+                .with_credentials_mode(moli_fetch::RequestCredentialsMode::SameOrigin)
+                .with_redirect_mode(moli_fetch::RequestRedirectMode::Follow)
+                .with_fetch_priority_hint(None)
+            },
             internal_id: 312,
             owner: Some(ServiceWorkerRunOwner::fresh(ServiceWorkerVersionId(1))),
-            request_url: request_url.clone(),
-            request_method: "POST".to_owned(),
-            request_headers: vec![
-                ("content-type".to_owned(), "text/plain".to_owned()),
-                ("x-keep".to_owned(), "yes".to_owned()),
-            ],
-            request_body: Some("payload".to_owned()),
-            request_body_bytes: Some(b"payload".to_vec()),
             cors_preflight_request_headers: Vec::new(),
             client_id: ServiceWorkerClientId::from_u64_for_test(0),
             resulting_client_id: None,
             destination: ServiceWorkerRequestDestination::Empty,
             is_reload: false,
             metadata: Default::default(),
-            request_mode: moli_fetch::RequestMode::Cors,
-            credentials_mode: moli_fetch::RequestCredentialsMode::SameOrigin,
-            redirect_mode: moli_fetch::RequestRedirectMode::Follow,
-            priority: None,
-            redirect_chain: Vec::new(),
-            redirect_count: 0,
             request_cookie_report: None,
             network_context: AsyncSubresourceNetworkContext {
                 frame_id: None,
+                request_origin: moli_url::WebOrigin::from_url(&request_url),
                 document_url: request_url.clone(),
                 resource_type: crate::types::SubresourceResourceType::Fetch,
                 policy_context: Default::default(),
@@ -1927,15 +2088,54 @@ mod tests {
             streaming_body_source_id: None,
             direct_completion_tx: None,
         };
+        let origin = moli_url::WebOrigin::from_url(&url("https://initiator.test/"));
+        job.request = job
+            .request
+            .with_request_origin(origin.clone())
+            .with_cache_mode(moli_fetch::RequestCacheMode::Validate)
+            .with_network_partition_key(Some("partition".to_owned()))
+            .without_inferred_referrer()
+            .with_fetch_priority_hint(Some(moli_fetch::FetchPriorityHint::High));
         let response = ServiceWorkerFetchResponse {
-            final_url: Some(request_url.clone()),
-            response_type: "default".to_owned(),
-            redirected: false,
-            status: 303,
-            status_text: "See Other".to_owned(),
-            headers: vec![("Location".to_owned(), "next".to_owned())],
+            head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: (Some(request_url.clone())).into_iter().collect(),
+                    redirected: false,
+                },
+                status: 303,
+                status_text: "See Other".to_owned(),
+                headers: vec![("Location".to_owned(), b"next".to_vec())],
+            },
             body: Vec::new(),
         };
+        for (location, expected) in [
+            (
+                b"next?utf8=\xe2\x98\x83".as_slice(),
+                "https://example.test/app/next?utf8=%E2%98%83",
+            ),
+            (
+                b"next?bad=\xff".as_slice(),
+                "https://example.test/app/next?bad=%FF",
+            ),
+            (
+                b"next?%e2%98%83\xe2\x98\x83".as_slice(),
+                "https://example.test/app/next?%e2%98%83%E2%98%83",
+            ),
+        ] {
+            let raw_response = ServiceWorkerFetchResponse {
+                head: moli_fetch_types::FetchResponseHead {
+                    headers: vec![("Location".to_owned(), location.to_vec())],
+                    ..response.head.clone()
+                },
+                ..response.clone()
+            };
+            assert_eq!(
+                service_worker_redirect_target(&job, &raw_response).unwrap(),
+                Some(url(expected))
+            );
+        }
         let next_url = service_worker_redirect_target(&job, &response)
             .expect("redirect target should resolve")
             .expect("redirect target should be present");
@@ -1944,20 +2144,41 @@ mod tests {
             .expect("synthetic redirect should apply");
 
         assert_eq!(next_url, url("https://example.test/app/next"));
-        assert_eq!(job.request_url, next_url);
-        assert_eq!(job.request_method, "GET");
-        assert_eq!(job.request_body, None);
-        assert_eq!(job.request_body_bytes, None);
+        assert_eq!(job.request.url, next_url);
+        assert_eq!(job.request.method, "GET");
+        assert_eq!(request_body_text(&job.request.body), None);
+        assert_eq!(job.request.body, None);
         assert_eq!(
-            job.request_headers,
-            vec![("x-keep".to_owned(), "yes".to_owned())]
+            job.request.request_headers.clone(),
+            vec![("x-keep".to_owned(), "yes".to_owned())].into()
         );
-        assert_eq!(job.cors_preflight_request_headers, job.request_headers);
-        assert_eq!(job.redirect_count, 1);
-        assert_eq!(job.redirect_chain.len(), 1);
-        assert_eq!(job.redirect_chain[0].from_url, request_url);
-        assert_eq!(job.redirect_chain[0].to_url, next_url);
-        assert_eq!(job.redirect_chain[0].status, 303);
+        assert_eq!(
+            job.cors_preflight_request_headers,
+            job.request.request_headers.to_byte_strings()
+        );
+        assert_eq!(job.request.redirect_count(), 1);
+        assert_eq!(job.request.redirect_chain().len(), 1);
+        assert_eq!(job.request.redirect_chain()[0].from_url, request_url);
+        assert_eq!(job.request.redirect_chain()[0].to_url, next_url);
+        assert_eq!(job.request.redirect_chain()[0].status, 303);
+
+        let fallback = service_worker_network_fallback_request_for_job(&job);
+        assert_eq!(fallback.url, next_url);
+        assert_eq!(fallback.method, "GET");
+        assert_eq!(fallback.body, None);
+        assert_eq!(fallback.request_headers, job.request.request_headers);
+        assert!(fallback.browser_origin().unwrap().same_origin(&origin));
+        assert_eq!(
+            fallback.cache_mode(),
+            moli_fetch::RequestCacheMode::Validate
+        );
+        assert_eq!(fallback.network_partition_key(), Some("partition"));
+        assert!(fallback.referrer_header_value(&fallback.url).is_none());
+        assert_eq!(
+            fallback.priority_hints.fetch_priority,
+            Some(moli_fetch::FetchPriorityHint::High)
+        );
+        assert_eq!(fallback.redirect_count(), 1);
     }
 
     #[test]
@@ -1981,12 +2202,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 302,
-                status_text: "Found".to_owned(),
-                headers: vec![("Location".to_owned(), "relative-target.txt".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 302,
+                    status_text: "Found".to_owned(),
+                    headers: vec![("Location".to_owned(), b"relative-target.txt".to_vec())],
+                },
                 body: Vec::new(),
             }),
         });
@@ -2028,12 +2254,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(response_url.clone()),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 302,
-                status_text: "Found".to_owned(),
-                headers: vec![("Location".to_owned(), "blank.html".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(response_url.clone())).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 302,
+                    status_text: "Found".to_owned(),
+                    headers: vec![("Location".to_owned(), b"blank.html".to_vec())],
+                },
                 body: Vec::new(),
             }),
         });
@@ -2059,14 +2290,17 @@ mod tests {
             .expect("redirected fetch job should be pending");
         assert_eq!(redirected_job.internal_id, 337);
         assert_eq!(
-            redirected_job.request_url,
+            redirected_job.request.url,
             url("https://redirect-source.test/resources/blank.html")
         );
-        assert_eq!(redirected_job.redirect_count, 1);
-        assert_eq!(redirected_job.redirect_chain.len(), 1);
-        assert_eq!(redirected_job.redirect_chain[0].from_url, response_url);
+        assert_eq!(redirected_job.request.redirect_count(), 1);
+        assert_eq!(redirected_job.request.redirect_chain().len(), 1);
         assert_eq!(
-            redirected_job.redirect_chain[0].to_url,
+            redirected_job.request.redirect_chain()[0].from_url,
+            response_url
+        );
+        assert_eq!(
+            redirected_job.request.redirect_chain()[0].to_url,
             url("https://redirect-source.test/resources/blank.html")
         );
     }
@@ -2092,12 +2326,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "error".to_owned(),
-                redirected: false,
-                status: 0,
-                status_text: String::new(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Error,
+                        timing_allow_passed: false,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 0,
+                    status_text: String::new(),
+                    headers: Vec::new(),
+                },
                 body: Vec::new(),
             }),
         });
@@ -2139,12 +2378,19 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cross-origin.test/data.txt")),
-                response_type: "cors".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Cors,
+                        timing_allow_passed: false,
+                        url_list: (Some(url("https://cross-origin.test/data.txt")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: Vec::new(),
+                },
                 body: Vec::new(),
             }),
         });
@@ -2185,12 +2431,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "opaque".to_owned(),
-                redirected: false,
-                status: 0,
-                status_text: String::new(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Opaque,
+                        timing_allow_passed: false,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 0,
+                    status_text: String::new(),
+                    headers: Vec::new(),
+                },
                 body: Vec::new(),
             }),
         });
@@ -2247,12 +2498,17 @@ mod tests {
                     run.clone(),
                 ),
                 result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                    final_url: None,
-                    response_type: "opaque".to_owned(),
-                    redirected: false,
-                    status: 0,
-                    status_text: String::new(),
-                    headers: Vec::new(),
+                    head: moli_fetch_types::FetchResponseHead {
+                        metadata: moli_fetch_types::FetchResponseMetadata {
+                            response_type: moli_fetch_types::FetchResponseType::Opaque,
+                            timing_allow_passed: false,
+                            url_list: (None).into_iter().collect(),
+                            redirected: false,
+                        },
+                        status: 0,
+                        status_text: String::new(),
+                        headers: Vec::new(),
+                    },
                     body: Vec::new(),
                 }),
             });
@@ -2294,18 +2550,25 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/image.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![
-                    ("content-type".to_owned(), "image/png".to_owned()),
-                    (
-                        "cross-origin-resource-policy".to_owned(),
-                        "same-origin".to_owned(),
-                    ),
-                ],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/image.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![
+                        ("content-type".to_owned(), b"image/png".to_vec()),
+                        (
+                            "cross-origin-resource-policy".to_owned(),
+                            b"same-origin".to_vec(),
+                        ),
+                    ],
+                },
                 body: b"blocked".to_vec(),
             }),
         });
@@ -2347,18 +2610,25 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/image.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![
-                    ("content-type".to_owned(), "image/png".to_owned()),
-                    (
-                        "cross-origin-resource-policy".to_owned(),
-                        "same-origin".to_owned(),
-                    ),
-                ],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/image.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![
+                        ("content-type".to_owned(), b"image/png".to_vec()),
+                        (
+                            "cross-origin-resource-policy".to_owned(),
+                            b"same-origin".to_vec(),
+                        ),
+                    ],
+                },
                 body: b"blocked".to_vec(),
             }),
         });
@@ -2410,12 +2680,19 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2469,12 +2746,19 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2527,18 +2811,25 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![
-                    ("content-type".to_owned(), "image/png".to_owned()),
-                    (
-                        "cross-origin-resource-policy".to_owned(),
-                        "cross-origin".to_owned(),
-                    ),
-                ],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![
+                        ("content-type".to_owned(), b"image/png".to_vec()),
+                        (
+                            "cross-origin-resource-policy".to_owned(),
+                            b"cross-origin".to_vec(),
+                        ),
+                    ],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2585,18 +2876,25 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![
-                    ("content-type".to_owned(), "image/png".to_owned()),
-                    (
-                        "cross-origin-resource-policy".to_owned(),
-                        "cross-origin".to_owned(),
-                    ),
-                ],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![
+                        ("content-type".to_owned(), b"image/png".to_vec()),
+                        (
+                            "cross-origin-resource-policy".to_owned(),
+                            b"cross-origin".to_vec(),
+                        ),
+                    ],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2637,19 +2935,26 @@ mod tests {
                 .policy_context
                 .cross_origin_embedder_policy =
                 crate::cross_origin_isolation::CrossOriginEmbedderPolicy::Credentialless;
-            job.credentials_mode = moli_fetch::RequestCredentialsMode::SameOrigin;
+            job.request.credentials_mode = moli_fetch::RequestCredentialsMode::SameOrigin;
         }
 
         service.finish_fetch_event_completed(ServiceWorkerFetchCompletion {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2690,19 +2995,26 @@ mod tests {
                 .policy_context
                 .cross_origin_embedder_policy =
                 crate::cross_origin_isolation::CrossOriginEmbedderPolicy::Credentialless;
-            job.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
+            job.request.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
         }
 
         service.finish_fetch_event_completed(ServiceWorkerFetchCompletion {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2755,12 +3067,19 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2805,19 +3124,26 @@ mod tests {
                 .expect("pending fetch job should exist");
             job.network_context.policy_context.document_isolation_policy =
                 crate::cross_origin_isolation::DocumentIsolationPolicy::IsolateAndCredentialless;
-            job.credentials_mode = moli_fetch::RequestCredentialsMode::SameOrigin;
+            job.request.credentials_mode = moli_fetch::RequestCredentialsMode::SameOrigin;
         }
 
         service.finish_fetch_event_completed(ServiceWorkerFetchCompletion {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2856,19 +3182,26 @@ mod tests {
                 .expect("pending fetch job should exist");
             job.network_context.policy_context.document_isolation_policy =
                 crate::cross_origin_isolation::DocumentIsolationPolicy::IsolateAndCredentialless;
-            job.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
+            job.request.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
         }
 
         service.finish_fetch_event_completed(ServiceWorkerFetchCompletion {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
+                },
                 body: b"png".to_vec(),
             }),
         });
@@ -2921,12 +3254,18 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             body_source_id,
-            response_head: MaterializedServiceWorkerFetchResponseHead {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
+            response_head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                        .into_iter()
+                        .collect(),
+                    redirected: false,
+                },
                 status: 200,
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                status_text: "OK".to_owned(),
+                headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
             },
         });
 
@@ -2981,19 +3320,25 @@ mod tests {
                 .policy_context
                 .cross_origin_embedder_policy =
                 crate::cross_origin_isolation::CrossOriginEmbedderPolicy::Credentialless;
-            job.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
+            job.request.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
         }
 
         service.finish_fetch_stream_started(ServiceWorkerFetchStreamStarted {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             body_source_id,
-            response_head: MaterializedServiceWorkerFetchResponseHead {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
+            response_head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                        .into_iter()
+                        .collect(),
+                    redirected: false,
+                },
                 status: 200,
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                status_text: "OK".to_owned(),
+                headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
             },
         });
 
@@ -3045,19 +3390,25 @@ mod tests {
                 .expect("pending fetch job should exist");
             job.network_context.policy_context.document_isolation_policy =
                 crate::cross_origin_isolation::DocumentIsolationPolicy::IsolateAndCredentialless;
-            job.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
+            job.request.credentials_mode = moli_fetch::RequestCredentialsMode::Include;
         }
 
         service.finish_fetch_stream_started(ServiceWorkerFetchStreamStarted {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             body_source_id,
-            response_head: MaterializedServiceWorkerFetchResponseHead {
-                final_url: Some(url("https://cdn.example.test/app/pixel.png")),
-                response_type: "default".to_owned(),
-                redirected: false,
+            response_head: moli_fetch_types::FetchResponseHead {
+                metadata: moli_fetch_types::FetchResponseMetadata {
+                    response_type: moli_fetch_types::FetchResponseType::Default,
+                    timing_allow_passed: true,
+                    url_list: (Some(url("https://cdn.example.test/app/pixel.png")))
+                        .into_iter()
+                        .collect(),
+                    redirected: false,
+                },
                 status: 200,
-                headers: vec![("content-type".to_owned(), "image/png".to_owned())],
+                status_text: "OK".to_owned(),
+                headers: vec![("content-type".to_owned(), b"image/png".to_vec())],
             },
         });
 
@@ -3103,12 +3454,19 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/data.json")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/data.json")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"application/json".to_vec())],
+                },
                 body: br#"{"secret":true}"#.to_vec(),
             }),
         });
@@ -3149,12 +3507,19 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: Some(url("https://cdn.example.test/app/data.json")),
-                response_type: "default".to_owned(),
-                redirected: false,
-                status: 200,
-                status_text: "OK".to_owned(),
-                headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::Default,
+                        timing_allow_passed: true,
+                        url_list: (Some(url("https://cdn.example.test/app/data.json")))
+                            .into_iter()
+                            .collect(),
+                        redirected: false,
+                    },
+                    status: 200,
+                    status_text: "OK".to_owned(),
+                    headers: vec![("content-type".to_owned(), b"application/json".to_vec())],
+                },
                 body: br#"{"visible":true}"#.to_vec(),
             }),
         });
@@ -3162,7 +3527,16 @@ mod tests {
         let completion = pop_async_subresource_completion(&mut completion_queue);
         assert_eq!(completion.internal_id, 332);
         assert!(completion.skip_fetch_security_validation);
-        assert_eq!(completion.response_filter, None);
+        assert_eq!(
+            completion.response_filter.as_ref().map(|filter| (
+                filter.response_type(),
+                filter
+                    .service_worker_metadata()
+                    .expect("SW response metadata")
+                    .timing_allow_passed,
+            )),
+            Some((crate::types::FetchResponseType::Basic, true))
+        );
         let response = completion
             .result
             .expect("Service Worker response should not need ACAO");
@@ -3193,12 +3567,17 @@ mod tests {
             event_id,
             owner: crate::service_worker_runtime::ServiceWorkerRunOwner::new(version_id, run),
             result: ServiceWorkerFetchResult::Response(ServiceWorkerFetchResponse {
-                final_url: None,
-                response_type: "opaqueredirect".to_owned(),
-                redirected: false,
-                status: 0,
-                status_text: String::new(),
-                headers: Vec::new(),
+                head: moli_fetch_types::FetchResponseHead {
+                    metadata: moli_fetch_types::FetchResponseMetadata {
+                        response_type: moli_fetch_types::FetchResponseType::OpaqueRedirect,
+                        timing_allow_passed: false,
+                        url_list: (None).into_iter().collect(),
+                        redirected: false,
+                    },
+                    status: 0,
+                    status_text: String::new(),
+                    headers: Vec::new(),
+                },
                 body: Vec::new(),
             }),
         });
@@ -3292,11 +3671,31 @@ mod tests {
             .pending_fetch_jobs
             .remove(&event_id)
             .expect("active fetch job");
-        job.request_url =
+        job.request.url =
             Url::parse(&format!("http://{address}/fallback")).expect("fallback request URL");
         job.network_context.document_url =
             Url::parse(&format!("http://{address}/page")).expect("fallback document URL");
-        job.redirect_count = 1;
+        job.network_context.request_origin = (&job.network_context.document_url).into();
+        job.request = job
+            .request
+            .with_initiator_url(&job.network_context.document_url)
+            .with_request_origin(job.network_context.request_origin.clone());
+        job.request.record_redirect(moli_fetch::RedirectInfo {
+            source: moli_fetch::RedirectSource::ServiceWorker,
+            from_url: job.network_context.document_url.clone(),
+            to_url: job.request.url.clone(),
+            status: 302,
+            headers: Vec::new(),
+            network_extra_info_available: false,
+            request_extra_info: None,
+            dispatched_request: None,
+            response_extra_info: None,
+            redirect_has_extra_info: false,
+            request_cookie_report: None,
+            cookie_set_reports: Vec::new(),
+            from_cache: false,
+            negotiated_http_version: None,
+        });
         job.direct_completion_tx = Some(direct_completion_tx);
 
         // This test intentionally calls from a plain test thread. The

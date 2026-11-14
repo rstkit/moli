@@ -1,8 +1,9 @@
 use super::*;
 use crate::custom_elements::is_form_associated_custom_element_handle;
+use crate::native_bridge::bridge::wrapped_handle_value_for_receiver;
 use crate::native_bridge::element::{html_element_getter_receiver, html_element_setter_receiver};
-use crate::util::throw_type_error;
 use moli_webapi_declare::DataPropertyDescriptorDeclaration;
+use std::ops::ControlFlow;
 
 pub(in crate::native_bridge) fn form_action_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -264,47 +265,75 @@ pub(in crate::native_bridge) fn form_elements_getter_function<'s>(
         tag_name_html_document: None,
         resolution_cache: Default::default(),
     };
-    let collection = collections::build_live_collection_wrapper(scope, runtime_ptr, descriptor);
+    let Some(collection) = collections::build_live_collection_wrapper_for_receiver(
+        scope,
+        runtime_ptr,
+        args.this(),
+        descriptor,
+    ) else {
+        rv.set_null();
+        return;
+    };
     rv.set(collection.into());
 }
 
 pub(crate) fn form_control_elements(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     form_handle: DomHandle,
 ) -> Vec<DomHandle> {
-    if runtime
-        .dom_host()
-        .is_html_element_named(form_handle, "fieldset")
-    {
-        return collect_form_control_elements_from(runtime, form_handle, false, None, false);
-    }
-
-    if !runtime
-        .dom_host()
-        .is_html_element_named(form_handle, "form")
-    {
+    let Some(scope) = FormControlScope::new(runtime, form_handle) else {
         return Vec::new();
+    };
+    collect_form_control_elements_from(runtime, scope.root, false, scope.owner, false)
+}
+
+#[derive(Clone, Copy)]
+struct FormControlScope {
+    root: DomHandle,
+    owner: Option<DomHandle>,
+}
+
+impl FormControlScope {
+    fn new(runtime: &PageScriptHost, form: DomHandle) -> Option<Self> {
+        let dom = runtime.dom_host();
+        if dom.is_html_element_named(form, "fieldset") {
+            return Some(Self {
+                root: form,
+                owner: None,
+            });
+        }
+        if !dom.is_html_element_named(form, "form") {
+            return None;
+        }
+        let root = if dom.is_connected(form) {
+            dom.owner_document_handle(form)
+                .unwrap_or_else(|| dom.document_handle())
+        } else {
+            form
+        };
+        Some(Self {
+            root,
+            owner: Some(form),
+        })
     }
 
-    if !runtime.dom_host().is_connected(form_handle) {
-        return collect_form_control_elements_from(
-            runtime,
-            form_handle,
-            false,
-            Some(form_handle),
-            false,
-        );
+    fn contains(self, runtime: &PageScriptHost, candidate: DomHandle) -> bool {
+        let dom = runtime.dom_host();
+        let mut current = dom.parent_node(candidate);
+        while let Some(handle) = current {
+            if handle == self.root {
+                return true;
+            }
+            current = dom
+                .parent_node(handle)
+                .or_else(|| dom.shadow_root_host(handle));
+        }
+        false
     }
-
-    let document_handle = runtime
-        .dom_host()
-        .owner_document_handle(form_handle)
-        .unwrap_or_else(|| runtime.dom_host().document_handle());
-    collect_form_control_elements_from(runtime, document_handle, false, Some(form_handle), false)
 }
 
 pub(crate) fn form_data_control_elements(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     form_handle: DomHandle,
 ) -> Vec<DomHandle> {
     if !runtime
@@ -332,7 +361,7 @@ pub(crate) fn form_data_control_elements(
 }
 
 pub(crate) fn autofill_related_form_control_elements(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     anchor: DomHandle,
 ) -> Vec<DomHandle> {
     if !is_form_control_handle(runtime, anchor, false) {
@@ -351,12 +380,14 @@ pub(crate) fn autofill_related_form_control_elements(
 }
 
 fn collect_form_control_elements_from(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     include_root: bool,
     form_handle: Option<DomHandle>,
     include_image_inputs: bool,
 ) -> Vec<DomHandle> {
+    #[cfg(test)]
+    crate::native_bridge::element::record_form_lookup_traversal_for_test();
     let mut out = Vec::new();
     let mut stack = Vec::new();
     if include_root {
@@ -365,10 +396,9 @@ fn collect_form_control_elements_from(
         push_shadow_including_children(runtime, root, &mut stack);
     }
     while let Some(handle) = stack.pop() {
-        if is_form_control_handle(runtime, handle, include_image_inputs)
-            && form_handle
-                .is_none_or(|owner| form_associated_form_owner(runtime, handle) == Some(owner))
-        {
+        #[cfg(test)]
+        crate::native_bridge::element::record_form_lookup_node_for_test();
+        if form_control_matches_owner(runtime, handle, form_handle, include_image_inputs) {
             out.push(handle);
         }
         push_shadow_including_children(runtime, handle, &mut stack);
@@ -377,7 +407,7 @@ fn collect_form_control_elements_from(
 }
 
 fn push_shadow_including_children(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     stack: &mut Vec<DomHandle>,
 ) {
@@ -400,7 +430,7 @@ fn push_shadow_including_children(
 }
 
 fn is_form_control_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     include_image_inputs: bool,
 ) -> bool {
@@ -421,6 +451,16 @@ fn is_form_control_handle(
                 _ => false,
             }
         })
+}
+
+fn form_control_matches_owner(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    owner: Option<DomHandle>,
+    include_image_inputs: bool,
+) -> bool {
+    is_form_control_handle(runtime, handle, include_image_inputs)
+        && owner.is_none_or(|owner| form_associated_form_owner(runtime, handle) == Some(owner))
 }
 
 pub(in crate::native_bridge) fn fieldset_elements_getter_function<'s>(
@@ -447,7 +487,15 @@ pub(in crate::native_bridge) fn fieldset_elements_getter_function<'s>(
         tag_name_html_document: None,
         resolution_cache: Default::default(),
     };
-    let collection = collections::build_live_collection_wrapper(scope, runtime_ptr, descriptor);
+    let Some(collection) = collections::build_live_collection_wrapper_for_receiver(
+        scope,
+        runtime_ptr,
+        args.this(),
+        descriptor,
+    ) else {
+        rv.set_null();
+        return;
+    };
     rv.set(collection.into());
 }
 
@@ -509,7 +557,7 @@ pub(in crate::native_bridge) fn form_target_getter_function<'s>(
     rv.set(value.into());
 }
 
-fn form_owner_document_url(runtime: &JsContextHost, handle: DomHandle) -> String {
+fn form_owner_document_url(runtime: &PageScriptHost, handle: DomHandle) -> String {
     runtime
         .dom_host()
         .owner_document_handle(handle)
@@ -541,118 +589,73 @@ pub(in crate::native_bridge) fn form_target_setter_function<'s>(
     rv.set_undefined();
 }
 
-pub(in crate::native_bridge) fn form_named_getter(
-    scope: &mut v8::PinScope<'_, '_>,
+// Getter and descriptor reads share value construction and identity policy. Queries,
+// deletion, and definition keep their own property-operation rules below.
+fn form_named_property_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
     key: v8::Local<'_, v8::Name>,
-    args: v8::PropertyCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) -> v8::Intercepted {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.holder())
-    else {
-        return v8::Intercepted::kNo;
-    };
-    let Ok(key) = v8::Local::<v8::String>::try_from(key) else {
-        return v8::Intercepted::kNo;
-    };
+) -> Option<v8::Local<'s, v8::Value>> {
+    let (runtime_ptr, handle) =
+        node_runtime_and_handle_from_object_or_detached(scope, receiver).ok()?;
+    let key = v8::Local::<v8::String>::try_from(key).ok()?;
+    if object_has_expando_named_property(scope, receiver, key.into()) {
+        return None;
+    }
     let key = key.to_rust_string_lossy(scope);
-    if is_array_index_property_name(&key)
-        || object_has_expando_named_property(scope, args.holder(), &key)
-    {
-        return v8::Intercepted::kNo;
+    if is_array_index_property_name(&key) {
+        return None;
     }
     let runtime = unsafe { &mut *runtime_ptr };
-    let matches = form_named_item_matches(runtime, handle, &key);
+    let (query_kind, matches) = form_named_item_matches(runtime, handle, &key);
     if matches.len() > 1 {
         let descriptor = LiveCollectionDescriptor {
             collection_kind: CollectionKind::RadioNodeList,
-            query_kind: LiveCollectionQueryKind::FormControlsByName,
+            query_kind,
             root: handle,
             query: Some(key),
             include_root: false,
             tag_name_html_document: None,
             resolution_cache: Default::default(),
         };
-        let list = collections::build_live_collection_wrapper(scope, runtime_ptr, descriptor);
-        rv.set(list.into());
-        return v8::Intercepted::kYes;
+        return collections::build_live_collection_wrapper_for_receiver(
+            scope,
+            runtime_ptr,
+            receiver,
+            descriptor,
+        )
+        .map(Into::into);
     }
-    let Some(match_handle) = matches.first().copied() else {
-        let Some(past_handle) = runtime.form_past_named_item(handle, &key) else {
-            return v8::Intercepted::kNo;
-        };
-        let Some(node) = runtime
-            .native_bridge_mut()
-            .wrap_handle(scope, runtime_ptr, past_handle)
-        else {
-            return v8::Intercepted::kNo;
-        };
-        rv.set(node.into());
-        return v8::Intercepted::kYes;
+    let match_handle = if let Some(match_handle) = matches.first().copied() {
+        runtime.remember_form_past_named_item(handle, key, match_handle);
+        match_handle
+    } else {
+        runtime.form_past_named_item(handle, &key)?
     };
-    runtime.remember_form_past_named_item(handle, key, match_handle);
-    let Some(node) = runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, match_handle)
-    else {
+    wrapped_handle_value_for_receiver(scope, runtime_ptr, receiver, match_handle)
+}
+
+pub(in crate::native_bridge) fn form_named_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: v8::Local<'_, v8::Name>,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) -> v8::Intercepted {
+    let Some(value) = form_named_property_value(scope, args.holder(), key) else {
         return v8::Intercepted::kNo;
     };
-    rv.set(node.into());
+    rv.set(value);
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_named_descriptor(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_named_descriptor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'_, v8::Name>,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.holder())
-    else {
+    let Some(value) = form_named_property_value(scope, args.holder(), key) else {
         return v8::Intercepted::kNo;
-    };
-    let Ok(key) = v8::Local::<v8::String>::try_from(key) else {
-        return v8::Intercepted::kNo;
-    };
-    let key = key.to_rust_string_lossy(scope);
-    if is_array_index_property_name(&key)
-        || object_has_expando_named_property(scope, args.holder(), &key)
-    {
-        return v8::Intercepted::kNo;
-    }
-    let runtime = unsafe { &mut *runtime_ptr };
-    let matches = form_named_item_matches(runtime, handle, &key);
-    let value = if matches.len() > 1 {
-        let descriptor = LiveCollectionDescriptor {
-            collection_kind: CollectionKind::RadioNodeList,
-            query_kind: LiveCollectionQueryKind::FormControlsByName,
-            root: handle,
-            query: Some(key),
-            include_root: false,
-            tag_name_html_document: None,
-            resolution_cache: Default::default(),
-        };
-        let list = collections::build_live_collection_wrapper(scope, runtime_ptr, descriptor);
-        list.into()
-    } else if let Some(match_handle) = matches.first().copied() {
-        runtime.remember_form_past_named_item(handle, key, match_handle);
-        let Some(node) = runtime
-            .native_bridge_mut()
-            .wrap_handle(scope, runtime_ptr, match_handle)
-        else {
-            return v8::Intercepted::kNo;
-        };
-        node.into()
-    } else {
-        let Some(past_handle) = runtime.form_past_named_item(handle, &key) else {
-            return v8::Intercepted::kNo;
-        };
-        let Some(node) = runtime
-            .native_bridge_mut()
-            .wrap_handle(scope, runtime_ptr, past_handle)
-        else {
-            return v8::Intercepted::kNo;
-        };
-        node.into()
     };
     let Ok(descriptor) = DataPropertyDescriptorDeclaration::new(value, false, false).bind(scope)
     else {
@@ -662,23 +665,25 @@ pub(in crate::native_bridge) fn form_named_descriptor(
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_named_deleter(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_named_deleter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'_, v8::Name>,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Boolean>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
     let Ok(key) = v8::Local::<v8::String>::try_from(key) else {
         return v8::Intercepted::kNo;
     };
+    if object_has_expando_named_property(scope, args.holder(), key.into()) {
+        return v8::Intercepted::kNo;
+    }
     let key = key.to_rust_string_lossy(scope);
-    if is_array_index_property_name(&key)
-        || object_has_expando_named_property(scope, args.holder(), &key)
-    {
+    if is_array_index_property_name(&key) {
         return v8::Intercepted::kNo;
     }
     if !form_has_named_item_or_past_name(unsafe { &*runtime_ptr }, handle, &key) {
@@ -688,14 +693,15 @@ pub(in crate::native_bridge) fn form_named_deleter(
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_named_definer(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_named_definer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'_, v8::Name>,
     _desc: &v8::PropertyDescriptor,
-    args: v8::PropertyCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Boolean>,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Boolean>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
@@ -703,102 +709,59 @@ pub(in crate::native_bridge) fn form_named_definer(
         return v8::Intercepted::kNo;
     };
     let key = key.to_rust_string_lossy(scope);
-    if is_array_index_property_name(&key)
-        || object_has_expando_named_property(scope, args.holder(), &key)
-    {
+    if is_array_index_property_name(&key) {
         return v8::Intercepted::kNo;
     }
     if !form_has_named_item_or_past_name(unsafe { &*runtime_ptr }, handle, &key) {
         return v8::Intercepted::kNo;
     }
-    throw_type_error(scope, "Cannot redefine an HTMLFormElement named property.");
+    // LegacyOverrideBuiltIns rejects defining any supported name, even when
+    // a real own property makes that name invisible to getters and deleters.
+    // Let V8 distinguish Object.defineProperty (throws) from Reflect (false).
+    rv.set_bool(false);
     v8::Intercepted::kYes
 }
 
 fn object_has_expando_named_property(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
-    key: &str,
+    key: v8::Local<'_, v8::Name>,
 ) -> bool {
-    if form_native_property_can_be_overridden(key) {
-        return false;
-    }
-    let Some(names) = object.get_own_property_names(
-        scope,
-        v8::GetPropertyNamesArgs {
-            mode: v8::KeyCollectionMode::OwnOnly,
-            property_filter: v8::PropertyFilter::ALL_PROPERTIES | v8::PropertyFilter::SKIP_SYMBOLS,
-            index_filter: v8::IndexFilter::IncludeIndices,
-            key_conversion: v8::KeyConversionMode::KeepNumbers,
-        },
-    ) else {
-        return false;
-    };
-    for index in 0..names.length() {
-        let Some(name) = names
-            .get_index(scope, index)
-            .and_then(|value| value.to_string(scope))
-            .map(|value| value.to_rust_string_lossy(scope))
-        else {
-            continue;
-        };
-        if name == key {
-            return true;
-        }
-    }
-    false
-}
-
-fn form_native_property_can_be_overridden(key: &str) -> bool {
-    matches!(
-        key,
-        "addEventListener"
-            | "removeEventListener"
-            | "dispatchEvent"
-            | "nodeType"
-            | "nodeName"
-            | "ownerDocument"
-            | "namespaceURI"
-            | "prefix"
-            | "localName"
-            | "title"
-            | "lang"
-            | "dir"
-            | "acceptCharset"
-            | "action"
-            | "autocomplete"
-            | "enctype"
-            | "encoding"
-            | "method"
-            | "name"
-            | "noValidate"
-            | "target"
-            | "elements"
-            | "length"
-            | "submit"
-            | "reset"
-            | "requestSubmit"
-            | "checkValidity"
-            | "reportValidity"
-    )
+    // Enumerating own keys invokes the indexed interceptor, which resolves every
+    // form control. A real-property check neither enumerates virtual properties
+    // nor evaluates an own accessor getter.
+    object.has_real_named_property(scope, key).unwrap_or(false)
 }
 
 fn form_has_named_item_or_past_name(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     form_handle: DomHandle,
     key: &str,
 ) -> bool {
-    !form_named_item_matches(runtime, form_handle, key).is_empty()
+    let Some(scope) = FormControlScope::new(runtime, form_handle) else {
+        return false;
+    };
+    runtime
+        .dom_host()
+        .visit_element_candidates_by_id_or_name(key, |candidate| {
+            if form_named_candidate_source(runtime, scope, candidate, key).is_some() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
         || runtime.form_past_named_item(form_handle, key).is_some()
 }
 
-pub(in crate::native_bridge) fn form_indexed_getter(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_indexed_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     index: u32,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, form_handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
@@ -809,23 +772,23 @@ pub(in crate::native_bridge) fn form_indexed_getter(
     else {
         return v8::Intercepted::kNo;
     };
-    let Some(control) = runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, control_handle)
+    let Some(control) =
+        wrapped_handle_value_for_receiver(scope, runtime_ptr, args.holder(), control_handle)
     else {
         return v8::Intercepted::kNo;
     };
-    rv.set(control.into());
+    rv.set(control);
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_indexed_query(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_indexed_query<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     index: u32,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Integer>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, form_handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
@@ -844,14 +807,15 @@ pub(in crate::native_bridge) fn form_indexed_query(
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_indexed_setter(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_indexed_setter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     index: u32,
     _value: v8::Local<'_, v8::Value>,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Boolean>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, form_handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
@@ -862,13 +826,14 @@ pub(in crate::native_bridge) fn form_indexed_setter(
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_indexed_descriptor(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_indexed_descriptor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     index: u32,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, form_handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
@@ -879,14 +844,12 @@ pub(in crate::native_bridge) fn form_indexed_descriptor(
     else {
         return v8::Intercepted::kNo;
     };
-    let Some(control) = runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, control_handle)
+    let Some(control) =
+        wrapped_handle_value_for_receiver(scope, runtime_ptr, args.holder(), control_handle)
     else {
         return v8::Intercepted::kNo;
     };
-    let Ok(descriptor) =
-        DataPropertyDescriptorDeclaration::new(control.into(), false, true).bind(scope)
+    let Ok(descriptor) = DataPropertyDescriptorDeclaration::new(control, false, true).bind(scope)
     else {
         return v8::Intercepted::kNo;
     };
@@ -894,13 +857,14 @@ pub(in crate::native_bridge) fn form_indexed_descriptor(
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_indexed_deleter(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_indexed_deleter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     index: u32,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Boolean>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, form_handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
@@ -911,12 +875,15 @@ pub(in crate::native_bridge) fn form_indexed_deleter(
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_indexed_enumerator(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::PropertyCallbackArguments<'_>,
+pub(in crate::native_bridge) fn form_indexed_enumerator<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Array>,
 ) {
-    let Ok((runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    #[cfg(test)]
+    crate::native_bridge::element::record_form_lookup_enumeration_for_test();
+    let Ok((runtime_ptr, form_handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         rv.set(v8::Array::new(scope, 0));
         return;
@@ -927,14 +894,15 @@ pub(in crate::native_bridge) fn form_indexed_enumerator(
     rv.set(v8::Array::new_with_elements(scope, &keys));
 }
 
-pub(in crate::native_bridge) fn form_indexed_definer(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_indexed_definer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     index: u32,
     _desc: &v8::PropertyDescriptor,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Boolean>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, form_handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, form_handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
@@ -945,23 +913,25 @@ pub(in crate::native_bridge) fn form_indexed_definer(
     v8::Intercepted::kYes
 }
 
-pub(in crate::native_bridge) fn form_named_query(
-    scope: &mut v8::PinScope<'_, '_>,
+pub(in crate::native_bridge) fn form_named_query<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'_, v8::Name>,
-    args: v8::PropertyCallbackArguments<'_>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Integer>,
 ) -> v8::Intercepted {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.holder())
+    let Ok((runtime_ptr, handle)) =
+        node_runtime_and_handle_from_object_or_detached(scope, args.holder())
     else {
         return v8::Intercepted::kNo;
     };
     let Ok(key) = v8::Local::<v8::String>::try_from(key) else {
         return v8::Intercepted::kNo;
     };
+    if object_has_expando_named_property(scope, args.holder(), key.into()) {
+        return v8::Intercepted::kNo;
+    }
     let key = key.to_rust_string_lossy(scope);
-    if is_array_index_property_name(&key)
-        || object_has_expando_named_property(scope, args.holder(), &key)
-    {
+    if is_array_index_property_name(&key) {
         return v8::Intercepted::kNo;
     }
     if !form_has_named_item_or_past_name(unsafe { &*runtime_ptr }, handle, &key) {
@@ -974,54 +944,119 @@ pub(in crate::native_bridge) fn form_named_query(
 }
 
 fn form_named_item_matches(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     form_handle: DomHandle,
     key: &str,
-) -> Vec<DomHandle> {
-    let controls = form_control_elements(runtime, form_handle)
-        .into_iter()
-        .filter(|handle| {
-            runtime
-                .dom_host()
-                .node(*handle)
-                .and_then(Node::as_element)
-                .is_some_and(|element| element.matches_named_item_key(key))
-        })
-        .collect::<Vec<_>>();
-    if controls.is_empty() {
-        form_named_image_matches(runtime, form_handle, key)
-    } else {
-        controls
-    }
+) -> (LiveCollectionQueryKind, Vec<DomHandle>) {
+    let Some(scope) = FormControlScope::new(runtime, form_handle) else {
+        return (LiveCollectionQueryKind::FormControlsByName, Vec::new());
+    };
+    let mut query_kind = LiveCollectionQueryKind::FormImagesByName;
+    let mut matches = Vec::new();
+    let _ = runtime
+        .dom_host()
+        .visit_element_candidates_by_id_or_name(key, |candidate| {
+            if let Some(source) = form_named_candidate_source(runtime, scope, candidate, key) {
+                if source == LiveCollectionQueryKind::FormControlsByName && source != query_kind {
+                    query_kind = source;
+                    matches.clear();
+                }
+                if source == query_kind {
+                    matches.push(candidate);
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    sort_form_named_matches(runtime, &mut matches);
+    (query_kind, matches)
 }
 
-fn form_named_image_matches(
-    runtime: &JsContextHost,
+pub(in crate::native_bridge) fn form_named_control_matches(
+    runtime: &PageScriptHost,
     form_handle: DomHandle,
     key: &str,
 ) -> Vec<DomHandle> {
-    if !runtime
-        .dom_host()
-        .is_html_element_named(form_handle, "form")
-    {
+    form_named_matches_from_source(
+        runtime,
+        form_handle,
+        key,
+        LiveCollectionQueryKind::FormControlsByName,
+    )
+}
+
+pub(in crate::native_bridge) fn form_named_image_matches(
+    runtime: &PageScriptHost,
+    form_handle: DomHandle,
+    key: &str,
+) -> Vec<DomHandle> {
+    form_named_matches_from_source(
+        runtime,
+        form_handle,
+        key,
+        LiveCollectionQueryKind::FormImagesByName,
+    )
+}
+
+fn form_named_matches_from_source(
+    runtime: &PageScriptHost,
+    form_handle: DomHandle,
+    key: &str,
+    source: LiveCollectionQueryKind,
+) -> Vec<DomHandle> {
+    let Some(scope) = FormControlScope::new(runtime, form_handle) else {
         return Vec::new();
-    }
-    runtime
+    };
+    let mut matches = Vec::new();
+    let _ = runtime
         .dom_host()
-        .elements_by_tag_name(form_handle, "img", false)
-        .into_iter()
-        .filter(|handle| nearest_form_ancestor(runtime, *handle) == Some(form_handle))
-        .filter(|handle| {
-            runtime
-                .dom_host()
-                .node(*handle)
-                .and_then(Node::as_element)
-                .is_some_and(|element| element.matches_named_item_key(key))
-        })
-        .collect()
+        .visit_element_candidates_by_id_or_name(key, |candidate| {
+            if form_named_candidate_source(runtime, scope, candidate, key) == Some(source) {
+                matches.push(candidate);
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    sort_form_named_matches(runtime, &mut matches);
+    matches
 }
 
-fn nearest_form_ancestor(runtime: &JsContextHost, handle: DomHandle) -> Option<DomHandle> {
+fn form_named_candidate_source(
+    runtime: &PageScriptHost,
+    scope: FormControlScope,
+    candidate: DomHandle,
+    key: &str,
+) -> Option<LiveCollectionQueryKind> {
+    #[cfg(test)]
+    crate::native_bridge::element::record_form_lookup_node_for_test();
+    let element = runtime
+        .dom_host()
+        .node(candidate)
+        .and_then(Node::as_element)?;
+    if !element.matches_named_item_key(key) {
+        return None;
+    }
+    if form_control_matches_owner(runtime, candidate, scope.owner, false)
+        && scope.contains(runtime, candidate)
+    {
+        Some(LiveCollectionQueryKind::FormControlsByName)
+    } else if element.is_html_element("img")
+        && scope.owner.is_some()
+        && nearest_form_ancestor(runtime, candidate) == scope.owner
+    {
+        Some(LiveCollectionQueryKind::FormImagesByName)
+    } else {
+        None
+    }
+}
+
+fn sort_form_named_matches(runtime: &PageScriptHost, matches: &mut [DomHandle]) {
+    matches.sort_by(|left, right| {
+        runtime
+            .dom_host()
+            .compare_handles_in_shadow_including_tree_order(*left, *right)
+    });
+}
+
+fn nearest_form_ancestor(runtime: &PageScriptHost, handle: DomHandle) -> Option<DomHandle> {
     let mut current = runtime.dom_host().parent_node(handle);
     while let Some(parent) = current {
         if runtime.dom_host().is_html_element_named(parent, "form") {

@@ -321,9 +321,27 @@ pub(crate) fn cleanup_staging_directory(bucket_dir: &Path) -> OpfsResult<()> {
 }
 
 pub(crate) fn sync_directory(path: &Path) -> OpfsResult<()> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
+    sync_directory_handle(path)
         .map_err(|source| OpfsError::io("sync backend directory", path, source))
+}
+
+#[cfg(not(windows))]
+fn sync_directory_handle(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory_handle(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+
+    OpenOptions::new()
+        .access_mode(GENERIC_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
 }
 
 fn staging_path(bucket_dir: &Path, owner_id: u64) -> PathBuf {
@@ -332,13 +350,7 @@ fn staging_path(bucket_dir: &Path, owner_id: u64) -> PathBuf {
         .join(format!("writer-{owner_id:016x}.stage"))
 }
 
-fn remove_file_if_exists(path: &Path, operation: &'static str) -> OpfsResult<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(OpfsError::io(operation, path, source)),
-    }
-}
+use crate::store::remove_file_if_exists;
 
 fn closed_io() -> std::io::Error {
     std::io::Error::other("writable staging file is closed")

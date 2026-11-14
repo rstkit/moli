@@ -33,6 +33,12 @@ html {
   color: CanvasText;
 }
 
+/* Direction attributes establish an inline bidi context. Direction itself
+ * enters through presentation hints, so author CSS can override either value. */
+[dir=ltr i], [dir=rtl i] {
+  unicode-bidi: isolate;
+}
+
 html, body, address, article, aside, blockquote, center, dd, dir, div, dl, dt,
 fieldset, figcaption, figure, footer, form, header, hgroup, legend, main, nav,
 noframes, p, search, section, details, summary, optgroup,
@@ -48,6 +54,10 @@ center {
 marquee,
 input, textarea, select, button {
   display: inline-block;
+}
+
+marquee {
+  overflow: hidden !important;
 }
 
 pre, xmp, plaintext, listing {
@@ -243,7 +253,7 @@ h6 {
 }
 
 base, basefont, datalist, head, link, meta, noembed, noframes, param, rp,
-script, style, template, title, source {
+script, style, template, title {
   display: none;
 }
 
@@ -520,12 +530,22 @@ slot {
   display: contents;
 }
 
+dialog {
+  color: CanvasText;
+  background-color: Canvas;
+}
+
 dialog:not([open]), [popover]:where(:not(:popover-open)) {
   display: none;
 }
 
 dialog[open], [popover]:popover-open {
   display: block;
+}
+
+dialog:modal {
+  -servo-top-layer: top;
+  visibility: visible;
 }
 
 u, ins {
@@ -580,6 +600,7 @@ nobr {
 }
 
 a:any-link {
+  color: LinkText;
   text-decoration: underline;
   cursor: pointer;
 }

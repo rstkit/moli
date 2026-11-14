@@ -1,27 +1,18 @@
 use super::*;
+use crate::context_bootstrap::indexed_db::indexed_db_transaction_status;
 
-pub(super) fn start_readwrite_transaction<'s>(
+pub(super) fn start_regular_transaction<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     transaction: v8::Local<'s, v8::Object>,
     transaction_handle: TransactionHandle,
 ) {
-    set_indexed_db_slot_value(
+    crate::context_bootstrap::indexed_db::mark_indexed_db_transaction_started(
         scope,
         transaction,
-        INDEXED_DB_TRANSACTION_HANDLE_SLOT,
-        v8::Number::new(scope, transaction_handle.into_raw() as f64).into(),
+        transaction_handle,
     );
-    set_indexed_db_slot_value(
-        scope,
-        transaction,
-        INDEXED_DB_TRANSACTION_STARTED_SLOT,
-        v8::Boolean::new(scope, true).into(),
-    );
-    run_waiting::run_operations_waiting_for_start(scope, transaction);
-    if object_number_property(scope, transaction, INDEXED_DB_TRANSACTION_PENDING_SLOT)
-        .unwrap_or(0.0)
-        == 0.0
-    {
+    crate::context_bootstrap::indexed_db::pump_transaction_operations(scope, transaction);
+    if indexed_db_transaction_status(scope, transaction).map_or(0, |state| state.pending) == 0 {
         enqueue_transaction_commit_task(scope, transaction);
     }
 }

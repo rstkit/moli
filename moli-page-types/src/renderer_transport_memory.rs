@@ -1,9 +1,11 @@
 //! Conservative retained-memory estimates for renderer output admission.
 //!
 //! These estimates intentionally live beside the renderer-neutral payload
-//! definitions, where private capacities and file-backed response state are
+//! definitions, where private capacities and disk-backed response state are
 //! visible. They do not model serialized CDP JSON; protocol projection has not
 //! happened while these values are queued.
+//! Shared upload buffers are charged by their visible byte length per item,
+//! even when multiple queued items retain the same backing storage.
 
 use super::*;
 
@@ -127,10 +129,14 @@ impl SubresourceResponseBody {
             SubresourceResponseBodyInner::Memory(bytes) => bytes
                 .capacity()
                 .saturating_add(std::mem::size_of::<SubresourceResponseBodyInner>()),
-            SubresourceResponseBodyInner::File { path, .. } => path
-                .as_os_str()
-                .len()
-                .saturating_mul(2)
+            SubresourceResponseBodyInner::Disk { storage } => storage
+                .chunks
+                .capacity()
+                .saturating_mul(std::mem::size_of::<DiskData>())
+                .saturating_add(storage.trailing_bytes.len())
+                .saturating_add(std::mem::size_of::<SubresourceResponseBodyInner>()),
+            SubresourceResponseBodyInner::ParkableImage(image) => image
+                .retained_memory_bytes()
                 .saturating_add(std::mem::size_of::<SubresourceResponseBodyInner>()),
         }
     }
@@ -146,14 +152,28 @@ impl PendingSubresourceFetchInfo {
             .saturating_add(url_charge(&self.document_url))
             .saturating_add(url_charge(&self.url))
             .saturating_add(string_charge(&self.method))
-            .saturating_add(headers_charge(&self.request_headers))
+            .saturating_add(request_headers_charge(&self.request_headers))
             .saturating_add(self.request_body.as_deref().map(string_charge).unwrap_or(0))
             .saturating_add(
                 self.request_body_bytes
                     .as_ref()
-                    .map(Vec::capacity)
+                    .map(bytes::Bytes::len)
                     .unwrap_or(0),
             )
+    }
+}
+
+impl ChildDocumentFetchRequest {
+    #[doc(hidden)]
+    pub fn renderer_transport_charge_bytes(&self) -> usize {
+        string_charge(&self.loader_id).saturating_add(self.redirect.as_ref().map_or(
+            0,
+            |redirect| {
+                url_charge(&redirect.from_url)
+                    .saturating_add(url_charge(&redirect.to_url))
+                    .saturating_add(headers_charge(&redirect.headers))
+            },
+        ))
     }
 }
 
@@ -165,7 +185,7 @@ impl PendingSubresourceContinueEvent {
             Self::ResponsePaused(response) => url_charge(&response.url)
                 .saturating_add(url_charge(&response.final_url))
                 .saturating_add(string_charge(&response.method))
-                .saturating_add(headers_charge(&response.request_headers))
+                .saturating_add(request_headers_charge(&response.request_headers))
                 .saturating_add(
                     response
                         .request_body
@@ -188,7 +208,7 @@ impl PendingSubresourceContinueEvent {
                 ),
             Self::AuthRequired(auth) => url_charge(&auth.url)
                 .saturating_add(string_charge(&auth.method))
-                .saturating_add(headers_charge(&auth.request_headers))
+                .saturating_add(request_headers_charge(&auth.request_headers))
                 .saturating_add(auth.request_body.as_deref().map(string_charge).unwrap_or(0))
                 .saturating_add(
                     auth.network_request_headers
@@ -234,18 +254,33 @@ fn url_charge(value: &Url) -> usize {
     string_charge(value.as_str())
 }
 
-fn headers_charge(headers: &[(String, String)]) -> usize {
+fn request_headers_charge(headers: &moli_fetch::RequestHeaders) -> usize {
     headers.iter().fold(
         headers
             .len()
-            .saturating_mul(std::mem::size_of::<(String, String)>()),
+            .saturating_mul(std::mem::size_of::<(String, Vec<u8>)>()),
         |total, (name, value)| {
             total
                 .saturating_add(string_charge(name))
-                .saturating_add(string_charge(value))
+                .saturating_add(value.len().saturating_mul(2))
         },
     )
 }
+
+pub fn transport_headers_charge_bytes<V: AsRef<[u8]>>(headers: &[(String, V)]) -> usize {
+    headers.iter().fold(
+        headers
+            .len()
+            .saturating_mul(std::mem::size_of::<(String, V)>()),
+        |total, (name, value)| {
+            total
+                .saturating_add(string_charge(name))
+                .saturating_add(value.as_ref().len().saturating_mul(2))
+        },
+    )
+}
+
+use self::transport_headers_charge_bytes as headers_charge;
 
 fn request_started_charge(request: &SubresourceRequestStarted) -> usize {
     request
@@ -256,7 +291,7 @@ fn request_started_charge(request: &SubresourceRequestStarted) -> usize {
         .saturating_add(url_charge(&request.document_url))
         .saturating_add(url_charge(&request.url))
         .saturating_add(string_charge(&request.method))
-        .saturating_add(headers_charge(&request.request_headers))
+        .saturating_add(request_headers_charge(&request.request_headers))
         .saturating_add(
             request
                 .request_body
@@ -268,7 +303,7 @@ fn request_started_charge(request: &SubresourceRequestStarted) -> usize {
             request
                 .request_body_bytes
                 .as_ref()
-                .map(Vec::capacity)
+                .map(bytes::Bytes::len)
                 .unwrap_or(0),
         )
 }
@@ -307,7 +342,7 @@ fn network_record_charge(record: &SubresourceNetworkRecord) -> usize {
         .saturating_add(url_charge(&record.document_url))
         .saturating_add(url_charge(&record.url))
         .saturating_add(string_charge(&record.method))
-        .saturating_add(headers_charge(&record.request_headers))
+        .saturating_add(request_headers_charge(&record.request_headers))
         .saturating_add(
             record
                 .request_body
@@ -319,7 +354,7 @@ fn network_record_charge(record: &SubresourceNetworkRecord) -> usize {
             record
                 .request_body_bytes
                 .as_ref()
-                .map(Vec::capacity)
+                .map(bytes::Bytes::len)
                 .unwrap_or(0),
         )
         .saturating_add(record.cookie_set_reports.len().saturating_mul(256))

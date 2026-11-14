@@ -1,13 +1,14 @@
-use moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE;
-use moli_layout::{LayoutRect, PaintCaptureRequest, PaintViewport};
-use moli_page_types::LayoutPolicy;
+//! Screenshot and screencast requests, replies and pixel capture.
+
+use moli_layout::{
+    LayoutRect, LayoutTransform2D, PaintCaptureRegion, PaintCaptureRequest, PaintCaptureSurface,
+    PaintViewport,
+};
+use moli_page_types::{LayoutPolicy, ViewportSurface};
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::{
-    PageVm, RendererCaptureScreencastFrameReply, RendererCaptureScreenshotReply,
-    RendererCapturedScreencastFrame, RendererCapturedScreenshot, RendererDocumentLifecycleIdentity,
-};
+use super::{PageVm, RendererDocumentLifecycleIdentity};
 
 #[derive(Default)]
 struct PaintFragmentProfile {
@@ -66,37 +67,38 @@ pub struct RendererVisualStateToken(Arc<RendererVisualState>);
 struct RendererVisualState {
     document: RendererDocumentLifecycleIdentity,
     dom_generation: u64,
-    style_generations: Vec<(u32, u64, u64, u64)>,
+    style_generations: Vec<(u32, u64, u64)>,
     interaction_generation: u64,
     resource_generation: u64,
     viewport_width: u32,
     viewport_height: u32,
     device_pixel_ratio_bits: u32,
+    base_background_color: [u8; 4],
 }
 
 impl RendererVisualStateToken {
     pub(crate) fn new(
         document: RendererDocumentLifecycleIdentity,
         dom_generation: u64,
-        style_generations: Vec<(crate::document_runtime::DomHandle, u64, u64, u64)>,
+        style_generations: Vec<(crate::document_runtime::DomHandle, u64, u64)>,
         interaction_generation: u64,
         resource_generation: u64,
         viewport: PaintViewport,
+        base_background_color: [u8; 4],
     ) -> Self {
         Self(Arc::new(RendererVisualState {
             document,
             dom_generation,
             style_generations: style_generations
                 .into_iter()
-                .map(|(document, source, computed, context)| {
-                    (document.index_u32(), source, computed, context)
-                })
+                .map(|(document, source, input)| (document.index_u32(), source, input))
                 .collect(),
             interaction_generation,
             resource_generation,
             viewport_width: viewport.css_width,
             viewport_height: viewport.css_height,
             device_pixel_ratio_bits: viewport.device_pixel_ratio.to_bits(),
+            base_background_color,
         }))
     }
 
@@ -109,12 +111,6 @@ impl RendererVisualStateToken {
 pub enum RendererScreenshotFormat {
     Png,
     Jpeg,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RendererScreenshotPurpose {
-    Screenshot,
-    Print { print_background: bool },
 }
 
 /// A CDP page-coordinate clip. Validation remains at the renderer boundary so
@@ -141,10 +137,11 @@ pub enum RendererScreenshotRegion {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RendererCaptureScreenshotRequest {
-    pub purpose: RendererScreenshotPurpose,
     pub format: RendererScreenshotFormat,
     pub quality: u8,
     pub region: RendererScreenshotRegion,
+    /// Straight-alpha sRGB bytes in RGBA order, beneath author backgrounds.
+    pub base_background_color: [u8; 4],
     pub optimize_for_speed: bool,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
@@ -157,19 +154,52 @@ pub struct RendererCaptureScreenshotRequest {
 pub struct RendererCaptureScreencastFrameRequest {
     pub format: RendererScreenshotFormat,
     pub quality: u8,
+    /// Straight-alpha sRGB bytes in RGBA order, beneath author backgrounds.
+    pub base_background_color: [u8; 4],
     pub optimize_for_speed: bool,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
     pub known_visual_state: Option<RendererVisualStateToken>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RendererCapturedScreenshot {
+    pub mime_type: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Arc<[u8]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RendererCaptureScreenshotReply {
+    Captured(RendererCapturedScreenshot),
+    LayoutDisabled,
+    NoDocument,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RendererCapturedScreencastFrame {
+    /// Native viewport dimensions before the encoded frame is fitted to limits.
+    pub viewport_size: (u32, u32),
+    pub image: RendererCapturedScreenshot,
+    pub visual_state: RendererVisualStateToken,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RendererCaptureScreencastFrameReply {
+    Captured(RendererCapturedScreencastFrame),
+    Unchanged,
+    LayoutDisabled,
+    NoDocument,
+}
+
 impl RendererCaptureScreenshotRequest {
     pub fn viewport_png() -> Self {
         Self {
-            purpose: RendererScreenshotPurpose::Screenshot,
             format: RendererScreenshotFormat::Png,
             quality: 100,
             region: RendererScreenshotRegion::Viewport,
+            base_background_color: [255; 4],
             optimize_for_speed: false,
             max_width: None,
             max_height: None,
@@ -178,40 +208,23 @@ impl RendererCaptureScreenshotRequest {
 }
 
 impl PageVm {
-    /// Captures an explicit screenshot or print raster. These demands always
-    /// execute a fresh paint pass and never carry screencast state.
+    /// Captures an explicit screenshot. These demands always execute a fresh
+    /// paint pass and never carry screencast state.
     pub(super) fn capture_screenshot(
         &mut self,
         request: RendererCaptureScreenshotRequest,
     ) -> anyhow::Result<RendererCaptureScreenshotReply> {
-        let barrier = match request.purpose {
-            RendererScreenshotPurpose::Screenshot => moli_action_window::ActionBarrier::Screenshot,
-            RendererScreenshotPurpose::Print { .. } => moli_action_window::ActionBarrier::Explicit,
-        };
-        self.flush_page_action_window(barrier)?;
-        let paint_capture = request.paint_capture_request()?;
-        let restore_media = if matches!(request.purpose, RendererScreenshotPurpose::Print { .. })
-            && self.emulated_media.media.is_none()
-        {
-            let previous = self.emulated_media.clone();
-            let mut print = previous.clone();
-            print.media = Some("print".to_owned());
-            self.set_emulated_media(&print);
-            Some(previous)
-        } else {
-            None
-        };
-        let result = self.capture_image(
+        self.flush_page_action_window(moli_action_window::ActionBarrier::Screenshot)?;
+        let paint_capture = request
+            .paint_capture_request(self.document_settings.viewport_surface.unwrap_or_default())?;
+        self.capture_image(
             request.format,
             request.quality,
             request.optimize_for_speed,
             paint_capture,
             moli_layout::LayoutFlushReason::Screenshot,
-        );
-        if let Some(previous) = restore_media {
-            self.set_emulated_media(&previous);
-        }
-        result.map(RendererImageCaptureOutcome::into_screenshot_reply)
+        )
+        .map(RendererImageCaptureOutcome::into_screenshot_reply)
     }
 
     /// Polls one screencast subscription. Only this request accepts a known
@@ -238,29 +251,29 @@ impl PageVm {
         before_layout: impl FnOnce(),
     ) -> anyhow::Result<RendererCaptureScreencastFrameReply> {
         self.flush_page_action_window(moli_action_window::ActionBarrier::Screencast)?;
-        if self.layout_policy == LayoutPolicy::Mock {
+        if self.layout_configuration.policy == LayoutPolicy::Mock {
             return Ok(RendererCaptureScreencastFrameReply::LayoutDisabled);
         }
-        let surface = self
-            .viewport_surface
-            .unwrap_or_else(default_viewport_surface);
+        let surface = self.document_settings.viewport_surface.unwrap_or_default();
         let viewport = PaintViewport::new(
             surface.inner_width,
             surface.inner_height,
             surface.device_pixel_ratio as f32,
         );
-        let visual_state_before = self
-            .vm()
-            .visual_state_token(self.document_lifecycle.identity(), viewport);
+        let visual_state_before = self.vm().visual_state_token(
+            self.document_lifecycle.identity(),
+            viewport,
+            request.base_background_color,
+        );
         if request.known_visual_state.as_ref() == Some(&visual_state_before) {
             return Ok(RendererCaptureScreencastFrameReply::Unchanged);
         }
         before_layout();
         let paint_capture = PaintCaptureRequest {
-            region: moli_layout::PaintCaptureRegion::Viewport,
+            region: paint_viewport_region(surface, ViewportCapture::Widget)?,
             include_backgrounds: true,
             include_viewport_controls: true,
-            base_background_color: moli_layout::PaintColor::WHITE,
+            base_background_color: paint_background_color(request.base_background_color),
             max_width: request.max_width,
             max_height: request.max_height,
         };
@@ -279,13 +292,16 @@ impl PageVm {
                 return Ok(RendererCaptureScreencastFrameReply::NoDocument);
             }
         };
-        let visual_state_after = self
-            .vm()
-            .visual_state_token(self.document_lifecycle.identity(), viewport);
+        let visual_state_after = self.vm().visual_state_token(
+            self.document_lifecycle.identity(),
+            viewport,
+            request.base_background_color,
+        );
         let visual_state =
             visual_state_for_captured_screencast_frame(visual_state_before, visual_state_after);
         Ok(RendererCaptureScreencastFrameReply::Captured(
             RendererCapturedScreencastFrame {
+                viewport_size: surface.visible_size(),
                 image,
                 visual_state,
             },
@@ -302,12 +318,10 @@ impl PageVm {
     ) -> anyhow::Result<RendererImageCaptureOutcome> {
         let profile_enabled = moli_trace::cpu_profile_enabled();
         let total_started = profile_enabled.then(Instant::now);
-        if self.layout_policy == LayoutPolicy::Mock {
+        if self.layout_configuration.policy == LayoutPolicy::Mock {
             return Ok(RendererImageCaptureOutcome::LayoutDisabled);
         }
-        let surface = self
-            .viewport_surface
-            .unwrap_or_else(default_viewport_surface);
+        let surface = self.document_settings.viewport_surface.unwrap_or_default();
         let viewport = PaintViewport::new(
             surface.inner_width,
             surface.inner_height,
@@ -346,7 +360,7 @@ impl PageVm {
         }
 
         let raster_started = profile_enabled.then(Instant::now);
-        let raster = moli_paint::raster_snapshot(&snapshot)?;
+        let mut raster = moli_paint::raster_snapshot(&snapshot)?;
         let raster_us = raster_started
             .map(|started| started.elapsed().as_micros())
             .unwrap_or_default();
@@ -360,6 +374,17 @@ impl PageVm {
                 ("image/png", encoded.width, encoded.height, encoded.bytes)
             }
             RendererScreenshotFormat::Jpeg => {
+                // Chrome captures JPEG against black. The encoder discards alpha,
+                // so composite our straight-alpha raster before handing it over.
+                for pixel in raster.rgba.as_chunks_mut::<4>().0 {
+                    let alpha = u16::from(pixel[3]);
+                    if alpha != 255 {
+                        for channel in &mut pixel[..3] {
+                            *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
+                        }
+                        pixel[3] = 255;
+                    }
+                }
                 let encoded = moli_image::encode_jpeg(&raster, quality)?;
                 ("image/jpeg", encoded.width, encoded.height, encoded.bytes)
             }
@@ -425,13 +450,18 @@ fn visual_state_for_captured_screencast_frame(
 }
 
 impl RendererCaptureScreenshotRequest {
-    fn paint_capture_request(&self) -> anyhow::Result<PaintCaptureRequest> {
+    fn paint_capture_request(
+        &self,
+        surface: ViewportSurface,
+    ) -> anyhow::Result<PaintCaptureRequest> {
         let include_viewport_controls = matches!(
             self.region,
             RendererScreenshotRegion::Viewport | RendererScreenshotRegion::ViewportClip(_)
         );
         let region = match self.region {
-            RendererScreenshotRegion::Viewport => moli_layout::PaintCaptureRegion::Viewport,
+            RendererScreenshotRegion::Viewport => {
+                paint_viewport_region(surface, ViewportCapture::Surface)?
+            }
             RendererScreenshotRegion::FullDocument => moli_layout::PaintCaptureRegion::FullDocument,
             RendererScreenshotRegion::ViewportClip(clip)
             | RendererScreenshotRegion::PageClip(clip) => {
@@ -448,16 +478,18 @@ impl RendererCaptureScreenshotRequest {
         };
         Ok(PaintCaptureRequest {
             region,
-            include_backgrounds: match self.purpose {
-                RendererScreenshotPurpose::Print { print_background } => print_background,
-                RendererScreenshotPurpose::Screenshot => true,
-            },
+            include_backgrounds: true,
             include_viewport_controls,
-            base_background_color: moli_layout::PaintColor::WHITE,
+            base_background_color: paint_background_color(self.base_background_color),
             max_width: self.max_width,
             max_height: self.max_height,
         })
     }
+}
+
+fn paint_background_color(rgba: [u8; 4]) -> moli_layout::PaintColor {
+    let [r, g, b, a] = rgba.map(|channel| f32::from(channel) / 255.0);
+    moli_layout::PaintColor::new(r, g, b, a)
 }
 
 fn finite_f32(label: &str, value: f64) -> anyhow::Result<f32> {
@@ -467,21 +499,55 @@ fn finite_f32(label: &str, value: f64) -> anyhow::Result<f32> {
     Ok(value as f32)
 }
 
-fn default_viewport_surface() -> crate::protocol_types::ViewportSurface {
-    fn dimension(value: f64) -> u32 {
-        debug_assert!(value.is_finite() && value >= 0.0 && value <= f64::from(u32::MAX));
-        value as u32
-    }
+enum ViewportCapture {
+    /// Screenshots restore the emulated DPR, regardless of the preview scale.
+    Surface,
+    /// Screencasts capture the actual widget, including the preview scale.
+    Widget,
+}
 
-    crate::protocol_types::ViewportSurface {
-        inner_width: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.inner_width),
-        inner_height: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.inner_height),
-        outer_width: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.inner_width),
-        outer_height: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.inner_height),
-        device_pixel_ratio: DEFAULT_WINDOW_SURFACE_PROFILE.device_pixel_ratio,
-        screen_width: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.screen_width),
-        screen_height: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.screen_height),
-        screen_avail_width: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.screen_avail_width),
-        screen_avail_height: dimension(DEFAULT_WINDOW_SURFACE_PROFILE.screen_avail_height),
-    }
+fn paint_viewport_region(
+    surface: ViewportSurface,
+    capture: ViewportCapture,
+) -> anyhow::Result<PaintCaptureRegion> {
+    let Some(view) = surface.emulated_view else {
+        return Ok(PaintCaptureRegion::Viewport);
+    };
+    let (scale, width, height) = match capture {
+        ViewportCapture::Surface => {
+            let ratio = surface.device_pixel_ratio / view.native_device_pixel_ratio;
+            (
+                ratio,
+                f64::from(surface.inner_width) * ratio,
+                f64::from(surface.inner_height) * ratio,
+            )
+        }
+        ViewportCapture::Widget => (view.scale, f64::from(view.width), f64::from(view.height)),
+    };
+    let (transform, scroll_scale) = if let Some(viewport) = view.viewport {
+        // Blink applies the preview scale first, then the page-coordinate
+        // viewport offset and scale. Resolve scroll compensation during layout.
+        (
+            LayoutTransform2D::new([
+                viewport.scale * scale,
+                0.0,
+                0.0,
+                viewport.scale * scale,
+                -viewport.x * viewport.scale,
+                -viewport.y * viewport.scale,
+            ]),
+            viewport.scale,
+        )
+    } else {
+        (LayoutTransform2D::scale(scale, scale), 0.0)
+    };
+    Ok(PaintCaptureRegion::TransformedViewport {
+        surface: PaintCaptureSurface::new(
+            finite_f32("capture width", width)?,
+            finite_f32("capture height", height)?,
+            finite_f32("native device-pixel ratio", view.native_device_pixel_ratio)?,
+        ),
+        transform,
+        scroll_scale,
+    })
 }

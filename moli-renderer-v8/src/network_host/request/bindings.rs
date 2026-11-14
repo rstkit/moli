@@ -1,3 +1,4 @@
+use crate::network_host::request_scope::callback_child_handle;
 mod init;
 
 use self::init::{
@@ -5,11 +6,13 @@ use self::init::{
 };
 use super::input::request_headers_guard_for_mode;
 use super::*;
+use crate::network_host::fetch_surface::{set_request_slot_bool, set_request_slot_value};
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Request")]
+#[webapi(interface = web_api_interfaces::Request)]
 struct RequestInstanceDeclaration<'scope> {
     #[webapi(slot = REQUEST_METHOD_SLOT)]
     method: String,
@@ -51,6 +54,15 @@ struct RequestInstanceDeclaration<'scope> {
     body_used: (),
 }
 
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Request")]
+struct RequestConstructorArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    input: super::input::RequestInfo<'s>,
+    #[webidl(dictionary)]
+    init: super::init::RequestInitMembers<'s>,
+}
+
 pub(crate) fn request_constructor_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -64,11 +76,14 @@ pub(crate) fn request_constructor_callback<'s>(
         return;
     }
 
+    let Some(parsed) = webidl::parse_args::<RequestConstructorArgs>(scope, &args) else {
+        return;
+    };
     let obj = args.this();
     let data = args.data();
     let child_handle = callback_child_handle(scope, data);
     let base_url = callback_base_url(scope, data);
-    let mut state = match request_initial_state(scope, &args, child_handle, base_url) {
+    let mut state = match request_initial_state(scope, parsed.input, child_handle, base_url) {
         Ok(state) => state,
         Err(error) => {
             webidl::throw_error(scope, &error);
@@ -76,39 +91,23 @@ pub(crate) fn request_constructor_callback<'s>(
         }
     };
 
-    let init_arg = args.get(1);
-    if !init_arg.is_null_or_undefined()
-        && let Ok(init) = v8::Local::<v8::Object>::try_from(init_arg)
-        && let Err(error) = apply_request_init_overrides(scope, init, &mut state)
-    {
+    if let Err(error) = apply_request_init_overrides(scope, parsed.init, &mut state) {
         webidl::throw_error(scope, &error);
         return;
     }
-    if let Err(error) = validate_request_body_is_usable(&state) {
+    if let Err(error) = validate_request_body_is_usable(scope, &state) {
         webidl::throw_error(scope, &error);
         return;
     }
 
     append_default_body_content_type(&mut state.headers, state.body_content_type.as_deref());
-    let body_buffer = state
-        .body
-        .take()
-        .and_then(|body| set_network_body_owned_bytes(scope, obj, body));
-
     let headers_obj = build_headers_object_with_state(
         scope,
         &state.headers,
         request_headers_guard_for_mode(&state.mode),
         false,
     );
-    install_headers_object_methods(scope, headers_obj);
 
-    let body_value = body_buffer
-        .and_then(|buffer| {
-            new_readable_stream_from_array_buffer(scope, buffer, buffer.byte_length())
-        })
-        .map(|stream| stream.into())
-        .unwrap_or_else(|| v8::null(scope).into());
     let signal_source = state
         .signal
         .as_ref()
@@ -117,6 +116,29 @@ pub(crate) fn request_constructor_callback<'s>(
         Some(signal) => signal,
         None if state.signal.is_some() => return,
         None => v8::undefined(scope).into(),
+    };
+    let body_value = if let Some(stream) = state.body_stream.as_ref() {
+        let stream = v8::Local::new(scope, stream);
+        let stream = if state.inherited_body_stream {
+            let Some(proxy) = crate::context_bootstrap::proxy_fetch_body_stream(scope, stream)
+            else {
+                return;
+            };
+            proxy
+        } else {
+            stream
+        };
+        if let Some(source) = state.inherited_body_source {
+            let source = v8::Local::new(scope, source);
+            body_source::set_network_body_stream_source(scope, obj, source);
+        }
+        stream.into()
+    } else {
+        state
+            .body
+            .and_then(|source| source.into_body_stream(scope, obj))
+            .map(|stream| stream.into())
+            .unwrap_or_else(|| v8::null(scope).into())
     };
     RequestInstanceDeclaration::new(
         state.method,
@@ -142,33 +164,92 @@ pub(crate) fn request_constructor_callback<'s>(
     rv.set(obj.into());
 }
 
-fn callback_base_url(
-    scope: &mut v8::PinScope<'_, '_>,
-    value: v8::Local<'_, v8::Value>,
-) -> Option<url::Url> {
-    if !value.is_string() {
-        return None;
-    }
-    value
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-        .and_then(|value| url::Url::parse(&value).ok())
+use crate::network_host::fetch_surface::callback_base_url;
+
+/// Reify a stored native cache key without running author URL conversion or
+/// constructors. Internal URLs may carry credentials supplied by XHR.
+pub(crate) fn build_cached_request_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+) -> Option<v8::Local<'s, v8::Object>> {
+    let headers = build_headers_object_with_state(
+        scope,
+        headers,
+        request_headers_guard_for_mode("cors"),
+        true,
+    );
+    let signal = new_abort_signal_for_request_with_source(scope, None)?;
+    RequestInstanceDeclaration::new(
+        method.to_owned(),
+        url.to_owned(),
+        headers,
+        "about:client".to_owned(),
+        String::new(),
+        "cors".to_owned(),
+        "same-origin".to_owned(),
+        "default".to_owned(),
+        "follow".to_owned(),
+        String::new(),
+        false,
+        "auto".to_owned(),
+        signal,
+        "half".to_owned(),
+        v8::null(scope).into(),
+    )
+    .bind(scope)
+    .ok()
 }
 
-fn callback_child_handle(
-    scope: &mut v8::PinScope<'_, '_>,
-    value: v8::Local<'_, v8::Value>,
-) -> Option<crate::document_runtime::DomHandle> {
-    if let Ok(big) = v8::Local::<v8::BigInt>::try_from(value) {
-        let (index, lossless) = big.u64_value();
-        return lossless
-            .then_some(index)
-            .and_then(|index| usize::try_from(index).ok())
-            .map(crate::document_runtime::DomHandle::new);
+/// Build an intercepted internal Request without invoking author constructors
+/// or RequestInit conversion, retaining its privileged header entries.
+pub(crate) fn build_service_worker_request_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: &crate::service_worker_runtime::ServiceWorkerFetchRequest,
+) -> Option<(v8::Local<'s, v8::Object>, v8::Local<'s, v8::Object>)> {
+    let mode: &'static str = source.request_mode.into();
+    let credentials: &'static str = source.credentials_mode.into();
+    let redirect: &'static str = source.redirect_mode.into();
+    let priority: &'static str = source.priority.map_or("auto", Into::into);
+    let headers = build_headers_object_with_state(
+        scope,
+        &source.headers,
+        request_headers_guard_for_mode(mode),
+        true,
+    );
+    let signal = new_abort_signal_for_request_with_source(scope, None)?;
+    let signal_object = v8::Local::<v8::Object>::try_from(signal).ok()?;
+    let request = RequestInstanceDeclaration::new(
+        source.method.clone(),
+        source.url.to_string(),
+        headers,
+        source.metadata.referrer.clone(),
+        source.metadata.referrer_policy.clone(),
+        mode.to_owned(),
+        credentials.to_owned(),
+        source.metadata.cache.clone(),
+        redirect.to_owned(),
+        source.metadata.integrity.clone(),
+        source.metadata.keepalive,
+        priority.to_owned(),
+        signal,
+        "half".to_owned(),
+        v8::null(scope).into(),
+    )
+    .bind(scope)
+    .ok()?;
+    let destination = v8::String::new(scope, source.destination.as_str())?;
+    set_request_slot_value(scope, request, REQUEST_DESTINATION_SLOT, destination.into());
+    set_request_slot_bool(
+        scope,
+        request,
+        REQUEST_IS_RELOAD_NAVIGATION_SLOT,
+        source.is_reload,
+    );
+    if let Some(bytes) = &source.body {
+        let body = PreparedBodySource::Bytes(bytes.clone()).into_body_stream(scope, request)?;
+        set_request_slot_value(scope, request, REQUEST_BODY_SLOT, body.into());
     }
-    value
-        .integer_value(scope)
-        .filter(|index| *index >= 0)
-        .and_then(|index| usize::try_from(index).ok())
-        .map(crate::document_runtime::DomHandle::new)
+    Some((request, signal_object))
 }

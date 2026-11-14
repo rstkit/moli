@@ -36,6 +36,7 @@ struct OpenRendererOutputStream {
     next_expected_sequence: u64,
     last_projected_sequence: u64,
     projecting_sequence: Option<u64>,
+    queued_ready: bool,
     pending: BTreeMap<u64, RendererOutputPublication>,
     /// `None` means the stream is open. `Some(None)` is a closing stream
     /// which never published a batch.
@@ -67,7 +68,6 @@ pub(crate) struct OrderedRendererOutputIngress {
     /// stream appears at most once, so a missing same-stream predecessor does
     /// not make every later admission rescan all buffered publications.
     ready_streams: VecDeque<RendererOutputStreamIdentity>,
-    queued_ready_streams: HashSet<RendererOutputStreamIdentity>,
 }
 
 impl OrderedRendererOutputIngress {
@@ -94,6 +94,7 @@ impl OrderedRendererOutputIngress {
                 next_expected_sequence: 1,
                 last_projected_sequence: 0,
                 projecting_sequence: None,
+                queued_ready: false,
                 pending: BTreeMap::new(),
                 closing_at: None,
                 active_cursor_leases: HashMap::new(),
@@ -163,6 +164,22 @@ impl OrderedRendererOutputIngress {
     /// target. Conversely, initial-document construction binds the reservation
     /// first. Supporting both orders here keeps transport scheduling from
     /// becoming an ownership contract.
+    #[cfg(test)]
+    pub(crate) fn owner_is_bound_for_fixture(
+        &self,
+        residence: RendererOutputResidenceIdentity,
+    ) -> bool {
+        self.pending_owners.contains_key(&residence)
+            || self
+                .open_streams
+                .iter()
+                .any(|(stream, state)| stream.residence() == residence && state.owner.is_some())
+            || self
+                .closed_streams
+                .keys()
+                .any(|stream| stream.residence() == residence)
+    }
+
     pub(crate) fn bind_owner(
         &mut self,
         residence: RendererOutputResidenceIdentity,
@@ -174,16 +191,16 @@ impl OrderedRendererOutputIngress {
                 continue;
             }
             matched_open_stream = true;
-            assert!(
-                state.pending.is_empty(),
-                "renderer output owner must bind before the first publication"
-            );
             if let Some(existing) = &state.owner {
                 assert_eq!(
                     existing, &owner,
                     "one renderer output stream cannot change protocol owner"
                 );
             } else {
+                assert!(
+                    state.pending.is_empty(),
+                    "renderer output owner must bind before the first publication"
+                );
                 state.owner = Some(owner.clone());
             }
         }
@@ -210,11 +227,13 @@ impl OrderedRendererOutputIngress {
             });
     }
 
+    /// Returns true only when all declared output has been projected and the
+    /// stream's protocol resources may be retired.
     pub(crate) fn close(
         &mut self,
         stream: RendererOutputStreamIdentity,
         last_published_sequence: Option<std::num::NonZeroU64>,
-    ) {
+    ) -> bool {
         let state = self
             .open_streams
             .get_mut(&stream)
@@ -248,7 +267,7 @@ impl OrderedRendererOutputIngress {
             "renderer output cursor lease names a publication beyond the declared stream tail"
         );
         state.closing_at = Some(last_published_sequence);
-        self.retire_closed_stream_if_complete(stream);
+        self.retire_closed_stream_if_complete(stream)
     }
 
     pub(crate) fn admit(
@@ -305,11 +324,12 @@ impl OrderedRendererOutputIngress {
     /// typed projections may still be awaiting an owner action such as popup
     /// target creation. Runtime responses fence on projection completion, not
     /// admission, so a WindowProxy can never escape before its browsing
-    /// context exists.
+    /// context exists. The second return value reports the one transition
+    /// that permits retiring a previously closed stream's protocol resources.
     pub(crate) fn complete_projection(
         &mut self,
         cursor: RendererOutputCursor,
-    ) -> Vec<AdmittedRendererOutputPublication> {
+    ) -> (Vec<AdmittedRendererOutputPublication>, bool) {
         {
             let state = self
                 .open_streams
@@ -334,8 +354,8 @@ impl OrderedRendererOutputIngress {
         }
         self.enqueue_stream_if_ready(cursor.stream());
         let ready = self.release_ready_publications();
-        self.retire_closed_stream_if_complete(cursor.stream());
-        ready
+        let retired = self.retire_closed_stream_if_complete(cursor.stream());
+        (ready, retired)
     }
 
     /// Returns whether the exact concrete cursor has finished every typed
@@ -344,6 +364,15 @@ impl OrderedRendererOutputIngress {
     /// A closed stream may satisfy the cursor only when the cursor was part of
     /// its declared tail; naming a later cursor is an internal ownership
     /// error, not a condition that can become true by waiting.
+    pub(crate) fn is_projection_outstanding(&self, cursor: RendererOutputCursor) -> bool {
+        self.open_streams
+            .get(&cursor.stream())
+            .is_some_and(|stream| {
+                stream.projecting_sequence == Some(cursor.sequence())
+                    || stream.pending.contains_key(&cursor.sequence())
+            })
+    }
+
     pub(crate) fn is_projection_complete(&self, cursor: RendererOutputCursor) -> bool {
         if let Some(state) = self.open_streams.get(&cursor.stream()) {
             return cursor.sequence() <= state.last_projected_sequence;
@@ -363,10 +392,10 @@ impl OrderedRendererOutputIngress {
     fn release_ready_publications(&mut self) -> Vec<AdmittedRendererOutputPublication> {
         let mut ready = Vec::new();
         while let Some(stream) = self.ready_streams.pop_front() {
-            self.queued_ready_streams.remove(&stream);
             let Some(state) = self.open_streams.get_mut(&stream) else {
                 continue;
             };
+            state.queued_ready = false;
             if state.projecting_sequence.is_some() {
                 continue;
             }
@@ -389,21 +418,24 @@ impl OrderedRendererOutputIngress {
     }
 
     fn enqueue_stream_if_ready(&mut self, stream: RendererOutputStreamIdentity) {
-        let is_ready = self.open_streams.get(&stream).is_some_and(|state| {
-            state.projecting_sequence.is_none()
-                && state.pending.contains_key(&state.next_expected_sequence)
-        });
-        if is_ready && self.queued_ready_streams.insert(stream) {
+        let Some(state) = self.open_streams.get_mut(&stream) else {
+            return;
+        };
+        if !state.queued_ready
+            && state.projecting_sequence.is_none()
+            && state.pending.contains_key(&state.next_expected_sequence)
+        {
+            state.queued_ready = true;
             self.ready_streams.push_back(stream);
         }
     }
 
-    fn retire_closed_stream_if_complete(&mut self, stream: RendererOutputStreamIdentity) {
+    fn retire_closed_stream_if_complete(&mut self, stream: RendererOutputStreamIdentity) -> bool {
         let Some(state) = self.open_streams.get(&stream) else {
-            return;
+            return false;
         };
         let Some(last_published_sequence) = state.closing_at else {
-            return;
+            return false;
         };
         let admitted_tail = state
             .next_expected_sequence
@@ -414,13 +446,12 @@ impl OrderedRendererOutputIngress {
             || state.last_projected_sequence != admitted_tail
             || state.projecting_sequence.is_some()
         {
-            return;
+            return false;
         }
         let state = self
             .open_streams
             .remove(&stream)
             .expect("completed renderer output stream must remain open until retirement");
-        self.queued_ready_streams.remove(&stream);
         if !state.active_cursor_leases.is_empty() {
             let active_cursor_leases = state.active_cursor_leases.into_keys().collect();
             assert!(
@@ -439,6 +470,7 @@ impl OrderedRendererOutputIngress {
         // A fully projected Page or Worker without an externally owned cursor
         // has no future observer. Reclaim it immediately instead of retaining
         // one tombstone per retired residence.
+        true
     }
 
     #[cfg(test)]
@@ -522,6 +554,32 @@ mod tests {
     }
 
     #[test]
+    fn rebinding_the_same_owner_preserves_an_outstanding_projection_and_its_successor() {
+        let stream =
+            RendererOutputStreamIdentity::new_page_for_protocol_test(PageId::new_for_testing(1));
+        let mut ingress = OrderedRendererOutputIngress::default();
+        ingress.open(stream, Some(owner()));
+        assert!(matches!(
+            ingress.admit(publication(stream, 1)),
+            RendererOutputIngressAdmission::Ready(_)
+        ));
+        assert!(matches!(
+            ingress.admit(publication(stream, 2)),
+            RendererOutputIngressAdmission::Buffered
+        ));
+        ingress.bind_owner(stream.residence(), owner());
+        assert!(!ingress.is_projection_complete(RendererOutputCursor::new_for_test(stream, 1)));
+        assert_eq!(
+            sequences(
+                &ingress
+                    .complete_projection(RendererOutputCursor::new_for_test(stream, 1))
+                    .0
+            ),
+            vec![2]
+        );
+    }
+
+    #[test]
     fn stream_requires_open_and_exact_sequence_then_closes_at_observed_tail() {
         let stream =
             RendererOutputStreamIdentity::new_page_for_protocol_test(PageId::new_for_testing(7));
@@ -534,6 +592,7 @@ mod tests {
         assert!(
             ingress
                 .complete_projection(RendererOutputCursor::new_for_test(stream, 1))
+                .0
                 .is_empty()
         );
         assert!(matches!(
@@ -543,9 +602,10 @@ mod tests {
         assert!(
             ingress
                 .complete_projection(RendererOutputCursor::new_for_test(stream, 2))
+                .0
                 .is_empty()
         );
-        ingress.close(stream, std::num::NonZeroU64::new(2));
+        assert!(ingress.close(stream, std::num::NonZeroU64::new(2)));
         assert_eq!(
             ingress.closed_stream_count(),
             0,
@@ -574,9 +634,14 @@ mod tests {
 
         // Stream closure can race the asynchronous projection. Retirement
         // must retain the completion state until that final action returns.
-        ingress.close(stream, std::num::NonZeroU64::new(1));
+        assert!(!ingress.close(stream, std::num::NonZeroU64::new(1)));
         assert!(!ingress.is_projection_complete(cursor));
-        assert!(ingress.complete_projection(cursor).is_empty());
+        let (ready, retired) = ingress.complete_projection(cursor);
+        assert!(ready.is_empty());
+        assert!(
+            retired,
+            "only completion of the final projection retires its resources"
+        );
         assert!(ingress.is_projection_complete(cursor));
         assert_eq!(ingress.closed_stream_count(), 1);
         ingress.release_cursor_lease(stream, lease_id);
@@ -602,11 +667,14 @@ mod tests {
             panic!("filling a stream gap must release its concrete head");
         };
         assert_eq!(sequences(&ready), vec![1]);
-        let ready = ingress.complete_projection(RendererOutputCursor::new_for_test(stream, 1));
+        let ready = ingress
+            .complete_projection(RendererOutputCursor::new_for_test(stream, 1))
+            .0;
         assert_eq!(sequences(&ready), vec![2]);
         assert!(
             ingress
                 .complete_projection(RendererOutputCursor::new_for_test(stream, 2))
+                .0
                 .is_empty()
         );
     }
@@ -634,7 +702,11 @@ mod tests {
             RendererOutputIngressAdmission::Ready(ready) if sequences(&ready) == vec![1]
         ));
         assert_eq!(
-            sequences(&ingress.complete_projection(RendererOutputCursor::new_for_test(first, 1))),
+            sequences(
+                &ingress
+                    .complete_projection(RendererOutputCursor::new_for_test(first, 1))
+                    .0
+            ),
             vec![2]
         );
     }
@@ -649,7 +721,7 @@ mod tests {
             ingress.admit(publication(stream, 2)),
             RendererOutputIngressAdmission::Buffered
         );
-        ingress.close(stream, std::num::NonZeroU64::new(2));
+        assert!(!ingress.close(stream, std::num::NonZeroU64::new(2)));
         assert_eq!(
             ingress.admit(publication(stream, 3)),
             RendererOutputIngressAdmission::Stale
@@ -658,13 +730,17 @@ mod tests {
             ingress.admit(publication(stream, 1)),
             RendererOutputIngressAdmission::Ready(ready) if sequences(&ready) == vec![1]
         ));
-        let ready = ingress.complete_projection(RendererOutputCursor::new_for_test(stream, 1));
+        let (ready, retired) =
+            ingress.complete_projection(RendererOutputCursor::new_for_test(stream, 1));
         assert_eq!(sequences(&ready), vec![2]);
         assert!(
-            ingress
-                .complete_projection(RendererOutputCursor::new_for_test(stream, 2))
-                .is_empty()
+            !retired,
+            "a buffered successor still owns the stream's resources"
         );
+        let (ready, retired) =
+            ingress.complete_projection(RendererOutputCursor::new_for_test(stream, 2));
+        assert!(ready.is_empty());
+        assert!(retired);
         assert_eq!(ingress.closed_stream_count(), 0);
     }
 
@@ -767,7 +843,7 @@ mod tests {
                 RendererOutputIngressAdmission::Ready(ready) if sequences(&ready) == vec![1]
             ));
             ingress.close(stream, std::num::NonZeroU64::new(1));
-            assert!(ingress.complete_projection(cursor).is_empty());
+            assert!(ingress.complete_projection(cursor).0.is_empty());
         }
         assert_eq!(ingress.closed_stream_count(), 0);
     }

@@ -1,14 +1,39 @@
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{
+    num::NonZeroU32,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use cidr::AnyIpCidr;
 use moli_browser_profile::{BrowserIdentityProfile, DEFAULT_ACCEPT_LANGUAGE};
+use moli_curl::{CurlTlsConfig, NetworkAddressPolicy};
 
-use crate::WebBotAuthSigner;
+use crate::{Request, WebBotAuthSigner};
+
+#[derive(Debug)]
+struct CookieHeaderScope {
+    value: String,
+    host: OnceLock<String>,
+}
+
+/// Cloned browser configurations share one default host binding. Treat a new
+/// setting as a new authority so config matching cannot reuse another binding.
+#[derive(Clone, Debug)]
+struct ScopedCookieHeader {
+    state: Arc<CookieHeaderScope>,
+}
+
+impl PartialEq for ScopedCookieHeader {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FetchConfig {
     browser_identity: BrowserIdentityProfile,
     default_request_headers: Vec<(String, String)>,
+    additional_cookies: Option<ScopedCookieHeader>,
     request_timeout_ms: u64,
     http_connect_timeout_ms: Option<u64>,
     obey_robots: bool,
@@ -24,22 +49,17 @@ pub struct FetchConfig {
     // HTTP/2 can use multiple streams without being limited by the HTTP/1
     // socket default.
     http_max_host_open: Option<NonZeroU32>,
-    // Transport cap passed to libcurl's per-host connection pool. When unset,
-    // Moli uses Chromium's HTTP/1-style default of six connections per
-    // host/group.
+    // Shared HTTP/WS transport cap passed to libcurl's per-host connection
+    // pool. When unset, use six connections per host/group.
     http_max_host_connections: Option<u8>,
-    // Transport cap for total cached/open connections across hosts.
+    // Shared HTTP/WS transport cap for cached/open connections across hosts.
     http_max_total_connections: Option<u16>,
     // HTTP/2 stream cap; this is separate from HTTP/1 connection count.
     http2_max_concurrent_streams: Option<u16>,
     http_max_response_size: Option<usize>,
     block_private_networks: bool,
     block_cidrs: Vec<AnyIpCidr>,
-    tls_verify_host: bool,
-    ca_cert: Option<PathBuf>,
-    client_cert: Option<PathBuf>,
-    client_key: Option<PathBuf>,
-    client_cert_password: Option<String>,
+    tls: CurlTlsConfig,
     web_bot_auth: Option<WebBotAuthSigner>,
 }
 
@@ -69,6 +89,67 @@ impl FetchConfig {
 
     pub fn browser_identity(&self) -> &BrowserIdentityProfile {
         &self.browser_identity
+    }
+
+    /// Configured Cookie data. Network requests select it through the default
+    /// host scope established by the first HTTP(S) top-level navigation.
+    pub fn additional_cookies(&self) -> Option<&str> {
+        self.additional_cookies
+            .as_ref()
+            .map(|cookies| cookies.state.value.as_str())
+    }
+
+    /// Sets literal Cookie data with a default host-only scope. Cloned configs
+    /// share the first navigation's binding; later navigations cannot rebind it.
+    pub fn set_additional_cookies(&mut self, cookies: Option<String>) {
+        self.additional_cookies = cookies.map(|value| ScopedCookieHeader {
+            state: Arc::new(CookieHeaderScope {
+                value,
+                host: OnceLock::new(),
+            }),
+        });
+    }
+
+    /// Pins configured Cookie data to the first HTTP(S) top-level navigation.
+    /// Browser navigation owners call this before Service Worker interception;
+    /// the fetch runtime also calls it for direct HTTP clients.
+    pub fn bind_additional_cookie_scope(&self, request: &Request) {
+        if !request.is_navigation_request() || !request.is_top_level_navigation_request() {
+            return;
+        }
+        let Some(cookies) = self.additional_cookies.as_ref() else {
+            return;
+        };
+        let initial_url = request
+            .redirect_chain()
+            .first()
+            .map_or(&request.url, |hop| &hop.from_url);
+        if matches!(initial_url.scheme(), "http" | "https")
+            && let Some(host) = initial_url.host_str()
+        {
+            cookies.state.host.get_or_init(|| host.to_owned());
+        }
+    }
+
+    pub(crate) fn additional_cookies_for_request(
+        &self,
+        request: &Request,
+        url: &url::Url,
+    ) -> Option<&str> {
+        let cookies = self.additional_cookies.as_ref()?;
+        let host = cookies.state.host.get()?;
+        let initial_url = request
+            .redirect_chain()
+            .first()
+            .map_or(&request.url, |hop| &hop.from_url);
+        // Explicit top-level transfers keep curl's redirect behavior. Automatic
+        // subrequests and later unrelated navigations use the pinned host only.
+        let scoped_navigation = request.is_navigation_request()
+            && request.is_top_level_navigation_request()
+            && initial_url.host_str() == Some(host.as_str());
+        (matches!(url.scheme(), "http" | "https")
+            && (url.host_str() == Some(host.as_str()) || scoped_navigation))
+            .then_some(cookies.state.value.as_str())
     }
 
     pub fn default_request_headers(&self) -> &[(String, String)] {
@@ -135,20 +216,23 @@ impl FetchConfig {
         http_max_total_connections: Option<u16>,
         http2_max_concurrent_streams: Option<u16>,
     ) {
-        // These are transport-level limits handed to curl. Keep them out of the
-        // runtime scheduler so a Chromium-like HTTP/1 connection default does
-        // not accidentally throttle HTTP/2 streams or queued browser work.
+        // Host/total limits count HTTP and WebSocket sockets together. The
+        // runtime scheduler and HTTP/2 stream limits count work separately.
         self.http_max_host_connections = http_max_host_connections;
         self.http_max_total_connections = http_max_total_connections;
         self.http2_max_concurrent_streams = http2_max_concurrent_streams;
     }
 
     pub fn tls_verify_host(&self) -> bool {
-        self.tls_verify_host
+        self.tls.verify
     }
 
     pub fn set_tls_verify_host(&mut self, tls_verify_host: bool) {
-        self.tls_verify_host = tls_verify_host;
+        self.tls.verify = tls_verify_host;
+    }
+
+    pub fn tls_config(&self) -> &CurlTlsConfig {
+        &self.tls
     }
 
     /// Configure TLS trust and mutual-TLS credentials for this fetch runtime,
@@ -162,26 +246,26 @@ impl FetchConfig {
         client_key: Option<PathBuf>,
         client_cert_password: Option<String>,
     ) {
-        self.ca_cert = ca_cert;
-        self.client_cert = client_cert;
-        self.client_key = client_key;
-        self.client_cert_password = client_cert_password;
+        self.tls.ca_cert = ca_cert;
+        self.tls.client_cert = client_cert;
+        self.tls.client_key = client_key;
+        self.tls.client_cert_password = client_cert_password;
     }
 
     pub fn ca_cert(&self) -> Option<&std::path::Path> {
-        self.ca_cert.as_deref()
+        self.tls.ca_cert.as_deref()
     }
 
     pub fn client_cert(&self) -> Option<&std::path::Path> {
-        self.client_cert.as_deref()
+        self.tls.client_cert.as_deref()
     }
 
     pub fn client_key(&self) -> Option<&std::path::Path> {
-        self.client_key.as_deref()
+        self.tls.client_key.as_deref()
     }
 
     pub fn client_cert_password(&self) -> Option<&str> {
-        self.client_cert_password.as_deref()
+        self.tls.client_cert_password.as_deref()
     }
 
     pub fn web_bot_auth(&self) -> Option<&WebBotAuthSigner> {
@@ -297,6 +381,10 @@ impl FetchConfig {
     pub fn block_cidrs(&self) -> &[AnyIpCidr] {
         &self.block_cidrs
     }
+
+    pub(crate) fn network_address_policy(&self) -> NetworkAddressPolicy {
+        NetworkAddressPolicy::new(self.block_private_networks, self.block_cidrs.clone())
+    }
 }
 
 impl Default for FetchConfig {
@@ -304,6 +392,7 @@ impl Default for FetchConfig {
         Self {
             browser_identity: BrowserIdentityProfile::default(),
             default_request_headers: Vec::new(),
+            additional_cookies: None,
             request_timeout_ms: 30_000,
             http_connect_timeout_ms: None,
             obey_robots: false,
@@ -321,11 +410,7 @@ impl Default for FetchConfig {
             http_max_response_size: None,
             block_private_networks: false,
             block_cidrs: Vec::new(),
-            tls_verify_host: true,
-            ca_cert: None,
-            client_cert: None,
-            client_key: None,
-            client_cert_password: None,
+            tls: CurlTlsConfig::default(),
             web_bot_auth: None,
         }
     }

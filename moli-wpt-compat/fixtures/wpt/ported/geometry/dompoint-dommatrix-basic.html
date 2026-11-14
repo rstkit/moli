@@ -85,6 +85,8 @@ test(function () {
 test(function () {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  rect.setAttribute("width", "10");
+  rect.setAttribute("height", "10");
   svg.appendChild(rect);
 
   const point = rect.getPointAtLength(0);
@@ -200,8 +202,8 @@ test(function () {
   assert_equals(matrix.toJSON().a, 1);
   assert_equals(matrix.toJSON().is2D, true);
   assert_throws_js(TypeError, function () {
-    new DOMMatrix({ a: Symbol("a") });
-  }, "DOMMatrix constructor uses WebIDL unrestricted double conversion for matrix init");
+    new DOMMatrix([Symbol("a"), 0, 0, 1, 0, 0]);
+  }, "DOMMatrix constructor uses WebIDL unrestricted double conversion for sequence elements");
   assert_throws_js(TypeError, function () {
     DOMMatrix.fromMatrix({ a: Symbol("a") });
   }, "DOMMatrix.fromMatrix uses WebIDL unrestricted double conversion for matrix init");

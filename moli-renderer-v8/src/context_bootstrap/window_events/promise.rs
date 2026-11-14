@@ -2,7 +2,7 @@ use super::*;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct PromiseRejectionEventInitDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     cancelable: bool,
@@ -14,7 +14,7 @@ struct PromiseRejectionEventInitDeclaration<'scope> {
 
 pub(crate) fn dispatch_window_promise_rejection_event<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     dispatch_scope: crate::native_bridge::OwnerDispatchScope,
     event_type: &str,
     promise: v8::Local<'s, v8::Promise>,

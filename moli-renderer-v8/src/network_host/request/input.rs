@@ -1,16 +1,22 @@
 use super::super::headers::HeadersGuard;
 use super::*;
+use crate::native_bridge::WindowEnvironmentSettings;
+use crate::web_api_interfaces;
 use crate::webidl;
+use moli_url::WebOrigin;
+use url::Url;
 
 pub(in crate::network_host) fn normalize_request_method(
     method: &str,
-) -> Result<String, &'static str> {
+) -> Result<String, webidl::WebIdlError> {
     if method.is_empty() {
         return Ok("GET".to_owned());
     }
     let normalized = method.to_ascii_uppercase();
     if matches!(normalized.as_str(), "CONNECT" | "TRACE" | "TRACK") {
-        return Err("Request method is forbidden");
+        return Err(webidl::WebIdlError::custom_message(
+            "Request method is forbidden",
+        ));
     }
     if matches!(
         normalized.as_str(),
@@ -26,11 +32,162 @@ pub(super) fn request_method_allows_body(method: &str) -> bool {
     !matches!(method, "GET" | "HEAD")
 }
 
+pub(crate) fn validate_request_method_body(
+    method: &str,
+    body: Option<&bytes::Bytes>,
+) -> Result<(), webidl::WebIdlError> {
+    if body.is_some() && !request_method_allows_body(method) {
+        return Err(webidl::WebIdlError::custom_message(
+            "Request with GET/HEAD method cannot have body",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn request_headers_guard_for_mode(mode: &str) -> HeadersGuard {
     if mode == "no-cors" {
         HeadersGuard::RequestNoCors
     } else {
         HeadersGuard::Request
+    }
+}
+
+/// Standard RequestInfo paths retain the native Request or converted URL.
+/// The boxed snapshot is confined to the existing request-like object extension.
+pub(crate) enum RequestInfo<'s> {
+    Native(v8::Local<'s, v8::Object>),
+    Url(String),
+    Legacy(v8::Local<'s, v8::Object>, Box<RequestInputSnapshot>),
+}
+
+impl<'s> webidl::WebIdlConverter<'s> for RequestInfo<'s> {
+    type Options = ();
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: webidl::Context,
+        _: &(),
+    ) -> Result<Self, webidl::WebIdlError> {
+        if let Ok(object) = v8::Local::<v8::Object>::try_from(value) {
+            if is_branded_request_object(scope, object) {
+                return Ok(Self::Native(object));
+            }
+            if let Some(snapshot) = request_input_snapshot_for_constructor(scope, value)? {
+                return Ok(Self::Legacy(object, Box::new(snapshot)));
+            }
+        }
+        webidl::convert::<webidl::UsvString>(scope, value, context).map(|value| Self::Url(value.0))
+    }
+}
+
+/// Keep native URL authority through constructor and fetch preparation.
+/// The request-like compatibility extension still uses ordinary URL validation.
+pub(crate) enum RequestInputUrl {
+    Native(String),
+    Converted(String),
+}
+
+impl RequestInputUrl {
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Native(url) | Self::Converted(url) => url,
+        }
+    }
+
+    pub(crate) fn validate_credentials(&self, parsed: &Url) -> Result<(), webidl::WebIdlError> {
+        match self {
+            Self::Native(_) => Ok(()),
+            Self::Converted(_) => validate_request_url_credentials(parsed),
+        }
+    }
+
+    pub(crate) fn into_constructor_url(
+        self,
+        scope: &mut v8::PinScope<'_, '_>,
+        child_handle: Option<crate::document_runtime::DomHandle>,
+        base_url: Option<Url>,
+    ) -> Result<String, webidl::WebIdlError> {
+        match self {
+            Self::Native(url) => Ok(url),
+            Self::Converted(url) => {
+                let resolved = try_resolve_request_constructor_url_for_scope(
+                    scope,
+                    &url,
+                    child_handle,
+                    base_url,
+                )
+                .map_err(|_| {
+                    webidl::WebIdlError::custom_message(
+                        "Failed to construct 'Request': invalid URL",
+                    )
+                })?;
+                if let Ok(parsed) = Url::parse(&resolved) {
+                    validate_request_url_credentials(&parsed)?;
+                }
+                Ok(resolved)
+            }
+        }
+    }
+}
+
+impl<'s> RequestInfo<'s> {
+    pub(crate) fn materialize_for_fetch(
+        self,
+        scope: &mut v8::PinScope<'s, '_>,
+        inherit_body: bool,
+    ) -> Result<
+        (
+            RequestInputUrl,
+            Option<RequestInputSnapshot>,
+            Option<v8::Local<'s, v8::Object>>,
+        ),
+        webidl::WebIdlError,
+    > {
+        let (url, mut inherited, source) = self.materialize(scope)?;
+        // Fetch's buffered transport needs the selected source bytes. Preserve
+        // read errors, and do not read an input body replaced by RequestInit.
+        if inherit_body
+            && let (Some(snapshot), Some(source)) = (inherited.as_mut(), source)
+            && is_branded_request_object(scope, source)
+            && !snapshot.body_unusable
+        {
+            snapshot.body = try_network_body_bytes_from_object(scope, source)
+                .map_err(|_| {
+                    webidl::WebIdlError::custom_message("Failed to materialize request body")
+                })?
+                .map(bytes::Bytes::from);
+        }
+        Ok((url, inherited, source))
+    }
+
+    pub(crate) fn materialize(
+        self,
+        scope: &mut v8::PinScope<'s, '_>,
+    ) -> Result<
+        (
+            RequestInputUrl,
+            Option<RequestInputSnapshot>,
+            Option<v8::Local<'s, v8::Object>>,
+        ),
+        webidl::WebIdlError,
+    > {
+        match self {
+            Self::Url(url) => Ok((RequestInputUrl::Converted(url), None, None)),
+            Self::Legacy(source, snapshot) => Ok((
+                RequestInputUrl::Converted(snapshot.url.clone()),
+                Some(*snapshot),
+                Some(source),
+            )),
+            Self::Native(source) => {
+                let snapshot = request_input_snapshot_for_constructor(scope, source.into())?
+                    .expect("native Request snapshot");
+                Ok((
+                    RequestInputUrl::Native(snapshot.url.clone()),
+                    Some(snapshot),
+                    Some(source),
+                ))
+            }
+        }
     }
 }
 
@@ -47,25 +204,10 @@ pub(crate) struct RequestInputSnapshot {
     pub(crate) keepalive: bool,
     pub(crate) priority: moli_fetch::FetchPriorityHint,
     pub(crate) duplex: String,
-    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) body: Option<bytes::Bytes>,
     pub(crate) body_unusable: bool,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) signal: Option<v8::Global<v8::Object>>,
-}
-
-pub(super) fn request_input_url<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Result<String, webidl::WebIdlError> {
-    webidl::convert::<webidl::UsvString>(scope, value, webidl::Context::argument("Request", 1))
-        .map(Into::into)
-}
-
-pub(crate) fn request_input_snapshot<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Result<Option<RequestInputSnapshot>, webidl::WebIdlError> {
-    request_input_snapshot_inner(scope, value, false)
 }
 
 pub(crate) fn mark_request_input_body_used_for_fetch<'s>(
@@ -92,23 +234,19 @@ pub(super) fn request_input_snapshot_for_constructor<'s>(
 fn request_input_snapshot_inner<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
-    allow_unusable_body: bool,
+    for_constructor: bool,
 ) -> Result<Option<RequestInputSnapshot>, webidl::WebIdlError> {
     let Ok(object) = v8::Local::<v8::Object>::try_from(value) else {
         return Ok(None);
     };
     if is_branded_request_object(scope, object) {
-        return request_input_snapshot_from_private_slots(scope, object, allow_unusable_body)
-            .map(Some);
+        return request_input_snapshot_from_private_slots(scope, object, for_constructor).map(Some);
     }
     let Some(url) = defined_object_string_property(scope, object, "url") else {
         return Ok(None);
     };
     let method = defined_object_string_property(scope, object, "method")
-        .map(|value| {
-            normalize_request_method(&value)
-                .map_err(|_| webidl::WebIdlError::custom_message("Request method is forbidden"))
-        })
+        .map(|value| normalize_request_method(&value))
         .transpose()?
         .unwrap_or_else(|| "GET".to_owned());
     let mode =
@@ -131,7 +269,8 @@ fn request_input_snapshot_inner<'s>(
     let duplex = defined_object_string_property(scope, object, "duplex")
         .unwrap_or_else(|| "half".to_owned());
     let body = try_network_body_bytes_from_object(scope, object)
-        .map_err(|_| webidl::WebIdlError::custom_message("Failed to materialize request body"))?;
+        .map_err(|_| webidl::WebIdlError::custom_message("Failed to materialize request body"))?
+        .map(bytes::Bytes::from);
     let headers = webidl::property_result(
         scope,
         object,
@@ -165,14 +304,11 @@ fn request_input_snapshot_inner<'s>(
 fn request_input_snapshot_from_private_slots<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-    allow_unusable_body: bool,
+    for_constructor: bool,
 ) -> Result<RequestInputSnapshot, webidl::WebIdlError> {
     let url = request_slot_string(scope, object, REQUEST_URL_SLOT).unwrap_or_default();
     let method = request_slot_string(scope, object, REQUEST_METHOD_SLOT)
-        .map(|value| {
-            normalize_request_method(&value)
-                .map_err(|_| webidl::WebIdlError::custom_message("Request method is forbidden"))
-        })
+        .map(|value| normalize_request_method(&value))
         .transpose()?
         .unwrap_or_else(|| "GET".to_owned());
     let mode =
@@ -195,25 +331,21 @@ fn request_input_snapshot_from_private_slots<'s>(
     let duplex = request_slot_string(scope, object, REQUEST_DUPLEX_SLOT)
         .unwrap_or_else(|| "half".to_owned());
     let body_unusable = request_body_unusable(scope, object);
-    if body_unusable && !allow_unusable_body {
+    if body_unusable && !for_constructor {
         return Err(request_body_already_used_error());
     }
-    let body = if body_unusable {
+    // Constructing from a Request transfers its current stream;
+    // copying its immutable source bytes would bypass pending reads and tee.
+    let body = if body_unusable || for_constructor {
         None
     } else {
-        try_network_body_bytes_from_object(scope, object).map_err(|_| {
-            webidl::WebIdlError::custom_message("Failed to materialize request body")
-        })?
+        try_network_body_bytes_from_object(scope, object)
+            .map_err(|_| webidl::WebIdlError::custom_message("Failed to materialize request body"))?
+            .map(bytes::Bytes::from)
     };
-    let headers = webidl::property_result(
-        scope,
-        object,
-        "headers",
-        webidl::Context::member("Request", "headers"),
-    )?
-    .map(|value| headers_entries_from_init(scope, value))
-    .transpose()?
-    .unwrap_or_default();
+    // Inherited headers are an internal list copy, unlike an explicit
+    // RequestInit.headers value, which undergoes WebIDL iterable conversion.
+    let headers = request_headers_entries(scope, object);
     let signal = request_slot_value(scope, object, REQUEST_SIGNAL_SLOT)
         .map(|value| request_signal_snapshot_from_value(scope, value))
         .transpose()?
@@ -238,7 +370,7 @@ fn request_input_snapshot_from_private_slots<'s>(
     })
 }
 
-pub(super) fn request_body_already_used_error() -> webidl::WebIdlError {
+pub(crate) fn request_body_already_used_error() -> webidl::WebIdlError {
     webidl::WebIdlError::custom_message(
         "Cannot construct a Request with a Request object that has already been used.",
     )
@@ -265,7 +397,7 @@ fn request_body_stream_locked<'s>(
     let Ok(stream) = v8::Local::<v8::Object>::try_from(body) else {
         return false;
     };
-    if !crate::context_bootstrap::object_prototype_matches(scope, stream, "ReadableStream") {
+    if !web_api_interfaces::ReadableStream::is_instance(scope, stream) {
         return false;
     }
     stream
@@ -325,7 +457,7 @@ pub(super) fn resolve_request_constructor_url(
 pub(crate) fn try_resolve_request_constructor_url(
     scope: &mut v8::PinScope<'_, '_>,
     input: &str,
-) -> Result<String, String> {
+) -> Result<String, RequestUrlError> {
     try_resolve_request_constructor_url_for_scope(scope, input, None, None)
 }
 
@@ -333,7 +465,7 @@ pub(crate) fn try_resolve_request_constructor_url_for_child(
     scope: &mut v8::PinScope<'_, '_>,
     input: &str,
     child_handle: Option<crate::document_runtime::DomHandle>,
-) -> Result<String, String> {
+) -> Result<String, RequestUrlError> {
     try_resolve_request_constructor_url_for_scope(scope, input, child_handle, None)
 }
 
@@ -341,7 +473,7 @@ pub(crate) fn try_resolve_request_constructor_url_for_base(
     scope: &mut v8::PinScope<'_, '_>,
     input: &str,
     base_url: Option<url::Url>,
-) -> Result<String, String> {
+) -> Result<String, RequestUrlError> {
     try_resolve_request_constructor_url_for_scope(scope, input, None, base_url)
 }
 
@@ -350,30 +482,43 @@ pub(crate) fn try_resolve_request_constructor_url_for_scope(
     input: &str,
     child_handle: Option<crate::document_runtime::DomHandle>,
     base_url: Option<url::Url>,
-) -> Result<String, String> {
+) -> Result<String, RequestUrlError> {
     if url::Url::parse(input).is_ok() {
         return Ok(input.to_owned());
     }
     if let Some(base_url) = base_url {
-        return resolve_context_url(&base_url, input, None).map(|url| url.to_string());
+        return resolve_context_url(&base_url, input, None)
+            .map(|url| url.to_string())
+            .map_err(RequestUrlError::from);
     }
     if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
-        let host = unsafe { &mut *host_ptr };
-        let document_url = child_handle
-            .and_then(|handle| {
-                host.child_browsing_context_request_scope(handle)
-                    .map(|(_, url)| url)
-            })
-            .unwrap_or_else(|| {
-                let (_, document_url, _) = effective_subresource_request_scope(scope, host, None);
-                document_url
-            });
-        resolve_context_url(&document_url, input, None).map(|url| url.to_string())
+        let host = unsafe { &*host_ptr };
+        let api_base_url =
+            if let Some(settings) = WindowEnvironmentSettings::for_current_realm(scope) {
+                settings
+                    .api_base_url(host)
+                    .ok_or(RequestUrlError::AssociatedDocumentUnavailable)?
+            } else {
+                child_handle
+                    .and_then(|handle| host.child_browsing_context_base_url(handle))
+                    .unwrap_or_else(|| {
+                        let owner = effective_subresource_request_owner(scope, host);
+                        subresource_api_base_url(scope, host, owner)
+                            .unwrap_or_else(|| host.document_url().clone())
+                    })
+            };
+        resolve_context_url(&api_base_url, input, None)
+            .map(|url| url.to_string())
+            .map_err(RequestUrlError::from)
     } else if let Some(worker_url) = crate::context_bootstrap::current_worker_script_url(scope) {
         if worker_url.scheme() == "blob" {
-            return Err(format!("Failed to parse URL from {input}"));
+            return Err(RequestUrlError::OpaqueWorkerBase {
+                input: input.to_owned(),
+            });
         }
-        resolve_context_url(&worker_url, input, None).map(|url| url.to_string())
+        resolve_context_url(&worker_url, input, None)
+            .map(|url| url.to_string())
+            .map_err(RequestUrlError::from)
     } else {
         Ok(input.to_owned())
     }
@@ -385,22 +530,36 @@ pub(super) fn normalize_request_referrer(scope: &mut v8::PinScope<'_, '_>, input
     }
 
     let resolved = resolve_request_constructor_url(scope, input);
-    let Some(context_url) = current_request_context_url(scope) else {
+    let Some(context_origin) = current_request_context_origin(scope) else {
         return resolved;
     };
-    if moli_url::parsed_same_origin(&resolved, &context_url) {
+    if Url::parse(&resolved).is_ok_and(|url| WebOrigin::from_url(&url).same_origin(&context_origin))
+    {
         resolved
     } else {
         "about:client".to_owned()
     }
 }
 
-fn current_request_context_url(scope: &mut v8::PinScope<'_, '_>) -> Option<String> {
-    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
-        let host = unsafe { &mut *host_ptr };
-        let (_, document_url, _) = effective_subresource_request_scope(scope, host, None);
-        Some(document_url.to_string())
-    } else {
-        crate::context_bootstrap::current_worker_script_url(scope).map(|url| url.to_string())
+fn current_request_context_origin(scope: &mut v8::PinScope<'_, '_>) -> Option<WebOrigin> {
+    if let Some(settings) = WindowEnvironmentSettings::for_current_realm(scope) {
+        return Some(settings.origin().clone());
     }
+    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
+        let host = unsafe { &*host_ptr };
+        let owner = effective_subresource_request_owner(scope, host);
+        let loader = host.document_resource_loader_for_dispatch_scope(owner)?;
+        Some(loader.fetch_context().request_origin())
+    } else {
+        crate::worker::worker_global_origin(scope)
+    }
+}
+
+fn validate_request_url_credentials(url: &url::Url) -> Result<(), webidl::WebIdlError> {
+    if !url.username().is_empty() || url.password().is_some_and(|value| !value.is_empty()) {
+        return Err(webidl::WebIdlError::custom_message(
+            "Request URL must not include credentials",
+        ));
+    }
+    Ok(())
 }

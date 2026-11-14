@@ -27,14 +27,54 @@
 //! `#[derive(WebIdlArgs)]` generates positional argument parsing for a V8
 //! native binding's `FunctionCallbackArguments`. `#[derive(WebIdlDictionary)]`
 //! generates named property parsing for dictionary objects. Both derives use
-//! the converter wrappers in `types` and only produce Rust values; object shape
-//! declaration and Web API wrapper allocation remain outside this crate.
+//! the converter wrappers in `types` and produce Rust values. The opt-in
+//! `#[webidl(snapshot)]` also serializes converted Rust fields to fresh JS
+//! dictionaries or existing backing state, and creates typed private carriers
+//! for subsequent snapshots. These paths copy containers without repeating
+//! input conversion or running author getters/iterators. Web API wrapper
+//! allocation and native interface identity remain outside this crate.
+//! Dictionary members are converted in lexicographical order of their final
+//! JavaScript names. `#[webidl(inherit)]` on one dictionary field converts the
+//! ancestor's members from the same object first; it does not read a nested
+//! property. Positional arguments retain their declaration/index order.
+//!
+//! Interface fields use `#[webidl(interface = interfaces::EventTarget)]` with
+//! `v8::Local<'s, v8::Object>`, optionally wrapped in `Option` or a variadic
+//! argument's `Vec`. The interface supplies `NAME` and `is_instance`; a
+//! `brand_check = path` attribute overrides the native identity predicate.
+//! `Option` skips missing/undefined values, while `nullable` additionally accepts
+//! null. Identity is checked at the field's position in conversion order, and
+//! the original object is retained. Interface conversion cannot be combined
+//! with `converter`, `with`, or string conversion options.
+//!
+//! Dictionary fields use `#[webidl(dictionary)]` with a type implementing
+//! `WebIdlDictionary`. Non-optional fields without an explicit default parse
+//! missing/undefined/null as an empty dictionary, executing member defaults and
+//! required-member checks. `Option<T>` skips missing/undefined but parses null
+//! as `Some(empty_dictionary)`; `nullable` instead maps null to `None`.
+//! Explicit `default = expr` replaces missing/undefined values only, following
+//! the same evaluation order as other field defaults. Null still parses an
+//! empty dictionary. Empty dictionaries have no inherited JavaScript properties.
+//!
+//! Iterable fields use `#[webidl(sequence)]` with `Vec<T>` or `Option<Vec<T>>`.
+//! Item conversion is inferred from `T`, or selected by `converter = "..."`.
+//! `sequence, interface = Type` validates every item using the same interface
+//! metadata and optional `brand_check` as scalar interface fields. Conversion
+//! reuses the runtime iterator and converts each item before reading the next.
+//! `sequence` converts one iterable argument; `variadic` converts argument tails.
+//!
+//! Uint8Array fields retain the native view identity and reject shared,
+//! resizable and growable buffers by default. `#[webidl(allow_shared)]` permits
+//! fixed shared storage, as required by `[AllowShared] Uint8Array` arguments.
 
 extern crate self as moli_webidl;
 
+mod buffer_source;
 mod convert;
+pub use buffer_source::{AllowSharedBufferSource, NonSharedBufferSource};
 mod error;
 mod helpers;
+mod snapshot;
 mod traits;
 mod types;
 
@@ -49,21 +89,50 @@ pub use convert::{
 };
 pub use error::{Context, WebIdlError, WebIdlErrorKind};
 pub use helpers::{
-    dictionary_arg, dictionary_value, event_listener_once_option, event_listener_once_value,
-    event_listener_options, event_listener_options_value, is_nullish, optional_number_property,
-    optional_object_arg, optional_string_property, property, property_non_nullish,
-    property_non_undefined, property_result, symbol_property_result, throw_dom_exception,
-    throw_error, throw_index_size_error, throw_type_error, v8_string,
+    add_event_listener_options_value, dictionary_arg, dictionary_value, event_listener_options,
+    event_listener_options_value, is_nullish, optional_number_property, optional_object_arg,
+    optional_string_property, property, property_non_nullish, property_non_undefined,
+    property_result, symbol_property_result, throw_dom_exception, throw_error,
+    throw_index_size_error, throw_type_error, v8_string,
 };
 pub use moli_webidl_callback::{
     PreparedWebIdlCallbackFunction, PreparedWebIdlCallbackInterface, WebIdlCallbackFunction,
     WebIdlCallbackInterface,
 };
 pub use moli_webidl_derive::{WebIdlArgs, WebIdlDictionary, WebIdlEnum};
+pub use snapshot::{
+    DictionarySnapshot, SnapshotKind, SnapshotMember, SnapshotPrototype, SnapshotSchema,
+    SnapshotWriter, WebIdlDictionarySerialize, WebIdlDictionarySnapshot, WebIdlSnapshotValue,
+    buffer_snapshot,
+};
+
+/// Canonical output token for enums whose variants have declarative WebIDL tokens.
+pub trait WebIdlEnumSnapshot {
+    fn snapshot_token(&self) -> &'static str;
+}
+
+#[doc(hidden)]
+pub mod __private {
+    pub use crate::snapshot::bytes_snapshot;
+    pub use moli_webapi_declare::WebApiValue;
+
+    pub fn enum_snapshot_value<'s, T: crate::WebIdlEnumSnapshot>(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: &T,
+    ) -> Option<v8::Local<'s, v8::Value>> {
+        crate::v8_string(scope, value.snapshot_token()).map(Into::into)
+    }
+}
 pub use traits::{ParseOutcome, WebIdlArguments, WebIdlConverter, WebIdlDictionary, WebIdlEnum};
 pub use types::{
-    Boolean, BufferSource, ByteString, ClampedUnsignedShort, DomString, Double, EnforceRangeLong,
-    EnforceRangeUnsignedLong, EnforceRangeUnsignedLongLong, EnumValue, EventListenerOptions, Long,
-    Record, Sequence, StringOptions, UnrestrictedDouble, UnsignedLong, UnsignedLongLong,
+    Boolean, BufferSource, ByteString, ClampedLongLong, ClampedUnsignedLong, ClampedUnsignedShort,
+    Dictionary, DomString, DomString16, Double, EnforceRangeLong, EnforceRangeUnsignedLong,
+    EnforceRangeUnsignedLongLong, EnumValue, EventListenerOptions, InterfaceObject,
+    InterfaceOptions, Long, LongLong, Octet, Record, Sequence, Short, StringOptions,
+    Uint8ArrayOptions, UnrestrictedDouble, UnrestrictedFloat, UnsignedLong, UnsignedLongLong,
     UnsignedShort, UsvString,
 };
+
+/// Restricted WebIDL float represented as a finite binary32 value.
+pub use types::Float;
+pub use types::{EnforceRangeLongLong, EnforceRangeUnsignedShort};

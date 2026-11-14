@@ -3,30 +3,46 @@
 <script src="/wpt/resources/testharness.js"></script>
 <script src="/wpt/resources/testharnessreport.js"></script>
 <script src="/wpt/resources/moli-wpt-adapter.js"></script>
+<body>
 <script>
 test(function () {
   const initialHref = location.href;
   const initialProtocol = location.protocol;
   const initialLength = history.length;
 
-  location.protocol = initialProtocol;
-  assert_equals(location.href, initialHref, "assigning the current protocol should be a no-op");
-  assert_equals(location.protocol, initialProtocol, "current protocol assignment should preserve protocol");
-  assert_equals(history.length, initialLength, "current protocol assignment should not grow history");
+  for (const invalid of ["", "1invalid:", "!bad", "http bad"]) {
+    assert_throws_dom(
+      "SyntaxError",
+      () => { location.protocol = invalid; },
+      `invalid scheme ${JSON.stringify(invalid)} should throw`
+    );
+  }
 
-  location.protocol = initialProtocol.toUpperCase();
-  assert_equals(location.href, initialHref, "scheme setter should treat protocol case-insensitively");
-  assert_equals(location.protocol, initialProtocol, "case-insensitive protocol assignment should preserve protocol");
-  assert_equals(history.length, initialLength, "case-insensitive no-op should not grow history");
+  assert_equals(location.href, initialHref, "invalid syntax must preserve the URL");
+  assert_equals(location.protocol, initialProtocol, "invalid syntax must preserve the protocol");
+  assert_equals(history.length, initialLength, "invalid syntax must not grow history");
+}, "location.protocol rejects invalid schemes without navigation");
 
-  location.protocol = initialProtocol.slice(0, -1);
-  assert_equals(location.href, initialHref, "protocol assignment without a trailing colon should normalize as the same scheme");
-  assert_equals(location.protocol, initialProtocol, "colonless current protocol assignment should preserve protocol");
-  assert_equals(history.length, initialLength, "colonless no-op should not grow history");
+for (const scheme of ["data", "custom", "file"]) {
+  promise_test(async t => {
+    const iframe = document.createElement("iframe");
+    t.add_cleanup(() => iframe.remove());
+    iframe.src = "resources/location-protocol-target.html";
+    const loaded = new Promise(resolve => { iframe.onload = resolve; });
+    document.body.appendChild(iframe);
+    await loaded;
 
-  location.protocol = "1invalid:";
-  assert_equals(location.href, initialHref, "invalid protocol assignment should leave the URL unchanged");
-  assert_equals(location.protocol, initialProtocol, "invalid protocol assignment should preserve protocol");
-  assert_equals(history.length, initialLength, "invalid protocol assignment should not grow history");
-}, "location.protocol no-op and invalid assignments do not navigate");
+    const originalDocument = iframe.contentDocument;
+    const originalHref = iframe.contentWindow.location.href;
+    if (scheme === "file") {
+      assert_not_equals(new URL(originalHref).port, "", "fixture uses a non-default port");
+    }
+    const reloaded = new Promise(resolve => { iframe.onload = resolve; });
+    iframe.contentWindow.location.protocol = scheme;
+    await reloaded;
+
+    assert_equals(iframe.contentWindow.location.href, originalHref, "scheme replacement preserves the URL");
+    assert_not_equals(iframe.contentDocument, originalDocument, "unchanged HTTP URL still navigates to a new Document");
+  }, `location.protocol = ${scheme} reloads an HTTP URL when scheme replacement is rejected`);
+}
 </script>

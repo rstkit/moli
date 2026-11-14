@@ -1,16 +1,14 @@
 //! Routes a JavaScript `AbortSignal` to the store that owns it.
 //!
 //! Window and worker AbortSignals have deliberately separate lifetime owners:
-//! the Window `JsContextHost` and the exact worker run. Shared Web API
+//! the Window `PageScriptHost` and the exact worker run. Shared Web API
 //! algorithms may accept either kind, but must not infer ownership from a
 //! public prototype or maintain a third abort-algorithm list. Resolving once
 //! produces a short-lived capability that delegates state and algorithm
 //! registration back to the owning store.
 
-use crate::context_bootstrap::MessagePortEventListenerId;
 use crate::context_bootstrap::context_host_ptr_from_global_bridge;
-use crate::types::MessagePortId;
-use crate::util::{throw_type_error, v8str};
+use crate::webidl;
 
 #[derive(Clone, Copy)]
 enum AbortSignalOwner {
@@ -27,6 +25,22 @@ enum AbortSignalOwner {
 pub(crate) struct ResolvedAbortSignal<'s> {
     signal: v8::Local<'s, v8::Object>,
     owner: AbortSignalOwner,
+}
+
+impl<'s> webidl::WebIdlConverter<'s> for ResolvedAbortSignal<'s> {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: webidl::Context,
+        _: &(),
+    ) -> Result<Self, webidl::WebIdlError> {
+        v8::Local::<v8::Object>::try_from(value)
+            .ok()
+            .and_then(|signal| Self::resolve(scope, signal))
+            .ok_or_else(|| webidl::WebIdlError::cannot_convert(context, "AbortSignal"))
+    }
 }
 
 impl<'s> ResolvedAbortSignal<'s> {
@@ -66,13 +80,25 @@ impl<'s> ResolvedAbortSignal<'s> {
         }
     }
 
+    pub(crate) fn reason(
+        self,
+        scope: &mut v8::PinScope<'s, '_>,
+    ) -> Option<v8::Local<'s, v8::Value>> {
+        match self.owner {
+            AbortSignalOwner::Window => {
+                let host_ptr = context_host_ptr_from_global_bridge(scope)?;
+                unsafe { &mut *host_ptr }.abort_signal_reason(scope, self.signal)
+            }
+            AbortSignalOwner::Worker => {
+                crate::worker::abort::worker_abort_signal_reason(scope, self.signal)
+            }
+        }
+    }
+
     pub(crate) fn abort(self, scope: &mut v8::PinScope<'s, '_>, reason: v8::Local<'s, v8::Value>) {
         match self.owner {
             AbortSignalOwner::Window => {
-                let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
-                    return;
-                };
-                unsafe { &mut *host_ptr }.abort_signal(scope, self.signal, reason);
+                crate::native_bridge::abort::abort_signal(scope, self.signal, reason);
             }
             AbortSignalOwner::Worker => {
                 let Some(signal_id) =
@@ -136,73 +162,32 @@ impl<'s> ResolvedAbortSignal<'s> {
             }
         }
     }
-
-    pub(crate) fn register_message_port_listener(
-        self,
-        scope: &mut v8::PinScope<'s, '_>,
-        port_id: MessagePortId,
-        listener_id: MessagePortEventListenerId,
-    ) -> bool {
-        match self.owner {
-            AbortSignalOwner::Window => {
-                let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
-                    return false;
-                };
-                unsafe { &mut *host_ptr }.register_abort_message_port_listener(
-                    scope,
-                    self.signal,
-                    port_id,
-                    listener_id,
-                )
-            }
-            AbortSignalOwner::Worker => {
-                crate::worker::abort::register_worker_abort_signal_message_port_listener(
-                    scope,
-                    self.signal,
-                    port_id,
-                    listener_id,
-                )
-            }
-        }
-    }
 }
 
-/// Parses the `signal` member of `AddEventListenerOptions`.
-///
-/// The outer `Option` distinguishes abrupt conversion from an absent member;
-/// the inner `Option` distinguishes no signal from a validated Window/worker
-/// signal capability.
+/// Converts the final AddEventListenerOptions member after capture/once/passive.
+/// A dictionary uses Get, not HasProperty: Proxy traps and inherited getters
+/// must run exactly once, and their original exceptions must escape unchanged.
 pub(crate) fn event_listener_signal_from_options_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
-) -> Option<Option<ResolvedAbortSignal<'s>>> {
-    if value.is_null_or_undefined() || !value.is_object() {
-        return Some(None);
-    }
+) -> Result<Option<ResolvedAbortSignal<'s>>, webidl::WebIdlError> {
     let Ok(options) = v8::Local::<v8::Object>::try_from(value) else {
-        return Some(None);
+        return Ok(None);
     };
-    let signal_key = v8str(scope, "signal");
-    if !options.has(scope, signal_key.into()).unwrap_or(false) {
-        return Some(None);
-    }
-    let signal_value = options.get(scope, signal_key.into())?;
+    let context = webidl::Context::member("AddEventListenerOptions", "signal");
+    let Some(signal_value) = webidl::property_result(scope, options, "signal", context)? else {
+        return Ok(None);
+    };
     if signal_value.is_undefined() {
-        return Some(None);
+        return Ok(None);
     }
-    let Ok(signal) = v8::Local::<v8::Object>::try_from(signal_value) else {
-        throw_type_error(
-            scope,
-            "Failed to execute 'addEventListener': options.signal must be an AbortSignal.",
-        );
-        return None;
-    };
-    let Some(signal) = ResolvedAbortSignal::resolve(scope, signal) else {
-        throw_type_error(
-            scope,
-            "Failed to execute 'addEventListener': options.signal must be an AbortSignal.",
-        );
-        return None;
-    };
-    Some(Some(signal))
+    let signal = v8::Local::<v8::Object>::try_from(signal_value)
+        .ok()
+        .and_then(|signal| ResolvedAbortSignal::resolve(scope, signal))
+        .ok_or_else(|| {
+            webidl::WebIdlError::custom_message(
+                "Failed to execute 'addEventListener': options.signal must be an AbortSignal.",
+            )
+        })?;
+    Ok(Some(signal))
 }

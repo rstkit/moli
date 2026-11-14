@@ -1,4 +1,5 @@
 use anyhow::Result;
+use moli_inspector_json::InspectorJson;
 use serde_json::{Value, json};
 
 use crate::cdp_writer::CdpSocketSink;
@@ -9,6 +10,7 @@ mod command;
 mod frontend_registry;
 mod output;
 mod pending_commands;
+mod session_output;
 
 pub(super) struct CdpRoutedFrontend {
     frontend_id: u64,
@@ -20,8 +22,12 @@ impl CdpRoutedFrontend {
         self.frontend_id
     }
 
-    pub(super) fn enqueue_message(self, message: Value) -> bool {
+    pub(super) fn enqueue_message(self, message: impl Into<InspectorJson>) -> bool {
         self.sink.enqueue_owned_message(message)
+    }
+
+    pub(super) fn into_sink(self) -> CdpSocketSink {
+        self.sink
     }
 }
 

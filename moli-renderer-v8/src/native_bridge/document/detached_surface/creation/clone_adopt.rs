@@ -2,15 +2,15 @@ use super::super::*;
 use crate::native_bridge::document::{
     parse_import_node_options, validate_registry_association_for_document,
 };
+use crate::native_bridge::node_runtime_and_handle_from_object_or_detached;
+use crate::native_bridge::set_wrapped_handle_or_null_for_receiver;
 use crate::util::context_host_ptr_from_global_bridge;
 
-use super::super::super::super::node::{
-    node_runtime_and_handle_from_object, set_wrapped_node_or_null,
-};
+use super::super::super::super::node::node_runtime_and_handle_from_object;
 
 fn native_clone_source_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     node: v8::Local<'s, v8::Object>,
 ) -> Option<DomHandle> {
     if let Ok((node_runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, node)
@@ -38,7 +38,7 @@ fn detached_document_root_local_name<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     document: v8::Local<'s, v8::Object>,
 ) -> Option<String> {
-    let root = object_property_as_object(scope, document, "documentElement")?;
+    let root = detached_document_element_object(scope, document)?;
     detached_native_element_local_name(scope, root)
         .or_else(|| object_string_property(scope, root, "localName"))
 }
@@ -48,6 +48,15 @@ fn clone_detached_document_shell<'s>(
     document: v8::Local<'s, v8::Object>,
     deep: bool,
 ) -> Option<v8::Local<'s, v8::Object>> {
+    let (source_runtime, source_handle) =
+        node_runtime_and_handle_from_object_or_detached(scope, document).ok()?;
+    let source_metadata = unsafe { &*source_runtime }
+        .dom_host()
+        .node(source_handle)?
+        .as_document()?
+        .clone();
+    let execution_context =
+        unsafe { &*source_runtime }.document_execution_context_for_node(source_handle)?;
     let document_kind = detached_state_string(scope, document, "documentKind");
     let root_is_html = detached_document_root_local_name(scope, document)
         .is_some_and(|name| name.eq_ignore_ascii_case("html"));
@@ -65,15 +74,34 @@ fn clone_detached_document_shell<'s>(
     };
     let cloned = call_global_bridge_method(scope, helper, &[])
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    if !deep {
-        return Some(cloned);
-    }
-
     if html_shell {
         for child in detached_child_node_objects(scope, cloned) {
             detached_detach_from_parent(scope, child);
         }
     }
+    let (clone_runtime, clone_handle) =
+        node_runtime_and_handle_from_object_or_detached(scope, cloned).ok()?;
+    unsafe { &mut *clone_runtime }
+        .set_inert_document_execution_context(clone_handle, Some(execution_context));
+    if !unsafe { &mut *clone_runtime }
+        .dom_host_mut()
+        .initialize_document_clone_metadata(clone_handle, &source_metadata)
+    {
+        return None;
+    }
+    // Browser Document clones fall back to their copied URL/about base URL
+    // when a copied <base> is removed. The native clone helper also serves
+    // callers that need a frozen computed base; do not expose that override.
+    unsafe { &mut *clone_runtime }
+        .dom_host_mut()
+        .node_mut(clone_handle)?
+        .data_mut()
+        .as_document_mut()?
+        .set_base_url_override(None);
+    if !deep {
+        return Some(cloned);
+    }
+
     let children = detached_child_node_objects(scope, document);
     for child in children {
         let cloned_child = clone_js_node_like_into_document_object(scope, cloned, child, true)?;
@@ -146,7 +174,13 @@ pub(in crate::native_bridge) fn bridge_clone_node_into_document_callback<'a>(
             rv.set_null();
             return;
         };
-        set_wrapped_node_or_null(scope, &mut rv, runtime_ptr, Some(imported));
+        set_wrapped_handle_or_null_for_receiver(
+            scope,
+            &mut rv,
+            runtime_ptr,
+            args.this(),
+            Some(imported),
+        );
         return;
     }
     match clone_js_node_like_into_document_object(scope, document, node, deep) {

@@ -394,6 +394,7 @@ impl DomHost {
         let mut stack = vec![root];
         while let Some(handle) = stack.pop() {
             let owner_document = self.node(handle).and_then(Node::owner_document);
+            self.dom.set_dialog_modal(handle, false);
             if let Some(node) = self.node_mut(handle) {
                 node.set_tree_scope(owner_document, false, false);
             }
@@ -506,9 +507,80 @@ impl DomHost {
         }
     }
 
+    /// Compare nodes in the order of a traversal that visits shadow children
+    /// before light children. Ordinary document-position comparison treats
+    /// different shadow trees as disconnected and cannot order these queries.
+    pub fn compare_handles_in_shadow_including_tree_order(
+        &self,
+        left: DomHandle,
+        right: DomHandle,
+    ) -> std::cmp::Ordering {
+        let ancestors = |handle| {
+            let mut path = Vec::new();
+            let mut current = Some(handle);
+            while let Some(handle) = current {
+                path.push(handle);
+                current = self
+                    .parent_node(handle)
+                    .or_else(|| self.shadow_root_host(handle));
+            }
+            path.reverse();
+            path
+        };
+        let left_path = ancestors(left);
+        let right_path = ancestors(right);
+        let common = left_path
+            .iter()
+            .zip(&right_path)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common == 0 {
+            return left.index().cmp(&right.index());
+        }
+        match (left_path.get(common), right_path.get(common)) {
+            (Some(left), Some(right)) => {
+                if self.is_shadow_root(*left) {
+                    std::cmp::Ordering::Less
+                } else if self.is_shadow_root(*right) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    self.compare_handles_in_document_order(*left, *right)
+                }
+            }
+            _ => left_path.len().cmp(&right_path.len()),
+        }
+    }
+
     pub fn is_connected(&self, handle: DomHandle) -> bool {
         self.node(handle)
             .is_some_and(|node| node.flags().connected())
+    }
+
+    /// Returns whether the node's shadow-including root is a `Document`.
+    ///
+    /// This is the DOM Standard's connectedness test. It intentionally also
+    /// counts nodes in secondary documents, whose internal lifecycle
+    /// `connected` flag is false because they are not part of the host
+    /// document tree.
+    pub fn is_connected_to_document(&self, handle: DomHandle) -> bool {
+        let Some(mut root) = self.root_node_handle(handle) else {
+            return false;
+        };
+        loop {
+            if self.node(root).is_some_and(Node::is_document) {
+                return true;
+            }
+            if !self.is_shadow_root(root) {
+                return false;
+            }
+            let Some(host) = self.shadow_root_host(root) else {
+                return false;
+            };
+            let Some(outer_root) = self.root_node_handle(host) else {
+                return false;
+            };
+            root = outer_root;
+        }
     }
 
     pub fn active_element_handle(&self) -> Option<DomHandle> {
@@ -713,24 +785,15 @@ impl DomHost {
         let document_element = match self.document_element_handle() {
             Some(document_element) => document_element,
             None => {
-                let html = self.create_parser_element(
-                    "html".to_owned(),
-                    "http://www.w3.org/1999/xhtml".to_owned(),
-                    None,
-                    Vec::new(),
-                );
-                let head = self.create_parser_element(
-                    "head".to_owned(),
-                    "http://www.w3.org/1999/xhtml".to_owned(),
-                    None,
-                    Vec::new(),
-                );
-                let body = self.create_parser_element(
-                    "body".to_owned(),
-                    "http://www.w3.org/1999/xhtml".to_owned(),
-                    None,
-                    Vec::new(),
-                );
+                let html = self
+                    .create_element_ns(Some("http://www.w3.org/1999/xhtml"), "html")
+                    .expect("valid HTML element");
+                let head = self
+                    .create_element_ns(Some("http://www.w3.org/1999/xhtml"), "head")
+                    .expect("valid HTML element");
+                let body = self
+                    .create_element_ns(Some("http://www.w3.org/1999/xhtml"), "body")
+                    .expect("valid HTML element");
                 let _ = self.append_child(self.document_handle(), html);
                 let _ = self.append_child(html, head);
                 let _ = self.append_child(html, body);
@@ -744,12 +807,9 @@ impl DomHost {
 
         let body = self.ensure_html_document_body()?;
         if self.document_head_handle().is_none() {
-            let head = self.create_parser_element(
-                "head".to_owned(),
-                "http://www.w3.org/1999/xhtml".to_owned(),
-                None,
-                Vec::new(),
-            );
+            let head = self
+                .create_element_ns(Some("http://www.w3.org/1999/xhtml"), "head")
+                .expect("valid HTML element");
             let _ = self.insert_before(document_element, head, Some(body));
         }
         Some(body)
@@ -770,12 +830,9 @@ impl DomHost {
             return None;
         }
 
-        let body = self.create_parser_element(
-            "body".to_owned(),
-            "http://www.w3.org/1999/xhtml".to_owned(),
-            None,
-            Vec::new(),
-        );
+        let body = self
+            .create_element_ns(Some("http://www.w3.org/1999/xhtml"), "body")
+            .expect("valid HTML element");
         let _ = self.append_child(document_element, body);
         Some(body)
     }
@@ -810,46 +867,90 @@ impl DomHost {
             })
     }
 
+    /// Whether any current element can match this legacy named-property key.
+    ///
+    /// This is deliberately independent of connectivity and document/tree scope:
+    /// callers may use a miss to avoid a traversal, but must still validate the
+    /// owner and scope on a hit. Reuse the incrementally maintained named indexes
+    /// rather than caching misses (custom-element upgrades can change eligibility
+    /// without changing an element's id or name).
+    pub fn has_element_with_named_item_key(&self, key: &str) -> bool {
+        self.visit_element_candidates_by_id_or_name(key, |handle| {
+            if self
+                .node(handle)
+                .and_then(Node::as_element)
+                .is_some_and(|element| element.matches_named_item_key(key))
+            {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    }
+
+    /// Visit current id/name candidates once each, without restricting document,
+    /// connectivity, or tree scope. Callers supply their eligibility rules and
+    /// sort accepted nodes if needed. Breaking avoids building a result list or
+    /// inspecting the remaining candidates for existence-only queries.
+    pub fn visit_element_candidates_by_id_or_name<B>(
+        &self,
+        key: &str,
+        mut visit: impl FnMut(DomHandle) -> std::ops::ControlFlow<B>,
+    ) -> std::ops::ControlFlow<B> {
+        if key.is_empty() {
+            return std::ops::ControlFlow::Continue(());
+        }
+        self.ensure_id_index();
+        self.ensure_name_index();
+        let ids = self.id_index.borrow();
+        let names = self.name_index.borrow();
+        let ids = ids
+            .as_ref()
+            .and_then(|index| index.handles_by_value.get(key));
+        let names = names
+            .as_ref()
+            .and_then(|index| index.handles_by_value.get(key));
+        let candidates = ids.into_iter().flat_map(NamedElementHandles::iter).chain(
+            names
+                .into_iter()
+                .flat_map(NamedElementHandles::iter)
+                .filter(|handle| ids.is_none_or(|ids| !ids.contains(handle))),
+        );
+        for &handle in candidates {
+            if self
+                .node(handle)
+                .and_then(Node::as_element)
+                .is_some_and(|element| {
+                    element.id() == Some(key) || element.name_attribute() == Some(key)
+                })
+            {
+                visit(handle)?;
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
     pub fn element_handles_by_id_or_name_matching(
         &self,
         key: &str,
         mut accepts_name: impl FnMut(DomHandle) -> bool,
     ) -> Vec<DomHandle> {
-        self.ensure_id_index();
-        self.ensure_name_index();
-
-        let mut candidates = IndexSet::new();
-        if let Some(handles) = self
-            .id_index
-            .borrow()
-            .as_ref()
-            .and_then(|index| index.handles_by_value.get(key))
-        {
-            candidates.extend(handles.iter().copied());
-        }
-        if let Some(handles) = self
-            .name_index
-            .borrow()
-            .as_ref()
-            .and_then(|index| index.handles_by_value.get(key))
-        {
-            candidates.extend(handles.iter().copied());
-        }
-
         let document_handle = self.document_handle();
-        let mut matches = candidates
-            .into_iter()
-            .filter(|handle| {
-                self.node(*handle).is_some_and(|node| {
-                    node.flags().in_document_tree()
-                        && node.owner_document() == Some(document_handle)
-                        && node.as_element().is_some_and(|element| {
-                            element.id() == Some(key)
-                                || (element.name_attribute() == Some(key) && accepts_name(*handle))
-                        })
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut matches = Vec::new();
+        let _ = self.visit_element_candidates_by_id_or_name(key, |handle| {
+            if self.node(handle).is_some_and(|node| {
+                node.flags().in_document_tree()
+                    && node.owner_document() == Some(document_handle)
+                    && node.as_element().is_some_and(|element| {
+                        element.id() == Some(key)
+                            || (element.name_attribute() == Some(key) && accepts_name(handle))
+                    })
+            }) {
+                matches.push(handle);
+            }
+            std::ops::ControlFlow::<()>::Continue(())
+        });
         matches.sort_by(|left, right| self.compare_handles_in_document_order(*left, *right));
         matches
     }
@@ -946,6 +1047,34 @@ impl DomHost {
             .map(Document::quirks_mode)
     }
 
+    pub fn document_design_mode_enabled_for_handle(
+        &self,
+        document_handle: DomHandle,
+    ) -> Option<bool> {
+        self.node(document_handle)
+            .and_then(Node::as_document)
+            .map(Document::design_mode_enabled)
+    }
+
+    pub fn set_document_design_mode_enabled_for_handle(
+        &mut self,
+        document_handle: DomHandle,
+        design_mode_enabled: bool,
+    ) -> bool {
+        let Some(document) = self
+            .node_mut(document_handle)
+            .and_then(|node| node.data_mut().as_document_mut())
+        else {
+            return false;
+        };
+        if document.design_mode_enabled() == design_mode_enabled {
+            return false;
+        }
+        document.set_design_mode_enabled(design_mode_enabled);
+        self.record_mutation(MutationScope::QueryState);
+        true
+    }
+
     pub fn document_base_url(&self) -> Option<Url> {
         self.document_base_url_for_handle(self.document_handle())
     }
@@ -992,6 +1121,15 @@ impl DomHost {
         self.node(document_handle)
             .and_then(Node::as_document)
             .and_then(Document::source_last_modified_ms)
+    }
+
+    pub fn document_source_response_status_for_handle(
+        &self,
+        document_handle: DomHandle,
+    ) -> Option<u16> {
+        self.node(document_handle)
+            .and_then(Node::as_document)
+            .and_then(Document::source_response_status)
     }
 
     pub fn document_default_language_for_node(&self, handle: DomHandle) -> Option<String> {
@@ -1077,12 +1215,33 @@ impl DomHost {
         else {
             return false;
         };
-        let fallback_base_url = fallback_base_url.unwrap_or_else(|| document.url().clone());
-        if document.fallback_base_url() == &fallback_base_url {
+        if !document.set_fallback_base_url(fallback_base_url) {
             return false;
         }
-        document.set_fallback_base_url(fallback_base_url);
         self.dom.process_base_element(document_handle, true);
+        self.record_mutation(MutationScope::LocalState);
+        true
+    }
+
+    pub fn document_character_set_for_handle(&self, document_handle: DomHandle) -> Option<&str> {
+        Some(self.node(document_handle)?.as_document()?.character_set())
+    }
+
+    pub fn set_document_character_set_for_handle(
+        &mut self,
+        document_handle: DomHandle,
+        character_set: &str,
+    ) -> bool {
+        let Some(document) = self
+            .node_mut(document_handle)
+            .and_then(|node| node.data_mut().as_document_mut())
+        else {
+            return false;
+        };
+        if document.character_set() == character_set {
+            return false;
+        }
+        document.set_character_set(character_set);
         self.record_mutation(MutationScope::LocalState);
         true
     }
@@ -1104,6 +1263,25 @@ impl DomHost {
         }
         document.set_content_type(content_type);
         self.record_mutation(MutationScope::LocalState);
+        true
+    }
+
+    pub fn set_document_quirks_mode_for_handle(
+        &mut self,
+        document_handle: DomHandle,
+        quirks_mode: selectors::matching::QuirksMode,
+    ) -> bool {
+        let Some(document) = self
+            .node_mut(document_handle)
+            .and_then(|node| node.data_mut().as_document_mut())
+        else {
+            return false;
+        };
+        if document.quirks_mode() == quirks_mode {
+            return false;
+        }
+        document.set_quirks_mode(quirks_mode);
+        self.record_mutation(MutationScope::QueryState);
         true
     }
 
@@ -1142,6 +1320,24 @@ impl DomHost {
         }
         document.set_source_last_modified_ms(timestamp_ms);
         self.record_mutation(MutationScope::QueryState);
+        true
+    }
+
+    pub fn set_document_source_response_status_for_handle(
+        &mut self,
+        document_handle: DomHandle,
+        status: Option<u16>,
+    ) -> bool {
+        let Some(document) = self
+            .node_mut(document_handle)
+            .and_then(|node| node.data_mut().as_document_mut())
+        else {
+            return false;
+        };
+        if document.source_response_status() == status {
+            return false;
+        }
+        document.set_source_response_status(status);
         true
     }
 
@@ -1236,7 +1432,12 @@ impl DomHost {
         self.find_document_anchor(document_handle, &decoded)
     }
 
-    fn find_document_anchor(&self, document_handle: DomHandle, name: &str) -> Option<DomHandle> {
+    /// Finds an ID or legacy named anchor without changing the document target.
+    pub fn find_document_anchor(
+        &self,
+        document_handle: DomHandle,
+        name: &str,
+    ) -> Option<DomHandle> {
         if name.is_empty() || !self.node(document_handle).is_some_and(Node::is_document) {
             return None;
         }
@@ -1284,6 +1485,48 @@ impl DomHost {
     pub fn child_nodes(&self, handle: DomHandle) -> Option<Vec<DomHandle>> {
         self.node(handle)?;
         Some(self.child_handles(handle).collect())
+    }
+
+    pub fn create_element_without_attributes_for_document(
+        &mut self,
+        document_handle: DomHandle,
+        local_name: String,
+        namespace: String,
+        prefix: Option<String>,
+    ) -> DomHandle {
+        self.allocate_element_for_document(document_handle, local_name, namespace, prefix, false)
+    }
+
+    pub(super) fn allocate_element_for_document(
+        &mut self,
+        document_handle: DomHandle,
+        local_name: String,
+        namespace: String,
+        prefix: Option<String>,
+        parser_created: bool,
+    ) -> DomHandle {
+        let is_child_browsing_context_host_candidate =
+            is_html_frame_owner_candidate(&local_name, &namespace);
+        let element = if parser_created {
+            Element::new_parser_created(local_name, namespace, prefix, Vec::new())
+        } else {
+            Element::new(local_name, namespace, prefix, Vec::new())
+        };
+        let node_id = self
+            .dom
+            .allocate_element_for_document(document_handle, element);
+        if let Some(node) = self.node_mut(node_id) {
+            node.set_parser_created(parser_created);
+        }
+        self.record_element_query_index_candidate(node_id);
+        if is_child_browsing_context_host_candidate {
+            let mut candidates = self.child_browsing_context_host_candidates.borrow_mut();
+            if !candidates.contains(&node_id) {
+                candidates.push(node_id);
+            }
+        }
+
+        node_id
     }
 
     pub fn create_element(&mut self, local_name: &str) -> DomHandle {
@@ -1336,13 +1579,15 @@ impl DomHost {
             .collect()
     }
 
+    /// Indexed frame owners in shadow-including order, including a frame root.
     pub fn child_browsing_context_host_candidate_handles_in_subtree_in_document_order(
         &self,
         root: DomHandle,
     ) -> Vec<DomHandle> {
-        let Some(root_node) = self.node(root) else {
+        if self.node(root).is_none() {
             return Vec::new();
-        };
+        }
+        let connected = self.is_connected(root);
         let mut handles = self
             .child_browsing_context_host_candidates
             .borrow()
@@ -1350,21 +1595,14 @@ impl DomHost {
             .copied()
             .filter(|handle| {
                 self.is_child_browsing_context_host_candidate(*handle)
-                    && root_node.contains(&self.dom, *handle)
+                    // Host-inclusive ancestry also crosses template.content.
+                    // A connected frame tree must exclude those inert owners.
+                    && (!connected || self.is_connected(*handle))
+                    && self.is_host_including_inclusive_ancestor(root, *handle)
             })
             .collect::<Vec<_>>();
         handles.sort_unstable_by(|left, right| {
-            let Some(left_node) = self.node(*left) else {
-                return std::cmp::Ordering::Greater;
-            };
-            let position = left_node.compare_document_position(&self.dom, *right);
-            if position & Node::DOCUMENT_POSITION_FOLLOWING != 0 {
-                std::cmp::Ordering::Less
-            } else if position & Node::DOCUMENT_POSITION_PRECEDING != 0 {
-                std::cmp::Ordering::Greater
-            } else {
-                left.index().cmp(&right.index())
-            }
+            self.compare_handles_in_shadow_including_tree_order(*left, *right)
         });
         handles.dedup();
         handles
@@ -1413,13 +1651,18 @@ impl DomHost {
             || self.name_index.borrow().is_some()
             || self.element_query_index.borrow().has_materialized_index();
         let mut shadow_hosts = Vec::new();
-        let mut stack = roots.iter().rev().copied().collect::<Vec<_>>();
-        while let Some(handle) = stack.pop() {
-            if record_query_candidates {
+        let mut stack = roots
+            .iter()
+            .rev()
+            .map(|&root| (root, true))
+            .collect::<Vec<_>>();
+        while let Some((handle, record_candidates)) = stack.pop() {
+            if record_candidates && record_query_candidates {
                 self.record_named_index_candidate(handle);
                 self.record_element_query_index_candidate(handle);
             }
-            if let Some(element) = self.node(handle).and_then(Node::as_element) {
+            if record_candidates && let Some(element) = self.node(handle).and_then(Node::as_element)
+            {
                 self.record_child_browsing_context_host_candidate_if_needed(
                     handle,
                     element.local_name(),
@@ -1429,9 +1672,12 @@ impl DomHost {
             if self.shadow_root_handle(handle).is_some() {
                 shadow_hosts.push(handle);
             }
+            if let Some(contents) = self.dom.template_contents_fragment(handle) {
+                stack.push((contents, false));
+            }
             let mut child = self.first_child(handle);
             while let Some(handle) = child {
-                stack.push(handle);
+                stack.push((handle, record_candidates));
                 child = self.next_sibling(handle);
             }
         }
@@ -1486,31 +1732,53 @@ impl DomHost {
 
     pub fn create_document_type(
         &mut self,
-        name: &str,
-        public_id: &str,
-        system_id: &str,
+        name: impl Into<crate::native::DomStringValue>,
+        public_id: impl Into<crate::native::DomStringValue>,
+        system_id: impl Into<crate::native::DomStringValue>,
     ) -> DomHandle {
-        self.dom
-            .create_document_type(name.to_owned(), public_id.to_owned(), system_id.to_owned())
+        self.dom.create_document_type(name, public_id, system_id)
     }
 
     pub fn create_document_type_for_document(
         &mut self,
         document_handle: DomHandle,
-        name: &str,
-        public_id: &str,
-        system_id: &str,
+        name: impl Into<crate::native::DomStringValue>,
+        public_id: impl Into<crate::native::DomStringValue>,
+        system_id: impl Into<crate::native::DomStringValue>,
     ) -> DomHandle {
-        self.dom.create_document_type_for_document(
-            document_handle,
-            name.to_owned(),
-            public_id.to_owned(),
-            system_id.to_owned(),
-        )
+        self.dom
+            .create_document_type_for_document(document_handle, name, public_id, system_id)
     }
 
     pub fn create_document(&mut self, url: url::Url) -> DomHandle {
         self.dom.create_document(url)
+    }
+
+    /// Initialize a fresh Document shell using the DOM node-cloning rules.
+    pub fn initialize_document_clone_metadata(
+        &mut self,
+        document_handle: DomHandle,
+        source: &Document,
+    ) -> bool {
+        let Some(document) = self
+            .node_mut(document_handle)
+            .and_then(|node| node.data_mut().as_document_mut())
+        else {
+            return false;
+        };
+        *document = source.clone_for_node();
+        self.record_mutation(MutationScope::QueryState);
+        true
+    }
+
+    /// Keep the retired Document and its nodes addressable while admitting a
+    /// fresh main Document into the same LocalWindow's DOM arena.
+    pub fn replace_main_document(&mut self, document: &Document) -> DomHandle {
+        self.active_element.set(None);
+        self.hovered_elements.borrow_mut().clear();
+        let handle = self.dom.replace_main_document(document);
+        self.record_mutation(MutationScope::QueryState);
+        handle
     }
 
     pub fn create_document_fragment(&mut self) -> DomHandle {
@@ -1585,6 +1853,7 @@ impl DomHost {
             return None;
         }
         let root = self.create_document_fragment();
+        self.dom.set_document_fragment_host(root, host);
         let owner_document = self.node(host).and_then(Node::owner_document);
         let connected = self.is_connected(host);
         self.dom.register_stylesheet_candidate_tree_scope(root);
@@ -1747,7 +2016,7 @@ impl DomHost {
         true
     }
 
-    fn mark_shadow_tree_scope_for_subtree(
+    pub(super) fn mark_shadow_tree_scope_for_subtree(
         &mut self,
         root: DomHandle,
         owner_document: Option<DomHandle>,
@@ -1755,9 +2024,16 @@ impl DomHost {
         stylesheet_owners: &mut Vec<DomHandle>,
     ) -> bool {
         let mut touched_shadow_root = false;
-        let mut stack = vec![root];
-        while let Some(handle) = stack.pop() {
-            stack.extend(self.child_handles_reversed(handle));
+        let mut stack = vec![(root, owner_document, connected)];
+        while let Some((handle, owner_document, connected)) = stack.pop() {
+            stack.extend(
+                self.child_handles_reversed(handle)
+                    .map(|child| (child, owner_document, connected)),
+            );
+            if let Some(contents) = self.dom.template_contents_fragment(handle) {
+                let contents_document = self.node(contents).and_then(Node::owner_document);
+                stack.push((contents, contents_document, false));
+            }
             if let Some(shadow_root) = self.shadow_root_handle(handle) {
                 for owner in self
                     .dom
@@ -1773,7 +2049,7 @@ impl DomHost {
                     }
                 }
                 touched_shadow_root = true;
-                stack.push(shadow_root);
+                stack.push((shadow_root, owner_document, connected));
             }
         }
         touched_shadow_root
@@ -2152,6 +2428,7 @@ impl DomHost {
                 continue;
             }
             self.dom.register_stylesheet_candidate_tree_scope(root);
+            self.dom.set_document_fragment_host(root, host);
             self.shadow_roots_by_host.borrow_mut().insert(
                 host,
                 ShadowRootState {
@@ -2176,6 +2453,11 @@ impl DomHost {
     }
 
     pub fn containing_shadow_root(&self, handle: DomHandle) -> Option<DomHandle> {
+        // `is_shadow_root` uses this same registry. Without any registered
+        // root, no ancestor walk can find one, even for detached subtrees.
+        if self.shadow_hosts_by_root.borrow().is_empty() {
+            return None;
+        }
         let mut current = Some(handle);
         while let Some(candidate) = current {
             if self.is_shadow_root(candidate) {

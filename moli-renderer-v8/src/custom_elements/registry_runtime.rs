@@ -1,13 +1,43 @@
 use super::{CustomElementRegistryAssociation, CustomElementRegistryKey};
+use crate::web_api_interfaces;
 use crate::{
     document_runtime::DomHandle,
-    native_bridge::JsContextHost,
-    util::{get_private_value, global_constructor_object, set_private_value, v8str},
+    native_bridge::PageScriptHost,
+    util::{
+        context_host_ptr_from_context_slot, get_private_object, get_private_value,
+        new_null_prototype_object, set_private_value,
+    },
 };
 
 pub(super) const CUSTOM_ELEMENTS_REGISTRY_CHILD_HANDLE_SLOT: &str =
     "__moliCustomElementsRegistryChildHandle";
 const CUSTOM_ELEMENTS_REGISTRY_SCOPED_ID_SLOT: &str = "__moliCustomElementsRegistryScopedId";
+const CUSTOM_ELEMENTS_REGISTRY_OWNER_SLOT: &str = "__moliCustomElementsRegistryOwner";
+
+pub(crate) fn mark_custom_elements_registry_owner(
+    scope: &mut v8::PinScope<'_, '_>,
+    registry: v8::Local<'_, v8::Object>,
+) {
+    // The allocation context of a receiver can come from an unrelated
+    // NewTarget. Anchor the native owner in the constructing binding's realm
+    // instead, using the same retained-Document lifetime as native nodes.
+    let owner = new_null_prototype_object(scope);
+    set_private_value(
+        scope,
+        registry,
+        CUSTOM_ELEMENTS_REGISTRY_OWNER_SLOT,
+        owner.into(),
+    );
+}
+
+pub(crate) fn registry_owner_host<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    registry: v8::Local<'s, v8::Object>,
+) -> Option<*mut PageScriptHost> {
+    let registry = moli_webapi_declare::web_api_object_target(scope, registry)?;
+    let owner = get_private_object(scope, registry, CUSTOM_ELEMENTS_REGISTRY_OWNER_SLOT)?;
+    context_host_ptr_from_context_slot(owner.get_creation_context(scope)?)
+}
 
 pub(crate) fn mark_scoped_custom_elements_registry(
     scope: &mut v8::PinScope<'_, '_>,
@@ -49,15 +79,7 @@ pub(crate) fn registry_association_from_value<'s>(
         return Some(CustomElementRegistryAssociation::Null);
     }
     let registry = v8::Local::<v8::Object>::try_from(value).ok()?;
-    if registry_u64_private_slot(scope, registry, CUSTOM_ELEMENTS_REGISTRY_SCOPED_ID_SLOT).is_some()
-        || registry_child_window_handle(scope, registry).is_some()
-    {
-        return Some(CustomElementRegistryAssociation::Registry(
-            registry_store_key(scope, registry),
-        ));
-    }
-    let constructor = global_constructor_object(scope, "CustomElementRegistry")?;
-    if !value.instance_of(scope, constructor).unwrap_or(false) {
+    if !web_api_interfaces::CustomElementRegistry::is_instance(scope, registry) {
         return None;
     }
     Some(CustomElementRegistryAssociation::Registry(
@@ -65,20 +87,8 @@ pub(crate) fn registry_association_from_value<'s>(
     ))
 }
 
-pub(crate) fn registry_association_from_create_options_value<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Option<CustomElementRegistryAssociation> {
-    if value.is_null_or_undefined() || value.is_string() {
-        return None;
-    }
-    let options = value.to_object(scope)?;
-    let registry = options.get(scope, v8str(scope, "customElementRegistry").into())?;
-    registry_association_from_value(scope, registry)
-}
-
-pub(crate) fn registry_association_matches_document_default(
-    host: &JsContextHost,
+pub(crate) fn registry_association_matches_document(
+    host: &PageScriptHost,
     document_handle: DomHandle,
     association: CustomElementRegistryAssociation,
 ) -> bool {

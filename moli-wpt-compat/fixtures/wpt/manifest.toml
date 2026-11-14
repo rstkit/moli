@@ -1358,7 +1358,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["location"]
-notes = "Manual compat port for the stable HTTP subset of location.protocol assignment: assigning the current protocol with or without a trailing colon, assigning the same protocol with different casing, and assigning an invalid scheme leave URL and session history unchanged. Cross-scheme http/https navigation remains follow-up until the WPT fixture server exposes an HTTPS origin."
+notes = "Manual compat coverage for location.protocol failure boundaries: invalid syntax throws SyntaxError, while rejected data/custom/file replacements reload a same-origin HTTP iframe at its unchanged URL. The file case uses the fixture's non-default port. Renderer tests also cover credentials, default ports, non-HTTP(S) results, same-scheme assignments and HTTP-to-HTTPS navigation."
 
 [[test]]
 id = "location-assign-fragment-history-basic"
@@ -1582,7 +1582,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["forms", "html", "submit", "events"]
-notes = "Manual compat port for SubmitEvent surface: constructor/getter shape, document.createEvent('SubmitEvent'), requestSubmit(submitter) preserving the active submitter, and requestSubmit() exposing null submitter."
+notes = "Manual compat port for SubmitEvent surface: constructor/getter shape, legacy document.createEvent('SubmitEvent') rejection, requestSubmit(submitter) preserving the active submitter, and requestSubmit() exposing null submitter."
 
 [[test]]
 id = "form-submit-button-click-basic"
@@ -2007,7 +2007,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["forms", "html", "validation", "input", "textarea", "length", "actions"]
-notes = "Manual compat port for user-edit provenance in input/textarea minLength/maxLength validity: script-set values remain exempt, manifest-driven insert-text actions make tooShort/tooLong participate in ValidityState.valid, and UTF-16 code unit length is checked for non-BMP input."
+notes = "Manual compat port for user-edit provenance and editing limits in input/textarea minLength/maxLength validity: script-set values remain exempt, short manifest-driven insert-text actions make tooShort participate in ValidityState.valid, and maxlength truncation counts UTF-16 code units without leaving a split surrogate."
 
 [[test.actions]]
 type = "evaluate"
@@ -2039,9 +2039,9 @@ text = "abcde"
 [[test.actions]]
 type = "evaluate"
 expression = '''
-__lmAssertLengthState(field.value === "abcde", "second input action should replace selected value");
-__lmAssertLengthState(field.validity.tooLong === true, "user-edited long input should trip tooLong");
-__lmAssertLengthState(field.validity.valid === false, "tooLong input should be invalid");
+__lmAssertLengthState(field.value === "abcd", "input action should truncate to maxlength");
+__lmAssertLengthState(field.validity.tooLong === false, "maxlength should prevent a tooLong input value");
+__lmAssertLengthState(field.validity.valid === true, "truncated input should remain valid");
 field.value = "abcdef";
 __lmAssertLengthState(field.validity.tooLong === false, "script-set value after user edit should clear tooLong provenance");
 __lmAssertLengthState(field.validity.valid === true, "script-set long input should be valid without user-edit provenance");
@@ -2064,9 +2064,9 @@ text = "abcd"
 [[test.actions]]
 type = "evaluate"
 expression = '''
-__lmAssertLengthState(bio.value === "abcd", "textarea action should replace selected value");
-__lmAssertLengthState(bio.validity.tooLong === true, "user-edited long textarea should trip tooLong");
-__lmAssertLengthState(bio.validity.valid === false, "tooLong textarea should be invalid");
+__lmAssertLengthState(bio.value === "abc", "textarea action should truncate to maxlength");
+__lmAssertLengthState(bio.validity.tooLong === false, "maxlength should prevent a tooLong textarea value");
+__lmAssertLengthState(bio.validity.valid === true, "truncated textarea should remain valid");
 const emoji = document.getElementById("emoji");
 emoji.focus();
 "ready";
@@ -2079,9 +2079,9 @@ text = "😀"
 [[test.actions]]
 type = "evaluate"
 expression = '''
-__lmAssertLengthState(emoji.value === "😀", "emoji input should receive the inserted scalar");
-__lmAssertLengthState(emoji.validity.tooLong === true, "maxlength should count UTF-16 code units for user-edited non-BMP input");
-__lmAssertLengthState(emoji.validity.valid === false, "non-BMP value over maxLength should be invalid");
+__lmAssertLengthState(emoji.value === "", "maxlength should not leave half of a surrogate pair");
+__lmAssertLengthState(emoji.validity.tooLong === false, "rejected non-BMP input should not be tooLong");
+__lmAssertLengthState(emoji.validity.valid === true, "rejected non-BMP input should remain valid");
 "done";
 '''
 
@@ -2355,7 +2355,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["fileapi", "drag-and-drop", "datatransfer", "events", "input", "actions"]
-notes = "Manual compat port for renderer-driven drag lifecycle behavior: manifest dispatch-drag actions synthesize dragenter/dragover/drop, reuse the same live DataTransfer object across the drag session, preserve listener mutations, and run the text input drop default action when drop is not canceled."
+notes = "Manual compat port for renderer-driven drag lifecycle behavior: manifest dispatch-drag actions synthesize dragenter/dragover/drop, give each target dispatch a separate DataTransfer view, keep data protected during dragenter/dragover so listener payload mutations are ignored, and let the user-agent insert the current drop command payload with a negotiated copy operation when the drop is accepted."
 
 [[test.actions]]
 type = "dispatch-drag"
@@ -2379,7 +2379,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 17
-items = [{ mime_type = "text/plain", data = "ignored-drop-text" }]
+items = [{ mime_type = "text/plain", data = "drop-text" }]
 
 [[test]]
 id = "drag-operation-mask-basic"
@@ -2393,7 +2393,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["fileapi", "drag-and-drop", "datatransfer", "events", "input", "actions"]
-notes = "Manual compat port for renderer drag operation-mask mapping: source drag_operations_mask values are exposed through DataTransfer.effectAllowed and the initial dropEffect, target dropEffect overrides only run text drop defaults when allowed by the source mask, dispatch-drag modifiers populate DragEvent modifier-key state, and Ctrl/Meta/Shift/Alt modifier combinations select copy/move/link defaults with explicit link gestures taking precedence when the source mask allows them."
+notes = "Manual compat port for renderer drag operation-mask mapping: source drag_operations_mask values initialize each protected target view's dropEffect, drop carries the negotiated operation, and explicitly canceled dragover requests only deliver drop and run text defaults when their dropEffect is allowed by the source mask. CDP modifier flags populate DragEvent modifier-key state without overriding the preferred operation."
 
 [[test.actions]]
 type = "dispatch-drag"
@@ -2417,7 +2417,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 0
-items = [{ mime_type = "text/plain", data = "ignored-none-drop" }]
+items = [{ mime_type = "text/plain", data = "none-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2445,7 +2445,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 2
-items = [{ mime_type = "text/plain", data = "ignored-link-drop" }]
+items = [{ mime_type = "text/plain", data = "link-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2473,7 +2473,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 16
-items = [{ mime_type = "text/plain", data = "ignored-move-drop" }]
+items = [{ mime_type = "text/plain", data = "move-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2501,7 +2501,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 3
-items = [{ mime_type = "text/plain", data = "ignored-copylink-drop" }]
+items = [{ mime_type = "text/plain", data = "copylink-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2529,7 +2529,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 18
-items = [{ mime_type = "text/plain", data = "ignored-linkmove-drop" }]
+items = [{ mime_type = "text/plain", data = "linkmove-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2557,7 +2557,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 19
-items = [{ mime_type = "text/plain", data = "ignored-all-drop" }]
+items = [{ mime_type = "text/plain", data = "all-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2585,7 +2585,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 modifiers = 5
-items = [{ mime_type = "text/plain", data = "ignored-modifiers-drop" }]
+items = [{ mime_type = "text/plain", data = "modifiers-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2616,7 +2616,7 @@ x = 15.0
 y = 15.0
 drag_operations_mask = 19
 modifiers = 1
-items = [{ mime_type = "text/plain", data = "ignored-modifier-selection-drop" }]
+items = [{ mime_type = "text/plain", data = "auto-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2647,7 +2647,7 @@ x = 15.0
 y = 15.0
 drag_operations_mask = 19
 modifiers = 5
-items = [{ mime_type = "text/plain", data = "ignored-modifier-precedence-drop" }]
+items = [{ mime_type = "text/plain", data = "precedence-text" }]
 
 [[test]]
 id = "drag-effect-negotiation-basic"
@@ -2661,7 +2661,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["fileapi", "drag-and-drop", "datatransfer", "events", "input", "actions"]
-notes = "Manual compat port for dropEffect/effectAllowed default-action negotiation: a dropEffect requested by the target must be allowed by the source operation mask before text-control drop default insertion runs."
+notes = "Manual compat port for dropEffect/effectAllowed default-action negotiation: the target explicitly cancels dragover to request its dropEffect, which must be allowed by the source operation mask before drop delivery or text-control insertion runs."
 
 [[test.actions]]
 type = "dispatch-drag"
@@ -2685,7 +2685,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 1
-items = [{ mime_type = "text/plain", data = "ignored-blocked-drop" }]
+items = [{ mime_type = "text/plain", data = "blocked-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2713,7 +2713,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 17
-items = [{ mime_type = "text/plain", data = "ignored-allowed-drop" }]
+items = [{ mime_type = "text/plain", data = "allowed-text" }]
 
 [[test]]
 id = "drag-contenteditable-basic"
@@ -2751,7 +2751,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 1
-items = [{ mime_type = "text/plain", data = "ignored-drop" }]
+items = [{ mime_type = "text/plain", data = "moli" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2786,8 +2786,8 @@ x = 15.0
 y = 15.0
 drag_operations_mask = 1
 items = [
-  { mime_type = "text/plain", data = "ignored-drop" },
-  { mime_type = "text/html", data = "<b>ignored</b>" },
+  { mime_type = "text/plain", data = "fallback" },
+  { mime_type = "text/html", data = "<b>rich</b> <i>html</i>" },
 ]
 
 [[test]]
@@ -2802,7 +2802,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["fileapi", "drag-and-drop", "datatransfer", "events", "input", "selection", "contenteditable", "actions"]
-notes = "Manual compat port for inherited contenteditable text drop behavior: a drop targeting a descendant of a contenteditable host edits the nearest editing host, while a contenteditable=false descendant stops the inherited default editing action."
+notes = "Manual compat port for inherited contenteditable text drop behavior: a drop targeting a descendant of a contenteditable host edits the nearest editing host, while a contenteditable=false descendant rejects drop delivery and editing events without changing its text or selection."
 
 [[test.actions]]
 type = "dispatch-drag"
@@ -2826,7 +2826,7 @@ event = "drop"
 x = 30.0
 y = 10.0
 drag_operations_mask = 1
-items = [{ mime_type = "text/plain", data = "ignored-allowed-drop" }]
+items = [{ mime_type = "text/plain", data = "allowed-text" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2854,7 +2854,11 @@ event = "drop"
 x = 30.0
 y = 10.0
 drag_operations_mask = 1
-items = [{ mime_type = "text/plain", data = "ignored-blocked-drop" }]
+items = [{ mime_type = "text/plain", data = "blocked-text" }]
+
+[[test.actions]]
+type = "evaluate"
+expression = "__finishContenteditableInheritance()"
 
 [[test]]
 id = "drag-contenteditable-range-basic"
@@ -2892,7 +2896,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 1
-items = [{ mime_type = "text/plain", data = "ignored-drop" }]
+items = [{ mime_type = "text/plain", data = "moli" }]
 
 [[test.actions]]
 type = "evaluate"
@@ -2920,7 +2924,7 @@ event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 1
-items = [{ mime_type = "text/plain", data = "ignored-nested-drop" }]
+items = [{ mime_type = "text/plain", data = "nested" }]
 
 [[test]]
 id = "drag-cancel-basic"
@@ -2934,7 +2938,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["fileapi", "drag-and-drop", "datatransfer", "events", "actions"]
-notes = "Manual compat port for renderer-driven drag cancellation: manifest dispatch-drag event=dragCancel clears the active DataTransfer session without dispatching a DOM dragCancel event, so a subsequent drop uses a fresh drag payload instead of listener-mutated canceled data."
+notes = "Manual compat port for renderer-driven drag cancellation: manifest dispatch-drag event=dragCancel clears the active DataTransfer session without dispatching a DOM dragCancel event, disables the canceled DataTransfer, and new dragenter/drop commands establish fresh payloads for a subsequent accepted drop. Renderer tests separately cover rejection of a late bare drop, since manifest drag actions require a handled command."
 
 [[test.actions]]
 type = "dispatch-drag"
@@ -2961,6 +2965,18 @@ drag_operations_mask = 1
 items = [{ mime_type = "text/plain", data = "ignored-cancel" }]
 
 [[test.actions]]
+type = "evaluate"
+expression = "__assertCanceledDragState()"
+
+[[test.actions]]
+type = "dispatch-drag"
+event = "dragenter"
+x = 15.0
+y = 15.0
+drag_operations_mask = 1
+items = [{ mime_type = "text/plain", data = "fresh-after-cancel" }]
+
+[[test.actions]]
 type = "dispatch-drag"
 event = "drop"
 x = 15.0
@@ -2984,6 +3000,14 @@ notes = "Manual compat port for renderer-driven file drop behavior: manifest dis
 
 [[test.actions]]
 type = "dispatch-drag"
+event = "dragenter"
+x = 15.0
+y = 15.0
+drag_operations_mask = 1
+files = [{ name = "drag-upload.txt", mime_type = "text/plain", text = "drag-upload", last_modified = 7 }]
+
+[[test.actions]]
+type = "dispatch-drag"
 event = "drop"
 x = 15.0
 y = 15.0
@@ -2996,11 +3020,23 @@ expression = "__advanceDragFileDropPhase()"
 
 [[test.actions]]
 type = "dispatch-drag"
+event = "dragenter"
+x = 15.0
+y = 15.0
+drag_operations_mask = 1
+files = [{ name = "blocked-upload.txt", mime_type = "text/plain", text = "blocked-upload", last_modified = 11 }]
+
+[[test.actions]]
+type = "dispatch-drag"
 event = "drop"
 x = 15.0
 y = 15.0
 drag_operations_mask = 1
 files = [{ name = "blocked-upload.txt", mime_type = "text/plain", text = "blocked-upload", last_modified = 11 }]
+
+[[test.actions]]
+type = "evaluate"
+expression = "__finishDragFileDrop()"
 
 [[test]]
 id = "drag-file-multiple-basic"
@@ -3014,7 +3050,18 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["fileapi", "drag-and-drop", "datatransfer", "events", "input", "file", "actions"]
-notes = "Manual compat port for file input multiple selection semantics under renderer-driven drops: a non-multiple input truncates multiple dropped files to the first selected file, while an input with multiple=true preserves all dropped files and exposes fakepath metadata for the first selected file."
+notes = "Manual compat port for file input multiple selection semantics under renderer-driven drops: a non-multiple input rejects a multiple-file drag without drop/input/change events, while an input with multiple=true accepts all dropped files and exposes fakepath metadata for the first selected file. Payload Files are captured synchronously during drop and remain readable after the DataTransfer becomes disabled."
+
+[[test.actions]]
+type = "dispatch-drag"
+event = "dragenter"
+x = 15.0
+y = 15.0
+drag_operations_mask = 1
+files = [
+  { name = "first.txt", mime_type = "text/plain", text = "first", last_modified = 1 },
+  { name = "second.txt", mime_type = "text/plain", text = "second", last_modified = 2 },
+]
 
 [[test.actions]]
 type = "dispatch-drag"
@@ -3033,6 +3080,17 @@ expression = "__enableMultipleFileDropPhase()"
 
 [[test.actions]]
 type = "dispatch-drag"
+event = "dragenter"
+x = 15.0
+y = 15.0
+drag_operations_mask = 1
+files = [
+  { name = "alpha.txt", mime_type = "text/plain", text = "alpha", last_modified = 3 },
+  { name = "beta.txt", mime_type = "text/plain", text = "beta", last_modified = 4 },
+]
+
+[[test.actions]]
+type = "dispatch-drag"
 event = "drop"
 x = 15.0
 y = 15.0
@@ -3041,6 +3099,10 @@ files = [
   { name = "alpha.txt", mime_type = "text/plain", text = "alpha", last_modified = 3 },
   { name = "beta.txt", mime_type = "text/plain", text = "beta", last_modified = 4 },
 ]
+
+[[test.actions]]
+type = "evaluate"
+expression = "__finishMultipleFileDrop()"
 
 [[test]]
 id = "formdata-idlharness"
@@ -11659,7 +11721,7 @@ wait_until = "load"
 timeout_ms = 5000
 suite = "smoke"
 tags = ["worker", "xhr", "xmlhttprequest"]
-notes = "Manual smoke port for dedicated worker XMLHttpRequest responseType=json, responseType=arraybuffer, and responseType=blob using the existing focused fixture routes, responseText InvalidStateError for non-text responseType values, Window-only responseXML exposure, responseType LOADING/DONE InvalidStateError preservation, plus worker-specific responseType=document ignore semantics and invalid responseType TypeError preservation."
+notes = "Manual smoke port for dedicated worker XMLHttpRequest responseType=json, responseType=arraybuffer, and responseType=blob using the existing focused fixture routes, responseText InvalidStateError for non-text responseType values, Window-only responseXML exposure, responseType LOADING/DONE InvalidStateError preservation, plus worker-specific responseType=document ignore semantics and invalid responseType assignments preserving the previous value without throwing."
 
 [[test]]
 id = "worker-xhr-redirect-error-basic"
@@ -11799,7 +11861,7 @@ wait_until = "load"
 timeout_ms = 30000
 suite = "smoke"
 tags = ["worker", "events"]
-notes = "Manual smoke port for page-global window.onerror propagation from unhandled dedicated worker runtime errors, and suppression through Worker error preventDefault() or truthy worker.onerror."
+notes = "Manual smoke port for page-global window.onerror propagation from unhandled dedicated worker runtime errors, and suppression through Worker error preventDefault() or false-returning Worker.onerror."
 
 [[test]]
 id = "worker-load-failure-basic"
@@ -20633,3 +20695,1253 @@ source_path = "workers/semantics/xhr/006.html"
 source_commit = "a03603fe9af6230a12f1b2fb2c18a7d003a0d937"
 tags = ["sharedworker", "worker", "xhr", "sync-xhr", "baseurl"]
 notes = "Imported upstream WPT SharedWorker synchronous XMLHttpRequest coverage for resolving relative URLs against the shared worker script directory. Uses the long local timeout because full-workspace nextest can run many fixture servers and worker runtimes concurrently before this window/iframe/SharedWorker chain reports its first subtest."
+
+[[test]]
+id = "testharness-dom-exception-assertions"
+upstream = "local WPT harness DOMException assertion overload and realm canary"
+upstream_commit = "local-regression-2026-09-20"
+local_path = "ported/harness/dom-exception-assertions.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+tags = ["testharness", "domexception", "cross-realm"]
+notes = "Local harness canary for implicit and explicit DOMException constructors, cross-realm exceptions, and rejection of incorrect constructors or missing exceptions."
+
+[[test]]
+id = "testharness-load-driven-crashtest"
+upstream = "local load-driven Window crashtest harness regression"
+upstream_commit = "local-regression-2026-10-04"
+local_path = "ported/harness/load-driven-crash.https.html"
+type = "crashtest"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+tags = ["testharness", "crashtest"]
+notes = "Exercise HTTPS fixture selection and load-driven crash reporting independently of browser features."
+
+[[test]]
+id = "testharness-no-handler-crashtest"
+upstream = "local load-driven Window crashtest harness regression"
+upstream_commit = "local-regression-2026-10-04"
+local_path = "ported/harness/no-handler-crash.https.html"
+type = "crashtest"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+tags = ["testharness", "crashtest"]
+notes = "Exercise HTTPS fixture selection and load-driven crash reporting independently of browser features."
+
+[[test]]
+id = "chromium-webmcp-model-context"
+upstream = "web-platform-tests/webmcp/imperative/model_context.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/model_context.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/model_context.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-duplicate-tool-registration"
+upstream = "web-platform-tests/webmcp/imperative/duplicate_tool_registration.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/duplicate_tool_registration.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/duplicate_tool_registration.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-name-validation"
+upstream = "web-platform-tests/webmcp/imperative/register_tool_name_validation.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register_tool_name_validation.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register_tool_name_validation.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-no-schema"
+upstream = "web-platform-tests/webmcp/imperative/register_tool_no_schema.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register_tool_no_schema.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register_tool_no_schema.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-with-schema"
+upstream = "web-platform-tests/webmcp/imperative/register_tool_with_schema.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register_tool_with_schema.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register_tool_with_schema.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-invalid-json-schema"
+upstream = "web-platform-tests/webmcp/imperative/register_tool_invalid_json_schema.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register_tool_invalid_json_schema.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register_tool_invalid_json_schema.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-with-empty-annotation"
+upstream = "web-platform-tests/webmcp/imperative/register_tool_with_empty_annotation.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register_tool_with_empty_annotation.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register_tool_with_empty_annotation.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-get-tools"
+upstream = "web-platform-tests/webmcp/imperative/getTools.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/getTools.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/getTools.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-get-tools-imperative-annotations"
+upstream = "web-platform-tests/webmcp/imperative/getTools-imperative-annotations.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/getTools-imperative-annotations.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/getTools-imperative-annotations.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-get-tools-imperative-schema"
+upstream = "web-platform-tests/webmcp/imperative/getTools-imperative-schema.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/getTools-imperative-schema.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/getTools-imperative-schema.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-title"
+upstream = "web-platform-tests/webmcp/imperative/register-tool-title.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register-tool-title.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register-tool-title.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-signal"
+upstream = "web-platform-tests/webmcp/imperative/register_tool_signal.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register_tool_signal.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register_tool_signal.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-register-tool-toolchange"
+upstream = "web-platform-tests/webmcp/imperative/register_tool_toolchange.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/register_tool_toolchange.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/register_tool_toolchange.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-object-arguments"
+upstream = "web-platform-tests/webmcp/imperative/object-arguments.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/object-arguments.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/object-arguments.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-execute-tool-abort"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-abort.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-abort.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-abort.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-tool-activated-event"
+upstream = "web-platform-tests/webmcp/tool-activated-event.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/tool-activated-event.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/tool-activated-event.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-tool-cancel-event"
+upstream = "web-platform-tests/webmcp/tool-cancel-event.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/tool-cancel-event.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/tool-cancel-event.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-get-tools-declarative-schema"
+upstream = "web-platform-tests/webmcp/declarative/getTools-declarative-schema.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/getTools-declarative-schema.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/getTools-declarative-schema.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-duplicate-tool-name"
+upstream = "web-platform-tests/webmcp/declarative/duplicate-tool-name.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/duplicate-tool-name.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/duplicate-tool-name.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-toolchange-on-attribute-mutation"
+upstream = "web-platform-tests/webmcp/declarative/toolchange-on-attribute-mutation.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/toolchange-on-attribute-mutation.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/toolchange-on-attribute-mutation.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-toolchange-on-control-add-remove"
+upstream = "web-platform-tests/webmcp/declarative/toolchange-on-control-add-remove.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/toolchange-on-control-add-remove.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/toolchange-on-control-add-remove.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-toolchange-on-name-change"
+upstream = "web-platform-tests/webmcp/declarative/toolchange-on-name-change.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/toolchange-on-name-change.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/toolchange-on-name-change.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-no-frame-documents"
+upstream = "web-platform-tests/webmcp/declarative/no-frame-documents.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/no-frame-documents.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/no-frame-documents.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-respond-with-reject"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-respondWith-reject.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-respondWith-reject.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-respondWith-reject.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-respond-with-circular-object"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-respondWith-circular-object.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-respondWith-circular-object.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-respondWith-circular-object.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-invalid-input"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-invalid-input.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-invalid-input.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-invalid-input.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-abort"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-abort.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-abort.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-abort.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-flexible-types"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-flexible-types.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-flexible-types.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-flexible-types.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-no-autosubmit"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-no-autosubmit.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-no-autosubmit.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-no-autosubmit.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-pseudo-classes"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-pseudo-classes.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-pseudo-classes.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-pseudo-classes.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-respond-with"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-respondWith.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-respondWith.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-respondWith.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-change-event"
+upstream = "web-platform-tests/webmcp/declarative/execute_tool_change_event.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/execute_tool_change_event.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/execute_tool_change_event.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-submit-from-js"
+upstream = "web-platform-tests/webmcp/declarative/execute_tool_submit_from_js.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/execute_tool_submit_from_js.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/execute_tool_submit_from_js.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-form-removal-submit-crash"
+upstream = "web-platform-tests/webmcp/declarative/form_removal_submit_crash.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/form_removal_submit_crash.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/form_removal_submit_crash.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-select-multiple-events"
+upstream = "web-platform-tests/webmcp/declarative/select-multiple-events.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/select-multiple-events.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/select-multiple-events.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-unregister-during-execute-tool"
+upstream = "web-platform-tests/webmcp/declarative/unregister-during-executeTool.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/unregister-during-executeTool.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/unregister-during-executeTool.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-navigation"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-navigation.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-navigation.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-navigation.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-execute-tool-detach-toolactivated"
+upstream = "web-platform-tests/webmcp/declarative/executeTool-detach-toolactivated.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/executeTool-detach-toolactivated.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/executeTool-detach-toolactivated.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-opaque-origin-tools"
+upstream = "web-platform-tests/webmcp/declarative/opaque-origin-tools.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/opaque-origin-tools.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/opaque-origin-tools.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-declarative-sandboxed-iframe"
+upstream = "web-platform-tests/webmcp/declarative/sandboxed-iframe.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/declarative/sandboxed-iframe.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/declarative/sandboxed-iframe.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "declarative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-cancel-reentrancy-crash"
+upstream = "web-platform-tests/webmcp/imperative/cancel-reentrancy-crash.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/cancel-reentrancy-crash.https.html"
+type = "crashtest"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/cancel-reentrancy-crash.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-detached-frame-execute-tool"
+upstream = "web-platform-tests/webmcp/imperative/detached-frame-executeTool.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/detached-frame-executeTool.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/detached-frame-executeTool.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-detached-frame-get-tools"
+upstream = "web-platform-tests/webmcp/imperative/detached-frame-getTools.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/detached-frame-getTools.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/detached-frame-getTools.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-detached-frame-model-context"
+upstream = "web-platform-tests/webmcp/imperative/detached-frame-modelContext.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/detached-frame-modelContext.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/detached-frame-modelContext.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-detached-frame-register-tool"
+upstream = "web-platform-tests/webmcp/imperative/detached-frame-registerTool.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/detached-frame-registerTool.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/detached-frame-registerTool.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-across-trees"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-across-trees.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-across-trees.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-across-trees.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-caller-navigate-abort"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-caller-navigate-abort.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-caller-navigate-abort.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-caller-navigate-abort.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-detach-toolactivated"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-detach-toolactivated.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-detach-toolactivated.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-detach-toolactivated.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-detach-toolcancel"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-detach-toolcancel.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-detach-toolcancel.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-detach-toolcancel.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-error-window-onerror"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-error-window-onerror.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-error-window-onerror.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-error-window-onerror.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-events"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-events.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-events.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-events.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-invalid-dictionary"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-invalid-dictionary.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-invalid-dictionary.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-invalid-dictionary.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-same-document-navigation-crash"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-same-document-navigation-crash.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-same-document-navigation-crash.https.html"
+type = "crashtest"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-same-document-navigation-crash.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-signal-cross-origin"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-signal-cross-origin.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-signal-cross-origin.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-signal-cross-origin.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-target-detachment"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-target-detachment.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-target-detachment.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-target-detachment.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-target-navigation"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-target-navigation.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-target-navigation.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-target-navigation.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-unauthorized-origin"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-unauthorized-origin.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-unauthorized-origin.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-unauthorized-origin.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-execute-tool-unregister-resolution-race"
+upstream = "web-platform-tests/webmcp/imperative/executeTool-unregister-resolution-race.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/executeTool-unregister-resolution-race.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/executeTool-unregister-resolution-race.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-exposed-to-cross-origin-child"
+upstream = "web-platform-tests/webmcp/imperative/exposedTo-cross-origin-child.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/exposedTo-cross-origin-child.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 60000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/exposedTo-cross-origin-child.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-exposed-to-defaults-cross-origin"
+upstream = "web-platform-tests/webmcp/imperative/exposedTo-defaults-cross-origin.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/exposedTo-defaults-cross-origin.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 60000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/exposedTo-defaults-cross-origin.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-exposed-to-defaults-same-origin"
+upstream = "web-platform-tests/webmcp/imperative/exposedTo-defaults-same-origin.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/exposedTo-defaults-same-origin.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/exposedTo-defaults-same-origin.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-exposed-to-invalid-origins"
+upstream = "web-platform-tests/webmcp/imperative/exposedTo-invalid-origins.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/exposedTo-invalid-origins.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/exposedTo-invalid-origins.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-exposed-to-multiple-children"
+upstream = "web-platform-tests/webmcp/imperative/exposedTo-multiple-children.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/exposedTo-multiple-children.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 60000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/exposedTo-multiple-children.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-exposed-to-window-open"
+upstream = "web-platform-tests/webmcp/imperative/exposedTo-window-open.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/exposedTo-window-open.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 60000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/exposedTo-window-open.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-get-tools-filtering"
+upstream = "web-platform-tests/webmcp/imperative/getTools-filtering.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/getTools-filtering.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 60000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/getTools-filtering.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-initial-about-blank-shared-tool"
+upstream = "web-platform-tests/webmcp/imperative/initial-about-blank-shared-tool.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/initial-about-blank-shared-tool.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/initial-about-blank-shared-tool.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-non-secure"
+upstream = "web-platform-tests/webmcp/imperative/non-secure.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/non-secure.html"
+type = "testharness"
+global = "window"
+status = "pass"
+origin = "insecure"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/non-secure.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-opaque-origin-tools"
+upstream = "web-platform-tests/webmcp/imperative/opaque-origin-tools.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/opaque-origin-tools.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/opaque-origin-tools.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-permissions-policy"
+upstream = "web-platform-tests/webmcp/imperative/permissions-policy.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/permissions-policy.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/permissions-policy.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-same-origin-iframe-register-tool-regression"
+upstream = "web-platform-tests/webmcp/imperative/same-origin-iframe-registerTool-regression.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/same-origin-iframe-registerTool-regression.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/same-origin-iframe-registerTool-regression.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."
+
+[[test]]
+id = "chromium-webmcp-imperative-unregister-during-execute-tool"
+upstream = "web-platform-tests/webmcp/imperative/unregister-during-executeTool.https.html"
+upstream_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+local_path = "upstream/webmcp/imperative/unregister-during-executeTool.https.html"
+type = "testharness"
+global = "window"
+status = "pass"
+wait_until = "load"
+timeout_ms = 5000
+suite = "broad"
+source = "chromium-wpt"
+source_path = "webmcp/imperative/unregister-during-executeTool.https.html"
+source_commit = "2d184faab9fb11e1070fb1eeafebf291f6e85923"
+tags = ["webmcp", "chromium", "upstream-wpt", "imperative"]
+notes = "Unmodified WPT imported from Chromium third_party/blink/web_tests/external/wpt at the recorded commit."

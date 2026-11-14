@@ -1,4 +1,6 @@
+use crate::web_api_interfaces;
 use moli_crypto::fill_secure_random;
+use moli_file_api::BlobData;
 use moli_storage_service::{
     DirectoryEntry, EntryKind, FileSnapshotIdentity, Opfs, OpfsBucketKey, OpfsError, OpfsPath,
     OpfsResult, OpfsSyncAccessHandleId, OpfsWritableId, SharedStorageService, StorageBucketId,
@@ -36,18 +38,13 @@ use crate::{
     webidl,
 };
 
-const FILE_SYSTEM_HANDLE_BRAND_SLOT: &str = "__moliFileSystemHandleBrand";
 const FILE_SYSTEM_HANDLE_STATE_SLOT: &str = "__moliFileSystemHandleState";
 const FILE_SYSTEM_HANDLE_ID_SLOT: &str = "__moliFileSystemHandleId";
-const FILE_SYSTEM_ITERATOR_BRAND_SLOT: &str = "__moliFileSystemIteratorBrand";
 const FILE_SYSTEM_ITERATOR_ID_SLOT: &str = "__moliFileSystemIteratorId";
 const FILE_SYSTEM_ITERATOR_PROTOTYPE_SLOT: &str = "__moliFileSystemIteratorPrototype";
-const FILE_SYSTEM_WRITABLE_BRAND_SLOT: &str = "__moliFileSystemWritableBrand";
 const FILE_SYSTEM_WRITABLE_MODE_SLOT: &str = "__moliFileSystemWritableMode";
 const FILE_SYSTEM_WRITABLE_SINK_STATE_SLOT: &str = "__moliFileSystemWritableSinkState";
-const FILE_SYSTEM_WRITABLE_SINK_BRAND_SLOT: &str = "__moliFileSystemWritableSinkBrand";
 const FILE_SYSTEM_FILE_SNAPSHOT_STATE_SLOT: &str = "__moliFileSystemFileSnapshotState";
-const FILE_SYSTEM_SYNC_ACCESS_BRAND_SLOT: &str = "__moliFileSystemSyncAccessBrand";
 const FILE_SYSTEM_SYNC_ACCESS_STATE_SLOT: &str = "__moliFileSystemSyncAccessState";
 const FILE_SYSTEM_SYNC_ACCESS_CLOSED_SLOT: &str = "__moliFileSystemSyncAccessClosed";
 const MAX_SYNC_ACCESS_FILE_OFFSET: u64 = i64::MAX as u64;
@@ -420,6 +417,7 @@ fn register_opfs_task<'s>(
     resolver: v8::Local<'s, v8::PromiseResolver>,
     locator: StorageBucketLocator,
     handle_access: OpfsHandleAccess,
+    writable_cleanup: Option<StorageOpfsWritableLease>,
 ) -> Option<RegisteredOpfsTask> {
     if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
         let (task_id, sender) =
@@ -430,11 +428,17 @@ fn register_opfs_task<'s>(
                 resolver,
                 locator,
                 handle_access,
+                writable_cleanup,
             )?;
         return Some(RegisteredOpfsTask::page(task_id, sender));
     }
-    let (task_id, sender) =
-        crate::worker::register_worker_opfs_task(scope, resolver, locator, handle_access)?;
+    let (task_id, sender) = crate::worker::register_worker_opfs_task(
+        scope,
+        resolver,
+        locator,
+        handle_access,
+        writable_cleanup,
+    )?;
     Some(RegisteredOpfsTask::worker(task_id, sender))
 }
 
@@ -567,6 +571,38 @@ fn cancel_registered_opfs_task(
     }
 }
 
+/// Bucket lifecycle operations share the existing exact-owner storage channel.
+/// Cleanup continues if the accepting Window/Worker retires before delivery.
+pub(in crate::context_bootstrap) fn dispatch_storage_bucket_operation<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resolver: v8::Local<'s, v8::PromiseResolver>,
+    operation: moli_storage_service::SqlBucketMaintenance,
+) {
+    let Some(registered) = register_opfs_task(scope, resolver, operation.locator(), None, None)
+    else {
+        reject_dom_exception(
+            scope,
+            resolver,
+            "UnknownError",
+            "The storage operation has no active asynchronous owner.",
+        );
+        return;
+    };
+    let (cancellation, sink) = registered.into_parts();
+    if operation
+        .dispatch(move |result| sink.send(OpfsTaskResult::StorageBucket(result)))
+        .is_err()
+    {
+        cancel_registered_opfs_task(scope, cancellation);
+        reject_dom_exception(
+            scope,
+            resolver,
+            "UnknownError",
+            "Failed to dispatch storage bucket operation.",
+        );
+    }
+}
+
 fn dispatch_opfs_task<'s, T, Operation, Wrap>(
     scope: &mut v8::PinScope<'s, '_>,
     resolver: v8::Local<'s, v8::PromiseResolver>,
@@ -580,9 +616,13 @@ fn dispatch_opfs_task<'s, T, Operation, Wrap>(
     Operation: FnOnce(&Opfs) -> OpfsResult<T> + Send + 'static,
     Wrap: FnOnce(Result<OpfsResult<T>, StorageServiceTaskError>) -> OpfsTaskResult + Send + 'static,
 {
-    let Some(registered) =
-        register_opfs_task(scope, resolver, locator.clone(), handle_access.clone())
-    else {
+    let Some(registered) = register_opfs_task(
+        scope,
+        resolver,
+        locator.clone(),
+        handle_access.clone(),
+        None,
+    ) else {
         let result = Ok(service.with_opfs(operation));
         settle_opfs_task_result(
             scope,
@@ -647,6 +687,7 @@ fn dispatch_opfs_quota_mutation_task<'s, T, Operation, Wrap>(
     fallback_quota: u64,
     quota_owner: Option<StorageBucketQuotaOwner>,
     handle_access: OpfsHandleAccess,
+    writable_cleanup: Option<StorageOpfsWritableLease>,
     operation: Operation,
     wrap: Wrap,
 ) where
@@ -654,9 +695,23 @@ fn dispatch_opfs_quota_mutation_task<'s, T, Operation, Wrap>(
     Operation: FnOnce(&Opfs, u64) -> OpfsResult<T> + Send + 'static,
     Wrap: FnOnce(Result<OpfsResult<T>, StorageServiceTaskError>) -> OpfsTaskResult + Send + 'static,
 {
-    let Some(registered) =
-        register_opfs_task(scope, resolver, locator.clone(), handle_access.clone())
-    else {
+    let requires_owner = writable_cleanup.is_some();
+    let Some(registered) = register_opfs_task(
+        scope,
+        resolver,
+        locator.clone(),
+        handle_access.clone(),
+        writable_cleanup,
+    ) else {
+        if requires_owner {
+            reject_dom_exception(
+                scope,
+                resolver,
+                "InvalidStateError",
+                "The OPFS writer has no live task owner.",
+            );
+            return;
+        }
         let result = Ok(with_opfs_quota_mutation(
             &service,
             &locator,
@@ -706,10 +761,8 @@ fn dispatch_opfs_quota_mutation_task<'s, T, Operation, Wrap>(
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "FileSystemDirectoryHandle", require_prototype)]
+#[webapi(interface = web_api_interfaces::FileSystemDirectoryHandle, require_prototype)]
 struct FileSystemDirectoryHandleObjectDeclaration {
-    #[webapi(slot, name = FILE_SYSTEM_HANDLE_BRAND_SLOT, constructor_default = true)]
-    brand: bool,
     #[webapi(slot = FILE_SYSTEM_HANDLE_STATE_SLOT)]
     state_json: String,
     #[webapi(slot = FILE_SYSTEM_HANDLE_ID_SLOT)]
@@ -717,10 +770,8 @@ struct FileSystemDirectoryHandleObjectDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "FileSystemFileHandle", require_prototype)]
+#[webapi(interface = web_api_interfaces::FileSystemFileHandle, require_prototype)]
 struct FileSystemFileHandleObjectDeclaration {
-    #[webapi(slot, name = FILE_SYSTEM_HANDLE_BRAND_SLOT, constructor_default = true)]
-    brand: bool,
     #[webapi(slot = FILE_SYSTEM_HANDLE_STATE_SLOT)]
     state_json: String,
     #[webapi(slot = FILE_SYSTEM_HANDLE_ID_SLOT)]
@@ -728,7 +779,7 @@ struct FileSystemFileHandleObjectDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FileSystemHandle", enumerable)]
+#[webapi(interface = web_api_interfaces::FileSystemHandle, enumerable)]
 struct FileSystemHandlePrototypeDeclaration {
     #[webapi(accessor_property, getter = file_system_handle_kind_getter_callback)]
     kind: (),
@@ -747,7 +798,7 @@ struct FileSystemHandlePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FileSystemDirectoryHandle", enumerable)]
+#[webapi(interface = web_api_interfaces::FileSystemDirectoryHandle, enumerable)]
 struct FileSystemDirectoryHandlePrototypeDeclaration {
     #[webapi(method, length = 1, callback = file_system_directory_get_file_handle_callback)]
     get_file_handle: (),
@@ -770,7 +821,7 @@ struct FileSystemDirectoryHandlePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FileSystemFileHandle", enumerable)]
+#[webapi(interface = web_api_interfaces::FileSystemFileHandle, enumerable)]
 struct FileSystemFileHandlePrototypeDeclaration {
     #[webapi(method, length = 0, callback = file_system_file_create_writable_callback)]
     create_writable: (),
@@ -781,7 +832,7 @@ struct FileSystemFileHandlePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FileSystemFileHandle", enumerable)]
+#[webapi(interface = web_api_interfaces::FileSystemFileHandle, enumerable)]
 struct FileSystemFileHandleSyncPrototypeDeclaration {
     #[webapi(
         method,
@@ -792,16 +843,14 @@ struct FileSystemFileHandleSyncPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "FileSystemWritableFileStream", require_prototype)]
+#[webapi(interface = web_api_interfaces::FileSystemWritableFileStream, require_prototype)]
 struct FileSystemWritableFileStreamObjectDeclaration {
-    #[webapi(slot, name = FILE_SYSTEM_WRITABLE_BRAND_SLOT, constructor_default = true)]
-    brand: bool,
     #[webapi(slot = FILE_SYSTEM_WRITABLE_MODE_SLOT)]
     mode: String,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FileSystemWritableFileStream", enumerable)]
+#[webapi(interface = web_api_interfaces::FileSystemWritableFileStream, enumerable)]
 struct FileSystemWritableFileStreamPrototypeDeclaration {
     #[webapi(accessor_property, getter = file_system_writable_mode_getter_callback)]
     mode: (),
@@ -814,10 +863,9 @@ struct FileSystemWritableFileStreamPrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+// An internal UnderlyingSink record, not a Web IDL interface instance.
+#[webapi(plain)]
 struct FileSystemWritableSinkObjectDeclaration {
-    #[webapi(slot, name = FILE_SYSTEM_WRITABLE_SINK_BRAND_SLOT, constructor_default = true)]
-    brand: bool,
     #[webapi(slot = FILE_SYSTEM_WRITABLE_SINK_STATE_SLOT)]
     state_json: String,
     #[webapi(method, length = 1, callback = file_system_writable_sink_write_callback)]
@@ -829,10 +877,8 @@ struct FileSystemWritableSinkObjectDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "FileSystemSyncAccessHandle", require_prototype)]
+#[webapi(interface = web_api_interfaces::FileSystemSyncAccessHandle, require_prototype)]
 struct FileSystemSyncAccessHandleObjectDeclaration {
-    #[webapi(slot, name = FILE_SYSTEM_SYNC_ACCESS_BRAND_SLOT, constructor_default = true)]
-    brand: bool,
     #[webapi(slot = FILE_SYSTEM_SYNC_ACCESS_STATE_SLOT)]
     state_json: String,
     #[webapi(slot, name = FILE_SYSTEM_SYNC_ACCESS_CLOSED_SLOT, constructor_default = false)]
@@ -840,7 +886,7 @@ struct FileSystemSyncAccessHandleObjectDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FileSystemSyncAccessHandle", enumerable)]
+#[webapi(interface = web_api_interfaces::FileSystemSyncAccessHandle, enumerable)]
 struct FileSystemSyncAccessHandlePrototypeDeclaration {
     #[webapi(accessor_property, getter = file_system_sync_access_mode_getter_callback)]
     mode: (),
@@ -859,17 +905,18 @@ struct FileSystemSyncAccessHandlePrototypeDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(
+    prototype = "Object",
+    interface = web_api_interfaces::FileSystemDirectoryHandleAsyncIterator
+)]
 struct FileSystemDirectoryIteratorObjectDeclaration {
-    #[webapi(slot = FILE_SYSTEM_ITERATOR_BRAND_SLOT, init = true)]
-    brand: (),
     #[webapi(slot = FILE_SYSTEM_ITERATOR_ID_SLOT)]
     iterator_id: f64,
 }
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "FileSystemDirectoryHandle AsyncIterator",
+    interface = web_api_interfaces::FileSystemDirectoryHandleAsyncIterator,
     intrinsic_prototype_parent = v8::Intrinsic::AsyncIteratorPrototype,
     prototype_to_string_tag = "FileSystemDirectoryHandle AsyncIterator",
     readonly_prototype,
@@ -1237,8 +1284,7 @@ fn handle_state<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> Option<FileSystemHandleState> {
-    let branded = get_private_value(scope, object, FILE_SYSTEM_HANDLE_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope));
+    let branded = web_api_interfaces::FileSystemHandle::is_instance(scope, object);
     if !branded {
         return None;
     }
@@ -1976,6 +2022,7 @@ fn get_child_handle<'s>(
         quota,
         quota_owner,
         handle_access,
+        None,
         move |opfs, max_usage| match kind {
             EntryKind::Directory => {
                 opfs.get_directory_with_quota(&key, &parent.current(), &name, create, max_usage)
@@ -2193,8 +2240,7 @@ fn file_system_directory_iterator_next_callback<'s>(
         return;
     };
     rv.set(resolver.get_promise(scope).into());
-    if !get_private_value(scope, args.this(), FILE_SYSTEM_ITERATOR_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
+    if !web_api_interfaces::FileSystemDirectoryHandleAsyncIterator::is_instance(scope, args.this())
     {
         reject_type_error(scope, resolver, "Illegal invocation");
         return;
@@ -2562,9 +2608,7 @@ fn sync_access_state<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> Option<FileSystemSyncAccessHandleState> {
-    if !get_private_value(scope, object, FILE_SYSTEM_SYNC_ACCESS_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-    {
+    if !web_api_interfaces::FileSystemSyncAccessHandle::is_instance(scope, object) {
         return None;
     }
     let json = get_private_value(scope, object, FILE_SYSTEM_SYNC_ACCESS_STATE_SLOT)?
@@ -3088,8 +3132,7 @@ fn writable_stream_is_branded<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     stream: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, stream, FILE_SYSTEM_WRITABLE_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
+    web_api_interfaces::FileSystemWritableFileStream::is_instance(scope, stream)
 }
 
 fn file_system_writable_mode_getter_callback<'s>(
@@ -3184,11 +3227,8 @@ fn writable_sink_state<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     sink: v8::Local<'s, v8::Object>,
 ) -> Option<FileSystemWritableSinkState> {
-    if !get_private_value(scope, sink, FILE_SYSTEM_WRITABLE_SINK_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-    {
-        return None;
-    }
+    // The sink is an internal record; its private payload carries the writer
+    // capability and is not a platform interface brand.
     let json = get_private_value(scope, sink, FILE_SYSTEM_WRITABLE_SINK_STATE_SLOT)?
         .to_string(scope)?
         .to_rust_string_lossy(scope);
@@ -3204,8 +3244,16 @@ enum WritableSinkError {
 }
 
 struct WritableSinkCommand {
-    command: WritableCommand,
+    command: WritableCommandInput,
     snapshot_validation: Option<WritableSnapshotValidation>,
+}
+
+enum WritableCommandInput {
+    Ready(WritableCommand),
+    Blob {
+        data: BlobData,
+        position: Option<u64>,
+    },
 }
 
 struct WritableSnapshotValidation {
@@ -3213,11 +3261,6 @@ struct WritableSnapshotValidation {
     key: OpfsBucketKey,
     path: OpfsPath,
     identity: FileSnapshotIdentity,
-}
-
-struct WritableData {
-    bytes: Vec<u8>,
-    snapshot_validation: Option<WritableSnapshotValidation>,
 }
 
 fn file_system_writable_sink_write_callback<'s>(
@@ -3278,7 +3321,41 @@ fn file_system_writable_sink_write_callback<'s>(
     let snapshot_validation = snapshot_validation
         .map(|validation| (validation.key, validation.path, validation.identity));
     let cleanup = StorageOpfsWritableLease::new(service.clone(), writer_id);
-    dispatch_opfs_quota_mutation_task(
+    let command = match command {
+        WritableCommandInput::Ready(command) => command,
+        WritableCommandInput::Blob { data, position } => {
+            let Some(registered) = register_opfs_task(
+                scope,
+                resolver,
+                state.locator,
+                handle_access,
+                Some(StorageOpfsWritableLease::new(service.clone(), writer_id)),
+            ) else {
+                reject_dom_exception(
+                    scope,
+                    resolver,
+                    "InvalidStateError",
+                    "The OPFS writer has no live task owner.",
+                );
+                return;
+            };
+            let (_, completion_sink) = registered.into_parts();
+            // Read before acquiring quota. The existing owner task rechecks
+            // access before submitting the ready command; its lease aborts
+            // the writer if the owner disappears or reading fails.
+            data.read_all(Box::new(move |bytes| {
+                completion_sink.send(OpfsTaskResult::WritableInput {
+                    bytes,
+                    position,
+                    snapshot_validation,
+                    service,
+                    cleanup,
+                });
+            }));
+            return;
+        }
+    };
+    dispatch_writable_command(
         scope,
         resolver,
         state.locator,
@@ -3286,6 +3363,36 @@ fn file_system_writable_sink_write_callback<'s>(
         quota,
         quota_owner,
         handle_access,
+        command,
+        snapshot_validation,
+        cleanup,
+        None,
+    );
+}
+
+fn dispatch_writable_command<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resolver: v8::Local<'s, v8::PromiseResolver>,
+    locator: StorageBucketLocator,
+    service: SharedStorageService,
+    quota: u64,
+    quota_owner: Option<StorageBucketQuotaOwner>,
+    handle_access: OpfsHandleAccess,
+    command: WritableCommand,
+    snapshot_validation: Option<(OpfsBucketKey, OpfsPath, FileSnapshotIdentity)>,
+    cleanup: StorageOpfsWritableLease,
+    writable_cleanup: Option<StorageOpfsWritableLease>,
+) {
+    let writer_id = cleanup.writer_id();
+    dispatch_opfs_quota_mutation_task(
+        scope,
+        resolver,
+        locator,
+        service,
+        quota,
+        quota_owner,
+        handle_access,
+        writable_cleanup,
         move |opfs, max_usage| {
             let result = (|| {
                 if let Some((key, path, identity)) = snapshot_validation {
@@ -3343,6 +3450,7 @@ fn file_system_writable_sink_close_callback<'s>(
         quota,
         quota_owner,
         handle_access,
+        None,
         move |opfs, max_usage| {
             let result = opfs.close_writable(writer_id, Some(max_usage));
             if result.is_err() {
@@ -3382,21 +3490,14 @@ fn writable_command_from_chunk<'s>(
     }
     if let Ok(object) = v8::Local::<v8::Object>::try_from(chunk) {
         if blob::is_blob_object(scope, object) {
-            let data = writable_data_bytes(scope, chunk)?;
-            return Ok(WritableSinkCommand {
-                command: WritableCommand::Write {
-                    data: data.bytes,
-                    position: None,
-                },
-                snapshot_validation: data.snapshot_validation,
-            });
+            return writable_data_command(scope, chunk, None);
         }
         if let Some(bytes) = blob::buffer_source_bytes_from_value(scope, chunk) {
             return Ok(WritableSinkCommand {
-                command: WritableCommand::Write {
+                command: WritableCommandInput::Ready(WritableCommand::Write {
                     data: bytes,
                     position: None,
-                },
+                }),
                 snapshot_validation: None,
             });
         }
@@ -3404,14 +3505,7 @@ fn writable_command_from_chunk<'s>(
             .map_err(WritableSinkError::WebIdl)?;
         return writable_command_from_params(scope, params);
     }
-    let data = writable_data_bytes(scope, chunk)?;
-    Ok(WritableSinkCommand {
-        command: WritableCommand::Write {
-            data: data.bytes,
-            position: None,
-        },
-        snapshot_validation: data.snapshot_validation,
-    })
+    writable_data_command(scope, chunk, None)
 }
 
 fn writable_command_from_params<'s>(
@@ -3422,7 +3516,7 @@ fn writable_command_from_params<'s>(
         FileSystemWriteCommandType::Truncate => params
             .size
             .map(|size| WritableSinkCommand {
-                command: WritableCommand::Truncate(size),
+                command: WritableCommandInput::Ready(WritableCommand::Truncate(size)),
                 snapshot_validation: None,
             })
             .ok_or_else(|| WritableSinkError::Dom {
@@ -3432,7 +3526,7 @@ fn writable_command_from_params<'s>(
         FileSystemWriteCommandType::Seek => params
             .position
             .map(|position| WritableSinkCommand {
-                command: WritableCommand::Seek(position),
+                command: WritableCommandInput::Ready(WritableCommand::Seek(position)),
                 snapshot_validation: None,
             })
             .ok_or_else(|| WritableSinkError::Dom {
@@ -3451,22 +3545,16 @@ fn writable_command_from_params<'s>(
                     "Invalid params passed. write requires non-null data.".to_owned(),
                 ));
             }
-            let data = writable_data_bytes(scope, data)?;
-            Ok(WritableSinkCommand {
-                command: WritableCommand::Write {
-                    data: data.bytes,
-                    position: params.position,
-                },
-                snapshot_validation: data.snapshot_validation,
-            })
+            writable_data_command(scope, data, params.position)
         }
     }
 }
 
-fn writable_data_bytes<'s>(
+fn writable_data_command<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
-) -> Result<WritableData, WritableSinkError> {
+    position: Option<u64>,
+) -> Result<WritableSinkCommand, WritableSinkError> {
     if value.is_null() {
         return Err(WritableSinkError::Type(
             "Writable data must not be null.".to_owned(),
@@ -3476,19 +3564,29 @@ fn writable_data_bytes<'s>(
         && blob::is_blob_object(scope, object)
     {
         let snapshot_validation = opfs_file_snapshot_validation(scope, object)?;
-        let bytes =
-            blob::blob_bytes_from_object(scope, object).ok_or_else(|| WritableSinkError::Dom {
+        let data =
+            blob::blob_data_from_object(scope, object).ok_or_else(|| WritableSinkError::Dom {
                 name: "NotFoundError",
                 message: "The Blob backing data is no longer available.".to_owned(),
             })?;
-        return Ok(WritableData {
-            bytes,
+        let command = match data.as_bytes() {
+            Some(bytes) => WritableCommandInput::Ready(WritableCommand::Write {
+                data: bytes.to_vec(),
+                position,
+            }),
+            None => WritableCommandInput::Blob { data, position },
+        };
+        return Ok(WritableSinkCommand {
+            command,
             snapshot_validation,
         });
     }
     if let Some(bytes) = blob::buffer_source_bytes_from_value(scope, value) {
-        return Ok(WritableData {
-            bytes,
+        return Ok(WritableSinkCommand {
+            command: WritableCommandInput::Ready(WritableCommand::Write {
+                data: bytes,
+                position,
+            }),
             snapshot_validation: None,
         });
     }
@@ -3497,8 +3595,11 @@ fn writable_data_bytes<'s>(
         value,
         webidl::Context::member("WriteParams", "data"),
     )
-    .map(|value| WritableData {
-        bytes: value.0.into_bytes(),
+    .map(|value| WritableSinkCommand {
+        command: WritableCommandInput::Ready(WritableCommand::Write {
+            data: value.0.into_bytes(),
+            position,
+        }),
         snapshot_validation: None,
     })
     .map_err(WritableSinkError::WebIdl)
@@ -3617,15 +3718,27 @@ pub(crate) fn settle_opfs_task_result<'s>(
     handle_access: Option<&OpfsHandleAccessContext>,
     result: OpfsTaskResult,
 ) {
+    if let OpfsTaskResult::StorageBucket(result) = result {
+        // Lifecycle operations use the manager's storage-key authority. A
+        // deleted/expired named locator intentionally no longer authorizes IO.
+        super::window_runtime::settle_storage_bucket_operation(scope, resolver, result);
+        return;
+    }
     let access_check = match handle_access {
         Some(access) => service_for_locator_with_handle_access(scope, locator, access),
         None => service_for_locator(scope, locator),
     };
-    if let Err(error) = access_check {
-        reject_handle_access_error(scope, resolver, error);
-        return;
-    }
+    let (service, _, quota) = match access_check {
+        Ok(access) => access,
+        Err(error) => {
+            reject_handle_access_error(scope, resolver, error);
+            return;
+        }
+    };
     match result {
+        OpfsTaskResult::StorageBucket(_) => {
+            unreachable!("bucket lifecycle settled before handle authorization")
+        }
         OpfsTaskResult::CreateSyncAccessHandle { mode, result } => {
             let Some(lease) = take_opfs_owner_result(
                 scope,
@@ -3792,6 +3905,59 @@ pub(crate) fn settle_opfs_task_result<'s>(
                 }
             }
             let _ = resolver.resolve(scope, array.into());
+        }
+        OpfsTaskResult::WritableInput {
+            bytes,
+            position,
+            snapshot_validation,
+            service: input_service,
+            cleanup,
+        } => {
+            // A writer id belongs to the service that accepted the write.
+            // Never send it to a replacement service after input preparation.
+            if !std::sync::Arc::ptr_eq(&service, &input_service) {
+                reject_handle_access_error(scope, resolver, HandleAccessError::Security);
+                return;
+            }
+            let data = match bytes {
+                Ok(data) => data,
+                Err(error) => {
+                    let name = if error.kind() == std::io::ErrorKind::NotFound {
+                        "NotFoundError"
+                    } else {
+                        "NotReadableError"
+                    };
+                    reject_dom_exception(
+                        scope,
+                        resolver,
+                        name,
+                        "Failed to read the Blob backing data for the OPFS write.",
+                    );
+                    return;
+                }
+            };
+            let quota_owner = match opfs_quota_owner(scope, locator) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    reject_handle_access_error(scope, resolver, error);
+                    return;
+                }
+            };
+            let writable_cleanup =
+                StorageOpfsWritableLease::new(service.clone(), cleanup.writer_id());
+            dispatch_writable_command(
+                scope,
+                resolver,
+                locator.clone(),
+                service,
+                quota,
+                quota_owner,
+                handle_access.cloned(),
+                WritableCommand::Write { data, position },
+                snapshot_validation,
+                cleanup,
+                Some(writable_cleanup),
+            );
         }
         OpfsTaskResult::WritableCommand {
             result,

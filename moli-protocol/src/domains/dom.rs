@@ -17,6 +17,7 @@ mod node_references;
 #[cfg(test)]
 mod patchright_shadow_tests;
 mod resolve;
+pub(crate) use resolve::native::try_start as try_start_native_command;
 mod search;
 mod set_file_input;
 mod stack_traces;
@@ -24,20 +25,22 @@ mod stack_traces;
 mod tests;
 
 pub(in crate::domains) use activity::{
-    DomPreparedOutputSlot, DomPreparedOutputs, project_dom_mutations_async,
+    DomPreparedOutputSlot, DomPreparedOutputs, project_dom_mutations,
 };
 pub(crate) use resolve::{
-    CompletedDomCommandDispatch, DomCommandTaskStep, PendingDomCommandDispatch,
-    complete_pending_dom_command_output_plan, execute_devtools_dom_command_async,
+    CompletedDomCommandDispatch, DevToolsDomCommandTaskStep, DomCommandTaskStep,
+    PendingDomCommandDispatch, complete_pending_dom_command_output_plan,
+    complete_pending_dom_command_result, start_runtime_dom_query,
 };
+mod automation;
+pub(crate) use automation::PreparedAutomationDomCommand;
 
 #[cfg(test)]
 use node_payload::{
-    backend_node_id_for_snapshot, node_snapshot_base_payload, node_snapshot_to_cdp_with_limit,
+    backend_node_id_for_snapshot, frontend_node_id_for_snapshot, node_snapshot_base_payload,
+    node_snapshot_to_cdp_with_limit,
 };
-use node_payload::{
-    collect_flattened_node_snapshot, frontend_node_id_for_snapshot, node_snapshot_to_cdp,
-};
+use node_payload::{collect_flattened_node_snapshot, node_snapshot_to_cdp};
 
 pub(crate) enum DomCommandDispatchStep {
     Pending(Box<PendingDomCommandDispatch>),
@@ -210,35 +213,19 @@ fn cached_dom_remote_object_node_for_owner(
     owner: &CommandOwnerScope,
     object_id: &str,
 ) -> Option<Value> {
-    let (browser_context_id, target_id) = conn.target_owner_identity_for_owner(owner)?;
-    let browser_context = conn.browser_context_by_id(&browser_context_id)?;
-    let target_id = target_id
-        .as_deref()
-        .or_else(|| browser_context.active_target_id())?;
-    browser_context
-        .page_target(target_id)?
+    conn.target_devtools_session_state_for_owner(owner)?
         .dom_remote_object_node_cache
         .get(object_id)
         .cloned()
 }
 
-fn cache_dom_remote_object_node_for_owner(
+pub(in crate::domains) fn cache_dom_remote_object_node_for_owner(
     conn: &mut CdpConnection,
     owner: &CommandOwnerScope,
     object_id: String,
     node: Value,
 ) {
-    let Some((browser_context_id, target_id)) = conn.target_owner_identity_for_owner(owner) else {
-        return;
-    };
-    if let Some(browser_context) = conn.browser_context_by_id_mut(&browser_context_id) {
-        let target_id = target_id.or_else(|| browser_context.active_target_id_owned());
-        let Some(target) = target_id
-            .as_deref()
-            .and_then(|target_id| browser_context.page_target_mut(target_id))
-        else {
-            return;
-        };
-        target.dom_remote_object_node_cache.insert(object_id, node);
-    }
+    conn.with_target_devtools_session_state_for_owner_mut(owner, |state| {
+        state.dom_remote_object_node_cache.insert(object_id, node);
+    });
 }

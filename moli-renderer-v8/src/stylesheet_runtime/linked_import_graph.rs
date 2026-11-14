@@ -296,7 +296,7 @@ impl DocumentRuntime {
             {
                 continue;
             }
-            self.spawn_linked_stylesheet_import_graph(fetch, urls);
+            self.spawn_linked_stylesheet_import_graph(fetch, urls, self.stylesheet_fetcher());
         }
     }
 
@@ -341,7 +341,7 @@ impl DocumentRuntime {
         &mut self,
         load: Arc<StylesheetLinkClient>,
         urls: Vec<Url>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) {
         let fetch = load.fetch().clone();
         let roots = self.linked_stylesheet_import_roots(&fetch);
@@ -349,16 +349,8 @@ impl DocumentRuntime {
             super::import_graph::ConnectedStyleImportReadiness::Ready(graph_successful) => {
                 if !host_ptr.is_null() {
                     for root in &roots {
-                        if unsafe { &*host_ptr }
-                            .install_live_stylesheet_import_graph(root.clone(), &[])
-                            .is_some()
-                        {
-                            let _ = unsafe { &mut *host_ptr }
-                                .refresh_live_stylesheet_after_import_graph(
-                                    root.owner,
-                                    root.stylesheet_id,
-                                );
-                        }
+                        let _ = unsafe { &mut *host_ptr }
+                            .install_and_refresh_live_stylesheet_import_graph(root.clone(), &[]);
                     }
                 }
                 self.note_stylesheet_import_graph_completion(
@@ -384,30 +376,23 @@ impl DocumentRuntime {
             self.bind_linked_stylesheet_import_blocking_operation(&fetch, blocking_operation, urls);
             return;
         }
-        self.spawn_linked_stylesheet_import_graph(fetch, urls);
+        let fetcher = self.stylesheet_fetcher_for_owner(load.owner(), host_ptr);
+        self.spawn_linked_stylesheet_import_graph(fetch, urls, fetcher);
     }
 
     fn spawn_linked_stylesheet_import_graph(
         &mut self,
         fetch: crate::stylesheet_blocking::StylesheetFetch,
         urls: Vec<Url>,
+        stylesheet_fetcher: crate::stylesheet_blocking::RendererStylesheetFetcher,
     ) {
         let task_producer = self
             .stylesheet_lifecycle
             .task_producer
             .clone()
             .expect("linked stylesheet import requires a bound Page task producer");
-        let stylesheet_fetcher = self.stylesheet_fetcher();
-        let document_url = self
-            .dom_host
-            .node(self.dom_host.document_handle())
-            .and_then(Node::as_document)
-            .map(|document| document.url().clone())
-            .expect("live dom host must retain a document url")
-            .clone();
-        let resource_loader = self
-            .current_document_resource_loader()
-            .expect("linked stylesheet import requires its Document authority");
+        let resource_loader = stylesheet_fetcher.resource_loader().clone();
+        let document_url = resource_loader.fetch_context().document_url().clone();
         resource_loader.spawn_resource_task(async move {
             let (graph, network_results) =
                 super::import_graph_projection::fetch_observed_stylesheet_import_graph(
@@ -524,14 +509,12 @@ mod tests {
         .into_iter()
         .next()
         .map(|blocker| {
-            crate::stylesheet_blocking::DocumentOwnedBlockingStylesheetDiscoveryInput::from(
-                &blocker,
-            )
+            crate::stylesheet_blocking::DocumentOwnedStylesheetDiscoveryInput::from(&blocker)
         })
         .expect("first parser-created import blocker");
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&first_document, &loader);
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs([&first_input]);
+        runtime.note_discovered_document_owned_stylesheet_inputs([&first_input]);
         let first_operation = runtime
             .stylesheet_lifecycle
             .fetches
@@ -564,13 +547,11 @@ mod tests {
         .into_iter()
         .next()
         .map(|blocker| {
-            crate::stylesheet_blocking::DocumentOwnedBlockingStylesheetDiscoveryInput::from(
-                &blocker,
-            )
-            .with_node_id(first_input.node_id())
+            crate::stylesheet_blocking::DocumentOwnedStylesheetDiscoveryInput::from(&blocker)
+                .with_node_id(first_input.node_id())
         })
         .expect("replacement parser-created import blocker");
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs([&second_input]);
+        runtime.note_discovered_document_owned_stylesheet_inputs([&second_input]);
         assert!(
             runtime
                 .stylesheet_lifecycle

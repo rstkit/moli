@@ -1,7 +1,62 @@
 use super::workers::WorkerExecutionState;
 use super::*;
+use crate::dom::native::Node;
 
-impl JsContextHost {
+impl PageScriptHost {
+    pub(crate) fn document_has_browsing_context(&self, document: DomHandle) -> bool {
+        // A detached iframe compatibility window can be a document's defaultView
+        // without registering a browsing context. Check the native association.
+        self.dom_host().document_handle() == document
+            || self
+                .child_browsing_context_host_for_document_handle(document)
+                .is_some()
+            || self
+                .lightweight_popup_id_for_document_handle(document)
+                .is_some()
+    }
+
+    pub(crate) fn document_is_fully_active(&self, document: DomHandle) -> bool {
+        if self.page_context_resources_closed {
+            return false;
+        }
+        // A retained Window association is insufficient: the Document and each
+        // ancestor must still be current in a live browsing context.
+        let mut document = document;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if document == self.document_handle() {
+                return true;
+            }
+            if let Some(popup_id) = self.lightweight_popup_id_for_document_handle(document) {
+                return self.lightweight_popup_is_open(popup_id);
+            }
+            let Some(frame) = self.child_browsing_context_host_for_document_handle(document) else {
+                return false;
+            };
+            if !visited.insert(frame) || !self.dom_host().is_connected(frame) {
+                return false;
+            }
+            let Some(parent_document) = self.dom_host().node(frame).and_then(Node::owner_document)
+            else {
+                return false;
+            };
+            document = parent_document;
+        }
+    }
+
+    pub(crate) fn document_activity(&self) -> moli_page_types::DocumentActivity {
+        self.document_activity
+    }
+
+    pub(crate) fn set_document_activity(
+        &mut self,
+        activity: moli_page_types::DocumentActivity,
+    ) -> bool {
+        let changed = self.document_activity != activity;
+        self.document_activity = activity;
+        changed
+    }
+
     pub(crate) fn begin_ordinary_page_turn_navigation_handoff(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.ordinary_page_turn_navigation_handoff_active,
@@ -20,6 +75,36 @@ impl JsContextHost {
         handoff: crate::page_task_queue::RendererTopLevelNavigationHandoff,
     ) {
         if self.ordinary_page_turn_navigation_handoff_active {
+            self.top_level_navigation_handoff_tx.send(handoff);
+        } else {
+            self.enqueue_related_page_turn_completion();
+        }
+    }
+
+    fn enqueue_related_page_turn_completion(&self) {
+        if self.command_turn_output.is_none()
+            && !self.ordinary_page_turn_navigation_handoff_active
+            && let Some(environment) = self.page_script_environment()
+        {
+            environment.enqueue_related_page_turn_completion();
+        }
+    }
+
+    pub(crate) fn finish_related_page_turn_completion(&self) {
+        if self.command_turn_output.is_some()
+            || self.ordinary_page_turn_navigation_handoff_active
+            || self.page_script_environment().is_none()
+            || !self
+                .output_journal
+                .as_ref()
+                .is_some_and(|journal| journal.transport_is_bound())
+        {
+            // Initial auxiliary Documents retain their records and pending
+            // navigation until target adoption binds the output transport.
+            return;
+        }
+        self.publish_live_turn_output_prefix();
+        if let Some(handoff) = self.pending_location_navigation_handoff() {
             self.top_level_navigation_handoff_tx.send(handoff);
         }
     }
@@ -95,6 +180,7 @@ impl JsContextHost {
             causal_command,
             observation,
         ));
+        self.enqueue_related_page_turn_completion();
         true
     }
 
@@ -122,6 +208,7 @@ impl JsContextHost {
             return false;
         };
         output_journal.append_records(records);
+        self.enqueue_related_page_turn_completion();
         true
     }
 
@@ -148,6 +235,7 @@ impl JsContextHost {
             causal_command,
             action,
         ));
+        self.enqueue_related_page_turn_completion();
         true
     }
 
@@ -163,10 +251,17 @@ impl JsContextHost {
         let Some(output_journal) = self.output_journal.as_ref() else {
             return false;
         };
-        if let Some(recorder) = self.command_turn_output.as_ref() {
-            output_journal.append_records(recorder.drain_records());
-        }
+        self.append_live_turn_output_prefix();
         output_journal.publish_pending().is_some()
+    }
+
+    /// Move the completed prefix without ending the active command recorder.
+    /// A nested DevTools handler must also resolve DOM facts and Inspector
+    /// state before publishing that prefix with its terminal response.
+    pub(crate) fn append_live_turn_output_prefix(&self) {
+        if let (Some(journal), Some(recorder)) = (&self.output_journal, &self.command_turn_output) {
+            journal.append_records(recorder.drain_records());
+        }
     }
 
     pub(crate) fn begin_command_turn_output(
@@ -411,5 +506,90 @@ impl JsContextHost {
                 );
             }
         }
+    }
+}
+
+impl PageScriptHost {
+    pub(crate) fn native_interception_context(
+        &mut self,
+    ) -> Option<crate::network::interception_output::ResourceInterceptionContext> {
+        Some(
+            crate::network::interception_output::ResourceInterceptionContext {
+                source_document: self.root_document_lifecycle_identity()?,
+                output: self.native_interception_output()?,
+            },
+        )
+    }
+
+    pub(crate) fn native_interception_output(
+        &mut self,
+    ) -> Option<crate::network::interception_output::InterceptionOutput> {
+        let document = self.root_document_lifecycle_identity()?;
+        if self
+            .native_interception_output
+            .as_ref()
+            .is_none_or(|(owner, _)| *owner != document)
+        {
+            if let Some((_, output)) = self.native_interception_output.take() {
+                output.close();
+            }
+            self.native_interception_output = Some((
+                document,
+                crate::network::interception_output::InterceptionOutput::new(
+                    self.output_journal.clone()?,
+                    self.resource_completion_sender(),
+                ),
+            ));
+        }
+        self.native_interception_output
+            .as_ref()
+            .map(|(_, output)| output.clone())
+    }
+
+    pub(crate) fn publish_related_document_prefix_before_native_wait(&self) {
+        if let Some(environment) = self.page_script_environment() {
+            for host in environment.related_document_hosts() {
+                if std::ptr::eq(self, host.as_ptr()) {
+                    continue;
+                }
+                // This owner-thread boundary only moves concrete output. It
+                // cannot run related Page tasks or enter another JS realm.
+                let host = unsafe { &*host.as_ptr() };
+                if let Some(environment) = host.page_script_environment() {
+                    host.append_live_turn_output_prefix();
+                    environment
+                        .output_journal()
+                        .publish_pending_before_modal_wait();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn begin_synchronous_network_wait(
+        &mut self,
+    ) -> Vec<crate::network::interception_output::SynchronousNetworkOutputScope> {
+        let own_output = self.native_interception_output();
+        self.publish_related_document_prefix_before_native_wait();
+        self.publish_live_turn_output_prefix();
+        let mut scopes = Vec::new();
+        if let Some(environment) = self.page_script_environment() {
+            for host in environment.related_document_hosts() {
+                if std::ptr::eq(self, host.as_ptr()) {
+                    continue;
+                }
+                // Related Pages share this owner thread. Their native network
+                // facts must also progress while its Page stack is suspended.
+                // This only reads existing native publishers; it runs no Page
+                // tasks and never enters a related realm.
+                let host = unsafe { &*host.as_ptr() };
+                if let Some((_, output)) = &host.native_interception_output {
+                    scopes.push(output.enter_synchronous_wait());
+                }
+            }
+        }
+        if let Some(output) = own_output {
+            scopes.push(output.enter_synchronous_wait());
+        }
+        scopes
     }
 }

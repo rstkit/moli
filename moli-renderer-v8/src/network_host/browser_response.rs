@@ -1,21 +1,36 @@
 use super::*;
 use moli_web_mime::data_url_body_and_mime_type;
+use std::fmt;
 
-pub(in crate::network_host) fn http_status_text(status: u16) -> &'static str {
-    StatusCode::from_u16(status)
-        .ok()
-        .and_then(|status| status.canonical_reason())
-        .unwrap_or("")
+#[derive(Debug)]
+pub(crate) enum LocalUrlError {
+    BlobMethod { method: String },
+    BlobUnavailable { url: url::Url },
+    InvalidData { url: url::Url },
 }
+
+impl fmt::Display for LocalUrlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlobMethod { method } => write!(f, "blob URL fetch requires GET, got `{method}`"),
+            Self::BlobUnavailable { url } => write!(f, "blob URL `{url}` is unavailable"),
+            Self::InvalidData { url } => write!(f, "data URL `{url}` is invalid"),
+        }
+    }
+}
+
+impl std::error::Error for LocalUrlError {}
 
 pub(crate) fn blob_url_response(url: &url::Url) -> Option<Response> {
     let (body_bytes, mime_type) = blob::object_url_bytes_and_type(url.as_str())?;
-    let mut headers = Vec::new();
-    if !mime_type.is_empty() {
-        headers.push(("Content-Type".to_owned(), mime_type));
-    }
+    let headers = moli_fetch::headers_from_byte_strings(&[
+        ("Content-Length".to_owned(), body_bytes.len().to_string()),
+        ("Content-Type".to_owned(), mime_type),
+    ])
+    .expect("Blob response headers contain ByteStrings");
     Some(Response::from_head_and_lossy_body_bytes(
         moli_fetch::ResponseHead {
+            status_text: None,
             final_url: url.clone(),
             status: 200,
             headers,
@@ -24,6 +39,7 @@ pub(crate) fn blob_url_response(url: &url::Url) -> Option<Response> {
             redirected: false,
             redirect_chain: Vec::new(),
             from_cache: false,
+            cache_state: Default::default(),
             negotiated_http_version: None,
         },
         body_bytes,
@@ -34,22 +50,29 @@ pub(crate) fn data_url_response(url: &url::Url) -> Option<Response> {
     let (body_bytes, mime_type) = data_url_body_and_mime_type(url.as_str())?;
     Some(Response::from_head_and_lossy_body_bytes(
         moli_fetch::ResponseHead {
+            status_text: None,
             final_url: url.clone(),
             status: 200,
-            headers: vec![("Content-Type".to_owned(), mime_type)],
+            headers: vec![(
+                "Content-Type".to_owned(),
+                moli_fetch::header_value_from_byte_string(&mime_type)
+                    .expect("serialized MIME types contain ByteStrings"),
+            )],
             request_cookie_report: None,
             cookie_set_reports: Vec::new(),
             redirected: false,
             redirect_chain: Vec::new(),
             from_cache: false,
+            cache_state: Default::default(),
             negotiated_http_version: None,
         },
         body_bytes,
     ))
 }
 
+/// Reads a local resource for consumers whose requests always use GET.
 pub(crate) fn local_url_response(url: &url::Url) -> Option<Response> {
-    local_url_response_result(url).and_then(Result::ok)
+    local_url_response_result(url, "GET").and_then(Result::ok)
 }
 
 /// Resolves renderer-owned URL schemes without falling through to the network
@@ -58,14 +81,22 @@ pub(crate) fn local_url_response(url: &url::Url) -> Option<Response> {
 /// `None` means that the URL is not owned by this resolver. `Some(Err(..))`
 /// means that it is a local URL and therefore must fail locally instead of
 /// being handed to libcurl.
-pub(crate) fn local_url_response_result(url: &url::Url) -> Option<Result<Response, String>> {
+/// `method` is the request's already normalized method.
+pub(crate) fn local_url_response_result(
+    url: &url::Url,
+    method: &str,
+) -> Option<Result<Response, LocalUrlError>> {
     match url.scheme() {
-        "blob" => {
-            Some(blob_url_response(url).ok_or_else(|| format!("blob URL `{url}` is unavailable")))
-        }
-        "data" => {
-            Some(data_url_response(url).ok_or_else(|| format!("data URL `{url}` is invalid")))
-        }
+        "blob" if method != "GET" => Some(Err(LocalUrlError::BlobMethod {
+            method: method.to_owned(),
+        })),
+        "blob" => Some(
+            blob_url_response(url)
+                .ok_or_else(|| LocalUrlError::BlobUnavailable { url: url.clone() }),
+        ),
+        "data" => Some(
+            data_url_response(url).ok_or_else(|| LocalUrlError::InvalidData { url: url.clone() }),
+        ),
         _ => None,
     }
 }
@@ -98,8 +129,8 @@ mod tests {
                 .headers
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                .map(|(_, value)| value.as_str()),
-            Some("text/html;charset=iso-2022-jp")
+                .map(|(_, value)| value.as_slice()),
+            Some(b"text/html;charset=iso-2022-jp".as_slice())
         );
     }
 
@@ -107,12 +138,12 @@ mod tests {
     fn unavailable_blob_url_is_a_local_failure() {
         let url = url::Url::parse("blob:https://example.test/not-registered").unwrap();
 
-        let error = local_url_response_result(&url)
+        let error = local_url_response_result(&url, "GET")
             .expect("blob URL must be owned by the local resolver")
             .expect_err("an unregistered blob URL must fail locally");
 
         assert_eq!(
-            error,
+            error.to_string(),
             "blob URL `blob:https://example.test/not-registered` is unavailable"
         );
     }

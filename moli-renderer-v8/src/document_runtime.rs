@@ -1,3 +1,5 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -16,6 +18,9 @@ mod lifecycle;
 mod main_parser_continuation;
 mod meta_refresh;
 mod mutation_commands;
+mod native_events;
+pub(crate) use native_events::NativeEventDispatch;
+mod parser_blocking;
 mod parser_modulepreload;
 mod query_facade;
 mod runtime_core;
@@ -24,6 +29,8 @@ mod script_scheduling;
 mod security_policy;
 #[path = "stylesheet_runtime/mod.rs"]
 mod stylesheet_runtime;
+mod timing;
+pub(crate) use timing::{DocumentLifecycleTiming, DocumentTimingSnapshot};
 
 #[cfg(test)]
 pub(crate) use mutation_commands::ParserPostStepRuntimeWorkForTest;
@@ -39,17 +46,18 @@ use super::{
         host_event_defaults,
     },
     mutation_coordinator::{MutationCoordinator, RuntimeMutationOptions},
-    native_bridge::{self, JsContextHost},
+    native_bridge::{self, PageScriptHost},
     page_task_queue::{PageTask, PageTaskQueue, PostParseLifecycleWork, PostParsePageOwnedWork},
     planning::PreparedScript,
     runtime::RendererBrowserContextRuntime,
     stylesheet_blocking::{
         DocumentBlockingStylesheetSignature, StylesheetBlockingState, StylesheetBlockingStatus,
     },
-    util::{object_string_property, v8str},
+    util::v8str,
 };
 #[cfg(test)]
 use crate::dom::native::ShadowRootBindingSnapshot;
+pub(crate) use crate::meta_refresh_scheduler::MetaRefreshNavigation;
 use crate::{
     dom::{
         NodeId,
@@ -61,7 +69,8 @@ use crate::{
     frame_owner_model::FrameDocumentTaskOwner,
     live_document_parser::{
         DocumentParserLifetime, DocumentParserRunState, DocumentParserSession,
-        DocumentParserSessionControlHandle, ParserResumePermit, ParserSuspensionCause,
+        DocumentParserSessionControlHandle, ParserResumeOwner, ParserResumePermit,
+        ParserSuspensionCause,
     },
     module_runtime::ModuleMapKey,
     network::ResourceRequestClient,
@@ -74,7 +83,7 @@ pub(crate) use devtools_mutations::{
     DevToolsDomChildListMutationFact, DevToolsDomMutationFact, DevToolsDomPrepublishedRemoval,
 };
 pub(crate) use inspector_issues::PendingInspectorIssue;
-pub(crate) use meta_refresh::MetaRefreshNavigation;
+use parser_blocking::{ParserInsertionWork, PendingParserBlockingWork, PendingParserInsertion};
 pub(crate) use parser_modulepreload::MainDocumentModulepreloadFetchOutcome;
 pub(crate) use script_lifecycle::{
     DeferredPageTask, DeferredPageTaskLane, DeferredPageTaskState, DocumentScriptLifecycle,
@@ -94,7 +103,8 @@ use stylesheet_runtime::{ConnectedLinkReadinessFetchOptions, ConnectedLoadParame
 pub(crate) use stylesheet_runtime::{
     ConnectedLoadCompletion, LinkedStylesheetImportGraphCompletion,
     LiveStylesheetImportLoadCompletion, StylesheetImportCompletionAuthority,
-    fetch_complete_stylesheet_import_graph, live_stylesheet_import_responses,
+    fetch_complete_stylesheet_import_graph, fetch_complete_stylesheet_import_graph_from_root,
+    live_stylesheet_import_responses,
 };
 use stylesheet_runtime::{
     ConnectedLoadOperation, LinkedStylesheetImportGraphs, QueuedConnectedStyleLoad,
@@ -202,7 +212,7 @@ impl std::fmt::Debug for ParserInsertionController {
 }
 
 impl ParserInsertionController {
-    fn for_stream(stream: &ParserStreamHandle) -> Self {
+    pub(crate) fn for_stream(stream: &ParserStreamHandle) -> Self {
         let input_session = stream.borrow().script_input_session();
         Self {
             input_session,
@@ -224,18 +234,6 @@ impl ParserInsertionController {
             .expect("synchronous parser insertion permission outlived its parser session");
         let stream = stream.borrow();
         operation(&stream)
-    }
-
-    pub(crate) fn with_parser_stream_mut<R>(
-        &self,
-        operation: impl FnOnce(&mut crate::parser::DocumentStream) -> R,
-    ) -> R {
-        let stream = self
-            .parser_stream
-            .upgrade()
-            .expect("synchronous parser insertion permission outlived its parser session");
-        let mut stream = stream.borrow_mut();
-        operation(&mut stream)
     }
 }
 
@@ -306,11 +304,13 @@ impl ParserConnectedScriptBridge {
     }
 
     pub(crate) fn suspend(&self, cause: ParserSuspensionCause) -> ParserResumePermit {
-        self.parser_control.suspend(cause)
+        self.parser_control
+            .suspend(cause, ParserResumeOwner::DocumentWrite)
     }
 
     pub(crate) fn resume(&self, permit: ParserResumePermit) -> bool {
-        self.parser_control.resume(permit)
+        self.parser_control
+            .resume(permit, ParserResumeOwner::DocumentWrite)
     }
 
     pub(crate) fn begin_pump(&self) -> crate::live_document_parser::DocumentParserPumpGuard {
@@ -406,6 +406,8 @@ pub(crate) struct ConnectedStyleImportRoot {
     pub(crate) stylesheet_id: crate::live_stylesheet::StylesheetId,
     pub(crate) contents_revision: u64,
     pub(crate) import_generation: u64,
+    /// Original resource URL; the live stylesheet retains the final parser base.
+    /// Inline roots have no resource identity to exclude from their imports.
     pub(crate) root_resource_url: Option<Url>,
 }
 
@@ -413,14 +415,14 @@ impl ConnectedStyleImportRoot {
     pub(crate) fn new(
         owner: DomHandle,
         stylesheet: &crate::live_stylesheet::LiveStylesheetRef,
-        root_is_external_resource: bool,
+        root_resource_url: Option<Url>,
     ) -> Self {
         Self {
             owner,
             stylesheet_id: stylesheet.id(),
             contents_revision: stylesheet.contents_revision(),
             import_generation: stylesheet.import_generation(),
-            root_resource_url: root_is_external_resource.then(|| stylesheet.base_url().clone()),
+            root_resource_url,
         }
     }
 
@@ -459,6 +461,7 @@ struct DocumentWriteExternalScriptStart {
 #[derive(Debug)]
 struct SuspendedDocumentWriteInsertion {
     document_handle: DomHandle,
+    document_incarnation: DocumentRuntimeIncarnationIdentity,
     parser_bridge: ParserConnectedScriptBridge,
     resume_permit: ParserResumePermit,
     resume_permit_consumed: bool,
@@ -477,19 +480,6 @@ enum SuspendedDocumentWriteContinuation {
     },
 }
 
-#[derive(Debug)]
-struct PendingDocumentWriteExternalScriptLoad {
-    target: crate::types::DocumentWriteExternalScriptFetchTarget,
-    start: DocumentWriteExternalScriptStart,
-    insertion: SuspendedDocumentWriteInsertion,
-    /// Stylesheets preceding this parser-inserted script.  Their fetches run
-    /// in parallel with the script source, but their owner events and style
-    /// installation must complete before the source can execute.
-    blocking_signatures_before: HashSet<DocumentBlockingStylesheetSignature>,
-    ready_completion: Option<crate::types::DocumentWriteExternalScriptLoadCompletion>,
-    resume_after_completion: VecDeque<SuspendedDocumentWriteContinuation>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DocumentWriteExternalScriptLoadApplication {
     Applied,
@@ -502,31 +492,6 @@ struct DocumentWriteScriptPreload {
     request: crate::runtime::BufferedScriptPreloadRequest,
     target: crate::types::DocumentWriteExternalScriptFetchTarget,
     ready_completion: Option<crate::types::DocumentWriteExternalScriptLoadCompletion>,
-}
-
-/// A parser-blocking script reached by a live `document.write`-style parser
-/// while one of the stylesheets that preceded it is still unresolved.
-///
-/// The parser stream and its insertion point stay owned by the document
-/// runtime.  A stylesheet-completion owner turn resumes this exact handoff;
-/// CDP/document callers never wait on the network operation themselves.
-#[derive(Debug)]
-struct PendingDocumentWriteStylesheetBlockedScript {
-    node: DomHandle,
-    start_line: u64,
-    start_column: u64,
-    script: PreparedScript,
-    blocking_signatures_before: HashSet<DocumentBlockingStylesheetSignature>,
-    insertion: SuspendedDocumentWriteInsertion,
-}
-
-/// Parser-created blocking stylesheet boundary with no script attached to it.
-/// Blink pauses token consumption at this boundary until the stylesheet owner
-/// settles, even when the next token is an ordinary element.
-#[derive(Debug)]
-struct PendingDocumentWriteStylesheetParserPause {
-    blocking_signatures: HashSet<DocumentBlockingStylesheetSignature>,
-    insertion: SuspendedDocumentWriteInsertion,
 }
 
 #[derive(Debug)]
@@ -679,9 +644,9 @@ pub(crate) struct DocumentPolicyContainer {
         crate::cross_origin_isolation::CrossOriginEmbedderPolicy,
     pub(crate) document_isolation_policy: crate::cross_origin_isolation::DocumentIsolationPolicy,
     pub(crate) cross_origin_isolated: bool,
-    pub(crate) document_content_security_policies: Vec<String>,
-    pub(crate) response_content_security_policies: Vec<String>,
-    pub(crate) response_content_security_report_only_policies: Vec<String>,
+    pub(crate) document_content_security_policies: Vec<ContentSecurityPolicy>,
+    pub(crate) response_content_security_policies: Vec<ContentSecurityPolicy>,
+    pub(crate) response_content_security_report_only_policies: Vec<ContentSecurityPolicy>,
     pub(crate) content_security_reporting_endpoints:
         crate::content_security_policy::ContentSecurityPolicyReportingEndpoints,
     pub(crate) credentialless: bool,
@@ -695,6 +660,7 @@ pub(crate) struct DocumentSandboxPolicy {
     pub(crate) forces_opaque_origin: bool,
     pub(crate) allows_scripts: bool,
     pub(crate) allows_modals: bool,
+    pub(crate) allows_top_navigation: bool,
     pub(crate) allows_popups_to_escape: bool,
     pub(crate) sandboxes_document_domain: bool,
 }
@@ -705,6 +671,7 @@ impl Default for DocumentSandboxPolicy {
             forces_opaque_origin: false,
             allows_scripts: true,
             allows_modals: true,
+            allows_top_navigation: true,
             allows_popups_to_escape: false,
             sandboxes_document_domain: false,
         }
@@ -712,7 +679,9 @@ impl Default for DocumentSandboxPolicy {
 }
 
 impl DocumentSandboxPolicy {
-    pub(crate) fn from_response_content_security_policies(policies: &[String]) -> Self {
+    pub(crate) fn from_response_content_security_policies(
+        policies: &[ContentSecurityPolicy],
+    ) -> Self {
         Self {
             forces_opaque_origin:
                 crate::content_security_policy::content_security_policy_forces_opaque_origin(
@@ -724,6 +693,10 @@ impl DocumentSandboxPolicy {
                 ),
             allows_modals:
                 crate::content_security_policy::content_security_policy_sandbox_allows_modals(
+                    policies,
+                ),
+            allows_top_navigation:
+                crate::content_security_policy::content_security_policy_sandbox_allows_top_navigation(
                     policies,
                 ),
             allows_popups_to_escape:
@@ -742,6 +715,7 @@ impl DocumentSandboxPolicy {
             self.forces_opaque_origin |= response.forces_opaque_origin;
             self.allows_scripts &= response.allows_scripts;
             self.allows_modals &= response.allows_modals;
+            self.allows_top_navigation &= response.allows_top_navigation;
             self.allows_popups_to_escape = if self.sandboxes_document_domain {
                 self.allows_popups_to_escape && response.allows_popups_to_escape
             } else {
@@ -764,14 +738,14 @@ pub(super) struct DocumentRuntime {
     selector_engine: QueryEngine,
     selector_debug: SelectorDebugCounters,
     document: HostDocumentState,
-    design_mode_documents: HashSet<DomHandle>,
+    timing: timing::DocumentTiming,
     script_execution_control: crate::script_execution_control::RendererScriptExecutionControl,
     author_styles_disabled: bool,
     bypass_content_security_policy: bool,
     policy_container: DocumentPolicyContainer,
-    delivered_meta_content_security_policies: RefCell<HashMap<DomHandle, Vec<String>>>,
+    delivered_meta_content_security_policies:
+        Arc<parking_lot::RwLock<HashMap<DomHandle, Vec<ContentSecurityPolicy>>>>,
     processed_meta_content_security_policy_handles: RefCell<HashSet<(DomHandle, DomHandle)>>,
-    document_character_set: String,
     resource_loader_binding: Option<DocumentResourceLoaderBinding>,
     script_context_stack: Vec<CurrentScriptContext>,
     root_document_parser: Option<DocumentParserSession>,
@@ -796,7 +770,7 @@ pub(super) struct DocumentRuntime {
     timeouts: HostTimeoutScheduler,
     events: HostEventTargetRegistry,
     mutations: MutationCoordinator,
-    meta_refresh_scheduler: meta_refresh::MetaRefreshScheduler,
+    meta_refresh_scheduler: crate::meta_refresh_scheduler::MetaRefreshScheduler,
     custom_element_reaction_depth: usize,
     structural_mutation_depth: usize,
     dom_content_loaded_dispatched: bool,
@@ -811,11 +785,7 @@ pub(super) struct DocumentRuntime {
     main_document_script_preloads: crate::runtime::DocumentScriptPreloadStore,
     document_write_script_preloads:
         HashMap<crate::runtime::BufferedScriptPreloadKey, DocumentWriteScriptPreload>,
-    pending_document_write_external_script_load: Option<PendingDocumentWriteExternalScriptLoad>,
-    pending_document_write_stylesheet_blocked_script:
-        Option<PendingDocumentWriteStylesheetBlockedScript>,
-    pending_document_write_stylesheet_parser_pause:
-        Option<PendingDocumentWriteStylesheetParserPause>,
+    pending_parser_blocking_work: Option<PendingParserBlockingWork>,
 }
 
 #[derive(Clone, Debug)]
@@ -837,16 +807,39 @@ pub(crate) struct ParserScriptStartPosition {
 /// call renderer-owned sinks, and each sink short-borrows this same native DOM
 /// object graph through `DocumentRuntime`.
 ///
-/// The wrapper centralizes direct `DomHost` borrowing so the parser path can
-/// avoid carrying a `DomHost` pointer or borrow token through helper layers.
+/// The live DOM also owns the canonical media settings, shared by native parser
+/// reads and Window bindings. The wrapper centralizes direct `DomHost` borrowing
+/// so the parser path avoids carrying a `DomHost` pointer or borrow token through
+/// helper layers.
 #[derive(Debug)]
 struct LiveRuntimeDomHost {
     dom_host: DomHost,
+    emulated_media: crate::protocol_types::EmulatedMediaOverrides,
+    viewport_surface: Option<crate::protocol_types::ViewportSurface>,
 }
 
 impl LiveRuntimeDomHost {
+    fn style_viewport(&self) -> crate::style_engine::StyleViewport {
+        self.viewport_surface
+            .map(crate::style_engine::StyleViewport::from_viewport_surface)
+            .unwrap_or_else(|| {
+                crate::style_engine::StyleViewport::new(
+                    Some(moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE.inner_width),
+                    Some(moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE.inner_height),
+                )
+                .with_screen_size(
+                    Some(moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE.screen_width),
+                    Some(moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE.screen_height),
+                )
+            })
+    }
+
     fn from_dom_host(dom_host: DomHost) -> Self {
-        Self { dom_host }
+        Self {
+            dom_host,
+            emulated_media: Default::default(),
+            viewport_surface: None,
+        }
     }
 
     #[track_caller]
@@ -1138,9 +1131,30 @@ impl DocumentRuntime {
         child: DomHandle,
         reference_child: Option<DomHandle>,
     ) -> DomMutationEffects {
+        self.insert_before_effects_in_structural_scope_with_state_preservation(
+            parent,
+            child,
+            reference_child,
+            false,
+        )
+    }
+
+    #[track_caller]
+    fn insert_before_effects_in_structural_scope_with_state_preservation(
+        &mut self,
+        parent: DomHandle,
+        child: DomHandle,
+        reference_child: Option<DomHandle>,
+        is_atomic_move: bool,
+    ) -> DomMutationEffects {
         let _guard = self.enter_structural_mutation();
-        self.dom_host
-            .insert_before_effects(parent, child, reference_child)
+        if is_atomic_move {
+            self.dom_host
+                .insert_before_preserving_state_effects(parent, child, reference_child)
+        } else {
+            self.dom_host
+                .insert_before_effects(parent, child, reference_child)
+        }
     }
 
     #[track_caller]
@@ -1149,8 +1163,23 @@ impl DocumentRuntime {
         parent: DomHandle,
         child: DomHandle,
     ) -> DomMutationEffects {
+        self.remove_child_effects_in_structural_scope_with_state_preservation(parent, child, false)
+    }
+
+    #[track_caller]
+    fn remove_child_effects_in_structural_scope_with_state_preservation(
+        &mut self,
+        parent: DomHandle,
+        child: DomHandle,
+        is_atomic_move: bool,
+    ) -> DomMutationEffects {
         let _guard = self.enter_structural_mutation();
-        self.dom_host.remove_child_effects(parent, child)
+        if is_atomic_move {
+            self.dom_host
+                .remove_child_preserving_state_effects(parent, child)
+        } else {
+            self.dom_host.remove_child_effects(parent, child)
+        }
     }
 
     #[track_caller]
@@ -1250,6 +1279,20 @@ impl super::planning::ParserPlanningReadView for LiveRuntimeDomHost {
 }
 
 impl super::stylesheet_blocking::StylesheetBlockingReadView for LiveRuntimeDomHost {
+    fn media_query_matches(&self, media: &str) -> bool {
+        let document = self
+            .borrow()
+            .node(self.borrow().document_handle())
+            .and_then(Node::as_document)
+            .expect("live Document");
+        crate::style_engine::media_list::evaluate_media_query_list_with_context(
+            media,
+            Some(&self.emulated_media),
+            self.style_viewport(),
+            document.base_url(),
+            document.quirks_mode(),
+        )
+    }
     fn stylesheet_element(
         &self,
         node_id: NativeNodeId,
@@ -1283,8 +1326,18 @@ impl super::stylesheet_blocking::StylesheetBlockingReadView for LiveRuntimeDomHo
         )
     }
 
+    fn stylesheet_base_url_clone(&self, node_id: NativeNodeId) -> Option<Url> {
+        <DomHost as super::stylesheet_blocking::StylesheetBlockingReadView>::stylesheet_base_url_clone(self.borrow(), node_id)
+    }
+
     fn document_node_id(&self) -> NativeNodeId {
         self.borrow().document_node_id()
+    }
+
+    fn document_is_quirks_mode(&self) -> bool {
+        <DomHost as super::stylesheet_blocking::StylesheetBlockingReadView>::document_is_quirks_mode(
+            self.borrow(),
+        )
     }
 
     fn document_order_stylesheet_candidate_ids_before(
@@ -1346,12 +1399,12 @@ mod tests {
         panic!("expected {tag_name} element in test document")
     }
 
-    fn parse_document_with_blocking_stylesheet_inputs(
+    fn parse_document_with_stylesheet_inputs(
         final_url: Url,
         html: impl Into<String>,
     ) -> (
         crate::dom::native::NativeDom,
-        Vec<crate::DocumentOwnedBlockingStylesheetDiscoveryInput>,
+        Vec<crate::DocumentOwnedStylesheetDiscoveryInput>,
     ) {
         let (document, _, inputs) =
             crate::parse_html_test_fixture_with_parser_outputs(final_url, html.into());
@@ -1395,6 +1448,69 @@ mod tests {
             ),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn stylesheet_discovery_reads_the_canonical_document_media_environment() {
+        let document = HtmlParser::SCRIPTING_ENABLED.parse(
+            Url::parse("https://example.test/media").unwrap(),
+            "<!doctype html><link id=sheet rel=stylesheet href=app.css media='(min-width: 700px)'>"
+                .to_owned(),
+        );
+        let link = first_element_handle(&document, "link");
+        let mut runtime = DocumentRuntime::from_document(document);
+        let blocks = |runtime: &DocumentRuntime| {
+            crate::stylesheet_blocking::stylesheet_link_disposition(
+                &runtime.dom_host,
+                NodeId::new(link.index()),
+            )
+            .expect("a nonmatching stylesheet must still have a load operation")
+            .is_blocking()
+        };
+        assert!(blocks(&runtime));
+        runtime.set_viewport_surface(Some(crate::protocol_types::ViewportSurface {
+            inner_width: 320,
+            inner_height: 200,
+            device_pixel_ratio: 2.0,
+            ..Default::default()
+        }));
+        assert!(!blocks(&runtime));
+        runtime.dom_host.set_attribute(
+            link,
+            "media",
+            "screen and (width: 320px) and (device-width: 1920px) and (resolution: 2dppx)",
+        );
+        assert!(blocks(&runtime));
+        runtime
+            .dom_host
+            .set_attribute(link, "media", "print and (prefers-color-scheme: dark)");
+        assert!(!blocks(&runtime));
+        runtime.set_emulated_media(&crate::protocol_types::EmulatedMediaOverrides {
+            media: Some("print".into()),
+            color_scheme: Some("dark".into()),
+            ..Default::default()
+        });
+        assert!(blocks(&runtime));
+        runtime.set_emulated_media(&Default::default());
+        assert!(!blocks(&runtime));
+    }
+
+    #[test]
+    fn live_runtime_dom_host_forwards_quirks_mode_for_stylesheet_processing() {
+        let document = HtmlParser::SCRIPTING_ENABLED.parse(
+            Url::parse("https://example.test/page.html").unwrap(),
+            "<html><head><link rel=stylesheet href=app.css></head></html>".to_owned(),
+        );
+        let link = first_element_handle(&document, "link");
+        let host = LiveRuntimeDomHost::from_dom_host(DomHost::from_dom(document));
+
+        let disposition = crate::stylesheet_blocking::stylesheet_link_disposition(
+            &host,
+            NodeId::new(link.index()),
+        )
+        .expect("stylesheet disposition");
+
+        assert!(disposition.options().quirks_mode_mime_compatibility());
     }
 
     #[test]
@@ -2087,7 +2203,7 @@ mod tests {
     #[test]
     fn parser_roundtrip_through_live_runtime_keeps_style_import_text_before_later_script() {
         let parser = HtmlParser::SCRIPTING_ENABLED;
-        let mut stream = parser.start_document(Url::parse("https://example.com/").unwrap());
+        let stream = parser.start_document(Url::parse("https://example.com/").unwrap());
         let html = "<!doctype html><html><head><script>window.start = 1;</script><style>@import url('/slow.css');</style><script>window.afterStyle = 1;</script><script src='/blocking.js'></script></head><body><div id='late'>late</div></body></html>";
 
         let crate::parser::ParserPumpStep::Yield(crate::parser::ParserYield::Script(_)) =
@@ -2146,7 +2262,7 @@ mod tests {
     #[test]
     fn parser_roundtrip_after_live_dom_mutation_keeps_later_body_hidden() {
         let parser = HtmlParser::SCRIPTING_ENABLED;
-        let mut stream = parser.start_document(Url::parse("https://example.com/").unwrap());
+        let stream = parser.start_document(Url::parse("https://example.com/").unwrap());
         let html = "<!doctype html><html><head><script>window.start = 1;</script><script>window.after = 1;</script></head><body><div id='late'>late</div></body></html>";
 
         let crate::parser::ParserPumpStep::Yield(crate::parser::ParserYield::Script(_)) =
@@ -2367,8 +2483,8 @@ mod tests {
 
     #[tokio::test]
     async fn stylesheet_typed_task_is_ready_for_document_processing() {
-        let (document, blocking_stylesheet_inputs) =
-            parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) =
+            parse_document_with_stylesheet_inputs(
             Url::parse("https://example.com/").unwrap(),
             "<!doctype html><html><head><link rel=stylesheet href=\"data:text/css,body%7B%7D\"></head><body></body></html>"
                 .to_owned(),
@@ -2378,9 +2494,7 @@ mod tests {
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
         let link = first_element_handle(&document, "link");
         let stylesheet_url = Url::parse("data:text/css,body%7B%7D").unwrap();
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
         runtime
             .stylesheet_lifecycle
             .fetches
@@ -2429,8 +2543,8 @@ mod tests {
 
     #[tokio::test]
     async fn stylesheet_completion_with_link_owner_surfaces_ready_parse_time_work() {
-        let (document, blocking_stylesheet_inputs) =
-            parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) =
+            parse_document_with_stylesheet_inputs(
             Url::parse("https://example.com/").unwrap(),
             "<!doctype html><html><head><link rel=stylesheet href=\"data:text/css,body%7B%7D\"></head><body></body></html>"
                 .to_owned(),
@@ -2452,9 +2566,7 @@ mod tests {
             .expect("stylesheet link");
         let link_node_id = crate::dom::NodeId::new(link.index());
         let stylesheet_url = Url::parse("data:text/css,body%7B%7D").unwrap();
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
         runtime
             .stylesheet_lifecycle
             .fetches
@@ -2471,8 +2583,8 @@ mod tests {
 
     #[tokio::test]
     async fn draining_blocking_stylesheet_completion_persists_resolved_state() {
-        let (document, blocking_stylesheet_inputs) =
-            parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) =
+            parse_document_with_stylesheet_inputs(
             Url::parse("https://example.com/").unwrap(),
             "<!doctype html><html><head><link rel=stylesheet href=/app.css></head><body></body></html>"
                 .to_owned(),
@@ -2480,9 +2592,7 @@ mod tests {
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
 
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
         assert!(!runtime.has_all_blocking_stylesheets_resolved());
 
         let node_id = NodeId::new(first_element_handle(&document, "link").index());
@@ -2525,17 +2635,15 @@ mod tests {
 
     #[tokio::test]
     async fn typed_stylesheet_claim_preserves_blocking_resolution_state() {
-        let (document, blocking_stylesheet_inputs) =
-            parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) =
+            parse_document_with_stylesheet_inputs(
             Url::parse("https://example.com/").unwrap(),
             "<!doctype html><html><head><link rel=stylesheet href=/app.css></head><body></body></html>"
                 .to_owned(),
         );
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         let node_id = NodeId::new(first_element_handle(&document, "link").index());
         let stylesheet_url = Url::parse("https://example.com/app.css").unwrap();
@@ -2888,17 +2996,15 @@ mod tests {
                 .unwrap();
         });
 
-        let (document, blocking_stylesheet_inputs) =
-            parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) =
+            parse_document_with_stylesheet_inputs(
             Url::parse(&format!("http://{addr}/page")).unwrap(),
             "<!doctype html><html><head><link rel=stylesheet href='/app.css'><script defer src='/app.js'></script></head><body></body></html>".to_owned(),
         );
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
 
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         let node_id = NodeId::new(first_element_handle(&document, "link").index());
         let stylesheet_url = Url::parse(&format!("http://{addr}/app.css")).unwrap();
@@ -2957,17 +3063,15 @@ mod tests {
                 .unwrap();
         });
 
-        let (document, blocking_stylesheet_inputs) =
-            parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) =
+            parse_document_with_stylesheet_inputs(
             Url::parse(&format!("http://{addr}/page")).unwrap(),
             "<!doctype html><html><head><link rel=stylesheet href='/app.css'><script defer src='/app.js'></script></head><body></body></html>".to_owned(),
         );
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
 
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         let node_id = NodeId::new(first_element_handle(&document, "link").index());
         let stylesheet_url = Url::parse(&format!("http://{addr}/app.css")).unwrap();
@@ -3052,14 +3156,14 @@ mod tests {
             script_node_id,
         )
         .into_iter()
-        .map(|blocker| crate::DocumentOwnedBlockingStylesheetDiscoveryInput::from(&blocker))
+        .map(|blocker| crate::DocumentOwnedStylesheetDiscoveryInput::from(&blocker))
         .collect::<Vec<_>>();
         assert_eq!(
             inputs.len(),
             1,
             "expected one parser-created style import blocker"
         );
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(inputs.iter());
+        runtime.note_discovered_document_owned_stylesheet_inputs(inputs.iter());
 
         let results = timeout(Duration::from_secs(2), async {
             loop {
@@ -3138,14 +3242,14 @@ mod tests {
             script_node_id,
         )
         .into_iter()
-        .map(|blocker| crate::DocumentOwnedBlockingStylesheetDiscoveryInput::from(&blocker))
+        .map(|blocker| crate::DocumentOwnedStylesheetDiscoveryInput::from(&blocker))
         .collect::<Vec<_>>();
         assert_eq!(
             inputs.len(),
             1,
             "expected one parser-created style import blocker"
         );
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(inputs.iter());
+        runtime.note_discovered_document_owned_stylesheet_inputs(inputs.iter());
 
         let results = timeout(Duration::from_secs(2), async {
             loop {
@@ -3609,8 +3713,8 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_front_page_task_does_not_count_as_ready_document_processing_wake() {
-        let (document, blocking_stylesheet_inputs) =
-            parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) =
+            parse_document_with_stylesheet_inputs(
             Url::parse("https://example.com/").unwrap(),
             "<!doctype html><html><head><link rel=stylesheet href=/app.css></head><body><script defer src=/app.js></script></body></html>"
                 .to_owned(),
@@ -3648,16 +3752,14 @@ mod tests {
             ),
         ]);
 
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         assert!(!runtime.has_ready_document_processing_wake(&mut task_queue));
     }
 
     #[tokio::test]
     async fn open_document_resets_document_owned_lifecycle_state() {
-        let (document, blocking_stylesheet_inputs) = parse_document_with_blocking_stylesheet_inputs(
+        let (document, stylesheet_inputs) = parse_document_with_stylesheet_inputs(
             Url::parse("https://example.com/").unwrap(),
             "<!doctype html><html><body><link rel=stylesheet href=/app.css></body></html>"
                 .to_owned(),
@@ -3665,9 +3767,7 @@ mod tests {
         let loader = ResourceRequestClient::new(&FetchConfig::default()).expect("loader");
         let mut runtime = DocumentRuntime::new_networked(&document, &loader);
         let handle = first_element_handle(&document, "link");
-        runtime.note_discovered_document_owned_blocking_stylesheet_inputs(
-            blocking_stylesheet_inputs.iter(),
-        );
+        runtime.note_discovered_document_owned_stylesheet_inputs(stylesheet_inputs.iter());
 
         runtime.enqueue_pending_connected_style_load_for_test(handle);
         runtime

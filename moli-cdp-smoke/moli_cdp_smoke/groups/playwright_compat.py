@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+
 import asyncio
 from typing import Any, Callable, Awaitable
 
+from ..diagnostics import new_cdp_session
 from . import SmokeState
 from ..assertions import SmokeError, assert_equal, wait_until
 from ..pdf_document import assert_pdf_envelope
+from ..png_image import decode_png
 
 
 async def run_playwright_compat_group(state: SmokeState) -> None:
+    await _verify_playwright_first_screenshot(state)
     await _verify_playwright_context_route_metadata_sample(state)
     await _verify_playwright_page_route_precedence_sample(state)
     await _verify_playwright_context_route_fallback_sample(state)
@@ -25,6 +29,42 @@ async def run_playwright_compat_group(state: SmokeState) -> None:
     await _verify_playwright_main_frame_cdp_session_sample(state)
     await _verify_playwright_cdp_session_detach_sample(state)
     await _verify_playwright_browser_cdp_session_sample(state)
+
+
+async def _verify_playwright_first_screenshot(state: SmokeState) -> None:
+    # Start each mode on a new page, without geometry probes or raw captures
+    # that could initialize layout before Playwright's own screenshot preflight.
+    for name, options, size in [
+        ("viewport", {}, (320, 240)),
+        ("clip", {"clip": {"x": 10, "y": 15, "width": 60, "height": 50}}, (60, 50)),
+        ("full-page", {"full_page": True}, (320, 900)),
+        ("full-page-clip", {"full_page": True, "clip": {"x": 10, "y": 15, "width": 60, "height": 50}}, (60, 50)),
+    ]:
+        page = await state.context.new_page()
+        try:
+            await page.set_viewport_size({"width": 320, "height": 240})
+            # Match Playwright's Chromium --hide-scrollbars launch default.
+            await page.goto(
+                "data:text/html,<!doctype html><style>html{scrollbar-width:none}</style>"
+                "<body style='margin:0'>"
+                "<div style='width:80px;height:900px;background:rgb(20,30,40)'></div>",
+                wait_until="load",
+                timeout=10_000,
+            )
+            image = decode_png(await page.screenshot(timeout=10_000, **options))
+            assert_equal((image.width, image.height), size, f"first Playwright {name} screenshot size")
+            assert_equal(image.pixel(5, 5), (20, 30, 40, 255), f"first Playwright {name} screenshot pixel")
+            if name == "full-page":
+                assert_equal(image.pixel(5, 880), (20, 30, 40, 255), "cold full-page bottom pixel")
+            full_image = decode_png(await page.screenshot(full_page=True, timeout=10_000))
+            assert_equal(full_image.height, 900, "subsequent full-page screenshot height")
+            assert_equal(full_image.pixel(5, 880), (20, 30, 40, 255), "subsequent full-page bottom pixel")
+        finally:
+            await page.close()
+    state.record(
+        "playwright_first_screenshot_without_published_layout",
+        {"modes": ["viewport", "clip", "full-page", "full-page-clip"]},
+    )
 
 
 async def _with_fresh_page(state: SmokeState, body: Callable[[Any, Any], Awaitable[None]]) -> None:
@@ -121,10 +161,12 @@ async def _verify_playwright_context_route_fallback_sample(state: SmokeState) ->
 async def _verify_playwright_route_times_sample(state: SmokeState) -> None:
     async def body(context: Any, page: Any) -> None:
         hits: list[str] = []
+        entered, release = asyncio.Event(), asyncio.Event()
 
         async def once(route: Any) -> None:
             hits.append("once")
-            await asyncio.sleep(0.05)
+            entered.set()
+            await release.wait()
             await route.fulfill(
                 status=200,
                 content_type="text/html; charset=utf-8",
@@ -132,7 +174,14 @@ async def _verify_playwright_route_times_sample(state: SmokeState) -> None:
             )
 
         await context.route("**/playwright-route-times", once, times=1)
-        await page.goto(f"{state.fixture}/playwright-route-times", wait_until="load", timeout=10_000)
+        navigation = asyncio.create_task(page.goto(
+            f"{state.fixture}/playwright-route-times", wait_until="load", timeout=10_000,
+        ))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=10)
+        finally:
+            release.set()
+            await navigation
         assert_equal(await page.text_content("body"), "intercepted", "Playwright route times first navigation")
         await page.goto(f"{state.fixture}/playwright-route-times", wait_until="load", timeout=10_000)
         assert_equal(await page.text_content("main"), "server fallback", "Playwright route times second navigation")
@@ -303,7 +352,7 @@ async def _verify_playwright_pdf_sample(state: SmokeState) -> None:
 
 async def _verify_playwright_cdp_session_sample(state: SmokeState) -> None:
     async def body(context: Any, page: Any) -> None:
-        session = await context.new_cdp_session(page)
+        session = await new_cdp_session(context, page)
         try:
             version = await session.send("Browser.getVersion")
             if not version.get("protocolVersion"):
@@ -319,7 +368,7 @@ async def _verify_playwright_cdp_session_sample(state: SmokeState) -> None:
 
 async def _verify_playwright_cdp_session_network_event_sample(state: SmokeState) -> None:
     async def body(context: Any, page: Any) -> None:
-        session = await context.new_cdp_session(page)
+        session = await new_cdp_session(context, page)
         events: list[dict[str, Any]] = []
         try:
             session.on("Network.requestWillBeSent", lambda event: events.append(event))
@@ -338,7 +387,7 @@ async def _verify_playwright_cdp_session_network_event_sample(state: SmokeState)
 
 async def _verify_playwright_cdp_session_error_sample(state: SmokeState) -> None:
     async def body(context: Any, page: Any) -> None:
-        session = await context.new_cdp_session(page)
+        session = await new_cdp_session(context, page)
         try:
             error = await _expect_async_error(session.send("ThisCommand.DoesNotExist"))
             if "ThisCommand.DoesNotExist" not in error:
@@ -352,7 +401,7 @@ async def _verify_playwright_cdp_session_error_sample(state: SmokeState) -> None
 
 async def _verify_playwright_main_frame_cdp_session_sample(state: SmokeState) -> None:
     async def body(context: Any, page: Any) -> None:
-        session = await context.new_cdp_session(page.main_frame)
+        session = await new_cdp_session(context, page.main_frame)
         try:
             await session.send("Runtime.enable")
             await session.send("Runtime.evaluate", {"expression": "window.__pwFrameSession = 'ok'"})
@@ -367,7 +416,7 @@ async def _verify_playwright_main_frame_cdp_session_sample(state: SmokeState) ->
 
 async def _verify_playwright_cdp_session_detach_sample(state: SmokeState) -> None:
     async def body(context: Any, page: Any) -> None:
-        session = await context.new_cdp_session(page)
+        session = await new_cdp_session(context, page)
         result = await session.send("Runtime.evaluate", {"expression": "1 + 2", "returnByValue": True})
         assert_equal(result.get("result", {}).get("value"), 3, "Playwright CDPSession before detach")
         await session.detach()

@@ -3,19 +3,19 @@ use serde_json::json;
 
 use moli_browser_profile::{DEFAULT_PROFILE_PARTITION_ID, ProfilePartitionId};
 
-use crate::conn::{
-    BackgroundProtocolEvent, TargetOwnerState, TargetWindowSurfaceState,
-    monotonic_timestamp_seconds,
-};
-use crate::devtools_runtime::{
-    DevToolsClientWindowInfo, DevToolsCommand, DevToolsCommandResult,
+use crate::automation::{
+    AutomationCommand, AutomationResult, DevToolsClientWindowInfo,
     DevToolsCreateBrowserContextCommand, DevToolsCreateBrowserContextResult, DevToolsError,
     DevToolsErrorKind, DevToolsGetBrowserContextsCommand, DevToolsGetBrowserContextsResult,
     DevToolsGetClientWindowsCommand, DevToolsGetClientWindowsResult,
     DevToolsGetServiceWorkerLogsCommand, DevToolsGetServiceWorkerLogsResult,
-    DevToolsGetTargetsCommand, DevToolsGetTargetsResult, DevToolsProtocol,
-    DevToolsRemoveBrowserContextCommand, DevToolsTargetFilterEntry, DevToolsTargetId,
-    DevToolsTargetInfo, DevToolsTargetKind, DevToolsWindowState, RuntimeConsoleEvent,
+    DevToolsGetTargetsCommand, DevToolsGetTargetsResult, DevToolsRemoveBrowserContextCommand,
+    DevToolsTargetFilterEntry, DevToolsTargetId, DevToolsTargetInfo, DevToolsTargetKind,
+    DevToolsWindowState, FrontendProtocol, RuntimeConsoleEvent,
+};
+use crate::conn::{
+    BackgroundProtocolEvent, TargetOwnerState, TargetWindowSurfaceState,
+    monotonic_timestamp_seconds,
 };
 use crate::domains::observable_output::runtime_console_message_type_and_text;
 
@@ -33,7 +33,7 @@ pub(super) fn start_get_targets_command(
         conn,
         cmd.id,
         cmd.session_id,
-        DevToolsCommand::GetTargets(command),
+        AutomationCommand::GetTargets(command),
     )
 }
 
@@ -54,7 +54,7 @@ struct GetTargetsFilterEntry {
 fn build_cdp_get_targets_command(cmd: &Cmd<'_>) -> Option<DevToolsGetTargetsCommand> {
     let params: Option<GetTargetsParams> = cmd.get_params().ok()?;
     Some(DevToolsGetTargetsCommand {
-        context: cmd.devtools_command_context(None::<&str>, None::<&str>),
+        context: cmd.automation_context(None::<&str>, None::<&str>),
         root: None,
         max_depth: None,
         filter: params.and_then(|params| {
@@ -76,9 +76,7 @@ pub(super) fn start_devtools_get_targets_command(
     command: DevToolsGetTargetsCommand,
 ) -> CommandOutputPlan {
     match execute_devtools_get_targets_command(conn, &command) {
-        Ok(result) => {
-            CommandOutputPlan::from_devtools_result(DevToolsCommandResult::GetTargets(result))
-        }
+        Ok(result) => CommandOutputPlan::from_devtools_result(AutomationResult::GetTargets(result)),
         Err(error) => CommandOutputPlan::from_devtools_error(error),
     }
 }
@@ -284,7 +282,7 @@ pub(super) fn execute_devtools_create_browser_context_command(
         .as_ref()
         .map(|id| id.as_str().to_owned())
         .unwrap_or_else(|| match command.context.protocol {
-            DevToolsProtocol::WebDriverBidi => conn.gen_user_browser_context_id(),
+            FrontendProtocol::WebDriverBidi => conn.gen_user_browser_context_id(),
             _ => conn.gen_bc_id(),
         });
     if conn.has_browser_context_id(&id) {
@@ -294,7 +292,9 @@ pub(super) fn execute_devtools_create_browser_context_command(
         ));
     }
 
-    let mut browser_context = conn.new_ephemeral_browser_context(id.clone());
+    let mut browser_context = conn
+        .new_ephemeral_browser_context(id.clone())
+        .map_err(|error| DevToolsError::new(DevToolsErrorKind::Internal, error))?;
     browser_context.default_tls_verify_host_override =
         command.accept_insecure_certs.map(|accept| !accept);
     browser_context.default_http_proxy_override = command.proxy_server;
@@ -304,7 +304,7 @@ pub(super) fn execute_devtools_create_browser_context_command(
     browser_context.proxy_socks_version = command.proxy_socks_version;
     conn.insert_browser_context(browser_context);
     Ok(DevToolsCreateBrowserContextResult {
-        browser_context_id: crate::devtools_runtime::DevToolsBrowserContextId::from(id),
+        browser_context_id: crate::automation::DevToolsBrowserContextId::from(id),
     })
 }
 
@@ -315,65 +315,59 @@ pub(super) fn devtools_get_browser_contexts_result(
     DevToolsGetBrowserContextsResult {
         browser_context_ids: conn
             .browser_contexts()
-            .map(|context| {
-                crate::devtools_runtime::DevToolsBrowserContextId::from(context.id.as_str())
-            })
+            .map(|context| crate::automation::DevToolsBrowserContextId::from(context.id.as_str()))
             .collect(),
     }
 }
 
-pub(super) async fn execute_devtools_remove_browser_context_command_async(
+pub(super) fn start_automation_remove_browser_context(
     conn: &mut CdpConnection,
     command: DevToolsRemoveBrowserContextCommand,
-) -> (
-    Result<DevToolsCommandResult, DevToolsError>,
-    Vec<BackgroundProtocolEvent>,
-) {
-    let should_emit_internal_lifecycle =
-        command.context.protocol == DevToolsProtocol::WebDriverBidi;
+    _id: u64,
+    context: &mut crate::conn::CommandDispatchContext,
+) -> TargetCommandTaskStep {
     let browser_context_id = command.browser_context_id.into_string();
     if browser_context_id == conn.default_browser_context_id() {
-        return (
-            Err(DevToolsError::new(
+        return TargetCommandTaskStep::Complete(CommandOutputPlan::from_devtools_error(
+            DevToolsError::new(
                 DevToolsErrorKind::InvalidArgument,
-                "DefaultBrowserContextCannotBeRemoved",
-            )),
-            Vec::new(),
-        );
-    }
-    if !conn.has_browser_context_id(&browser_context_id) {
-        return (
-            Err(DevToolsError::new(
-                DevToolsErrorKind::NoSuchTarget,
-                "UnknownBrowserContextId",
-            )),
-            Vec::new(),
-        );
-    }
-
-    let mut protocol_events = Vec::new();
-    if should_emit_internal_lifecycle {
-        protocol_events.extend(target_destroyed_automation_events_for_browser_context(
-            conn,
-            &browser_context_id,
+                DefaultBrowserContextCannotBeRemoved,
+            ),
         ));
     }
-    let mut side_effects = events::TargetProtocolSideEffects::default();
-    let mut command_context = crate::conn::CommandDispatchContext::default();
-    if let Err(error) = super::browser_context_disposal::execute_browser_context_disposal_async(
+    if !conn.has_browser_context_id(&browser_context_id) {
+        return TargetCommandTaskStep::Complete(CommandOutputPlan::from_devtools_error(
+            DevToolsError::new(DevToolsErrorKind::NoSuchTarget, UnknownBrowserContextId),
+        ));
+    }
+    let lifecycle = if command.context.protocol == FrontendProtocol::WebDriverBidi {
+        target_destroyed_automation_events_for_browser_context(conn, &browser_context_id)
+    } else {
+        Vec::new()
+    };
+    let disposal = match super::browser_context_disposal::PreparedBrowserContextDisposal::prepare(
         conn,
         browser_context_id,
-        &mut side_effects,
-        &mut command_context,
-    )
-    .await
+    ) {
+        Ok(disposal) => disposal,
+        Err(error) => {
+            return TargetCommandTaskStep::Complete(CommandOutputPlan::from_devtools_error(error));
+        }
+    };
+    context.protocol_events_mut().extend(lifecycle);
     {
-        return (Err(error), Vec::new());
+        let access = conn.protocol_state_access();
+        TargetCommandTaskStep::Workflow(disposal.into_workflow(access))
     }
-    protocol_events.extend(side_effects.into_background_events());
-    protocol_events.extend(command_context.take_protocol_events());
-    (Ok(DevToolsCommandResult::Empty), protocol_events)
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("DefaultBrowserContextCannotBeRemoved")]
+struct DefaultBrowserContextCannotBeRemoved;
+
+#[derive(Debug, thiserror::Error)]
+#[error("UnknownBrowserContextId")]
+struct UnknownBrowserContextId;
 
 pub(super) const DEVTOOLS_BROWSER_TARGET_ID: &str = "browser";
 
@@ -513,7 +507,10 @@ pub(super) fn create_browser_context(conn: &mut CdpConnection, cmd: &Cmd<'_>) ->
         return CommandOutputPlan::error_without_session(-32602, message);
     }
     let id = conn.gen_bc_id();
-    let mut browser_context = conn.new_ephemeral_browser_context(id.clone());
+    let mut browser_context = match conn.new_ephemeral_browser_context(id.clone()) {
+        Ok(context) => context,
+        Err(error) => return CommandOutputPlan::error_without_session(-32000, &error),
+    };
     browser_context.default_http_proxy_override = params.proxy_server;
     browser_context.default_http_no_proxy_override =
         normalize_proxy_bypass_list_for_loader(params.proxy_bypass_list.as_deref());
@@ -552,7 +549,10 @@ struct DisposeBcParams {
     browser_context_id: Option<String>,
 }
 
-pub(super) fn start_dispose_browser_context_command(cmd: &Cmd<'_>) -> TargetCommandTaskStep {
+pub(super) fn start_dispose_browser_context_command(
+    conn: &mut CdpConnection,
+    cmd: &Cmd<'_>,
+) -> TargetCommandTaskStep {
     let params: DisposeBcParams = match cmd.get_params() {
         Ok(Some(p)) => p,
         _ => {
@@ -565,28 +565,13 @@ pub(super) fn start_dispose_browser_context_command(cmd: &Cmd<'_>) -> TargetComm
             return super::target_command_error(-32602, "InvalidParams");
         }
     };
-    pending_dispose_browser_context_command(cmd.id, cmd.session_id, wanted_id)
-}
-
-pub(super) async fn complete_dispose_browser_context_command_async(
-    conn: &mut CdpConnection,
-    wanted_id: String,
-    command_context: &mut crate::conn::CommandDispatchContext,
-) -> CommandOutputPlan {
-    let mut side_effects = events::TargetProtocolSideEffects::default();
-    match super::browser_context_disposal::execute_browser_context_disposal_async(
-        conn,
-        wanted_id,
-        &mut side_effects,
-        command_context,
-    )
-    .await
-    {
-        Ok(()) => {
-            let mut plan = CommandOutputPlan::success();
-            plan.extend(side_effects.into_plan());
-            plan
+    let disposal = match super::browser_context_disposal::PreparedBrowserContextDisposal::prepare(
+        conn, wanted_id,
+    ) {
+        Ok(disposal) => disposal,
+        Err(error) => {
+            return TargetCommandTaskStep::Complete(CommandOutputPlan::from_devtools_error(error));
         }
-        Err(error) => CommandOutputPlan::from_devtools_error(error),
-    }
+    };
+    TargetCommandTaskStep::Workflow(disposal.into_workflow(conn.protocol_state_access()))
 }

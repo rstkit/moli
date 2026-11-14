@@ -9,11 +9,12 @@
 use moli_webidl_callback::WebIdlCallbackFunction;
 
 use crate::{
-    native_bridge::{JsContextHost, RuntimeObservableContextToken, WindowExecutionContextIdentity},
-    window_webidl_callback::{
-        WindowWebIdlCallbackFunction, WindowWebIdlCallbackFunctionOutcome,
-        invoke_window_webidl_callback_function,
+    exception_reporting::V8ExceptionReport,
+    native_bridge::{
+        PageScriptHost, RuntimeObservableContextToken, WindowExecutionContextIdentity,
     },
+    webidl_callback_execution::WebIdlCallbackExecutionOutcome,
+    window_webidl_callback::WindowWebIdlCallbackFunction,
 };
 
 /// API-specific body data for one Window Web IDL callback scheduled on the
@@ -41,7 +42,7 @@ pub(super) struct ScheduledWindowWebIdlCallback {
 impl ScheduledWindowWebIdlCallback {
     pub(super) fn new(
         scope: &mut v8::PinScope<'_, '_>,
-        host: &JsContextHost,
+        host: &PageScriptHost,
         callback: WebIdlCallbackFunction,
         target_receiver: v8::Local<'_, v8::Object>,
         kind: WindowWebIdlCallbackTaskKind,
@@ -99,10 +100,12 @@ impl ScheduledWindowWebIdlCallback {
     pub(super) fn invoke<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         extra_args: &[v8::Global<v8::Value>],
-    ) -> WindowWebIdlCallbackFunctionOutcome {
-        let prepared = self.callback.prepare(scope);
+    ) -> WebIdlCallbackExecutionOutcome<v8::Global<v8::Value>, Box<V8ExceptionReport>> {
+        let Some(prepared) = self.callback.prepare_execution(scope, host_ptr, None) else {
+            return WebIdlCallbackExecutionOutcome::Unavailable;
+        };
         let mut arguments = Vec::new();
         let receiver = match self.kind {
             WindowWebIdlCallbackTaskKind::Timer => {
@@ -126,7 +129,7 @@ impl ScheduledWindowWebIdlCallback {
                 let Some(deadline) =
                     crate::window_host::build_window_idle_deadline(scope, did_timeout)
                 else {
-                    return WindowWebIdlCallbackFunctionOutcome::Retired;
+                    return WebIdlCallbackExecutionOutcome::Unavailable;
                 };
                 arguments.push(deadline.into());
                 v8::undefined(scope).into()
@@ -161,13 +164,11 @@ impl ScheduledWindowWebIdlCallback {
                 "Geolocation callback",
             ),
         };
-        invoke_window_webidl_callback_function(
+        prepared.invoke_with_report(
             scope,
-            host_ptr,
             callback_kind,
             log_label,
             callback_name,
-            &prepared,
             receiver,
             &arguments,
         )

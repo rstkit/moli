@@ -1,30 +1,36 @@
+use crate::web_api_interfaces;
 use crate::{
     context_bootstrap,
     dom::native::{DocumentType, Node, NodeType},
     webidl,
 };
+use anyhow::{Context, bail};
 use moli_webapi_declare::WebApiFunctionTemplate;
 
 use super::super::{
     document_runtime::DomHandle,
     util::{
-        call_global_bridge_method, context_host_ptr_from_global_bridge, get_private_value,
+        call_global_bridge_method, context_host_ptr_from_context_slot, get_private_value,
         throw_type_error, v8_string, v8str,
     },
 };
 use super::{
-    CollectionKind, JsContextHost, LiveCollectionQueryKind, callback_arg_string,
-    runtime_ptr_from_object, set_wrapped_handle_or_null, throw_dom_exception,
+    CollectionKind, LiveCollectionQueryKind, PageScriptHost, callback_arg_string,
+    runtime_ptr_from_object, set_wrapped_handle_or_null, set_wrapped_handle_or_null_for_receiver,
+    throw_dom_exception,
 };
 
+mod arguments;
 mod bridge_callbacks;
 mod character_data;
 mod errors;
 mod foreign;
 mod metadata;
 mod mutation;
+mod reference;
 mod tree;
 
+pub(super) use self::arguments::*;
 pub(super) use self::bridge_callbacks::*;
 pub(crate) use self::character_data::install_character_data_template_bindings;
 pub(super) use self::character_data::*;
@@ -34,10 +40,11 @@ pub(super) use self::foreign::*;
 use self::metadata::*;
 pub(crate) use self::mutation::validate_pre_insert_handles;
 pub(super) use self::mutation::*;
+pub(crate) use self::reference::NativeNodeReference;
 pub(super) use self::tree::*;
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Node", enumerable)]
+#[webapi(interface = web_api_interfaces::Node, enumerable, receiver)]
 struct NodePrototypeReflectionDeclaration {
     #[webapi(accessor_property = "nodeType", getter = node_node_type_getter_function)]
     node_type: (),
@@ -82,21 +89,21 @@ struct NodePrototypeReflectionDeclaration {
     append_child: (),
     #[webapi(method, length = 2, callback = node_insert_before_prototype_callback)]
     insert_before: (),
-    #[webapi(method, length = 1, callback = node_remove_child_prototype_callback)]
+    #[webapi(method, length = 1, callback = node_remove_child_prototype_callback, receiver = web_api_interfaces::Node::is_instance)]
     remove_child: (),
     #[webapi(method, length = 2, callback = node_replace_child_prototype_callback)]
     replace_child: (),
     #[webapi(method, length = 0, callback = node_clone_node_callback)]
     clone_node: (),
-    #[webapi(method, length = 1, callback = node_contains_callback)]
+    #[webapi(method, length = 1, callback = node_contains_callback, receiver = web_api_interfaces::Node::is_instance)]
     contains: (),
     #[webapi(method, length = 0, callback = node_has_child_nodes_callback)]
     has_child_nodes: (),
-    #[webapi(method, length = 1, callback = node_is_same_node_callback)]
+    #[webapi(method, length = 1, callback = node_is_same_node_callback, receiver = web_api_interfaces::Node::is_instance)]
     is_same_node: (),
-    #[webapi(method, length = 1, callback = node_is_equal_node_callback)]
+    #[webapi(method, length = 1, callback = node_is_equal_node_callback, receiver = web_api_interfaces::Node::is_instance)]
     is_equal_node: (),
-    #[webapi(method, length = 1, callback = node_compare_document_position_callback)]
+    #[webapi(method, length = 1, callback = node_compare_document_position_callback, receiver = web_api_interfaces::Node::is_instance)]
     compare_document_position: (),
     #[webapi(method, length = 0, callback = node_get_root_node_callback)]
     get_root_node: (),
@@ -110,30 +117,47 @@ struct NodePrototypeReflectionDeclaration {
     normalize: (),
 }
 
-#[derive(WebApiFunctionTemplate)]
-#[webapi(name = "ParentNode", enumerable)]
-struct ParentNodePrototypeDeclaration {
-    #[webapi(accessor_property, getter = parent_node_children_getter_function)]
-    children: (),
-    #[webapi(accessor_property, getter = parent_node_first_element_child_getter_function)]
-    first_element_child: (),
-    #[webapi(accessor_property, getter = parent_node_last_element_child_getter_function)]
-    last_element_child: (),
-    #[webapi(accessor_property, getter = parent_node_child_element_count_getter_function)]
-    child_element_count: (),
-    #[webapi(method, length = 0, callback = node_prepend_callback)]
-    prepend: (),
-    #[webapi(method, length = 0, callback = node_append_callback)]
-    append: (),
-    #[webapi(method, length = 0, callback = node_replace_children_callback)]
-    replace_children: (),
-    #[webapi(method = "moveBefore", length = 2, callback = node_move_before_callback)]
-    move_before: (),
-    #[webapi(method, length = 1, callback = super::element::node_query_selector_callback)]
-    query_selector: (),
-    #[webapi(method, length = 1, callback = super::element::node_query_selector_all_callback)]
-    query_selector_all: (),
+macro_rules! declare_parent_node_prototype {
+    ($declaration:ident, $($binding:tt)*) => {
+        #[derive(WebApiFunctionTemplate)]
+        #[webapi($($binding)*)]
+        struct $declaration {
+            #[webapi(accessor_property, getter = parent_node_children_getter_function)]
+            children: (),
+            #[webapi(accessor_property, getter = parent_node_first_element_child_getter_function)]
+            first_element_child: (),
+            #[webapi(accessor_property, getter = parent_node_last_element_child_getter_function)]
+            last_element_child: (),
+            #[webapi(accessor_property, getter = parent_node_child_element_count_getter_function)]
+            child_element_count: (),
+            #[webapi(method, length = 0, callback = node_prepend_callback)]
+            prepend: (),
+            #[webapi(method, length = 0, callback = node_append_callback)]
+            append: (),
+            #[webapi(method, length = 0, callback = node_replace_children_callback)]
+            replace_children: (),
+            #[webapi(method = "moveBefore", length = 2, callback = node_move_before_callback)]
+            move_before: (),
+            #[webapi(method, length = 1, callback = super::element::node_query_selector_callback)]
+            query_selector: (),
+            #[webapi(method, length = 1, callback = super::element::node_query_selector_all_callback)]
+            query_selector_all: (),
+        }
+    };
 }
+
+declare_parent_node_prototype!(
+    ParentNodePrototypeDeclaration,
+    name = "ParentNode",
+    enumerable
+);
+// A mixin member must validate the interface whose prototype owns it.
+declare_parent_node_prototype!(
+    DocumentParentNodePrototypeDeclaration,
+    interface = web_api_interfaces::Document,
+    enumerable,
+    receiver
+);
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(name = "ChildNode", enumerable)]
@@ -158,7 +182,7 @@ struct NonDocumentTypeChildNodePrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "DocumentType", enumerable)]
+#[webapi(interface = web_api_interfaces::DocumentType, enumerable)]
 struct DocumentTypePrototypeDeclaration {
     #[webapi(accessor_property, getter = document_type_name_getter_function)]
     name: (),
@@ -189,15 +213,24 @@ fn detached_bridge_value_for_this<'s>(
     receiver: v8::Local<'s, v8::Object>,
     method: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    get_private_value(scope, receiver, super::document::DETACHED_STATE_SLOT)?;
+    let receiver = detached_node_backing_object(scope, receiver)?;
     call_global_bridge_method(scope, method, &[receiver.into()])
 }
 
-pub(super) fn receiver_has_detached_state<'s>(
+fn detached_node_backing_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let receiver = node_backing_object(scope, receiver)?;
+    get_private_value(scope, receiver, super::document::DETACHED_STATE_SLOT)?;
+    Some(receiver)
+}
+
+pub(crate) fn receiver_has_detached_state<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, receiver, super::document::DETACHED_STATE_SLOT).is_some()
+    detached_node_backing_object(scope, receiver).is_some()
 }
 
 pub(super) fn throw_incompatible_getter_receiver(
@@ -233,11 +266,11 @@ pub(super) fn throw_incompatible_method_receiver(
     );
 }
 
-fn node_type_for_handle(runtime: &JsContextHost, handle: DomHandle) -> Option<NodeType> {
+fn node_type_for_handle(runtime: &PageScriptHost, handle: DomHandle) -> Option<NodeType> {
     runtime.dom_host().node(handle).map(Node::node_type)
 }
 
-fn is_parent_node_receiver(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_parent_node_receiver(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     node_type_for_handle(runtime, handle).is_some_and(|node_type| {
         matches!(
             node_type,
@@ -246,7 +279,7 @@ fn is_parent_node_receiver(runtime: &JsContextHost, handle: DomHandle) -> bool {
     })
 }
 
-fn is_child_node_receiver(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_child_node_receiver(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     node_type_for_handle(runtime, handle).is_some_and(|node_type| {
         matches!(
             node_type,
@@ -260,7 +293,7 @@ fn is_child_node_receiver(runtime: &JsContextHost, handle: DomHandle) -> bool {
     })
 }
 
-fn is_non_document_type_child_node_receiver(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_non_document_type_child_node_receiver(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     node_type_for_handle(runtime, handle).is_some_and(|node_type| {
         matches!(
             node_type,
@@ -275,7 +308,7 @@ fn is_non_document_type_child_node_receiver(runtime: &JsContextHost, handle: Dom
 
 pub(super) fn require_parent_node_receiver(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     member: &str,
     is_method: bool,
@@ -293,7 +326,7 @@ pub(super) fn require_parent_node_receiver(
 
 pub(super) fn require_child_node_receiver(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     member: &str,
 ) -> bool {
@@ -306,7 +339,7 @@ pub(super) fn require_child_node_receiver(
 
 pub(super) fn require_non_document_type_child_node_receiver(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     member: &str,
 ) -> bool {
@@ -319,7 +352,7 @@ pub(super) fn require_non_document_type_child_node_receiver(
 
 pub(super) fn require_element_getter_receiver(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     member: &str,
 ) -> bool {
@@ -332,7 +365,7 @@ pub(super) fn require_element_getter_receiver(
 
 pub(super) fn require_element_setter_receiver(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     member: &str,
 ) -> bool {
@@ -345,7 +378,7 @@ pub(super) fn require_element_setter_receiver(
 
 pub(super) fn require_element_method_receiver(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     method: &str,
 ) -> bool {
@@ -511,11 +544,10 @@ fn node_node_value_setter_function<'s>(
 ) {
     let raw_value = args.get(0);
     let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_args(scope, &args) else {
-        if !receiver_has_detached_state(scope, args.this()) {
+        let Some(node) = detached_node_backing_object(scope, args.this()) else {
             throw_incompatible_setter_receiver(scope, "Node", "nodeValue");
             return;
-        }
-        let node = args.this();
+        };
         let _ =
             call_global_bridge_method(scope, "__setDetachedNodeValue", &[node.into(), raw_value]);
         return;
@@ -602,7 +634,7 @@ fn node_owner_document_getter_function<'s>(
         .dom_host()
         .node(handle)
         .and_then(Node::owner_document);
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, owner);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), owner);
 }
 
 fn node_base_uri_getter_function<'s>(
@@ -655,55 +687,71 @@ fn node_base_uri_getter_function<'s>(
     rv.set(value.into());
 }
 
-fn node_parent_node_getter_function<'s>(
+enum NodeTreeRelation {
+    ParentNode,
+    ParentElement,
+    FirstChild,
+    LastChild,
+    PreviousSibling,
+    NextSibling,
+}
+
+fn node_tree_relation_getter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
+    relation: NodeTreeRelation,
 ) {
+    let (property, detached_slot) = match relation {
+        NodeTreeRelation::ParentNode => ("parentNode", "__detachedParentNode"),
+        NodeTreeRelation::ParentElement => ("parentElement", "__detachedParentElement"),
+        NodeTreeRelation::FirstChild => ("firstChild", "__detachedFirstChild"),
+        NodeTreeRelation::LastChild => ("lastChild", "__detachedLastChild"),
+        NodeTreeRelation::PreviousSibling => ("previousSibling", "__detachedPreviousSibling"),
+        NodeTreeRelation::NextSibling => ("nextSibling", "__detachedNextSibling"),
+    };
     let Ok((runtime_ptr, handle)) =
         node_runtime_and_handle_from_object_or_detached(scope, args.this())
     else {
-        if let Some(value) =
-            detached_bridge_value_for_this(scope, args.this(), "__detachedParentNode")
-        {
+        if let Some(value) = detached_bridge_value_for_this(scope, args.this(), detached_slot) {
             rv.set(value);
             return;
         }
-        throw_incompatible_getter_receiver(scope, "Node", "parentNode");
+        throw_incompatible_getter_receiver(scope, "Node", property);
         rv.set_null();
         return;
     };
-    let parent = unsafe { &*runtime_ptr }
+    let runtime = unsafe { &*runtime_ptr };
+    let related = runtime
         .dom_host()
         .node(handle)
-        .and_then(Node::parent_node);
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, parent);
+        .and_then(|node| match relation {
+            NodeTreeRelation::ParentNode => node.parent_node(),
+            NodeTreeRelation::ParentElement => node
+                .parent_node()
+                .filter(|parent| node_is_element(runtime, *parent)),
+            NodeTreeRelation::FirstChild => node.first_child(),
+            NodeTreeRelation::LastChild => node.last_child(),
+            NodeTreeRelation::PreviousSibling => node.prev_sibling(),
+            NodeTreeRelation::NextSibling => node.next_sibling(),
+        });
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), related);
+}
+
+fn node_parent_node_getter_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s, v8::Value>,
+) {
+    node_tree_relation_getter(scope, args, rv, NodeTreeRelation::ParentNode);
 }
 
 fn node_parent_element_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s, v8::Value>,
+    rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Ok((runtime_ptr, handle)) =
-        node_runtime_and_handle_from_object_or_detached(scope, args.this())
-    else {
-        if let Some(value) =
-            detached_bridge_value_for_this(scope, args.this(), "__detachedParentElement")
-        {
-            rv.set(value);
-            return;
-        }
-        throw_incompatible_getter_receiver(scope, "Node", "parentElement");
-        rv.set_null();
-        return;
-    };
-    let parent = unsafe { &*runtime_ptr }
-        .dom_host()
-        .node(handle)
-        .and_then(Node::parent_node)
-        .filter(|parent| node_is_element(unsafe { &*runtime_ptr }, *parent));
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, parent);
+    node_tree_relation_getter(scope, args, rv, NodeTreeRelation::ParentElement);
 }
 
 fn node_child_nodes_getter_function<'s>(
@@ -724,6 +772,11 @@ fn node_child_nodes_getter_function<'s>(
         rv.set_null();
         return;
     };
+    let Some(context) = args.this().get_creation_context(scope) else {
+        rv.set_null();
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, context);
     let collection = super::collections::build_live_collection_for_node(
         scope,
         runtime_ptr,
@@ -739,101 +792,33 @@ fn node_child_nodes_getter_function<'s>(
 fn node_first_child_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s, v8::Value>,
+    rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Ok((runtime_ptr, handle)) =
-        node_runtime_and_handle_from_object_or_detached(scope, args.this())
-    else {
-        if let Some(value) =
-            detached_bridge_value_for_this(scope, args.this(), "__detachedFirstChild")
-        {
-            rv.set(value);
-            return;
-        }
-        throw_incompatible_getter_receiver(scope, "Node", "firstChild");
-        rv.set_null();
-        return;
-    };
-    let child = unsafe { &*runtime_ptr }
-        .dom_host()
-        .node(handle)
-        .and_then(Node::first_child);
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, child);
+    node_tree_relation_getter(scope, args, rv, NodeTreeRelation::FirstChild);
 }
 
 fn node_last_child_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s, v8::Value>,
+    rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Ok((runtime_ptr, handle)) =
-        node_runtime_and_handle_from_object_or_detached(scope, args.this())
-    else {
-        if let Some(value) =
-            detached_bridge_value_for_this(scope, args.this(), "__detachedLastChild")
-        {
-            rv.set(value);
-            return;
-        }
-        throw_incompatible_getter_receiver(scope, "Node", "lastChild");
-        rv.set_null();
-        return;
-    };
-    let child = unsafe { &*runtime_ptr }
-        .dom_host()
-        .node(handle)
-        .and_then(Node::last_child);
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, child);
+    node_tree_relation_getter(scope, args, rv, NodeTreeRelation::LastChild);
 }
 
 fn node_previous_sibling_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s, v8::Value>,
+    rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Ok((runtime_ptr, handle)) =
-        node_runtime_and_handle_from_object_or_detached(scope, args.this())
-    else {
-        if let Some(value) =
-            detached_bridge_value_for_this(scope, args.this(), "__detachedPreviousSibling")
-        {
-            rv.set(value);
-            return;
-        }
-        throw_incompatible_getter_receiver(scope, "Node", "previousSibling");
-        rv.set_null();
-        return;
-    };
-    let sibling = unsafe { &*runtime_ptr }
-        .dom_host()
-        .node(handle)
-        .and_then(Node::prev_sibling);
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, sibling);
+    node_tree_relation_getter(scope, args, rv, NodeTreeRelation::PreviousSibling);
 }
 
 fn node_next_sibling_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s, v8::Value>,
+    rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Ok((runtime_ptr, handle)) =
-        node_runtime_and_handle_from_object_or_detached(scope, args.this())
-    else {
-        if let Some(value) =
-            detached_bridge_value_for_this(scope, args.this(), "__detachedNextSibling")
-        {
-            rv.set(value);
-            return;
-        }
-        throw_incompatible_getter_receiver(scope, "Node", "nextSibling");
-        rv.set_null();
-        return;
-    };
-    let sibling = unsafe { &*runtime_ptr }
-        .dom_host()
-        .node(handle)
-        .and_then(Node::next_sibling);
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, sibling);
+    node_tree_relation_getter(scope, args, rv, NodeTreeRelation::NextSibling);
 }
 
 pub(in crate::native_bridge) fn node_text_content_getter_function<'s>(
@@ -885,11 +870,11 @@ fn node_text_content_setter_function<'s>(
 ) {
     let raw_value = args.get(0);
     let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_args(scope, &args) else {
-        if !receiver_has_detached_state(scope, args.this()) {
+        let Some(node) = detached_node_backing_object(scope, args.this()) else {
             throw_incompatible_setter_receiver(scope, "Node", "textContent");
             return;
-        }
-        super::document::set_detached_node_text_content(scope, args.this(), raw_value);
+        };
+        super::document::set_detached_node_text_content(scope, node, raw_value);
         return;
     };
     let runtime = unsafe { &*runtime_ptr };
@@ -923,7 +908,7 @@ fn node_text_content_setter_function<'s>(
 }
 
 pub(super) fn element_name_for_owner_document(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<String> {
     let dom_host = runtime.dom_host();
@@ -959,6 +944,11 @@ fn parent_node_children_getter_function<'s>(
         rv.set_null();
         return;
     }
+    let Some(context) = args.this().get_creation_context(scope) else {
+        rv.set_null();
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, context);
     let collection = super::collections::build_live_collection_for_node(
         scope,
         runtime_ptr,
@@ -1003,7 +993,7 @@ fn parent_node_first_element_child_getter_function<'s>(
         .dom_host()
         .node(handle)
         .and_then(|node| node.first_element_child(unsafe { &*runtime_ptr }.dom_host().dom()));
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, child);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), child);
 }
 
 fn parent_node_last_element_child_getter_function<'s>(
@@ -1038,7 +1028,7 @@ fn parent_node_last_element_child_getter_function<'s>(
         .dom_host()
         .node(handle)
         .and_then(|node| node.last_element_child(unsafe { &*runtime_ptr }.dom_host().dom()));
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, child);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), child);
 }
 
 fn parent_node_child_element_count_getter_function<'s>(
@@ -1112,7 +1102,7 @@ fn non_document_type_child_node_previous_element_sibling_getter_function<'s>(
         .dom_host()
         .node(handle)
         .and_then(|node| node.previous_element_sibling(unsafe { &*runtime_ptr }.dom_host().dom()));
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, sibling);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), sibling);
 }
 
 fn non_document_type_child_node_next_element_sibling_getter_function<'s>(
@@ -1146,7 +1136,7 @@ fn non_document_type_child_node_next_element_sibling_getter_function<'s>(
         .dom_host()
         .node(handle)
         .and_then(|node| node.next_element_sibling(unsafe { &*runtime_ptr }.dom_host().dom()));
-    set_wrapped_handle_or_null(scope, &mut rv, runtime_ptr, sibling);
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), sibling);
 }
 
 fn node_append_child_prototype_callback<'s>(
@@ -1214,7 +1204,9 @@ pub(crate) fn install_node_template_bindings<'s>(
     if interface_name == "Node" {
         NodePrototypeReflectionDeclaration::initialize_prototype_template(scope, prototype);
     }
-    if matches!(interface_name, "Document" | "DocumentFragment" | "Element") {
+    if interface_name == "Document" {
+        DocumentParentNodePrototypeDeclaration::initialize_prototype_template(scope, prototype);
+    } else if matches!(interface_name, "DocumentFragment" | "Element") {
         ParentNodePrototypeDeclaration::initialize_prototype_template(scope, prototype);
     }
     if matches!(interface_name, "DocumentType" | "Element" | "CharacterData") {
@@ -1230,11 +1222,34 @@ pub(crate) fn install_node_template_bindings<'s>(
     }
 }
 
+// Native factories read regular wrappers before branding is complete. Proxy
+// state comes only from a backing object admitted by the shared brand registry.
+pub(super) fn node_backing_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if object.is_proxy() {
+        let target = moli_webapi_declare::web_api_object_target(scope, object)?;
+        web_api_interfaces::Node::is_instance(scope, target).then_some(target)
+    } else {
+        Some(object)
+    }
+}
+
 pub(crate) fn node_runtime_and_handle_from_object(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
-) -> std::result::Result<(*mut JsContextHost, DomHandle), String> {
-    let (runtime_ptr, handle) = super::bridge_handle_from_object(scope, object)?;
+) -> anyhow::Result<(*mut PageScriptHost, DomHandle)> {
+    let object = v8::Local::new(scope, object);
+    let object =
+        node_backing_object(scope, object).context("Node receiver has no native backing")?;
+    if let Some(delegate) =
+        crate::util::get_private_object(scope, object, super::document::DETACHED_LIVE_DELEGATE_SLOT)
+    {
+        return node_runtime_and_handle_from_object(scope, delegate);
+    }
+    let (runtime_ptr, handle) = super::bridge_handle_from_object(scope, object)
+        .context("failed to resolve Node wrapper")?;
     match handle {
         super::BridgeHandle::Node(handle) => Ok((runtime_ptr, handle)),
         super::BridgeHandle::Window
@@ -1242,7 +1257,7 @@ pub(crate) fn node_runtime_and_handle_from_object(
         | super::BridgeHandle::Dataset(_)
         | super::BridgeHandle::Style(_)
         | super::BridgeHandle::ComputedStyle(_, _) => {
-            Err("wrapper did not contain a node identity".to_owned())
+            bail!("wrapper did not contain a Node identity")
         }
     }
 }
@@ -1258,20 +1273,45 @@ pub(crate) fn object_is_node_wrapper_or_detached<'s>(
 pub(crate) fn node_runtime_and_handle_from_object_or_detached<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> std::result::Result<(*mut JsContextHost, DomHandle), String> {
+) -> anyhow::Result<(*mut PageScriptHost, DomHandle)> {
+    let object = v8::Local::new(scope, object);
+    let object =
+        node_backing_object(scope, object).context("Node receiver has no native backing")?;
     if let Ok(node) = node_runtime_and_handle_from_object(scope, object) {
         return Ok(node);
     }
-    let runtime_ptr = context_host_ptr_from_global_bridge(scope)
-        .ok_or_else(|| "missing native bridge host".to_owned())?;
+    // Detached node indices are host-local too. Borrowed bindings and
+    // structuredClone can run in another Page, so resolve the producer's
+    // lifecycle-checked context instead of looking in the caller's arena.
+    let runtime_ptr = object
+        .get_creation_context(scope)
+        .and_then(context_host_ptr_from_context_slot)
+        .context("detached node's context has no PageScriptHost")?;
     let handle = super::document::detached_native_handle_for_runtime(scope, runtime_ptr, object)
-        .ok_or_else(|| "object did not contain a node identity".to_owned())?;
+        .context("object is neither a Node wrapper nor a detached node")?;
     Ok((runtime_ptr, handle))
+}
+
+/// Resolve a DOM interface argument using native identity, without consulting
+/// author properties. Only registered native proxies can expose a backing node.
+pub(crate) fn branded_node_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    interface: moli_webapi_declare::WebApiInterfaceDescriptor,
+) -> Option<DomHandle> {
+    let object = v8::Local::<v8::Object>::try_from(value).ok()?;
+    if !interface.is_instance(scope, object) {
+        return None;
+    }
+    let target = moli_webapi_declare::web_api_object_target(scope, object)?;
+    node_runtime_and_handle_from_object_or_detached(scope, target)
+        .ok()
+        .map(|(_, handle)| handle)
 }
 
 pub(crate) fn current_or_live_delegate_node_arg_handle(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     value: v8::Local<'_, v8::Value>,
 ) -> Option<DomHandle> {
     let object = v8::Local::<v8::Object>::try_from(value).ok()?;
@@ -1285,36 +1325,30 @@ pub(crate) fn current_or_live_delegate_node_arg_handle(
 pub(super) fn node_runtime_and_handle_from_args(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
-) -> std::result::Result<(*mut JsContextHost, DomHandle), String> {
+) -> anyhow::Result<(*mut PageScriptHost, DomHandle)> {
     node_runtime_and_handle_from_object(scope, args.this())
 }
 
 pub(super) fn node_runtime_and_handle_from_args_or_detached(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
-) -> std::result::Result<(*mut JsContextHost, DomHandle), String> {
+) -> anyhow::Result<(*mut PageScriptHost, DomHandle)> {
     let this = v8::Global::new(scope, args.this());
     let this = v8::Local::new(scope, this);
-    if let Some(runtime_ptr) = context_host_ptr_from_global_bridge(scope)
-        && let Some(handle) =
-            super::document::detached_native_handle_for_runtime(scope, runtime_ptr, this)
-    {
-        return Ok((runtime_ptr, handle));
-    }
-    if let Ok(node) = node_runtime_and_handle_from_object(scope, this) {
-        return Ok(node);
-    }
     node_runtime_and_handle_from_object_or_detached(scope, this)
 }
 
-pub(super) fn node_owner_document_relevant_context<'s>(
+pub(crate) fn node_owner_document_relevant_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<v8::Local<'s, v8::Context>> {
     let document_handle = unsafe { &*runtime_ptr }
         .dom_host()
         .owner_document_handle(handle)?;
+    if document_handle == unsafe { &*runtime_ptr }.document_handle() {
+        return unsafe { &*runtime_ptr }.page_default_context(scope);
+    }
     if let Some(child_handle) =
         unsafe { &*runtime_ptr }.child_browsing_context_host_for_document_handle(document_handle)
         && let Some(context) =
@@ -1332,17 +1366,20 @@ pub(crate) fn node_relevant_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Context>> {
-    node_runtime_and_handle_from_object(scope, object)
-        .ok()
-        .and_then(|(runtime_ptr, handle)| {
-            node_owner_document_relevant_context(scope, runtime_ptr, handle)
-        })
-        .or_else(|| object.get_creation_context(scope))
+    // Wrappers are created in their owning realm. In particular an isolated
+    // world's Document must not resolve back to the frame's default context.
+    object.get_creation_context(scope).or_else(|| {
+        node_runtime_and_handle_from_object(scope, object)
+            .ok()
+            .and_then(|(runtime_ptr, handle)| {
+                node_owner_document_relevant_context(scope, runtime_ptr, handle)
+            })
+    })
 }
 
 pub(super) fn node_arg_handle(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     value: v8::Local<'_, v8::Value>,
 ) -> Option<DomHandle> {
     if value.is_null_or_undefined() {
@@ -1357,7 +1394,7 @@ pub(super) fn node_arg_handle(
 }
 
 pub(super) fn insertion_document_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     parent: DomHandle,
 ) -> Option<DomHandle> {
     if node_is_document(runtime, parent) {
@@ -1370,14 +1407,14 @@ pub(super) fn insertion_document_handle(
     }
 }
 
-pub(super) fn node_is_document(runtime: &JsContextHost, handle: DomHandle) -> bool {
+pub(super) fn node_is_document(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
         .is_some_and(Node::is_document)
 }
 
-pub(super) fn node_is_element(runtime: &JsContextHost, handle: DomHandle) -> bool {
+pub(super) fn node_is_element(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -1387,7 +1424,7 @@ pub(super) fn node_is_element(runtime: &JsContextHost, handle: DomHandle) -> boo
 pub(super) fn set_wrapped_node_or_null(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: Option<DomHandle>,
 ) {
     set_wrapped_handle_or_null(scope, rv, runtime_ptr, handle);

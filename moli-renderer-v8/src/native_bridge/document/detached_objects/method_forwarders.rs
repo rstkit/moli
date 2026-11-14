@@ -1,9 +1,13 @@
 use super::*;
 use crate::detached_event_target::dispatch_detached_focus_event;
 use crate::dom_parser::map_live_value_to_foreign;
+use crate::native_bridge::document::{
+    DocumentCreateElementArgs, DocumentCreateElementNsArgs, create_detached_element_for_document,
+};
 use crate::util::{
     context_host_ptr_from_global_bridge, get_private_object, get_private_value, set_private_value,
 };
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::WebApiObject;
 
@@ -15,7 +19,7 @@ const DETACHED_NODE_ITERATOR_NODES_SLOT: &str = "__moliDetachedNodeIteratorNodes
 const DETACHED_NODE_ITERATOR_INDEX_SLOT: &str = "__moliDetachedNodeIteratorIndex";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "NodeIterator")]
+#[webapi(interface = web_api_interfaces::NodeIterator)]
 struct DetachedNodeIteratorDeclaration<'scope> {
     #[webapi(slot = DETACHED_NODE_ITERATOR_NODES_SLOT)]
     nodes: v8::Local<'scope, v8::Array>,
@@ -28,26 +32,10 @@ struct DetachedNodeIteratorDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(interface = web_api_interfaces::DOMImplementation, prototype = "Object")]
 struct DetachedDomImplementationDeclaration<'scope> {
     #[webapi(slot = DOM_IMPLEMENTATION_OWNER_DOCUMENT_SLOT)]
     owner_document: v8::Local<'scope, v8::Object>,
-}
-
-#[derive(webidl::WebIdlArgs)]
-#[webidl(prefix = "Document.createElement")]
-struct DetachedForwardCreateElementArgs {
-    #[webidl(required)]
-    local_name: String,
-}
-
-#[derive(webidl::WebIdlArgs)]
-#[webidl(prefix = "Document.createElementNS")]
-struct DetachedForwardCreateElementNsArgs {
-    #[webidl(required, nullable)]
-    namespace: Option<String>,
-    #[webidl(required)]
-    qualified_name: String,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -103,10 +91,19 @@ pub(in crate::native_bridge::document) fn detached_move_before_method_callback<'
 ) {
     let _ = detached_method_forward(scope, args, "__detachedMoveBefore");
 }
-detached_bridge_method_forwarder!(
-    detached_remove_child_method_callback,
-    "__detachedRemoveChild"
-);
+pub(in crate::native_bridge) fn detached_remove_child_method_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    if webidl::parse_args::<crate::native_bridge::node::RequiredNodeArgs>(scope, &args).is_none() {
+        return;
+    }
+    match detached_method_forward(scope, args, "__detachedRemoveChild") {
+        Some(value) => rv.set(value),
+        None => rv.set_undefined(),
+    }
+}
 detached_bridge_method_forwarder!(
     detached_replace_child_method_callback,
     "__detachedReplaceChild"
@@ -238,15 +235,6 @@ pub(in crate::native_bridge::document) fn detached_lookup_namespace_uri_method_c
         None => rv.set_null(),
     }
 }
-detached_bridge_method_forwarder!(detached_contains_method_callback, "__detachedContains");
-detached_bridge_method_forwarder!(
-    detached_is_same_node_method_callback,
-    "__detachedIsSameNode"
-);
-detached_bridge_method_forwarder!(
-    detached_is_equal_node_method_callback,
-    "__detachedIsEqualNode"
-);
 pub(in crate::native_bridge) fn detached_clone_node_method_callback<'a>(
     scope: &mut v8::PinScope<'a, '_>,
     args: v8::FunctionCallbackArguments<'a>,
@@ -665,12 +653,9 @@ pub(in crate::native_bridge) fn detached_click_method_callback<'s>(
         }
         return;
     };
-    if !sync_detached_download_activation_attributes(scope, target, runtime_ptr, handle)
-        && let Some(delegate) = detached_live_delegate_object(scope, target)
-    {
-        let _ = call_object_method(scope, delegate, "click", &[]);
-        return;
-    }
+    // Reflected attributes already live in the native DOM. Reading public
+    // href/download properties here would invoke author getters and turn the
+    // default empty download value into a real download attribute.
     let outcome = crate::native_bridge::element::activate_handle_via_synthetic_click(
         scope,
         runtime_ptr,
@@ -686,121 +671,6 @@ pub(in crate::native_bridge) fn detached_click_method_callback<'s>(
     if let Some(file_chooser) = outcome.pending_file_chooser {
         unsafe { &mut *runtime_ptr }.record_pending_file_chooser_activation(file_chooser);
     }
-}
-
-fn sync_detached_download_activation_attributes<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    target: v8::Local<'s, v8::Object>,
-    runtime_ptr: *mut JsContextHost,
-    handle: DomHandle,
-) -> bool {
-    let runtime = unsafe { &*runtime_ptr };
-    let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
-        return false;
-    };
-    if !matches!(element.local_name(), "a" | "area") {
-        return false;
-    }
-
-    let property_href = detached_optional_string_property(scope, target, "href");
-    let property_download = detached_optional_string_property(scope, target, "download");
-    if let Some(href) = property_href {
-        let _ = write_detached_native_attribute(scope, target, "href", &href);
-    }
-    if let Some(download) = property_download {
-        let _ = write_detached_native_attribute(scope, target, "download", &download);
-    }
-
-    let runtime = unsafe { &*runtime_ptr };
-    runtime
-        .dom_host()
-        .node(handle)
-        .and_then(Node::as_element)
-        .is_some_and(|element| {
-            element.attribute("href").is_some() && element.attribute("download").is_some()
-        })
-}
-
-fn detached_optional_string_property<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    target: v8::Local<'s, v8::Object>,
-    name: &'static str,
-) -> Option<String> {
-    let value = target.get(scope, v8str(scope, name).into())?;
-    if value.is_undefined() {
-        return None;
-    }
-    value
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-}
-
-pub(in crate::native_bridge::document) fn detached_compare_document_position_method_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    const DOCUMENT_POSITION_DISCONNECTED: u32 = 0x01;
-    const DOCUMENT_POSITION_PRECEDING: u32 = 0x02;
-    const DOCUMENT_POSITION_FOLLOWING: u32 = 0x04;
-    const DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: u32 = 0x20;
-
-    let Some(runtime_ptr) = context_host_ptr_from_global_bridge(scope) else {
-        rv.set(v8::Integer::new_from_unsigned(scope, 0).into());
-        return;
-    };
-    let this = args.this();
-    let Some(handle) = detached_native_handle_for_runtime(scope, runtime_ptr, this) else {
-        rv.set(v8::Integer::new_from_unsigned(scope, 0).into());
-        return;
-    };
-    let other_value = args.get(0);
-    let Ok(other) = v8::Local::<v8::Object>::try_from(other_value) else {
-        throw_type_error(
-            scope,
-            "Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.",
-        );
-        return;
-    };
-    if let Some(other_handle) = detached_native_handle_for_runtime(scope, runtime_ptr, other)
-        .or_else(|| {
-            crate::native_bridge::node_runtime_and_handle_from_object(scope, other)
-                .ok()
-                .and_then(|(other_runtime_ptr, other_handle)| {
-                    (other_runtime_ptr == runtime_ptr).then_some(other_handle)
-                })
-        })
-    {
-        let runtime = unsafe { &*runtime_ptr };
-        let relation = runtime
-            .dom_host()
-            .node(handle)
-            .map(|node| node.compare_document_position(runtime.dom_host().dom(), other_handle))
-            .unwrap_or(0);
-        rv.set(v8::Integer::new_from_unsigned(scope, relation as u32).into());
-        return;
-    }
-    if get_private_object(scope, other, DETACHED_STATE_SLOT).is_none() {
-        throw_type_error(
-            scope,
-            "Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.",
-        );
-        return;
-    }
-    let this_hash = this.get_identity_hash().get() as i64;
-    let other_hash = other.get_identity_hash().get() as i64;
-    let order_bit = if other_hash > this_hash {
-        DOCUMENT_POSITION_FOLLOWING
-    } else {
-        DOCUMENT_POSITION_PRECEDING
-    };
-    rv.set(
-        v8::Integer::new_from_unsigned(
-            scope,
-            DOCUMENT_POSITION_DISCONNECTED | DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC | order_bit,
-        )
-        .into(),
-    );
 }
 
 pub(in crate::native_bridge::document) fn detached_remove_method_callback<'a>(
@@ -886,26 +756,19 @@ pub(in crate::native_bridge::document) fn detached_create_html_element_method_ca
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(parsed) = webidl::parse_args::<DetachedForwardCreateElementArgs>(scope, &args) else {
+    let Some(parsed) = webidl::parse_args::<DocumentCreateElementArgs>(scope, &args) else {
         return;
     };
-    let Some(local_name) = v8_string(scope, &parsed.local_name) else {
-        rv.set_null();
-        return;
-    };
-    match call_global_bridge_method(
+    match create_detached_element_for_document(
         scope,
-        "__detachedCreateElement",
-        &[
-            args.this().into(),
-            local_name.into(),
-            v8str(scope, XHTML_NS).into(),
-            v8str(scope, "html").into(),
-            v8str(scope, "name").into(),
-            args.get(1),
-        ],
+        args.this(),
+        &parsed.local_name,
+        Some(XHTML_NS.to_owned()),
+        "html",
+        false,
+        parsed.options,
     ) {
-        Some(value) => rv.set(value),
+        Some(value) => rv.set(value.into()),
         None => rv.set_null(),
     }
 }
@@ -915,26 +778,19 @@ pub(in crate::native_bridge::document) fn detached_create_xml_element_method_cal
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(parsed) = webidl::parse_args::<DetachedForwardCreateElementArgs>(scope, &args) else {
+    let Some(parsed) = webidl::parse_args::<DocumentCreateElementArgs>(scope, &args) else {
         return;
     };
-    let Some(local_name) = v8_string(scope, &parsed.local_name) else {
-        rv.set_null();
-        return;
-    };
-    match call_global_bridge_method(
+    match create_detached_element_for_document(
         scope,
-        "__detachedCreateElement",
-        &[
-            args.this().into(),
-            local_name.into(),
-            v8::null(scope).into(),
-            v8str(scope, "xml").into(),
-            v8str(scope, "name").into(),
-            args.get(1),
-        ],
+        args.this(),
+        &parsed.local_name,
+        None,
+        "xml",
+        false,
+        parsed.options,
     ) {
-        Some(value) => rv.set(value),
+        Some(value) => rv.set(value.into()),
         None => rv.set_null(),
     }
 }
@@ -944,32 +800,19 @@ pub(in crate::native_bridge::document) fn detached_create_html_element_ns_method
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(parsed) = webidl::parse_args::<DetachedForwardCreateElementNsArgs>(scope, &args)
-    else {
+    let Some(parsed) = webidl::parse_args::<DocumentCreateElementNsArgs>(scope, &args) else {
         return;
     };
-    let Some(qualified_name) = v8_string(scope, &parsed.qualified_name) else {
-        rv.set_null();
-        return;
-    };
-    let namespace = parsed
-        .namespace
-        .as_deref()
-        .and_then(|namespace| v8_string(scope, namespace).map(Into::into))
-        .unwrap_or_else(|| v8::null(scope).into());
-    match call_global_bridge_method(
+    match create_detached_element_for_document(
         scope,
-        "__detachedCreateElement",
-        &[
-            args.this().into(),
-            qualified_name.into(),
-            namespace,
-            v8str(scope, "html").into(),
-            v8str(scope, "qualified").into(),
-            args.get(2),
-        ],
+        args.this(),
+        &parsed.qualified_name,
+        parsed.namespace,
+        "html",
+        true,
+        parsed.options,
     ) {
-        Some(value) => rv.set(value),
+        Some(value) => rv.set(value.into()),
         None => rv.set_null(),
     }
 }
@@ -979,32 +822,19 @@ pub(in crate::native_bridge::document) fn detached_create_xml_element_ns_method_
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(parsed) = webidl::parse_args::<DetachedForwardCreateElementNsArgs>(scope, &args)
-    else {
+    let Some(parsed) = webidl::parse_args::<DocumentCreateElementNsArgs>(scope, &args) else {
         return;
     };
-    let Some(qualified_name) = v8_string(scope, &parsed.qualified_name) else {
-        rv.set_null();
-        return;
-    };
-    let namespace = parsed
-        .namespace
-        .as_deref()
-        .and_then(|namespace| v8_string(scope, namespace).map(Into::into))
-        .unwrap_or_else(|| v8::null(scope).into());
-    match call_global_bridge_method(
+    match create_detached_element_for_document(
         scope,
-        "__detachedCreateElement",
-        &[
-            args.this().into(),
-            qualified_name.into(),
-            namespace,
-            v8str(scope, "xml").into(),
-            v8str(scope, "qualified").into(),
-            args.get(2),
-        ],
+        args.this(),
+        &parsed.qualified_name,
+        parsed.namespace,
+        "xml",
+        true,
+        parsed.options,
     ) {
-        Some(value) => rv.set(value),
+        Some(value) => rv.set(value.into()),
         None => rv.set_null(),
     }
 }
@@ -1015,9 +845,12 @@ pub(in crate::native_bridge::document) fn detached_document_implementation_gette
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let document = args.this();
-    let global = scope.get_current_context().global(scope);
-    let _ = crate::context_bootstrap::ensure_dom_implementation_singleton(scope, global);
-    match ensure_detached_document_implementation(scope, document) {
+    let relevant_context = crate::native_bridge::node_relevant_context(scope, document)
+        .unwrap_or_else(|| scope.get_current_context());
+    let target_scope = &mut v8::ContextScope::new(scope, relevant_context);
+    let global = relevant_context.global(target_scope);
+    let _ = crate::context_bootstrap::ensure_dom_implementation_singleton(target_scope, global);
+    match ensure_detached_document_implementation(target_scope, document) {
         Some(implementation) => rv.set(implementation.into()),
         None => rv.set_null(),
     }
@@ -1027,7 +860,9 @@ pub(crate) fn ensure_detached_document_implementation<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     document: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    if let Some(cached) = get_private_object(scope, document, DETACHED_DOCUMENT_IMPLEMENTATION_SLOT)
+    let document = canonical_detached_node_object(scope, document)?;
+    let backing = crate::native_bridge::node::node_backing_object(scope, document)?;
+    if let Some(cached) = get_private_object(scope, backing, DETACHED_DOCUMENT_IMPLEMENTATION_SLOT)
     {
         return Some(cached);
     }
@@ -1040,11 +875,13 @@ pub(crate) fn ensure_detached_document_implementation<'s>(
         .bind(scope)
         .ok()?;
     if let Some(prototype) = singleton.get_prototype(scope) {
-        let _ = implementation.set_prototype(scope, prototype);
+        implementation
+            .set_prototype(scope, prototype)?
+            .then_some(())?;
     }
     set_private_value(
         scope,
-        document,
+        backing,
         DETACHED_DOCUMENT_IMPLEMENTATION_SLOT,
         implementation.into(),
     );

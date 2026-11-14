@@ -1,14 +1,17 @@
+mod propagation;
+pub(crate) use propagation::dispatch_simple_event_target_event_with_ancestors;
+
 use super::*;
+use crate::context_bootstrap::shared_event_targets::{ResolvedEventTarget, resolve_event_target};
 use crate::{
     callback_invocation::{CallbackInvocation, CallbackInvocationOutcome, CallbackInvoker},
     context_bootstrap::events::{
-        EVENT_PASSIVE_SLOT, EVENT_STOP_IMMEDIATE_PROPAGATION_SLOT, clear_event_composed_path,
-        clear_event_dispatch_fields, event_internal_bool_flag, set_event_composed_path,
-        set_event_dispatch_fields, set_event_internal_flag,
+        EVENT_PASSIVE_SLOT, EVENT_STOP_IMMEDIATE_PROPAGATION_SLOT, error_event_handler_arguments,
+        event_internal_bool_flag, set_event_default_prevented, set_event_internal_flag,
     },
     exception_reporting::CallbackExceptionLogLevel,
     host::report_event_callback_exception,
-    util::{context_host_ptr_from_global_bridge, serialize_v8_array},
+    util::context_host_ptr_from_global_bridge,
 };
 
 fn event_stop_immediate_propagation<'s>(
@@ -23,129 +26,248 @@ pub(in crate::context_bootstrap::media_queries::events::simple_event_target) fn 
 >(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
-    slot_name: &str,
+    target: ResolvedSimpleEventTarget<'s>,
     rv: &mut v8::ReturnValue<'s, v8::Value>,
 ) {
-    let event_value = args.get(0);
-    if !event_value.is_object() || event_value.is_function() {
-        throw_type_error(
+    let Some((event, event_type)) =
+        crate::context_bootstrap::event_target_dispatch::prepare_script_dispatch(
             scope,
-            "Failed to execute 'dispatchEvent': parameter 1 is not an object.",
-        );
-        return;
-    }
-    let Ok(event) = v8::Local::<v8::Object>::try_from(event_value) else {
-        throw_type_error(
-            scope,
-            "Failed to execute 'dispatchEvent': parameter 1 is not an object.",
-        );
-        return;
-    };
-    let Some(event_type) = object_string_property_defined(scope, event, "type") else {
-        throw_type_error(
-            scope,
-            "Failed to execute 'dispatchEvent': event type is required.",
-        );
+            args.get(0),
+        )
+    else {
+        rv.set_bool(false);
         return;
     };
 
-    let target = args.this();
-    let dispatch_result =
-        dispatch_simple_event_target_event(scope, target, slot_name, &event_type, event);
-    rv.set(v8::Boolean::new(scope, dispatch_result).into());
+    let dispatch_result = dispatch_resolved_event(
+        scope,
+        target.identity,
+        target.registry,
+        &event_type,
+        event,
+        None,
+        None,
+    );
+    rv.set_bool(dispatch_result.uncanceled);
 }
 
 pub(crate) fn dispatch_simple_event_target_event<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
-    slot_name: &str,
     event_type: &str,
     event: v8::Local<'s, v8::Object>,
 ) -> bool {
-    set_event_dispatch_fields(scope, target, event);
-    let path = serialize_v8_array(scope, [target]).unwrap_or_else(|| v8::Array::new(scope, 1));
-    set_event_composed_path(scope, event, path);
-
-    if !simple_event_target_uses_ordered_handlers(scope, target) {
-        let handler_name = format!("on{event_type}");
-        if let Some(handler_key) = v8_string(scope, &handler_name)
-            && let Some(handler_value) = target.get(scope, handler_key.into())
-            && let Ok(handler) = v8::Local::<v8::Object>::try_from(handler_value)
-            && handler.is_callable()
-        {
-            let current_context = scope.get_current_context();
-            let relevant_context = handler
-                .get_creation_context(scope)
-                .unwrap_or(current_context);
-            let incumbent_context = scope.get_incumbent_context().unwrap_or(current_context);
-            let _ = invoke_simple_event_callback(
-                scope,
-                event_type,
-                &format!("simple event target {handler_name}"),
-                handler,
-                relevant_context,
-                incumbent_context,
-                true,
-                target.into(),
-                &[event.into()],
-                event,
-            );
-        }
-    }
-
-    if !event_stop_immediate_propagation(scope, event) {
-        let listeners =
-            simple_object_event_listeners_snapshot(scope, target, slot_name, event_type);
-        'phases: for capture_phase in [true, false] {
-            for listener in listeners
-                .iter()
-                .filter(|listener| listener.capture == capture_phase)
-            {
-                if !simple_object_event_listener_is_registered(
-                    scope,
-                    target,
-                    slot_name,
-                    event_type,
-                    listener.original,
-                    listener.capture,
-                ) {
-                    continue;
-                }
-                if listener.once {
-                    simple_object_event_remove_listener_value_for_type(
-                        scope,
-                        target,
-                        slot_name,
-                        event_type,
-                        listener.original,
-                        listener.capture,
-                    );
-                }
-                set_event_internal_flag(scope, event, EVENT_PASSIVE_SLOT, listener.passive);
-                let _ = invoke_simple_event_listener(
-                    scope,
-                    event_type,
-                    &format!("simple event target {event_type} listener"),
-                    listener,
-                    target.into(),
-                    &[event.into()],
-                    event,
-                );
-                set_event_internal_flag(scope, event, EVENT_PASSIVE_SLOT, false);
-                if event_stop_immediate_propagation(scope, event) {
-                    break 'phases;
-                }
-            }
-        }
-    }
-
-    clear_event_dispatch_fields(scope, event);
-    clear_event_composed_path(scope, event);
-    let default_prevented = object_bool_property(scope, event, "defaultPrevented").unwrap_or(false);
-    !default_prevented
+    dispatch_simple_event_target_event_collecting_errors(scope, target, event_type, event, None)
+        .uncanceled
 }
 
-pub(crate) fn invoke_simple_event_listener<'s>(
+#[derive(Default)]
+pub(crate) struct SimpleEventDispatchResult {
+    pub(crate) uncanceled: bool,
+    pub(crate) dispatched: bool,
+    pub(crate) did_listeners_throw: bool,
+}
+
+pub(crate) fn dispatch_simple_event_target_event_collecting_errors<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<'s, v8::Object>,
+    event_type: &str,
+    event: v8::Local<'s, v8::Object>,
+    callback_errors: Option<&mut Vec<crate::exception_reporting::V8ExceptionReport>>,
+) -> SimpleEventDispatchResult {
+    dispatch_object_event(scope, target, event_type, event, callback_errors, None)
+}
+
+/// Run the caller's microtask checkpoint while the native event is still
+/// dispatching. ExtendableEvent.waitUntil and Worker error cancellation depend
+/// on this boundary; the shared dispatcher always finishes the event afterward.
+pub(crate) fn dispatch_simple_event_target_event_with_checkpoint<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<'s, v8::Object>,
+    event_type: &str,
+    event: v8::Local<'s, v8::Object>,
+    checkpoint: fn(&mut v8::PinScope<'s, '_>),
+) -> SimpleEventDispatchResult {
+    dispatch_object_event(scope, target, event_type, event, None, Some(checkpoint))
+}
+
+fn dispatch_object_event<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<'s, v8::Object>,
+    event_type: &str,
+    event: v8::Local<'s, v8::Object>,
+    callback_errors: Option<&mut Vec<crate::exception_reporting::V8ExceptionReport>>,
+    checkpoint: Option<fn(&mut v8::PinScope<'s, '_>)>,
+) -> SimpleEventDispatchResult {
+    let Some(target) = resolve_event_target(scope, target) else {
+        return SimpleEventDispatchResult {
+            uncanceled: true,
+            dispatched: false,
+            did_listeners_throw: false,
+        };
+    };
+    let Some(registry) = SimpleEventListenerRegistry::from_owner(scope, target.listener_owner)
+    else {
+        // A native producer may dispatch before listener state is initialized.
+        // It still owes the event its target, checkpoint and dispatch cleanup.
+        crate::context_bootstrap::event_target_dispatch::begin_dispatch(
+            scope,
+            target.dispatch_target,
+            event,
+        );
+        return SimpleEventDispatchResult {
+            uncanceled: finish_event_dispatch(scope, event, checkpoint),
+            dispatched: false,
+            did_listeners_throw: false,
+        };
+    };
+    dispatch_resolved_event(
+        scope,
+        target,
+        registry,
+        event_type,
+        event,
+        callback_errors,
+        checkpoint,
+    )
+}
+
+fn dispatch_resolved_event<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: ResolvedEventTarget<'s>,
+    registry: SimpleEventListenerRegistry<'s>,
+    event_type: &str,
+    event: v8::Local<'s, v8::Object>,
+    callback_errors: Option<&mut Vec<crate::exception_reporting::V8ExceptionReport>>,
+    checkpoint: Option<fn(&mut v8::PinScope<'s, '_>)>,
+) -> SimpleEventDispatchResult {
+    let target = target.dispatch_target;
+    let can_invoke =
+        crate::context_bootstrap::event_target_dispatch::begin_dispatch(scope, target, event);
+    let mut result = if can_invoke {
+        invoke_simple_event_listeners(
+            scope,
+            target,
+            registry,
+            event_type,
+            event,
+            None,
+            callback_errors,
+        )
+    } else {
+        SimpleEventDispatchResult::default()
+    };
+    result.uncanceled = finish_event_dispatch(scope, event, checkpoint);
+    result
+}
+
+fn invoke_simple_event_listeners<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<'s, v8::Object>,
+    registry: SimpleEventListenerRegistry<'s>,
+    event_type: &str,
+    event: v8::Local<'s, v8::Object>,
+    capture: Option<bool>,
+    mut callback_errors: Option<&mut Vec<crate::exception_reporting::V8ExceptionReport>>,
+) -> SimpleEventDispatchResult {
+    let mut dispatched = false;
+    let mut did_listeners_throw = false;
+    let error_arguments = if event_type == "error"
+        && (crate::web_api_interfaces::WorkerGlobalScope::is_instance(scope, target)
+            || crate::web_api_interfaces::Window::is_instance(scope, target))
+    {
+        error_event_handler_arguments(scope, event)
+    } else {
+        None
+    };
+    // Snapshot each invocation. Filter capture before preparing a once
+    // listener, so another phase cannot consume it prematurely.
+    let listeners = simple_object_event_listeners_snapshot_in_registry(scope, registry, event_type);
+    for listener in &listeners {
+        if capture.is_some_and(|capture| listener.capture != capture) {
+            continue;
+        }
+        let Some(listener) = listener.prepare_in_registry(scope, registry, event_type) else {
+            continue;
+        };
+        set_event_internal_flag(scope, event, EVENT_PASSIVE_SLOT, listener.passive);
+        let callback_target = crate::context_bootstrap::shared_event_targets::target_in_realm(
+            scope,
+            target,
+            listener.relevant_context(),
+        );
+        let Some(callback_event) =
+            crate::context_bootstrap::navigation_event_worlds::event_in_realm(
+                scope,
+                target,
+                event,
+                listener.relevant_context(),
+            )
+        else {
+            continue;
+        };
+        let callback_arguments = [callback_event.into()];
+        let outcome = invoke_simple_event_listener_collecting_errors(
+            scope,
+            event_type,
+            &format!("simple event target {event_type} listener"),
+            &listener,
+            callback_target.into(),
+            if listener.handler_slot.is_some() {
+                error_arguments
+                    .as_ref()
+                    .map_or(callback_arguments.as_slice(), |values| values.as_slice())
+            } else {
+                &callback_arguments
+            },
+            callback_event,
+            callback_errors.as_deref_mut(),
+        );
+        dispatched |= outcome.invoked;
+        did_listeners_throw |= outcome.threw;
+        if listener.handler_slot.is_some()
+            && let Some(returned) = outcome.value
+        {
+            apply_handler_return_value(
+                scope,
+                event,
+                v8::Local::new(scope, &returned),
+                error_arguments.is_some(),
+            );
+        }
+        set_event_internal_flag(scope, event, EVENT_PASSIVE_SLOT, false);
+        if event_stop_immediate_propagation(scope, event) {
+            break;
+        }
+    }
+
+    SimpleEventDispatchResult {
+        uncanceled: true,
+        dispatched,
+        did_listeners_throw,
+    }
+}
+
+fn finish_event_dispatch<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    event: v8::Local<'s, v8::Object>,
+    checkpoint: Option<fn(&mut v8::PinScope<'s, '_>)>,
+) -> bool {
+    if let Some(checkpoint) = checkpoint {
+        checkpoint(scope);
+    }
+    crate::context_bootstrap::event_target_dispatch::finish_dispatch(scope, event);
+    !crate::context_bootstrap::event_bool_attribute(scope, event, "defaultPrevented")
+}
+
+struct SimpleEventCallbackResult {
+    invoked: bool,
+    threw: bool,
+    value: Option<v8::Global<v8::Value>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invoke_simple_event_listener_collecting_errors<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event_type: &str,
     callback_name: &str,
@@ -153,7 +275,8 @@ pub(crate) fn invoke_simple_event_listener<'s>(
     callback_this: v8::Local<'s, v8::Value>,
     arguments: &[v8::Local<'s, v8::Value>],
     current_event: v8::Local<'s, v8::Object>,
-) -> Option<v8::Global<v8::Value>> {
+    callback_errors: Option<&mut Vec<crate::exception_reporting::V8ExceptionReport>>,
+) -> SimpleEventCallbackResult {
     let invocation = listener.invocation(callback_this, arguments, Some(current_event));
     invoke_simple_event_callback_with_invocation(
         scope,
@@ -162,39 +285,7 @@ pub(crate) fn invoke_simple_event_listener<'s>(
         callback_this,
         listener.relevant_context(),
         invocation,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn invoke_simple_event_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    event_type: &str,
-    callback_name: &str,
-    callback: v8::Local<'s, v8::Object>,
-    relevant_context: v8::Local<'s, v8::Context>,
-    incumbent_context: v8::Local<'s, v8::Context>,
-    is_callable: bool,
-    callback_this: v8::Local<'s, v8::Value>,
-    arguments: &[v8::Local<'s, v8::Value>],
-    current_event: v8::Local<'s, v8::Object>,
-) -> Option<v8::Global<v8::Value>> {
-    let invocation = CallbackInvocation::new(
-        callback,
-        callback_this,
-        relevant_context,
-        incumbent_context,
-        is_callable,
-        "handleEvent",
-        arguments,
-        Some(current_event),
-    );
-    invoke_simple_event_callback_with_invocation(
-        scope,
-        event_type,
-        callback_name,
-        callback_this,
-        relevant_context,
-        invocation,
+        callback_errors,
     )
 }
 
@@ -214,6 +305,7 @@ fn simple_event_target_interface_name<'s>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn invoke_simple_event_callback_with_invocation<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     event_type: &str,
@@ -221,7 +313,8 @@ fn invoke_simple_event_callback_with_invocation<'s>(
     callback_target: v8::Local<'s, v8::Value>,
     relevant_context: v8::Local<'s, v8::Context>,
     mut invocation: CallbackInvocation<'s, '_>,
-) -> Option<v8::Global<v8::Value>> {
+    callback_errors: Option<&mut Vec<crate::exception_reporting::V8ExceptionReport>>,
+) -> SimpleEventCallbackResult {
     let host_ptr = context_host_ptr_from_global_bridge(scope);
     let relevant_identity = host_ptr.and_then(|host_ptr| {
         unsafe { &*host_ptr }
@@ -246,9 +339,15 @@ fn invoke_simple_event_callback_with_invocation<'s>(
         callback_name,
         invocation,
     ) {
-        CallbackInvocationOutcome::Returned(value) => Some(value),
+        CallbackInvocationOutcome::Returned(value) => SimpleEventCallbackResult {
+            invoked: true,
+            threw: false,
+            value: Some(value),
+        },
         CallbackInvocationOutcome::Threw(report) => {
-            if let Some(host_ptr) = host_ptr {
+            if let Some(errors) = callback_errors {
+                errors.push(*report);
+            } else if let Some(host_ptr) = host_ptr {
                 report_event_callback_exception(
                     scope,
                     host_ptr,
@@ -257,9 +356,36 @@ fn invoke_simple_event_callback_with_invocation<'s>(
                     None,
                     &report,
                 );
+            } else {
+                let _ = crate::worker::dispatch_current_worker_callback_exception(scope, *report);
             }
-            None
+            SimpleEventCallbackResult {
+                invoked: true,
+                threw: true,
+                value: None,
+            }
         }
-        CallbackInvocationOutcome::Retired => None,
+        CallbackInvocationOutcome::Retired => SimpleEventCallbackResult {
+            invoked: false,
+            threw: false,
+            value: None,
+        },
+    }
+}
+
+fn apply_handler_return_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    event: v8::Local<'s, v8::Object>,
+    returned: v8::Local<'s, v8::Value>,
+    error_handler: bool,
+) {
+    if (if error_handler {
+        returned.is_true()
+    } else {
+        returned.is_false()
+    }) && crate::context_bootstrap::event_bool_attribute(scope, event, "cancelable")
+        && !event_internal_bool_flag(scope, event, EVENT_PASSIVE_SLOT)
+    {
+        set_event_default_prevented(scope, event);
     }
 }

@@ -17,11 +17,66 @@ impl RendererOutputRecord {
                 observation_transport_charge_bytes(observation)
             }
             RendererOutputItem::OwnerAction(action) => owner_action_transport_charge_bytes(action),
+            RendererOutputItem::NativeTerminal(terminal) => native_terminal_charge_bytes(terminal),
         };
         std::mem::size_of::<Self>()
             .saturating_add(payload)
             .max(RECORD_FLOOR_BYTES)
     }
+}
+
+fn native_terminal_charge_bytes(terminal: &super::RendererNativeCommandTerminal) -> usize {
+    let mut charge = terminal.session.wire_session_id().map_or(0, string_charge);
+    let response = &terminal.reply;
+    charge = charge.saturating_add(match &response.result {
+        Ok(value) => json_charge(value),
+        Err(error) => string_charge(&error.message),
+    });
+    for update in &response.state_updates {
+        charge = charge.saturating_add(match update {
+            super::RendererNativeProtocolStateUpdate::RuntimeSubscription { output, .. } => {
+                runtime_command_output_charge_bytes(output)
+            }
+            super::RendererNativeProtocolStateUpdate::RuntimeBinding {
+                binding, output, ..
+            } => runtime_command_output_charge_bytes(output)
+                .saturating_add(string_charge(&binding.name))
+                .saturating_add(
+                    binding
+                        .execution_context_name
+                        .as_deref()
+                        .map_or(0, string_charge),
+                ),
+            super::RendererNativeProtocolStateUpdate::WebMcpEnabled(_) => 0,
+            super::RendererNativeProtocolStateUpdate::DomRemoteObjectNode { object_id, node } => {
+                string_charge(object_id).saturating_add(json_charge(node))
+            }
+        });
+    }
+    for notification in &response.notifications {
+        charge = charge.saturating_add(match notification {
+            super::RendererNativeProtocolNotification::Json(value) => json_charge(value),
+            super::RendererNativeProtocolNotification::DomSetChildNodes { nodes, .. } => {
+                nodes.iter().fold(
+                    std::mem::size_of::<super::RendererNativeProtocolNotification>(),
+                    |charge, node| charge.saturating_add(json_charge(node)),
+                )
+            }
+        });
+    }
+    charge
+}
+
+fn runtime_command_output_charge_bytes(
+    output: &crate::runtime::RendererRuntimeCommandOutput,
+) -> usize {
+    output.messages().iter().fold(
+        std::mem::size_of_val(output)
+            .saturating_add(output.v8_state_update().map_or(0, |state| state.len())),
+        |total, message| {
+            total.saturating_add(runtime_inspector_message_transport_charge_bytes(message))
+        },
+    )
 }
 
 fn string_charge(value: &str) -> usize {
@@ -59,7 +114,47 @@ fn json_charge(value: &serde_json::Value) -> usize {
 
 fn observation_transport_charge_bytes(observation: &RendererProtocolObservation) -> usize {
     match observation {
-        RendererProtocolObservation::MainDocumentCommit(commit) => [
+        RendererProtocolObservation::WebMcp(observation) => {
+            use moli_page_types::{RendererWebMcpEvent as Event, RendererWebMcpResult as Result};
+            let frame_charge = |frame: &Option<String>| frame.as_deref().map_or(0, string_charge);
+            let payload = match &observation.event {
+                Event::ToolsAdded(tools) => tools.iter().fold(
+                    tools
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<moli_page_types::RendererWebMcpTool>()),
+                    |sum, tool| {
+                        sum.saturating_add(frame_charge(&tool.frame_id))
+                            .saturating_add(string_charge(&tool.name))
+                            .saturating_add(string_charge(&tool.description))
+                            .saturating_add(tool.input_schema.as_deref().map_or(0, string_charge))
+                    },
+                ),
+                Event::ToolsRemoved(tools) => {
+                    tools
+                        .iter()
+                        .fold(tools.capacity().saturating_mul(64), |sum, tool| {
+                            sum.saturating_add(frame_charge(&tool.frame_id))
+                                .saturating_add(string_charge(&tool.name))
+                        })
+                }
+                Event::ToolInvoked { tool, input, .. } => frame_charge(&tool.frame_id)
+                    .saturating_add(string_charge(&tool.name))
+                    .saturating_add(string_charge(input)),
+                Event::ToolResponded { result, .. } => match result {
+                    Result::Completed(output) => string_charge(output),
+                    Result::Canceled => 0,
+                    Result::Error { message, exception } => string_charge(message)
+                        .saturating_add(exception.as_ref().map_or(0, json_charge)),
+                },
+            };
+            payload.saturating_add(
+                observation
+                    .session
+                    .wire_session_id()
+                    .map_or(0, string_charge),
+            )
+        }
+        RendererProtocolObservation::MainDocumentCommit { commit, .. } => [
             commit.frame_id.as_str(),
             commit.loader_id.as_str(),
             commit.url.as_str(),
@@ -134,6 +229,8 @@ fn owner_action_transport_charge_bytes(action: &RendererOwnerAction) -> usize {
         .into_iter()
         .map(string_charge)
         .sum(),
+        RendererOwnerAction::CloseAuxiliaryWindow(_) => 0,
+        RendererOwnerAction::NavigateAuxiliaryWindow { url, .. } => string_charge(url),
         RendererOwnerAction::Popup(event) => {
             string_charge(event.url()).saturating_add(string_charge(event.target_name()))
         }
@@ -174,7 +271,8 @@ fn owner_action_transport_charge_bytes(action: &RendererOwnerAction) -> usize {
                 .saturating_add(string_charge(&event.loader_id))
                 .saturating_add(child_frame_document_network_charge(&event.snapshot))
         }
-        RendererOwnerAction::ChildFrameLoad { event, .. } => [
+        RendererOwnerAction::ChildFrameCommit { event, .. }
+        | RendererOwnerAction::ChildFrameLoad { event, .. } => [
             Some(event.frame_id.as_str()),
             event.parent_frame_id.as_deref(),
             event.loader_id.as_deref(),
@@ -197,6 +295,13 @@ fn owner_action_transport_charge_bytes(action: &RendererOwnerAction) -> usize {
             string_charge(&navigation.url)
                 .saturating_add(string_charge(&navigation.navigation_type))
         }
+        RendererOwnerAction::SessionHistoryUpdate { update, .. } => string_charge(&update.root_url)
+            .saturating_add(
+                update
+                    .root_entry_steps
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            ),
         RendererOwnerAction::TopLevelLocationNavigation(event) => string_charge(event.url())
             .saturating_add(string_charge(event.request_method()))
             .saturating_add(
@@ -207,9 +312,23 @@ fn owner_action_transport_charge_bytes(action: &RendererOwnerAction) -> usize {
             )
             .saturating_add(headers_charge(event.request_headers())),
         RendererOwnerAction::TopLevelHistoryTraversal(_) => 0,
-        RendererOwnerAction::SubresourceFetchPause { info, .. } => {
-            info.renderer_transport_charge_bytes()
-        }
+        RendererOwnerAction::SubresourceFetchPause {
+            info,
+            child_document,
+            redirect,
+            ..
+        } => info
+            .renderer_transport_charge_bytes()
+            .saturating_add(
+                child_document
+                    .as_ref()
+                    .map_or(0, |document| document.renderer_transport_charge_bytes()),
+            )
+            .saturating_add(redirect.as_ref().map_or(0, |redirect| {
+                string_charge(redirect.from_url.as_str())
+                    .saturating_add(string_charge(redirect.to_url.as_str()))
+                    .saturating_add(headers_charge(&redirect.headers))
+            })),
         RendererOwnerAction::SubresourceContinue { event, .. } => {
             event.renderer_transport_charge_bytes()
         }
@@ -228,18 +347,7 @@ fn owner_action_transport_charge_bytes(action: &RendererOwnerAction) -> usize {
     }
 }
 
-fn headers_charge(headers: &[(String, String)]) -> usize {
-    headers.iter().fold(
-        headers
-            .len()
-            .saturating_mul(std::mem::size_of::<(String, String)>()),
-        |total, (name, value)| {
-            total
-                .saturating_add(string_charge(name))
-                .saturating_add(string_charge(value))
-        },
-    )
-}
+use crate::protocol_types::transport_headers_charge_bytes as headers_charge;
 
 fn child_frame_document_network_charge(
     snapshot: &crate::protocol_types::ChildFrameDocumentNetworkSnapshot,
@@ -392,7 +500,7 @@ fn service_worker_event_transport_charge_bytes(
                     |total, (name, value)| {
                         total
                             .saturating_add(string_charge(name))
-                            .saturating_add(string_charge(value))
+                            .saturating_add(value.len().saturating_mul(2))
                     },
                 ),
                 crate::runtime::RendererServiceWorkerFetchDiagnosticResult::Failure { message } => {

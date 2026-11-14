@@ -1,15 +1,18 @@
+use super::transform_finish::{
+    perform_transform_stream_close, transform_stream_sink_abort_algorithm,
+};
 use super::*;
-use crate::text_codec::{TextCodecStore, TextDecodeError};
-use crate::util::get_private_value;
+use crate::text_codec::{TextCodecStore, TextDecodeError, TextEncoderState};
+use crate::util::{get_private_value, v8_string_to_u16_string};
+use crate::webidl;
 use moli_streams::queue::{QueueBounds, QueueRemainderPlan};
 use moli_streams::strategy::StrategySnapshot;
 use moli_streams::transform::{
-    AlgorithmOutcome, EnqueueErrorSource, ErrorReasonSource, FinishAlgorithm, FinishClaimPlan,
-    FinishOperation, FinishResidenceState, FinishSettlementPlan, FinishSetupFailurePlan,
-    ReadableErrorAction, ReadableTerminateAction, StartSettlementPlan, TransformCancelAlgorithm,
-    TransformCloseAdmissionPlan, TransformEnqueueFailure, TransformFlushAlgorithm, TransformMode,
-    TransformReadableSnapshot, TransformSnapshot, TransformWriteAdmissionPlan,
-    TransformWriteAlgorithm, WritableCloseSettlementPlan, WriteSettlementPlan,
+    AlgorithmOutcome, EnqueueErrorSource, ErrorReasonSource, FinishResidenceState,
+    ReadableErrorAction, ReadableTerminateAction, StartSettlementPlan, TransformCloseAdmissionPlan,
+    TransformEnqueueFailure, TransformMode, TransformReadableSnapshot, TransformSnapshot,
+    TransformWriteAdmissionPlan, TransformWriteAlgorithm, WritableCloseSettlementPlan,
+    WriteSettlementPlan,
 };
 use moli_streams::writable::default_controller::{
     ContinuationPlan, PendingWriteKind, PumpState, ReadyTransition, RejectEntryPlan, SinkPumpPlan,
@@ -40,6 +43,7 @@ const WRITABLE_PENDING_ABORT_PROMISE_INDEX: u32 = 0;
 const WRITABLE_PENDING_ABORT_RESIDENCE_INDEX: u32 = 1;
 const WRITABLE_PENDING_ABORT_REASON_INDEX: u32 = 2;
 const WRITABLE_PENDING_ABORT_ALREADY_ERRORING_INDEX: u32 = 3;
+const TEXT_ENCODER_LEADING_SURROGATE_SLOT: &str = "__moliTextEncoderLeadingSurrogate";
 
 fn writable_stream_kind<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -173,7 +177,7 @@ fn transform_readable_snapshot<'s>(
     )
 }
 
-fn transform_stream_snapshot<'s>(
+pub(super) fn transform_stream_snapshot<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     writable: v8::Local<'s, v8::Object>,
     readable: v8::Local<'s, v8::Object>,
@@ -201,7 +205,7 @@ fn transform_stream_snapshot<'s>(
     )
 }
 
-fn invoke_writable_stream_algorithm<'s>(
+pub(super) fn invoke_writable_stream_algorithm<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     stream: v8::Local<'s, v8::Object>,
     underlying_object: v8::Local<'s, v8::Object>,
@@ -704,504 +708,6 @@ pub(in crate::context_bootstrap::stream_adapter) fn transform_stream_readable_pu
     rv.set_undefined();
 }
 
-pub(in crate::context_bootstrap::stream_adapter) fn transform_stream_readable_cancel_callback<
-    's,
->(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let writable = args.this();
-    let reason = args.get(0);
-    let Some(readable) = stream_slot_object(scope, writable, WRITABLE_STREAM_TARGET_READABLE_SLOT)
-        .filter(|readable| !readable.is_null_or_undefined())
-    else {
-        error_writable_stream_with_value(scope, writable, reason);
-        rv.set_undefined();
-        return;
-    };
-    let Some(claim) = claim_transform_finish_residence(
-        scope,
-        writable,
-        readable,
-        FinishOperation::ReadableCancel,
-    ) else {
-        error_writable_stream_with_value(scope, writable, reason);
-        rv.set_undefined();
-        return;
-    };
-    let (finish_promise, residence, algorithm) = match claim {
-        TransformFinishResidenceClaim::Existing(promise) => {
-            rv.set(promise.into());
-            return;
-        }
-        TransformFinishResidenceClaim::Started {
-            promise,
-            residence,
-            algorithm,
-        } => (promise, residence, algorithm),
-    };
-
-    let FinishAlgorithm::Cancel(algorithm) = algorithm else {
-        unreachable!("readable cancel must claim the transform cancel algorithm")
-    };
-    if matches!(algorithm, TransformCancelAlgorithm::None) {
-        clear_transform_stream_terminal_algorithms(scope, writable);
-        apply_transform_source_cancel_fulfillment(scope, writable, readable, residence, reason);
-        rv.set(finish_promise.into());
-        return;
-    }
-    let cancel_result =
-        invoke_transform_stream_cancel_algorithm(scope, writable, reason, algorithm);
-    clear_transform_stream_terminal_algorithms(scope, writable);
-    let Some(cancel_promise) = transform_algorithm_result_promise(scope, cancel_result) else {
-        apply_transform_finish_setup_failure(
-            scope,
-            writable,
-            readable,
-            residence,
-            FinishOperation::ReadableCancel,
-            reason,
-        );
-        rv.set(finish_promise.into());
-        return;
-    };
-    attach_transform_source_cancel_reactions(scope, cancel_promise, writable, residence, reason);
-    rv.set(finish_promise.into());
-}
-
-/// A transform controller has one terminal residence shared by writable
-/// close/abort and readable cancel.
-///
-/// `Existing` means another terminal algorithm already owns callback
-/// invocation and settlement. The caller must return the same promise without
-/// invoking `flush` or `cancel` again. `Started` transfers the one-shot
-/// resolver capability to this caller.
-enum TransformFinishResidenceClaim<'s> {
-    Existing(v8::Local<'s, v8::Promise>),
-    Started {
-        promise: v8::Local<'s, v8::Promise>,
-        residence: v8::Local<'s, v8::Object>,
-        algorithm: FinishAlgorithm,
-    },
-}
-
-fn claim_transform_finish_residence<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-    operation: FinishOperation,
-) -> Option<TransformFinishResidenceClaim<'s>> {
-    let controller = stream_slot_object(scope, writable, WRITABLE_STREAM_CONTROLLER_SLOT)?;
-    match transform_stream_snapshot(scope, writable, readable).plan_finish(operation) {
-        FinishClaimPlan::Reuse => {
-            let promise = stream_slot_value(
-                scope,
-                controller,
-                TRANSFORM_STREAM_CONTROLLER_FINISH_PROMISE_SLOT,
-            )
-            .and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok())?;
-            Some(TransformFinishResidenceClaim::Existing(promise))
-        }
-        FinishClaimPlan::Claim { algorithm } => {
-            let (promise, residence) = new_pending_read_promise(scope)?;
-            set_stream_slot_value(
-                scope,
-                controller,
-                TRANSFORM_STREAM_CONTROLLER_FINISH_PROMISE_SLOT,
-                promise.into(),
-            );
-            set_stream_slot_value(
-                scope,
-                controller,
-                TRANSFORM_STREAM_CONTROLLER_FINISH_RESIDENCE_SLOT,
-                residence.into(),
-            );
-            Some(TransformFinishResidenceClaim::Started {
-                promise,
-                residence,
-                algorithm,
-            })
-        }
-    }
-}
-
-fn invoke_transform_stream_cancel_algorithm<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-    reason: v8::Local<'s, v8::Value>,
-    algorithm: TransformCancelAlgorithm,
-) -> Result<Option<v8::Local<'s, v8::Value>>, v8::Local<'s, v8::Value>> {
-    if matches!(algorithm, TransformCancelAlgorithm::None) {
-        return Ok(None);
-    }
-    let Some(transformer) = stream_slot_object(scope, writable, WRITABLE_STREAM_TRANSFORMER_SLOT)
-        .filter(|transformer| !transformer.is_null_or_undefined())
-    else {
-        return Ok(None);
-    };
-    invoke_writable_stream_algorithm(
-        scope,
-        writable,
-        transformer,
-        WRITABLE_STREAM_ALGORITHM_TRANSFORM_CANCEL_INDEX,
-        "cancel",
-        &[reason],
-    )
-}
-
-fn clear_transform_stream_terminal_algorithms<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-) {
-    if let Some(algorithms) = stream_slot_array(scope, writable, WRITABLE_STREAM_ALGORITHMS_SLOT) {
-        for index in [
-            WRITABLE_STREAM_ALGORITHM_TRANSFORM_INDEX,
-            WRITABLE_STREAM_ALGORITHM_TRANSFORM_FLUSH_INDEX,
-            WRITABLE_STREAM_ALGORITHM_TRANSFORM_CANCEL_INDEX,
-        ] {
-            let _ = algorithms.set_index(scope, index, v8::undefined(scope).into());
-        }
-    }
-    set_stream_slot_value(
-        scope,
-        writable,
-        WRITABLE_STREAM_TRANSFORMER_SLOT,
-        v8::null(scope).into(),
-    );
-}
-
-fn transform_algorithm_result_promise<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    result: Result<Option<v8::Local<'s, v8::Value>>, v8::Local<'s, v8::Value>>,
-) -> Option<v8::Local<'s, v8::Promise>> {
-    match result {
-        Ok(result) => normalize_stream_algorithm_result(scope, result),
-        Err(error) => rejected_promise_value(scope, error)
-            .and_then(|promise| v8::Local::<v8::Promise>::try_from(promise).ok()),
-    }
-}
-
-fn apply_transform_finish_setup_failure<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-    residence: v8::Local<'s, v8::Object>,
-    operation: FinishOperation,
-    reason: v8::Local<'s, v8::Value>,
-) {
-    match transform_stream_snapshot(scope, writable, readable).plan_finish_setup_failure(operation)
-    {
-        FinishSetupFailurePlan::ErrorWritableWithOriginalReasonAndReject => {
-            error_writable_stream_with_value(scope, writable, reason);
-            reject_pending_read(scope, residence, reason);
-        }
-        FinishSetupFailurePlan::ErrorReadableWithOriginalReasonAndReject
-        | FinishSetupFailurePlan::ErrorReadableWithUndefinedAndReject => {
-            error_stream(scope, readable, reason);
-            reject_pending_read(scope, residence, reason);
-        }
-    }
-}
-
-fn attach_transform_source_cancel_reactions<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    cancel_promise: v8::Local<'s, v8::Promise>,
-    writable: v8::Local<'s, v8::Object>,
-    residence: v8::Local<'s, v8::Object>,
-    reason: v8::Local<'s, v8::Value>,
-) {
-    let data = v8::Array::new(scope, 3);
-    let _ = data.set_index(scope, 0, writable.into());
-    let _ = data.set_index(scope, 1, residence.into());
-    let _ = data.set_index(scope, 2, reason);
-    publish_required_stream_promise_reactions(
-        scope,
-        cancel_promise,
-        v8::Function::builder(transform_source_cancel_fulfilled_callback).data(data.into()),
-        "transform source cancel fulfillment",
-        v8::Function::builder(transform_source_cancel_rejected_callback).data(data.into()),
-        "transform source cancel rejection",
-        "transform source cancel",
-    )
-    .finish_at_owner_boundary();
-}
-
-fn transform_source_cancel_fulfilled_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some((writable, residence, reason)) =
-        transform_source_cancel_reaction_values(scope, args.data())
-    else {
-        rv.set_undefined();
-        return;
-    };
-    let Some(readable) = stream_slot_object(scope, writable, WRITABLE_STREAM_TARGET_READABLE_SLOT)
-        .filter(|readable| !readable.is_null_or_undefined())
-    else {
-        reject_pending_read(scope, residence, reason);
-        rv.set_undefined();
-        return;
-    };
-    apply_transform_source_cancel_fulfillment(scope, writable, readable, residence, reason);
-    rv.set_undefined();
-}
-
-fn apply_transform_source_cancel_fulfillment<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-    residence: v8::Local<'s, v8::Object>,
-    reason: v8::Local<'s, v8::Value>,
-) {
-    match transform_stream_snapshot(scope, writable, readable)
-        .plan_finish_settlement(FinishOperation::ReadableCancel, AlgorithmOutcome::Fulfilled)
-    {
-        FinishSettlementPlan::RejectWithWritableStoredError => {
-            let error = writable_stream_stored_error(scope, writable).unwrap_or(reason);
-            reject_pending_read(scope, residence, error);
-        }
-        FinishSettlementPlan::ErrorWritableWithOriginalReasonAndResolve => {
-            error_writable_stream_with_value(scope, writable, reason);
-            resolve_pending_promise(scope, residence, v8::undefined(scope).into());
-        }
-        _ => unreachable!("readable cancel fulfillment produced an invalid plan"),
-    }
-}
-
-fn transform_source_cancel_rejected_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some((writable, residence, _)) =
-        transform_source_cancel_reaction_values(scope, args.data())
-    else {
-        rv.set_undefined();
-        return;
-    };
-    let error = args.get(0);
-    let Some(readable) = stream_slot_object(scope, writable, WRITABLE_STREAM_TARGET_READABLE_SLOT)
-        .filter(|readable| !readable.is_null_or_undefined())
-    else {
-        reject_pending_read(scope, residence, error);
-        rv.set_undefined();
-        return;
-    };
-    match transform_stream_snapshot(scope, writable, readable)
-        .plan_finish_settlement(FinishOperation::ReadableCancel, AlgorithmOutcome::Rejected)
-    {
-        FinishSettlementPlan::ErrorWritableWithCallbackErrorAndReject => {
-            error_writable_stream_with_value(scope, writable, error);
-            reject_pending_read(scope, residence, error);
-        }
-        _ => unreachable!("readable cancel rejection produced an invalid plan"),
-    }
-    rv.set_undefined();
-}
-
-fn transform_source_cancel_reaction_values<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Value>,
-) -> Option<(
-    v8::Local<'s, v8::Object>,
-    v8::Local<'s, v8::Object>,
-    v8::Local<'s, v8::Value>,
-)> {
-    let data = v8::Local::<v8::Array>::try_from(data).ok()?;
-    let writable = data
-        .get_index(scope, 0)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let residence = data
-        .get_index(scope, 1)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let reason = data
-        .get_index(scope, 2)
-        .unwrap_or_else(|| v8::undefined(scope).into());
-    Some((writable, residence, reason))
-}
-
-fn transform_stream_sink_abort_algorithm<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-    reason: v8::Local<'s, v8::Value>,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let readable = v8::Global::new(scope, readable);
-    let reason = v8::Global::new(scope, reason);
-    with_transform_stream_relevant_realm(scope, writable, |scope, writable| {
-        let readable = v8::Local::new(scope, &readable);
-        let reason = v8::Local::new(scope, &reason);
-        transform_stream_sink_abort_algorithm_in_relevant_realm(scope, writable, readable, reason)
-    })
-}
-
-fn transform_stream_sink_abort_algorithm_in_relevant_realm<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-    reason: v8::Local<'s, v8::Value>,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let claim = claim_transform_finish_residence(
-        scope,
-        writable,
-        readable,
-        FinishOperation::WritableAbort,
-    )?;
-    let (finish_promise, residence, algorithm) = match claim {
-        TransformFinishResidenceClaim::Existing(promise) => return Some(promise.into()),
-        TransformFinishResidenceClaim::Started {
-            promise,
-            residence,
-            algorithm,
-        } => (promise, residence, algorithm),
-    };
-    let FinishAlgorithm::Cancel(algorithm) = algorithm else {
-        unreachable!("writable abort must claim the transform cancel algorithm")
-    };
-    if matches!(algorithm, TransformCancelAlgorithm::None) {
-        clear_transform_stream_terminal_algorithms(scope, writable);
-        apply_transform_sink_abort_fulfillment(scope, writable, readable, residence, reason);
-        return Some(finish_promise.into());
-    }
-    let cancel_result =
-        invoke_transform_stream_cancel_algorithm(scope, writable, reason, algorithm);
-    clear_transform_stream_terminal_algorithms(scope, writable);
-    let Some(cancel_promise) = transform_algorithm_result_promise(scope, cancel_result) else {
-        apply_transform_finish_setup_failure(
-            scope,
-            writable,
-            readable,
-            residence,
-            FinishOperation::WritableAbort,
-            reason,
-        );
-        return Some(finish_promise.into());
-    };
-    let data = v8::Array::new(scope, 4);
-    let _ = data.set_index(scope, 0, writable.into());
-    let _ = data.set_index(scope, 1, readable.into());
-    let _ = data.set_index(scope, 2, residence.into());
-    let _ = data.set_index(scope, 3, reason);
-    if matches!(
-        publish_required_stream_promise_reactions(
-            scope,
-            cancel_promise,
-            v8::Function::builder(transform_sink_abort_fulfilled_callback).data(data.into()),
-            "transform sink abort fulfillment",
-            v8::Function::builder(transform_sink_abort_rejected_callback).data(data.into()),
-            "transform sink abort rejection",
-            "transform sink abort",
-        ),
-        StreamOwnerPublication::OwnerTerminating
-    ) {
-        return Some(finish_promise.into());
-    }
-    Some(finish_promise.into())
-}
-
-fn transform_sink_abort_fulfilled_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some((readable, residence, reason)) =
-        transform_sink_abort_reaction_values(scope, args.data())
-    else {
-        rv.set_undefined();
-        return;
-    };
-    let Some(writable) = transform_sink_abort_reaction_writable(scope, args.data()) else {
-        reject_pending_read(scope, residence, reason);
-        rv.set_undefined();
-        return;
-    };
-    apply_transform_sink_abort_fulfillment(scope, writable, readable, residence, reason);
-    rv.set_undefined();
-}
-
-fn apply_transform_sink_abort_fulfillment<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    writable: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-    residence: v8::Local<'s, v8::Object>,
-    reason: v8::Local<'s, v8::Value>,
-) {
-    match transform_stream_snapshot(scope, writable, readable)
-        .plan_finish_settlement(FinishOperation::WritableAbort, AlgorithmOutcome::Fulfilled)
-    {
-        FinishSettlementPlan::RejectWithReadableStoredError => {
-            let error = readable_stream_error(scope, readable).unwrap_or(reason);
-            reject_pending_read(scope, residence, error);
-        }
-        FinishSettlementPlan::ErrorReadableWithOriginalReasonAndResolve => {
-            error_stream(scope, readable, reason);
-            resolve_pending_promise(scope, residence, v8::undefined(scope).into());
-        }
-        _ => unreachable!("writable abort fulfillment produced an invalid plan"),
-    }
-}
-
-fn transform_sink_abort_rejected_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some((readable, residence, _)) = transform_sink_abort_reaction_values(scope, args.data())
-    else {
-        rv.set_undefined();
-        return;
-    };
-    let error = args.get(0);
-    let Some(writable) = transform_sink_abort_reaction_writable(scope, args.data()) else {
-        reject_pending_read(scope, residence, error);
-        rv.set_undefined();
-        return;
-    };
-    match transform_stream_snapshot(scope, writable, readable)
-        .plan_finish_settlement(FinishOperation::WritableAbort, AlgorithmOutcome::Rejected)
-    {
-        FinishSettlementPlan::ErrorReadableWithCallbackErrorAndReject => {
-            error_stream(scope, readable, error);
-            reject_pending_read(scope, residence, error);
-        }
-        _ => unreachable!("writable abort rejection produced an invalid plan"),
-    }
-    rv.set_undefined();
-}
-
-fn transform_sink_abort_reaction_values<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Value>,
-) -> Option<(
-    v8::Local<'s, v8::Object>,
-    v8::Local<'s, v8::Object>,
-    v8::Local<'s, v8::Value>,
-)> {
-    let data = v8::Local::<v8::Array>::try_from(data).ok()?;
-    let readable = data
-        .get_index(scope, 1)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let residence = data
-        .get_index(scope, 2)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let reason = data
-        .get_index(scope, 3)
-        .unwrap_or_else(|| v8::undefined(scope).into());
-    Some((readable, residence, reason))
-}
-
-fn transform_sink_abort_reaction_writable<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Value>,
-) -> Option<v8::Local<'s, v8::Object>> {
-    let data = v8::Local::<v8::Array>::try_from(data).ok()?;
-    data.get_index(scope, 0)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-}
-
 fn process_transform_writable_queue<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     writable: v8::Local<'s, v8::Object>,
@@ -1323,7 +829,7 @@ fn transform_writable_queue_continuation_callback<'s>(
     rv.set_undefined();
 }
 
-fn normalize_stream_algorithm_result<'s>(
+pub(super) fn normalize_stream_algorithm_result<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     result: Option<v8::Local<'s, v8::Value>>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
@@ -1386,7 +892,18 @@ pub(in crate::context_bootstrap) fn set_transform_stream_start_result<'s>(
     readable: v8::Local<'s, v8::Object>,
     result: Option<v8::Local<'s, v8::Value>>,
 ) {
-    let Some(promise) = normalize_stream_algorithm_result(scope, result) else {
+    // InitializeTransformStream gives the underlying controllers an algorithm
+    // returning the shared startPromise, resolved with transformer.start's
+    // result. SetUpWritableStreamDefaultController in turn resolves its own
+    // start promise with that result. Preserve this adoption: writable must
+    // remain Erroring until the controller's start reaction can run.
+    let result = result.unwrap_or_else(|| v8::undefined(scope).into());
+    let Some(start_promise) = resolved_promise_value(scope, result) else {
+        return;
+    };
+    let Some(promise) = resolved_promise_value(scope, start_promise)
+        .and_then(|promise| v8::Local::<v8::Promise>::try_from(promise).ok())
+    else {
         return;
     };
     let data = transform_promise_reaction_data(scope, writable, readable);
@@ -1535,7 +1052,7 @@ pub(in crate::context_bootstrap) fn begin_writable_stream_start<'s>(
 /// creation context owns built-in conversions, exceptions, chunks, and
 /// internal promises. A page callback can still enter its own callback Realm
 /// from inside this boundary.
-fn with_transform_stream_relevant_realm<'s>(
+pub(super) fn with_transform_stream_relevant_realm<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     writable: v8::Local<'s, v8::Object>,
     operation: impl FnOnce(
@@ -1586,27 +1103,33 @@ fn perform_transform_stream_write_in_relevant_realm<'s>(
         transform_stream_snapshot(scope, stream, readable).plan_queued_write_algorithm();
     match algorithm {
         TransformWriteAlgorithm::TextEncoder => {
-            let input = match text_encoder_stream_chunk_string(scope, chunk) {
+            let input = match text_encoder_stream_chunk_utf16(scope, chunk) {
                 Ok(input) => input,
                 Err(error) => {
                     return reject_transform_stream_with_value(scope, stream, readable, error);
                 }
             };
-            let bytes = new_uint8_array_from_bytes(scope, input.into_bytes())
-                .expect("TextEncoderStream output allocation must succeed");
-            if let Err(error) =
-                enqueue_transform_readable_chunk(scope, stream, readable, bytes.into())
-            {
-                return rejected_promise_value(scope, error);
-            }
-            return None;
+            let mut state = text_encoder_stream_state(scope, stream);
+            let bytes = state.encode(&input);
+            store_text_encoder_stream_state(scope, stream, &state);
+            return enqueue_text_encoder_stream_bytes(scope, stream, readable, bytes);
         }
         TransformWriteAlgorithm::TextDecoder => {
-            if let Some(bytes) = value_buffer_source_bytes(scope, chunk) {
-                return write_text_decoder_stream_chunk(scope, stream, readable, &bytes);
-            }
-            let error = text_decoder_stream_type_error_value(scope);
-            return reject_transform_stream_with_value(scope, stream, readable, error);
+            let input = match webidl::convert::<webidl::AllowSharedBufferSource<'s>>(
+                scope,
+                chunk,
+                webidl::Context::argument("TextDecoderStream", 1),
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    let message = v8::String::new(scope, &error.to_string())
+                        .expect("Web IDL conversion error message");
+                    let error = v8::Exception::type_error(scope, message);
+                    return reject_transform_stream_with_value(scope, stream, readable, error);
+                }
+            };
+            let bytes = input.to_vec(scope);
+            return write_text_decoder_stream_chunk(scope, stream, readable, &bytes);
         }
         TransformWriteAlgorithm::Callback => {
             let transformer = stream_slot_object(scope, stream, WRITABLE_STREAM_TRANSFORMER_SLOT)?;
@@ -2611,178 +2134,7 @@ pub(in crate::context_bootstrap) fn writable_stream_abort_promise<'s>(
     writable_stream_abort_internal(scope, stream, reason)
 }
 
-fn perform_transform_stream_close<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    stream: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let readable = v8::Global::new(scope, readable);
-    with_transform_stream_relevant_realm(scope, stream, |scope, stream| {
-        let readable = v8::Local::new(scope, &readable);
-        perform_transform_stream_close_in_relevant_realm(scope, stream, readable)
-    })
-}
-
-fn perform_transform_stream_close_in_relevant_realm<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    stream: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let claim =
-        claim_transform_finish_residence(scope, stream, readable, FinishOperation::WritableClose)?;
-    let (finish_promise, residence, algorithm) = match claim {
-        TransformFinishResidenceClaim::Existing(promise) => {
-            return attach_transform_writable_close_settlement(scope, stream, promise);
-        }
-        TransformFinishResidenceClaim::Started {
-            promise,
-            residence,
-            algorithm,
-        } => (promise, residence, algorithm),
-    };
-    let FinishAlgorithm::Flush(algorithm) = algorithm else {
-        unreachable!("writable close must claim the transform flush algorithm")
-    };
-    let flush_result = match algorithm {
-        TransformFlushAlgorithm::TextDecoder => {
-            Ok(flush_text_decoder_stream(scope, stream, readable))
-        }
-        TransformFlushAlgorithm::Callback => {
-            let transformer = stream_slot_object(scope, stream, WRITABLE_STREAM_TRANSFORMER_SLOT)?;
-            let controller = stream_slot_object(scope, stream, WRITABLE_STREAM_CONTROLLER_SLOT)
-                .unwrap_or_else(|| {
-                    super::super::stream_objects::new_transform_stream_controller_object(
-                        scope, readable, stream,
-                    )
-                });
-            invoke_writable_stream_algorithm(
-                scope,
-                stream,
-                transformer,
-                WRITABLE_STREAM_ALGORITHM_TRANSFORM_FLUSH_INDEX,
-                "flush",
-                &[controller.into()],
-            )
-        }
-        TransformFlushAlgorithm::None => Ok(None),
-    };
-    clear_transform_stream_terminal_algorithms(scope, stream);
-    let Some(flush_promise) = transform_algorithm_result_promise(scope, flush_result) else {
-        let reason = v8::undefined(scope).into();
-        apply_transform_finish_setup_failure(
-            scope,
-            stream,
-            readable,
-            residence,
-            FinishOperation::WritableClose,
-            reason,
-        );
-        return attach_transform_writable_close_settlement(scope, stream, finish_promise);
-    };
-    attach_transform_sink_close_reactions(scope, flush_promise, stream, readable, residence);
-    attach_transform_writable_close_settlement(scope, stream, finish_promise)
-}
-
-fn attach_transform_sink_close_reactions<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    flush_promise: v8::Local<'s, v8::Promise>,
-    writable: v8::Local<'s, v8::Object>,
-    readable: v8::Local<'s, v8::Object>,
-    residence: v8::Local<'s, v8::Object>,
-) {
-    let data = v8::Array::new(scope, 3);
-    let _ = data.set_index(scope, 0, writable.into());
-    let _ = data.set_index(scope, 1, readable.into());
-    let _ = data.set_index(scope, 2, residence.into());
-    publish_required_stream_promise_reactions(
-        scope,
-        flush_promise,
-        v8::Function::builder(transform_sink_close_fulfilled_callback).data(data.into()),
-        "transform sink close fulfillment",
-        v8::Function::builder(transform_sink_close_rejected_callback).data(data.into()),
-        "transform sink close rejection",
-        "transform sink close",
-    )
-    .finish_at_owner_boundary();
-}
-
-fn transform_sink_close_fulfilled_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some((writable, readable, residence)) =
-        transform_sink_close_reaction_values(scope, args.data())
-    else {
-        rv.set_undefined();
-        return;
-    };
-    match transform_stream_snapshot(scope, writable, readable)
-        .plan_finish_settlement(FinishOperation::WritableClose, AlgorithmOutcome::Fulfilled)
-    {
-        FinishSettlementPlan::RejectWithReadableStoredError => {
-            let error = readable_stream_error(scope, readable)
-                .unwrap_or_else(|| v8::undefined(scope).into());
-            reject_pending_read(scope, residence, error);
-        }
-        FinishSettlementPlan::CloseReadableAndResolve => {
-            close_stream(scope, readable);
-            resolve_pending_promise(scope, residence, v8::undefined(scope).into());
-        }
-        FinishSettlementPlan::Resolve => {
-            resolve_pending_promise(scope, residence, v8::undefined(scope).into());
-        }
-        _ => unreachable!("transform flush fulfillment produced an invalid plan"),
-    }
-    rv.set_undefined();
-}
-
-fn transform_sink_close_rejected_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some((writable, readable, residence)) =
-        transform_sink_close_reaction_values(scope, args.data())
-    else {
-        rv.set_undefined();
-        return;
-    };
-    let error = args.get(0);
-    match transform_stream_snapshot(scope, writable, readable)
-        .plan_finish_settlement(FinishOperation::WritableClose, AlgorithmOutcome::Rejected)
-    {
-        FinishSettlementPlan::ErrorReadableWithCallbackErrorAndReject => {
-            error_stream(scope, readable, error);
-            reject_pending_read(scope, residence, error);
-        }
-        _ => unreachable!("transform flush rejection produced an invalid plan"),
-    }
-    rv.set_undefined();
-}
-
-fn transform_sink_close_reaction_values<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Value>,
-) -> Option<(
-    v8::Local<'s, v8::Object>,
-    v8::Local<'s, v8::Object>,
-    v8::Local<'s, v8::Object>,
-)> {
-    let data = v8::Local::<v8::Array>::try_from(data).ok()?;
-    let writable = data
-        .get_index(scope, 0)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let readable = data
-        .get_index(scope, 1)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let residence = data
-        .get_index(scope, 2)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    Some((writable, readable, residence))
-}
-
-fn attach_transform_writable_close_settlement<'s>(
+pub(super) fn attach_transform_writable_close_settlement<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     writable: v8::Local<'s, v8::Object>,
     finish_promise: v8::Local<'s, v8::Promise>,
@@ -2900,7 +2252,7 @@ fn write_text_decoder_stream_chunk<'s>(
     }
 }
 
-fn flush_text_decoder_stream<'s>(
+pub(super) fn flush_text_decoder_stream<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     stream: v8::Local<'s, v8::Object>,
     readable: v8::Local<'s, v8::Object>,
@@ -2918,23 +2270,80 @@ fn flush_text_decoder_stream<'s>(
     }
 }
 
-fn text_encoder_stream_chunk_string<'s>(
+fn text_encoder_stream_chunk_utf16<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     chunk: v8::Local<'s, v8::Value>,
-) -> Result<String, v8::Local<'s, v8::Value>> {
+) -> Result<Vec<u16>, v8::Local<'s, v8::Value>> {
     let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-    let scope = try_catch.init();
-    match chunk.to_string(&scope) {
-        Some(value) => Ok(value.to_rust_string_lossy(&scope)),
+    let scope = &mut try_catch.init();
+    match chunk.to_string(scope) {
+        Some(value) => Ok(v8_string_to_u16_string(scope, value).into_vec()),
         None if scope.has_caught() => Err(scope.exception().unwrap_or_else(|| {
-            let message = v8str(&scope, "Failed to convert chunk");
-            v8::Exception::type_error(&scope, message)
+            let message = v8str(scope, "Failed to convert chunk");
+            v8::Exception::type_error(scope, message)
         })),
         None => {
-            let message = v8str(&scope, "Failed to convert chunk");
-            Err(v8::Exception::type_error(&scope, message))
+            let message = v8str(scope, "Failed to convert chunk");
+            Err(v8::Exception::type_error(scope, message))
         }
     }
+}
+
+fn text_encoder_stream_state<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream: v8::Local<'s, v8::Object>,
+) -> TextEncoderState {
+    let leading_surrogate = stream_slot_value(scope, stream, TEXT_ENCODER_LEADING_SURROGATE_SLOT)
+        .filter(|value| value.is_uint32())
+        .and_then(|value| value.uint32_value(scope))
+        .and_then(|value| u16::try_from(value).ok());
+    TextEncoderState::new(leading_surrogate)
+}
+
+fn store_text_encoder_stream_state<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream: v8::Local<'s, v8::Object>,
+    state: &TextEncoderState,
+) {
+    let value = match state.leading_surrogate() {
+        Some(unit) => v8::Integer::new_from_unsigned(scope, u32::from(unit)).into(),
+        None => v8::null(scope).into(),
+    };
+    set_required_stream_slot_value(
+        scope,
+        stream,
+        TEXT_ENCODER_LEADING_SURROGATE_SLOT,
+        value,
+        "TextEncoderStream leading surrogate",
+    );
+}
+
+fn enqueue_text_encoder_stream_bytes<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream: v8::Local<'s, v8::Object>,
+    readable: v8::Local<'s, v8::Object>,
+    bytes: Vec<u8>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let bytes = new_uint8_array_from_bytes(scope, bytes)
+        .expect("TextEncoderStream output allocation must succeed");
+    match enqueue_transform_readable_chunk(scope, stream, readable, bytes.into()) {
+        Ok(()) => None,
+        Err(error) => rejected_promise_value(scope, error),
+    }
+}
+
+pub(super) fn flush_text_encoder_stream<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream: v8::Local<'s, v8::Object>,
+    readable: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let mut state = text_encoder_stream_state(scope, stream);
+    let bytes = state.flush();
+    store_text_encoder_stream_state(scope, stream, &state);
+    enqueue_text_encoder_stream_bytes(scope, stream, readable, bytes)
 }
 
 fn decode_text_decoder_stream<'s>(
@@ -2943,22 +2352,11 @@ fn decode_text_decoder_stream<'s>(
     bytes: &[u8],
     stream_decode: bool,
 ) -> Result<String, TextDecodeError> {
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+    let Some(decoder_id) = TextCodecStore::decoder_id_from_object(scope, stream) else {
         return Ok(String::new());
     };
-    let Some(decoder_id) = text_decoder_stream_decoder_id(scope, stream) else {
-        return Ok(String::new());
-    };
-    unsafe { &mut *host_ptr }
-        .text_codecs_mut()
-        .decode(decoder_id, bytes, stream_decode)
-}
-
-fn text_decoder_stream_decoder_id<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    stream: v8::Local<'s, v8::Object>,
-) -> Option<u32> {
-    TextCodecStore::decoder_id_from_object(scope, stream)
+    decode_text_decoder_state(scope, decoder_id, bytes, stream_decode)
+        .unwrap_or_else(|| Ok(String::new()))
 }
 
 fn reject_text_decoder_stream<'s>(
@@ -3257,15 +2655,6 @@ fn text_decode_error_value<'s>(
     error: TextDecodeError,
 ) -> v8::Local<'s, v8::Value> {
     v8::Exception::type_error(scope, v8str(scope, error.message()))
-}
-
-fn text_decoder_stream_type_error_value<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> v8::Local<'s, v8::Value> {
-    v8::Exception::type_error(
-        scope,
-        v8str(scope, "TextDecoderStream chunk must be a BufferSource"),
-    )
 }
 
 pub(in crate::context_bootstrap) fn writable_stream_abort_internal<'s>(

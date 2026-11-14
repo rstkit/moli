@@ -1,16 +1,14 @@
-use tokio::sync::mpsc;
-
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
     pub origin: String,
     pub user_agent: String,
-    pub extra_headers: Vec<(String, String)>,
+    pub extra_headers: moli_header_field::HeaderFields,
     pub http_proxy: Option<String>,
     pub http_no_proxy: Option<String>,
+    pub http_host_resolve: Vec<String>,
     pub proxy_bearer_token: Option<String>,
-    pub tls_verify_host: bool,
+    pub tls: moli_curl::CurlTlsConfig,
     pub cookie_header: Option<String>,
-    pub pause_after_handshake: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,17 +23,17 @@ pub enum Event {
         socket_id: u64,
         protocol: String,
         extensions: String,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_header_field::HeaderFields,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: moli_header_field::HeaderFields,
     },
     Open {
         socket_id: u64,
         protocol: String,
         extensions: String,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_header_field::HeaderFields,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: moli_header_field::HeaderFields,
     },
     TextMessage {
         socket_id: u64,
@@ -45,14 +43,12 @@ pub enum Event {
         socket_id: u64,
         data: Vec<u8>,
     },
-    FrameSent {
+    /// One complete outgoing message, including an empty message.
+    /// Drives browser byte accounting, stream writes and CDP message records.
+    SendCompleted {
         socket_id: u64,
         opcode: FrameOpcode,
         payload_length: usize,
-    },
-    BufferedAmountConsumed {
-        socket_id: u64,
-        amount: usize,
     },
     Error {
         socket_id: u64,
@@ -76,8 +72,7 @@ impl Event {
             | Self::Open { socket_id, .. }
             | Self::TextMessage { socket_id, .. }
             | Self::BinaryMessage { socket_id, .. }
-            | Self::FrameSent { socket_id, .. }
-            | Self::BufferedAmountConsumed { socket_id, .. }
+            | Self::SendCompleted { socket_id, .. }
             | Self::Error { socket_id, .. }
             | Self::Closing { socket_id }
             | Self::Close { socket_id, .. } => *socket_id,
@@ -86,24 +81,13 @@ impl Event {
 }
 
 #[derive(Debug)]
-pub enum Command {
+pub(crate) enum Command {
     SendText(String),
     SendBinary(Vec<u8>),
+    SendBlob(moli_file_api::BlobData),
     ReceiveText(String),
     ReceiveBinary(Vec<u8>),
-    ContinueOpen {
-        response_status: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
-    },
-    FailOpen(String),
-    ServerClose {
-        code: Option<u16>,
-        reason: String,
-    },
-    Close {
-        code: Option<u16>,
-        reason: String,
-    },
+    Fail(String),
+    ServerClose { code: Option<u16>, reason: String },
+    Close { code: Option<u16>, reason: String },
 }
-
-pub type CommandSender = mpsc::UnboundedSender<Command>;

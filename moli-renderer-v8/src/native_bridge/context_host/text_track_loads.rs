@@ -1,5 +1,5 @@
 use super::{
-    JsContextHost, MediaLoadSequenceId, PendingMediaTextTrackGate,
+    MediaLoadSequenceId, PageScriptHost, PendingMediaTextTrackGate,
     PendingTextTrackLoadNetworkState, PendingTextTrackLoadSequence, TextTrackLoadSequenceId,
 };
 use crate::{
@@ -57,7 +57,7 @@ impl PendingMediaCanPlayFollowup {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn current_pending_text_track_load_task(
         &self,
         task_id: RendererPageTextTrackLoadTaskId,
@@ -107,7 +107,7 @@ impl JsContextHost {
     pub(crate) fn apply_authorized_text_track_load_task(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         task_id: RendererPageTextTrackLoadTaskId,
         target: super::WindowDocumentTaskTarget,
         kind: RendererPageTextTrackLoadTaskKind,
@@ -249,7 +249,7 @@ impl JsContextHost {
         &mut self,
         track_handle: DomHandle,
         sequence: TextTrackLoadSequenceId,
-        result: Result<String, String>,
+        terminal: PendingTextTrackLoadTerminal,
     ) -> Option<PendingTextTrackLoadTerminalFollowup> {
         let pending = self
             .pending_text_track_load_sequences
@@ -259,9 +259,13 @@ impl JsContextHost {
         {
             return None;
         }
-        pending.network_state = match result {
-            Ok(body) => PendingTextTrackLoadNetworkState::Ready(body),
-            Err(_) => PendingTextTrackLoadNetworkState::FetchFailed,
+        pending.network_state = match terminal {
+            PendingTextTrackLoadTerminal::Ready(body) => {
+                PendingTextTrackLoadNetworkState::Ready(body)
+            }
+            PendingTextTrackLoadTerminal::FetchFailed => {
+                PendingTextTrackLoadNetworkState::FetchFailed
+            }
         };
         pending_text_track_terminal_followup(pending)
     }
@@ -271,7 +275,7 @@ impl JsContextHost {
         track_handle: DomHandle,
         sequence: TextTrackLoadSequenceId,
         internal_id: u64,
-        result: Result<String, String>,
+        terminal: PendingTextTrackLoadTerminal,
     ) -> Option<PendingTextTrackLoadTerminalFollowup> {
         let pending = self
             .pending_text_track_load_sequences
@@ -287,9 +291,13 @@ impl JsContextHost {
             );
             return None;
         }
-        pending.network_state = match result {
-            Ok(body) => PendingTextTrackLoadNetworkState::Ready(body),
-            Err(_) => PendingTextTrackLoadNetworkState::FetchFailed,
+        pending.network_state = match terminal {
+            PendingTextTrackLoadTerminal::Ready(body) => {
+                PendingTextTrackLoadNetworkState::Ready(body)
+            }
+            PendingTextTrackLoadTerminal::FetchFailed => {
+                PendingTextTrackLoadNetworkState::FetchFailed
+            }
         };
         tracing::debug!(
             track = track_handle.index(),

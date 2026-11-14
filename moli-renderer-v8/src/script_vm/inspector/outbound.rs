@@ -11,14 +11,15 @@ use crate::runtime::{
     RendererTurnOutputJournal,
 };
 use anyhow::Result;
+use moli_inspector_json::InspectorJson;
 use moli_page_types::{
     DevToolsSessionKey, RendererDevToolsAgentToken, RendererInspectorResponseDelivery,
 };
 use serde_json::Value;
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet, VecDeque},
-    rc::Rc,
+    collections::{HashMap, VecDeque},
+    rc::{Rc, Weak},
 };
 
 /// Push-based ordered outbound handling for inspector messages.
@@ -41,7 +42,7 @@ struct InspectorOutboundMessageState {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct InspectorOutboundMessage {
     pub(super) agent_token: RendererDevToolsAgentToken,
-    pub(super) value: Value,
+    pub(super) value: InspectorJson,
 }
 
 #[derive(Default)]
@@ -49,7 +50,7 @@ struct InspectorResponseRoutingState {
     // These fields belong to one agent-local V8 session channel and never
     // cross a renderer agent boundary.
     pending_response_callbacks: HashMap<i32, RendererRuntimeInspectorResponseSender>,
-    canceled_response_callbacks: HashSet<i32>,
+    canceled_response_callbacks: HashMap<i32, Option<String>>,
     dispatch_response_capture_depth: usize,
     internal_dispatch_response_call_ids: Vec<i32>,
     runtime_command_output: Option<RendererRuntimeCommandOutputRecorder>,
@@ -63,6 +64,8 @@ type SharedInspectorResponseRoutingState = Rc<RefCell<InspectorResponseRoutingSt
 
 #[derive(Clone)]
 pub(in crate::script_vm) struct InspectorOutbound {
+    native_session: Rc<RefCell<Weak<v8::inspector::V8InspectorSession>>>,
+    debugger_pauses_enabled: bool,
     agent_token: RendererDevToolsAgentToken,
     session: Option<DevToolsSessionKey>,
     output_journal: Option<RendererTurnOutputJournal>,
@@ -90,8 +93,27 @@ impl InspectorSessionOutput for InspectorOutbound {
 }
 
 impl InspectorOutbound {
+    pub(super) fn prepare_native_session_binding(
+        &mut self,
+    ) -> Rc<RefCell<Weak<v8::inspector::V8InspectorSession>>> {
+        // Reattach may reuse the message store, but an old native channel must
+        // retain its own binding and can never clean a successor's groups.
+        self.native_session = Default::default();
+        self.native_session.clone()
+    }
+
+    fn release_abandoned_group(&self, group: Option<&str>) {
+        if let Some(group) = group
+            && let Some(session) = self.native_session.borrow().upgrade()
+        {
+            session.release_object_group(v8::inspector::StringView::from(group.as_bytes()));
+        }
+    }
+
     pub(super) fn for_agent(agent_token: RendererDevToolsAgentToken) -> Self {
         Self {
+            native_session: Default::default(),
+            debugger_pauses_enabled: false,
             agent_token,
             session: None,
             output_journal: None,
@@ -112,6 +134,15 @@ impl InspectorOutbound {
         outbound.output_journal = output_journal;
         *outbound.session_route.borrow_mut() = Some(session_route);
         outbound
+    }
+
+    pub(super) fn with_debugger_pauses_enabled(mut self, enabled: bool) -> Self {
+        self.debugger_pauses_enabled = enabled;
+        self
+    }
+
+    pub(super) fn debugger_pauses_enabled(&self) -> bool {
+        self.debugger_pauses_enabled
     }
 
     pub(super) fn with_output_journal(
@@ -170,7 +201,7 @@ impl InspectorOutbound {
         let view = message.string();
         let message_units = view.len();
         let message_width = if view.is_8bit() { 8 } else { 16 };
-        match moli_v8_util::decode_inspector_protocol_message(view) {
+        match moli_v8_util::inspector_protocol_json(view) {
             Ok(value) => self.push_value(value),
             Err(error) => {
                 let raw = moli_v8_util::inspector_protocol_message_text(view);
@@ -192,18 +223,30 @@ impl InspectorOutbound {
         let view = message.string();
         let message_units = view.len();
         let message_width = if view.is_8bit() { 8 } else { 16 };
-        match moli_v8_util::decode_inspector_protocol_message(view) {
-            Ok(value) => self.push_response_value(call_id, value),
+        match moli_v8_util::inspector_protocol_json(view) {
+            Ok(value) if value.id_i64() == Some(i64::from(call_id)) => self.push_response_value(call_id, value),
+            Ok(_) => self.push_response_value(call_id, serde_json::json!({"id":call_id,"error":{"code":-32603,"message":"Inspector response ID mismatch"}})),
             Err(error) => {
                 let raw = moli_v8_util::inspector_protocol_message_text(view);
                 tracing::warn!(target: "moli::cdp::inspector",
-                    %error, %raw, message_units, message_width,
-                    "failed to decode inspector protocol response; dropping");
+                    %error, %raw, call_id, message_units, message_width,
+                    "failed to decode inspector protocol response; returning protocol error");
+                self.push_response_value(
+                    call_id,
+                    serde_json::json!({
+                        "id": call_id,
+                        "error": {
+                            "code": -32603,
+                            "message": format!("Failed to decode Inspector response: {error}"),
+                        },
+                    }),
+                );
             }
         }
     }
 
-    pub(super) fn push_value(&self, value: Value) {
+    pub(super) fn push_value(&self, value: impl Into<InspectorJson>) {
+        let value = value.into();
         if let Some(session_route) = self.session_route.borrow().clone() {
             match session_route.route_notification(&value) {
                 RendererInspectorPauseNotificationRoute::OrdinaryTurn => {
@@ -230,7 +273,7 @@ impl InspectorOutbound {
         &self,
         mut preface: Vec<RendererRuntimeInspectorMessage>,
         command_output: Option<crate::devtools::pause::RendererInspectorPauseCommandOutputRoute>,
-        value: Value,
+        value: InspectorJson,
     ) {
         let session = self
             .session
@@ -293,7 +336,7 @@ impl InspectorOutbound {
             .and_then(|route| route.stage_pause_preface(messages))
     }
 
-    fn push_local_value(&self, value: Value) {
+    fn push_local_value(&self, value: InspectorJson) {
         let (runtime_command_output, command_turn_output, dispatch_is_active) = {
             let routing = self.response_routing.borrow();
             if routing.runtime_command_output_suppression_depth == 0 {
@@ -339,7 +382,7 @@ impl InspectorOutbound {
         self.queue_local_value(value);
     }
 
-    fn queue_local_value(&self, value: Value) {
+    fn queue_local_value(&self, value: InspectorJson) {
         self.state()
             .borrow_mut()
             .messages
@@ -349,7 +392,8 @@ impl InspectorOutbound {
             });
     }
 
-    pub(super) fn push_response_value(&self, call_id: i32, value: Value) {
+    pub(super) fn push_response_value(&self, call_id: i32, value: impl Into<InspectorJson>) {
+        let value = value.into();
         let mut guard = self.response_routing.borrow_mut();
         if guard
             .internal_dispatch_response_call_ids
@@ -361,10 +405,16 @@ impl InspectorOutbound {
             return;
         }
         if let Some(session_route) = self.session_route.borrow().as_ref() {
-            session_route.mark_command_response(call_id, value.get("error").is_none());
+            session_route.mark_command_response(call_id, !value.has_field("error"));
         }
         let callback = guard.pending_response_callbacks.remove(&call_id);
         if let Some(callback) = callback {
+            let cleanup_group = callback.abandoned_object_group().map(str::to_owned);
+            if cleanup_group.is_some() && !callback.is_open() {
+                drop(guard);
+                self.release_abandoned_group(cleanup_group.as_deref());
+                return;
+            }
             let recorder = (guard.runtime_command_output_suppression_depth == 0)
                 .then(|| guard.runtime_command_output.clone())
                 .flatten();
@@ -374,6 +424,7 @@ impl InspectorOutbound {
                 return;
             }
             if let Err(message) = callback.send(value) {
+                self.release_abandoned_group(cleanup_group.as_deref());
                 tracing::debug!(
                     call_id,
                     message = ?message,
@@ -382,7 +433,9 @@ impl InspectorOutbound {
             }
             return;
         }
-        if guard.canceled_response_callbacks.remove(&call_id) {
+        if let Some(cleanup_group) = guard.canceled_response_callbacks.remove(&call_id) {
+            drop(guard);
+            self.release_abandoned_group(cleanup_group.as_deref());
             tracing::debug!(
                 call_id,
                 message = ?value,
@@ -434,17 +487,6 @@ impl InspectorOutbound {
         self.register_response_callback(callback);
     }
 
-    /// Publishes a synchronous non-V8 agent response through the terminal
-    /// destination selected when the frontend call was registered.
-    pub(in crate::script_vm) fn publish_frontend_response(
-        &self,
-        callback: RendererRuntimeInspectorResponseSender,
-        message: Value,
-    ) {
-        let callback = self.route_frontend_response(callback);
-        let _ = callback.send(message);
-    }
-
     pub(in crate::script_vm) fn route_frontend_response(
         &self,
         callback: RendererRuntimeInspectorResponseSender,
@@ -473,15 +515,27 @@ impl InspectorOutbound {
 
     pub(in crate::script_vm) fn cancel_response_callback(&self, call_id: i32) {
         let mut guard = self.response_routing.borrow_mut();
-        guard.pending_response_callbacks.remove(&call_id);
-        guard.canceled_response_callbacks.insert(call_id);
+        if let Some(callback) = guard.pending_response_callbacks.remove(&call_id) {
+            guard.canceled_response_callbacks.insert(
+                call_id,
+                callback.abandoned_object_group().map(str::to_owned),
+            );
+        } else {
+            guard
+                .canceled_response_callbacks
+                .entry(call_id)
+                .or_insert(None);
+        }
     }
 
     pub(in crate::script_vm) fn len(&self) -> usize {
         self.state().borrow().messages.len()
     }
 
-    pub(in crate::script_vm) fn take_messages_after(&self, snapshot_len: usize) -> Vec<Value> {
+    pub(in crate::script_vm) fn take_messages_after(
+        &self,
+        snapshot_len: usize,
+    ) -> Vec<InspectorJson> {
         let state = self.state();
         let mut guard = state.borrow_mut();
         if snapshot_len >= guard.messages.len() {
@@ -554,11 +608,11 @@ impl InspectorOutbound {
             .enumerate()
             .skip(snapshot_len)
             .find_map(|(index, message)| {
-                (message.value.get("id").and_then(Value::as_i64) == Some(call_id)).then_some(index)
+                (message.value.id_i64() == Some(call_id)).then_some(index)
             });
         position
             .and_then(|position| guard.messages.remove(position))
-            .map(|message| message.value)
+            .map(|message| message.value.into_value())
     }
 
     // DOMDebugger's internal Runtime.callFunctionOn can execute JS, unlike the
@@ -570,18 +624,21 @@ impl InspectorOutbound {
         let routing_available = {
             let routing = self.response_routing.borrow();
             !routing.pending_response_callbacks.contains_key(&call_id)
-                && !routing.canceled_response_callbacks.contains(&call_id)
+                && !routing.canceled_response_callbacks.contains_key(&call_id)
                 && !routing
                     .internal_dispatch_response_call_ids
                     .contains(&call_id)
         };
         routing_available
-            && !self.state().borrow().messages.iter().any(|message| {
-                message.value.get("id").and_then(Value::as_i64) == Some(i64::from(call_id))
-            })
+            && !self
+                .state()
+                .borrow()
+                .messages
+                .iter()
+                .any(|message| message.value.id_i64() == Some(i64::from(call_id)))
     }
 
-    pub(super) fn values_after(&self, snapshot_len: usize) -> Vec<Value> {
+    pub(super) fn values_after(&self, snapshot_len: usize) -> Vec<InspectorJson> {
         let state = self.state();
         let guard = state.borrow();
         if snapshot_len >= guard.messages.len() {
@@ -595,7 +652,7 @@ impl InspectorOutbound {
             .collect()
     }
 
-    pub(in crate::script_vm) fn take_pending_messages(&self) -> Vec<Value> {
+    pub(in crate::script_vm) fn take_pending_messages(&self) -> Vec<InspectorJson> {
         let state = self.state();
         let mut guard = state.borrow_mut();
         guard
@@ -814,9 +871,12 @@ mod tests {
             .borrow()
             .clone()
             .expect("frontend route");
-        route.route_notification(&serde_json::json!({
-            "method": "Debugger.paused", "params": {"callFrames": []}
-        }));
+        route.route_notification(
+            &serde_json::json!({
+                "method": "Debugger.paused", "params": {"callFrames": []}
+            })
+            .into(),
+        );
         assert!(bridge.enter_pause().is_some());
         let dispatch = bridge.begin_command_dispatch(
             1,
@@ -843,7 +903,7 @@ mod tests {
         assert!(
             matches!(
                 route.route_notification(
-                    &serde_json::json!({"method": "Debugger.resumed", "params": {}})
+                    &serde_json::json!({"method": "Debugger.resumed", "params": {}}).into()
                 ),
                 RendererInspectorPauseNotificationRoute::PublishImmediately {
                     command_output: None,
@@ -918,11 +978,15 @@ mod tests {
                 if batch.messages.iter().any(|message| matches!(
                     message,
                     RendererRuntimeInspectorMessage::Protocol(value)
-                        if value["method"] == "Runtime.consoleAPICalled"
+                        if value.payload().method() == Some("Runtime.consoleAPICalled")
                 ))
         ));
         assert_eq!(
-            outbound.take_pending_messages(),
+            outbound
+                .take_pending_messages()
+                .into_iter()
+                .map(InspectorJson::into_value)
+                .collect::<Vec<_>>(),
             vec![serde_json::json!({
                 "id": 7,
                 "result": {"value": "response"}
@@ -954,7 +1018,7 @@ mod tests {
                 if batch.messages.iter().any(|message| matches!(
                     message,
                     RendererRuntimeInspectorMessage::Protocol(value)
-                        if value["method"] == "Runtime.consoleAPICalled"
+                        if value.payload().method() == Some("Runtime.consoleAPICalled")
                 ))
         ));
     }

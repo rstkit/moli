@@ -1,5 +1,6 @@
 use super::super::store::headers_entries;
 use super::*;
+use crate::web_api_interfaces;
 use crate::{
     callback_invocation::invoke_synchronous_webidl_callback_function,
     util::{
@@ -35,14 +36,14 @@ enum HeadersIteratorKind {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct HeadersIteratorResultDeclaration<'scope> {
     done: bool,
     value: v8::Local<'scope, v8::Value>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::HeadersIterator)]
 struct HeadersIteratorDeclaration<'scope> {
     #[webapi(slot = HEADERS_ITERATOR_TARGET_SLOT)]
     target: v8::Local<'scope, v8::Object>,
@@ -54,7 +55,7 @@ struct HeadersIteratorDeclaration<'scope> {
 
 #[derive(WebApiFunctionTemplate)]
 #[webapi(
-    name = "Headers Iterator",
+    interface = web_api_interfaces::HeadersIterator,
     intrinsic_prototype_parent = v8::Intrinsic::IteratorPrototype,
     prototype_to_string_tag = "Headers Iterator",
     readonly_prototype,
@@ -125,11 +126,18 @@ pub(in crate::network_host::headers) fn headers_for_each_callback<'s>(
         .this_arg
         .unwrap_or_else(|| v8::undefined(scope).into());
     let callback = parsed.callback.prepare(scope);
-    for (name, value) in headers_entries(scope, this) {
-        let Some(name) = v8_string(scope, &name) else {
+    let mut index = 0;
+    loop {
+        // Script can change both the values and the sorted pair order.
+        let entries = headers_entries(scope, this);
+        let Some((name, value)) = entries.get(index) else {
+            break;
+        };
+        index += 1;
+        let Some(name) = v8_string(scope, name) else {
             continue;
         };
-        let Some(value) = v8_string(scope, &value) else {
+        let Some(value) = v8_string(scope, value) else {
             continue;
         };
         if invoke_synchronous_webidl_callback_function(
@@ -157,7 +165,9 @@ fn live_headers_iterator<'s>(
         .ok()?;
 
     let prototype = headers_iterator_prototype(scope)?;
-    iterator.set_prototype(scope, prototype.into())?;
+    iterator
+        .set_prototype(scope, prototype.into())?
+        .then_some(())?;
     Some(iterator.into())
 }
 

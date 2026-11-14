@@ -1,8 +1,457 @@
+#[path = "websocket/split30_websocket_native_receivers.rs"]
+mod split30_websocket_native_receivers;
+
 use super::*;
+use crate::types::SubresourceInterceptionClasses;
 use moli_webapi_declare::WebApiObject;
 
+use moli_websocket::test_support::{header_value, spawn_tls_header_capture_websocket_server};
+
+#[tokio::test]
+async fn websocket_cross_origin_popup_child_initial_blank_uses_popup_handshake_origin() {
+    assert_websocket_cross_origin_popup_child_handshake_origin(false).await;
+}
+
+#[tokio::test]
+async fn websocket_cross_origin_popup_child_srcdoc_uses_popup_handshake_origin() {
+    assert_websocket_cross_origin_popup_child_handshake_origin(true).await;
+}
+
+async fn assert_websocket_cross_origin_popup_child_handshake_origin(srcdoc: bool) {
+    for constructor in ["WebSocket", "WebSocketStream"] {
+        for nested in [false, true] {
+            for sandboxed in [false, true] {
+                if sandboxed && !srcdoc {
+                    continue;
+                }
+                let (socket_url, headers_rx, server) =
+                    spawn_tls_header_capture_websocket_server().await;
+                let mut opener_url =
+                    moli_websocket::websocket_cookie_url(&url::Url::parse(&socket_url).unwrap());
+                opener_url.set_path("/frame.html");
+                let popup_origin = moli_url::origin_ascii_serialization(&opener_url);
+                let host_url = "https://websocket-host.test/";
+                let host_origin =
+                    moli_url::origin_ascii_serialization(&url::Url::parse(host_url).unwrap());
+                assert_ne!(popup_origin, host_origin);
+                let mut config = moli_fetch::FetchConfig::default();
+                config.set_tls_verify_host(false);
+                let loader = ResourceRequestClient::new(&config).unwrap();
+                let mut vm = new_page_task_executor_test_vm_with_loader(host_url, &loader);
+                // The popup must retain B's policy as well as B's origin;
+                // accidentally inheriting the host's policy would block it.
+                vm.set_main_navigation_policy_container(
+                    crate::document_runtime::DocumentPolicyContainer::from_navigation_response_headers(
+                        &[("Content-Security-Policy".to_owned(), b"connect-src 'none'".to_vec())],
+                        &url::Url::parse(host_url).unwrap(),
+                    ),
+                );
+                // Fulfill only the cross-origin opener Document. WebSocket
+                // handshakes must reach the actual TLS server.
+                vm.set_fetch_subresource_interception(
+                    SubresourceInterceptionClasses::for_resource_type(
+                        crate::types::SubresourceResourceType::Document,
+                    ),
+                );
+                let opener_literal = serde_json::to_string(opener_url.as_str()).unwrap();
+                vm.eval(&format!(
+                    r#"
+                    globalThis.__popupChildOriginResult = null;
+                    globalThis.__popupChildOriginViolations = [];
+                    addEventListener('message', event => {{
+                        if (event.data.kind === 'popup-child-origin') {{
+                            __popupChildOriginResult = event.data;
+                        }} else if (event.data.kind === 'popup-child-origin-csp') {{
+                            __popupChildOriginViolations.push(event.data.policy);
+                        }}
+                    }});
+                    const frame = document.createElement('iframe');
+                    frame.src = {opener_literal};
+                    document.body.appendChild(frame);
+                    "#,
+                ))
+                .unwrap();
+                vm.drain_ready_page_task_executor_turns_for_setup(&loader, 128)
+                    .await
+                    .unwrap();
+                let pending = vm.take_pending_subresource_fetch_infos();
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].url, opener_url);
+                assert_eq!(
+                    pending[0].resource_type,
+                    crate::types::SubresourceResourceType::Document
+                );
+                let socket_literal = serde_json::to_string(&socket_url).unwrap();
+                let probe = format!(
+                    r#"
+                    const reportWindow = top.opener.parent;
+                    const report = result => reportWindow.postMessage({{
+                        kind: 'popup-child-origin', documentURL: document.URL, result
+                    }}, '*');
+                    addEventListener('securitypolicyviolation', event => {{
+                        reportWindow.postMessage({{
+                            kind: 'popup-child-origin-csp', policy: event.originalPolicy
+                        }}, '*');
+                    }});
+                    try {{
+                        const socket = new {constructor}({socket_literal});
+                        if (socket.opened) {{
+                            socket.opened.then(() => report('opened'), error => report(error.name));
+                        }} else {{
+                            socket.onopen = () => report('opened');
+                            socket.onerror = () => report('error');
+                        }}
+                    }} catch (error) {{ report(error.name); }}
+                    void 0;
+                    "#,
+                );
+                let probe_literal = serde_json::to_string(&probe).unwrap();
+                let markup_literal = serde_json::to_string(&format!("<script>{probe}</script>"))
+                    .unwrap()
+                    .replace('<', "\\u003c");
+                let frame_script = format!(
+                    r#"
+                    const frame = document.createElement('iframe');
+                    if ({sandboxed}) frame.sandbox = 'allow-scripts';
+                    if ({srcdoc}) {{
+                        frame.srcdoc = {markup_literal};
+                        document.body.appendChild(frame);
+                    }} else {{
+                        document.body.appendChild(frame);
+                        frame.src = 'javascript:' + encodeURIComponent({probe_literal});
+                    }}
+                    void 0;
+                    "#,
+                );
+                let popup_script = if nested {
+                    let outer_markup = serde_json::to_string(&format!(
+                        "<!doctype html><body><script>{frame_script}</script>",
+                    ))
+                    .unwrap();
+                    format!(
+                        "const outer = document.createElement('iframe');\
+                        outer.srcdoc = {outer_markup}; document.body.appendChild(outer); void 0;"
+                    )
+                } else {
+                    frame_script
+                };
+                let popup_literal = serde_json::to_string(&popup_script)
+                    .unwrap()
+                    .replace('<', "\\u003c");
+                let opener_html = format!(
+                    "<script>const popup = open('about:blank');\
+                     popup.location.href = 'javascript:' + encodeURIComponent({popup_literal});</script>",
+                );
+                vm.fulfill_pending_subresource_fetch(
+                    pending[0].internal_id,
+                    200,
+                    vec![
+                        (
+                            "Content-Type".to_owned(),
+                            b"text/html; charset=utf-8".to_vec(),
+                        ),
+                        (
+                            "Content-Security-Policy".to_owned(),
+                            b"connect-src 'self'".to_vec(),
+                        ),
+                    ],
+                    crate::runtime::RendererSyntheticResponseBody::from_bytes(
+                        opener_html.into_bytes(),
+                    ),
+                )
+                .unwrap();
+                let context = format!(
+                    "{constructor}, srcdoc={srcdoc}, nested={nested}, sandboxed={sandboxed}"
+                );
+                advance_page_task_executor_until_eval_equals(
+                    &mut vm,
+                    &loader,
+                    "String(__popupChildOriginResult !== null)",
+                    "true",
+                    &context,
+                )
+                .await;
+                let result: serde_json::Value = serde_json::from_str(
+                    &vm.eval("JSON.stringify(__popupChildOriginResult)").unwrap(),
+                )
+                .unwrap();
+                if result["result"] != "opened" {
+                    vm.drain_ready_page_task_executor_turns_for_setup(&loader, 128)
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(
+                    result,
+                    serde_json::json!({
+                        "kind": "popup-child-origin",
+                        "documentURL": if srcdoc { "about:srcdoc" } else { "about:blank" },
+                        "result": "opened",
+                    }),
+                    "{context}; CSP violations={}",
+                    vm.eval("JSON.stringify(__popupChildOriginViolations)")
+                        .unwrap(),
+                );
+                let headers = tokio::time::timeout(std::time::Duration::from_secs(3), headers_rx)
+                    .await
+                    .expect("popup child handshake should arrive")
+                    .expect("popup child header capture channel should stay open");
+                server.await.expect("popup child TLS server should finish");
+                let origin = header_value(&headers, "origin");
+                assert_ne!(origin.as_deref(), Some(host_origin.as_str()), "{context}");
+                assert_eq!(
+                    origin.as_deref(),
+                    Some(if sandboxed { "null" } else { &popup_origin }),
+                    "{context}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn websocket_popup_child_frames_inherit_secure_popup_with_http_host() {
+    assert_websocket_popup_child_frames_security(
+        "http://websocket-host.test/",
+        "https://websocket-opener.test/frame.html",
+        "SecurityError",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn websocket_popup_child_frames_do_not_inherit_https_host_security() {
+    assert_websocket_popup_child_frames_security(
+        "https://websocket-host.test/",
+        "http://websocket-opener.test/frame.html",
+        "allowed",
+    )
+    .await;
+}
+
+async fn assert_websocket_popup_child_frames_security(
+    host_url: &str,
+    opener_url: &str,
+    expected: &str,
+) {
+    for srcdoc in [false, true] {
+        for nested in [false, true] {
+            let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+            let mut vm = new_page_task_executor_test_vm_with_loader(host_url, &loader);
+            // Supply the opener's response without external networking, and
+            // hold any allowed WebSocket handshake at the request boundary.
+            vm.set_fetch_subresource_interception(SubresourceInterceptionClasses::ALL);
+            vm.eval(&format!(
+                r#"
+                globalThis.__popupChildWebSocketResult = null;
+                addEventListener('message', event => {{
+                    if (event.data.kind === 'popup-child-websocket') {{
+                        __popupChildWebSocketResult = event.data;
+                    }}
+                }});
+                const frame = document.createElement('iframe');
+                frame.src = {opener_url:?};
+                document.body.appendChild(frame);
+                "#,
+            ))
+            .unwrap();
+            vm.drain_ready_page_task_executor_turns_for_setup(&loader, 128)
+                .await
+                .unwrap();
+            let pending = vm.take_pending_subresource_fetch_infos();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].resource_type,
+                crate::types::SubresourceResourceType::Document
+            );
+            assert_eq!(pending[0].url.as_str(), opener_url);
+
+            // Both branches run the constructor in the innermost iframe's
+            // script, rather than borrowing it through a cross-origin Window.
+            let probe = r#"
+                let result;
+                try {
+                    new WebSocket('ws://insecure.invalid/socket');
+                    result = 'allowed';
+                } catch (error) {
+                    result = error.name;
+                }
+                top.opener.parent.postMessage({
+                    kind: 'popup-child-websocket', documentURL: document.URL, result
+                }, '*');
+                void 0;
+            "#;
+            let probe_literal = serde_json::to_string(probe).unwrap();
+            let markup_literal = serde_json::to_string(&format!("<script>{probe}</script>"))
+                .unwrap()
+                .replace('<', "\\u003c");
+            let frame_script = format!(
+                r#"
+                const frame = document.createElement('iframe');
+                if ({srcdoc}) {{
+                    frame.srcdoc = {markup_literal};
+                    document.body.appendChild(frame);
+                }} else {{
+                    document.body.appendChild(frame);
+                    frame.src = 'javascript:' + encodeURIComponent({probe_literal});
+                }}
+                void 0;
+                "#,
+            );
+            let popup_script = if nested {
+                let outer_html = serde_json::to_string(&format!(
+                    "<!doctype html><body><script>{frame_script}</script>"
+                ))
+                .unwrap();
+                format!(
+                    "const outer = document.createElement('iframe');\
+                     outer.srcdoc = {outer_html}; document.body.appendChild(outer); void 0;"
+                )
+            } else {
+                frame_script
+            };
+            let script_literal = serde_json::to_string(&popup_script)
+                .unwrap()
+                .replace('<', "\\u003c");
+            let opener_html = format!(
+                "<script>const popup = open('about:blank');\
+                 popup.location.href = 'javascript:' + encodeURIComponent({script_literal});</script>"
+            );
+            // Child Document fulfillment queues its response; the production
+            // Page task executor below runs the commit and the frame scripts.
+            vm.fulfill_pending_subresource_fetch(
+                pending[0].internal_id,
+                200,
+                vec![(
+                    "Content-Type".to_owned(),
+                    b"text/html; charset=utf-8".to_vec(),
+                )],
+                crate::runtime::RendererSyntheticResponseBody::from_bytes(opener_html.into_bytes()),
+            )
+            .unwrap();
+            advance_page_task_executor_until_eval_equals(
+                &mut vm,
+                &loader,
+                "String(__popupChildWebSocketResult !== null)",
+                "true",
+                &format!("popup child WebSocket: {host_url}, {opener_url}, srcdoc={srcdoc}, nested={nested}"),
+            )
+            .await;
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    &vm.eval("JSON.stringify(__popupChildWebSocketResult)")
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::json!({
+                    "kind": "popup-child-websocket",
+                    "documentURL": if srcdoc { "about:srcdoc" } else { "about:blank" },
+                    "result": expected,
+                }),
+                "{host_url}, {opener_url}, srcdoc={srcdoc}, nested={nested}",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn websocket_popup_http_base_does_not_bypass_mixed_content() {
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+    let mut vm = new_storage_test_vm_with_loader("https://websocket-popup.test/", &loader);
+    vm.eval(
+        r#"
+            (() => {
+                const popup = window.open('about:blank');
+                popup.location.href = `javascript:
+                const base = document.createElement('base');
+                base.href = 'http://different-origin.test/';
+                document.head.appendChild(base);
+                opener.__popupMixedContent = [WebSocket, WebSocketStream].map(Constructor => {
+                    try {
+                        new Constructor('ws://insecure.invalid/socket');
+                        return 'allowed';
+                    } catch (error) {
+                        return error.name;
+                    }
+                }).join('|');
+                void 0;`;
+            })()
+            "#,
+    )
+    .expect("popup mixed-content checks should evaluate");
+    vm.drain_pending_child_frame_work_for_test();
+    assert!(
+        vm.run_next_due_timer_callback_for_test(&loader)
+            .await
+            .unwrap()
+    );
+    let result = vm.eval("String(__popupMixedContent)").unwrap();
+    assert_eq!(result, "SecurityError|SecurityError");
+}
+
+#[tokio::test]
+async fn websocket_popup_https_base_does_not_create_secure_context() {
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+    let mut vm = new_storage_test_vm_with_loader("http://websocket-popup.test/", &loader);
+    vm.eval(
+        r#"
+            (() => {
+                const popup = window.open('about:blank');
+                popup.location.href = `javascript:
+                const base = document.createElement('base');
+                base.href = 'https://different-origin.test/';
+                document.head.appendChild(base);
+                try {
+                    opener.__popupMixedContent = new WebSocket('ws://insecure.invalid/socket').url;
+                } catch (error) {
+                    opener.__popupMixedContent = error.name;
+                }
+                void 0;`;
+            })()
+            "#,
+    )
+    .expect("insecure popup WebSocket construction should evaluate");
+    vm.drain_pending_child_frame_work_for_test();
+    assert!(
+        vm.run_next_due_timer_callback_for_test(&loader)
+            .await
+            .unwrap()
+    );
+    let result = vm.eval("String(__popupMixedContent)").unwrap();
+    assert_eq!(result, "ws://insecure.invalid/socket");
+}
+
+#[test]
+fn websocket_relative_urls_follow_each_receiver_document_base() {
+    let mut vm = new_storage_html_test_vm("https://websocket-base.test/page.html");
+    let result = vm
+        .eval(
+            r#"
+            (() => {
+                const frame = document.createElement('iframe');
+                document.body.appendChild(frame);
+                return [window, frame.contentWindow].flatMap(realm => {
+                    const base = realm.document.createElement('base');
+                    base.href = 'https://different-origin.test/socket-base/';
+                    realm.document.head.appendChild(base);
+                    return ['WebSocket', 'WebSocketStream'].map(name => {
+                        return new realm[name]({toString() {
+                            base.href = 'https://live-base.test/converted/';
+                            return 'relative';
+                        }}).url;
+                    });
+                }).join('|');
+            })()
+            "#,
+        )
+        .expect("WebSocket relative URLs should follow the receiver's live base");
+    assert_eq!(
+        result,
+        ["wss://live-base.test/converted/relative"; 4].join("|")
+    );
+}
+
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", allow_empty)]
+#[webapi(plain)]
 struct LoadingWorkerWrapperProbeDeclaration {}
 
 fn loading_worker_wrapper_probe<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
@@ -498,12 +947,14 @@ fn websocket_wpt_target_event_target_listener_options_and_objects() {
                 throw new Error(`WebSocket simple EventTarget internals should not be reflected: ${simpleOwn.join(',')}`);
             }
             const expected = {
-                addEventListener: 'true:true:true:true:function:0:addEventListener',
-                removeEventListener: 'true:true:true:true:function:0:removeEventListener',
-                dispatchEvent: 'true:true:true:true:function:0:dispatchEvent'
+                addEventListener: 'true:true:true:true:function:2:addEventListener',
+                removeEventListener: 'true:true:true:true:function:2:removeEventListener',
+                dispatchEvent: 'true:true:true:true:function:1:dispatchEvent'
             };
             for (const [name, shape] of Object.entries(expected)) {
-                const descriptor = Object.getOwnPropertyDescriptor(socket, name);
+                if (Object.hasOwn(socket, name) || socket[name] !== EventTarget.prototype[name])
+                    throw new Error(`inherited EventTarget method ${name}`);
+                const descriptor = Object.getOwnPropertyDescriptor(EventTarget.prototype, name);
                 const actual = [
                     !!descriptor,
                     descriptor && descriptor.enumerable,
@@ -1054,7 +1505,7 @@ fn websocket_wpt_target_message_event_constructor_surface() {
                     second.lastEventId,
                     'ports' in second,
                     'source' in second,
-                    new MessageEvent('message', { data: undefined }).data === undefined
+                    new MessageEvent('message', { data: undefined }).data === null
                 ].join('|');
             })()
             "#,
@@ -1091,7 +1542,7 @@ fn websocket_wpt_target_constructor_identity_and_string_tags() {
 
     assert_eq!(
         result,
-        "1|WebSocket|true|[object WebSocket]|[object WebSocket]|[object WebSocketPrototype]"
+        "1|WebSocket|true|[object WebSocket]|[object WebSocket]|[object WebSocket]"
     );
 }
 
@@ -1131,7 +1582,7 @@ fn websocket_wpt_target_global_constructor_and_prototype_descriptors() {
 }
 
 #[test]
-fn websocket_wpt_target_close_event_reason_usvstring_conversion() {
+fn websocket_wpt_target_close_event_reason_domstring_conversion() {
     let mut vm = new_storage_test_vm("https://websocket-wpt-target.test/");
 
     let result = vm
@@ -1146,9 +1597,9 @@ fn websocket_wpt_target_close_event_reason_usvstring_conversion() {
             })()
             "#,
         )
-        .expect("target CloseEvent USVString conversion test should evaluate");
+        .expect("target CloseEvent DOMString conversion test should evaluate");
 
-    assert_eq!(result, "1|fffd");
+    assert_eq!(result, "1|d800");
 }
 
 #[test]
@@ -1468,22 +1919,12 @@ fn websocket_wpt_target_binary_type_accessor_surface() {
             if (socket.binaryType !== 'arraybuffer') {
                 throw new Error('binaryType should accept arraybuffer');
             }
-            let invalidDidThrow = (() => {
-                try {
-                    socket.binaryType = 'notBlobOrArrayBuffer';
-                    return false;
-                } catch (error) {
-                    if (error?.name !== 'SyntaxError') {
-                        throw error;
-                    }
-                    return true;
+            for (const value of ['notBlobOrArrayBuffer', 'ArrayBuffer', '', undefined,
+                                 null, false, 7, 7n, '\ud800']) {
+                socket.binaryType = value;
+                if (socket.binaryType !== 'arraybuffer') {
+                    throw new Error('invalid binaryType assignments should preserve the previous value');
                 }
-            })();
-            if (!invalidDidThrow) {
-                throw new Error('invalid binaryType assignments should throw SyntaxError');
-            }
-            if (socket.binaryType !== 'arraybuffer') {
-                throw new Error('invalid binaryType assignments should preserve the previous value');
             }
             Object.defineProperty(WebSocket.prototype, 'binaryType', {
                 configurable: true,
@@ -1506,7 +1947,53 @@ fn websocket_wpt_target_binary_type_accessor_surface() {
         })()
         "#,
     )
-    .expect("target WebSocket binaryType accessor surface test should pass once implemented");
+    .expect("WebSocket binaryType descriptors, enum values, and overrides should evaluate");
+}
+
+#[test]
+fn websocket_binary_type_conversion_preserves_reentry_and_errors() {
+    let mut vm = new_storage_test_vm("https://websocket-binary-type.test/");
+    let result = vm.eval(
+        r#"
+        (() => {
+            function check(value, message) { if (!value) throw new Error(message); }
+            const socket = new WebSocket('wss://example.test/socket');
+            socket.binaryType = 'arraybuffer';
+            const calls = [];
+            socket.binaryType = {
+                [Symbol.toPrimitive](hint) {
+                    calls.push(hint);
+                    check(socket.binaryType === 'arraybuffer', 'read the current value during conversion');
+                    socket.binaryType = 'blob';
+                    return 'invalid';
+                }
+            };
+            check(calls.join(',') === 'string', 'convert exactly once with a string hint');
+            check(socket.binaryType === 'blob', 'an invalid outer value keeps reentrant mutations');
+            socket.binaryType = {
+                toString() { calls.push('toString'); return 'arraybuffer'; }
+            };
+            check(calls.join(',') === 'string,toString', 'ordinary ToString also runs once');
+            check(socket.binaryType === 'arraybuffer', 'accept a converted enum value');
+            let caught;
+            try { socket.binaryType = Symbol('invalid'); } catch (error) { caught = error; }
+            check(caught instanceof TypeError, 'Symbol conversion must still throw TypeError');
+            check(socket.binaryType === 'arraybuffer', 'Symbol failure preserves the current value');
+            const marker = {};
+            caught = undefined;
+            try { socket.binaryType = {toString() { throw marker; }}; }
+            catch (error) { caught = error; }
+            check(caught === marker, 'propagate the original conversion exception');
+            check(socket.binaryType === 'arraybuffer', 'conversion failure preserves the current value');
+            socket.close();
+            socket.binaryType = 'blob';
+            socket.binaryType = 'invalid';
+            check(socket.binaryType === 'blob', 'enum assignment remains available after close');
+            return 'ok';
+        })()
+        "#,
+    ).expect("WebSocket binaryType should preserve observable conversion semantics");
+    assert_eq!(result, "ok");
 }
 
 #[test]
@@ -2247,5 +2734,21 @@ fn readable_stream_async_iterator_declared_shape_keeps_symbol_and_tag() {
     assert_eq!(
         result,
         r#"{"toString":"[object ReadableStream AsyncIterator]","asyncIteratorReturnsSelf":true,"globalNamesBefore":"","globalNamesAfterCache":"","globalNamesAfterSpoof":"__moliReadableStreamAsyncIteratorPrototype","ownNames":[],"ownSymbols":[],"leaksReader":false,"leaksClosed":false,"leaksPreventCancel":false,"asyncDescriptor":"false,true,true,0","prototypeParentIsIntrinsic":true,"prototypeStableAfterSpoof":true,"prototypeNames":["next","return"],"prototypeHasConstructor":false,"tagDescriptor":"false,false,true,ReadableStream AsyncIterator"}"#
+    );
+}
+
+#[test]
+fn websocket_error_messages_preserve_utf16_code_units() {
+    let mut vm = new_parsed_test_vm(
+        "https://websocket-conversion.test/",
+        "<html><body></body></html>",
+    );
+    let probe = include_str!("../../../tests/fixtures/websocket-error-message-utf16.js");
+    assert_eq!(
+        vm.eval(&format!(
+            "{probe}\ndocument.body.innerHTML = '<iframe></iframe>';\n\
+             JSON.stringify([websocketErrorMessageUtf16Probe(window), websocketErrorMessageUtf16Probe(document.querySelector('iframe').contentWindow)])"
+        )).unwrap(),
+        r#"["ok","ok"]"#
     );
 }

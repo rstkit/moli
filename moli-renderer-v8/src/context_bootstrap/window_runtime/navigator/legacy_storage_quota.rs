@@ -7,19 +7,14 @@
 //! Quota state is intentionally synthetic; scheduling, owner authorization,
 //! task completion, and retry policy do not live in this module.
 
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 use moli_webidl_callback::WebIdlCallbackFunction;
 
 use crate::{
-    host::report_event_callback_exception,
-    native_bridge::JsContextHost,
-    page_task_queue::RendererPageMiscPlatformApiTaskKind,
-    util::context_host_ptr_from_global_bridge,
-    webidl,
-    window_webidl_callback::{
-        WindowWebIdlCallbackFunction, WindowWebIdlCallbackFunctionOutcome,
-        invoke_window_webidl_callback_function,
-    },
+    native_bridge::PageScriptHost, page_task_queue::RendererPageMiscPlatformApiTaskKind,
+    util::context_host_ptr_from_global_bridge, webidl,
+    window_webidl_callback::WindowWebIdlCallbackFunction,
 };
 
 use super::super::super::navigation_window::navigation_document_has_opaque_origin;
@@ -30,7 +25,7 @@ const TEMPORARY_STORAGE_TYPE: f64 = 0.0;
 const PERSISTENT_STORAGE_TYPE: f64 = 1.0;
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::DeprecatedStorageQuota)]
 struct LegacyStorageQuotaObjectDeclaration {
     #[webapi(
         method,
@@ -50,7 +45,7 @@ struct LegacyStorageQuotaObjectDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::DeprecatedStorageInfo)]
 struct LegacyStorageInfoObjectDeclaration {
     #[webapi(data_property = "TEMPORARY", enumerable)]
     temporary: f64,
@@ -169,7 +164,7 @@ pub(crate) enum LegacyStorageQuotaCallbackTaskEffect {
 impl LegacyStorageQuotaCallbackTask {
     pub(crate) fn new(
         scope: &mut v8::PinScope<'_, '_>,
-        host: &JsContextHost,
+        host: &PageScriptHost,
         callback: WebIdlCallbackFunction,
         outcome: LegacyStorageQuotaCallbackOutcome,
     ) -> Self {
@@ -182,18 +177,21 @@ impl LegacyStorageQuotaCallbackTask {
     pub(crate) fn invoke(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
     ) -> LegacyStorageQuotaCallbackTaskEffect {
-        let prepared = self.callback.prepare(scope);
-        let relevant_identity = prepared.relevant_identity();
-        let host = unsafe { &*host_ptr };
-        if !prepared.is_current(host) {
+        let Some(identity) = self.callback.relevant_identity() else {
+            return LegacyStorageQuotaCallbackTaskEffect::CallbackNotInvoked;
+        };
+        if !unsafe { &*host_ptr }.window_execution_context_identity_is_current(identity) {
             return LegacyStorageQuotaCallbackTaskEffect::CallbackNotInvoked;
         }
         let Some(relevant_context) = self.callback.relevant_context(scope) else {
             return LegacyStorageQuotaCallbackTaskEffect::CallbackNotInvoked;
         };
         let scope = &mut v8::ContextScope::new(scope, relevant_context);
+        let Some(callback) = self.callback.prepare_execution(scope, host_ptr, None) else {
+            return LegacyStorageQuotaCallbackTaskEffect::CallbackNotInvoked;
+        };
         let arguments: Vec<v8::Local<'_, v8::Value>> = match self.outcome {
             LegacyStorageQuotaCallbackOutcome::UsageAndQuota { usage, quota } => vec![
                 v8::Number::new(scope, usage).into(),
@@ -209,37 +207,16 @@ impl LegacyStorageQuotaCallbackTask {
             }
         };
         let receiver = v8::undefined(scope);
-        match invoke_window_webidl_callback_function(
+        if callback.invoke_and_report(
             scope,
-            host_ptr,
-            match self.outcome {
-                LegacyStorageQuotaCallbackOutcome::UsageAndQuota { .. } => "StorageUsageCallback",
-                LegacyStorageQuotaCallbackOutcome::GrantedQuota { .. } => "StorageQuotaCallback",
-                LegacyStorageQuotaCallbackOutcome::Error { .. } => "StorageErrorCallback",
-            },
-            "deprecated storage quota callback threw",
+            "deprecatedstoragequota",
             "deprecated storage quota callback",
-            &prepared,
             receiver.into(),
             &arguments,
         ) {
-            WindowWebIdlCallbackFunctionOutcome::Returned => {
-                LegacyStorageQuotaCallbackTaskEffect::CallbackInvoked
-            }
-            WindowWebIdlCallbackFunctionOutcome::Threw(report) => {
-                report_event_callback_exception(
-                    scope,
-                    host_ptr,
-                    "deprecatedstoragequota",
-                    relevant_identity,
-                    None,
-                    &report,
-                );
-                LegacyStorageQuotaCallbackTaskEffect::CallbackInvoked
-            }
-            WindowWebIdlCallbackFunctionOutcome::Retired => {
-                LegacyStorageQuotaCallbackTaskEffect::CallbackNotInvoked
-            }
+            LegacyStorageQuotaCallbackTaskEffect::CallbackInvoked
+        } else {
+            LegacyStorageQuotaCallbackTaskEffect::CallbackNotInvoked
         }
     }
 }

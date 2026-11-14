@@ -1,6 +1,10 @@
-use super::dispatch_media_query_list_event;
+use super::event::create_media_query_list_event;
+use super::{
+    dispatch_media_query_list_event, initialize_simple_event_target,
+    simple_object_event_set_handler,
+};
 use crate::context_bootstrap::DEFAULT_WINDOW_SURFACE_PROFILE;
-use crate::context_bootstrap::events::initialize_event_object;
+use crate::context_bootstrap::current_window_style_viewport;
 use crate::context_bootstrap::{
     MEDIA_QUERY_LIST_MATCHES_SLOT, MEDIA_QUERY_LIST_MEDIA_SLOT, MEDIA_QUERY_LIST_ONCHANGE_SLOT,
     MEDIA_QUERY_LIST_REGISTRY_SLOT,
@@ -14,23 +18,12 @@ use crate::util::{
     callback_data_index_value, callback_data_item, context_host_ptr_from_global_bridge,
     get_private_value, set_private_value,
 };
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
-fn current_window_style_viewport(
-    scope: &mut v8::PinScope<'_, '_>,
-    host: &crate::native_bridge::JsContextHost,
-) -> StyleViewport {
-    let global = scope.get_current_context().global(scope);
-    super::super::window_accessors::window_child_context_handle(scope, global)
-        .and_then(|frame_handle| {
-            crate::native_bridge::element::iframe_handle_viewport(host, frame_handle)
-        })
-        .unwrap_or_else(|| host.style_viewport())
-}
-
 #[derive(WebApiObject)]
-#[webapi(interface = "MediaQueryList")]
+#[webapi(interface = web_api_interfaces::MediaQueryList)]
 struct MediaQueryListObjectDeclaration {
     #[webapi(slot = MEDIA_QUERY_LIST_MEDIA_SLOT)]
     media: String,
@@ -41,7 +34,7 @@ struct MediaQueryListObjectDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MediaQueryList")]
+#[webapi(interface = web_api_interfaces::MediaQueryList, receiver)]
 struct MediaQueryListPrototypeAccessorsDeclaration {
     #[webapi(
         accessor_property,
@@ -64,19 +57,6 @@ struct MediaQueryListPrototypeAccessorsDeclaration {
         enumerable
     )]
     onchange: (),
-}
-
-#[derive(WebApiObject)]
-#[webapi(interface = "Event", allow_empty)]
-struct MediaQueryListChangeEventObjectDeclaration {}
-
-#[derive(WebApiObject)]
-#[webapi(interface = "Event")]
-struct MediaQueryListChangeEventPropertiesDeclaration {
-    #[webapi(data_property)]
-    media: String,
-    #[webapi(data_property)]
-    matches: bool,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -109,10 +89,15 @@ fn media_query_list_attribute_getter_callback<'s>(
         return;
     };
     if slot == MEDIA_QUERY_LIST_MATCHES_SLOT {
+        let context = args
+            .this()
+            .get_creation_context(scope)
+            .unwrap_or_else(|| scope.get_current_context());
+        let scope = &mut v8::ContextScope::new(scope, context);
         let media = media_query_list_media_slot(scope, args.this()).unwrap_or_default();
         let matches = if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
             let host = unsafe { &*host_ptr };
-            evaluate_match_media_query_list_with_viewport(
+            evaluate_media_query_list(
                 &media,
                 Some(host.emulated_media()),
                 current_window_style_viewport(scope, host),
@@ -151,12 +136,14 @@ fn media_query_list_onchange_setter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let value = if args.get(0).is_null_or_undefined() {
-        v8::null(scope).into()
-    } else {
-        args.get(0)
-    };
-    set_media_query_list_slot_value(scope, args.this(), MEDIA_QUERY_LIST_ONCHANGE_SLOT, value);
+    let target = args.this();
+    simple_object_event_set_handler(
+        scope,
+        target,
+        "change",
+        MEDIA_QUERY_LIST_ONCHANGE_SLOT,
+        args.get(0),
+    );
     rv.set_undefined();
 }
 
@@ -179,14 +166,12 @@ pub(crate) fn window_match_media_callback<'s>(
         } else {
             (None, match_media_style_viewport(None))
         };
-    let matches = evaluate_match_media_query_list_with_viewport(
-        &serialized_query,
-        emulated_media.as_ref(),
-        viewport,
-    );
+    let matches = evaluate_media_query_list(&serialized_query, emulated_media.as_ref(), viewport);
     let mql = MediaQueryListObjectDeclaration::new(serialized_query, matches)
         .bind(scope)
         .expect("MediaQueryList declaration should bind");
+    initialize_simple_event_target(scope, mql);
+
     if global_queue_array(scope, MEDIA_QUERY_LIST_REGISTRY_SLOT).is_none() {
         let global = scope.get_current_context().global(scope);
         let registry = v8::Array::new(scope, 0);
@@ -203,14 +188,18 @@ pub(crate) fn window_match_media_callback<'s>(
 
 pub(crate) fn dispatch_media_query_list_change_events<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    previous_media: &crate::protocol_types::EmulatedMediaOverrides,
-    previous_viewport: StyleViewport,
-    current_media: &crate::protocol_types::EmulatedMediaOverrides,
-    current_viewport: StyleViewport,
-) {
-    let Some(registry) = global_queue_array(scope, MEDIA_QUERY_LIST_REGISTRY_SLOT) else {
-        return;
+) -> bool {
+    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+        return false;
     };
+    let host = unsafe { &*host_ptr };
+    let target = host.current_window_document_task_target(scope);
+    let current_media = host.emulated_media().clone();
+    let current_viewport = current_window_style_viewport(scope, host);
+    let Some(registry) = global_queue_array(scope, MEDIA_QUERY_LIST_REGISTRY_SLOT) else {
+        return false;
+    };
+    let mut dispatched = false;
     for index in 0..registry.length() {
         let Some(value) = registry.get_index(scope, index) else {
             continue;
@@ -221,38 +210,27 @@ pub(crate) fn dispatch_media_query_list_change_events<'s>(
         let Some(media) = media_query_list_media_slot(scope, mql) else {
             continue;
         };
-        let previous_matches = evaluate_match_media_query_list_with_viewport(
-            &media,
-            Some(previous_media),
-            previous_viewport,
-        );
-        let current_matches = evaluate_match_media_query_list_with_viewport(
-            &media,
-            Some(current_media),
-            current_viewport,
-        );
+        if target.is_none_or(|target| {
+            !unsafe { &*host_ptr }.window_document_owner_is_current_for_dispatch_scope(
+                target.owner(),
+                target.dispatch_scope(),
+            )
+        }) {
+            break;
+        }
+        let previous_matches = get_private_value(scope, mql, MEDIA_QUERY_LIST_MATCHES_SLOT)
+            .is_some_and(|value| value.boolean_value(scope));
+        let current_matches =
+            evaluate_media_query_list(&media, Some(&current_media), current_viewport);
         set_media_query_list_bool_slot(scope, mql, MEDIA_QUERY_LIST_MATCHES_SLOT, current_matches);
         if previous_matches == current_matches {
             continue;
         }
-        let event = media_query_list_change_event(scope, &media, current_matches);
+        let event = create_media_query_list_event(scope, &media, current_matches);
         let _ = dispatch_media_query_list_event(scope, mql, event);
+        dispatched = true;
     }
-}
-
-fn media_query_list_change_event<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    media: &str,
-    matches: bool,
-) -> v8::Local<'s, v8::Object> {
-    let event = MediaQueryListChangeEventObjectDeclaration::new()
-        .bind(scope)
-        .expect("MediaQueryList change Event declaration should bind");
-    initialize_event_object(scope, event, "change", false, false);
-    MediaQueryListChangeEventPropertiesDeclaration::new(media.to_owned(), matches)
-        .initialize(scope, event)
-        .expect("MediaQueryList change Event properties should initialize object");
-    event
+    dispatched
 }
 
 fn media_query_list_slot_value<'s>(
@@ -309,22 +287,11 @@ pub(crate) fn evaluate_match_media_query_list_with_viewport_width(
     emulated_media: Option<&crate::protocol_types::EmulatedMediaOverrides>,
     viewport_width: Option<f64>,
 ) -> bool {
-    evaluate_match_media_query_list_with_viewport(
+    evaluate_media_query_list(
         query,
         emulated_media,
         match_media_style_viewport(viewport_width),
     )
-}
-
-pub(crate) fn evaluate_match_media_query_list_with_viewport(
-    query: &str,
-    emulated_media: Option<&crate::protocol_types::EmulatedMediaOverrides>,
-    viewport: StyleViewport,
-) -> bool {
-    if query.trim().is_empty() {
-        return true;
-    }
-    evaluate_media_query_list(query, emulated_media, viewport)
 }
 
 fn match_media_style_viewport(viewport_width: Option<f64>) -> StyleViewport {

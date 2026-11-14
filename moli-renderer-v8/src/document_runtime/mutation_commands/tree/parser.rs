@@ -10,7 +10,7 @@ use crate::{
     document_runtime::{DocumentRuntime, DomHandle},
     dom::native::DomMutationEffects,
     mutation_coordinator::RuntimeMutationOptions,
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
     parser::ParserDomMutation,
 };
 
@@ -18,7 +18,7 @@ impl DocumentRuntime {
     pub(crate) fn apply_parser_dom_mutation_to_live_dom_host(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         mutation: ParserDomMutation,
     ) {
         match mutation {
@@ -45,7 +45,7 @@ impl DocumentRuntime {
     fn apply_parser_append_child_to_live_dom_host(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         child: DomHandle,
     ) {
@@ -54,13 +54,6 @@ impl DocumentRuntime {
             Some(handles) => handles,
             None => std::slice::from_ref(&child),
         };
-        let scroll_anchor_adjustment = self
-            .window_scroll_anchor_adjustment_for_connected_roots_moved_to_disconnected_parent(
-                scope,
-                host_ptr,
-                parent,
-                insertion_roots,
-            );
         let insertion_plan = self.tree_insertion_plan(
             parent,
             insertion_roots,
@@ -68,7 +61,6 @@ impl DocumentRuntime {
             TreeInsertionPlanOptions::insert(
                 None,
                 fragment_children.is_some() && !self.dom_host.is_shadow_root(child),
-                scroll_anchor_adjustment,
                 TreeInsertionSelectednessPolicy::Skip,
             ),
         );
@@ -86,7 +78,7 @@ impl DocumentRuntime {
     fn apply_parser_insert_before_to_live_dom_host(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         child: DomHandle,
         reference_child: Option<DomHandle>,
@@ -96,13 +88,6 @@ impl DocumentRuntime {
             Some(handles) => handles,
             None => std::slice::from_ref(&child),
         };
-        let scroll_anchor_adjustment = self
-            .window_scroll_anchor_adjustment_for_connected_roots_moved_to_disconnected_parent(
-                scope,
-                host_ptr,
-                parent,
-                insertion_roots,
-            );
         let insertion_plan = self.tree_insertion_plan(
             parent,
             insertion_roots,
@@ -110,7 +95,6 @@ impl DocumentRuntime {
             TreeInsertionPlanOptions::insert(
                 reference_child,
                 fragment_children.is_some() && !self.dom_host.is_shadow_root(child),
-                scroll_anchor_adjustment,
                 TreeInsertionSelectednessPolicy::Skip,
             ),
         );
@@ -129,7 +113,7 @@ impl DocumentRuntime {
     fn apply_parser_tree_mutation_followups(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: TreeInsertionPlan<'_>,
         effects: DomMutationEffects,
     ) {
@@ -166,7 +150,7 @@ impl DocumentRuntime {
     pub(super) fn dispatch_parser_tree_insertion_side_effects_after_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: &TreeInsertionPlan<'_>,
         profile: TreeMutationSourceProfile,
     ) {
@@ -219,7 +203,7 @@ impl DocumentRuntime {
     fn enqueue_parser_tree_insertion_reactions_after_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_plan: &TreeInsertionPlan<'_>,
     ) {
         let lifecycle_quiescent =
@@ -304,11 +288,11 @@ impl DocumentRuntime {
     fn apply_parser_remove_child_to_live_dom_host(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         child: DomHandle,
     ) {
-        let removal_plan = self.tree_removal_plan(scope, host_ptr, parent, child);
+        let removal_plan = self.tree_removal_plan(host_ptr, parent, child);
         let effects = self.parser_remove_child_effects_in_structural_scope(parent, child);
         self.apply_tree_removal_node_iterator_plan_if_changed(host_ptr, &removal_plan, &effects);
         self.assert_active_parser_document_incarnation();

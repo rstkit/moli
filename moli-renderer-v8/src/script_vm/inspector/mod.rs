@@ -11,6 +11,7 @@ mod v8_backend;
 use self::agent::RendererDevToolsAgent;
 pub(crate) use self::agent::{
     RendererDomDebuggerPauseScheduler, RendererDomDebuggerScheduledPause,
+    RendererInspectorObjectWrapper,
 };
 pub(super) use self::agent_sessions::PageInspectorSessionTarget;
 use self::agent_sessions::inspector_session_key;
@@ -20,14 +21,14 @@ use self::context_registry::DocumentInspectorContextGroupId;
 pub(in crate::script_vm) use self::context_registry::DocumentInspectorContextRegistrationId;
 use self::document_backend::DocumentInspectorBackendState;
 pub(super) use self::input_state::{
-    current_selection_range, current_selection_state, is_space_key, key_target_info,
-    option_is_disabled, radio_group_members,
+    current_selection_state, is_space_key, key_target_info, option_is_disabled, radio_group_members,
 };
 pub(in crate::script_vm) use self::outbound::InspectorOutbound;
 pub(super) use self::outbound::ScriptVmInspectorCommandTurnOutputScope;
 #[cfg(test)]
 use self::v8_backend::RendererInspectorClientUniqueIdState;
 pub(in crate::script_vm) use self::v8_backend::RendererInspectorIsolateBackend;
+pub(in crate::script_vm) use self::v8_backend::finish_page_close_termination;
 pub(crate) use self::v8_backend::{
     RendererInspectorIsolateBackendHandle, dispatch_inspector_io_owner_wake,
     dispatch_inspector_main_owner_wake,
@@ -35,17 +36,17 @@ pub(crate) use self::v8_backend::{
 use crate::devtools::target::RendererDevToolsTargetHandle;
 #[cfg(test)]
 use crate::runtime::RendererRuntimeCommandOutputRecorder;
-use crate::runtime::RendererRuntimeInspectorResponseSender;
 use crate::{
     frame_owner_model::FrameRealmId,
     protocol_types::RuntimeBindingRegistration,
-    script_vm::document_isolate::RendererDocumentIsolateHandle,
+    script_vm::document_isolate::RendererIsolateHandle,
     {document_runtime::DomHandle, runtime::RendererCommandTurnOutputRecorder},
 };
 use anyhow::Result;
+use moli_inspector_json::InspectorJson;
 use moli_page_types::{
-    DevToolsSessionKey, RendererDevToolsAgentToken, RendererInspectorResponseDelivery,
-    RendererInspectorSessionRestoreSnapshot, V8InspectorSessionState,
+    DevToolsSessionKey, RendererDevToolsAgentToken, RendererInspectorSessionRestoreSnapshot,
+    V8InspectorSessionState,
 };
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap};
@@ -79,13 +80,18 @@ pub(super) struct ChildFrameRealmRecord {
     pub(super) child_handle: DomHandle,
     pub(super) local_window_id: crate::frame_owner_model::LocalWindowId,
     pub(super) owner_realm_id: FrameRealmId,
-    pub(super) context: v8::Global<v8::Context>,
-    pub(super) _bridge_ref: crate::native_bridge::JsContextHostBridgeRef,
-    pub(super) runtime_observable_context_token:
-        crate::native_bridge::RuntimeObservableContextToken,
+    pub(super) runtime: super::WindowRealmRuntime,
     pub(super) inspector_execution_context_id: i64,
     pub(super) inspector_execution_context_realm_id: Option<String>,
     pub(super) inspector_context_registration_id: DocumentInspectorContextRegistrationId,
+}
+
+impl std::ops::Deref for ChildFrameRealmRecord {
+    type Target = super::WindowRealmRuntimeState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
 }
 
 pub(super) struct ReportedExecutionContext {
@@ -94,6 +100,10 @@ pub(super) struct ReportedExecutionContext {
 }
 
 impl DocumentInspectorBinding {
+    pub(crate) fn configure_debugger(&self, enabled: bool) {
+        self.agent.configure_debugger(enabled);
+    }
+
     pub(crate) fn new(isolate_backend: RendererInspectorIsolateBackendHandle) -> Self {
         let devtools_target = isolate_backend.devtools_target();
         Self {
@@ -108,12 +118,18 @@ impl DocumentInspectorBinding {
         self,
         output_journal: crate::runtime::RendererTurnOutputJournal,
     ) -> Self {
+        self.isolate_backend_handle()
+            .bind_native_output_journal(output_journal.clone());
         self.agent.bind_output_journal(output_journal);
         self
     }
 
     pub(crate) fn devtools_target(&self) -> RendererDevToolsTargetHandle {
         self.devtools_target.clone()
+    }
+
+    pub(crate) fn isolate_backend_handle(&self) -> RendererInspectorIsolateBackendHandle {
+        self.agent.isolate_backend_handle()
     }
 
     pub(crate) fn dom_debugger_pause_scheduler(&self) -> RendererDomDebuggerPauseScheduler {
@@ -143,22 +159,6 @@ impl DocumentInspectorBinding {
                 self.agent.with_frontend(backend, session_key, op)
             }
         }
-    }
-
-    pub(super) fn route_frontend_response(
-        &self,
-        inspector_session_id: Option<&str>,
-        response: RendererRuntimeInspectorResponseSender,
-    ) -> Result<RendererRuntimeInspectorResponseSender> {
-        if response.response_delivery() == RendererInspectorResponseDelivery::AdapterReply {
-            return Ok(response);
-        }
-        let session_key = inspector_session_key(inspector_session_id);
-        let outbound = self
-            .agent
-            .frontend_outbound(&session_key)
-            .ok_or_else(|| anyhow::anyhow!("Inspector frontend session is not available"))?;
-        Ok(outbound.route_frontend_response(response))
     }
 
     pub(super) fn v8_session_state(
@@ -194,6 +194,10 @@ impl DocumentInspectorBinding {
     ) {
         self.agent
             .ensure_frontend(backend, inspector_session_key(inspector_session_id));
+    }
+
+    pub(super) fn object_wrapper(&self) -> RendererInspectorObjectWrapper {
+        self.agent.object_wrapper()
     }
 
     pub(super) fn end_runtime_command_output_for_session(
@@ -292,7 +296,7 @@ impl DocumentInspectorBinding {
     pub(super) fn take_outbound_messages_for_session(
         &self,
         inspector_session_id: Option<&str>,
-    ) -> Vec<Value> {
+    ) -> Vec<InspectorJson> {
         let session_key = inspector_session_key(inspector_session_id);
         self.observable_outbound_routes()
             .into_iter()
@@ -317,7 +321,7 @@ impl DocumentInspectorBinding {
 
     pub(super) fn attach_context<'s>(
         &mut self,
-        renderer_document_isolate: RendererDocumentIsolateHandle,
+        renderer_document_isolate: RendererIsolateHandle,
         backend: &mut RendererInspectorIsolateBackend,
         context: v8::Local<'s, v8::Context>,
         default_context: v8::Global<v8::Context>,
@@ -396,7 +400,7 @@ impl DocumentInspectorBinding {
 
     pub(super) fn attach_isolated_context<'s>(
         &mut self,
-        renderer_document_isolate: RendererDocumentIsolateHandle,
+        renderer_document_isolate: RendererIsolateHandle,
         backend: &mut RendererInspectorIsolateBackend,
         context: v8::Local<'s, v8::Context>,
         registered_context: v8::Global<v8::Context>,
@@ -454,7 +458,7 @@ impl DocumentInspectorBinding {
 
     pub(super) fn attach_child_default_context<'s>(
         &mut self,
-        renderer_document_isolate: RendererDocumentIsolateHandle,
+        renderer_document_isolate: RendererIsolateHandle,
         backend: &mut RendererInspectorIsolateBackend,
         context: v8::Local<'s, v8::Context>,
         registered_context: v8::Global<v8::Context>,
@@ -503,13 +507,13 @@ impl DocumentInspectorBinding {
 
     pub(super) fn record_execution_context_state(
         &mut self,
-        messages: &[Value],
+        event: &crate::protocol_types::RuntimeContextRestoreEvent,
         root_frame_id: Option<&str>,
     ) {
         self.backend
             .borrow_mut()
             .runtime_realms
-            .record_execution_context_state(messages, root_frame_id);
+            .record_execution_context_state(event, root_frame_id);
     }
 
     fn outbound_snapshots(&self) -> HashMap<DevToolsSessionKey, usize> {
@@ -522,7 +526,7 @@ impl DocumentInspectorBinding {
     fn outbound_after_snapshots(
         &self,
         snapshots: &HashMap<DevToolsSessionKey, usize>,
-    ) -> Vec<Value> {
+    ) -> Vec<InspectorJson> {
         let mut messages = Vec::new();
         for (key, outbound) in self.observable_outbound_routes() {
             let snapshot_len = snapshots.get(&key).copied().unwrap_or_default();
@@ -549,11 +553,13 @@ fn inspector_execution_context_origin(url: &Url) -> String {
     }
 }
 
-fn reported_execution_context_created(messages: &[Value]) -> Option<ReportedExecutionContext> {
+fn reported_execution_context_created(
+    messages: &[InspectorJson],
+) -> Option<ReportedExecutionContext> {
     let context = messages
         .iter()
-        .find(|message| message["method"] == json!("Runtime.executionContextCreated"))
-        .map(|message| &message["params"]["context"])?;
+        .find(|message| message.method() == Some("Runtime.executionContextCreated"))
+        .map(|message| &message.value()["params"]["context"])?;
     Some(ReportedExecutionContext {
         id: context["id"].as_i64()?,
         unique_id: context["uniqueId"].as_str().map(str::to_owned),

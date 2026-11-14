@@ -64,7 +64,13 @@ pub(crate) fn modulepreload_href(element: &Element) -> Option<&str> {
 }
 
 pub(crate) fn modulepreload_as_state(element: &Element) -> ModulepreloadAsState {
-    match link_as_destination(element.attribute("as")) {
+    modulepreload_as_state_from_attribute(element.attribute("as"))
+}
+
+pub(crate) fn modulepreload_as_state_from_attribute(
+    as_attribute: Option<&str>,
+) -> ModulepreloadAsState {
+    match link_as_destination(as_attribute) {
         LinkAsDestination::None
         | LinkAsDestination::Script
         | LinkAsDestination::AudioWorklet
@@ -110,9 +116,7 @@ pub(crate) fn invalid_modulepreload_as_warning(value: &str) -> String {
 
 fn modulepreload_attributes_for_state(state: ModulepreloadAsState) -> Option<ModuleAttributesKey> {
     match state {
-        ModulepreloadAsState::ScriptLike | ModulepreloadAsState::Text => {
-            Some(ModuleAttributesKey::empty())
-        }
+        ModulepreloadAsState::ScriptLike => Some(ModuleAttributesKey::empty()),
         ModulepreloadAsState::Style => Some(ModuleAttributesKey::from_pairs(vec![(
             "type".to_owned(),
             "css".to_owned(),
@@ -121,12 +125,20 @@ fn modulepreload_attributes_for_state(state: ModulepreloadAsState) -> Option<Mod
             "type".to_owned(),
             "json".to_owned(),
         )])),
+        ModulepreloadAsState::Text => Some(ModuleAttributesKey::from_pairs(vec![(
+            "type".into(),
+            "text".into(),
+        )])),
         ModulepreloadAsState::Invalid => None,
     }
 }
 
 pub(crate) fn modulepreload_media_matches(element: &Element) -> bool {
-    let Some(media) = element.attribute("media").map(str::trim) else {
+    modulepreload_media_attribute_matches(element.attribute("media"))
+}
+
+pub(crate) fn modulepreload_media_attribute_matches(media: Option<&str>) -> bool {
+    let Some(media) = media.map(str::trim) else {
         return true;
     };
     if media.is_empty() {
@@ -176,16 +188,11 @@ pub(crate) fn modulepreload_fetch_candidate(
         element.attribute("integrity"),
         import_map_integrity,
     );
-    let key = if state == ModulepreloadAsState::Text {
-        ModuleMapKey::modulepreload_text(request_url.clone())
-    } else {
-        ModuleMapKey::from_url_and_attributes(&request_url, &attributes).ok()?
-    };
+    let key = ModuleMapKey::from_url_and_attributes(&request_url, &attributes).ok()?;
     Some(ModulepreloadFetchCandidate {
         key: key.clone(),
         request: NativeModuleSingleFetchRequest::new(
             request_url.clone(),
-            request_url,
             document_url.clone(),
             key,
             ModuleFetchMetadata::from_modulepreload_script_fetch_metadata(&fetch_metadata),

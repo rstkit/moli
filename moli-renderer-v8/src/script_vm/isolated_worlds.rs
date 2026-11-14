@@ -1,25 +1,31 @@
 use crate::{
-    document_runtime::DomHandle,
-    native_bridge::{JsContextHostBridgeRef, RuntimeObservableContextToken},
-    script_vm::inspector::DocumentInspectorContextRegistrationId,
+    document_runtime::DomHandle, script_vm::inspector::DocumentInspectorContextRegistrationId,
 };
 use moli_page_types::DevToolsSessionKey;
-use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub(super) struct PageIsolatedWorldContext {
+    // Explicit requests promote an implicit member without changing its
+    // Context, world identity, globals or per-Realm execution authority.
+    pub(super) explicit: bool,
     pub(super) name: String,
     pub(super) devtools_session: Option<DevToolsSessionKey>,
     pub(super) grant_universal_access: bool,
     pub(super) frame_id: Option<String>,
     pub(super) child_handle: Option<DomHandle>,
     pub(super) document_owner: crate::frame_owner_model::FrameDocumentTaskOwner,
-    pub(super) context: v8::Global<v8::Context>,
-    pub(super) _bridge_ref: JsContextHostBridgeRef,
-    pub(super) runtime_observable_context_token: RuntimeObservableContextToken,
+    pub(super) runtime: super::WindowRealmRuntime,
     pub(super) inspector_execution_context_id: Option<i64>,
     pub(super) inspector_execution_context_realm_id: Option<String>,
     pub(super) inspector_context_registration_id: DocumentInspectorContextRegistrationId,
+}
+
+impl std::ops::Deref for PageIsolatedWorldContext {
+    type Target = super::WindowRealmRuntimeState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
 }
 
 pub(super) struct PageIsolatedWorldRegistry {
@@ -34,6 +40,10 @@ struct InspectorIsolatedContextCreated<'a> {
 }
 
 impl PageIsolatedWorldRegistry {
+    pub(super) fn contexts_mut(&mut self) -> impl Iterator<Item = &mut PageIsolatedWorldContext> {
+        self.contexts.values_mut()
+    }
+
     pub(super) fn new() -> Self {
         Self {
             contexts: BTreeMap::new(),
@@ -167,34 +177,32 @@ impl PageIsolatedWorldRegistry {
 
     pub(super) fn record_inspector_context_state(
         &mut self,
-        messages: &[Value],
+        event: &crate::protocol_types::RuntimeContextRestoreEvent,
         root_frame_id: Option<&str>,
     ) {
-        for message in messages {
-            match message["method"].as_str() {
-                Some("Runtime.executionContextsCleared") => self.clear_inspector_context_state(),
-                Some("Runtime.executionContextDestroyed") => {
-                    let destroyed_id = message["params"]["executionContextId"].as_i64();
-                    let destroyed_realm_id = message["params"]["executionContextUniqueId"].as_str();
-                    self.clear_destroyed_inspector_context_state(destroyed_id, destroyed_realm_id);
-                }
-                Some("Runtime.executionContextCreated") => {
-                    let Some(created) = InspectorIsolatedContextCreated::from_message(message)
-                    else {
-                        continue;
-                    };
-                    let Some(execution_context_id) =
-                        self.matching_execution_context_id(&created, root_frame_id)
-                    else {
-                        continue;
-                    };
-                    self.set_inspector_execution_context_id(
-                        execution_context_id,
-                        created.inspector_context_id,
-                        created.realm_id,
-                    );
-                }
-                _ => {}
+        use crate::protocol_types::RuntimeContextRestoreEvent;
+        match event {
+            RuntimeContextRestoreEvent::Cleared(_) => self.clear_inspector_context_state(),
+            RuntimeContextRestoreEvent::Destroyed(event) => {
+                self.clear_destroyed_inspector_context_state(
+                    event.context_id,
+                    event.realm_id.as_deref(),
+                );
+            }
+            RuntimeContextRestoreEvent::Created(event) => {
+                let Some(created) = InspectorIsolatedContextCreated::from_event(event) else {
+                    return;
+                };
+                let Some(execution_context_id) =
+                    self.matching_execution_context_id(&created, root_frame_id)
+                else {
+                    return;
+                };
+                self.set_inspector_execution_context_id(
+                    execution_context_id,
+                    created.inspector_context_id,
+                    created.realm_id,
+                );
             }
         }
     }
@@ -286,16 +294,17 @@ impl PageIsolatedWorldRegistry {
 }
 
 impl InspectorIsolatedContextCreated<'_> {
-    fn from_message(message: &Value) -> Option<InspectorIsolatedContextCreated<'_>> {
-        let context = &message["params"]["context"];
-        if context["auxData"]["type"].as_str() != Some("isolated") {
+    fn from_event(
+        event: &crate::protocol_types::RuntimeExecutionContextRestoreEvent,
+    ) -> Option<InspectorIsolatedContextCreated<'_>> {
+        if event.context_type.as_deref() != Some("isolated") {
             return None;
         }
         Some(InspectorIsolatedContextCreated {
-            inspector_context_id: context["id"].as_i64()?,
-            realm_id: context["uniqueId"].as_str().map(str::to_owned),
-            name: context["name"].as_str()?,
-            frame_id: context["auxData"]["frameId"].as_str(),
+            inspector_context_id: event.context_id?,
+            realm_id: event.realm_id.clone(),
+            name: event.name.as_deref()?,
+            frame_id: event.frame_id.as_deref(),
         })
     }
 }

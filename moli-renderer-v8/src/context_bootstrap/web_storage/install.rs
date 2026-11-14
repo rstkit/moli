@@ -17,10 +17,11 @@ use super::interceptors::{
 };
 use super::*;
 use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object", enumerable)]
+#[webapi(plain, enumerable)]
 struct StoragePrototypeMethodsDeclaration {
     #[webapi(method, length = 1, callback = storage_get_item_callback)]
     get_item: (),
@@ -37,30 +38,30 @@ struct StoragePrototypeMethodsDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Storage")]
+#[webapi(fragment, prototype = "Storage")]
 struct StoragePrototypeMetadataDeclaration {
     #[webapi(to_string_tag, init = string("Storage"))]
     to_string_tag: (),
 }
 
-#[derive(WebApiObject)]
-#[webapi(interface = "Object")]
-struct StorageAliasesDeclaration<'scope> {
-    #[webapi(data_property = "localStorage")]
-    local_storage: v8::Local<'scope, v8::Object>,
-    #[webapi(data_property = "sessionStorage")]
-    session_storage: v8::Local<'scope, v8::Object>,
+#[derive(Default, WebApiObject)]
+#[webapi(plain, enumerable, receiver_access_check, receiver = crate::context_bootstrap::is_window_receiver)]
+struct StorageAliasesDeclaration {
+    #[webapi(accessor_property = "localStorage", getter = window_local_storage_getter)]
+    local_storage: (),
+    #[webapi(accessor_property = "sessionStorage", getter = window_session_storage_getter)]
+    session_storage: (),
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct StorageConstructorGlobalDeclaration<'scope> {
     #[webapi(data_property = "Storage")]
     constructor: v8::Local<'scope, v8::Function>,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "Storage", constructor = "illegal", constructor_length = 0)]
+#[webapi(interface = web_api_interfaces::Storage, constructor = "illegal", constructor_length = 0)]
 struct StorageConstructorTemplateDeclaration {}
 
 pub(in crate::context_bootstrap) fn install_storage_runtime_state<'s>(
@@ -90,17 +91,13 @@ pub(crate) fn install_storage_aliases_for_window<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     window: v8::Local<'s, v8::Object>,
 ) -> Result<()> {
-    let local_storage =
-        ensure_storage_runtime_state_for_window(scope, window, WINDOW_LOCAL_STORAGE_SLOT, "local")
-            .ok_or_else(|| anyhow!("failed to install localStorage object"))?;
-    let session_storage = ensure_storage_runtime_state_for_window(
-        scope,
-        window,
-        WINDOW_SESSION_STORAGE_SLOT,
-        "session",
-    )
-    .ok_or_else(|| anyhow!("failed to install sessionStorage object"))?;
-    StorageAliasesDeclaration::new(local_storage, session_storage)
+    ensure_storage_runtime_state_for_window(scope, window, WINDOW_LOCAL_STORAGE_SLOT, "local")
+        .ok_or_else(|| anyhow!("failed to install localStorage object"))?;
+    ensure_storage_runtime_state_for_window(scope, window, WINDOW_SESSION_STORAGE_SLOT, "session")
+        .ok_or_else(|| anyhow!("failed to install sessionStorage object"))?;
+    // Popup aliases must use the same receiver and origin checks as other
+    // Windows, even though their Storage objects are already initialized.
+    StorageAliasesDeclaration::default()
         .initialize(scope, window)
         .map_err(|error| anyhow!("failed to initialize storage aliases: {error}"))
 }
@@ -129,9 +126,12 @@ fn install_named_storage_runtime_state<'s>(
     };
     let owner_value = v8::BigInt::new_from_u64(scope, owner);
     let _ = storage.set_internal_field(STORAGE_OWNER_INTERNAL_FIELD_INDEX, owner_value.into());
-    if let Some(prototype) = prototype {
-        let _ = storage.set_prototype(scope, prototype.into());
+    if let Some(prototype) = prototype
+        && storage.set_prototype(scope, prototype.into()) != Some(true)
+    {
+        return Err(anyhow!("failed to set Storage prototype"));
     }
+    web_api_interfaces::Storage::DESCRIPTOR.initialize(scope, storage)?;
     set_private_value(scope, global, slot_name, storage.into());
     Ok(storage)
 }

@@ -12,7 +12,7 @@ use crate::{
         host::{
             EventTargetHandle, HostDocumentState, HostEventTargetRegistry, dispatch_host_event,
         },
-        native_bridge::JsContextHost,
+        native_bridge::PageScriptHost,
     },
 };
 use tracing::debug;
@@ -68,6 +68,11 @@ pub(crate) enum PreparedRuntimeScriptStartCommit {
     InlineClassic {
         node: NativeNodeId,
         host_script_handle: String,
+        source: String,
+    },
+    InlineImportMap {
+        node: NativeNodeId,
+        base_url: url::Url,
         source: String,
     },
     Admission {
@@ -210,7 +215,7 @@ impl PreparedRuntimeScriptStart {
                     scripts.cancel_script_start(host_script_handle, node);
                     return Ok(None);
                 }
-                scripts.register_dynamic_import_map(&preparation, &source);
+                scripts.register_dynamic_import_map(&preparation.base_url, &source);
                 Ok(None)
             }
             RuntimeScriptStartDecision::RejectExternalImportMap => {
@@ -402,16 +407,20 @@ pub(crate) fn prepare_runtime_script_start_commit(
             })
         }
         RuntimeScriptStartDecision::RegisterImportMap { source } => {
-            if finish_local_runtime_script_start(
+            if !finish_local_runtime_script_start(
                 dom_host,
                 scripts,
                 node,
                 &host_script_handle,
                 ScriptStartCommitKind::RegisterImportMap,
             ) {
-                scripts.register_dynamic_import_map(&preparation, &source);
+                return Ok(PreparedRuntimeScriptStartCommit::Noop);
             }
-            Ok(PreparedRuntimeScriptStartCommit::Noop)
+            Ok(PreparedRuntimeScriptStartCommit::InlineImportMap {
+                node,
+                base_url: preparation.base_url,
+                source,
+            })
         }
         RuntimeScriptStartDecision::RejectExternalImportMap => {
             if finish_local_runtime_script_start(
@@ -617,7 +626,7 @@ pub(crate) fn dispatch_script_event(
     scripts: &HostScriptScheduler,
     events: &mut HostEventTargetRegistry,
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     task: &ScriptEventTask,
 ) -> std::result::Result<(), String> {
     let Some(script_handle) = scripts.script_handle_target(&task.handle) else {

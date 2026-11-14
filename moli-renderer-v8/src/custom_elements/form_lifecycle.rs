@@ -1,5 +1,5 @@
 use super::element_state::is_form_associated_custom_element_handle;
-use super::existing_upgrade::has_pending_upgrade_reaction;
+use super::reaction_types::FormStateRestoreMode;
 use super::reactions::{
     CustomElementReaction, enqueue_custom_element_reaction, with_custom_element_reaction_scope,
 };
@@ -7,19 +7,16 @@ use super::reactions::{
 use super::super::{
     document_runtime::DomHandle,
     native_bridge::{
-        JsContextHost,
+        PageScriptHost,
         element::{form_associated_form_owner, form_control_is_effectively_disabled},
     },
 };
 
 pub(crate) fn enqueue_form_association_callback_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> bool {
-    if has_pending_upgrade_reaction(host_ptr, handle) {
-        return false;
-    }
     if !unsafe { &*host_ptr }
         .custom_elements_for_node_handle(handle)
         .is_some_and(|store| store.is_upgraded_handle(handle))
@@ -62,12 +59,9 @@ pub(crate) fn enqueue_form_association_callback_if_needed(
 
 pub(super) fn enqueue_form_disabled_callback_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> bool {
-    if has_pending_upgrade_reaction(host_ptr, handle) {
-        return false;
-    }
     if !unsafe { &*host_ptr }
         .custom_elements_for_node_handle(handle)
         .is_some_and(|store| store.is_upgraded_handle(handle))
@@ -110,7 +104,7 @@ pub(super) fn enqueue_form_disabled_callback_if_needed(
 
 pub(crate) fn dispatch_form_association_callback_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     with_custom_element_reaction_scope(scope, host_ptr, |scope| {
@@ -120,10 +114,30 @@ pub(crate) fn dispatch_form_association_callback_if_needed(
 
 pub(crate) fn dispatch_form_disabled_callback_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     with_custom_element_reaction_scope(scope, host_ptr, |scope| {
         enqueue_form_disabled_callback_if_needed(scope, host_ptr, handle);
+    });
+}
+
+// The session-history/autofill owner calls this once restoration is implemented.
+// Keep the reaction path here so callback invocation cannot bypass CE ordering.
+#[allow(dead_code)]
+pub(crate) fn dispatch_form_state_restore_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    host_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    value: String,
+    mode: FormStateRestoreMode,
+) {
+    with_custom_element_reaction_scope(scope, host_ptr, |scope| {
+        enqueue_custom_element_reaction(
+            scope,
+            host_ptr,
+            handle,
+            CustomElementReaction::FormStateRestore { value, mode },
+        );
     });
 }

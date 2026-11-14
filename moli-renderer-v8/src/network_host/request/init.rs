@@ -1,19 +1,45 @@
-use super::input::{normalize_request_method, normalize_request_referrer};
+use super::input::{RequestInfo, normalize_request_method, normalize_request_referrer};
 use super::*;
 use crate::webidl;
 use moli_fetch::{FetchPriorityHint, RequestCredentialsMode, RequestMode, RequestRedirectMode};
 use std::str::FromStr;
 
+/// Fetch rejects with the original conversion exception, including primitive
+/// values. Keep the catch boundary around argument conversion, before a body
+/// is consumed or any request is dispatched.
+pub(crate) fn convert_fetch_arguments<'s, T>(
+    scope: &mut v8::PinScope<'s, '_>,
+    convert: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Result<T, FetchArgumentError>,
+) -> Result<T, v8::Local<'s, v8::Value>> {
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut conversion_scope = try_catch.init();
+    let result = convert(&mut conversion_scope);
+    if !conversion_scope.has_caught()
+        && let Err(error) = &result
+    {
+        // WebIDL's PendingException already carries an exception through V8;
+        // only ordinary validation failures need a new TypeError here.
+        error.throw(&mut conversion_scope);
+    }
+    if conversion_scope.has_caught() {
+        let exception = conversion_scope
+            .exception()
+            .unwrap_or_else(|| v8::undefined(&conversion_scope).into());
+        conversion_scope.reset();
+        return Err(exception);
+    }
+    result.map_err(|_| v8::undefined(&conversion_scope).into())
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedFetchInit {
     pub(crate) method: String,
     pub(crate) method_present: bool,
-    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) body: Option<bytes::Bytes>,
     pub(crate) body_present: bool,
     pub(crate) body_content_type: Option<String>,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) headers_present: bool,
-    pub(crate) suppress_default_content_type: bool,
     pub(crate) request_mode: Option<RequestMode>,
     pub(crate) credentials_mode: Option<RequestCredentialsMode>,
     pub(crate) redirect_mode: Option<RequestRedirectMode>,
@@ -23,6 +49,7 @@ pub(crate) struct ParsedFetchInit {
     pub(crate) referrer_policy: Option<String>,
     pub(crate) integrity: Option<String>,
     pub(crate) keepalive: Option<bool>,
+    pub(crate) signal: Option<Option<v8::Global<v8::Object>>>,
 }
 
 impl Default for ParsedFetchInit {
@@ -35,7 +62,6 @@ impl Default for ParsedFetchInit {
             body_content_type: None,
             headers: Vec::new(),
             headers_present: false,
-            suppress_default_content_type: false,
             request_mode: None,
             credentials_mode: None,
             redirect_mode: None,
@@ -45,6 +71,7 @@ impl Default for ParsedFetchInit {
             referrer_policy: None,
             integrity: None,
             keepalive: None,
+            signal: None,
         }
     }
 }
@@ -67,22 +94,21 @@ pub(super) struct RequestPriorityWebIdl(pub(super) FetchPriorityHint);
 
 #[derive(webidl::WebIdlDictionary)]
 #[webidl(prefix = "RequestInit")]
-pub(super) struct RequestInitMembers {
-    #[webidl(legacy_nullish)]
+pub(crate) struct RequestInitMembers<'s> {
+    // Keep the opaque BodyInit value until native extraction, matching Blink.
+    #[webidl(converter = "raw")]
+    pub(super) body: Option<v8::Local<'s, v8::Value>>,
+    #[webidl(with = request_init_signal_member)]
+    pub(super) signal: Option<Option<v8::Global<v8::Object>>>,
     pub(super) method: Option<String>,
-    #[webidl(legacy_nullish)]
     pub(super) cache: Option<String>,
     #[webidl(converter = "enum")]
     pub(super) mode: Option<RequestModeWebIdl>,
-    #[webidl(legacy_nullish, converter = "enum")]
+    #[webidl(converter = "enum")]
     pub(super) redirect: Option<RequestRedirectModeWebIdl>,
-    #[webidl(legacy_nullish)]
     pub(super) referrer: Option<String>,
-    #[webidl(legacy_nullish)]
     pub(super) referrer_policy: Option<String>,
-    #[webidl(legacy_nullish)]
     pub(super) integrity: Option<String>,
-    #[webidl(legacy_nullish)]
     pub(super) duplex: Option<String>,
     #[webidl(with = request_init_headers_member)]
     pub(super) headers: Option<Vec<(String, String)>>,
@@ -93,77 +119,120 @@ pub(super) struct RequestInitMembers {
     pub(super) keepalive: Option<bool>,
 }
 
+impl RequestInitMembers<'_> {
+    pub(super) fn has_any_member(&self) -> bool {
+        self.body.is_some()
+            || self.signal.is_some()
+            || self.method.is_some()
+            || self.cache.is_some()
+            || self.mode.is_some()
+            || self.redirect.is_some()
+            || self.referrer.is_some()
+            || self.referrer_policy.is_some()
+            || self.integrity.is_some()
+            || self.duplex.is_some()
+            || self.headers.is_some()
+            || self.credentials_mode.is_some()
+            || self.priority.is_some()
+            || self.keepalive.is_some()
+    }
+
+    pub(crate) fn body_is_present(&self) -> bool {
+        // Explicit null is an init member but does not replace an input body.
+        self.body.is_some_and(|body| !body.is_null_or_undefined())
+    }
+}
+
+fn request_init_signal_member<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    _: &str,
+) -> Result<Option<Option<v8::Global<v8::Object>>>, webidl::WebIdlError> {
+    let context = webidl::Context::member("RequestInit", "signal");
+    let Some(value) = webidl::property_result(scope, object, "signal", context)?
+        .filter(|value| !value.is_undefined())
+    else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let signal = v8::Local::<v8::Object>::try_from(value)
+        .ok()
+        .and_then(|signal| crate::abort_signal_route::ResolvedAbortSignal::resolve(scope, signal))
+        .ok_or_else(|| webidl::WebIdlError::cannot_convert(context, "AbortSignal"))?;
+    Ok(Some(Some(v8::Global::new(scope, signal.value()))))
+}
+
 fn request_init_headers_member<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     _key: &str,
 ) -> Result<Option<Vec<(String, String)>>, webidl::WebIdlError> {
-    webidl::property_non_nullish(scope, object, "headers")
-        .map(|headers| headers_entries_from_init(scope, headers).map(Some))
-        .unwrap_or(Ok(None))
+    webidl::property_result(
+        scope,
+        object,
+        "headers",
+        webidl::Context::member("RequestInit", "headers"),
+    )?
+    .filter(|value| !value.is_undefined())
+    .map(|headers| headers_entries_from_init(scope, headers).map(Some))
+    .unwrap_or(Ok(None))
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "fetch")]
+pub(crate) struct FetchArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    pub(crate) input: RequestInfo<'s>,
+    #[webidl(dictionary)]
+    pub(crate) init: RequestInitMembers<'s>,
 }
 
 pub(crate) fn parse_fetch_init<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<ParsedFetchInit, String> {
-    if args.length() <= index {
-        return Ok(ParsedFetchInit::default());
-    }
-
-    let Some(init_object) = webidl::optional_object_arg(args, index) else {
-        return Ok(ParsedFetchInit::default());
-    };
-
-    let init = webidl::parse_dictionary_object::<RequestInitMembers>(scope, init_object)
-        .map_err(|error| error.to_string())?;
+    init: RequestInitMembers<'s>,
+) -> Result<ParsedFetchInit, webidl::WebIdlError> {
+    let body_present = init.body_is_present();
     let priority = init.priority.map(|value| value.0);
-    let method_present = init_object
-        .has(scope, v8str(scope, "method").into())
-        .unwrap_or(false);
+    let method_present = init.method.is_some();
     let method = init
         .method
-        .map(|s| normalize_request_method(&s).map_err(str::to_owned))
+        .map(|s| normalize_request_method(&s))
         .transpose()?
         .unwrap_or_else(|| "GET".to_owned());
 
-    let body_present = init_object
-        .has(scope, v8str(scope, "body").into())
-        .unwrap_or(false);
-    let prepared_body = webidl::property_result(
-        scope,
-        init_object,
-        "body",
-        webidl::Context::member("RequestInit", "body"),
-    )
-    .map_err(|error| error.to_string())?
-    .map(|value| body_init(scope, value, webidl::Context::member("RequestInit", "body")))
-    .transpose()
-    .map_err(|error| error.to_string())?
-    .flatten();
-    let body = prepared_body.as_ref().map(|body| body.bytes.clone());
+    if init.keepalive == Some(true)
+        && init
+            .body
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+            .is_some_and(|object| {
+                crate::web_api_interfaces::ReadableStream::is_instance(scope, object)
+            })
+    {
+        return Err(webidl::WebIdlError::custom_message(
+            "Request with keepalive cannot have a ReadableStream body",
+        ));
+    }
+    let prepared_body = init
+        .body
+        .map(|body| body_init(scope, body, webidl::Context::member("RequestInit", "body")))
+        .transpose()?
+        .flatten();
+    let body = prepared_body
+        .as_ref()
+        .map(|body| match &body.source {
+            PreparedBodySource::Bytes(bytes) => Ok(bytes.clone()),
+            PreparedBodySource::Blob(_) => body.source.clone().into_buffered_bytes(scope),
+            PreparedBodySource::Stream(_) => Ok(bytes::Bytes::new()),
+        })
+        .transpose()?;
     let body_content_type = prepared_body
         .as_ref()
         .and_then(|body| body.content_type.clone());
-    if body.as_ref().is_some_and(|body| !body.is_empty())
-        && matches!(method.as_str(), "GET" | "HEAD")
-    {
-        return Err("Request with GET/HEAD method cannot have body".to_owned());
-    }
-
-    let headers_present = init_object
-        .has(scope, v8str(scope, "headers").into())
-        .unwrap_or(false);
+    let headers_present = init.headers.is_some();
     let mut extra_headers = init.headers.unwrap_or_default();
-    let mut suppress_default_content_type = false;
-    if let Some(prepared_body) = prepared_body.as_ref() {
-        if let Some(content_type) = prepared_body.content_type.as_deref() {
-            append_default_body_content_type(&mut extra_headers, Some(content_type));
-        } else if !has_header(&extra_headers, "content-type") {
-            suppress_default_content_type = true;
-        }
-    }
+    append_default_body_content_type(&mut extra_headers, body_content_type.as_deref());
 
     let request_mode = init.mode.map(|value| value.0);
     let credentials_mode = init.credentials_mode.map(|value| value.0);
@@ -180,7 +249,6 @@ pub(crate) fn parse_fetch_init<'s>(
         body_content_type,
         headers: extra_headers,
         headers_present,
-        suppress_default_content_type,
         request_mode,
         credentials_mode,
         redirect_mode,
@@ -190,20 +258,25 @@ pub(crate) fn parse_fetch_init<'s>(
         referrer_policy: init.referrer_policy,
         integrity: init.integrity,
         keepalive: init.keepalive,
+        signal: init.signal,
     })
 }
 
 pub(crate) fn request_object_credentials_mode<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Result<Option<moli_fetch::RequestCredentialsMode>, String> {
+) -> Result<Option<moli_fetch::RequestCredentialsMode>, webidl::WebIdlError> {
     if is_branded_request_object(scope, object) {
         return Ok(request_slot_string(scope, object, REQUEST_CREDENTIALS_SLOT)
             .and_then(|value| RequestCredentialsMode::from_str(&value).ok()));
     }
-    webidl::parse_dictionary_object::<RequestInitMembers>(scope, object)
-        .map(|parsed| parsed.credentials_mode.map(|value| value.0))
-        .map_err(|error| error.to_string())
+    webidl::optional_member::<webidl::EnumValue<RequestCredentialsModeWebIdl>>(
+        scope,
+        object,
+        "credentials",
+        webidl::Context::member("Request", "credentials"),
+    )
+    .map(|value| value.map(|value| value.0.0))
 }
 
 pub(in crate::network_host) fn request_credentials_mode_label(

@@ -10,7 +10,9 @@ use crate::context_bootstrap::image_data::{
 };
 use crate::native_bridge::element::image_selected_source;
 use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use crate::webidl;
+use crate::webidl::dom_string_property_value as canvas_context_dom_string_value;
 use moli_canvas::{
     DEFAULT_FILL_STYLE, DEFAULT_FONT, DrawImageBlit, ScaleFilter, blit_draw_image_filtered,
     blit_image_data, byte_len, data_image_rgba8_pixels, draw_text, extract_image_data,
@@ -38,14 +40,14 @@ pub(super) fn reset_canvas_context_state<'s>(
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextMetrics")]
+#[webapi(interface = web_api_interfaces::TextMetrics)]
 struct CanvasTextMetricsDeclaration {
     #[webapi(slot = TEXT_METRICS_WIDTH_SLOT)]
     width: f64,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextMetrics", enumerable)]
+#[webapi(interface = web_api_interfaces::TextMetrics, enumerable)]
 struct TextMetricsPrototypeDeclaration {
     #[webapi(accessor_property, getter = text_metrics_width_getter)]
     width: (),
@@ -59,6 +61,44 @@ pub(super) fn install_text_metrics_template_bindings<'s>(
         scope,
         template.prototype_template(scope),
     );
+}
+
+macro_rules! canvas_rect_declaration {
+    ($name:ident, $interface:path) => {
+        #[derive(WebApiFunctionTemplate)]
+        #[webapi(interface = $interface, enumerable, receiver)]
+        struct $name {
+            #[webapi(method = "fillRect", length = 4, callback = canvas_context_fill_rect_callback)]
+            fill_rect: (),
+            #[webapi(method = "clearRect", length = 4, callback = canvas_context_clear_rect_callback)]
+            clear_rect: (),
+        }
+    };
+}
+
+canvas_rect_declaration!(
+    CanvasRectDeclaration,
+    web_api_interfaces::CanvasRenderingContext2D
+);
+canvas_rect_declaration!(
+    OffscreenCanvasRectDeclaration,
+    web_api_interfaces::OffscreenCanvasRenderingContext2D
+);
+
+pub(crate) fn install_canvas_rect_bindings<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+    prototype: v8::Local<'s, v8::ObjectTemplate>,
+    interface: &str,
+) {
+    match interface {
+        "CanvasRenderingContext2D" => {
+            CanvasRectDeclaration::initialize_prototype_template(scope, prototype);
+        }
+        "OffscreenCanvasRenderingContext2D" => {
+            OffscreenCanvasRectDeclaration::initialize_prototype_template(scope, prototype);
+        }
+        _ => unreachable!("only Canvas 2D contexts have rectangle bindings"),
+    }
 }
 
 fn text_metrics_width_getter<'s>(
@@ -250,6 +290,32 @@ struct CanvasContextRectPathArgs {
 }
 
 #[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "CanvasRenderingContext2D.fillRect")]
+struct CanvasContextFillRectArgs {
+    #[webidl(required)]
+    x: f64,
+    #[webidl(required)]
+    y: f64,
+    #[webidl(required)]
+    width: f64,
+    #[webidl(required)]
+    height: f64,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "CanvasRenderingContext2D.clearRect")]
+struct CanvasContextClearRectArgs {
+    #[webidl(required, converter = "unrestricted_double")]
+    x: f64,
+    #[webidl(required, converter = "unrestricted_double")]
+    y: f64,
+    #[webidl(required, converter = "unrestricted_double")]
+    width: f64,
+    #[webidl(required, converter = "unrestricted_double")]
+    height: f64,
+}
+
+#[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "CanvasRenderingContext2D.arc")]
 struct CanvasContextArcArgs {
     #[webidl(required)]
@@ -307,7 +373,9 @@ fn require_canvas_context_receiver<'s>(
     receiver: v8::Local<'s, v8::Object>,
     member: &str,
 ) -> bool {
-    if get_private_value(scope, receiver, CANVAS_CONTEXT_FILL_STYLE_SLOT).is_some() {
+    if web_api_interfaces::CanvasRenderingContext2D::is_instance(scope, receiver)
+        || web_api_interfaces::OffscreenCanvasRenderingContext2D::is_instance(scope, receiver)
+    {
         return true;
     }
     throw_type_error(
@@ -482,25 +550,6 @@ pub(crate) fn canvas_context_image_smoothing_quality_setter_callback<'s>(
         quality.label(),
     );
     rv.set_undefined();
-}
-
-fn canvas_context_dom_string_value<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-    owner: &'static str,
-    property: &'static str,
-) -> Option<String> {
-    match webidl::convert::<webidl::DomString>(
-        scope,
-        value,
-        webidl::Context::member(owner, property),
-    ) {
-        Ok(value) => Some(value.0),
-        Err(error) => {
-            webidl::throw_error(scope, &error);
-            None
-        }
-    }
 }
 
 fn canvas_required_unrestricted_double_arg<'s>(
@@ -732,29 +781,55 @@ pub(crate) fn canvas_context_fill_rect_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(canvas) = canvas_owner_from_context(scope, args.this()) else {
+    let context = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("generated fillRect binding validates the receiver");
+    let Some(parsed) = webidl::parse_args::<CanvasContextFillRectArgs>(scope, &args) else {
         return;
     };
-    let Some(rect) = normalized_rect(scope, &args, "CanvasRenderingContext2D.fillRect") else {
+    if ![parsed.x, parsed.y, parsed.width, parsed.height]
+        .into_iter()
+        .all(f64::is_finite)
+        || parsed.width == 0.0
+        || parsed.height == 0.0
+    {
+        return;
+    }
+    let Some(canvas) = canvas_owner_from_context(scope, context) else {
         return;
     };
-    let fill_style = context_string_slot(scope, args.this(), CANVAS_CONTEXT_FILL_STYLE_SLOT)
-        .unwrap_or_else(|| DEFAULT_FILL_STYLE.to_owned());
-    let color = fill_style_rgba(&fill_style);
-    let _ = with_canvas_like_pixels_mut(scope, canvas, |pixels, width, height| {
-        paint_rect(pixels, width, height, rect, color);
-    });
+    let path_state = canvas_path_state(scope, context);
+    let state = path_state.borrow();
+    if state.inverse_transform().is_none() {
+        return;
+    }
+    let transform = state.transform();
+    drop(state);
+    // Rectangles use local coordinates and must leave the default path untouched.
+    let mut rectangle = super::path::Canvas2dPathState::default();
+    rectangle.rect(parsed.x, parsed.y, parsed.width, parsed.height);
+    let fragment = PaintFragment::Fill {
+        fill_rule: moli_layout::PaintFillRule::NonZero,
+        shape: PaintShape::Path(rectangle.paint_path()),
+        brush: PaintBrush::Solid(context_fill_color(scope, context)),
+        transform,
+    };
+    rasterize_canvas_fragment(scope, canvas, fragment);
 }
 
-pub(crate) fn canvas_context_clear_rect_callback<'s>(
+fn canvas_context_clear_rect_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(canvas) = canvas_owner_from_context(scope, args.this()) else {
+    let context = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("generated clearRect binding validates the receiver");
+    let Some(parsed) = webidl::parse_args::<CanvasContextClearRectArgs>(scope, &args) else {
         return;
     };
-    let Some(rect) = normalized_rect(scope, &args, "CanvasRenderingContext2D.clearRect") else {
+    let Some(rect) = canvas_normalize_rect(parsed.x, parsed.y, parsed.width, parsed.height) else {
+        return;
+    };
+    let Some(canvas) = canvas_owner_from_context(scope, context) else {
         return;
     };
     let _ = with_canvas_like_pixels_mut(scope, canvas, |pixels, width, height| {
@@ -1110,6 +1185,7 @@ pub(crate) fn canvas_context_fill_callback<'s>(
             return None;
         }
         Some(PaintFragment::Fill {
+            fill_rule: moli_layout::PaintFillRule::NonZero,
             shape: PaintShape::Path(state.paint_path()),
             brush: PaintBrush::Solid(context_fill_color(scope, args.this())),
             transform: PaintTransform2D::IDENTITY,
@@ -1562,11 +1638,14 @@ fn rasterize_canvas_fragment<'s>(
     });
 }
 
-/// Composites `source` (premultiplied RGBA8) over `destination` (straight
-/// RGBA8) using source-over. This is the format vello_cpu renders into, while
-/// the canvas backing store is straight alpha.
+/// Composites straight-alpha RGBA8 source and destination using source-over.
 fn composite_rgba8_over(destination: &mut [u8], source: &[u8]) {
-    for (dst, src) in destination.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+    for (dst, src) in destination
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(source.as_chunks::<4>().0.iter())
+    {
         let src_alpha = u32::from(src[3]);
         if src_alpha == 0 {
             continue;
@@ -1582,7 +1661,7 @@ fn composite_rgba8_over(destination: &mut [u8], source: &[u8]) {
             continue;
         }
         for channel in 0..3 {
-            let src_premultiplied = u32::from(src[channel]);
+            let src_premultiplied = (u32::from(src[channel]) * src_alpha + 127) / 255;
             let dst_premultiplied = u32::from(dst[channel]) * dst_alpha / 255;
             let out_premultiplied = src_premultiplied + dst_premultiplied * (255 - src_alpha) / 255;
             dst[channel] = ((out_premultiplied * 255 + out_alpha / 2) / out_alpha) as u8;
@@ -1871,12 +1950,11 @@ fn canvas_context_relevant_context<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     context: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Context>> {
-    canvas_owner_from_context(scope, context)
-        .and_then(|canvas| {
-            crate::context_bootstrap::shared::node_owner_document_or_self(scope, canvas)
-        })
-        .and_then(|document| crate::native_bridge::node_relevant_context(scope, document))
-        .or_else(|| context.get_creation_context(scope))
+    // Adoption changes ownerDocument, but the context keeps its original realm.
+    context.get_creation_context(scope).or_else(|| {
+        canvas_owner_from_context(scope, context)
+            .and_then(|canvas| crate::native_bridge::node_relevant_context(scope, canvas))
+    })
 }
 
 pub(crate) fn canvas_context_create_image_data_callback<'s>(
@@ -1894,10 +1972,13 @@ pub(crate) fn canvas_context_create_image_data_callback<'s>(
         rv.set(v8::undefined(scope).into());
         return;
     };
-    if let Some(image_data) = build_image_data_object(scope, width, height) {
+    let relevant_context = canvas_context_relevant_context(scope, args.this())
+        .unwrap_or_else(|| scope.get_current_context());
+    let target_scope = &mut v8::ContextScope::new(scope, relevant_context);
+    if let Some(image_data) = build_image_data_object(target_scope, width, height) {
         rv.set(image_data.into());
     } else {
-        rv.set(v8::undefined(scope).into());
+        rv.set(v8::undefined(target_scope).into());
     }
 }
 
@@ -1914,15 +1995,12 @@ pub(crate) fn canvas_context_put_image_data_callback<'s>(
         else {
             return;
         };
-        let Some(dirty_rect) = normalized_image_data_dirty_rect(
-            scope,
+        let dirty_rect = moli_canvas::ImageDataRect::new(
             parsed.dirty_x,
             parsed.dirty_y,
             parsed.dirty_width,
             parsed.dirty_height,
-        ) else {
-            return;
-        };
+        );
         (parsed.image_data, parsed.dx, parsed.dy, Some(dirty_rect))
     } else {
         let Some(parsed) = webidl::parse_args::<CanvasContextPutImageDataArgs>(scope, &args) else {
@@ -1942,11 +2020,9 @@ pub(crate) fn canvas_context_put_image_data_callback<'s>(
         return;
     };
 
-    let (dirty_x, dirty_y, dirty_width, dirty_height) = if args.length() >= 7 {
-        dirty_rect.unwrap_or((0, 0, 0, 0))
-    } else {
-        (0, 0, source_width as i32, source_height as i32)
-    };
+    let dirty_rect = dirty_rect.unwrap_or_else(|| {
+        moli_canvas::ImageDataRect::new(0, 0, source_width as i32, source_height as i32)
+    });
 
     let _ = with_canvas_like_pixels_mut(scope, canvas, |pixels, width, height| {
         blit_image_data(
@@ -1958,10 +2034,7 @@ pub(crate) fn canvas_context_put_image_data_callback<'s>(
             source_height,
             dx,
             dy,
-            dirty_x,
-            dirty_y,
-            dirty_width,
-            dirty_height,
+            dirty_rect,
         );
     });
 }
@@ -1975,42 +2048,33 @@ pub(crate) fn canvas_context_get_image_data_callback<'s>(
         rv.set(v8::undefined(scope).into());
         return;
     };
-    let Some(width) = positive_image_data_dimension_from_long(scope, parsed.sw) else {
-        rv.set(v8::undefined(scope).into());
+    let rect = moli_canvas::ImageDataRect::new(parsed.sx, parsed.sy, parsed.sw, parsed.sh);
+    let (width, height) = (rect.width(), rect.height());
+    if width == 0 || height == 0 {
+        webidl::throw_index_size_error(scope);
         return;
-    };
-    let Some(height) = positive_image_data_dimension_from_long(scope, parsed.sh) else {
-        rv.set(v8::undefined(scope).into());
-        return;
-    };
+    }
     if byte_len(width, height).is_none() {
         webidl::throw_index_size_error(scope);
         rv.set(v8::undefined(scope).into());
         return;
     }
-    let source_x = parsed.sx;
-    let source_y = parsed.sy;
     let bytes = if let Some(canvas) = canvas_owner_from_context(scope, args.this()) {
         canvas_like_pixels_copy(scope, canvas)
             .map(|(pixels, canvas_width, canvas_height)| {
-                extract_image_data(
-                    &pixels,
-                    canvas_width,
-                    canvas_height,
-                    source_x,
-                    source_y,
-                    width,
-                    height,
-                )
+                extract_image_data(&pixels, canvas_width, canvas_height, rect)
             })
             .unwrap_or_else(|| blank_image_data(width, height))
     } else {
         blank_image_data(width, height)
     };
-    let Some(image_data) = build_image_data_object_with_bytes(scope, width, height, bytes)
-        .or_else(|| build_image_data_object(scope, width, height))
-    else {
-        rv.set(v8::undefined(scope).into());
+    let relevant_context = canvas_context_relevant_context(scope, args.this())
+        .unwrap_or_else(|| scope.get_current_context());
+    let target_scope = &mut v8::ContextScope::new(scope, relevant_context);
+    let image_data = build_image_data_object_with_bytes(target_scope, width, height, bytes)
+        .or_else(|| build_image_data_object(target_scope, width, height));
+    let Some(image_data) = image_data else {
+        rv.set(v8::undefined(target_scope).into());
         return;
     };
     rv.set(image_data.into());
@@ -2036,61 +2100,6 @@ fn image_data_dimension_from_long(scope: &mut v8::PinScope<'_, '_>, value: i32) 
         return None;
     }
     Some(value.unsigned_abs())
-}
-
-fn positive_image_data_dimension_from_long(
-    scope: &mut v8::PinScope<'_, '_>,
-    value: i32,
-) -> Option<u32> {
-    if value <= 0 {
-        webidl::throw_index_size_error(scope);
-        return None;
-    }
-    Some(value as u32)
-}
-
-fn normalized_image_data_dirty_rect(
-    scope: &mut v8::PinScope<'_, '_>,
-    dirty_x: i32,
-    dirty_y: i32,
-    dirty_width: i32,
-    dirty_height: i32,
-) -> Option<(i32, i32, i32, i32)> {
-    let (dirty_x, dirty_width) = normalized_dirty_axis(scope, dirty_x, dirty_width)?;
-    let (dirty_y, dirty_height) = normalized_dirty_axis(scope, dirty_y, dirty_height)?;
-    Some((dirty_x, dirty_y, dirty_width, dirty_height))
-}
-
-fn normalized_dirty_axis(
-    scope: &mut v8::PinScope<'_, '_>,
-    start: i32,
-    span: i32,
-) -> Option<(i32, i32)> {
-    if span >= 0 {
-        return Some((start, span));
-    }
-    if span == i32::MIN {
-        webidl::throw_index_size_error(scope);
-        return None;
-    }
-    let start = start.checked_add(span).or_else(|| {
-        webidl::throw_index_size_error(scope);
-        None
-    })?;
-    Some((start, -span))
-}
-
-fn normalized_rect<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    prefix: &'static str,
-) -> Option<(i32, i32, i32, i32)> {
-    canvas_normalize_rect(
-        canvas_unrestricted_double_arg(scope, args, 0, prefix)?,
-        canvas_unrestricted_double_arg(scope, args, 1, prefix)?,
-        canvas_unrestricted_double_arg(scope, args, 2, prefix)?,
-        canvas_unrestricted_double_arg(scope, args, 3, prefix)?,
-    )
 }
 
 fn normalized_draw_image_args<'s>(

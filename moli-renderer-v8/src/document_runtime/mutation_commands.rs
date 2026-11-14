@@ -9,10 +9,10 @@ use crate::{
 };
 use moli_dom::native::{Element, Node, NodeType};
 
-use super::dom_facade::sync_style_sources_from_dom_mutation_effects;
 use super::*;
 
 mod details;
+mod scriptless_parser;
 mod tree;
 
 #[cfg(test)]
@@ -52,11 +52,12 @@ struct DomDebuggerTreeInsertionEffects {
 impl DocumentRuntime {
     fn tree_insertion_effects_with_dom_debugger(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         child: DomHandle,
         insertion_roots: &[DomHandle],
         reference_child: Option<DomHandle>,
+        is_atomic_move: bool,
     ) -> Option<DomDebuggerTreeInsertionEffects> {
         let host = unsafe { &mut *host_ptr };
         if !host.has_dom_debugger_dom_breakpoints() {
@@ -70,10 +71,11 @@ impl DocumentRuntime {
         // breakpoint is installed.
         if insertion_roots.is_empty() {
             return Some(DomDebuggerTreeInsertionEffects {
-                effects: self.insert_before_effects_in_structural_scope(
+                effects: self.insert_before_effects_in_structural_scope_with_state_preservation(
                     parent,
                     child,
                     reference_child,
+                    is_atomic_move,
                 ),
                 prepublished_removals: Vec::new(),
             });
@@ -97,6 +99,7 @@ impl DocumentRuntime {
             insertion_roots,
             &mut effects,
             &mut prepublished_removals,
+            is_atomic_move,
         ) {
             return Some(DomDebuggerTreeInsertionEffects {
                 effects,
@@ -106,8 +109,12 @@ impl DocumentRuntime {
 
         unsafe { &mut *host_ptr }.break_on_dom_debugger_will_insert_dom_node(parent);
         for &root in insertion_roots {
-            let inserted =
-                self.insert_before_effects_in_structural_scope(parent, root, reference_child);
+            let inserted = self.insert_before_effects_in_structural_scope_with_state_preservation(
+                parent,
+                root,
+                reference_child,
+                is_atomic_move,
+            );
             if !inserted.did_change() {
                 return Some(DomDebuggerTreeInsertionEffects {
                     effects,
@@ -132,10 +139,11 @@ impl DocumentRuntime {
 
     fn remove_tree_insertion_roots_with_dom_debugger(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         insertion_roots: &[DomHandle],
         effects: &mut DomMutationEffects,
         prepublished_removals: &mut Vec<devtools_mutations::DevToolsDomPrepublishedRemoval>,
+        is_atomic_move: bool,
     ) -> bool {
         for &root in insertion_roots {
             let Some(old_parent) = self.dom_host.parent_node(root) else {
@@ -143,7 +151,11 @@ impl DocumentRuntime {
             };
             prepublished_removals
                 .extend(unsafe { &mut *host_ptr }.break_on_dom_debugger_will_remove_dom_node(root));
-            let removed = self.remove_child_effects_in_structural_scope(old_parent, root);
+            let removed = self.remove_child_effects_in_structural_scope_with_state_preservation(
+                old_parent,
+                root,
+                is_atomic_move,
+            );
             if !removed.did_change() {
                 return false;
             }
@@ -199,7 +211,7 @@ impl DocumentRuntime {
 
     fn break_on_dom_debugger_before_tree_removal(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         parent: DomHandle,
         child: DomHandle,
     ) -> Vec<devtools_mutations::DevToolsDomPrepublishedRemoval> {
@@ -216,7 +228,7 @@ impl DocumentRuntime {
     pub(crate) fn set_text_content(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         value: &str,
     ) -> bool {
@@ -232,7 +244,7 @@ impl DocumentRuntime {
     pub(crate) fn set_text_content_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         value: &str,
     ) -> bool {
@@ -248,7 +260,7 @@ impl DocumentRuntime {
     fn set_text_content_with_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         value: &str,
         reaction_policy: TextContentReactionPolicy,
@@ -326,8 +338,9 @@ impl DocumentRuntime {
                         );
                     }
                 }
-                unsafe { &mut *host_ptr }
-                    .drop_child_browsing_context_subtree_with_window_realm(scope, root);
+                PageScriptHost::drop_child_browsing_context_subtree_with_window_realm(
+                    scope, host_ptr, root,
+                );
             }
         }
         record_dom_binding_timing("dom.setTextContent", started);
@@ -337,7 +350,7 @@ impl DocumentRuntime {
     pub(crate) fn queue_character_data_mutation_record(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         old_value: Option<String>,
     ) -> bool {
@@ -365,7 +378,7 @@ impl DocumentRuntime {
     pub(crate) fn split_text(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         offset: usize,
         original: &str,
@@ -409,7 +422,7 @@ impl DocumentRuntime {
     pub(crate) fn normalize(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> bool {
         let (effects, prepublished_removals) =
@@ -429,7 +442,7 @@ impl DocumentRuntime {
 
     fn normalize_effects_with_dom_debugger(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> (
         DomMutationEffects,
@@ -540,7 +553,7 @@ impl DocumentRuntime {
     pub(crate) fn set_attribute(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         value: &str,
@@ -558,7 +571,7 @@ impl DocumentRuntime {
     pub(crate) fn set_attribute_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         value: &str,
@@ -576,7 +589,7 @@ impl DocumentRuntime {
     fn set_attribute_with_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         value: &str,
@@ -596,7 +609,7 @@ impl DocumentRuntime {
     pub(crate) fn set_style_attribute_from_cssom_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         value: &str,
     ) -> bool {
@@ -615,7 +628,7 @@ impl DocumentRuntime {
     fn set_attribute_with_reaction_policy_and_options(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         value: &str,
@@ -704,7 +717,7 @@ impl DocumentRuntime {
     /// only when a `srcdoc` navigate event canceled the navigation.
     fn apply_frame_owner_attribute_mutation_followup(
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         removed: bool,
@@ -726,7 +739,7 @@ impl DocumentRuntime {
         if is_srcdoc {
             runtime.clear_child_browsing_context_cached_snapshot_for_navigation(handle);
         }
-        runtime.refresh_child_browsing_context_and_initial_history_floor(scope, handle);
+        runtime.refresh_child_browsing_context_and_queue_ready_work(scope, handle);
         if is_srcdoc {
             runtime.sync_existing_child_browsing_context_window_state(scope, handle);
         } else if is_navigation_attribute
@@ -740,7 +753,7 @@ impl DocumentRuntime {
 
     fn dispatch_child_srcdoc_navigation_event(
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
     ) -> bool {
         let child_window = {
@@ -755,7 +768,7 @@ impl DocumentRuntime {
     pub(crate) fn remove_attribute(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
     ) -> bool {
@@ -771,7 +784,7 @@ impl DocumentRuntime {
     pub(crate) fn remove_attribute_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
     ) -> bool {
@@ -787,7 +800,7 @@ impl DocumentRuntime {
     fn remove_attribute_with_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         reaction_policy: AttributeChangedReactionPolicy,
@@ -876,7 +889,7 @@ impl DocumentRuntime {
     fn dispatch_custom_element_form_state_attribute_change(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
     ) {
@@ -894,7 +907,7 @@ impl DocumentRuntime {
     pub(crate) fn remove_attribute_ns_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         namespace: Option<&str>,
         local_name: &str,
@@ -912,7 +925,7 @@ impl DocumentRuntime {
     fn remove_attribute_ns_with_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         namespace: Option<&str>,
         local_name: &str,
@@ -1005,7 +1018,7 @@ impl DocumentRuntime {
     pub(crate) fn set_attribute_ns(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         namespace: Option<&str>,
         prefix: Option<&str>,
@@ -1029,7 +1042,7 @@ impl DocumentRuntime {
     pub(crate) fn set_attribute_ns_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         namespace: Option<&str>,
         prefix: Option<&str>,
@@ -1053,7 +1066,7 @@ impl DocumentRuntime {
     fn set_attribute_ns_with_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         namespace: Option<&str>,
         prefix: Option<&str>,
@@ -1151,7 +1164,7 @@ impl DocumentRuntime {
     pub(crate) fn set_parser_custom_element_token_attribute(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         attribute: &crate::dom::native::Attribute,
     ) -> bool {
@@ -1184,7 +1197,7 @@ impl DocumentRuntime {
     pub(crate) fn set_boolean_attribute(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         enabled: bool,
@@ -1202,7 +1215,7 @@ impl DocumentRuntime {
     pub(crate) fn set_boolean_attribute_appending_to_current_reaction_queue(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         enabled: bool,
@@ -1220,7 +1233,7 @@ impl DocumentRuntime {
     fn set_boolean_attribute_with_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         enabled: bool,
@@ -1248,7 +1261,7 @@ impl DocumentRuntime {
 
     fn note_attribute_state_style_activity_if_needed(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         state: StyloElementState,
         old_style_state: Option<StyloElementState>,
@@ -1265,7 +1278,7 @@ impl DocumentRuntime {
     fn apply_attribute_changed_reaction_policy(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         name: &str,
         namespace: Option<&str>,
@@ -1273,14 +1286,10 @@ impl DocumentRuntime {
         new_value: Option<&str>,
         policy: AttributeChangedReactionPolicy,
     ) {
-        let retired_event_callback = self.sync_body_window_messageerror_content_attribute(
-            handle,
-            name,
-            namespace,
-            new_value.is_some(),
-        );
-        if let Some(callback_id) = retired_event_callback {
-            unsafe { &mut *host_ptr }.release_event_callback(callback_id);
+        if namespace.is_none() {
+            native_bridge::element::invalidate_event_handler_content_attribute(
+                scope, host_ptr, handle, name,
+            );
         }
         match policy {
             AttributeChangedReactionPolicy::DispatchNow => {
@@ -1298,7 +1307,7 @@ impl DocumentRuntime {
 
     fn retained_old_style_state_for_impact(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         state: StyloElementState,
     ) -> Option<StyloElementState> {
@@ -1309,7 +1318,7 @@ impl DocumentRuntime {
 
     fn retained_derived_old_style_states_for_attribute_impact(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         namespace: Option<&str>,
         name: &str,
@@ -1409,7 +1418,7 @@ impl DocumentRuntime {
 
     fn note_derived_element_state_style_activity(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         derived_old_style_states: &[(DomHandle, StyloElementState, Option<StyloElementState>)],
     ) {
         let runtime = unsafe { &mut *host_ptr };
@@ -1442,6 +1451,15 @@ impl DocumentRuntime {
 
     pub(crate) fn set_autofilled(&mut self, handle: DomHandle, autofilled: bool) -> bool {
         self.dom_host.set_autofilled_state(handle, autofilled)
+    }
+
+    pub(crate) fn set_web_mcp_activity(
+        &mut self,
+        handle: DomHandle,
+        form: bool,
+        submit: bool,
+    ) -> bool {
+        self.dom_host.set_web_mcp_activity(handle, form, submit)
     }
 
     pub(crate) fn set_input_files(
@@ -1526,7 +1544,7 @@ impl DocumentRuntime {
     pub(crate) fn set_checked_state_with_old_states(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         checked: bool,
         old_states: &[(DomHandle, StyloElementState)],
@@ -1552,7 +1570,7 @@ impl DocumentRuntime {
 
     pub(crate) fn set_checked_state_with_dirty_and_old_states(
         &mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         checked: bool,
         dirty: bool,
@@ -1579,7 +1597,7 @@ impl DocumentRuntime {
     pub(crate) fn set_selected_state(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         selected: bool,
     ) -> bool {
@@ -1599,7 +1617,7 @@ impl DocumentRuntime {
     pub(crate) fn set_selected_state_with_dirty(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         selected: bool,
         dirty: bool,
@@ -1622,7 +1640,7 @@ impl DocumentRuntime {
     pub(crate) fn set_indeterminate_state(
         &mut self,
         _scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         indeterminate: bool,
     ) -> bool {
@@ -1641,7 +1659,7 @@ impl DocumentRuntime {
     pub(crate) fn set_select_explicit_none(
         &mut self,
         _scope: &mut v8::PinScope<'_, '_>,
-        _host_ptr: *mut JsContextHost,
+        _host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         explicit_none: bool,
     ) -> bool {
@@ -1656,7 +1674,7 @@ impl DocumentRuntime {
     pub(crate) fn set_script_async(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         is_async: bool,
     ) -> bool {
@@ -1669,7 +1687,7 @@ impl DocumentRuntime {
     pub(super) fn apply_runtime_mutation_effects(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         effects: DomMutationEffects,
         options: RuntimeMutationOptions,
     ) -> bool {
@@ -1685,7 +1703,7 @@ impl DocumentRuntime {
     fn apply_runtime_mutation_effects_with_prepublished_removals(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         effects: DomMutationEffects,
         options: RuntimeMutationOptions,
         prepublished_removals: Vec<devtools_mutations::DevToolsDomPrepublishedRemoval>,
@@ -1709,9 +1727,9 @@ impl DocumentRuntime {
     }
 }
 
-pub(super) struct RuntimeMutationApplyResult {
+pub(crate) struct RuntimeMutationApplyResult {
     changed: bool,
-    meta_refresh_candidates: Vec<MetaRefreshNavigation>,
+    meta_refresh_candidates: Vec<super::meta_refresh::MetaRefreshMutationCandidate>,
     devtools_dom_mutations: Vec<super::devtools_mutations::DevToolsDomMutationFact>,
     runtime_script_start_candidates: Vec<crate::mutation_coordinator::RuntimeScriptStartCandidate>,
     removed_open_popovers: Vec<DomHandle>,
@@ -1742,7 +1760,7 @@ impl InlineStyleAttributeCspMutation {
 pub(super) fn finish_runtime_mutation_effects(
     runtime: &mut DocumentRuntime,
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     result: RuntimeMutationApplyResult,
 ) -> bool {
     let RuntimeMutationApplyResult {
@@ -1759,45 +1777,10 @@ pub(super) fn finish_runtime_mutation_effects(
 
     runtime.queue_devtools_dom_mutations(devtools_dom_mutations);
 
-    if let Some(scheduled) = runtime.note_top_level_meta_refresh_candidates(meta_refresh_candidates)
-    {
-        let delay_ms = scheduled.navigation.delay_ms;
-        let url = scheduled.navigation.url.clone();
-        let owner = scheduled.owner;
-        let (task, ready_at) = scheduled.into_internal_loading_task();
-        tracing::debug!(
-            owner = ?owner,
-            %url,
-            delay_ms,
-            ?ready_at,
-            "rescheduled top-level meta refresh after a DOM mutation"
-        );
-        if unsafe { &*host_ptr }
-            .page_internal_loading_sender()
-            .schedule_at(task, ready_at)
-            .is_err()
-        {
-            tracing::debug!("dropped meta refresh because its Page source closed");
-        }
-    }
+    runtime.finish_meta_refresh_mutation_candidates(scope, host_ptr, meta_refresh_candidates);
 
     for candidate in runtime_script_start_candidates {
-        let (node, host_script_handle) = candidate.into_parts();
-        let Some(plan) = runtime.host_plan_script_start(node, &host_script_handle) else {
-            continue;
-        };
-        match unsafe { &mut *host_ptr }.commit_current_main_runtime_script_start(runtime, plan) {
-            Ok(Some(committed)) => {
-                execute_committed_inline_classic_script(runtime, scope, host_ptr, committed);
-            }
-            Ok(None) => {}
-            Err(message) => {
-                if let Some(message) = v8::String::new(scope, &message) {
-                    let exception = v8::Exception::error(scope, message);
-                    scope.throw_exception(exception);
-                }
-            }
-        }
+        finish_runtime_script_start_candidate(runtime, scope, host_ptr, candidate);
     }
 
     for popover in removed_open_popovers {
@@ -1815,10 +1798,32 @@ pub(super) fn finish_runtime_mutation_effects(
         );
     }
     runtime.apply_pending_stylesheet_source_css_projections(scope, host_ptr);
-    if changed {
+    if changed && !stylesheet_owner_changes.is_empty() {
+        let mut prime_result =
+            runtime.prime_stylesheet_owner_runtime_changes(host_ptr, &stylesheet_owner_changes);
+        crate::native_bridge::document::apply_stylesheet_owner_css_projections(
+            scope,
+            unsafe { &*host_ptr },
+            &stylesheet_owner_changes,
+        );
+        let completed_clients = prime_result.take_completed_stylesheet_clients();
+        runtime.settle_stylesheet_link_clients_in_current_scope(scope, host_ptr, completed_clients);
+        runtime
+            .pending_connected_style_load_prime_result
+            .extend(prime_result);
+    }
+    changed
+}
+
+impl DocumentRuntime {
+    pub(super) fn prime_stylesheet_owner_runtime_changes(
+        &mut self,
+        host_ptr: *mut PageScriptHost,
+        stylesheet_owner_changes: &[crate::dom::native::DomStylesheetOwnerChange],
+    ) -> ConnectedStyleLoadPrimeResult {
         let mut prime_result = ConnectedStyleLoadPrimeResult::default();
         let prepared_owner_changes =
-            runtime.prepare_stylesheet_owner_runtime_changes(&stylesheet_owner_changes);
+            self.prepare_stylesheet_owner_runtime_changes(stylesheet_owner_changes);
         let (canceled_load_event_bindings, prepared_owner_changes) =
             prepared_owner_changes.into_parts();
         for binding in canceled_load_event_bindings {
@@ -1838,7 +1843,7 @@ pub(super) fn finish_runtime_mutation_effects(
                     .install_cached_linked_stylesheet_for_owner(owner, url);
             }
             let inline_source = unsafe { &*host_ptr }.owner_style_sheet_processing_source(owner);
-            let prepared_loads = runtime.prepare_connected_style_loads(owner, false);
+            let prepared_loads = self.prepare_connected_style_loads(owner, false);
             for prepared_load in prepared_loads {
                 // A native DOM callback already owns this exact live host.
                 // Commit touches only FrameOwnerStore and never dereferences
@@ -1853,7 +1858,7 @@ pub(super) fn finish_runtime_mutation_effects(
                     continue;
                 };
                 debug_assert_eq!(prepared_load.owner(), owner);
-                prime_result.extend(runtime.apply_prepared_connected_style_load(
+                prime_result.extend(self.apply_prepared_connected_style_load(
                     prepared_load,
                     inline_source.clone(),
                     event_admission,
@@ -1861,37 +1866,176 @@ pub(super) fn finish_runtime_mutation_effects(
                 ));
             }
         }
-        crate::native_bridge::document::apply_stylesheet_owner_css_projections(
-            scope,
-            unsafe { &*host_ptr },
-            &stylesheet_owner_changes,
-        );
-        let completed_clients = prime_result.take_completed_stylesheet_clients();
-        runtime.settle_stylesheet_link_clients_in_current_scope(scope, host_ptr, completed_clients);
-        runtime
-            .pending_connected_style_load_prime_result
-            .extend(prime_result);
+        prime_result
     }
-    changed
+}
+
+pub(super) fn finish_runtime_script_start_candidate(
+    runtime: &mut DocumentRuntime,
+    scope: &mut v8::PinScope<'_, '_>,
+    host_ptr: *mut PageScriptHost,
+    candidate: crate::mutation_coordinator::RuntimeScriptStartCandidate,
+) {
+    let node = candidate.into_node();
+    let Some(owner_document_handle) = runtime.dom_host.owner_document_handle(node) else {
+        return;
+    };
+    if owner_document_handle != runtime.dom_host.document_handle() {
+        start_connected_child_document_script(
+            runtime,
+            scope,
+            host_ptr,
+            node,
+            owner_document_handle,
+        );
+        return;
+    }
+    let wrapper = unsafe { &mut *host_ptr }
+        .native_bridge_mut()
+        .wrap_handle(scope, host_ptr, node);
+    let Some(wrapper) = wrapper else {
+        return;
+    };
+
+    let host_script_handle = native_bridge::object_string_property(scope, wrapper, "__moliHandle")
+        .unwrap_or_else(|| {
+            let handle = format!("dynamic-script-native-{}", node.index());
+            if let Some(value) = v8::String::new(scope, &handle) {
+                let key = v8str(scope, "__moliHandle");
+                let _ = wrapper.define_own_property(
+                    scope,
+                    key.into(),
+                    value.into(),
+                    v8::PropertyAttribute::DONT_ENUM,
+                );
+            }
+            handle
+        });
+    let Some(plan) = runtime.host_plan_script_start(node, &host_script_handle) else {
+        return;
+    };
+    match unsafe { &mut *host_ptr }.commit_current_main_runtime_script_start(scope, runtime, plan) {
+        Ok(Some(committed)) => {
+            execute_committed_inline_classic_script(runtime, scope, host_ptr, committed);
+        }
+        Ok(None) => {}
+        Err(message) => {
+            if let Some(message) = v8::String::new(scope, &message) {
+                let exception = v8::Exception::error(scope, message);
+                scope.throw_exception(exception);
+            }
+        }
+    }
+}
+
+fn start_connected_child_document_script(
+    runtime: &mut DocumentRuntime,
+    scope: &mut v8::PinScope<'_, '_>,
+    host_ptr: *mut PageScriptHost,
+    node: DomHandle,
+    owner_document_handle: DomHandle,
+) {
+    use crate::host::{
+        RuntimeScriptStartDecision, ScriptElementLoader, ScriptElementLoaderOptions,
+    };
+    let (preparation, decision) = ScriptElementLoader::prepare(
+        &mut runtime.dom_host,
+        &runtime.document,
+        node,
+        ScriptElementLoaderOptions::with_scripting_enabled(
+            unsafe { &*host_ptr }.document_scripting_enabled(owner_document_handle),
+        ),
+    )
+    .into_parts();
+    match decision {
+        RuntimeScriptStartDecision::Skip { commit_start, .. } => {
+            if commit_start {
+                let _ = runtime.dom_host.set_script_already_started(node, true);
+            }
+        }
+        RuntimeScriptStartDecision::ExecuteInlineClassic { source } => {
+            if let Err(error) = unsafe { &mut *host_ptr }
+                .execute_child_dynamic_inline_classic_script_on_current_stack(
+                    scope,
+                    owner_document_handle,
+                    node,
+                    source,
+                )
+            {
+                // Script exceptions are reported in the child Window. They do
+                // not escape from the DOM operation that inserted the element.
+                tracing::debug!(%error, "child dynamic inline classic script failed");
+            }
+        }
+        RuntimeScriptStartDecision::Queue {
+            source,
+            kind,
+            mode,
+            source_kind,
+        } => {
+            match unsafe { &mut *host_ptr }
+                .queue_child_dynamic_external_classic_script_for_current_document(
+                    scope,
+                    owner_document_handle,
+                    node,
+                    &preparation,
+                    &source,
+                    kind,
+                    mode,
+                    source_kind,
+                ) {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    node = ?node,
+                    owner_document_handle = ?owner_document_handle,
+                    kind = ?kind,
+                    mode = ?mode,
+                    source_kind = ?source_kind,
+                    "child runtime script has no supported current-document queue"
+                ),
+                Err(error) => tracing::warn!(
+                    node = ?node,
+                    owner_document_handle = ?owner_document_handle,
+                    %error,
+                    "failed to prepare child runtime external classic script"
+                ),
+            }
+        }
+        RuntimeScriptStartDecision::RejectExternalImportMap
+        | RuntimeScriptStartDecision::QueueFailed { .. } => {}
+        RuntimeScriptStartDecision::RegisterImportMap { source } => {
+            PageScriptHost::register_child_dynamic_document_import_map(
+                scope,
+                host_ptr,
+                owner_document_handle,
+                node,
+                preparation,
+                source,
+            );
+        }
+    }
 }
 
 fn execute_committed_inline_classic_script(
     runtime: &mut DocumentRuntime,
     scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
+    host_ptr: *mut PageScriptHost,
     committed: crate::host::CommittedInlineClassicScript,
 ) {
     let (node, host_script_handle, source) = committed.into_parts();
-    let nonce = runtime
+    // An inserted script executes in its Document's main world, including
+    // when a child or isolated world performed the insertion.
+    let default_context = unsafe { &*host_ptr }
+        .page_default_context(scope)
+        .expect("top-level inline script execution requires the page main-world context");
+    let scope = &mut v8::ContextScope::new(scope, default_context);
+    let script_url = runtime.document.url().clone();
+    let base_url = runtime
         .dom_host
-        .node(node)
-        .and_then(Node::as_element)
-        .and_then(|element| {
-            element
-                .cryptographic_nonce()
-                .or_else(|| element.attribute("nonce"))
-        })
-        .map(str::to_owned);
+        .document_base_url_for_handle(runtime.dom_host.document_handle())
+        .unwrap_or_else(|| script_url.clone());
+    let nonce =
+        crate::host::script_element_nonce_for_csp(&runtime.dom_host, node).map(str::to_owned);
     let request = crate::content_security_policy::ContentSecurityPolicyScriptElementRequest {
         nonce: nonce.as_deref(),
         integrity: None,
@@ -1902,42 +2046,40 @@ fn execute_committed_inline_classic_script(
     ) else {
         return;
     };
-    let Some(source) = v8::String::new(scope, &source) else {
-        return;
-    };
-    let Some(script) = v8::Script::compile(scope, source, None) else {
-        return;
-    };
+    // Parse errors are reported by running the classic script too. Keep
+    // currentScript set through both compilation and synchronous error reporting,
+    // and contain the exception so the inserting DOM operation can continue.
     unsafe { &mut *host_ptr }.push_current_inline_script(node);
-    let run_result = script.run(scope);
+    let run_result = crate::script_vm::execute_source_text_on_current_stack(
+        scope,
+        &source,
+        Some(&script_url),
+        Some(&base_url),
+        0,
+        nonce.as_deref(),
+        true,
+    );
     unsafe { &mut *host_ptr }.pop_current_inline_script(node);
-    if run_result.is_some() {
-        let _ = runtime.enqueue_script_event_lifecycle_work(
-            crate::host::ScriptEventKind::Load,
-            &host_script_handle,
+    if let Err(error) = run_result {
+        debug!(
+            host_script_handle,
+            %error,
+            "dynamic inline classic script execution failed"
         );
     }
 }
 
-pub(super) fn apply_runtime_mutation_effects_to_dom_host(
-    mutations: &mut MutationCoordinator,
-    document: &HostDocumentState,
-    scripts: &mut HostScriptScheduler,
-    events: &mut HostEventTargetRegistry,
-    scope: &mut v8::PinScope<'_, '_>,
-    host_ptr: *mut JsContextHost,
-    dom_host: &mut DomHost,
-    effects: DomMutationEffects,
+pub(super) fn prepare_runtime_mutation_effects(
+    dom_host: &DomHost,
+    document_url: &Url,
+    effects: &DomMutationEffects,
     options: RuntimeMutationOptions,
 ) -> RuntimeMutationApplyResult {
-    let cpu_profile_enabled = moli_trace::cpu_profile_enabled();
-    let total_started = cpu_profile_enabled.then(Instant::now);
-    let style_sources_started = cpu_profile_enabled.then(Instant::now);
     let stylesheet_owner_changes = effects.stylesheet_owners().changes().to_vec();
     let meta_refresh_candidates = super::meta_refresh::meta_refresh_navigations_from_mutation(
         dom_host,
-        &effects,
-        document.url(),
+        effects,
+        document_url,
     );
     let inline_style_attribute_csp_mutations = if options.check_inline_style_csp {
         effects
@@ -1975,41 +2117,57 @@ pub(super) fn apply_runtime_mutation_effects_to_dom_host(
         Vec::new()
     };
     let devtools_dom_mutations =
-        super::devtools_mutations::capture_devtools_dom_mutation_facts(dom_host, &effects);
-    if effects.did_change() {
-        sync_style_sources_from_dom_mutation_effects(host_ptr, &effects);
+        super::devtools_mutations::capture_devtools_dom_mutation_facts(dom_host, effects);
+    RuntimeMutationApplyResult {
+        changed: effects.did_change(),
+        meta_refresh_candidates,
+        devtools_dom_mutations,
+        runtime_script_start_candidates: Vec::new(),
+        removed_open_popovers: effects.tree().removed_open_popovers().to_vec(),
+        changed_slots: effects.slots().changed_slots().to_vec(),
+        stylesheet_owner_changes,
+        inline_style_attribute_csp_mutations,
+        connected_style_csp_roots,
     }
-    let style_sources_us = style_sources_started
+}
+
+pub(super) fn apply_runtime_mutation_effects_to_dom_host(
+    mutations: &mut MutationCoordinator,
+    document: &HostDocumentState,
+    scripts: &mut HostScriptScheduler,
+    events: &mut HostEventTargetRegistry,
+    scope: &mut v8::PinScope<'_, '_>,
+    host_ptr: *mut PageScriptHost,
+    dom_host: &mut DomHost,
+    effects: DomMutationEffects,
+    options: RuntimeMutationOptions,
+) -> RuntimeMutationApplyResult {
+    let cpu_profile_enabled = moli_trace::cpu_profile_enabled();
+    let total_started = cpu_profile_enabled.then(Instant::now);
+    let preparation_started = cpu_profile_enabled.then(Instant::now);
+    let mut result = prepare_runtime_mutation_effects(dom_host, document.url(), &effects, options);
+    let preparation_us = preparation_started
         .map(|started| started.elapsed().as_micros())
         .unwrap_or_default();
     let started = dom_binding_timing_started();
-    let mutation_result = mutations.apply(
-        scope, host_ptr, dom_host, document, scripts, events, effects, options,
-    );
+    let mutation_result =
+        mutations.apply(scope, host_ptr, dom_host, scripts, events, effects, options);
     if let Some(started) = total_started {
         let total_us = started.elapsed().as_micros();
         if total_us >= 500 {
             tracing::info!(
                 target: "moli_cpu_profile",
                 stage = "apply_runtime_mutation_effects",
-                style_sources_us,
-                coordinator_us = total_us.saturating_sub(style_sources_us),
+                preparation_us,
+                coordinator_us = total_us.saturating_sub(preparation_us),
                 total_us,
             );
         }
     }
     record_dom_binding_timing("mutation.apply", started);
-    RuntimeMutationApplyResult {
-        changed: mutation_result.changed,
-        meta_refresh_candidates,
-        devtools_dom_mutations,
-        runtime_script_start_candidates: mutation_result.runtime_script_start_candidates,
-        removed_open_popovers: mutation_result.removed_open_popovers,
-        changed_slots: mutation_result.changed_slots,
-        stylesheet_owner_changes,
-        inline_style_attribute_csp_mutations,
-        connected_style_csp_roots,
-    }
+    result.changed = mutation_result.changed;
+    result.runtime_script_start_candidates = mutation_result.runtime_script_start_candidates;
+    result
 }
 
 fn should_dispatch_attribute_changed_for_set(
@@ -2140,7 +2298,7 @@ fn is_disableable_descendant_for_optgroup(element: &Element) -> bool {
 impl DocumentRuntime {
     fn note_attribute_layout_activity(
         &self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         handle: DomHandle,
         attribute_name: &str,
     ) {

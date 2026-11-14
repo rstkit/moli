@@ -1,4 +1,6 @@
+use super::range_records::RangeRecordRegistry;
 use super::*;
+use crate::dom::native::{DomHost, NodeType};
 use crate::range_boundary::RangeBoundaryPoint;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -74,7 +76,106 @@ struct SelectionRecord {
     composed_end: Option<RangeBoundaryPoint>,
 }
 
+pub(super) struct SelectionRangeBoundaryLink {
+    selection: SelectionRecordHandle,
+    range: RangeRecordHandle,
+    role: SelectionBoundaryRole,
+    side: RangeBoundarySide,
+}
+
+fn same_boundary_position(dom: &DomHost, a: RangeBoundaryPoint, b: RangeBoundaryPoint) -> bool {
+    if a.container() != b.container() {
+        return false;
+    }
+    if dom.node(a.container()).is_some_and(|node| {
+        matches!(
+            node.node_type(),
+            NodeType::Text
+                | NodeType::CDataSection
+                | NodeType::ProcessingInstruction
+                | NodeType::Comment
+        )
+    }) {
+        let (mut a, mut b) = (a, b);
+        a.offset(dom) == b.offset(dom)
+    } else {
+        // The child may already have left its parent when a removal hook
+        // runs. Compare stable child anchors, not a now-unresolvable offset.
+        a.child_before() == b.child_before()
+    }
+}
+
 impl SelectionRecordRegistry {
+    pub(super) fn linked_range_boundaries(
+        &self,
+        dom: &DomHost,
+        ranges: &RangeRecordRegistry,
+        include_composed: bool,
+    ) -> Vec<SelectionRangeBoundaryLink> {
+        let mut links = Vec::new();
+        for (&selection, record) in &self.records {
+            let Some(range) = record.associated_range else {
+                continue;
+            };
+            let start = ranges.boundary_point(range, RangeBoundarySide::Start);
+            let end = ranges.boundary_point(range, RangeBoundarySide::End);
+            for (role, point) in [
+                (SelectionBoundaryRole::Anchor, record.anchor),
+                (SelectionBoundaryRole::Focus, record.focus),
+                (SelectionBoundaryRole::ComposedStart, record.composed_start),
+                (SelectionBoundaryRole::ComposedEnd, record.composed_end),
+            ] {
+                if !include_composed
+                    && matches!(
+                        role,
+                        SelectionBoundaryRole::ComposedStart | SelectionBoundaryRole::ComposedEnd
+                    )
+                {
+                    continue;
+                }
+                let Some(point) = point else { continue };
+                let side = if start.is_some_and(|start| same_boundary_position(dom, point, start)) {
+                    RangeBoundarySide::Start
+                } else if end.is_some_and(|end| same_boundary_position(dom, point, end)) {
+                    RangeBoundarySide::End
+                } else {
+                    // Focus and cross-tree selections may retain separate
+                    // composed boundaries. Do not overwrite their projection.
+                    continue;
+                };
+                links.push(SelectionRangeBoundaryLink {
+                    selection,
+                    range,
+                    role,
+                    side,
+                });
+            }
+        }
+        links
+    }
+
+    pub(super) fn sync_linked_range_boundaries(
+        &mut self,
+        dom: &DomHost,
+        ranges: &RangeRecordRegistry,
+        links: Vec<SelectionRangeBoundaryLink>,
+    ) {
+        for link in links {
+            if let Some(point) = ranges.boundary_point(link.range, link.side)
+                && let Some(record) = self.records.get_mut(&link.selection)
+            {
+                *record.boundary_slot_mut(link.role) = Some(point);
+            }
+        }
+        for record in self.records.values_mut() {
+            if let (Some(anchor), Some(focus)) = (record.anchor, record.focus)
+                && same_boundary_position(dom, anchor, focus)
+            {
+                record.direction = SelectionDirection::None;
+            }
+        }
+    }
+
     pub(super) fn new() -> Self {
         Self {
             next_id: 1,
@@ -294,7 +395,7 @@ impl SelectionRecord {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn create_selection_record(&mut self) -> Option<SelectionRecordHandle> {
         self.selection_record_registry.create_record()
     }
@@ -330,7 +431,7 @@ impl JsContextHost {
         composed_start: (DomHandle, u32),
         composed_end: (DomHandle, u32),
     ) -> bool {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.selection_record_registry.store(
             dom_host,
@@ -360,7 +461,7 @@ impl JsContextHost {
         handle: SelectionRecordHandle,
         role: SelectionBoundaryRole,
     ) -> Option<SelectionBoundarySnapshot> {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.selection_record_registry
             .boundary(dom_host, handle, role)
@@ -373,17 +474,30 @@ impl JsContextHost {
         container: DomHandle,
         offset: u32,
     ) -> bool {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.selection_record_registry
             .set_boundary(dom_host, handle, role, container, offset)
     }
 
     pub(crate) fn selection_record_is_collapsed(&mut self, handle: SelectionRecordHandle) -> bool {
-        let runtime = self.runtime;
+        let runtime = self.document_runtime;
         let dom_host = unsafe { &*runtime }.dom_host();
         self.selection_record_registry
             .is_collapsed(dom_host, handle)
+    }
+
+    pub(crate) fn selection_records_for_range(
+        &self,
+        range: RangeRecordHandle,
+    ) -> Vec<SelectionRecordHandle> {
+        self.selection_record_registry
+            .records
+            .iter()
+            .filter_map(|(&handle, record)| {
+                (record.associated_range == Some(range)).then_some(handle)
+            })
+            .collect()
     }
 
     pub(crate) fn document_selection_snapshot(
@@ -392,5 +506,18 @@ impl JsContextHost {
     ) -> Option<DocumentSelectionSnapshot> {
         self.selection_record_registry
             .document_snapshot(self.dom_host(), document)
+    }
+
+    pub(crate) fn selection_record_spans_dom_roots(&self, handle: SelectionRecordHandle) -> bool {
+        let Some(record) = self.selection_record_registry.records.get(&handle) else {
+            return false;
+        };
+        let (Some(start), Some(end)) = (record.composed_start, record.composed_end) else {
+            return false;
+        };
+        let dom = self.dom_host();
+        dom.root_node_handle(start.container())
+            .zip(dom.root_node_handle(end.container()))
+            .is_some_and(|(start, end)| start != end)
     }
 }

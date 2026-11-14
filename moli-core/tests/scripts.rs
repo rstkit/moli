@@ -1,5 +1,9 @@
 #[path = "scripts/child_script_text.rs"]
 mod child_script_text;
+#[path = "scripts/integrity.rs"]
+mod integrity;
+#[path = "scripts/worker_fetch_metadata.rs"]
+mod worker_fetch_metadata;
 
 use moli_test_support as support;
 
@@ -10,6 +14,9 @@ use moli_core::{
 };
 use support::FixtureServer;
 use tokio::time::Duration;
+
+#[path = "scripts/child_synthetic_modules.rs"]
+mod child_synthetic_modules;
 
 fn diagnostic_global<'a>(
     page: &'a moli_core::page::Page,
@@ -54,7 +61,7 @@ async fn parse_time_inline_classic_scripts_observe_partial_dom_during_initial_pa
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/parse-time-inline-classic"))
         .await?;
 
@@ -87,7 +94,7 @@ async fn parse_time_external_classic_scripts_observe_partial_dom_during_initial_
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/parse-time-external-classic"))
         .await?;
 
@@ -155,7 +162,7 @@ async fn parse_time_async_classic_scripts_can_run_during_parse_before_late_dom_a
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/parse-time-async-classic"))
         .await?;
 
@@ -477,7 +484,7 @@ async fn parser_blocking_external_script_waits_for_blocking_stylesheet() -> Resu
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "blockingStylesheetParserBlockedEnough"),
+        diagnostic_global(&page, "blockingStylesheetParserSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -504,7 +511,7 @@ async fn parser_blocking_external_document_write_keeps_insertion_point_after_blo
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "blockingStylesheetParserWriteBlockedEnough"),
+        diagnostic_global(&page, "blockingStylesheetParserWriteSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -532,7 +539,7 @@ async fn defer_script_waits_for_blocking_stylesheet_before_domcontentloaded() ->
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "blockingStylesheetDeferBlockedEnough"),
+        diagnostic_global(&page, "blockingStylesheetDeferSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -558,7 +565,7 @@ async fn module_script_waits_for_blocking_stylesheet_before_domcontentloaded() -
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "blockingStylesheetModuleBlockedEnough"),
+        diagnostic_global(&page, "blockingStylesheetModuleSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -650,7 +657,7 @@ async fn parser_blocking_external_script_waits_for_parser_created_style_import()
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "blockingStyleImportParserBlockedEnough"),
+        diagnostic_global(&page, "blockingStyleImportParserSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -677,7 +684,7 @@ async fn module_script_waits_for_parser_created_style_import_before_domcontentlo
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "blockingStyleImportModuleBlockedEnough"),
+        diagnostic_global(&page, "blockingStyleImportModuleSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -710,7 +717,7 @@ async fn domcontentloaded_is_indirectly_delayed_by_blocking_stylesheet_gated_def
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "blockingStylesheetDeferDclBlockedEnough"),
+        diagnostic_global(&page, "blockingStylesheetDeferDclSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -743,6 +750,11 @@ async fn alternate_stylesheet_does_not_block_parser_blocking_script() -> Result<
         diagnostic_global(&page, "blockingStylesheetAlternateSawDcl"),
         Some(&JsValueSnapshot::Bool(false))
     );
+    assert_eq!(
+        diagnostic_global(&page, "blockingStylesheetAlternateLoaded"),
+        Some(&JsValueSnapshot::Bool(true)),
+        "the probe must release the stylesheet response before Window load"
+    );
 
     server.shutdown().await;
     Ok(())
@@ -758,7 +770,7 @@ async fn runtime_inserted_stylesheet_load_waits_for_fetch_completion() -> Result
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "runtimeInsertedStylesheetLoadBlockedEnough"),
+        diagnostic_global(&page, "runtimeInsertedStylesheetLoadSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -774,11 +786,10 @@ async fn runtime_inserted_stylesheet_load_waits_for_fetch_completion() -> Result
 async fn runtime_inserted_stylesheet_load_mutation_syncs_back_into_parser_before_later_script()
 -> Result<()> {
     // Runtime-inserted stylesheets are intentionally not parser/script-blocking
-    // stylesheets under HTML's parser-created stylesheet rule. The fixture keeps
-    // the runtime stylesheet fast and the parser-owned stylesheet slow, so this
-    // test covers only the renderer/parser snapshot boundary: a mutation made by
-    // an already-fired runtime stylesheet load handler must be visible before
-    // the later parser-inserted script executes.
+    // stylesheets under HTML's parser-created stylesheet rule. The fixture
+    // releases the parser-owned stylesheet after the runtime load handler
+    // appends its marker. This establishes the exact snapshot boundary without
+    // racing two network delays under parallel load.
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
@@ -808,7 +819,7 @@ async fn runtime_inserted_stylesheet_load_can_trigger_location_replace() -> Resu
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/runtime-inserted-stylesheet-load-triggers-location-replace"))
         .await?;
 
@@ -831,9 +842,15 @@ async fn runtime_inserted_stylesheet_href_mutation_uses_fresh_fetch_for_parser_b
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
-        .fetch(&server.url("/compat/runtime-inserted-stylesheet-href-mutation-uses-fresh-fetch"))
-        .await?;
+    // The second parser script releases the stale stylesheet response. If it
+    // waits on that stale request, the fixture never supplies CSS to unblock it.
+    let page = tokio::time::timeout(
+        Duration::from_secs(5),
+        browser.fetch(
+            &server.url("/compat/runtime-inserted-stylesheet-href-mutation-uses-fresh-fetch"),
+        ),
+    )
+    .await??;
 
     assert_eq!(
         diagnostic_global(&page, "runtimeInsertedHrefMutationParserNotBlocked"),
@@ -1094,7 +1111,7 @@ async fn phase_two_shared_blocking_stylesheet_keeps_parser_owned_defer_phase_ord
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "sharedBlockingDeferBlockedEnough"),
+        diagnostic_global(&page, "sharedBlockingDeferSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -1119,7 +1136,7 @@ async fn phase_two_shared_blocking_stylesheet_keeps_parser_owned_module_phase_or
         .await?;
 
     assert_eq!(
-        diagnostic_global(&page, "sharedBlockingModuleBlockedEnough"),
+        diagnostic_global(&page, "sharedBlockingModuleSawStylesheet"),
         Some(&JsValueSnapshot::Bool(true))
     );
     assert_eq!(
@@ -1406,7 +1423,7 @@ async fn document_open_during_parser_script_with_pending_written_external_is_ign
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url(
             "/compat/document-open-during-parser-script-with-pending-written-external-is-ignored",
         ))
@@ -1979,6 +1996,11 @@ async fn runtime_owned_inline_module_runs_while_parser_defer_is_blocked() -> Res
                 .to_owned()
         ))
     );
+    assert_eq!(
+        diagnostic_global(&page, "runtimeModuleBlockedDeferStyleLoaded"),
+        Some(&JsValueSnapshot::Bool(true)),
+        "the module microtask must release a successful stylesheet response"
+    );
 
     server.shutdown().await;
     Ok(())
@@ -2319,7 +2341,7 @@ async fn document_write_replacement_syncs_style_sources_before_written_scripts()
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/document-write-replacement-style-source-sync"))
         .await?;
 
@@ -2405,7 +2427,7 @@ async fn document_write_inserted_external_script_resumes_chunked_root_input() ->
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = tokio::time::timeout(
+    let mut page = tokio::time::timeout(
         Duration::from_secs(5),
         browser.fetch(&server.url("/compat/document-write-inserted-external-resumes-chunked-root")),
     )
@@ -2753,13 +2775,13 @@ async fn document_write_module_runs_without_hanging_late_stylesheet_tail() -> Re
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/document-write-late-stylesheet-does-not-block-written-module"))
         .await?;
 
+    let html = page.serialize_html_async().await?;
     let result = diagnostic_global(&page, "documentWriteLateStyleResult");
     let order = diagnostic_global(&page, "documentWriteLateStyleOrder");
-    let html = page.serialize_html_async().await?;
     assert_eq!(
         result,
         Some(&JsValueSnapshot::String(
@@ -4260,7 +4282,7 @@ async fn module_dependency_fetch_uses_module_credentials_mode() -> Result<()> {
     let browser = Browser::new(AppConfig::default())?;
 
     let _ = browser.fetch(&server.url("/cookie")).await?;
-    let page = browser
+    let mut page = browser
         .fetch(&server.url("/compat/module-dependency-fetch-uses-module-credentials"))
         .await?;
 
@@ -4471,7 +4493,7 @@ async fn module_import_attributes_and_dynamic_options_execute() -> Result<()> {
     browser
         .wait_for_script_truthy(
             &mut page,
-            "window.moduleImportAttributesDynamicValue === 'comment-ok' && window.moduleImportAttributesTextRejected === true",
+            "window.moduleImportAttributesDynamicValue === 'comment-ok' && window.moduleImportAttributesUnsupportedRejected === true",
             Duration::from_secs(2),
         )
         .await?;
@@ -4490,7 +4512,7 @@ async fn module_import_attributes_and_dynamic_options_execute() -> Result<()> {
         ))
     );
     assert_eq!(
-        diagnostic_global(&page, "moduleImportAttributesTextErrorName"),
+        diagnostic_global(&page, "moduleImportAttributesUnsupportedErrorName"),
         Some(&JsValueSnapshot::String("TypeError".to_owned()))
     );
 
@@ -5049,7 +5071,7 @@ async fn audio_worklet_module_imports_wasm_source_phase() -> Result<()> {
     let server = FixtureServer::spawn().await?;
     let browser = Browser::new(AppConfig::default())?;
 
-    let page = browser
+    let mut page = browser
         .fetch_with_wait_until(
             &server.url("/compat/audio-worklet-wasm-source-phase"),
             RenderedDomWaitUntil::NetworkIdle,
@@ -5368,7 +5390,7 @@ async fn module_wasm_js_cycle_reports_guard_without_crashing() -> Result<()> {
         .await?;
     assert_eq!(
         diagnostic_global(&page, "moduleWasmJsCycleConstructor"),
-        Some(&JsValueSnapshot::String("Error".to_owned())),
+        Some(&JsValueSnapshot::String("TypeError".to_owned())),
         "message: {:?}",
         diagnostic_global(&page, "moduleWasmJsCycleMessage")
     );
@@ -6706,3 +6728,24 @@ async fn parse_time_lifecycle_queue_can_stop_cleanly_at_load_stage_after_load_mi
     server.shutdown().await;
     Ok(())
 }
+
+#[path = "scripts/document_write_errors.rs"]
+mod document_write_errors;
+
+#[path = "scripts/child_markup_insertion.rs"]
+mod child_markup_insertion;
+
+#[path = "scripts/child_input_stream_readiness.rs"]
+mod child_input_stream_readiness;
+
+#[path = "scripts/document_close.rs"]
+mod document_close;
+
+#[path = "scripts/post_parse_async.rs"]
+mod post_parse_async;
+
+#[path = "scripts/text_modules.rs"]
+mod text_modules;
+
+#[path = "scripts/child_stylesheet_imports.rs"]
+mod child_stylesheet_imports;

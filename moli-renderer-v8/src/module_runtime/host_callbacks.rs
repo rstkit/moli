@@ -14,7 +14,7 @@ use crate::{
 };
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct ImportMetaDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     url: v8::Local<'scope, v8::String>,
@@ -35,16 +35,10 @@ pub(crate) unsafe extern "C" fn initialize_import_meta_object_callback(
     meta: v8::Local<'_, v8::Object>,
 ) {
     v8::callback_scope!(unsafe scope, context);
-    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+    let Ok(module_url) = v8::Local::<v8::String>::try_from(module.get_resource_name(scope)) else {
         return;
     };
-    let Some(module_url) = (unsafe { &*host_ptr }).native_module_url_for(module) else {
-        return;
-    };
-    let Some(value) = v8_string(scope, module_url.as_str()) else {
-        return;
-    };
-    let _ = ImportMetaDeclaration::new(value).initialize(scope, meta);
+    let _ = ImportMetaDeclaration::new(module_url).initialize(scope, meta);
 }
 
 pub(crate) fn dynamic_import_callback<'s, 'i>(
@@ -188,7 +182,7 @@ fn dynamic_import_base_url<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     host_defined_options: v8::Local<'s, v8::Data>,
     resource_name: v8::Local<'s, v8::Value>,
-    host: &crate::native_bridge::JsContextHost,
+    host: &crate::native_bridge::PageScriptHost,
 ) -> Url {
     if let Some(base_url) = script_base_url_from_host_defined_options(scope, host_defined_options) {
         return base_url;
@@ -243,7 +237,7 @@ fn dynamic_import_referrer_fetch_metadata(
 fn dynamic_import_base_url_from_compiled_string_resource(
     scope: &mut v8::PinScope<'_, '_>,
     resource_name: v8::Local<'_, v8::Value>,
-    host: &crate::native_bridge::JsContextHost,
+    host: &crate::native_bridge::PageScriptHost,
 ) -> Option<Url> {
     let resource_url = resource_name
         .to_string(scope)
@@ -308,8 +302,10 @@ fn import_meta_resolve_callback(
         throw_type_error(scope, "Module specifier resolution is not available.");
         return;
     };
+    // V8 enters the built-in's creation realm, even when it is extracted or
+    // called from another Window. Keep that realm's settings across ToString.
+    let settings = crate::native_bridge::WindowEnvironmentSettings::for_current_realm(scope);
     let Some(specifier) = callback_arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "Module specifier must be a string.");
         return;
     };
     let Some(base_url) = v8::Local::<v8::String>::try_from(args.data())
@@ -319,8 +315,11 @@ fn import_meta_resolve_callback(
         throw_type_error(scope, "Module base URL is invalid.");
         return;
     };
-    let resolved =
-        unsafe { &mut *host_ptr }.resolve_module_specifier_with_base(&specifier, &base_url);
+    let host = unsafe { &mut *host_ptr };
+    let resolved = match settings {
+        Some(settings) => settings.resolve_module_specifier(host, &specifier, &base_url),
+        None => host.resolve_module_specifier_with_base(&specifier, &base_url),
+    };
     match resolved {
         Ok(module_url) => {
             let Some(value) = v8_string(scope, module_url.as_str()) else {

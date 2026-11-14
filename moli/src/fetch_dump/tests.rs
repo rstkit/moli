@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{Router, routing::get};
+use axum::{Router, response::Html, routing::get};
 use moli_core::{
     LayoutPolicy,
     page::Page,
@@ -36,7 +36,7 @@ async fn load_page_with_config(
             "/",
             get(move || {
                 let body = Arc::clone(&server_body);
-                async move { (*body).clone() }
+                async move { Html((*body).clone()) }
             }),
         );
         axum::serve(listener, app).await.unwrap();
@@ -67,14 +67,7 @@ async fn render_full_page_screenshot_extends_beyond_viewport() -> Result<()> {
     )
     .await?;
 
-    let viewport = render_page_output_async(
-        &mut page,
-        &FetchCommandConfig {
-            dump_mode: Some(DumpFormat::Screenshot),
-            ..FetchCommandConfig::default()
-        },
-    )
-    .await?;
+    // Full-document output must work before any other capture publishes layout.
     let full_page = render_page_output_async(
         &mut page,
         &FetchCommandConfig {
@@ -83,9 +76,18 @@ async fn render_full_page_screenshot_extends_beyond_viewport() -> Result<()> {
         },
     )
     .await?;
+    let viewport = render_page_output_async(
+        &mut page,
+        &FetchCommandConfig {
+            dump_mode: Some(DumpFormat::Screenshot),
+            ..FetchCommandConfig::default()
+        },
+    )
+    .await?;
 
     let viewport_dimensions = png_dimensions(&viewport);
     let full_page_dimensions = png_dimensions(&full_page);
+    assert_eq!(full_page_dimensions.1, 1300);
     assert_eq!(full_page_dimensions.0, viewport_dimensions.0);
     assert!(full_page_dimensions.1 > viewport_dimensions.1);
 
@@ -125,6 +127,37 @@ async fn render_page_dump_default_html_uses_renderer_live_serialize() -> Result<
     assert!(!rendered.contains(r#"<main id="target">old</main>"#));
 
     let _ = page.finish_runtime_protocol_message(completion)?;
+    http_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn strip_ui_keeps_content_inside_details() -> Result<()> {
+    let (_browser, mut page, http_server) = load_page(
+        "<!doctype html><html><body><nav><details><summary>Menu</summary><p>Navigation entry</p></details></nav><main><details><summary>Product details</summary><p>Critical product description</p><button>Buy now</button></details><details open><summary>Specifications</summary><p>Material: cotton</p></details></main></body></html>",
+    )
+    .await?;
+    let rendered = render_page_dump_with_options_async(
+        &mut page,
+        DumpFormat::Markdown,
+        StripOptions {
+            js: false,
+            css: false,
+            ui: true,
+        },
+        false,
+        false,
+        false,
+        None,
+    )
+    .await?;
+    assert!(!rendered.contains("Menu"));
+    assert!(!rendered.contains("Navigation entry"));
+    assert!(!rendered.contains("Buy now"));
+    assert!(rendered.contains("Product details"));
+    assert!(rendered.contains("Critical product description"));
+    assert!(rendered.contains("Specifications"));
+    assert!(rendered.contains("Material: cotton"));
     http_server.abort();
     Ok(())
 }
@@ -249,6 +282,72 @@ async fn render_semantic_tree_dump_uses_renderer_live_accessibility_tree() -> Re
 }
 
 #[tokio::test]
+async fn semantic_dump_preserves_protocol_json_bytes_and_text_fields() -> Result<()> {
+    let (_browser, mut page, http_server) = load_page(
+        r#"<!doctype html><html><head><title>AX serialization</title></head><body>
+          <ul><li>List item</li></ul>
+          <input aria-label="Text field" value="field value">
+          <input type="range" aria-label="Numeric field" value="42">
+          <button disabled>Disabled action</button>
+          <div aria-hidden="true"><span>Ignored text</span></div>
+          <div hidden>Not rendered</div>
+        </body></html>"#,
+    )
+    .await?;
+    let protocol = page
+        .accessibility_tree_payloads_for_document_async(None)
+        .await?;
+    let json = super::semantic::render_json(&mut page, false).await?;
+    assert_eq!(json, serde_json::to_string_pretty(&protocol)?);
+    let nodes: Vec<serde_json::Value> = serde_json::from_str(&json)?;
+    let field_names = |node: &serde_json::Value| {
+        node.as_object()
+            .expect("AX object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        field_names(&nodes[0]),
+        [
+            "nodeId",
+            "backendDOMNodeId",
+            "ignored",
+            "role",
+            "name",
+            "properties",
+            "childIds",
+        ]
+    );
+    let marker = nodes
+        .iter()
+        .find(|node| node["role"]["value"] == "ListMarker")
+        .expect("list marker");
+    assert_eq!(
+        field_names(marker),
+        [
+            "nodeId",
+            "ignored",
+            "role",
+            "name",
+            "properties",
+            "parentId",
+            "childIds",
+        ]
+    );
+    let text = super::semantic::render_text(&mut page, false).await?;
+    assert!(text.contains("textbox: Text field = field value [backendNodeId="));
+    assert!(text.contains("textbox: Numeric field = 42 [backendNodeId="));
+    assert!(
+        !text.contains("ListMarker"),
+        "markers have no child reference in the protocol tree"
+    );
+    assert!(!text.contains("Not rendered"));
+    http_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn render_semantic_tree_dumps_include_child_frames_only_when_requested() -> Result<()> {
     let (_browser, mut page, http_server) = load_page(
             r#"<!doctype html><html><body><iframe srcdoc="<button aria-label='Child action'>inside</button>"></iframe></body></html>"#,
@@ -285,6 +384,16 @@ async fn render_semantic_tree_dumps_include_child_frames_only_when_requested() -
         .filter(|payload| payload["role"]["value"] == "RootWebArea")
         .nth(1)
         .expect("child frame RootWebArea");
+    assert_eq!(
+        child_root
+            .as_object()
+            .expect("child root object")
+            .keys()
+            .next_back()
+            .map(String::as_str),
+        Some("parentId"),
+        "frame attachment must preserve the existing JSON field order"
+    );
     let child_root_id = child_root["nodeId"].as_str().expect("child root nodeId");
     let owner_id = child_root["parentId"]
         .as_str()
@@ -389,7 +498,7 @@ async fn render_page_dump_async_includes_network_trace_config_summary() -> Resul
             trace_network: true,
             network_trace_config: Some(crate::network_trace::NetworkTraceConfigSummary {
                 explicit_http_proxy: true,
-                libcurl_env_proxy_fallback: false,
+                env_proxy_fallback: false,
                 http_no_proxy: true,
                 proxy_bearer_token: true,
                 tls_verify_host: true,
@@ -414,12 +523,186 @@ async fn render_page_dump_async_includes_network_trace_config_summary() -> Resul
     let payload: Value = serde_json::from_str(&rendered)?;
 
     assert_eq!(payload["network"]["config"]["explicit_http_proxy"], true);
-    assert_eq!(
-        payload["network"]["config"]["libcurl_env_proxy_fallback"],
-        false
-    );
+    assert_eq!(payload["network"]["config"]["env_proxy_fallback"], false);
     assert_eq!(payload["network"]["config"]["proxy_bearer_token"], true);
     assert_eq!(payload["network"]["config"]["connect_timeout_ms"], 2500);
+    http_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn html_serialization_refreshes_page_state_and_preserves_reply_url_pairing() -> Result<()> {
+    use moli_core::page::RendererHtmlSerializeOptions;
+    let (_browser, mut page, http_server) =
+        load_page("<!doctype html><p id=target>before</p>").await?;
+    let mut pending_updates = Vec::new();
+    for case in 0..4 {
+        let expected = page
+            .final_url()
+            .join(&format!("/serialized-{case}?paired=1"))?;
+        let old_url = page.final_url().clone();
+        let command = json!({ "id": 720 + case, "method": "Runtime.evaluate", "params": {
+            "expression": format!("history.replaceState(null, '', {}); document.getElementById('target').textContent = 'case-{case}'; 'done'", serde_json::to_string(expected.as_str())?),
+            "returnByValue": true
+        }});
+        let pending = page.start_runtime_protocol_message(serde_json::to_string(&command)?)?;
+        // The renderer has changed, but the caller has not applied its PageState.
+        pending_updates.push(pending.wait().await?);
+        assert_eq!(page.final_url(), &old_url);
+        let html = match case {
+            0 => page.serialize_html_async().await?,
+            1 => {
+                let document = page
+                    .serialize_document_async(RendererHtmlSerializeOptions {
+                        with_base: true,
+                        ..Default::default()
+                    })
+                    .await?;
+                assert_eq!(document.url, expected.as_str());
+                document.html
+            }
+            2 => {
+                let pending = page.start_serialize_html()?;
+                let document = page.finish_serialized_document(pending.wait().await?)?;
+                assert_eq!(document.url, expected.as_str());
+                document.html
+            }
+            _ => {
+                let output = render_page_dump_with_options_async(
+                    &mut page,
+                    DumpFormat::Json,
+                    StripOptions {
+                        css: true,
+                        ..Default::default()
+                    },
+                    true,
+                    false,
+                    true,
+                    None,
+                )
+                .await?;
+                let payload: Value = serde_json::from_str(&output)?;
+                assert_eq!(payload["final_url"], expected.as_str());
+                assert_eq!(
+                    payload["network"]["main_document"]["url"],
+                    expected.as_str()
+                );
+                payload["html"].as_str().unwrap().to_owned()
+            }
+        };
+        assert!(html.contains(&format!("case-{case}")), "{html}");
+        assert_eq!(page.final_url(), &expected);
+    }
+    drop(pending_updates);
+    http_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn html_dump_profiles_preserve_golden_markup_and_the_live_source() -> Result<()> {
+    let (_browser, mut page, http_server) = load_page("<!doctype html><html><head><style>p{color:red}</style></head><body><nav>MENU</nav><p style=\"color:red\" onclick=\"void 0\">KEEP &amp; text</p><script>window.secret=1</script><x-card></x-card></body></html>").await?;
+    let setup = page.evaluate_runtime_expression_by_value_async(r#"
+        globalThis.exportShadow=document.querySelector('x-card').attachShadow({mode:'closed',slotAssignment:'manual'});
+        exportShadow.innerHTML='<b>SHADOW &amp; text</b>';
+        globalThis.exportChanges=0;
+        globalThis.exportObserver=new MutationObserver(records=>exportChanges+=records.length);
+        exportObserver.observe(document,{subtree:true,childList:true,attributes:true,characterData:true});
+        JSON.stringify([document.documentElement.outerHTML,exportShadow.innerHTML,document.baseURI])
+    "#).await?;
+    assert!(setup.get("exception").is_none(), "{setup}");
+    assert!(setup["value"].is_string(), "{setup}");
+    for bits in 0..8 {
+        let strip = StripOptions {
+            js: bits & 1 != 0,
+            css: bits & 2 != 0,
+            ui: bits & 4 != 0,
+        };
+        let mut expected = String::from("<!DOCTYPE html><html><head>");
+        if !strip.css {
+            expected.push_str("<style>p{color:red}</style>");
+        }
+        expected.push_str("</head><body>");
+        if !strip.ui {
+            expected.push_str("<nav>MENU</nav>");
+        }
+        expected.push_str("<p");
+        if !strip.css {
+            expected.push_str(" style=\"color:red\"");
+        }
+        if !strip.js {
+            expected.push_str(" onclick=\"void 0\"");
+        }
+        expected.push_str(">KEEP &amp; text</p>");
+        if !strip.js {
+            expected.push_str("<script>window.secret=1</script>");
+        }
+        expected.push_str("<x-card><template shadowrootmode=\"closed\" shadowrootslotassignment=\"manual\"><b>SHADOW &amp; text</b></template></x-card></body></html>");
+        for _ in 0..2 {
+            let output = render_page_dump_with_options_async(
+                &mut page,
+                DumpFormat::Html,
+                strip,
+                false,
+                false,
+                false,
+                None,
+            )
+            .await?;
+            assert_eq!(output, expected, "strip={bits}");
+            let snapshot=page.evaluate_runtime_expression_by_value_async("JSON.stringify([document.documentElement.outerHTML,exportShadow.innerHTML,document.baseURI])").await?;
+            assert_eq!(snapshot["value"], setup["value"]);
+            let changes = page
+                .evaluate_runtime_expression_by_value_async(
+                    "exportChanges+exportObserver.takeRecords().length",
+                )
+                .await?;
+            assert_eq!(changes["value"], 0);
+        }
+    }
+    http_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn html_dump_filters_template_contents_and_includes_inert_author_shadow_roots() -> Result<()>
+{
+    let (_browser, mut page, http_server) = load_page("<!doctype html><template id=content><nav>MENU</nav><script>secret=1</script><style>b{color:red}</style><div style=\"color:red\" onclick=\"void 0\">KEEP</div><x-card></x-card><iframe srcdoc=\"<script>inert=1</script><p>unparsed</p>\"></iframe></template>").await?;
+    let setup=page.evaluate_runtime_expression_by_value_async("document.getElementById('content').content.querySelector('x-card').attachShadow({mode:'closed'}).innerHTML='<style>b{color:red}</style><b>SHADOW</b>'; 'ready'").await?;
+    assert!(setup.get("exception").is_none(), "{setup}");
+    let before = page.serialize_html_async().await?;
+    assert!(
+        before.contains("shadowrootmode=\"closed\"") && before.contains("SHADOW"),
+        "{before}"
+    );
+    let output = render_page_dump_with_options_async(
+        &mut page,
+        DumpFormat::Html,
+        StripOptions {
+            js: true,
+            css: true,
+            ui: true,
+        },
+        false,
+        true,
+        false,
+        None,
+    )
+    .await?;
+    for removed in ["MENU", "secret=1", "color:red", "onclick="] {
+        assert!(!output.contains(removed), "{output}");
+    }
+    assert!(
+        output.contains("<div>KEEP</div>") && output.contains("<b>SHADOW</b>"),
+        "{output}"
+    );
+    // Inert owners have no live child Document. Preserve their raw srcdoc;
+    // exporting is not an HTML sanitizer and must not parse/load that string.
+    assert!(
+        output
+            .contains("srcdoc=\"&lt;script&gt;inert=1&lt;/script&gt;&lt;p&gt;unparsed&lt;/p&gt;\""),
+        "{output}"
+    );
+    assert_eq!(page.serialize_html_async().await?, before);
     http_server.abort();
     Ok(())
 }

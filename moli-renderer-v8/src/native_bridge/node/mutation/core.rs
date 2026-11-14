@@ -1,14 +1,11 @@
 use super::fragment::validate_document_sequence;
 use super::*;
 use crate::custom_elements;
-use crate::native_bridge::document::{
-    detached_native_handle_for_runtime, is_attr_node_value,
-    paired_detached_native_object_for_handle,
-};
+use crate::native_bridge::document::{detached_native_handle_for_runtime, is_attr_node_value};
 
 fn required_tree_insertion_node_arg_handle(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document_handle: Option<DomHandle>,
     value: v8::Local<'_, v8::Value>,
     invalid_type_message: &'static str,
@@ -29,7 +26,7 @@ fn required_tree_insertion_node_arg_handle(
 fn set_original_node_arg_or_wrapped_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     rv: &mut v8::ReturnValue<'_, v8::Value>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     value: v8::Local<'s, v8::Value>,
     handle: DomHandle,
 ) {
@@ -41,43 +38,6 @@ fn set_original_node_arg_or_wrapped_handle<'s>(
         return;
     }
     set_wrapped_node_or_null(scope, rv, runtime_ptr, Some(handle));
-}
-
-fn inserted_handles_for_post_insert_events(
-    runtime: &JsContextHost,
-    handle: DomHandle,
-) -> Vec<DomHandle> {
-    if runtime
-        .dom_host()
-        .node(handle)
-        .is_some_and(Node::is_document_fragment)
-    {
-        runtime.dom_host().child_handles(handle).collect()
-    } else {
-        vec![handle]
-    }
-}
-
-fn dispatch_detached_post_insert_events(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
-    handles: &[DomHandle],
-) {
-    for handle in handles {
-        if !unsafe { &*runtime_ptr }
-            .dom_host()
-            .is_html_element_named(*handle, "iframe")
-        {
-            continue;
-        }
-        let Some(target) = paired_detached_native_object_for_handle(scope, runtime_ptr, *handle)
-        else {
-            continue;
-        };
-        let _ = crate::detached_event_target::dispatch_detached_simple_event(
-            scope, target, "load", false, false, false,
-        );
-    }
 }
 
 pub(in crate::native_bridge) fn node_append_child_callback<'s>(
@@ -100,26 +60,23 @@ pub(in crate::native_bridge) fn node_append_child_callback<'s>(
     ) else {
         return;
     };
+    if !validate_pre_insert_handles(scope, unsafe { &*runtime_ptr }, parent, child, None, &[]) {
+        return;
+    }
     let child_value = args.get(0);
-    let post_insert_event_handles =
-        inserted_handles_for_post_insert_events(unsafe { &*runtime_ptr }, child);
     let inserted =
         custom_elements::with_custom_element_reaction_scope(scope, runtime_ptr, |scope| {
-            if !unsafe { &mut *runtime_ptr }.append_child_appending_to_current_reaction_queue(
+            unsafe { &mut *runtime_ptr }.append_child_appending_to_current_reaction_queue(
                 scope,
                 runtime_ptr,
                 parent,
                 child,
-            ) {
-                return false;
-            }
-            true
+            )
         });
     if !inserted {
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
         return;
     }
-    dispatch_detached_post_insert_events(scope, runtime_ptr, &post_insert_event_handles);
     set_original_node_arg_or_wrapped_handle(scope, &mut rv, runtime_ptr, child_value, child);
 }
 
@@ -200,37 +157,31 @@ pub(in crate::native_bridge) fn node_insert_before_callback<'s>(
         parent,
         child,
         reference_child,
-        &[child],
+        &[],
     ) {
         return;
     }
     let child_value = args.get(0);
-    let post_insert_event_handles =
-        inserted_handles_for_post_insert_events(unsafe { &*runtime_ptr }, child);
     let inserted =
         custom_elements::with_custom_element_reaction_scope(scope, runtime_ptr, |scope| {
-            if !unsafe { &mut *runtime_ptr }.insert_before_appending_to_current_reaction_queue(
+            unsafe { &mut *runtime_ptr }.insert_before_appending_to_current_reaction_queue(
                 scope,
                 runtime_ptr,
                 parent,
                 child,
                 reference_child,
-            ) {
-                return false;
-            }
-            true
+            )
         });
     if !inserted {
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
         return;
     }
-    dispatch_detached_post_insert_events(scope, runtime_ptr, &post_insert_event_handles);
     set_original_node_arg_or_wrapped_handle(scope, &mut rv, runtime_ptr, child_value, child);
 }
 
 pub(crate) fn validate_pre_insert_handles(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
     reference_child: Option<DomHandle>,
@@ -267,12 +218,12 @@ pub(crate) fn validate_pre_insert_handles(
 
 fn validate_pre_insert_parent_and_ancestor(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
 ) -> bool {
     if !node_can_contain_children(runtime, parent)
-        || node_move_before_shadow_including_contains(runtime, child, parent)
+        || node_is_host_including_inclusive_ancestor(runtime, child, parent)
     {
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
         return false;
@@ -282,7 +233,7 @@ fn validate_pre_insert_parent_and_ancestor(
 
 fn validate_pre_insert_node_type_and_document(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
     reference_child: Option<DomHandle>,
@@ -292,12 +243,16 @@ fn validate_pre_insert_node_type_and_document(
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
         return false;
     };
+    let parent_is_document = node_is_document(runtime, parent);
     if !node_type_is_insertable(child_node_type)
-        || (node_type_is_text_like(child_node_type) && node_is_document(runtime, parent))
-        || (child_node_type == NodeType::DocumentType && !node_is_document(runtime, parent))
+        || (node_type_is_text_like(child_node_type) && parent_is_document)
+        || (child_node_type == NodeType::DocumentType && !parent_is_document)
     {
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
         return false;
+    }
+    if !parent_is_document {
+        return true;
     }
 
     let inserted = pre_insert_validation_handles(runtime, child);
@@ -308,7 +263,7 @@ fn validate_pre_insert_node_type_and_document(
     true
 }
 
-pub(super) fn node_can_contain_children(runtime: &JsContextHost, handle: DomHandle) -> bool {
+pub(super) fn node_can_contain_children(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime.dom_host().node(handle).is_some_and(|node| {
         matches!(
             node.node_type(),
@@ -335,7 +290,7 @@ fn node_type_is_text_like(node_type: NodeType) -> bool {
 }
 
 pub(super) fn pre_insert_validation_handles(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Vec<DomHandle> {
     if runtime
@@ -407,7 +362,7 @@ pub(in crate::native_bridge) fn node_move_before_callback(
 
 fn node_move_before_after_argument_validation(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     parent: DomHandle,
     child: DomHandle,
     reference_child: Option<DomHandle>,
@@ -415,7 +370,7 @@ fn node_move_before_after_argument_validation(
     let runtime = unsafe { &*runtime_ptr };
     if !node_move_before_is_valid_parent(runtime, parent)
         || !node_move_before_is_valid_child(runtime, child)
-        || node_move_before_shadow_including_contains(runtime, child, parent)
+        || node_is_host_including_inclusive_ancestor(runtime, child, parent)
         || node_move_before_shadow_including_root(runtime, parent)
             != node_move_before_shadow_including_root(runtime, child)
     {
@@ -446,7 +401,7 @@ fn node_move_before_after_argument_validation(
     }
 
     let moved = custom_elements::with_custom_element_reaction_scope(scope, runtime_ptr, |scope| {
-        if !unsafe { &mut *runtime_ptr }
+        unsafe { &mut *runtime_ptr }
             .move_before_preserving_state_appending_to_current_reaction_queue(
                 scope,
                 runtime_ptr,
@@ -454,26 +409,15 @@ fn node_move_before_after_argument_validation(
                 child,
                 reference_child,
             )
-        {
-            return false;
-        }
-        true
     });
     if !moved {
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
     }
 }
 
-fn node_move_before_is_valid_parent(runtime: &JsContextHost, handle: DomHandle) -> bool {
-    runtime.dom_host().node(handle).is_some_and(|node| {
-        matches!(
-            node.node_type(),
-            NodeType::Document | NodeType::DocumentFragment | NodeType::Element
-        )
-    })
-}
+use self::node_can_contain_children as node_move_before_is_valid_parent;
 
-fn node_move_before_is_valid_child(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn node_move_before_is_valid_child(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime.dom_host().node(handle).is_some_and(|node| {
         matches!(
             node.node_type(),
@@ -486,33 +430,18 @@ fn node_move_before_is_valid_child(runtime: &JsContextHost, handle: DomHandle) -
     })
 }
 
-pub(super) fn node_move_before_shadow_including_contains(
-    runtime: &JsContextHost,
+pub(super) fn node_is_host_including_inclusive_ancestor(
+    runtime: &PageScriptHost,
     ancestor: DomHandle,
     node: DomHandle,
 ) -> bool {
-    let mut current = Some(node);
-    while let Some(handle) = current {
-        if handle == ancestor {
-            return true;
-        }
-        current = runtime
-            .dom_host()
-            .node(handle)
-            .and_then(Node::parent_node)
-            .or_else(|| {
-                runtime
-                    .dom_host()
-                    .is_shadow_root(handle)
-                    .then(|| runtime.dom_host().shadow_root_host(handle))
-                    .flatten()
-            });
-    }
-    false
+    runtime
+        .dom_host()
+        .is_host_including_inclusive_ancestor(ancestor, node)
 }
 
 fn node_move_before_shadow_including_root(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
     let mut root = runtime.dom_host().root_node_handle(handle)?;
@@ -533,7 +462,10 @@ pub(in crate::native_bridge) fn node_remove_child_callback<'s>(
         rv.set_null();
         return;
     };
-    let child = match existing_node_arg(scope, runtime_ptr, args.get(0)) {
+    let Some(parsed) = webidl::parse_args::<RequiredNodeArgs>(scope, &args) else {
+        return;
+    };
+    let child = match existing_node_arg(scope, runtime_ptr, parsed.node.into()) {
         ExistingNodeArgument::Handle(child) => child,
         ExistingNodeArgument::ForeignNode => {
             throw_dom_exception(
@@ -568,15 +500,12 @@ pub(in crate::native_bridge) fn node_remove_child_callback<'s>(
     }
     let removed =
         custom_elements::with_custom_element_reaction_scope(scope, runtime_ptr, |scope| {
-            if !unsafe { &mut *runtime_ptr }.remove_child_appending_to_current_reaction_queue(
+            unsafe { &mut *runtime_ptr }.remove_child_appending_to_current_reaction_queue(
                 scope,
                 runtime_ptr,
                 parent,
                 child,
-            ) {
-                return false;
-            }
-            true
+            )
         });
     if !removed {
         throw_dom_exception(
@@ -671,25 +600,19 @@ pub(in crate::native_bridge) fn node_replace_child_callback<'s>(
     ) {
         return;
     }
-    let post_insert_event_handles =
-        inserted_handles_for_post_insert_events(unsafe { &*runtime_ptr }, new_child);
     let replaced =
         custom_elements::with_custom_element_reaction_scope(scope, runtime_ptr, |scope| {
-            if !unsafe { &mut *runtime_ptr }.replace_child_appending_to_current_reaction_queue(
+            unsafe { &mut *runtime_ptr }.replace_child_appending_to_current_reaction_queue(
                 scope,
                 runtime_ptr,
                 parent,
                 new_child,
                 old_child,
-            ) {
-                return false;
-            }
-            true
+            )
         });
     if !replaced {
         throw_dom_exception(scope, "HierarchyRequestError", 3, "Hierarchy Error");
         return;
     }
-    dispatch_detached_post_insert_events(scope, runtime_ptr, &post_insert_event_handles);
     set_original_node_arg_or_wrapped_handle(scope, &mut rv, runtime_ptr, args.get(1), old_child);
 }

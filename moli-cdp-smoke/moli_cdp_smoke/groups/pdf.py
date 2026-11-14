@@ -6,7 +6,8 @@ from typing import Any
 
 from ..assertions import SmokeError, assert_equal, record
 from ..pdf_document import assert_pdf_envelope, inspect_moli_pdf
-from ..raw_cdp import RawCdpClient, connect_raw_cdp, discover_websocket_url
+from ..navigation import navigate as navigate_document
+from ..raw_cdp import RawCdpClient, connect_raw_cdp, discover_browser_version
 
 
 async def _response(
@@ -70,30 +71,7 @@ async def _open_fixture_target(client: RawCdpClient, fixture: str) -> tuple[str,
         },
         session_id=session_id,
     )
-    navigation, seen = await _success(
-        client,
-        "Page.navigate",
-        {"url": f"{fixture}/plain?pdf-smoke"},
-        session_id=session_id,
-    )
-    if navigation.get("errorText"):
-        raise SmokeError(f"Page.navigate failed: {navigation!r}")
-    if not any(
-        message.get("sessionId") == session_id
-        and message.get("method") == "Page.loadEventFired"
-        for message in seen
-    ):
-        deadline = asyncio.get_running_loop().time() + 10.0
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise SmokeError("timed out waiting for PDF fixture load")
-            message = await asyncio.wait_for(client.recv(), timeout=remaining)
-            if (
-                message.get("sessionId") == session_id
-                and message.get("method") == "Page.loadEventFired"
-            ):
-                break
+    await navigate_document(client, session_id, {"url": f"{fixture}/plain?pdf-smoke"})
     await _success(
         client,
         "Runtime.evaluate",
@@ -102,6 +80,9 @@ async def _open_fixture_target(client: RawCdpClient, fixture: str) -> tuple[str,
               (() => {
                 document.documentElement.style.cssText = 'margin:0;background:white';
                 document.body.style.cssText = 'margin:0;min-height:1800px;background:#123456';
+                document.body.innerHTML = [20, 820, 1620].map((top, i) =>
+                  `<p style="position:absolute;top:${top}px;margin:0">Font Text 123 page ${i + 1}</p>`
+                ).join('');
                 const style = document.createElement('style');
                 style.textContent = '@media print { body { background: #234567 } }';
                 document.head.append(style);
@@ -157,8 +138,8 @@ async def run_pdf_group(
     fixture: str,
     results: list[dict[str, Any]],
 ) -> None:
-    websocket_url = await discover_websocket_url(endpoint)
-    is_moli = websocket_url.endswith("/devtools/browser/moli-browser")
+    version = await discover_browser_version(endpoint)
+    is_moli = isinstance(version.get("Moli-Version"), str)
     client = await connect_raw_cdp(endpoint)
     target_id: str | None = None
     try:
@@ -250,12 +231,15 @@ async def run_pdf_group(
                 ((432.0, 288.0),),
                 "landscape PDF MediaBox",
             )
+            assert_equal(base64_info.page_text, ("Font Text 123 page 1", "Font Text 123 page 2"), "selected PDF text")
+            assert_equal(stream_info.page_text, ("Font Text 123 page 1", "Font Text 123 page 2", "Font Text 123 page 3"), "stream PDF text")
             detail.update(
                 {
                     "selectedPages": base64_info.page_count,
                     "allPages": stream_info.page_count,
                     "landscapeMediaBox": list(landscape_info.media_boxes[0]),
-                    "xrefValidated": True,
+                    "structureValidated": True,
+                    "textExtractionValidated": True,
                 }
             )
         record(results, "page_print_to_pdf", detail)

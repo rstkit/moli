@@ -6,6 +6,16 @@ use super::{
 };
 
 impl Page {
+    /// Captures this Page without queuing renderer work or resuming a paused
+    /// script. Preparation activates the replacement only after a response is
+    /// accepted as a Document.
+    pub fn document_replacement_target(
+        &self,
+        cancellation: moli_fetch::FetchCancelHandle,
+    ) -> crate::runtime::RendererPageReplacementTarget {
+        self.handle.document_replacement_target(cancellation)
+    }
+
     pub fn start_set_document_content(
         &self,
         frame_id: String,

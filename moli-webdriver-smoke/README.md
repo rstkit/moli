@@ -54,6 +54,19 @@ non-yielding WebDriver timeout behavior.
   switching, shadow roots, page-side SharedWorker probe without polluting window
   handles, `document.open()` replacement stale-element behavior, and headless window state surface.
 - WebDriver BiDi `session.status`, `session.new`, `browsingContext.create`,
+  exactly one `browsingContext.userPromptOpened`/`userPromptClosed` notification
+  per alert/confirm/prompt under `ignore`, `accept`, and `dismiss`, JavaScript
+  return values after manual or automatic handling, and one-shot handling
+  followed by live commands in the same session. Alert close events report
+  acknowledgement for both automatic and manual dismissal. Popup dialogs work without
+  a `contextCreated` subscription while their causing script is still pending.
+  With lifecycle events subscribed, popup creation precedes prompt opening under
+  manual handling and automatic acceptance/dismissal. Closing a popup while its
+  prompt is waiting produces one prompt closure before one destruction. A nested popup
+  with a configured preload channel checks parent/child creation order and modal progress.
+  A shared Classic/BiDi session
+  checks that explicit empty, omitted, and replacement BiDi text override text
+  previously stored by Classic. The group also covers
   `session.subscribe`, `browsingContext.navigate`, DOMContentLoaded lifecycle
   events, `input.performActions`, `input.releaseActions`, key actions that trigger a top-level Page
   replacement and remain successful through the replacement lifecycle, element-origin input
@@ -67,6 +80,84 @@ non-yielding WebDriver timeout behavior.
   `emulation.setUserAgentOverride`, `emulation.setLocaleOverride`,
   `emulation.setTimezoneOverride`, `emulation.setNetworkConditions`, storage
   isolation, `storage.setCookie`, `storage.getCookies`, and `session.end`.
+  Twenty-nine cross-engine `bidi-network` scenarios cover iframe event ownership,
+  request identity, subscription initialization, and navigation independence.
+  Six hold Page A's HTTP response at an explicit server barrier while Page B
+  resolves its exact realm and sends two channel messages. A then completes,
+  closes, or accepts a replacement navigation before the held response is
+  released; shared and isolated user contexts are covered. Closing must not
+  revive A, and a late response must not replace its successor Document.
+  Six keep the foreground tab
+  active while an unattached background Page inserts, navigates, or nests an
+  iframe. They cover shared and separate user contexts, require request/response
+  and DOMContentLoaded/load events to identify the loaded child context, and read
+  exact response bytes through the background Page's collector. The foreground
+  collector must return `no such network data`. Two more load distinct iframe
+  responses in two live Pages, in shared or separate user contexts. Page-scoped
+  collectors and a collector spanning both Pages must retain both bodies after
+  the second request completes, and the request IDs must be distinct. Three
+  subscribe globally or by the default user context as the first BiDi command on
+  an existing Classic session, then insert an iframe without calling `getTree`
+  or creating a Page. They require lifecycle events with and without Network
+  events; `getTree` runs only after those events arrive. Another subscribes on a
+  Classic Page that already contains an iframe, checking parent-first context
+  replay without duplicate notifications from overlapping subscriptions. Four
+  Frame lifetime scenarios check stable IDs across iframe navigation, nested
+  subtree removal, parent Document navigation, and an iframe created and removed
+  synchronously in one script. Removed contexts must reject new subscriptions,
+  destruction events must retain current URLs and nested children, and collected
+  response bodies survive detach. Two more create a popup before subscribing,
+  verifying its replayed `originalOpener` agrees with `getTree`, and navigate a
+  middle iframe to a new Document. The middle Frame ID must survive, its old
+  child must be destroyed exactly once and reject commands, and a later detach
+  must not destroy the retired child again. Four popup cases check the initiating
+  Frame's `originalOpener` in live events, subscription replay and `getTree`,
+  including iframe openers and replay after the opener Page has closed. A final
+  case completes two `document.open/write/close` cycles inside an iframe: each must emit one ordered
+  DOMContentLoaded/load pair while preserving the initial navigation ID and
+  Frame ID. All twenty-three identical scenarios passed against Moli and Chrome
+  for Testing/ChromeDriver 156.0.8078.47 on 2026-10-29, with equal normalized
+  semantic result records.
+  The original six fail on the main revision preceding the owner fix. At the
+  initial owner-fix revision, the separate-user-context collector returns the
+  second response for the first request, and both first-command global
+  subscriptions miss iframe lifecycle events. Before separating internal Frame
+  facts from CDP Page subscriptions, the Frame lifetime cases miss context creation.
+  The revision before preserving popup opener identity fails the replay scenario
+  with `originalOpener: null`; middle-iframe navigation already passes there.
+  At `d7f570cd49`, all five latest scenarios fail: iframe popup attribution uses
+  the Page ID, closed openers become null, and document-open lifecycle events
+  are suppressed. The corrected implementation passes the same Chrome cases.
+  Forty-three `bidi-storage` scenarios cover value, compound attribute, size,
+  exact-path and expiry filters, non-ASCII string values, no matches, and
+  empty/omitted filters that clear all cookies. Each scenario creates one unpartitioned cookie via `storage.setCookie`
+  and two CHIPS cookies via real HTTP `Set-Cookie` responses (including a cross-site
+  iframe), all sharing the same name/domain/path. It also seeds a different path
+  and an unrelated name, then verifies every survivor and another user context
+  remain unchanged. These scenarios run in the default `bidi-storage` group,
+  with separate failure records under `--continue-on-failure`.
+  Storage-key cases cover `sourceOrigin` normalization and partition isolation,
+  `goog:hasCrossSiteAncestor`, partitioned writes (including file sites), and
+  malformed origins, invalid flags, missing user contexts and missing browsing
+  contexts. Invalid commands must preserve every stored cookie. Writes target
+  the supplied cookie domain even when the active document is on another site.
+  Numeric cases enforce the `js-uint` range (0 through 2^53-1), reject invalid
+  expiry/size values without changing any cookies, accept integer-valued JSON
+  numbers such as `21.0`, and preserve valid unmatched filters at the upper bound.
+  A maximum-safe expiry write remains persistent with Chrome's 400-day cap.
+  Subdomain cases retain Chrome's distinction between the descriptor's normalized
+  origin and the cookie's canonical site: writing with `https://shop.example.com`
+  creates a cookie at `https://example.com`, while querying or deleting with the
+  original subdomain matches nothing. This behavior is checked against Chrome
+  rather than inferred from the storage-key helper's canonicalization rules.
+  Context-owner cases pass real same-origin, cross-origin and nested iframe IDs
+  from `browsingContext.getTree` to get/set/delete. They verify unique child IDs
+  and storage isolation across simultaneous user contexts, and reject removed
+  frames and IDs retired by document replacement without changing cookies.
+  The identical forty-three scenarios passed against Chrome for Testing and ChromeDriver
+  156.0.8078.47 on 2026-10-28. The returned partition key is checked for consistency
+  between `getCookies` and `deleteCookies`; its supported fields can vary by engine
+  under the [WebDriver BiDi storage contract](https://www.w3.org/TR/webdriver-bidi/#module-storage).
 - Selenium Python Remote WebDriver session creation, Selenium BiDi facade
   `webSocketUrl` attachment with `browsing_context` create/navigate/get_tree/
   locate_nodes, browsing context fragment/history event handlers, `script`
@@ -125,6 +216,18 @@ lifecycle, error, and teardown coverage is still pending.
 
 ## Usage
 
+WebdriverIO v9 has a separate pinned client smoke, also run by CI. It checks
+capability opt-in and the same navigation, form input, click, and link workflow
+in Classic opt-out, default BiDi, and explicit BiDi sessions. BiDi sessions also
+check one shared node identity in both directions, pass Classic element and
+ShadowRoot references directly to BiDi before any BiDi lookup, and check stale-node
+errors after navigation for a reference never previously used by Classic:
+
+```bash
+npm ci --prefix moli-webdriver-smoke
+MOLI_BIN="$PWD/target/debug/moli" npm run smoke:webdriverio --prefix moli-webdriver-smoke
+```
+
 Build moli first when no binary exists:
 
 ```bash
@@ -139,10 +242,10 @@ uv sync
 uv run moli-webdriver-smoke
 ```
 
-With no `--group`, both local and CI runs execute all seven Moli groups:
+With no `--group`, both local and CI runs execute all eight Moli groups:
 
 ```text
-classic,bidi,selenium,semantics,url-policy,navigation-errors,script-interrupt
+classic,bidi,bidi-storage,selenium,semantics,url-policy,navigation-errors,script-interrupt
 ```
 
 CI adds `--continue-on-failure` so one failing group does not hide later smoke
@@ -160,6 +263,7 @@ Run focused groups:
 ```bash
 uv run moli-webdriver-smoke --group classic
 uv run moli-webdriver-smoke --group bidi
+uv run moli-webdriver-smoke --group bidi-storage
 uv run moli-webdriver-smoke --group selenium
 uv run moli-webdriver-smoke --group semantics --continue-on-failure
 uv run moli-webdriver-smoke --group url-policy --continue-on-failure
@@ -187,6 +291,24 @@ uv run moli-webdriver-smoke \
   --browser-binary ~/chromium/src/out/Default/chrome \
   --group semantics --continue-on-failure
 ```
+
+Run the same BiDi cookie deletion scenarios against ChromeDriver:
+
+```bash
+/path/to/chromedriver --port=9515
+
+uv run moli-webdriver-smoke \
+  --endpoint http://127.0.0.1:9515 \
+  --browser-name chrome \
+  --browser-binary /path/to/chrome \
+  --group bidi-storage --continue-on-failure
+```
+
+Use matching Chrome and ChromeDriver versions. The fixture uses `127.0.0.1`
+and `localhost` as distinct top-level sites and waits for the iframe load
+before checking the seeded cookies. No persistent browser profile is needed.
+Validate additions or expectation changes against real Chrome with this same
+group and record the browser/driver versions before adopting them as contracts.
 
 Run the bounded ChromeDriver script-timeout oracle against the local Chromium
 147 pair:
@@ -234,3 +356,65 @@ Useful environment variables:
 
 If both debug and release binaries exist, the runner uses the newest one by file
 modification time. Set `MOLI_BIN` when you need an exact binary.
+
+`bidi-progress` is part of the default suite. It pipelines real WebSocket
+commands while an HTTP response, an unresolved Promise, an input pause, or
+another page's prompt remains pending. It checks per-command terminal replies,
+independent cancellation, top-level input-state sharing, and the performActions
+queue. `releaseActions` bypasses the long performActions wait and only releases
+already-dispatched input state. The Classic/attached-BiDi case records the
+shared ChromeDriver boundary and requires settlement after the HTTP gate opens.
+
+The navigation/prompt case opens the old Document's prompt only after the new
+navigation reaches a held HTTP response. Handling must return the real confirm
+result before that response is released, and the navigation must then finish.
+This avoids relying on Chrome's separate behavior of dismissing a prompt that
+was already open when navigation began.
+
+`classic-alert-progress` runs Get/Set/accept/dismiss with no navigation, with an
+existing prompt during a held script navigation, with a prompt arriving after
+the Classic request is sent, and with no prompt. The existing/arriving cases
+must return the actual JavaScript prompt value before the navigation response
+is released. Without a prompt, Classic still waits for navigation and then
+returns `no such alert`. This differs from BiDi's finite prompt handling.
+The same 16 prompt-state cases run against Moli and ChromeDriver. Absence is observed for a
+bounded 250 ms after the HTTP request is written; deterministic Rust tests also
+poll the actual wait before installing a prompt. The navigation response gate
+opens only after the verdict, never to rescue a blocked alert operation. The
+separate prompt trigger opens after the navigation request arrives.
+
+Four additional alert cases set `pageLoad` to 200 ms and keep the navigation
+response withheld through the timeout and recovery checks. Get/Set/accept/dismiss
+must return HTTP 500 `timeout`, stop the pending navigation, and leave the old Document
+and subsequent Classic commands usable. The Get case also keeps a second Page
+navigating and verifies it still loads normally. Deterministic Native tests use
+a paused clock for zero and 200 ms deadlines; admitted scheduler inputs finish
+outside the receive/deadline race.
+
+The release/old/new input-generation case is calibrated against
+Chrome/ChromeDriver 156.0.8078.73. Upstream mapper commit
+[`49622edb`](https://github.com/GoogleChromeLabs/chromium-bidi/commit/49622edb9775aaacbf99ef9afa4b3736cbaaafcf)
+instead serializes perform/release on the same queue. The fixed-version oracle
+does not establish the behavior of newer Chrome versions; this PR preserves
+the tested input behavior.
+
+Three additional groups require explicit selection:
+
+- `bidi-input-layout` requires a layout-enabled endpoint (for example,
+  `moli serve --layout --resource`). It checks child-frame viewport and element
+  origins with actual pointer hit testing; default Mock-mode error checks stay
+  in the existing `bidi` group.
+- `bidi-auth-progress` diagnoses concurrent authentication navigation and Native
+  Fetch context ownership. It currently exposes a separate multi-target Fetch
+  routing limitation in Moli and exits unsuccessfully when that occurs. It is
+  deliberately not counted as a passing command-progress contract.
+- `bidi-layout-freshness` requires a layout endpoint. With no input command in
+  flight, it changes an element from left=20 to left=220, waits for a real
+  animation-frame callback, and checks its geometry. The saved Moli baseline and
+  this branch both expose stale geometry here; the diagnostic fails explicitly.
+
+All progress cases keep their requests and received frames in the result JSON.
+No scenario retries failed commands or opens its HTTP gate to rescue a blocked
+control command. Passing the static pointer-origin tests does not establish
+dynamic geometry freshness; that separate rendering precondition must pass
+before interpreting a moving-element input test.

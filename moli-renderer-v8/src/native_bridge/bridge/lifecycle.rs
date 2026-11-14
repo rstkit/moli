@@ -1,5 +1,5 @@
 use super::super::{
-    BridgeIdentityStore, JsContextHost, NativeBridgeBindings, abort, document, traversal,
+    BridgeIdentityStore, NativeBridgeBindings, PageScriptHost, abort, document, traversal,
 };
 use super::NativeDomBridge;
 use anyhow::Result;
@@ -15,6 +15,7 @@ impl NativeDomBridge {
             bindings,
             identity: BridgeIdentityStore::default(),
             abort: abort::AbortStore::default(),
+            web_mcp: crate::context_bootstrap::web_mcp::ModelContextStore::default(),
             traversal: traversal::TraversalStore::default(),
         }
     }
@@ -23,7 +24,7 @@ impl NativeDomBridge {
         &mut self,
         scope: &mut v8::PinScope<'s, '_>,
         global: v8::Local<'s, v8::Object>,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         rc_ptr: *mut c_void,
     ) -> Result<()> {
         self.bindings

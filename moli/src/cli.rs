@@ -1,18 +1,8 @@
 use std::{ffi::OsString, num::NonZeroU32, path::PathBuf, str::FromStr};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+pub use moli_cookie_import::{ChromeCryptoKey, ImportIncludes};
 use regex::Regex;
-
-const DUMP_MODES: &[&str] = &[
-    "json",
-    "html",
-    "markdown",
-    "screenshot",
-    "screenshot_full",
-    "pdf",
-    "semantic_tree",
-    "semantic_tree_text",
-];
 
 pub const DEFAULT_REDIRECT_WAIT_MS: u64 = 1_000;
 
@@ -75,8 +65,45 @@ pub struct Cli {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Commands {
+    /// Fetch a URL and write page content, a screenshot, or a JavaScript result to stdout.
     Fetch(Box<FetchArgs>),
+    /// Start a browser automation server for CDP, WebDriver Classic, and WebDriver BiDi.
     Serve(Box<ServeArgs>),
+    /// [Beta feature] Import browser session state into a Moli profile.
+    Import(Box<ImportArgs>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+#[command(group(
+    ArgGroup::new("import_sources")
+        .required(true)
+        .multiple(true)
+        .args(["chrome_profile_dir", "firefox_profile_dir", "cookie_jar"])
+))]
+pub struct ImportArgs {
+    /// Destination Moli profile directory.
+    #[arg(short = 'P', long, value_name = "PATH")]
+    pub profile_dir: PathBuf,
+
+    /// Comma-separated state to import: cookies,storage,indexeddb, or all.
+    #[arg(long, value_name = "KINDS", default_value = "all")]
+    pub includes: ImportIncludes,
+
+    /// Chrome profile directory (for example, `.../Chrome/Default`).
+    #[arg(long, value_name = "PATH")]
+    pub chrome_profile_dir: Option<PathBuf>,
+
+    /// Chrome cookie key source: system, or base64:<raw-key>.
+    #[arg(long, value_name = "SOURCE", requires = "chrome_profile_dir")]
+    pub chrome_crypto_key: Option<ChromeCryptoKey>,
+
+    /// Firefox profile directory (for example, `.../Profiles/name.default-release`).
+    #[arg(long, value_name = "PATH")]
+    pub firefox_profile_dir: Option<PathBuf>,
+
+    /// Netscape/curl cookie-jar file. May be specified more than once.
+    #[arg(long, value_name = "PATH")]
+    pub cookie_jar: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
@@ -84,40 +111,42 @@ pub struct FetchArgs {
     /// Select the fetch output format. When omitted, rendered HTML documents
     /// are serialized and raw responses such as PDFs or videos are written
     /// verbatim. `screenshot` writes a viewport PNG, `screenshot_full` writes a
-    /// full-document PNG, and `pdf` writes a paginated PDF directly to stdout;
-    /// all three require layout. Dump output is quiet by default; pass
+    /// full-document PNG, and `pdf` writes a paginated PDF with CSS backgrounds
+    /// directly to stdout; all three require layout. Dump output is quiet by default; pass
     /// `--log-level` to opt into diagnostic logs.
     #[arg(short, long, value_enum)]
     pub dump: Option<DumpFormat>,
 
-    /// Evaluate one JavaScript expression after page readiness and write its
-    /// value to stdout. Promises are awaited. Strings are written as text;
-    /// other serializable values are written as compact JSON.
-    #[arg(
-        long,
-        value_name = "EXPRESSION",
-        conflicts_with_all = [
-            "eval_file",
-            "dump",
-            "with_base",
-            "with_frames",
-            "strip_mode"
-        ]
-    )]
+    /// Exit with code 22 if the final main-document HTTP status is >= 400,
+    /// suppressing response output and reporting the status to stderr.
+    #[arg(long, conflicts_with = "fail_with_body")]
+    pub fail: bool,
+
+    /// Exit with code 22 if the final main-document HTTP status is >= 400,
+    /// preserving the selected output format and reporting the status to stderr.
+    /// Readiness or output errors retain exit code 1 and include the known HTTP status.
+    #[arg(long, conflicts_with = "fail")]
+    pub fail_with_body: bool,
+
+    /// Evaluate one expression after page readiness. Promises are awaited.
+    /// With --dump, discard its value and dump the resulting page state.
+    /// Otherwise write strings as text and other serializable values as JSON.
+    #[arg(long, value_name = "EXPRESSION", conflicts_with = "eval_file")]
     pub eval: Option<String>,
 
     /// Read the JavaScript expression from a UTF-8 file, or from stdin when PATH
     /// is `-`. This avoids command-line argument length limits for large or
-    /// multiline scripts. Promises are awaited.
-    #[arg(
-        long,
-        value_name = "PATH",
-        conflicts_with_all = ["eval", "dump", "with_base", "with_frames", "strip_mode"]
-    )]
+    /// multiline scripts. Promises are awaited. With --dump, export the
+    /// resulting page state instead of the expression value.
+    #[arg(long, value_name = "PATH", conflicts_with = "eval")]
     pub eval_file: Option<PathBuf>,
 
     #[arg(short = 'H', long = "header", value_name = "HEADER", value_parser = parse_request_header_arg)]
     pub headers: Vec<RequestHeaderArg>,
+
+    /// Write final unpartitioned cookies to a Netscape file, or - for stdout.
+    #[arg(long, value_name = "FILE", overrides_with = "cookie_jar")]
+    pub cookie_jar: Option<String>,
 
     /// Disable page-authored JavaScript before the Document starts parsing.
     /// Stylesheets still load; automation expressions remain available.
@@ -150,7 +179,13 @@ pub struct FetchArgs {
     #[arg(long, value_enum, value_delimiter = ',')]
     pub strip_mode: Vec<StripModeChoice>,
 
-    #[arg(long, value_enum, default_value = "done")]
+    #[arg(
+        long = "wait",
+        alias = "wait-until",
+        value_name = "WAIT",
+        value_enum,
+        default_value = "done"
+    )]
     pub wait_until: FetchWaitUntil,
 
     /// Minimum milliseconds from fetch start to allow an executable 3xx-5xx
@@ -240,8 +275,15 @@ pub struct FetchArgs {
     /// Maximum total readiness time in milliseconds. Initial and HTTP-error
     /// replacement navigations, the selected lifecycle stage, response match,
     /// selector, and script waits share one absolute deadline. Network-idle and
-    /// DOM-stable return the current page with a warning when it expires.
-    #[arg(short, long, alias = "wait-ms", default_value_t = 25_000)]
+    /// DOM-stable return the current page when it expires. Pass `--log-level warn`
+    /// to see timeout warnings.
+    #[arg(
+        short,
+        long = "timeout-ms",
+        aliases = ["timeout", "wait-ms"],
+        value_name = "MILLISECONDS",
+        default_value_t = 25_000
+    )]
     pub timeout: u64,
 
     #[command(flatten)]
@@ -396,6 +438,15 @@ fn parse_request_header_arg(raw: &str) -> Result<RequestHeaderArg, String> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ServeArgs {
+    /// Write final unpartitioned cookies on graceful shutdown to a Netscape file,
+    /// or - for stdout. Signal-driven termination does not export cookies.
+    #[arg(long, value_name = "FILE", overrides_with = "cookie_jar")]
+    pub cookie_jar: Option<String>,
+
+    /// Enable debugger pauses. By default, debugger statements and breakpoints do not pause execution.
+    #[arg(long)]
+    pub debugger: bool,
+
     #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
@@ -404,6 +455,22 @@ pub struct ServeArgs {
 
     #[arg(short, long, default_value_t = 10)]
     pub timeout: u32,
+
+    /// Allow browser requests from these origins (comma-separated, repeatable).
+    /// Requests without Origin and same-origin requests are allowed by default;
+    /// other origins are rejected. '*' allows all origins.
+    #[arg(long, value_name = "ORIGINS", value_delimiter = ',')]
+    pub remote_allow_origins: Vec<String>,
+
+    /// Set the screencast interval in milliseconds (default: 1000). Requires --layout.
+    #[arg(
+        long = "screencast-interval-ms",
+        alias = "screencast-interval",
+        value_name = "MILLISECONDS",
+        value_parser = clap::value_parser!(u32).range(1..),
+        requires = "layout"
+    )]
+    pub screencast_interval: Option<u32>,
 
     #[command(flatten)]
     pub common: CommonArgs,
@@ -437,12 +504,23 @@ pub struct CommonArgs {
     #[arg(long)]
     pub obey_robots: bool,
 
-    #[arg(long)]
+    /// Route HTTP(S) and WebSocket traffic through an HTTP, HTTPS, SOCKS5, or
+    /// SOCKS4 proxy. SOCKS targets always use proxy-side DNS; `socks` is a
+    /// SOCKS5 alias, while `socks5h` and `socks4a` remain accepted. Moli
+    /// resolves and pins the proxy endpoint; the proxy is responsible for
+    /// resolving and filtering request target hostnames.
+    #[arg(long, value_name = "URL")]
     pub http_proxy: Option<String>,
 
+    /// Comma-separated hostnames, domains, IP addresses, or CIDRs that bypass
+    /// the proxy. Port suffixes are not supported; IPv6 entries omit brackets.
+    /// A single `*` as the entire value bypasses all hosts; `*` inside a list
+    /// does not act as a wildcard. Also applies to `no_proxy` / `NO_PROXY`.
     #[arg(long)]
     pub http_no_proxy: Option<String>,
 
+    /// Permanently map a directly connected origin or proxy endpoint to an IP.
+    /// Target mappings are rejected when a remote-DNS proxy would ignore them.
     #[arg(long = "http-host-resolve", value_name = "HOST:PORT:ADDR")]
     pub http_host_resolve: Vec<String>,
 
@@ -460,7 +538,7 @@ pub struct CommonArgs {
     #[arg(long)]
     pub http_max_host_open: Option<NonZeroU32>,
 
-    /// Limit transport connections per host/group.
+    /// Limit shared HTTP and WebSocket connections per host/group.
     ///
     /// Defaults to 6 to match Chromium's normal HTTP/1 socket-pool shape. This
     /// does not limit HTTP/2 streams; use `--http2-max-concurrent-streams` for
@@ -468,7 +546,7 @@ pub struct CommonArgs {
     #[arg(long)]
     pub http_max_host_connections: Option<u8>,
 
-    /// Limit total transport connections across all hosts.
+    /// Limit total HTTP and WebSocket connections across all hosts.
     #[arg(long)]
     pub http_max_total_connections: Option<u16>,
 
@@ -492,6 +570,7 @@ pub struct CommonArgs {
     #[arg(long)]
     pub http_cache_dir: Option<String>,
 
+    /// Persist browser storage in this directory. Without it, IndexedDB and OPFS use temporary files.
     #[arg(short = 'P', long)]
     pub profile_dir: Option<String>,
 
@@ -527,6 +606,9 @@ pub struct CommonArgs {
     pub disable_subframes: bool,
 
     /// Enable the real on-demand layout renderer and screenshot surfaces.
+    /// Native scrollbars are hidden unless --scrollbars or MOLI_SCROLLBARS is enabled.
+    /// With `fetch --eval` or `--eval-file`, refresh layout once before running
+    /// the script so geometry APIs can read it. Script mutations do not refresh it.
     ///
     /// Without this flag Moli keeps deterministic compatibility
     /// geometry and does not construct layout or paint output.
@@ -538,7 +620,23 @@ pub struct CommonArgs {
     )]
     pub layout: bool,
 
-    #[arg(short, long = "cookie-file")]
+    /// Show native scrollbars. Requires --layout.
+    #[arg(
+        long,
+        env = "MOLI_SCROLLBARS",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        requires_if("true", "layout")
+    )]
+    pub scrollbars: bool,
+
+    /// Send Cookie header data or load a cookie file. Use - for stdin. May be repeated.
+    /// Use --cookie-jar to explicitly select an output, including overwriting an input file.
+    /// In serve mode, literal data defaults to the first HTTP(S) top-level navigation host.
+    #[arg(
+        long = "cookie",
+        visible_alias = "cookie-file",
+        value_name = "DATA|FILE"
+    )]
     pub cookie_file: Vec<String>,
 
     #[arg(long)]
@@ -547,6 +645,8 @@ pub struct CommonArgs {
     #[arg(long)]
     pub document_start_script_file: Vec<String>,
 
+    /// Block private addresses for directly connected request targets.
+    /// Proxy-resolved targets are outside this client-side policy.
     #[arg(
         long,
         env = "MOLI_BLOCK_PRIVATE_NETWORKS",
@@ -554,6 +654,8 @@ pub struct CommonArgs {
     )]
     pub block_private_networks: bool,
 
+    /// Block CIDRs for directly connected request targets. Proxy-resolved
+    /// targets must be filtered by the configured proxy.
     #[arg(long)]
     pub block_cidrs: Option<String>,
 
@@ -633,11 +735,16 @@ pub enum DumpFormat {
     // Stable machine-readable output for scrapling-style integrations.
     Json,
     Html,
+    #[value(alias = "md")]
     Markdown,
+    #[value(alias = "png")]
     Screenshot,
+    #[value(alias = "png_full")]
     ScreenshotFull,
     Pdf,
+    #[value(alias = "semtree")]
     SemanticTree,
+    #[value(alias = "semtree_text")]
     SemanticTreeText,
 }
 
@@ -703,7 +810,7 @@ fn normalize_dump_flag(args: &mut Vec<OsString>) {
         .map(|arg| arg.to_string_lossy().into_owned());
     let next_is_valid_dump_mode = next
         .as_deref()
-        .is_some_and(|candidate| DUMP_MODES.contains(&candidate));
+        .is_some_and(|candidate| DumpFormat::from_str(candidate, false).is_ok());
 
     if !next_is_valid_dump_mode {
         args.insert(index + 1, OsString::from("html"));
@@ -772,6 +879,22 @@ mod tests {
     }
 
     #[test]
+    fn timeout_help_uses_milliseconds_only_for_fetch() {
+        let fetch_help = Cli::try_parse_from(["moli", "fetch", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(fetch_help.contains("-t, --timeout-ms <MILLISECONDS>"));
+        assert!(!fetch_help.contains("--timeout <"));
+        assert!(!fetch_help.contains("--wait-ms"));
+
+        let serve_help = Cli::try_parse_from(["moli", "serve", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(serve_help.contains("-t, --timeout <TIMEOUT>"));
+        assert!(!serve_help.contains("--timeout-ms"));
+    }
+
+    #[test]
     fn fetch_help_labels_literal_and_regex_response_waits() {
         let help = Cli::try_parse_from(["moli", "fetch", "--help"])
             .unwrap_err()
@@ -816,6 +939,7 @@ mod tests {
             let common = match cli.command {
                 Commands::Fetch(args) => args.common,
                 Commands::Serve(args) => args.common,
+                Commands::Import(_) => unreachable!("test only parses fetch and serve"),
             };
             assert_eq!(common.ca_cert, Some(PathBuf::from("ca.pem")));
             let certificate = common.client_cert.expect("client certificate");
@@ -823,6 +947,51 @@ mod tests {
             assert_eq!(certificate.password(), Some("secret"));
             assert_eq!(common.client_key, Some(PathBuf::from("client-key.pem")));
         }
+    }
+
+    #[test]
+    fn parses_import_sources_includes_and_explicit_key() {
+        let cli = Cli::parse_from([
+            "moli",
+            "import",
+            "--chrome-profile-dir",
+            "/tmp/chrome/Default",
+            "--profile-dir",
+            "/tmp/moli",
+            "--includes",
+            "cookies,storage",
+            "--chrome-crypto-key",
+            "base64:YWJjZA==",
+        ]);
+        let Commands::Import(args) = cli.command else {
+            panic!("expected import command");
+        };
+        assert!(args.includes.contains(ImportIncludes::COOKIES));
+        assert!(args.includes.contains(ImportIncludes::STORAGE));
+        assert!(!args.includes.contains(ImportIncludes::INDEXED_DB));
+        assert_eq!(
+            args.chrome_crypto_key,
+            Some(ChromeCryptoKey::Base64("YWJjZA==".into()))
+        );
+    }
+
+    #[test]
+    fn import_defaults_to_all_and_requires_a_source() {
+        let cli = Cli::parse_from([
+            "moli",
+            "import",
+            "--profile-dir",
+            "/tmp/moli",
+            "--cookie-jar",
+            "/tmp/cookies.txt",
+        ]);
+        let Commands::Import(args) = cli.command else {
+            panic!("expected import command");
+        };
+        assert!(args.includes.contains(ImportIncludes::COOKIES));
+        assert!(args.includes.contains(ImportIncludes::STORAGE));
+
+        assert!(Cli::try_parse_from(["moli", "import", "--profile-dir", "/tmp/moli"]).is_err());
     }
 
     #[test]
@@ -893,13 +1062,15 @@ mod tests {
             "load",
             "--wait-selector",
             "main",
-            "--timeout",
+            "--timeout-ms",
             "5000",
             "--layout",
             "--image",
             "--font",
-            "--cookie-file",
+            "--cookie",
             "jar.txt",
+            "--cookie-jar",
+            "final-jar.txt",
             "--profile-dir",
             "/tmp/p",
             "--user-agent",
@@ -922,8 +1093,10 @@ mod tests {
             "-l",
             "--image",
             "--font",
-            "-c",
+            "--cookie-file",
             "jar.txt",
+            "--cookie-jar",
+            "final-jar.txt",
             "-P",
             "/tmp/p",
             "-A",

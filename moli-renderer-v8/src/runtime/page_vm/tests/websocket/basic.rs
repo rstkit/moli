@@ -20,6 +20,7 @@ async fn websocket_text_echo_delivers_browser_style_async_events() {
                             globalThis.__wsEvents.push(`open:${{socket.readyState}}:${{socket.protocol}}`);
                             socket.send('hello');
                             globalThis.__wsEvents.push(`bufferedAfterSend:${{socket.bufferedAmount}}`);
+                            Promise.resolve().then(() => globalThis.__wsEvents.push(`bufferedInMicrotask:${{socket.bufferedAmount}}`));
                         }});
                         socket.addEventListener('message', event => {{
                             globalThis.__wsEvents.push(`message:${{event.data}}:${{socket.bufferedAmount}}`);
@@ -60,7 +61,7 @@ async fn websocket_text_echo_delivers_browser_style_async_events() {
         server.await.expect("websocket echo server should finish");
         assert_eq!(
             events,
-            r#"["constructed:0","open:1:","bufferedAfterSend:5","message:hello:0","afterCloseCall:2","close:3:1000:done:true"]"#
+            r#"["constructed:0","open:1:","bufferedAfterSend:5","bufferedInMicrotask:5","message:hello:0","afterCloseCall:2","close:3:1000:done:true"]"#
         );
         })
         .await;
@@ -669,7 +670,7 @@ async fn websocket_binary_echo_delivers_blob_by_default() {
 }
 
 #[tokio::test]
-async fn websocket_binary_type_invalid_values_throw_syntax_error() {
+async fn websocket_binary_type_ignores_invalid_values() {
     run_page_vm_async_test(async move {
         let (url, server) = spawn_text_echo_websocket_server().await;
         let url_literal = serde_json::to_string(&url).expect("serialize websocket url");
@@ -722,7 +723,7 @@ async fn websocket_binary_type_invalid_values_throw_syntax_error() {
             .expect("websocket binaryType server should finish");
         assert_eq!(
             events,
-            r#"["initial:blob","invalid:SyntaxError:blob","arraybuffer:arraybuffer","blob:blob","close:true"]"#
+            r#"["initial:blob","invalid-write:blob","arraybuffer:arraybuffer","blob:blob","close:true"]"#
         );
         })
         .await;
@@ -954,7 +955,7 @@ async fn websocket_open_and_frames_record_network_trace_entries() {
             record
                 .request_headers()
                 .iter()
-                .any(|(name, _): &(String, String)| name.eq_ignore_ascii_case("origin"))
+                .any(|(name, _)| name.eq_ignore_ascii_case("origin"))
         );
         match record.outcome() {
             SubresourceNetworkOutcome::Success {
@@ -1009,6 +1010,59 @@ async fn websocket_open_and_frames_record_network_trace_entries() {
         assert_eq!(lifecycle_events[2].close_code(), Some(1000));
         assert_eq!(lifecycle_events[2].close_reason(), Some("trace"));
         assert_eq!(lifecycle_events[2].was_clean(), Some(true));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropping_page_releases_native_websocket_and_websocket_stream_transports() {
+    run_page_vm_async_test(async move {
+        for constructor in ["WebSocket", "WebSocketStream"] {
+            let (url, server) =
+                moli_websocket::test_support::spawn_transport_retirement_websocket_server().await;
+            let page_vm = test_page_vm();
+            let local_executor = page_vm.local_executor.clone();
+            local_executor
+                .run(async move {
+                    let mut page_vm = page_vm;
+                    page_vm.vm_mut().eval(&format!(
+                        r#"
+                    globalThis.__nativeTransportOpened = false;
+                    globalThis.__nativeTransport = new {constructor}({url:?});
+                    if ({constructor:?} === 'WebSocket') {{
+                        __nativeTransport.onopen = () => {{ __nativeTransportOpened = true; }};
+                    }} else {{
+                        __nativeTransport.opened.then(() => {{ __nativeTransportOpened = true; }});
+                    }}
+                "#
+                    ))?;
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        loop {
+                            while page_vm
+                                .run_exact_page_websocket_selected_task_for_test()
+                                .await?
+                                .is_some()
+                            {}
+                            if page_vm.vm_mut().eval("String(__nativeTransportOpened)")? == "true" {
+                                break;
+                            }
+                            page_vm
+                                .wait_for_page_work_arrival_without_timeout(false)
+                                .await;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    })
+                    .await
+                    .expect("native transport should open")?;
+                    drop(page_vm);
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .expect("page retirement should run on owner lane");
+            server
+                .await
+                .expect("dropping Page releases its native socket");
+        }
     })
     .await;
 }

@@ -448,7 +448,7 @@ fn text_control_default_value_type_and_reset_paths_clamp_selection() {
 
 #[test]
 fn input_click_activation_state_and_type_change_defaults_match_browser_order() {
-    let mut vm = new_storage_test_vm("https://forms-input-click-activation.test/");
+    let mut vm = new_storage_html_test_vm("https://forms-input-click-activation.test/");
 
     let result = vm
         .eval(
@@ -537,7 +537,7 @@ fn input_click_activation_state_and_type_change_defaults_match_browser_order() {
 
 #[test]
 fn checkbox_click_activation_tracks_trust_and_indeterminate_state() {
-    let mut vm = new_storage_test_vm("https://forms-checkbox-click-activation.test/");
+    let mut vm = new_storage_html_test_vm("https://forms-checkbox-click-activation.test/");
 
     let result = vm
         .eval(
@@ -1144,6 +1144,202 @@ async fn text_control_selectionchange_bubbles_across_shadow_and_exec_delete_targ
         "0|document"
     );
 }
+
+#[test]
+fn exec_command_insert_text_enforces_maxlength_in_utf16_units() {
+    let mut vm = new_storage_test_vm("https://exec-command-insert-text-maxlength.test/");
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const root = document.documentElement || document.appendChild(document.createElement('html'));
+  const body = document.body || root.appendChild(document.createElement('body'));
+  const input = document.createElement('input');
+  input.setAttribute('maxlength', ' +10tail');
+  body.append(input);
+  const events = [];
+  input.addEventListener('input', () => events.push('input'));
+  input.focus();
+  const returned = document.execCommand('insertText', false, '👨‍👩‍👧‍👦');
+
+  const lineInput = document.createElement('input');
+  body.append(lineInput);
+  lineInput.focus();
+  const lineReturned = document.execCommand('insertText', false, 'A\r\nB\n');
+
+  const rangeInput = document.createElement('input');
+  rangeInput.value = 'A😀B';
+  body.append(rangeInput);
+  rangeInput.setRangeText('x', 1, 3, 'end');
+
+  return JSON.stringify({
+    returned,
+    value: input.value,
+    valueLength: input.value.length,
+    selectionStart: input.selectionStart,
+    selectionEnd: input.selectionEnd,
+    events,
+    lineReturned,
+    lineValue: lineInput.value,
+    rangeValue: rangeInput.value,
+    rangeSelection: [rangeInput.selectionStart, rangeInput.selectionEnd]
+  });
+})()
+"#,
+        )
+        .expect("execCommand insertText maxlength probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"returned":true,"value":"👨‍👩‍👧‍","valueLength":9,"selectionStart":9,"selectionEnd":9,"events":["input"],"lineReturned":true,"lineValue":"A B","rangeValue":"AxB","rangeSelection":[2,2]}"#
+    );
+}
+
+#[test]
+fn exec_command_text_control_deletion_preserves_surrogate_pairs() {
+    let mut vm = new_storage_test_vm("https://exec-command-surrogate-pairs.test/");
+
+    for tag in ["input", "textarea"] {
+        for (initial, command, start, end, value, caret) in [
+            ("A😀B", "delete", 3, 3, "AB", 1),
+            ("A😀B", "forwardDelete", 1, 1, "AB", 1),
+            ("A😀B", "delete", 2, 2, "AB", 1),
+            ("A😀B", "forwardDelete", 2, 2, "A😀", 3),
+            ("A😀B", "delete", 0, 0, "A😀B", 0),
+            ("A😀B", "forwardDelete", 4, 4, "A😀B", 4),
+            ("A😀B", "delete", 1, 2, "AB", 1),
+            ("A😀B", "forwardDelete", 1, 2, "AB", 1),
+            ("A😀B", "delete", 2, 3, "AB", 1),
+            ("A😀B", "forwardDelete", 2, 3, "A😀", 3),
+            ("A😀B", "delete", 1, 3, "AB", 1),
+            ("A😀B", "forwardDelete", 1, 3, "AB", 1),
+            ("A😀B", "delete", 0, 2, "B", 0),
+            ("A😀B", "forwardDelete", 0, 2, "B", 0),
+            ("A😀B", "delete", 2, 4, "A😀", 3),
+            ("A😀B", "forwardDelete", 2, 4, "A😀", 3),
+            ("", "delete", 0, 0, "", 0),
+            ("", "forwardDelete", 0, 0, "", 0),
+            ("😀", "delete", 1, 1, "", 0),
+            ("😀", "forwardDelete", 1, 1, "😀", 1),
+            ("A😀", "delete", 2, 2, "A", 1),
+            ("A😀", "forwardDelete", 2, 2, "A😀", 2),
+            ("😀😀", "delete", 3, 3, "😀", 2),
+            ("😀😀", "forwardDelete", 3, 3, "😀😀", 3),
+        ] {
+            let result = vm
+                .eval(&format!(
+                    r#"
+(() => {{
+  const root = document.documentElement || document.appendChild(document.createElement('html'));
+  const body = document.body || root.appendChild(document.createElement('body'));
+  const control = document.createElement('{tag}');
+  body.append(control);
+  control.value = '{initial}';
+  control.focus();
+  control.setSelectionRange({start}, {end});
+  const before = [control.selectionStart, control.selectionEnd];
+  const returned = document.execCommand('{command}');
+  const result = [...before, returned, control.value, control.selectionStart, control.selectionEnd];
+  control.remove();
+  return JSON.stringify(result);
+}})()
+"#
+                ))
+                .expect("execCommand deletion should evaluate");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+                serde_json::json!([start, end, true, value, caret, caret]),
+                "{tag} {command} value={initial:?} with selection [{start}, {end}]"
+            );
+        }
+    }
+}
+
+#[test]
+fn exec_command_insert_html_enforces_maxlength_in_utf16_units() {
+    let mut vm = new_storage_test_vm("https://exec-command-insert-html-maxlength.test/");
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const root = document.documentElement || document.appendChild(document.createElement('html'));
+  const body = document.body || root.appendChild(document.createElement('body'));
+  const input = document.createElement('input');
+  input.setAttribute('maxlength', ' +10tail');
+  body.append(input);
+  const events = [];
+  input.addEventListener('beforeinput', () => events.push('beforeinput'));
+  input.addEventListener('input', () => events.push('input'));
+
+  const supported = document.queryCommandSupported('InsertHTML');
+  const enabledBeforeFocus = document.queryCommandEnabled('InsertHTML');
+  input.focus();
+  const enabled = document.queryCommandEnabled('InsertHTML');
+  const returned = document.execCommand('InsertHTML', false, '👨‍👩‍👧‍👦');
+
+  const markupInput = document.createElement('input');
+  body.append(markupInput);
+  markupInput.focus();
+  const markupReturned = document.execCommand(
+    'InsertHTML',
+    false,
+    '<b>A</b><br>B<script>C</script>&amp;'
+  );
+
+  const rangeInput = document.createElement('input');
+  rangeInput.value = 'A😀B';
+  body.append(rangeInput);
+  rangeInput.setRangeText('x', 1, 3, 'end');
+
+  input.readOnly = true;
+  input.focus();
+  const enabledReadonly = document.queryCommandEnabled('InsertHTML');
+  const readonlyReturned = document.execCommand('InsertHTML', false, 'x');
+
+  return JSON.stringify({
+    supported,
+    enabledBeforeFocus,
+    enabled,
+    returned,
+    value: input.value,
+    valueLength: input.value.length,
+    selectionStart: input.selectionStart,
+    selectionEnd: input.selectionEnd,
+    events,
+    markupReturned,
+    markupValue: markupInput.value,
+    rangeValue: rangeInput.value,
+    rangeSelection: [rangeInput.selectionStart, rangeInput.selectionEnd],
+    enabledReadonly,
+    readonlyReturned
+  });
+})()
+"#,
+        )
+        .expect("execCommand InsertHTML maxlength probe should evaluate");
+
+    assert_eq!(
+        result,
+        r#"{"supported":true,"enabledBeforeFocus":false,"enabled":true,"returned":true,"value":"👨‍👩‍👧‍","valueLength":9,"selectionStart":9,"selectionEnd":9,"events":["input"],"markupReturned":true,"markupValue":"A BC&","rangeValue":"AxB","rangeSelection":[2,2],"enabledReadonly":false,"readonlyReturned":false}"#
+    );
+}
+
+#[test]
+fn exec_command_insert_html_matches_chromium_text_control_matrix() {
+    let mut vm = new_storage_test_vm("https://exec-command-insert-html-matrix.test/");
+    let failures = vm
+        .eval(include_str!(
+            "../../../../tests/fixtures/exec-command-insert-html.js"
+        ))
+        .expect("InsertHTML text control matrix should evaluate");
+    assert_eq!(
+        failures, "[]",
+        "InsertHTML compatibility failures: {failures}"
+    );
+}
+
 #[test]
 fn input_file_value_setter_rejects_non_empty_values() {
     let mut vm = new_storage_test_vm("https://forms-input-file-value.test/");

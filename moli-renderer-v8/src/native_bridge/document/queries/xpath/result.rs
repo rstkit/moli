@@ -2,6 +2,7 @@ use super::super::*;
 use super::types::*;
 use crate::native_bridge::document::detached_tree_query_version;
 use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 use moli_xpath::SnapshotValue;
@@ -10,7 +11,7 @@ use std::ffi::c_void;
 #[derive(Clone, Copy)]
 pub(super) enum XPathIteratorMutationState<'s> {
     Live {
-        runtime_ptr: *mut JsContextHost,
+        runtime_ptr: *mut PageScriptHost,
         query_version: u64,
     },
     ObjectTree {
@@ -27,7 +28,7 @@ struct XPathResultSnapshotItemArgs {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "XPathResult")]
+#[webapi(interface = web_api_interfaces::XPathResult)]
 struct XPathResultBaseDeclaration<'scope> {
     #[webapi(slot = XPATH_RESULT_TYPE_SLOT)]
     result_type: u32,
@@ -48,7 +49,7 @@ struct XPathResultBaseDeclaration<'scope> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "XPathResult", enumerable)]
+#[webapi(interface = web_api_interfaces::XPathResult, enumerable, receiver)]
 struct XPathResultPrototypeDeclaration {
     #[webapi(accessor_property, getter = xpath_result_result_type_getter_callback)]
     result_type: (),
@@ -66,12 +67,12 @@ struct XPathResultPrototypeDeclaration {
     snapshot_length: (),
     #[webapi(method, length = 0, callback = xpath_result_iterate_next_callback)]
     iterate_next: (),
-    #[webapi(method, length = 0, callback = xpath_result_snapshot_item_callback)]
+    #[webapi(method, length = 1, callback = xpath_result_snapshot_item_callback)]
     snapshot_item: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "XPathResult")]
+#[webapi(interface = web_api_interfaces::XPathResult)]
 struct XPathResultConstantsDeclaration {
     #[webapi(constant = "ANY_TYPE", value = XPATH_ANY_TYPE)]
     any_type: (),
@@ -132,12 +133,24 @@ pub(super) fn install_xpath_result_template_bindings<'s>(
     XPathResultPrototypeDeclaration::initialize_prototype_template(scope, prototype);
 }
 
-fn set_xpath_result_slot(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<'_, v8::Object>,
+fn xpath_result_slot<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
     name: &'static str,
-    value: v8::Local<'_, v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let object = moli_webapi_declare::web_api_object_target(scope, object)?;
+    get_private_value(scope, object, name)
+}
+
+fn set_xpath_result_slot<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &'static str,
+    value: v8::Local<'s, v8::Value>,
 ) {
+    let Some(object) = moli_webapi_declare::web_api_object_target(scope, object) else {
+        return;
+    };
     set_private_value(scope, object, name, value);
 }
 
@@ -233,7 +246,7 @@ fn xpath_result_type<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     result: v8::Local<'s, v8::Object>,
 ) -> u32 {
-    get_private_value(scope, result, XPATH_RESULT_TYPE_SLOT)
+    xpath_result_slot(scope, result, XPATH_RESULT_TYPE_SLOT)
         .and_then(|value| value.uint32_value(scope))
         .unwrap_or(XPATH_ANY_TYPE)
 }
@@ -267,7 +280,7 @@ fn xpath_result_baseline_query_version<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     result: v8::Local<'s, v8::Object>,
 ) -> Option<u64> {
-    let value = get_private_value(scope, result, XPATH_RESULT_QUERY_VERSION_SLOT)?;
+    let value = xpath_result_slot(scope, result, XPATH_RESULT_QUERY_VERSION_SLOT)?;
     let big = v8::Local::<v8::BigInt>::try_from(value).ok()?;
     let (version, _lossless) = big.u64_value();
     Some(version)
@@ -276,10 +289,10 @@ fn xpath_result_baseline_query_version<'s>(
 fn xpath_result_runtime_ptr<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     result: v8::Local<'s, v8::Object>,
-) -> Option<*mut JsContextHost> {
-    let value = get_private_value(scope, result, XPATH_RESULT_RUNTIME_SLOT)?;
+) -> Option<*mut PageScriptHost> {
+    let value = xpath_result_slot(scope, result, XPATH_RESULT_RUNTIME_SLOT)?;
     let external = v8::Local::<v8::External>::try_from(value).ok()?;
-    let runtime_ptr = external.value() as *mut JsContextHost;
+    let runtime_ptr = external.value() as *mut PageScriptHost;
     (!runtime_ptr.is_null()).then_some(runtime_ptr)
 }
 
@@ -287,7 +300,7 @@ fn xpath_result_object_tree_root<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     result: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    get_private_value(scope, result, XPATH_RESULT_OBJECT_TREE_ROOT_SLOT)
+    xpath_result_slot(scope, result, XPATH_RESULT_OBJECT_TREE_ROOT_SLOT)
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
 }
 
@@ -339,7 +352,7 @@ fn xpath_result_number_value_getter_callback<'s>(
         xpath_result_throw_type_error(scope, "The result type is not a number.");
         return;
     }
-    if let Some(value) = get_private_value(scope, result, XPATH_RESULT_NUMBER_VALUE_SLOT) {
+    if let Some(value) = xpath_result_slot(scope, result, XPATH_RESULT_NUMBER_VALUE_SLOT) {
         rv.set(value);
     }
 }
@@ -354,7 +367,7 @@ fn xpath_result_string_value_getter_callback<'s>(
         xpath_result_throw_type_error(scope, "The result type is not a string.");
         return;
     }
-    if let Some(value) = get_private_value(scope, result, XPATH_RESULT_STRING_VALUE_SLOT) {
+    if let Some(value) = xpath_result_slot(scope, result, XPATH_RESULT_STRING_VALUE_SLOT) {
         rv.set(value);
     }
 }
@@ -369,7 +382,7 @@ fn xpath_result_boolean_value_getter_callback<'s>(
         xpath_result_throw_type_error(scope, "The result type is not a boolean.");
         return;
     }
-    if let Some(value) = get_private_value(scope, result, XPATH_RESULT_BOOLEAN_VALUE_SLOT) {
+    if let Some(value) = xpath_result_slot(scope, result, XPATH_RESULT_BOOLEAN_VALUE_SLOT) {
         rv.set(value);
     }
 }
@@ -384,7 +397,7 @@ fn xpath_result_single_node_value_getter_callback<'s>(
         xpath_result_throw_type_error(scope, "The result type is not a single node.");
         return;
     }
-    if let Some(value) = get_private_value(scope, result, XPATH_RESULT_SINGLE_NODE_VALUE_SLOT) {
+    if let Some(value) = xpath_result_slot(scope, result, XPATH_RESULT_SINGLE_NODE_VALUE_SLOT) {
         rv.set(value);
     }
 }
@@ -399,7 +412,7 @@ fn xpath_result_snapshot_length_getter_callback<'s>(
         xpath_result_throw_type_error(scope, "The result type is not a snapshot.");
         return;
     }
-    if let Some(value) = get_private_value(scope, result, XPATH_RESULT_SNAPSHOT_LENGTH_SLOT) {
+    if let Some(value) = xpath_result_slot(scope, result, XPATH_RESULT_SNAPSHOT_LENGTH_SLOT) {
         rv.set(value);
     }
 }
@@ -410,10 +423,17 @@ pub(super) fn build_xpath_scalar_result<'s>(
     requested_result_type: u32,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let result_type = match requested_result_type {
-        XPATH_ANY_TYPE | XPATH_STRING_TYPE => XPATH_STRING_TYPE,
-        XPATH_NUMBER_TYPE => XPATH_NUMBER_TYPE,
-        XPATH_BOOLEAN_TYPE => XPATH_BOOLEAN_TYPE,
-        _ => XPATH_STRING_TYPE,
+        XPATH_ANY_TYPE => match &value {
+            SnapshotValue::Boolean(_) => XPATH_BOOLEAN_TYPE,
+            SnapshotValue::Number(_) => XPATH_NUMBER_TYPE,
+            SnapshotValue::String(_) => XPATH_STRING_TYPE,
+            SnapshotValue::Nodes(_) => return None,
+        },
+        XPATH_STRING_TYPE | XPATH_NUMBER_TYPE | XPATH_BOOLEAN_TYPE => requested_result_type,
+        _ => {
+            throw_type_error(scope, "The XPath result is not a node set.");
+            return None;
+        }
     };
     let object = build_xpath_result_base(scope, result_type)?;
     match result_type {
@@ -508,13 +528,13 @@ fn xpath_result_iterate_next_callback<'s>(
         );
         return;
     }
-    let Some(nodes) = get_private_value(scope, result, XPATH_RESULT_NODES_SLOT)
+    let Some(nodes) = xpath_result_slot(scope, result, XPATH_RESULT_NODES_SLOT)
         .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
     else {
         rv.set_null();
         return;
     };
-    let index = get_private_value(scope, result, XPATH_RESULT_INDEX_SLOT)
+    let index = xpath_result_slot(scope, result, XPATH_RESULT_INDEX_SLOT)
         .and_then(|value| value.uint32_value(scope))
         .unwrap_or(0);
     if index >= nodes.length() {
@@ -539,17 +559,17 @@ fn xpath_result_snapshot_item_callback<'s>(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let result = args.this();
+    let Some(parsed) = webidl::parse_args::<XPathResultSnapshotItemArgs>(scope, &args) else {
+        return;
+    };
     if !xpath_result_type_is_snapshot(xpath_result_type(scope, result)) {
         xpath_result_throw_type_error(scope, "The result type is not a snapshot.");
         return;
     }
-    let Some(nodes) = get_private_value(scope, result, XPATH_RESULT_NODES_SLOT)
+    let Some(nodes) = xpath_result_slot(scope, result, XPATH_RESULT_NODES_SLOT)
         .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
     else {
         rv.set_null();
-        return;
-    };
-    let Some(parsed) = webidl::parse_args::<XPathResultSnapshotItemArgs>(scope, &args) else {
         return;
     };
     if parsed.index >= nodes.length() {

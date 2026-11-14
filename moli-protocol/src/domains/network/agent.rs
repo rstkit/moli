@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Result;
+
 use moli_bounded_buffer::{BoundedByteBuffer, ByteLimits, InsertOutcome};
 use moli_core::page::{ScriptNetworkOutputItem, SubresourceNetworkRequestHandle};
 
+use crate::automation::DevToolsNetworkDataType;
 use crate::conn::{CapturedBody, ConnectionNetworkRequestIdAllocator};
-use crate::devtools_runtime::DevToolsNetworkDataType;
 
 use super::{
     PendingNetworkBacklogDeliverySnapshot, PendingSubresourceNetworkActivity,
@@ -508,10 +510,38 @@ impl TargetNetworkAgentState {
             .record_fetch_pause_announced_request_id(request_id);
     }
 
-    pub(crate) fn take_fetch_pause_announced_request_id(&mut self, request_id: &str) -> bool {
+    pub(crate) fn record_fetch_pause_announced_redirect(&mut self, request_id: &str) {
         self.artifacts
             .subresource_network_artifacts
-            .take_fetch_pause_announced_request_id(request_id)
+            .fetch_pause_announced_request_ids
+            .entry(request_id.to_owned())
+            .or_default()
+            .announced_redirects += 1;
+    }
+
+    pub(crate) fn fetch_pause_announced_redirects(&self, request_id: &str) -> usize {
+        self.artifacts
+            .subresource_network_artifacts
+            .fetch_pause_announced_request_ids
+            .get(request_id)
+            .map_or(0, |announcement| announcement.announced_redirects)
+    }
+
+    pub(crate) fn replace_navigation_fetch_request_id(
+        &mut self,
+        network_id: String,
+        session_id: Option<String>,
+        fetch_id: String,
+    ) -> Option<String> {
+        self.artifacts
+            .subresource_network_artifacts
+            .replace_navigation_fetch_request_id(network_id, session_id, fetch_id)
+    }
+
+    pub(crate) fn request_was_announced_by_fetch_pause(&self, request_id: &str) -> bool {
+        self.artifacts
+            .subresource_network_artifacts
+            .request_was_announced_by_fetch_pause(request_id)
     }
 
     pub(crate) fn clear_fetch_pause_announced_request_id(&mut self, request_id: &str) {
@@ -621,7 +651,7 @@ impl TargetNetworkAgentState {
     pub(crate) fn record_captured_request_body_with_collector_scope(
         &mut self,
         request_id: String,
-        request_body: Vec<u8>,
+        request_body: bytes::Bytes,
         session_ids: impl IntoIterator<Item = Option<String>>,
         collector_ids: impl IntoIterator<Item = String>,
         collection_was_gated: bool,
@@ -722,6 +752,7 @@ impl TargetNetworkAgentState {
         self.artifacts.body_artifacts.allocate_io_stream_handle()
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_io_stream(&mut self, handle: String, bytes: Vec<u8>, offset: usize) {
         self.artifacts
             .body_artifacts
@@ -731,7 +762,7 @@ impl TargetNetworkAgentState {
     pub(crate) fn insert_io_stream_body_source(
         &mut self,
         handle: String,
-        body: CapturedBody,
+        body: impl Into<crate::conn::ProtocolResponseBody>,
         offset: usize,
     ) {
         self.artifacts
@@ -739,6 +770,11 @@ impl TargetNetworkAgentState {
             .insert_stream_body_source(handle, body, offset);
     }
 
+    pub(crate) fn io_stream(&self, handle: &str) -> Option<IoStreamState> {
+        self.artifacts.body_artifacts.io_stream(handle)
+    }
+
+    #[cfg(test)]
     pub(crate) fn read_io_stream(
         &mut self,
         handle: &str,
@@ -963,8 +999,8 @@ impl TargetNetworkAgentState {
     }
 }
 
-/// Network lifecycle state retained only until a replaced renderer Page has
-/// published and closed its final output stream.
+/// Network lifecycle state retained until a replaced Document has published
+/// its final output, including any detached keepalive request terminals.
 #[derive(Debug)]
 pub(crate) struct RetiringTargetNetworkAgentState {
     output_queue: TargetNetworkOutputQueue,
@@ -975,6 +1011,10 @@ pub(crate) struct RetiringTargetNetworkAgentState {
 }
 
 impl RetiringTargetNetworkAgentState {
+    pub(crate) fn has_pending_renderer_requests(&self) -> bool {
+        !self.active_renderer_subresource_requests.is_empty()
+    }
+
     pub(crate) fn ingest_renderer_output_item_and_prepare_live_delivery(
         &mut self,
         item: &ScriptNetworkOutputItem,
@@ -1156,19 +1196,19 @@ impl CapturedResponseBody {
         }
     }
 
-    pub(crate) fn body_bytes_limited(&self, limit: usize) -> anyhow::Result<Vec<u8>> {
+    pub(crate) fn captured_body(&self) -> Result<&CapturedBody> {
         match &self.state {
-            CapturedResponseBodyState::Ready(body) => body.materialize_bytes_limited(limit),
-            CapturedResponseBodyState::Pending => {
-                anyhow::bail!("No data found for resource with given identifier")
+            CapturedResponseBodyState::Ready(body) => Ok(body),
+            CapturedResponseBodyState::Pending | CapturedResponseBodyState::Failed(_) => {
+                Err(CapturedResponseBodyError::NoData.into())
             }
-            CapturedResponseBodyState::Failed(_) => {
-                anyhow::bail!("No data found for resource with given identifier")
-            }
-            CapturedResponseBodyState::Evicted => {
-                anyhow::bail!("Request content was evicted from inspector cache")
-            }
+            CapturedResponseBodyState::Evicted => Err(CapturedResponseBodyError::Evicted.into()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body_bytes_limited(&self, limit: usize) -> Result<Vec<u8>> {
+        self.captured_body()?.materialize_bytes_limited(limit)
     }
 
     pub(crate) fn is_visible_to_session(&self, session_id: Option<&str>) -> bool {
@@ -1214,6 +1254,14 @@ impl CapturedResponseBody {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum CapturedResponseBodyError {
+    #[error("No data found for resource with given identifier")]
+    NoData,
+    #[error("Request content was evicted from inspector cache")]
+    Evicted,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CapturedRequestBody {
     body: CapturedBody,
@@ -1224,7 +1272,7 @@ pub(crate) struct CapturedRequestBody {
 
 impl CapturedRequestBody {
     pub(crate) fn new_with_collector_scope(
-        body: Vec<u8>,
+        body: bytes::Bytes,
         session_ids: impl IntoIterator<Item = Option<String>>,
         collector_ids: impl IntoIterator<Item = String>,
         collection_was_gated: bool,
@@ -1238,8 +1286,8 @@ impl CapturedRequestBody {
         }
     }
 
-    pub(crate) fn body_bytes_limited(&self, limit: usize) -> anyhow::Result<Vec<u8>> {
-        self.body.materialize_bytes_limited(limit)
+    pub(crate) fn captured_body(&self) -> &CapturedBody {
+        &self.body
     }
 
     pub(crate) fn is_visible_to_session(&self, session_id: Option<&str>) -> bool {
@@ -1293,7 +1341,7 @@ impl CapturedRequestBodyStore {
     pub(crate) fn insert_with_collector_scope(
         &mut self,
         request_id: String,
-        body: Vec<u8>,
+        body: bytes::Bytes,
         session_ids: impl IntoIterator<Item = Option<String>>,
         collector_ids: impl IntoIterator<Item = String>,
         collection_was_gated: bool,
@@ -1379,7 +1427,7 @@ impl CapturedResponseBodyStore {
         collector_ids: impl IntoIterator<Item = String>,
         collection_was_gated: bool,
     ) {
-        let byte_len = body.len();
+        let byte_charge = body.retained_size_bytes();
         let captured = CapturedResponseBody::from_captured_body_with_collector_scope(
             body,
             session_ids,
@@ -1387,7 +1435,10 @@ impl CapturedResponseBodyStore {
             collection_was_gated,
         );
         self.bodies.remove(&request_id);
-        match self.buffered_bodies.insert(request_id, captured, byte_len) {
+        match self
+            .buffered_bodies
+            .insert(request_id, captured, byte_charge)
+        {
             InsertOutcome::Stored { evicted } => {
                 for (evicted_request_id, mut evicted_body) in evicted {
                     evicted_body.mark_evicted();
@@ -1667,7 +1718,7 @@ impl TargetNetworkBodyArtifacts {
     pub(crate) fn insert_request_body_with_collector_scope(
         &mut self,
         request_id: String,
-        request_body: Vec<u8>,
+        request_body: bytes::Bytes,
         session_ids: impl IntoIterator<Item = Option<String>>,
         collector_ids: impl IntoIterator<Item = String>,
         collection_was_gated: bool,
@@ -1749,6 +1800,7 @@ impl TargetNetworkBodyArtifacts {
         self.io_stream_artifacts.allocate_handle()
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_stream(&mut self, handle: String, bytes: Vec<u8>, offset: usize) {
         self.io_stream_artifacts
             .insert_stream(handle, bytes, offset);
@@ -1757,13 +1809,18 @@ impl TargetNetworkBodyArtifacts {
     pub(crate) fn insert_stream_body_source(
         &mut self,
         handle: String,
-        body: CapturedBody,
+        body: impl Into<crate::conn::ProtocolResponseBody>,
         offset: usize,
     ) {
         self.io_stream_artifacts
             .insert_stream_body_source(handle, body, offset);
     }
 
+    pub(crate) fn io_stream(&self, handle: &str) -> Option<IoStreamState> {
+        self.io_stream_artifacts.streams.get(handle).cloned()
+    }
+
+    #[cfg(test)]
     pub(crate) fn read_io_stream(
         &mut self,
         handle: &str,
@@ -1821,7 +1878,13 @@ struct SubresourceNetworkArtifacts {
     emitted_record_counts_by_session: HashMap<Option<String>, usize>,
     request_ids_by_handle: HashMap<SubresourceNetworkRequestHandle, String>,
     completed_request_ids: HashSet<String>,
-    fetch_pause_announced_request_ids: HashSet<String>,
+    fetch_pause_announced_request_ids: HashMap<String, FetchPauseAnnouncement>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FetchPauseAnnouncement {
+    fetch_ids: HashMap<Option<String>, String>,
+    announced_redirects: usize,
 }
 
 impl SubresourceNetworkArtifacts {
@@ -1893,11 +1956,27 @@ impl SubresourceNetworkArtifacts {
     }
 
     fn record_fetch_pause_announced_request_id(&mut self, request_id: String) {
-        self.fetch_pause_announced_request_ids.insert(request_id);
+        self.fetch_pause_announced_request_ids
+            .entry(request_id)
+            .or_default();
     }
 
-    fn take_fetch_pause_announced_request_id(&mut self, request_id: &str) -> bool {
-        self.fetch_pause_announced_request_ids.remove(request_id)
+    fn replace_navigation_fetch_request_id(
+        &mut self,
+        network_id: String,
+        session_id: Option<String>,
+        fetch_id: String,
+    ) -> Option<String> {
+        self.fetch_pause_announced_request_ids
+            .entry(network_id)
+            .or_default()
+            .fetch_ids
+            .insert(session_id, fetch_id)
+    }
+
+    fn request_was_announced_by_fetch_pause(&self, request_id: &str) -> bool {
+        self.fetch_pause_announced_request_ids
+            .contains_key(request_id)
     }
 
     fn clear_fetch_pause_announced_request_id(&mut self, request_id: &str) {
@@ -1927,6 +2006,430 @@ impl SubresourceNetworkArtifacts {
     #[cfg(test)]
     pub(crate) fn set_emitted_record_count_for_test(&mut self, count: usize) {
         self.set_session_cursor(None, count);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WebSocketNetworkArtifacts {
+    observation: WebSocketNetworkObservationArtifacts,
+    request_ids: WebSocketRequestIdState,
+}
+
+impl WebSocketNetworkArtifacts {
+    pub(crate) fn emitted_record_count_for_session(&self, session_id: Option<&str>) -> usize {
+        self.observation
+            .emitted_record_count_for_session(session_id)
+    }
+
+    pub(crate) fn emitted_event_count_for_session(&self, session_id: Option<&str>) -> usize {
+        self.observation.emitted_event_count_for_session(session_id)
+    }
+
+    fn minimum_emitted_record_count(&self) -> Option<usize> {
+        self.observation
+            .emitted_record_counts_by_session
+            .values()
+            .copied()
+            .min()
+    }
+
+    fn minimum_emitted_event_count(&self) -> Option<usize> {
+        self.observation
+            .emitted_event_counts_by_session
+            .values()
+            .copied()
+            .min()
+    }
+
+    pub(crate) fn mark_emitted(
+        &mut self,
+        session_id: Option<&str>,
+        record_start_index: usize,
+        record_count: usize,
+        event_start_index: usize,
+        event_count: usize,
+    ) {
+        self.observation.mark_emitted(
+            session_id,
+            record_start_index,
+            record_count,
+            event_start_index,
+            event_count,
+        );
+    }
+
+    pub(crate) fn reset_cursors(&mut self) {
+        self.observation.reset_cursors();
+    }
+
+    pub(crate) fn set_session_cursors(
+        &mut self,
+        session_id: Option<&str>,
+        record_count: usize,
+        event_count: usize,
+    ) {
+        self.observation
+            .set_session_cursors(session_id, record_count, event_count);
+    }
+
+    pub(crate) fn remove_session_cursors(&mut self, session_id: Option<&str>) {
+        self.observation.remove_session_cursors(session_id);
+    }
+
+    pub(crate) fn clear_request_ids(&mut self) {
+        self.request_ids.clear();
+    }
+
+    pub(crate) fn clear_all(&mut self) {
+        self.reset_cursors();
+        self.clear_request_ids();
+    }
+
+    pub(crate) fn register_synthetic_request(
+        &mut self,
+        request_id: String,
+        network_request_id: String,
+        socket_id: u64,
+    ) {
+        self.request_ids
+            .register_synthetic_request(request_id, network_request_id, socket_id);
+    }
+
+    pub(crate) fn synthetic_socket_id_for_request(&self, request_id: &str) -> Option<u64> {
+        self.request_ids.synthetic_socket_id_for_request(request_id)
+    }
+
+    pub(crate) fn request_id_for_socket(&self, socket_id: u64) -> Option<&str> {
+        self.request_ids.request_id_for_socket(socket_id)
+    }
+
+    pub(crate) fn set_request_id_for_socket_if_absent(
+        &mut self,
+        socket_id: u64,
+        request_id: String,
+    ) {
+        self.request_ids
+            .set_request_id_for_socket_if_absent(socket_id, request_id);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WebSocketNetworkObservationArtifacts {
+    emitted_record_counts_by_session: HashMap<Option<String>, usize>,
+    emitted_event_counts_by_session: HashMap<Option<String>, usize>,
+}
+
+impl WebSocketNetworkObservationArtifacts {
+    pub(crate) fn emitted_record_count_for_session(&self, session_id: Option<&str>) -> usize {
+        self.emitted_record_counts_by_session
+            .get(&session_id.map(str::to_owned))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn emitted_event_count_for_session(&self, session_id: Option<&str>) -> usize {
+        self.emitted_event_counts_by_session
+            .get(&session_id.map(str::to_owned))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn mark_emitted(
+        &mut self,
+        session_id: Option<&str>,
+        record_start_index: usize,
+        record_count: usize,
+        event_start_index: usize,
+        event_count: usize,
+    ) {
+        let record_cursor = record_start_index
+            .checked_add(record_count)
+            .expect("websocket emitted record cursor exhausted");
+        let event_cursor = event_start_index
+            .checked_add(event_count)
+            .expect("websocket emitted event cursor exhausted");
+        self.set_session_cursors(session_id, record_cursor, event_cursor);
+    }
+
+    pub(crate) fn reset_cursors(&mut self) {
+        self.emitted_record_counts_by_session.clear();
+        self.emitted_event_counts_by_session.clear();
+    }
+
+    pub(crate) fn set_session_cursors(
+        &mut self,
+        session_id: Option<&str>,
+        record_count: usize,
+        event_count: usize,
+    ) {
+        let session_id = session_id.map(str::to_owned);
+        self.emitted_record_counts_by_session
+            .insert(session_id.clone(), record_count);
+        self.emitted_event_counts_by_session
+            .insert(session_id, event_count);
+    }
+
+    pub(crate) fn remove_session_cursors(&mut self, session_id: Option<&str>) {
+        let session_id = session_id.map(str::to_owned);
+        self.emitted_record_counts_by_session.remove(&session_id);
+        self.emitted_event_counts_by_session.remove(&session_id);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WebSocketRequestIdState {
+    request_ids_by_socket_id: HashMap<u64, String>,
+    socket_ids_by_request_id: HashMap<String, u64>,
+}
+
+impl WebSocketRequestIdState {
+    pub(crate) fn clear(&mut self) {
+        self.request_ids_by_socket_id.clear();
+        self.socket_ids_by_request_id.clear();
+    }
+
+    pub(crate) fn register_synthetic_request(
+        &mut self,
+        request_id: String,
+        network_request_id: String,
+        socket_id: u64,
+    ) {
+        self.socket_ids_by_request_id.insert(request_id, socket_id);
+        self.socket_ids_by_request_id
+            .insert(network_request_id.clone(), socket_id);
+        self.request_ids_by_socket_id
+            .insert(socket_id, network_request_id);
+    }
+
+    pub(crate) fn synthetic_socket_id_for_request(&self, request_id: &str) -> Option<u64> {
+        self.socket_ids_by_request_id.get(request_id).copied()
+    }
+
+    pub(crate) fn request_id_for_socket(&self, socket_id: u64) -> Option<&str> {
+        self.request_ids_by_socket_id
+            .get(&socket_id)
+            .map(String::as_str)
+    }
+
+    pub(crate) fn set_request_id_for_socket_if_absent(
+        &mut self,
+        socket_id: u64,
+        request_id: String,
+    ) {
+        self.request_ids_by_socket_id
+            .entry(socket_id)
+            .or_insert(request_id);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IoStreamState {
+    body: crate::conn::ProtocolResponseBody,
+    cursor: std::sync::Arc<tokio::sync::Mutex<usize>>,
+}
+
+impl PartialEq for IoStreamState {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.cursor, &other.cursor)
+    }
+}
+
+impl Eq for IoStreamState {}
+
+type IoReadTurn = futures_util::future::Either<
+    std::future::Ready<tokio::sync::OwnedMutexGuard<usize>>,
+    futures_util::future::LocalBoxFuture<'static, tokio::sync::OwnedMutexGuard<usize>>,
+>;
+
+/// Owns one stream's cursor turn, not a connection borrow. Queue the turn at
+/// admission so task polling order cannot reverse two accepted sequential reads.
+pub(crate) struct PreparedIoStreamRead {
+    body: crate::conn::ProtocolResponseBody,
+    turn: IoReadTurn,
+    offset: Option<usize>,
+    size: Option<usize>,
+}
+
+impl PreparedIoStreamRead {
+    pub(crate) async fn run(self) -> Result<serde_json::Value> {
+        let mut cursor = self.turn.await;
+        if let crate::conn::ProtocolResponseBody::Network(body) = self.body {
+            anyhow::ensure!(self.offset.is_none(), "OffsetNotSupportedForStream");
+            let (bytes, eof) = body
+                .read_chunk(*cursor, self.size.unwrap_or(10 * 1024 * 1024))
+                .await?;
+            *cursor += bytes.len();
+            return crate::conn::run_body_storage_work(move || {
+                Ok(crate::domains::io::read_output_value(&bytes, eof))
+            })
+            .await;
+        }
+        let crate::conn::ProtocolResponseBody::Captured(body) = self.body else {
+            unreachable!()
+        };
+        let len = body.len();
+        let start = self.offset.unwrap_or(*cursor).min(len);
+        let requested = self.size.unwrap_or_else(|| len.saturating_sub(start));
+        let (value, end) = body
+            .process_in_worker(move |body| {
+                let bytes = body.read_range(start, requested).unwrap_or_default();
+                let end = start.saturating_add(bytes.len()).min(len);
+                Ok((
+                    crate::domains::io::read_output_value(&bytes, end >= len),
+                    end,
+                ))
+            })
+            .await?;
+        *cursor = end;
+        Ok(value)
+    }
+}
+
+impl IoStreamState {
+    #[cfg(test)]
+    pub(crate) fn from_bytes(bytes: Vec<u8>, offset: usize) -> Self {
+        Self::from_body_source(CapturedBody::from_bytes_spooled(bytes), offset)
+    }
+
+    pub(crate) fn from_body_source(
+        body: impl Into<crate::conn::ProtocolResponseBody>,
+        offset: usize,
+    ) -> Self {
+        Self {
+            body: body.into(),
+            cursor: std::sync::Arc::new(tokio::sync::Mutex::new(offset)),
+        }
+    }
+
+    pub(crate) fn prepare_read(
+        &self,
+        offset: Option<usize>,
+        size: Option<usize>,
+    ) -> PreparedIoStreamRead {
+        use futures_util::FutureExt as _;
+        let mut lock = self.cursor.clone().lock_owned().boxed_local();
+        let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        let turn = match lock.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(guard) => {
+                futures_util::future::Either::Left(std::future::ready(guard))
+            }
+            std::task::Poll::Pending => futures_util::future::Either::Right(lock),
+        };
+        PreparedIoStreamRead {
+            body: self.body.clone(),
+            turn,
+            offset,
+            size,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_for_test(
+        &self,
+        offset: Option<usize>,
+        size: Option<usize>,
+    ) -> TargetIoStreamRead {
+        let mut cursor = self.cursor.try_lock().expect("no test read is in flight");
+        let body = self
+            .body
+            .captured()
+            .expect("test read requires a captured body");
+        let len = body.len();
+        let start = offset.unwrap_or(*cursor).min(len);
+        let bytes = body
+            .read_range(start, size.unwrap_or_else(|| len.saturating_sub(start)))
+            .unwrap_or_default();
+        *cursor = start.saturating_add(bytes.len()).min(len);
+        TargetIoStreamRead {
+            bytes,
+            eof: *cursor >= len,
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetIoStreamRead {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) eof: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TargetIoStreamArtifacts {
+    next_stream_id: u64,
+    streams: HashMap<String, IoStreamState>,
+}
+
+impl TargetIoStreamArtifacts {
+    pub(crate) fn allocate_handle(&mut self) -> String {
+        self.next_stream_id = self
+            .next_stream_id
+            .checked_add(1)
+            .expect("IO stream id sequence exhausted");
+        format!("STREAM-{}", self.next_stream_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_stream(&mut self, handle: String, bytes: Vec<u8>, offset: usize) {
+        self.streams
+            .insert(handle, IoStreamState::from_bytes(bytes, offset));
+    }
+
+    pub(crate) fn insert_stream_body_source(
+        &mut self,
+        handle: String,
+        body: impl Into<crate::conn::ProtocolResponseBody>,
+        offset: usize,
+    ) {
+        self.streams
+            .insert(handle, IoStreamState::from_body_source(body, offset));
+    }
+
+    pub(crate) fn remove(&mut self, handle: &str) -> Option<IoStreamState> {
+        let stream = self.streams.remove(handle)?;
+        if let crate::conn::ProtocolResponseBody::Network(body) = &stream.body {
+            body.cancel();
+        }
+        Some(stream)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read(
+        &mut self,
+        handle: &str,
+        offset: Option<usize>,
+        size: Option<usize>,
+    ) -> Option<TargetIoStreamRead> {
+        Some(self.streams.get(handle)?.read_for_test(offset, size))
+    }
+
+    pub(crate) fn clear_streams(&mut self) {
+        for stream in self.streams.values() {
+            if let crate::conn::ProtocolResponseBody::Network(body) = &stream.body {
+                body.cancel();
+            }
+        }
+        self.streams.clear();
+    }
+
+    pub(crate) fn reset_all(&mut self) {
+        self.next_stream_id = 0;
+        self.clear_streams();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_stream_id_for_test(&mut self, next_stream_id: u64) {
+        self.next_stream_id = next_stream_id;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_stream_id_for_test(&self) -> u64 {
+        self.next_stream_id
     }
 }
 
@@ -2014,6 +2517,92 @@ mod tests {
     }
 
     #[test]
+    fn response_body_store_charges_shared_prefix_backing_for_both_limits() {
+        use moli_page_types::{SubresourceResponseBody, SubresourceResponseBodyWriter};
+
+        let loader =
+            moli_core::network::ResourceRequestClient::new(&moli_fetch::FetchConfig::default())
+                .unwrap();
+        let pool = loader.handle().disk_pool().unwrap();
+        for (disk, visible) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
+            let prefix = || {
+                let full = if disk {
+                    let mut writer = SubresourceResponseBodyWriter::with_memory_limit_and_disk_pool(
+                        2,
+                        Some(pool.clone()),
+                    );
+                    writer.append(b"abcdef");
+                    writer.finish()
+                } else {
+                    SubresourceResponseBody::from_bytes(b"abcdef".to_vec())
+                };
+                let protocol_reader = CapturedBody::from_subresource_response_body(&full);
+                let body = CapturedBody::from_subresource_response_body(&full.prefix(visible));
+                drop(full);
+                drop(protocol_reader);
+                assert_eq!(body.len(), visible);
+                body
+            };
+            let mut store =
+                CapturedResponseBodyStore::with_limits(moli_bounded_buffer::ByteLimits::new(10, 8));
+            for id in ["first", "second", "third"] {
+                store.insert_captured_body_with_collector_scope(
+                    id.to_owned(),
+                    prefix(),
+                    [None],
+                    std::iter::empty::<String>(),
+                    false,
+                );
+                assert_eq!(store.buffered_body_bytes(), 6, "disk={disk} id={id}");
+            }
+            for id in ["first", "second"] {
+                assert_eq!(
+                    store
+                        .get(id)
+                        .unwrap()
+                        .body_bytes_limited(1)
+                        .unwrap_err()
+                        .to_string(),
+                    "Request content was evicted from inspector cache"
+                );
+            }
+            assert_eq!(
+                store.get("third").unwrap().body_bytes_limited(1).unwrap(),
+                &b"a"[..visible]
+            );
+            if disk {
+                let usage = pool.diagnostics();
+                assert_eq!(usage.disk_footprint_bytes - usage.free_bytes as u64, 6);
+            }
+            store.clear();
+            assert_eq!(store.buffered_body_bytes(), 0);
+            if disk {
+                let usage = pool.diagnostics();
+                assert_eq!(usage.disk_footprint_bytes, usage.free_bytes as u64);
+            }
+            let mut single_entry =
+                CapturedResponseBodyStore::with_limits(moli_bounded_buffer::ByteLimits::new(10, 5));
+            single_entry.insert_captured_body_with_collector_scope(
+                "too-large".to_owned(),
+                prefix(),
+                [None],
+                std::iter::empty::<String>(),
+                false,
+            );
+            assert_eq!(single_entry.buffered_body_bytes(), 0);
+            assert_eq!(
+                single_entry
+                    .get("too-large")
+                    .unwrap()
+                    .body_bytes_limited(1)
+                    .unwrap_err()
+                    .to_string(),
+                "Request content was evicted from inspector cache"
+            );
+        }
+    }
+
+    #[test]
     fn response_body_store_returns_byte_charge_on_state_and_visibility_removal() {
         let mut store =
             CapturedResponseBodyStore::with_limits(moli_bounded_buffer::ByteLimits::new(8, 4));
@@ -2054,7 +2643,7 @@ mod tests {
             Url::parse("https://example.com/").expect("document URL should parse"),
             url.clone(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Script,
             None,
@@ -2074,14 +2663,14 @@ mod tests {
             Url::parse("https://example.com/").expect("document URL should parse"),
             url.clone(),
             "GET".to_owned(),
-            vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())],
+            vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())].into(),
             None,
             SubresourceResourceType::WebSocket,
             None,
             Vec::new(),
             url,
             101,
-            vec![("Upgrade".to_owned(), "websocket".to_owned())],
+            vec![("Upgrade".to_owned(), b"websocket".to_vec())],
             String::new(),
             Vec::new(),
         )
@@ -2140,7 +2729,7 @@ mod tests {
                 document_url,
                 request_url,
                 "GET".to_owned(),
-                Vec::new(),
+                Vec::new().into(),
                 None,
                 SubresourceResourceType::Xhr,
                 SubresourceRequestInitiatorType::Script,
@@ -2174,7 +2763,7 @@ mod tests {
                     Url::parse("https://example.com/").expect("document URL should parse"),
                     Url::parse("https://example.com/collect").expect("request URL should parse"),
                     "POST".to_owned(),
-                    Vec::new(),
+                    Vec::new().into(),
                     None,
                     SubresourceResourceType::Fetch,
                     SubresourceRequestInitiatorType::Script,
@@ -3246,327 +3835,28 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WebSocketNetworkArtifacts {
-    observation: WebSocketNetworkObservationArtifacts,
-    request_ids: WebSocketRequestIdState,
-}
+#[cfg(test)]
+mod stream_cursor_tests {
+    use super::*;
+    use futures_util::poll;
 
-impl WebSocketNetworkArtifacts {
-    pub(crate) fn emitted_record_count_for_session(&self, session_id: Option<&str>) -> usize {
-        self.observation
-            .emitted_record_count_for_session(session_id)
-    }
-
-    pub(crate) fn emitted_event_count_for_session(&self, session_id: Option<&str>) -> usize {
-        self.observation.emitted_event_count_for_session(session_id)
-    }
-
-    fn minimum_emitted_record_count(&self) -> Option<usize> {
-        self.observation
-            .emitted_record_counts_by_session
-            .values()
-            .copied()
-            .min()
-    }
-
-    fn minimum_emitted_event_count(&self) -> Option<usize> {
-        self.observation
-            .emitted_event_counts_by_session
-            .values()
-            .copied()
-            .min()
-    }
-
-    pub(crate) fn mark_emitted(
-        &mut self,
-        session_id: Option<&str>,
-        record_start_index: usize,
-        record_count: usize,
-        event_start_index: usize,
-        event_count: usize,
-    ) {
-        self.observation.mark_emitted(
-            session_id,
-            record_start_index,
-            record_count,
-            event_start_index,
-            event_count,
+    #[tokio::test]
+    async fn buffered_stream_admission_orders_reads_and_cancel_releases_its_turn() {
+        let mut bytes = vec![b'x'; 1_100_000];
+        bytes[..6].copy_from_slice(b"abcdef");
+        let stream = IoStreamState::from_bytes(bytes, 0);
+        let first = stream.prepare_read(None, Some(2));
+        let second = stream.prepare_read(None, Some(3));
+        let mut second = Box::pin(second.run());
+        assert!(
+            poll!(second.as_mut()).is_pending(),
+            "B must wait for A's admitted cursor turn even when polled first"
         );
-    }
-
-    pub(crate) fn reset_cursors(&mut self) {
-        self.observation.reset_cursors();
-    }
-
-    pub(crate) fn set_session_cursors(
-        &mut self,
-        session_id: Option<&str>,
-        record_count: usize,
-        event_count: usize,
-    ) {
-        self.observation
-            .set_session_cursors(session_id, record_count, event_count);
-    }
-
-    pub(crate) fn remove_session_cursors(&mut self, session_id: Option<&str>) {
-        self.observation.remove_session_cursors(session_id);
-    }
-
-    pub(crate) fn clear_request_ids(&mut self) {
-        self.request_ids.clear();
-    }
-
-    pub(crate) fn clear_all(&mut self) {
-        self.reset_cursors();
-        self.clear_request_ids();
-    }
-
-    pub(crate) fn register_synthetic_request(
-        &mut self,
-        request_id: String,
-        network_request_id: String,
-        socket_id: u64,
-    ) {
-        self.request_ids
-            .register_synthetic_request(request_id, network_request_id, socket_id);
-    }
-
-    pub(crate) fn synthetic_socket_id_for_request(&self, request_id: &str) -> Option<u64> {
-        self.request_ids.synthetic_socket_id_for_request(request_id)
-    }
-
-    pub(crate) fn request_id_for_socket(&self, socket_id: u64) -> Option<&str> {
-        self.request_ids.request_id_for_socket(socket_id)
-    }
-
-    pub(crate) fn set_request_id_for_socket_if_absent(
-        &mut self,
-        socket_id: u64,
-        request_id: String,
-    ) {
-        self.request_ids
-            .set_request_id_for_socket_if_absent(socket_id, request_id);
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WebSocketNetworkObservationArtifacts {
-    emitted_record_counts_by_session: HashMap<Option<String>, usize>,
-    emitted_event_counts_by_session: HashMap<Option<String>, usize>,
-}
-
-impl WebSocketNetworkObservationArtifacts {
-    pub(crate) fn emitted_record_count_for_session(&self, session_id: Option<&str>) -> usize {
-        self.emitted_record_counts_by_session
-            .get(&session_id.map(str::to_owned))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn emitted_event_count_for_session(&self, session_id: Option<&str>) -> usize {
-        self.emitted_event_counts_by_session
-            .get(&session_id.map(str::to_owned))
-            .copied()
-            .unwrap_or(0)
-    }
-
-    pub(crate) fn mark_emitted(
-        &mut self,
-        session_id: Option<&str>,
-        record_start_index: usize,
-        record_count: usize,
-        event_start_index: usize,
-        event_count: usize,
-    ) {
-        let record_cursor = record_start_index
-            .checked_add(record_count)
-            .expect("websocket emitted record cursor exhausted");
-        let event_cursor = event_start_index
-            .checked_add(event_count)
-            .expect("websocket emitted event cursor exhausted");
-        self.set_session_cursors(session_id, record_cursor, event_cursor);
-    }
-
-    pub(crate) fn reset_cursors(&mut self) {
-        self.emitted_record_counts_by_session.clear();
-        self.emitted_event_counts_by_session.clear();
-    }
-
-    pub(crate) fn set_session_cursors(
-        &mut self,
-        session_id: Option<&str>,
-        record_count: usize,
-        event_count: usize,
-    ) {
-        let session_id = session_id.map(str::to_owned);
-        self.emitted_record_counts_by_session
-            .insert(session_id.clone(), record_count);
-        self.emitted_event_counts_by_session
-            .insert(session_id, event_count);
-    }
-
-    pub(crate) fn remove_session_cursors(&mut self, session_id: Option<&str>) {
-        let session_id = session_id.map(str::to_owned);
-        self.emitted_record_counts_by_session.remove(&session_id);
-        self.emitted_event_counts_by_session.remove(&session_id);
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WebSocketRequestIdState {
-    request_ids_by_socket_id: HashMap<u64, String>,
-    socket_ids_by_request_id: HashMap<String, u64>,
-}
-
-impl WebSocketRequestIdState {
-    pub(crate) fn clear(&mut self) {
-        self.request_ids_by_socket_id.clear();
-        self.socket_ids_by_request_id.clear();
-    }
-
-    pub(crate) fn register_synthetic_request(
-        &mut self,
-        request_id: String,
-        network_request_id: String,
-        socket_id: u64,
-    ) {
-        self.socket_ids_by_request_id.insert(request_id, socket_id);
-        self.socket_ids_by_request_id
-            .insert(network_request_id.clone(), socket_id);
-        self.request_ids_by_socket_id
-            .insert(socket_id, network_request_id);
-    }
-
-    pub(crate) fn synthetic_socket_id_for_request(&self, request_id: &str) -> Option<u64> {
-        self.socket_ids_by_request_id.get(request_id).copied()
-    }
-
-    pub(crate) fn request_id_for_socket(&self, socket_id: u64) -> Option<&str> {
-        self.request_ids_by_socket_id
-            .get(&socket_id)
-            .map(String::as_str)
-    }
-
-    pub(crate) fn set_request_id_for_socket_if_absent(
-        &mut self,
-        socket_id: u64,
-        request_id: String,
-    ) {
-        self.request_ids_by_socket_id
-            .entry(socket_id)
-            .or_insert(request_id);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IoStreamState {
-    body: CapturedBody,
-    pub offset: usize,
-}
-
-impl IoStreamState {
-    pub(crate) fn from_bytes(bytes: Vec<u8>, offset: usize) -> Self {
-        Self {
-            body: CapturedBody::from_bytes_spooled(bytes),
-            offset,
-        }
-    }
-
-    pub(crate) fn from_body_source(body: CapturedBody, offset: usize) -> Self {
-        Self { body, offset }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.body.len()
-    }
-
-    pub(crate) fn read_range(&self, offset: usize, len: usize) -> Vec<u8> {
-        self.body.read_range(offset, len).unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TargetIoStreamRead {
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) eof: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct TargetIoStreamArtifacts {
-    next_stream_id: u64,
-    streams: HashMap<String, IoStreamState>,
-}
-
-impl TargetIoStreamArtifacts {
-    pub(crate) fn allocate_handle(&mut self) -> String {
-        self.next_stream_id = self
-            .next_stream_id
-            .checked_add(1)
-            .expect("IO stream id sequence exhausted");
-        format!("STREAM-{}", self.next_stream_id)
-    }
-
-    pub(crate) fn insert_stream(&mut self, handle: String, bytes: Vec<u8>, offset: usize) {
-        self.streams
-            .insert(handle, IoStreamState::from_bytes(bytes, offset));
-    }
-
-    pub(crate) fn insert_stream_body_source(
-        &mut self,
-        handle: String,
-        body: CapturedBody,
-        offset: usize,
-    ) {
-        self.streams
-            .insert(handle, IoStreamState::from_body_source(body, offset));
-    }
-
-    pub(crate) fn remove(&mut self, handle: &str) -> Option<IoStreamState> {
-        self.streams.remove(handle)
-    }
-
-    pub(crate) fn read(
-        &mut self,
-        handle: &str,
-        offset: Option<usize>,
-        size: Option<usize>,
-    ) -> Option<TargetIoStreamRead> {
-        let stream = self.streams.get_mut(handle)?;
-        let stream_len = stream.len();
-        let start = offset.unwrap_or(stream.offset).min(stream_len);
-        stream.offset = start;
-        let requested_len = size.unwrap_or_else(|| stream_len.saturating_sub(start));
-        let bytes = stream.read_range(start, requested_len);
-        let end = start.saturating_add(bytes.len()).min(stream_len);
-        stream.offset = end;
-        Some(TargetIoStreamRead {
-            bytes,
-            eof: end >= stream_len,
-        })
-    }
-
-    pub(crate) fn clear_streams(&mut self) {
-        self.streams.clear();
-    }
-
-    pub(crate) fn reset_all(&mut self) {
-        self.next_stream_id = 0;
-        self.streams.clear();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.streams.is_empty()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_next_stream_id_for_test(&mut self, next_stream_id: u64) {
-        self.next_stream_id = next_stream_id;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn next_stream_id_for_test(&self) -> u64 {
-        self.next_stream_id
+        assert_eq!(first.run().await.unwrap()["data"], "ab");
+        assert_eq!(second.await.unwrap()["data"], "cde");
+        let cancelled = stream.prepare_read(None, Some(1));
+        let next = stream.prepare_read(None, Some(1));
+        drop(cancelled);
+        assert_eq!(next.run().await.unwrap()["data"], "f");
     }
 }

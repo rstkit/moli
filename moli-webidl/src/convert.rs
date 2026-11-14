@@ -1,10 +1,10 @@
 use crate::{
-    Boolean, BufferSource, ByteString, ClampedUnsignedShort, Context, DomString, Double,
-    EnforceRangeLong, EnforceRangeUnsignedLong, EnforceRangeUnsignedLongLong, EnumValue, Long,
-    Record, Sequence, StringOptions, UnrestrictedDouble, UnsignedLong, UnsignedLongLong,
-    UnsignedShort, UsvString, WebIdlArguments, WebIdlConverter, WebIdlDictionary, WebIdlEnum,
-    WebIdlError, WebIdlErrorKind, dictionary_value, is_nullish, property_result,
-    symbol_property_result, throw_error, throw_type_error,
+    Boolean, BufferSource, ByteString, ClampedUnsignedShort, Context, Dictionary, DomString,
+    DomString16, Double, EnforceRangeLong, EnforceRangeLongLong, EnforceRangeUnsignedLong,
+    EnforceRangeUnsignedLongLong, EnumValue, Long, Record, Sequence, StringOptions,
+    UnrestrictedDouble, UnsignedLong, UnsignedLongLong, UnsignedShort, UsvString, WebIdlArguments,
+    WebIdlConverter, WebIdlDictionary, WebIdlEnum, WebIdlError, WebIdlErrorKind, dictionary_value,
+    is_nullish, property_result, symbol_property_result, throw_error, throw_type_error,
 };
 
 impl<'s> WebIdlConverter<'s> for DomString {
@@ -16,8 +16,22 @@ impl<'s> WebIdlConverter<'s> for DomString {
         context: Context,
         options: &Self::Options,
     ) -> Result<Self, WebIdlError> {
+        DomString16::convert(scope, value, context, options)
+            .map(|value| Self(String::from_utf16_lossy(&value.0)))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for DomString16 {
+    type Options = StringOptions;
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
         if value.is_null() && options.treat_null_as_empty_string {
-            return Ok(Self(String::new()));
+            return Ok(Self(Vec::new()));
         }
         if value.is_symbol() {
             return Err(WebIdlError::new(
@@ -25,8 +39,7 @@ impl<'s> WebIdlConverter<'s> for DomString {
                 WebIdlErrorKind::CannotConvert("DOMString"),
             ));
         }
-        string_value_utf16(scope, value, context, "DOMString")
-            .map(|value| Self(String::from_utf16_lossy(&value)))
+        string_value_utf16(scope, value, context, "DOMString").map(Self)
     }
 }
 
@@ -155,6 +168,37 @@ impl<'s> WebIdlConverter<'s> for UnrestrictedDouble {
     }
 }
 
+impl<'s> WebIdlConverter<'s> for crate::UnrestrictedFloat {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        number_value(scope, value, context, "unrestricted float").map(|value| Self(value as f32))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for crate::Float {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        let value = number_value(scope, value, context, "float")? as f32;
+        if value.is_finite() {
+            Ok(Self(value))
+        } else {
+            Err(WebIdlError::cannot_convert(context, "float"))
+        }
+    }
+}
+
 impl<'s> WebIdlConverter<'s> for Double {
     type Options = ();
 
@@ -186,6 +230,21 @@ impl<'s> WebIdlConverter<'s> for Long {
         _options: &Self::Options,
     ) -> Result<Self, WebIdlError> {
         number_value(scope, value, context, "long").map(|value| Self(long(value)))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for crate::Octet {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        // Reducing modulo 2^32 first preserves the low eight bits, including
+        // negative values and integers too large for a saturating Rust cast.
+        number_value(scope, value, context, "octet").map(|value| Self(unsigned_long(value) as u8))
     }
 }
 
@@ -230,6 +289,21 @@ impl<'s> WebIdlConverter<'s> for EnforceRangeUnsignedLong {
     }
 }
 
+impl<'s> WebIdlConverter<'s> for crate::Short {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        // Both 16-bit integer types truncate and reduce modulo 2^16; signed
+        // short then interprets the high bit as a negative value.
+        number_value(scope, value, context, "short").map(|value| Self(unsigned_short(value) as i16))
+    }
+}
+
 impl<'s> WebIdlConverter<'s> for UnsignedShort {
     type Options = ();
 
@@ -241,6 +315,26 @@ impl<'s> WebIdlConverter<'s> for UnsignedShort {
     ) -> Result<Self, WebIdlError> {
         number_value(scope, value, context, "unsigned short")
             .map(|value| Self(unsigned_short(value)))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for crate::EnforceRangeUnsignedShort {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        let value = number_value(scope, value, context, "[EnforceRange] unsigned short")?.trunc();
+        if !value.is_finite() || !(0.0..=f64::from(u16::MAX)).contains(&value) {
+            return Err(WebIdlError::cannot_convert(
+                context,
+                "[EnforceRange] unsigned short",
+            ));
+        }
+        Ok(Self(value as u16))
     }
 }
 
@@ -258,6 +352,20 @@ impl<'s> WebIdlConverter<'s> for ClampedUnsignedShort {
     }
 }
 
+impl<'s> WebIdlConverter<'s> for crate::ClampedUnsignedLong {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        number_value(scope, value, context, "[Clamp] unsigned long")
+            .map(|value| Self(clamped_unsigned(value, f64::from(u32::MAX)) as u32))
+    }
+}
+
 impl<'s> WebIdlConverter<'s> for UnsignedLongLong {
     type Options = ();
 
@@ -269,6 +377,52 @@ impl<'s> WebIdlConverter<'s> for UnsignedLongLong {
     ) -> Result<Self, WebIdlError> {
         number_value(scope, value, context, "unsigned long long")
             .map(|value| Self(unsigned_long_long(value)))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for crate::LongLong {
+    type Options = ();
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _: &(),
+    ) -> Result<Self, WebIdlError> {
+        number_value(scope, value, context, "long long")
+            .map(|value| Self(unsigned_long_long(value) as i64))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for crate::ClampedLongLong {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        let value = number_value(scope, value, context, "[Clamp] long long")?;
+        if value.is_nan() {
+            return Ok(Self(0));
+        }
+        // ConvertToInt restricts annotated 64-bit integers to exact Numbers.
+        let value = value.clamp(-9_007_199_254_740_991.0, 9_007_199_254_740_991.0);
+        Ok(Self(value.round_ties_even() as i64))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for EnforceRangeLongLong {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        let value = number_value(scope, value, context, "[EnforceRange] long long")?;
+        enforce_range_long_long(value, context).map(Self)
     }
 }
 
@@ -322,6 +476,24 @@ where
     }
 }
 
+impl<'s, T> WebIdlConverter<'s> for Dictionary<T>
+where
+    T: WebIdlDictionary<'s>,
+{
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        _options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        let object = dictionary_value(value, context)?
+            .unwrap_or_else(|| moli_v8_util::new_null_prototype_object(scope));
+        T::parse_dictionary(scope, object).map(Self)
+    }
+}
+
 /// Converts an iterable to a WebIDL sequence, or returns `None` when the value
 /// has no `@@iterator` method.
 ///
@@ -352,33 +524,13 @@ where
         sequence_iterator_from_method(scope, value, iterator_method, context)?;
     let mut values = Vec::new();
     while let Some(item) = sequence_iterator_next(scope, iterator, next_method, context)? {
-        let (converted, caught_exception) = {
-            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-            let mut conversion_scope = try_catch.init();
-            let converted = T::convert(&mut conversion_scope, item, context, options);
-            let caught_exception = conversion_scope
-                .has_caught()
-                .then(|| conversion_scope.exception())
-                .flatten()
-                .map(|exception| v8::Global::new(&conversion_scope, exception));
-            (converted, caught_exception)
-        };
-        match converted {
-            Ok(value) => values.push(value),
-            Err(error) => {
-                sequence_iterator_close_ignoring_errors(scope, iterator);
-                if let Some(exception) = caught_exception {
-                    let exception = v8::Local::new(scope, &exception);
-                    scope.throw_exception(exception);
-                }
-                return Err(error);
-            }
-        }
+        // WebIDL sequence conversion propagates errors without IteratorClose.
+        values.push(T::convert(scope, item, context, options)?);
     }
     Ok(Some(Sequence(values)))
 }
 
-// Records are converted from own property names and then property values. If two
+// Records are converted from own property keys and then property values. If two
 // JavaScript keys become the same WebIDL key after key conversion, the later
 // property wins, matching the WebIDL record replacement behavior.
 impl<'s, K, V> WebIdlConverter<'s> for Record<K, V>
@@ -398,12 +550,15 @@ where
     ) -> Result<Self, WebIdlError> {
         let object = v8::Local::<v8::Object>::try_from(value)
             .map_err(|_| WebIdlError::new(context, WebIdlErrorKind::CannotConvert("record")))?;
-        let properties = own_property_names(scope, object, context)?;
-        let mut entries: Vec<(K, V)> = Vec::with_capacity(properties.length() as usize);
-        for index in 0..properties.length() {
-            let key_value = properties.get_index(scope, index).ok_or_else(|| {
+        let keys = record_own_keys(scope, object, context)?;
+        let mut entries: Vec<(K, V)> = Vec::with_capacity(keys.length() as usize);
+        for index in 0..keys.length() {
+            let key_value = keys.get_index(scope, index).ok_or_else(|| {
                 WebIdlError::new(context, WebIdlErrorKind::CannotConvert("record"))
             })?;
+            if !record_property_is_enumerable(scope, object, key_value, context)? {
+                continue;
+            }
             let key = K::convert(scope, key_value, context, &K::Options::default())?;
             let value = record_property_value(scope, object, key_value, context)?;
             let value = V::convert(scope, value, context, &V::Options::default())?;
@@ -417,6 +572,24 @@ where
             }
         }
         Ok(Self(entries))
+    }
+}
+
+impl<'s> WebIdlConverter<'s> for crate::InterfaceObject<'s> {
+    type Options = crate::InterfaceOptions;
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: Context,
+        options: &Self::Options,
+    ) -> Result<Self, WebIdlError> {
+        let object = v8::Local::<v8::Object>::try_from(value)
+            .map_err(|_| WebIdlError::cannot_convert(context, options.name))?;
+        if !(options.brand_check)(scope, object) {
+            return Err(WebIdlError::cannot_convert(context, options.name));
+        }
+        Ok(Self(object))
     }
 }
 
@@ -566,16 +739,35 @@ impl<'s> WebIdlConverter<'s> for v8::Local<'s, v8::Array> {
 }
 
 impl<'s> WebIdlConverter<'s> for v8::Local<'s, v8::Uint8Array> {
-    type Options = ();
+    type Options = crate::Uint8ArrayOptions;
 
     fn convert(
-        _scope: &mut v8::PinScope<'s, '_>,
+        scope: &mut v8::PinScope<'s, '_>,
         value: v8::Local<'s, v8::Value>,
         context: Context,
-        _options: &Self::Options,
+        options: &Self::Options,
     ) -> Result<Self, WebIdlError> {
-        v8::Local::<v8::Uint8Array>::try_from(value)
-            .map_err(|_| WebIdlError::new(context, WebIdlErrorKind::CannotConvert("Uint8Array")))
+        let view = Self::try_from(value)
+            .map_err(|_| WebIdlError::cannot_convert(context, "Uint8Array"))?;
+        let buffer = view
+            .buffer(scope)
+            .ok_or_else(|| WebIdlError::cannot_convert(context, "Uint8Array"))?;
+        if !options.allow_shared && buffer.is_shared_array_buffer() {
+            return Err(WebIdlError::cannot_convert(
+                context,
+                "non-shared Uint8Array",
+            ));
+        }
+        // The native buffer retains this flag even when empty or detached.
+        // BackingStore flags and author-visible `buffer` properties cannot
+        // reliably classify these views.
+        if buffer.is_resizable_by_user_javascript() {
+            return Err(WebIdlError::cannot_convert(
+                context,
+                "non-resizable Uint8Array",
+            ));
+        }
+        Ok(view)
     }
 }
 
@@ -1157,27 +1349,6 @@ fn sequence_iterator_next<'s>(
     Ok(Some(value))
 }
 
-fn sequence_iterator_close_ignoring_errors<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    iterator: v8::Local<'s, v8::Object>,
-) {
-    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-    let scope = try_catch.init();
-    let Some(return_key) = v8::String::new(&scope, "return") else {
-        return;
-    };
-    let Some(return_method) = iterator.get(&scope, return_key.into()) else {
-        return;
-    };
-    if return_method.is_null_or_undefined() {
-        return;
-    }
-    let Ok(return_method) = v8::Local::<v8::Function>::try_from(return_method) else {
-        return;
-    };
-    let _ = return_method.call(&scope, iterator.into(), &[]);
-}
-
 fn call_sequence_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     function: v8::Local<'s, v8::Function>,
@@ -1200,15 +1371,65 @@ fn call_sequence_function<'s>(
     }
 }
 
-fn own_property_names<'s>(
+fn record_own_keys<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     context: Context,
 ) -> Result<v8::Local<'s, v8::Array>, WebIdlError> {
     let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
     let mut scope = try_catch.init();
-    match object.get_own_property_names(&scope, v8::GetPropertyNamesArgs::default()) {
+    // WebIDL record conversion starts with [[OwnPropertyKeys]]. Enumerability is
+    // checked later, one key at a time, so Proxy descriptor traps stay interleaved
+    // with key and value conversion.
+    let property_names_args = v8::GetPropertyNamesArgsBuilder::new()
+        .property_filter(v8::PropertyFilter::ALL_PROPERTIES)
+        .key_conversion(v8::KeyConversionMode::ConvertToString)
+        .build();
+    match object.get_own_property_names(&scope, property_names_args) {
         Some(properties) => Ok(properties),
+        None if scope.has_caught() => {
+            let _ = scope.rethrow();
+            Err(WebIdlError::pending_exception(context))
+        }
+        None => Err(WebIdlError::new(
+            context,
+            WebIdlErrorKind::CannotConvert("record"),
+        )),
+    }
+}
+
+fn record_property_is_enumerable<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    key: v8::Local<'s, v8::Value>,
+    context: Context,
+) -> Result<bool, WebIdlError> {
+    let key = v8::Local::<v8::Name>::try_from(key)
+        .map_err(|_| WebIdlError::new(context, WebIdlErrorKind::CannotConvert("record")))?;
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut scope = try_catch.init();
+    let descriptor = match object.get_own_property_descriptor(&scope, key) {
+        Some(descriptor) => descriptor,
+        None if scope.has_caught() => {
+            let _ = scope.rethrow();
+            return Err(WebIdlError::pending_exception(context));
+        }
+        None => {
+            return Err(WebIdlError::new(
+                context,
+                WebIdlErrorKind::CannotConvert("record"),
+            ));
+        }
+    };
+    if descriptor.is_undefined() {
+        return Ok(false);
+    }
+    let descriptor = v8::Local::<v8::Object>::try_from(descriptor)
+        .map_err(|_| WebIdlError::new(context, WebIdlErrorKind::CannotConvert("record")))?;
+    let enumerable_key = v8::String::new(&scope, "enumerable")
+        .ok_or_else(|| WebIdlError::new(context, WebIdlErrorKind::CannotConvert("record")))?;
+    match descriptor.get(&scope, enumerable_key.into()) {
+        Some(enumerable) => Ok(enumerable.boolean_value(&scope)),
         None if scope.has_caught() => {
             let _ = scope.rethrow();
             Err(WebIdlError::pending_exception(context))
@@ -1260,11 +1481,14 @@ fn unsigned_short(value: f64) -> u16 {
 }
 
 fn clamped_unsigned_short(value: f64) -> u16 {
+    clamped_unsigned(value, f64::from(u16::MAX)) as u16
+}
+
+fn clamped_unsigned(value: f64, maximum: f64) -> f64 {
     if value.is_nan() {
-        return 0;
+        return 0.0;
     }
-    let clamped = value.clamp(0.0, f64::from(u16::MAX));
-    round_half_even(clamped) as u16
+    round_half_even(value.clamp(0.0, maximum))
 }
 
 fn round_half_even(value: f64) -> f64 {
@@ -1285,39 +1509,61 @@ fn unsigned_long_long(value: f64) -> u64 {
     if !value.is_finite() || value == 0.0 {
         return 0;
     }
-    let integer = value.trunc();
-    let wrapped = integer.rem_euclid(2f64.powi(64));
-    wrapped as u64
+    // Adding 2^64 to a small negative remainder in f64 loses its low bits.
+    // Convert the magnitude first, then perform the sign wrap exactly in u64.
+    let magnitude = (value.trunc().abs() % 2f64.powi(64)) as u64;
+    if value.is_sign_negative() {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    }
+}
+
+fn enforce_range_long_long(value: f64, context: Context) -> Result<i64, WebIdlError> {
+    // ConvertToInt uses the exact JavaScript integer range for 64-bit types.
+    let value = value.trunc();
+    if !value.is_finite() || !(-9_007_199_254_740_991.0..=9_007_199_254_740_991.0).contains(&value)
+    {
+        return Err(WebIdlError::new(
+            context,
+            WebIdlErrorKind::CannotConvert("[EnforceRange] long long"),
+        ));
+    }
+    Ok(value as i64)
 }
 
 fn enforce_range_unsigned_long_long(value: f64, context: Context) -> Result<u64, WebIdlError> {
-    if !value.is_finite() || value < 0.0 || value >= 2f64.powi(64) {
+    // ConvertToInt uses the exact JavaScript integer range for 64-bit types.
+    let value = value.trunc();
+    if !value.is_finite() || !(0.0..=9_007_199_254_740_991.0).contains(&value) {
         return Err(WebIdlError::new(
             context,
             WebIdlErrorKind::CannotConvert("[EnforceRange] unsigned long long"),
         ));
     }
-    Ok(value.trunc() as u64)
+    Ok(value as u64)
 }
 
 fn enforce_range_unsigned_long(value: f64, context: Context) -> Result<u32, WebIdlError> {
+    let value = value.trunc();
     if !value.is_finite() || value < 0.0 || value >= 2f64.powi(32) {
         return Err(WebIdlError::new(
             context,
             WebIdlErrorKind::CannotConvert("[EnforceRange] unsigned long"),
         ));
     }
-    Ok(value.trunc() as u32)
+    Ok(value as u32)
 }
 
 fn enforce_range_long(value: f64, context: Context) -> Result<i32, WebIdlError> {
+    let value = value.trunc();
     if !value.is_finite() || value < -(2f64.powi(31)) || value >= 2f64.powi(31) {
         return Err(WebIdlError::new(
             context,
             WebIdlErrorKind::CannotConvert("[EnforceRange] long"),
         ));
     }
-    Ok(value.trunc() as i32)
+    Ok(value as i32)
 }
 
 fn long(value: f64) -> i32 {
@@ -1394,13 +1640,41 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_long_long_preserves_low_bits_when_wrapping_negative_values() {
+        for (value, expected) in [
+            (-0.9, 0),
+            (-2.0, u64::MAX - 1),
+            (-3.9, u64::MAX - 2),
+            (-1025.0, u64::MAX - 1024),
+            (-2047.0, u64::MAX - 2046),
+            (-2f64.powi(63), 1 << 63),
+            (-2f64.powi(64) + 2048.0, 2048),
+            (-2f64.powi(64), 0),
+            (-2f64.powi(64) - 4096.0, u64::MAX - 4095),
+            (2f64.powi(64) - 2048.0, u64::MAX - 2047),
+            (2f64.powi(64), 0),
+            (2f64.powi(64) + 4096.0, 4096),
+        ] {
+            assert_eq!(unsigned_long_long(value), expected, "{value}");
+        }
+    }
+
+    #[test]
     fn enforce_range_unsigned_long_long_rejects_out_of_range_values() {
         let context = Context::argument("IDBFactory.open", 2);
         assert!(enforce_range_unsigned_long_long(f64::NAN, context).is_err());
         assert!(enforce_range_unsigned_long_long(f64::INFINITY, context).is_err());
+        assert!(enforce_range_unsigned_long_long(f64::NEG_INFINITY, context).is_err());
         assert!(enforce_range_unsigned_long_long(-1.0, context).is_err());
+        assert!(enforce_range_unsigned_long_long(2f64.powi(53), context).is_err());
         assert!(enforce_range_unsigned_long_long(2f64.powi(64), context).is_err());
         assert_eq!(enforce_range_unsigned_long_long(1.9, context).unwrap(), 1);
+        assert_eq!(enforce_range_unsigned_long_long(-0.9, context).unwrap(), 0);
+        assert_eq!(enforce_range_unsigned_long_long(-0.0, context).unwrap(), 0);
+        assert_eq!(
+            enforce_range_unsigned_long_long(9_007_199_254_740_991.0, context).unwrap(),
+            9_007_199_254_740_991
+        );
     }
 
     #[test]
@@ -1408,9 +1682,16 @@ mod tests {
         let context = Context::argument("IDBCursor.advance", 1);
         assert!(enforce_range_unsigned_long(f64::NAN, context).is_err());
         assert!(enforce_range_unsigned_long(f64::INFINITY, context).is_err());
+        assert!(enforce_range_unsigned_long(f64::NEG_INFINITY, context).is_err());
         assert!(enforce_range_unsigned_long(-1.0, context).is_err());
         assert!(enforce_range_unsigned_long(2f64.powi(32), context).is_err());
         assert_eq!(enforce_range_unsigned_long(1.9, context).unwrap(), 1);
+        assert_eq!(enforce_range_unsigned_long(-0.9, context).unwrap(), 0);
+        assert_eq!(enforce_range_unsigned_long(-0.0, context).unwrap(), 0);
+        assert_eq!(
+            enforce_range_unsigned_long(4_294_967_295.9, context).unwrap(),
+            u32::MAX
+        );
     }
 
     #[test]
@@ -1418,10 +1699,20 @@ mod tests {
         let context = Context::argument("CanvasRenderingContext2D.getImageData", 1);
         assert!(enforce_range_long(f64::NAN, context).is_err());
         assert!(enforce_range_long(f64::INFINITY, context).is_err());
+        assert!(enforce_range_long(f64::NEG_INFINITY, context).is_err());
         assert!(enforce_range_long(-(2f64.powi(31)) - 1.0, context).is_err());
         assert!(enforce_range_long(2f64.powi(31), context).is_err());
         assert_eq!(enforce_range_long(-1.9, context).unwrap(), -1);
         assert_eq!(enforce_range_long(1.9, context).unwrap(), 1);
+        assert_eq!(enforce_range_long(-0.0, context).unwrap(), 0);
+        assert_eq!(
+            enforce_range_long(-2_147_483_648.9, context).unwrap(),
+            i32::MIN
+        );
+        assert_eq!(
+            enforce_range_long(2_147_483_647.9, context).unwrap(),
+            i32::MAX
+        );
     }
 
     #[test]

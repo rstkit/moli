@@ -2,6 +2,7 @@ use crate::custom_elements;
 use crate::document_runtime::DomHandle;
 use crate::util::v8_string;
 use crate::webidl;
+pub(super) use crate::webidl::dom_string_property_value as property_dom_string_value;
 
 use super::super::node::{node_is_element, node_runtime_and_handle_from_object_or_detached};
 use super::{
@@ -180,9 +181,12 @@ pub(super) enum DomStringReflection {
     EmbedHeight,
     EmbedType,
     EmbedWidth,
+    FontFace,
     FontSize,
     FrameFrameBorder,
     FrameScrolling,
+    FrameSetCols,
+    FrameSetRows,
     HrColor,
     HrSize,
     HrWidth,
@@ -206,13 +210,17 @@ pub(super) enum DomStringReflection {
     LinkCharset,
     LinkFetchPriority,
     LinkHreflang,
+    LinkIntegrity,
     LinkMedia,
     LinkReferrerPolicy,
+    LinkRev,
+    LinkType,
     LiType,
     MarqueeBgColor,
     MarqueeHeight,
     MarqueeWidth,
     MetaMedia,
+    MetaScheme,
     ModDateTime,
     ObjectArchive,
     ObjectCode,
@@ -382,6 +390,15 @@ const DOM_STRING_REFLECTION_DESCRIPTORS: &[(DomStringReflection, DomStringReflec
             DomStringReflectionDescriptor::new("HTMLEmbedElement", "width", "width"),
         ),
         (
+            DomStringReflection::FontFace,
+            DomStringReflectionDescriptor::new_html_element(
+                "HTMLFontElement",
+                "font",
+                "face",
+                "face",
+            ),
+        ),
+        (
             DomStringReflection::FontSize,
             DomStringReflectionDescriptor::new("HTMLFontElement", "size", "size"),
         ),
@@ -392,6 +409,24 @@ const DOM_STRING_REFLECTION_DESCRIPTORS: &[(DomStringReflection, DomStringReflec
         (
             DomStringReflection::FrameScrolling,
             DomStringReflectionDescriptor::new("HTMLFrameElement", "scrolling", "scrolling"),
+        ),
+        (
+            DomStringReflection::FrameSetCols,
+            DomStringReflectionDescriptor::new_html_element(
+                "HTMLFrameSetElement",
+                "frameset",
+                "cols",
+                "cols",
+            ),
+        ),
+        (
+            DomStringReflection::FrameSetRows,
+            DomStringReflectionDescriptor::new_html_element(
+                "HTMLFrameSetElement",
+                "frameset",
+                "rows",
+                "rows",
+            ),
         ),
         (
             DomStringReflection::HrColor,
@@ -509,6 +544,15 @@ const DOM_STRING_REFLECTION_DESCRIPTORS: &[(DomStringReflection, DomStringReflec
             DomStringReflectionDescriptor::new("HTMLLinkElement", "hreflang", "hreflang"),
         ),
         (
+            DomStringReflection::LinkIntegrity,
+            DomStringReflectionDescriptor::new_html_element(
+                "HTMLLinkElement",
+                "link",
+                "integrity",
+                "integrity",
+            ),
+        ),
+        (
             DomStringReflection::LinkMedia,
             DomStringReflectionDescriptor::new("HTMLLinkElement", "media", "media"),
         ),
@@ -518,6 +562,24 @@ const DOM_STRING_REFLECTION_DESCRIPTORS: &[(DomStringReflection, DomStringReflec
                 "HTMLLinkElement",
                 "referrerpolicy",
                 "referrerPolicy",
+            ),
+        ),
+        (
+            DomStringReflection::LinkRev,
+            DomStringReflectionDescriptor::new_html_element(
+                "HTMLLinkElement",
+                "link",
+                "rev",
+                "rev",
+            ),
+        ),
+        (
+            DomStringReflection::LinkType,
+            DomStringReflectionDescriptor::new_html_element(
+                "HTMLLinkElement",
+                "link",
+                "type",
+                "type",
             ),
         ),
         (
@@ -539,6 +601,15 @@ const DOM_STRING_REFLECTION_DESCRIPTORS: &[(DomStringReflection, DomStringReflec
         (
             DomStringReflection::MetaMedia,
             DomStringReflectionDescriptor::new("HTMLMetaElement", "media", "media"),
+        ),
+        (
+            DomStringReflection::MetaScheme,
+            DomStringReflectionDescriptor::new_html_element(
+                "HTMLMetaElement",
+                "meta",
+                "scheme",
+                "scheme",
+            ),
         ),
         (
             DomStringReflection::ModDateTime,
@@ -1042,7 +1113,7 @@ impl_reflection_callback_data!(CrossOriginReflection);
 
 pub(super) fn set_reflected_attribute(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut super::super::JsContextHost,
+    runtime_ptr: *mut super::super::PageScriptHost,
     handle: DomHandle,
     name: &str,
     value: &str,
@@ -1060,7 +1131,7 @@ pub(super) fn set_reflected_attribute(
 
 pub(super) fn set_reflected_style_attribute_with_inline_base_url(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut super::super::JsContextHost,
+    runtime_ptr: *mut super::super::PageScriptHost,
     handle: DomHandle,
     value: &str,
     inline_base_url: Option<&url::Url>,
@@ -1085,7 +1156,7 @@ pub(super) fn set_reflected_style_attribute_with_inline_base_url(
 
 pub(super) fn remove_reflected_attribute(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut super::super::JsContextHost,
+    runtime_ptr: *mut super::super::PageScriptHost,
     handle: DomHandle,
     name: &str,
 ) {
@@ -1101,7 +1172,7 @@ pub(super) fn remove_reflected_attribute(
 
 pub(super) fn set_reflected_boolean_attribute(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut super::super::JsContextHost,
+    runtime_ptr: *mut super::super::PageScriptHost,
     handle: DomHandle,
     name: &str,
     enabled: bool,
@@ -1161,11 +1232,10 @@ pub(super) fn set_dom_string_attribute_property_on_object<'s>(
     owner: &'static str,
     property: &'static str,
 ) {
-    let Some(value) = property_dom_string_value(scope, value, owner, property) else {
+    let Some((runtime_ptr, handle)) = element_reflection_receiver_or_throw(scope, object) else {
         return;
     };
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, object)
-    else {
+    let Some(value) = property_dom_string_value(scope, value, owner, property) else {
         return;
     };
     set_reflected_attribute(scope, runtime_ptr, handle, name, &value);
@@ -1198,15 +1268,9 @@ pub(super) fn attribute_property_getter_from_object_or_detached<'s>(
     name: &str,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, object)
-    else {
-        rv.set_null();
+    let Some((runtime_ptr, handle)) = element_reflection_receiver_or_throw(scope, object) else {
         return;
     };
-    if !node_is_element(unsafe { &*runtime_ptr }, handle) {
-        rv.set_undefined();
-        return;
-    }
     let value = element_attribute(unsafe { &*runtime_ptr }, handle, name).unwrap_or_default();
     let Some(value) = v8_string(scope, &value) else {
         rv.set_null();
@@ -1235,10 +1299,10 @@ pub(super) fn nullable_attribute_property_getter_from_object_or_detached<'s>(
     rv.set(value.into());
 }
 
-fn element_reflection_receiver_or_throw<'s>(
+pub(super) fn element_reflection_receiver_or_throw<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<(*mut super::super::JsContextHost, DomHandle)> {
+) -> Option<(*mut super::super::PageScriptHost, DomHandle)> {
     let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object_or_detached(scope, object)
     else {
         webidl::throw_type_error(scope, "Illegal invocation");
@@ -1256,25 +1320,6 @@ pub(super) fn property_string_value(
     value: v8::Local<'_, v8::Value>,
 ) -> Option<String> {
     Some(value.to_string(scope)?.to_rust_string_lossy(scope))
-}
-
-pub(super) fn property_dom_string_value<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-    owner: &'static str,
-    property: &'static str,
-) -> Option<String> {
-    match webidl::convert::<webidl::DomString>(
-        scope,
-        value,
-        webidl::Context::member(owner, property),
-    ) {
-        Ok(value) => Some(value.0),
-        Err(error) => {
-            webidl::throw_error(scope, &error);
-            None
-        }
-    }
 }
 
 pub(super) fn property_usv_string_value<'s>(

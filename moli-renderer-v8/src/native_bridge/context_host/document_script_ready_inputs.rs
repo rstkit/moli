@@ -1,4 +1,4 @@
-use super::JsContextHost;
+use super::PageScriptHost;
 use crate::{
     document_script_scheduler::{
         DocumentScriptReadyActionDispatchRoute, DocumentScriptReadyDispatchOwnerMismatch,
@@ -131,7 +131,7 @@ impl ChildDocumentScriptReadyTaskLedger {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     #[cfg(test)]
     pub(crate) fn child_document_script_schedulers(&self) -> &FrameDocumentScriptSchedulerStore {
         &self.child_document_script_schedulers
@@ -451,7 +451,6 @@ impl JsContextHost {
             return;
         };
         match *work {
-            FrameDocumentRealmBoundScriptWork::DynamicClassic(_) => {}
             FrameDocumentRealmBoundScriptWork::ExternalClassic(work) => {
                 let _ = self.settle_child_async_classic_script_load_delay(
                     work.child_handle,

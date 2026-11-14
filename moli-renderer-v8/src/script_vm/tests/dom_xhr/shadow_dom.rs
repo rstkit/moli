@@ -1,4 +1,55 @@
+#[path = "shadow_dom/split30_gethtml_derived_options.rs"]
+mod split30_gethtml_derived_options;
+#[path = "shadow_dom/split30_slot_derived_options.rs"]
+mod split30_slot_derived_options;
+
 use super::*;
+
+#[test]
+fn template_adoption_clears_retained_shadow_adopted_style_sheet_lists() {
+    let mut vm = new_parsed_test_vm(
+        "https://template-shadow-sheets.test/",
+        "<!doctype html><body></body>",
+    );
+    assert_eq!(
+        vm.eval(
+            r#"(() => {
+      const check = (ok, label) => { if (!ok) throw Error(label); };
+      for (const mode of ['adopt', 'append']) {
+        const template = document.createElement('template');
+        const nested = template.content.appendChild(document.createElement('template'));
+        const sheet = new CSSStyleSheet();
+        sheet.replaceSync('span {color: blue}');
+        const roots = [template, nested].map(owner => {
+          const host = document.createElement('div');
+          const root = host.attachShadow({mode: 'open'});
+          root.innerHTML = '<span>text</span>';
+          root.adoptedStyleSheets = [sheet];
+          owner.content.appendChild(host);
+          return root;
+        });
+        const lists = roots.map(root => root.adoptedStyleSheets);
+        const sheets = lists.map(list => list[0]);
+        check(lists.every(list => list.length === 1), 'own template owner retains sheets');
+        check(sheets.every(sheet => sheet.cssRules.length === 1), 'sheet contents available');
+        document.adoptNode(template);
+        check(lists.every(list => list.length === 1), 'same document retains sheets');
+        const destination = document.implementation.createHTMLDocument('destination');
+        const inert = destination.createElement('template').content.ownerDocument;
+        if (mode === 'adopt') destination.adoptNode(template);
+        else destination.body.appendChild(template);
+        check(roots.every(root => root.ownerDocument === inert), mode + ' shadow owners moved');
+        // Observe the retained lists without invoking a getter that could reinstall sheets.
+        check(lists.every(list => list.length === 0), mode + ' retained lists cleared');
+        check(sheets.every(sheet => sheet.cssRules.length === 1), mode + ' sheet objects preserved');
+      }
+      return true;
+    })()"#
+        )
+        .expect("template shadow stylesheet adoption should evaluate"),
+        "true"
+    );
+}
 
 #[test]
 fn child_content_document_body_set_html_unsafe_preserves_declarative_shadow_roots() {
@@ -169,14 +220,10 @@ fn detached_iframe_open_shadow_host_receives_related_target_events() {
     });
   }
 
-  const event = new Event('x-related', {
+  const event = new FocusEvent('x-related', {
     bubbles: true,
-    composed: true
-  });
-  Object.defineProperty(event, 'relatedTarget', {
-    value: two,
-    writable: true,
-    configurable: true
+    composed: true,
+    relatedTarget: two
   });
   one.dispatchEvent(event);
 
@@ -188,6 +235,70 @@ fn detached_iframe_open_shadow_host_receives_related_target_events() {
 
     assert_eq!(result, "one:one:two:one,shadow|shadow:one:two:one,shadow");
 }
+
+#[test]
+fn event_related_target_expando_does_not_change_the_dispatch_path() {
+    let mut vm = new_storage_test_vm("https://event-private-state.test/");
+    let result = vm
+        .eval(
+            r#"
+        if (!document.documentElement) document.appendChild(document.createElement('html'));
+        if (!document.body) document.documentElement.appendChild(document.createElement('body'));
+        const host = document.createElement('div');
+        document.body.appendChild(host);
+        const shadow = host.attachShadow({mode: 'open'});
+        const one = document.createElement('button');
+        const two = document.createElement('button');
+        shadow.append(one, two);
+        let calls = 0;
+        let getterCalls = 0;
+        host.addEventListener('probe', () => calls++);
+        const event = new Event('probe', {bubbles: true, composed: true});
+        Object.defineProperty(event, 'relatedTarget', {get() { getterCalls++; return two; }});
+        one.dispatchEvent(event);
+        JSON.stringify([calls, getterCalls])
+    "#,
+        )
+        .unwrap();
+    assert_eq!(result, "[1,0]");
+}
+
+#[test]
+fn submit_event_private_submitter_controls_shadow_dispatch_path() {
+    let mut vm = new_streamed_parser_test_vm(
+        "https://event-private-submitter.test/",
+        r#"<!doctype html><div id="host"></div><button id="submitter"></button>"#,
+    );
+    let result = vm
+        .eval(
+            r#"
+        const host = document.getElementById('host');
+        const submitter = document.getElementById('submitter');
+        const shadow = host.attachShadow({mode: 'open'});
+        const form = document.createElement('form');
+        shadow.append(form);
+        const event = new SubmitEvent('submit', {bubbles: true, cancelable: true, submitter});
+        const submitterGetter = Object.getOwnPropertyDescriptor(SubmitEvent.prototype, 'submitter').get;
+        let getterCalls = 0;
+        const shadowGetter = () => { getterCalls++; throw new Error('public submitter getter'); };
+        Object.defineProperty(event, 'submitter', {get: shadowGetter});
+        Object.defineProperty(SubmitEvent.prototype, 'submitter', {get: shadowGetter, configurable: true});
+        const seen = [];
+        form.addEventListener('submit', event => {
+            event.preventDefault();
+            seen.push(['form', event.target === form, submitterGetter.call(event) === submitter]);
+        });
+        host.addEventListener('submit', event => {
+            seen.push(['host', event.target === host, submitterGetter.call(event) === submitter]);
+        });
+        form.dispatchEvent(event);
+        JSON.stringify([seen, getterCalls])
+    "#,
+        )
+        .unwrap();
+    assert_eq!(result, r#"[[["form",true,true],["host",true,true]],0]"#);
+}
+
 #[test]
 fn detached_iframe_shadow_focus_events_retarget_and_trim_paths() {
     let mut vm = new_storage_test_vm("https://detached-shadow-focus-events.test/");
@@ -2045,25 +2156,42 @@ fn document_design_mode_controls_content_editable_without_crossing_shadow_roots(
   const inside = document.createElement('span');
   root.appendChild(inside);
   document.body.append(inherited, disabled);
-  const before = [document.designMode, inherited.isContentEditable].join(':');
+  const before = [
+    document.designMode,
+    inherited.isContentEditable,
+    inherited.matches(':read-write'),
+    inherited.matches(':read-only')
+  ].join(':');
   document.designMode = 'ON';
   const enabled = [
     document.designMode,
     inherited.isContentEditable,
     disabled.isContentEditable,
-    inside.isContentEditable
+    inside.isContentEditable,
+    inherited.matches(':read-write'),
+    inherited.matches(':read-only'),
+    disabled.matches(':read-write'),
+    inside.matches(':read-write')
   ].join(':');
   document.designMode = 'invalid';
   const afterInvalid = document.designMode;
   document.designMode = 'off';
-  const disabledAgain = [document.designMode, inherited.isContentEditable].join(':');
+  const disabledAgain = [
+    document.designMode,
+    inherited.isContentEditable,
+    inherited.matches(':read-write'),
+    inherited.matches(':read-only')
+  ].join(':');
   return [before, enabled, afterInvalid, disabledAgain].join('|');
 })()
 "#,
         )
         .expect("Document designMode contenteditable probe should evaluate");
 
-    assert_eq!(result, "off:false|on:true:false:false|on|off:false");
+    assert_eq!(
+        result,
+        "off:false:false:true|on:true:false:false:true:false:false:false|on|off:false:false:true"
+    );
 }
 
 #[test]
@@ -2521,12 +2649,11 @@ async fn focused_display_none_blur_listener_sees_updated_focus_state() {
 #[test]
 fn scroll_container_focusability_tracks_current_layout() {
     let mut vm = new_storage_test_vm("https://scroll-focusability.test/");
-    vm.force_fresh_layout_reads_for_test();
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -2544,19 +2671,21 @@ fn scroll_container_focusability_tracks_current_layout() {
   const button = document.getElementById('button');
   const scroller = document.getElementById('scroller');
   const horizontal = document.getElementById('horizontal');
-  scroller.focus();
+  yield; // Publish this scene before reading its geometry.
+scroller.focus();
   const initiallyScrollable = document.activeElement === scroller;
   button.focus();
   horizontal.focus();
   const horizontallyScrollable = document.activeElement === horizontal;
   button.focus();
   scroller.style.height = '200px';
+yield; // Publish this scene before reading its geometry.
   scroller.focus();
   return [initiallyScrollable, horizontallyScrollable, document.activeElement === button].join('|');
 })()
 "#,
-        )
-        .expect("scroll container focusability should evaluate");
+    )
+    .expect("scroll container focusability should evaluate");
 
     assert_eq!(result, "true|true|true");
 }
@@ -2564,10 +2693,10 @@ fn scroll_container_focusability_tracks_current_layout() {
 fn tab_key_keeps_focused_scroller_until_focus_leaves_interactive_child() {
     let mut vm = new_storage_test_vm("https://scroll-tab-focusability.test/");
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -2586,7 +2715,8 @@ fn tab_key_keeps_focused_scroller_until_focus_leaves_interactive_child() {
   }
   const start = document.getElementById('start');
   const submit = document.getElementById('submit');
-  start.focus();
+  yield; // Publish this scene before reading its geometry.
+start.focus();
   pressTab();
   const first = document.activeElement.id;
   submit.disabled = false;
@@ -2601,8 +2731,8 @@ fn tab_key_keeps_focused_scroller_until_focus_leaves_interactive_child() {
   return [first, second, third, fourth, fifth].join('|');
 })()
 "#,
-        )
-        .expect("Tab default action should drop scroller after focus leaves it");
+    )
+    .expect("Tab default action should drop scroller after focus leaves it");
 
     assert_eq!(result, "scroller|submit|end|submit|start");
 }
@@ -2647,15 +2777,16 @@ fn caret_position_get_client_rect_declared_prototype_method() {
 fn caret_position_backing_slots_ignore_reflection_and_spoofing() {
     let mut vm = new_storage_test_vm("https://caret-position-private-slots.test/");
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   const root = document.documentElement || document.appendChild(document.createElement('html'));
   const body = document.body || root.appendChild(document.createElement('body'));
   body.innerHTML = '<span id="target">hello</span>';
   const span = document.getElementById('target');
-  const rect = span.getBoundingClientRect();
+  yield; // Publish this scene before reading its geometry.
+const rect = span.getBoundingClientRect();
   const charWidth = rect.width / span.textContent.length;
   const pos = document.caretPositionFromPoint(
     rect.left + charWidth * 2,
@@ -2695,8 +2826,8 @@ fn caret_position_backing_slots_ignore_reflection_and_spoofing() {
   });
 })()
 "#,
-        )
-        .expect("CaretPosition private backing slots should ignore public spoofing");
+    )
+    .expect("CaretPosition private backing slots should ignore public spoofing");
 
     assert_eq!(
         result,
@@ -2707,12 +2838,10 @@ fn caret_position_backing_slots_ignore_reflection_and_spoofing() {
 #[test]
 fn document_caret_position_from_point_handles_shadow_root_allowlist() {
     let mut vm = new_storage_test_vm("https://shadow-caret-position.test/");
-    vm.force_fresh_layout_reads_for_test();
 
-    let result = vm
-        .eval(
+    let result = eval_with_layout_publications(&mut vm,
             r#"
-(() => {
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -2743,7 +2872,8 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   container.setHTMLUnsafe('<span>hello, world</span>');
   {
     const span = container.firstChild;
-    const rect = span.getBoundingClientRect();
+    yield; // Publish this scene before reading its geometry.
+const rect = span.getBoundingClientRect();
     const pos = document.caretPositionFromPoint(rect.left + rect.width / span.textContent.length * 2, rect.top + rect.height / 2, {});
     const posRect = pos.getClientRect();
     check('light-text', pos instanceof CaretPosition && pos.offsetNode === span.firstChild && pos.offset === 2);
@@ -2753,6 +2883,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   container.setHTMLUnsafe('<div id="textDiv" style="display:inline-block">aaa</div>');
   {
     const textDiv = document.getElementById('textDiv');
+    yield;
     const rect = textDiv.getBoundingClientRect();
     const characterWidth = rect.width / textDiv.textContent.length;
     const pos = document.caretPositionFromPoint(rect.left + characterWidth * 2, rect.top + rect.height / 2);
@@ -2767,6 +2898,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   container.setHTMLUnsafe('<div id="textDivFromSheet">aaa</div>');
   {
     const textDiv = document.getElementById('textDivFromSheet');
+    yield;
     const rect = textDiv.getBoundingClientRect();
     const characterWidth = rect.width / textDiv.textContent.length;
     const pos = document.caretPositionFromPoint(rect.left + characterWidth * 2, rect.top + rect.height / 2);
@@ -2777,7 +2909,11 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   container.setHTMLUnsafe('<script>const ignored = true;</script><svg width="100" height="100"><circle cx="50" cy="50" r="50"></circle></svg>');
   {
     const circle = container.querySelector('circle');
+    yield;
     const rect = circle.getBoundingClientRect();
+    // Chromium 145: SVG graphics expose their transformed object rectangle,
+    // even though hit testing still resolves to the outer replaced SVG here.
+    check('svg-circle-rect', rect.left === 8 && rect.top === 8 && rect.width === 100 && rect.height === 100);
     const pos = document.caretPositionFromPoint(50, 50);
     check('svg-circle', pos instanceof CaretPosition && pos.offsetNode === circle && pos.offset === 0, `${labelNode(pos && pos.offsetNode)},${circle.namespaceURI},${rect.left},${rect.top},${rect.width},${rect.height}`);
   }
@@ -2785,6 +2921,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   container.setHTMLUnsafe('<div id="textDivAfterSvg">aaa</div>');
   {
     const textDiv = document.getElementById('textDivAfterSvg');
+    yield;
     const rect = textDiv.getBoundingClientRect();
     const characterWidth = rect.width / textDiv.textContent.length;
     const pos = document.caretPositionFromPoint(rect.left + characterWidth * 2, rect.top + rect.height / 2);
@@ -2795,6 +2932,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   container.setHTMLUnsafe("<input value='text inside input' />");
   {
     const input = container.firstChild;
+    yield;
     const rect = input.getBoundingClientRect();
     const pos = document.caretPositionFromPoint(rect.left + 1, rect.top + rect.height / 2);
     check('input', pos.offsetNode === input && pos.offset === 0);
@@ -2803,6 +2941,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   container.setHTMLUnsafe('<textarea rows="3" cols="4">12345678\n901234567890</textarea>');
   {
     const textarea = container.firstChild;
+    yield;
     const rect = textarea.getBoundingClientRect();
     const fontMatch = getComputedStyle(textarea).fontSize.match(/\d+/);
     const fontSize = fontMatch ? parseInt(fontMatch[0]) : rect.width / 4;
@@ -2818,6 +2957,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
     const root = host.attachShadow({ mode: 'closed' });
     root.setHTMLUnsafe('<span>hello, world</span>');
     const span = root.firstChild;
+    yield;
     const rect = span.getBoundingClientRect();
     const pos = document.caretPositionFromPoint(rect.left + rect.width / span.textContent.length * 2, rect.top + rect.height / 2, { shadowRoots: [root] });
     check('closed-allowed', pos.offsetNode === span.firstChild && pos.offset === 2);
@@ -2827,6 +2967,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
   {
     const root = document.getElementById('host').shadowRoot;
     const span = root.querySelector('span');
+    yield;
     const rect = span.getBoundingClientRect();
     const pos = document.caretPositionFromPoint(rect.left + rect.width / span.textContent.length * 2, rect.top + rect.height / 2);
     const posAllowed = document.caretPositionFromPoint(rect.left + rect.width / span.textContent.length * 2, rect.top + rect.height / 2, { shadowRoots: [root] });
@@ -2842,6 +2983,7 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
     const outerRoot = document.getElementById('outerHost').shadowRoot;
     const innerRoot = outerRoot.getElementById('innerHost').shadowRoot;
     const span = innerRoot.querySelector('span');
+    yield;
     const rect = span.getBoundingClientRect();
     const x = rect.left + rect.width / span.textContent.length * 2;
     const y = rect.top + rect.height / 2;
@@ -2862,18 +3004,17 @@ fn document_caret_position_from_point_handles_shadow_root_allowlist() {
 
     assert_eq!(
         result,
-        "bad-options:pass|light-text:pass|light-text-rect:pass|inline-block-text-rect:pass|sheet-inline-block-text-rect:pass|svg-circle:fail:svg#:1,http://www.w3.org/2000/svg,0,0,0,0|post-svg-text-rect:pass|input:pass|textarea-wrap:fail|textarea-forced:fail:10,23.75,28,63,60|closed-allowed:pass|shadow-hidden:pass|shadow-hidden-rect:pass|shadow-allowed:pass|nested-hidden:pass|nested-inner:pass|nested-outer:pass|nested-both:pass"
+        "bad-options:pass|light-text:pass|light-text-rect:pass|inline-block-text-rect:pass|sheet-inline-block-text-rect:pass|svg-circle-rect:pass|svg-circle:fail:svg#:1,http://www.w3.org/2000/svg,8,8,100,100|post-svg-text-rect:pass|input:pass|textarea-wrap:fail|textarea-forced:fail:10,23.75,28,63,60|closed-allowed:pass|shadow-hidden:pass|shadow-hidden-rect:pass|shadow-allowed:pass|nested-hidden:pass|nested-inner:pass|nested-outer:pass|nested-both:pass"
     );
 }
 #[test]
 fn document_caret_position_from_point_retargets_media_controls_to_parent() {
     let mut vm = new_storage_test_vm("https://caret-position-media.test/");
-    vm.force_fresh_layout_reads_for_test();
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   const root = document.documentElement || document.appendChild(document.createElement('html'));
   const body = document.body || root.appendChild(document.createElement('body'));
   body.innerHTML = '<div id="container"></div>';
@@ -2882,7 +3023,8 @@ fn document_caret_position_from_point_retargets_media_controls_to_parent() {
   for (const tag of ['audio', 'video']) {
     container.innerHTML = `<${tag} controls></${tag}>`;
     const media = container.firstElementChild;
-    const rect = media.getBoundingClientRect();
+    yield; // Publish this scene before reading its geometry.
+const rect = media.getBoundingClientRect();
     const pos = document.caretPositionFromPoint(
       rect.left + rect.width / 2,
       rect.top + rect.height / 2
@@ -2892,8 +3034,8 @@ fn document_caret_position_from_point_retargets_media_controls_to_parent() {
   return out.join('|');
 })()
 "#,
-        )
-        .expect("media caret position should evaluate");
+    )
+    .expect("media caret position should evaluate");
 
     assert_eq!(result, "audio:true:0|video:true:0");
 }
@@ -2921,6 +3063,7 @@ fn child_document_caret_position_uses_srcdoc_geometry() {
         "the srcdoc Document must commit on its own owner turn"
     );
 
+    publish_layout_for_test(&mut vm);
     let result = vm
         .eval(
             r#"
@@ -2951,6 +3094,11 @@ fn child_document_caret_position_uses_srcdoc_geometry() {
 #[test]
 fn accesskey_default_action_finds_shadow_tree_buttons() {
     let mut vm = new_storage_test_vm("https://shadow-accesskey.test/");
+    vm.eval(&format!(
+        "globalThis.accesskeyUsesControl = {}",
+        cfg!(target_os = "macos")
+    ))
+    .unwrap();
 
     let result = vm
         .eval(
@@ -2970,7 +3118,7 @@ fn accesskey_default_action_finds_shadow_tree_buttons() {
   let openClicks = 0;
   openRoot.querySelector('button').addEventListener('click', () => ++openClicks);
 
-  __moliDispatchTrustedKey('keydown', 'g', 'KeyG', true, false, false, true);
+  __moliDispatchTrustedKey('keydown', 'g', 'KeyG', true, accesskeyUsesControl, false, !accesskeyUsesControl);
   openHost.remove();
 
   const closedHost = document.createElement('div');
@@ -2980,7 +3128,7 @@ fn accesskey_default_action_finds_shadow_tree_buttons() {
   let closedClicks = 0;
   closedRoot.querySelector('button').addEventListener('click', () => ++closedClicks);
 
-  __moliDispatchTrustedKey('keydown', 'g', 'KeyG', true, false, false, true);
+  __moliDispatchTrustedKey('keydown', 'g', 'KeyG', true, accesskeyUsesControl, false, !accesskeyUsesControl);
 
   return `${openClicks}|${closedClicks}`;
 })()
@@ -3245,7 +3393,11 @@ fn clonable_shadow_roots_are_copied_by_host_clone_node() {
     clonedVideo.volume,
     clonedVideo.muted,
     clonedVideo.playbackRate,
-    clonedVideo.currentTime
+    clonedVideo.currentTime,
+    video.volume,
+    video.muted,
+    video.playbackRate,
+    video.currentTime
   ].join('|');
 })()
 "#,
@@ -3254,9 +3406,40 @@ fn clonable_shadow_roots_are_copied_by_host_clone_node() {
 
     assert_eq!(
         result,
-        "NotSupportedError|true|true|2|input|span|true|2|0|true|true|NotSupportedError|true|true|strong|3|http://www.w3.org/2000/svg|g|yes|dirty|false|true|0.25|true|1.5|3"
+        "NotSupportedError|true|true|2|input|span|true|2|0|true|true|NotSupportedError|true|true|strong|3|http://www.w3.org/2000/svg|g|yes|dirty|false|true|1|false|1|0|0.25|true|1.5|3"
     );
 }
+#[test]
+fn html_fragment_replacement_distinguishes_shadow_roots_from_inert_template_contents() {
+    let mut vm = new_parsed_test_vm(
+        "https://fragment-custom-elements.test/",
+        "<!doctype html><html><head></head><body></body></html>",
+    );
+    let probe = include_str!("html_fragment_custom_elements.js");
+    let result = vm
+        .eval(&format!("JSON.stringify({probe})"))
+        .expect("fragment custom element probe should evaluate");
+    let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let rows = result["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 12);
+    for row in rows {
+        assert_eq!(row["upgraded"], true, "{row}");
+        assert_eq!(
+            row["events"],
+            serde_json::json!(["constructed", "connected"]),
+            "{row}"
+        );
+        if row["kind"] == "template" {
+            assert_eq!(row["inert"], true, "{row}");
+            assert_eq!(row["before"], serde_json::json!([]), "{row}");
+        }
+    }
+    assert_eq!(
+        result["realmInfo"],
+        serde_json::json!({"distinctObject": true, "distinctTypeError": true})
+    );
+}
+
 #[test]
 fn set_html_unsafe_preserves_declarative_shadow_roots() {
     let mut vm = new_storage_test_vm("https://set-html-unsafe-shadow.test/");
@@ -3323,6 +3506,59 @@ fn set_html_unsafe_preserves_declarative_shadow_roots() {
         "function|1|true|true|2|input|span|1|em|true|2|true|false|true|true|true|slot|true"
     );
 }
+
+#[test]
+fn set_html_unsafe_in_xml_documents_uses_xml_fragment_serialization() {
+    let mut vm = new_storage_test_vm("https://set-html-unsafe-xml.test/");
+
+    let result = vm
+        .eval(
+            r#"
+(() => {
+  const markup = '<p><foo><b><i>test</b></i>';
+  const xml = document.implementation.createDocument(null, 'root', null);
+  xml.documentElement.setHTMLUnsafe(markup);
+
+  const svg = document.implementation.createDocument(
+    'http://www.w3.org/2000/svg',
+    'root',
+    null
+  );
+  svg.documentElement.setHTMLUnsafe(markup);
+
+  const liveSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  liveSvg.setHTMLUnsafe('<circle></circle>');
+
+  return [
+    xml.contentType,
+    xml.documentElement.innerHTML,
+    xml.documentElement.firstChild.namespaceURI,
+    svg.contentType,
+    svg.documentElement.innerHTML,
+    svg.documentElement.firstChild.namespaceURI,
+    liveSvg.innerHTML,
+    liveSvg.firstChild.namespaceURI
+  ].join('|');
+})()
+"#,
+        )
+        .expect("setHTMLUnsafe should serialize XML document fragments as XML");
+
+    assert_eq!(
+        result,
+        concat!(
+            "application/xml|",
+            "<p xmlns=\"http://www.w3.org/1999/xhtml\"><foo><b><i>test</i></b></foo></p>|",
+            "http://www.w3.org/1999/xhtml|",
+            "image/svg+xml|",
+            "<p xmlns=\"http://www.w3.org/1999/xhtml\"><foo><b><i>test</i></b></foo></p>|",
+            "http://www.w3.org/1999/xhtml|",
+            "<circle></circle>|",
+            "http://www.w3.org/2000/svg"
+        )
+    );
+}
+
 #[test]
 fn get_html_serializes_shadow_roots_when_requested() {
     let mut vm = new_storage_test_vm("https://shadow-get-html.test/");
@@ -3720,7 +3956,7 @@ fn document_import_node_resolves_shadow_adopted_sheets_against_destination_docum
 }
 #[test]
 fn declarative_shadow_adopted_stylesheets_resolve_same_document_css_module() {
-    let mut vm = new_storage_test_vm("https://shadow-adopted-css-module.test/");
+    let mut vm = new_storage_html_test_vm("https://shadow-adopted-css-module.test/");
 
     let result = vm
         .eval(
@@ -3730,7 +3966,7 @@ fn declarative_shadow_adopted_stylesheets_resolve_same_document_css_module() {
   style.setAttribute('type', 'module');
   style.setAttribute('specifier', 'foo');
   style.textContent = 'span { color: blue }';
-  document.appendChild(style);
+  document.head.appendChild(style);
 
   const wrapper = document.createElement('section');
   wrapper.setHTMLUnsafe(
@@ -3740,7 +3976,7 @@ fn declarative_shadow_adopted_stylesheets_resolve_same_document_css_module() {
       "</template>" +
     "</div>"
   );
-  document.appendChild(wrapper);
+  document.body.appendChild(wrapper);
 
   const host = document.getElementById('host');
   const parsed = Document.parseHTMLUnsafe(
@@ -4166,7 +4402,10 @@ fn attach_shadow_reuses_declarative_shadow_root() {
 }
 #[test]
 fn child_document_snapshots_expose_declarative_shadow_roots() {
-    let mut vm = new_storage_test_vm("https://shadow-root-child-documents.test/");
+    let mut vm = new_parsed_test_vm(
+        "https://shadow-root-child-documents.test/",
+        "<!doctype html><html><body></body></html>",
+    );
 
     vm.eval(
         r#"
@@ -4215,6 +4454,7 @@ fn child_document_snapshots_expose_declarative_shadow_roots() {
         "the srcdoc snapshot Document must commit on its own owner turn"
     );
 
+    publish_layout_for_test(&mut vm);
     let result = vm
         .eval(
             r#"
@@ -5797,12 +6037,11 @@ fn radio_groups_are_scoped_to_shadow_root_tree() {
 #[test]
 fn highlight_registry_hits_shadow_and_light_dom_text_ranges() {
     let mut vm = new_storage_test_vm("https://highlight-registry-shadow.test/");
-    vm.force_fresh_layout_reads_for_test();
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -5824,7 +6063,8 @@ fn highlight_registry_hits_shadow_and_light_dom_text_ranges() {
   range.setEnd(spanInShadowDOM.childNodes[0], 10);
   const highlight = new Highlight(range);
   CSS.highlights.set('example-highlight', highlight);
-  const rect = spanInShadowDOM.getBoundingClientRect();
+  yield; // Publish this scene before reading its geometry.
+const rect = spanInShadowDOM.getBoundingClientRect();
   const x = rect.left + 3 * (rect.width / spanInShadowDOM.textContent.length);
   const y = rect.top + rect.height / 2;
   const shadowResults = CSS.highlights.highlightsFromPoint(x, y, { shadowRoots: [shadowRoot] });
@@ -5841,7 +6081,8 @@ fn highlight_registry_hits_shadow_and_light_dom_text_ranges() {
     </div>0123456789`);
   const nestedShadowRoot = container.querySelector('#host').shadowRoot;
   const nestedSpan = nestedShadowRoot.querySelector('span');
-  const nestedRect = nestedSpan.getBoundingClientRect();
+  yield; // Publish this scene before reading its geometry.
+const nestedRect = nestedSpan.getBoundingClientRect();
   const nestedCharacterWidth = nestedRect.width / nestedSpan.textContent.length;
   const nestedX = nestedRect.left + nestedCharacterWidth;
   const textPoint = (node) => {
@@ -5881,8 +6122,8 @@ fn highlight_registry_hits_shadow_and_light_dom_text_ranges() {
   });
 })()
 "#,
-        )
-        .expect("HighlightRegistry hit testing should evaluate");
+    )
+    .expect("HighlightRegistry hit testing should evaluate");
 
     assert_eq!(
         result,
@@ -5894,10 +6135,10 @@ fn highlight_registry_hits_shadow_and_light_dom_text_ranges() {
 fn highlight_registry_hits_cross_text_node_range_and_static_range() {
     let mut vm = new_storage_test_vm("https://highlight-registry-range-static-range.test/");
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -5925,7 +6166,8 @@ fn highlight_registry_hits_cross_text_node_range_and_static_range() {
   const highlight = new Highlight(liveRange, staticRange);
   CSS.highlights.set('example-highlight', highlight);
 
-  const rect = span1.getBoundingClientRect();
+  yield; // Publish this scene before reading its geometry.
+const rect = span1.getBoundingClientRect();
   const characterWidth = rect.width / span1.textContent.length;
   const characterHeight = rect.height;
   const names = new Map([[liveRange, 'live'], [staticRange, 'static']]);
@@ -5943,8 +6185,8 @@ fn highlight_registry_hits_cross_text_node_range_and_static_range() {
   ].join('|');
 })()
 "#,
-        )
-        .expect("HighlightRegistry Range/StaticRange hit testing should evaluate");
+    )
+    .expect("HighlightRegistry Range/StaticRange hit testing should evaluate");
 
     assert_eq!(result, "1:static|1:live,static|1:static|0");
 }
@@ -6146,10 +6388,10 @@ fn highlight_and_registry_collection_surfaces_use_live_webidl_iteration() {
 fn highlight_setlike_add_and_registry_reset_preserve_order() {
     let mut vm = new_storage_test_vm("https://highlight-setlike.test/");
 
-    let result = vm
-        .eval(
-            r#"
-(() => {
+    let result = eval_with_layout_publications(
+        &mut vm,
+        r#"
+(function* () {
   if (!document.documentElement) {
     document.appendChild(document.createElement('html'));
   }
@@ -6177,7 +6419,8 @@ fn highlight_setlike_add_and_registry_reset_preserve_order() {
   CSS.highlights.set('fourth', fourth);
   CSS.highlights.set('replace-me', replacement);
 
-  const rect = span.getBoundingClientRect();
+  yield; // Publish this scene before reading its geometry.
+const rect = span.getBoundingClientRect();
   const names = new Map([
     [first, 'first'],
     [replacement, 'replacement'],
@@ -6197,8 +6440,8 @@ fn highlight_setlike_add_and_registry_reset_preserve_order() {
   });
 })()
 "#,
-        )
-        .expect("Highlight setlike and registry order probe should evaluate");
+    )
+    .expect("Highlight setlike and registry order probe should evaluate");
 
     assert_eq!(
         result,

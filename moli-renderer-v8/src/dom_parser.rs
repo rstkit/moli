@@ -1,4 +1,5 @@
-use moli_web_mime::{is_dom_parser_xml_mime, is_html_document_mime};
+use crate::web_api_interfaces;
+use moli_web_mime::{is_dom_parser_xml_mime, is_html_document_mime, is_xml_document_mime};
 use moli_webapi_declare::WebApiFunctionTemplate;
 use url::Url;
 
@@ -17,14 +18,26 @@ use super::{
 };
 
 pub(crate) const DOM_PARSER_FOREIGN_NODE_SLOT: &str = "__moliDomParserForeignNode";
+const DOM_PARSER_CONSTRUCTION_REALM_SLOT: &str = "__moliDomParserConstructionRealm";
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 const PARSER_ERROR_STYLE: &str = "display: block; white-space: pre; border: 2px solid #c77; padding: 0 1em 0 1em; margin: 1em; background-color: #fdd; color: black";
 const PARSER_ERROR_DETAIL_STYLE: &str = "font-family:monospace;font-size:12px";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetachedDocumentKind {
+    Document,
     Html,
     Xml,
+}
+
+impl DetachedDocumentKind {
+    fn bridge_kind(self) -> &'static str {
+        match self {
+            Self::Document => "plain",
+            Self::Html => "html",
+            Self::Xml => "xml",
+        }
+    }
 }
 
 #[derive(Clone, Copy, webidl::WebIdlEnum)]
@@ -91,7 +104,7 @@ fn dom_parser_source_arg<'s>(
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "DOMParser", enumerable)]
+#[webapi(interface = web_api_interfaces::DOMParser, enumerable)]
 struct DomParserPrototypeMethodsDeclaration {
     #[webapi(method, length = 2, callback = dom_parser_parse_from_string_callback)]
     parse_from_string: (),
@@ -106,6 +119,16 @@ pub(super) fn dom_parser_constructor_callback(
         throw_type_error(scope, "DOMParser constructor must be called with new");
         return;
     }
+    // The constructor's Window is independent of newTarget.prototype. Keep
+    // a V8-traced creation-Realm witness, not a native persistent Context root
+    // or a WindowProxy that can be rebound to another Window on navigation.
+    let realm = crate::util::new_null_prototype_object(scope);
+    crate::util::set_private_value(
+        scope,
+        args.this(),
+        DOM_PARSER_CONSTRUCTION_REALM_SLOT,
+        realm.into(),
+    );
     rv.set(args.this().into());
 }
 
@@ -138,11 +161,30 @@ pub(super) fn dom_parser_parse_from_string_callback<'s>(
             source
         }
     };
+    // Borrowing parseFromString from another Realm does not change the
+    // parser's associated Window or the returned Document's wrapper Realm.
+    let Some(context) = get_private_object(scope, args.this(), DOM_PARSER_CONSTRUCTION_REALM_SLOT)
+        .and_then(|realm| realm.get_creation_context(scope))
+    else {
+        throw_type_error(scope, "Illegal invocation");
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) else {
+        return;
+    };
+    let execution_context = unsafe { &*host_ptr }.current_realm_window_for_inert_document(scope);
     let Some(obj) = parse_detached_document_from_string(scope, &source, parsed.mime.as_mime())
     else {
         rv.set(v8::null(scope).into());
         return;
     };
+    if let Ok((runtime_ptr, handle)) =
+        crate::native_bridge::node_runtime_and_handle_from_object_or_detached(scope, obj)
+    {
+        unsafe { &mut *runtime_ptr }
+            .set_inert_document_execution_context(handle, execution_context);
+    }
     rv.set(obj.into());
 }
 
@@ -181,17 +223,44 @@ pub(super) fn parse_detached_document_from_string<'s>(
         );
     }
 
+    parse_detached_xml_document_from_source(
+        scope,
+        runtime.document_url().clone(),
+        source,
+        mime,
+        XmlParseErrorBehavior::ParserErrorDocument,
+    )
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum XmlParseErrorBehavior {
+    ParserErrorDocument,
+    ReturnNone,
+}
+
+pub(super) fn parse_detached_xml_document_from_source<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    document_url: Url,
+    source: &str,
+    mime: &str,
+    error_behavior: XmlParseErrorBehavior,
+) -> Option<v8::Local<'s, v8::Object>> {
     let parser = XmlParser;
-    let parsed = parser.parse(runtime.document_url().clone(), source.to_owned());
+    let parsed = parser.parse(document_url, source.to_owned());
     let parsed = if parsed.parse_errors().is_empty() && native_document_has_element_child(&parsed) {
         parsed
     } else {
-        materialize_xml_parser_error_document(parsed)
+        match error_behavior {
+            XmlParseErrorBehavior::ParserErrorDocument => {
+                materialize_xml_parser_error_document(parsed)
+            }
+            XmlParseErrorBehavior::ReturnNone => return None,
+        }
     };
     build_detached_document_with_content_type(
         scope,
         parsed,
-        DetachedDocumentKind::Xml,
+        DetachedDocumentKind::Document,
         false,
         Some(mime),
     )
@@ -221,13 +290,13 @@ fn materialize_xml_parser_error_document(parsed: NativeDom) -> NativeDom {
     for child in host.child_handles(document).collect::<Vec<_>>() {
         let _ = host.remove_child(document, child);
     }
-    let html = host.create_parser_element_without_attributes_for_document(
+    let html = host.create_element_without_attributes_for_document(
         document,
         "html".to_owned(),
         HTML_NAMESPACE.to_owned(),
         None,
     );
-    let body = host.create_parser_element_without_attributes_for_document(
+    let body = host.create_element_without_attributes_for_document(
         document,
         "body".to_owned(),
         HTML_NAMESPACE.to_owned(),
@@ -244,7 +313,7 @@ fn create_dom_parser_error_element(
     document: NativeNodeId,
     error_detail: &str,
 ) -> NativeNodeId {
-    let parser_error = host.create_parser_element_without_attributes_for_document(
+    let parser_error = host.create_element_without_attributes_for_document(
         document,
         "parsererror".to_owned(),
         HTML_NAMESPACE.to_owned(),
@@ -281,7 +350,7 @@ fn create_dom_parser_error_child(
     local_name: &str,
     style: Option<&str>,
 ) -> NativeNodeId {
-    let element = host.create_parser_element_without_attributes_for_document(
+    let element = host.create_element_without_attributes_for_document(
         document,
         local_name.to_owned(),
         HTML_NAMESPACE.to_owned(),
@@ -365,7 +434,11 @@ pub(crate) fn preserve_decoded_bom_only_browsing_context_body<'a>(
     source: &'a str,
     content_type: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
-    if source == "\u{feff}" && !content_type.is_some_and(is_dom_parser_xml_mime) {
+    if source == "\u{feff}"
+        && !content_type.is_some_and(|mime| {
+            is_xml_document_mime(mime) || moli_web_mime::is_text_document_mime(mime)
+        })
+    {
         std::borrow::Cow::Borrowed("<body>\u{feff}</body>")
     } else {
         std::borrow::Cow::Borrowed(source)
@@ -378,14 +451,22 @@ fn parse_browsing_context_document_snapshot(
     content_type: Option<&str>,
     html_parser: HtmlParser,
 ) -> (DomHost, DetachedDocumentKind) {
-    if content_type.is_some_and(is_dom_parser_xml_mime)
-        || child_document_url_is_xml_like(&document_url)
+    if content_type.is_some_and(is_xml_document_mime)
+        || (content_type.is_none() && child_document_url_is_xml_like(&document_url))
     {
         let parser = XmlParser;
         return (
             DomHost::from_dom(parser.parse(document_url, source.to_owned())),
             DetachedDocumentKind::Xml,
         );
+    }
+    if let Some(content_type) =
+        content_type.filter(|mime| moli_web_mime::is_text_document_mime(mime))
+    {
+        let stream = HtmlParser::with_scripting_enabled(false)
+            .start_text_document(document_url, content_type);
+        stream.feed(source);
+        return (stream.finish_dom_host(), DetachedDocumentKind::Html);
     }
     (
         html_parser.parse_dom_host(document_url, source.to_owned()),
@@ -421,13 +502,9 @@ fn build_detached_document_with_content_type<'s>(
     content_type: Option<&str>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let _ = expose_declarative_shadow_roots;
-    let kind = match kind {
-        DetachedDocumentKind::Html => "html",
-        DetachedDocumentKind::Xml => "xml",
-    };
     build_detached_document_object_from_dom_host_with_content_type(
         scope,
-        kind,
+        kind.bridge_kind(),
         DomHost::from_dom(parsed),
         content_type,
         None,
@@ -441,11 +518,7 @@ fn build_detached_document_from_dom_host<'s>(
     expose_declarative_shadow_roots: bool,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let _ = expose_declarative_shadow_roots;
-    let kind = match kind {
-        DetachedDocumentKind::Html => "html",
-        DetachedDocumentKind::Xml => "xml",
-    };
-    build_detached_document_object_from_dom_host(scope, kind, parsed)
+    build_detached_document_object_from_dom_host(scope, kind.bridge_kind(), parsed)
 }
 
 fn build_detached_document_from_dom_host_with_content_type<'s>(
@@ -457,13 +530,9 @@ fn build_detached_document_from_dom_host_with_content_type<'s>(
     character_set: Option<&str>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let _ = expose_declarative_shadow_roots;
-    let kind = match kind {
-        DetachedDocumentKind::Html => "html",
-        DetachedDocumentKind::Xml => "xml",
-    };
     build_detached_document_object_from_dom_host_with_content_type(
         scope,
-        kind,
+        kind.bridge_kind(),
         parsed,
         content_type,
         character_set,
@@ -571,5 +640,115 @@ mod tests {
 
         let disabled = parse(HtmlParser::SCRIPTING_DISABLED);
         assert!(disabled.element_handle_by_id("fallback").is_some());
+    }
+
+    #[test]
+    fn child_projection_preserves_xml_suffix_document_structure_and_namespace() {
+        let source = "<feed xmlns='http://www.w3.org/2005/Atom'><title>Example</title></feed>";
+        for mime in [
+            "application/atom+xml",
+            "application/rss+xml",
+            "text/example+xml",
+        ] {
+            for path in ["feed.xml", "feed.html", "feed"] {
+                let (document, kind) = parse_browsing_context_document_snapshot(
+                    Url::parse(&format!("https://example.test/{path}")).unwrap(),
+                    source,
+                    Some(mime),
+                    HtmlParser::SCRIPTING_ENABLED,
+                );
+                let root = first_document_element(&document);
+                let element = document
+                    .node(root)
+                    .and_then(|node| node.as_element())
+                    .unwrap();
+                assert_eq!(kind, DetachedDocumentKind::Xml, "{mime} at {path}");
+                assert_eq!(element.local_name(), "feed", "{mime} at {path}");
+                assert_eq!(element.namespace(), "http://www.w3.org/2005/Atom");
+                assert_eq!(document.text_content(root).as_deref(), Some("Example"));
+            }
+        }
+    }
+
+    #[test]
+    fn child_projection_explicit_mime_overrides_xml_extension() {
+        let source = "\n<&amp;</pre><script>window.executed=1</script>";
+        for mime in [
+            "text/plain",
+            "application/json",
+            "application/problem+json",
+            "text/javascript",
+        ] {
+            let (document, kind) = parse_browsing_context_document_snapshot(
+                Url::parse("https://example.test/data.xml").unwrap(),
+                source,
+                Some(mime),
+                HtmlParser::SCRIPTING_ENABLED,
+            );
+            let root = document.document_handle();
+            assert_eq!(kind, DetachedDocumentKind::Html);
+            assert_eq!(
+                document.text_content(root).as_deref(),
+                Some(source),
+                "{mime}"
+            );
+            let children = document.child_handles(root).collect::<Vec<_>>();
+            assert_eq!(children.len(), 1);
+            assert!(document.is_html_element_named(children[0], "html"));
+            assert_eq!(
+                document.document_quirks_mode_for_handle(root),
+                Some(selectors::matching::QuirksMode::NoQuirks)
+            );
+        }
+        let (document, kind) = parse_browsing_context_document_snapshot(
+            Url::parse("https://example.test/page.svg").unwrap(),
+            "<!doctype html><b id='parsed'>&amp;</b>",
+            Some("text/html"),
+            HtmlParser::SCRIPTING_ENABLED,
+        );
+        assert_eq!(kind, DetachedDocumentKind::Html);
+        assert!(document.element_handle_by_id("parsed").is_some());
+        assert_eq!(
+            document.text_content(document.document_handle()).as_deref(),
+            Some("&")
+        );
+    }
+
+    #[test]
+    fn child_plain_text_document_uses_pre_and_no_quirks_mode() {
+        let (document, kind) = parse_browsing_context_document_snapshot(
+            Url::parse("https://example.test/sample.txt").expect("test URL"),
+            "\nalpha<&amp;\r\nbeta\rgamma\0",
+            Some("text/plain"),
+            HtmlParser::SCRIPTING_ENABLED,
+        );
+        let document_handle = document.document_handle();
+        let document_children = document.child_handles(document_handle).collect::<Vec<_>>();
+
+        assert_eq!(kind, DetachedDocumentKind::Html);
+        assert_eq!(document_children.len(), 1);
+        assert!(document_children.iter().all(|child| {
+            document
+                .node(*child)
+                .is_none_or(|node| node.as_document_type().is_none())
+        }));
+        assert_eq!(
+            document.document_quirks_mode_for_handle(document_handle),
+            Some(selectors::matching::QuirksMode::NoQuirks)
+        );
+
+        let html = document_children[0];
+        let html_children = document.child_handles(html).collect::<Vec<_>>();
+        assert_eq!(html_children.len(), 2);
+        assert!(document.is_html_element_named(html_children[0], "head"));
+        assert!(document.is_html_element_named(html_children[1], "body"));
+
+        let body_children = document.child_handles(html_children[1]).collect::<Vec<_>>();
+        assert_eq!(body_children.len(), 1);
+        assert!(document.is_html_element_named(body_children[0], "pre"));
+        assert_eq!(
+            document.text_content(body_children[0]).as_deref(),
+            Some("\nalpha<&amp;\nbeta\ngamma\u{fffd}")
+        );
     }
 }

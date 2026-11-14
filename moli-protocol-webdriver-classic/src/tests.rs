@@ -1,14 +1,14 @@
-use moli_protocol::devtools_runtime::{
-    DevToolsCaptureScreenshotClip, DevToolsCommand, DevToolsDomBoxModel,
+use moli_protocol::automation::{
+    AutomationCommand, DevToolsCaptureScreenshotClip, DevToolsDomBoxModel,
     DevToolsDomGeometryOperation, DevToolsDomGeometryResult, DevToolsDomNodeReference,
     DevToolsDomQuad, DevToolsError, DevToolsErrorKind, DevToolsGetAttributesResult,
     DevToolsGetCookiesResult, DevToolsGetNavigationHistoryResult, DevToolsGetPropertyResult,
     DevToolsGetTargetsResult, DevToolsGetTextResult, DevToolsHistoryTraversalDestination,
     DevToolsKeyEventType, DevToolsLocateNodesLocator, DevToolsLocateNodesTextMatch,
     DevToolsMouseEventType, DevToolsNavigationWait, DevToolsPointerType,
-    DevToolsPrintToPdfTransferMode, DevToolsProtocol, DevToolsRemoteHandleId,
-    DevToolsResultOwnership, DevToolsSessionId, DevToolsTargetId, DevToolsTargetKind,
-    DevToolsTouchEventType, DevToolsViewportSetting, DevToolsWindowState,
+    DevToolsPrintToPdfTransferMode, DevToolsRemoteHandleId, DevToolsResultOwnership,
+    DevToolsSessionId, DevToolsTargetId, DevToolsTargetKind, DevToolsTouchEventType,
+    DevToolsViewportSetting, DevToolsWindowState, FrontendProtocol,
 };
 use serde_json::json;
 
@@ -50,24 +50,45 @@ fn status_response_uses_webdriver_value_envelope() {
 }
 
 #[test]
-fn session_registry_allocates_unique_non_reused_ids() {
+fn session_registry_allocates_unique_v4_uuids_across_deletions() {
     let mut registry = ClassicSessionRegistry::new();
 
     let first = registry.create_session();
-    assert_eq!(first.session_id, "classic-session-1");
     assert_eq!(first.timeouts, ClassicTimeouts::default());
     assert_eq!(first.page_load_strategy, ClassicPageLoadStrategy::Normal);
     assert_eq!(
         first.unhandled_prompt_behavior.returned_capability(),
         json!("dismiss and notify")
     );
-    assert!(registry.has_session("classic-session-1"));
-    assert!(registry.release_session("classic-session-1"));
-
     let second = registry.create_session();
-    assert_eq!(second.session_id, "classic-session-2");
-    assert!(!registry.has_session("classic-session-1"));
-    assert!(registry.has_session("classic-session-2"));
+    assert_eq!(registry.session_count(), 2);
+    assert!(registry.has_session(&first.session_id));
+    assert!(registry.has_session(&second.session_id));
+    assert!(registry.release_session(&first.session_id));
+
+    let third = registry.create_session();
+    assert!(!registry.has_session(&first.session_id));
+    assert!(registry.has_session(&second.session_id));
+    assert!(registry.has_session(&third.session_id));
+    assert!(registry.release_session(&second.session_id));
+    assert!(registry.release_session(&third.session_id));
+    assert_eq!(registry.session_count(), 0);
+
+    let fourth = registry.create_session();
+    assert!(registry.has_session(&fourth.session_id));
+    assert_eq!(registry.session_count(), 1);
+
+    let mut ids = std::collections::BTreeSet::new();
+    for session in [first, second, third, fourth] {
+        let id = uuid::Uuid::parse_str(&session.session_id).expect("session ID must be a UUID");
+        assert_eq!(id.get_version_num(), 4);
+        assert_eq!(id.get_variant(), uuid::Variant::RFC4122);
+        assert_eq!(id.to_string(), session.session_id);
+        assert!(
+            ids.insert(session.session_id),
+            "session IDs must not be reused"
+        );
+    }
 }
 
 #[test]
@@ -424,11 +445,11 @@ fn creates_initial_target_command_for_webdriver_classic_session() {
 
     let command = create_initial_target_command(&context);
 
-    let DevToolsCommand::CreateTarget(command) = command else {
+    let AutomationCommand::CreateTarget(command) = command else {
         panic!("expected CreateTarget command");
     };
     assert_eq!(command.url, "about:blank");
-    assert_eq!(command.context.protocol, DevToolsProtocol::WebDriverClassic);
+    assert_eq!(command.context.protocol, FrontendProtocol::WebDriverClassic);
     assert_eq!(
         command
             .context
@@ -441,7 +462,7 @@ fn creates_initial_target_command_for_webdriver_classic_session() {
 }
 
 #[test]
-fn maps_url_commands_to_shared_devtools_commands() {
+fn maps_url_commands_to_shared_automation_commands() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let navigate = navigate_command(
@@ -450,7 +471,7 @@ fn maps_url_commands_to_shared_devtools_commands() {
         DevToolsNavigationWait::Load,
     )
     .expect("navigate command");
-    let DevToolsCommand::Navigate(navigate) = navigate else {
+    let AutomationCommand::Navigate(navigate) = navigate else {
         panic!("expected Navigate command");
     };
     assert_eq!(navigate.url, "https://example.test/");
@@ -465,7 +486,7 @@ fn maps_url_commands_to_shared_devtools_commands() {
     );
 
     let get_url = current_url_command(&context);
-    let DevToolsCommand::GetTargets(get_url) = get_url else {
+    let AutomationCommand::GetTargets(get_url) = get_url else {
         panic!("expected GetTargets command");
     };
     assert_eq!(
@@ -475,11 +496,11 @@ fn maps_url_commands_to_shared_devtools_commands() {
 }
 
 #[test]
-fn maps_title_and_source_to_shared_devtools_commands() {
+fn maps_title_and_source_to_shared_automation_commands() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let title = title_command(&context);
-    let DevToolsCommand::EvaluateScript(title) = title else {
+    let AutomationCommand::EvaluateScript(title) = title else {
         panic!("expected EvaluateScript command");
     };
     assert_eq!(title.expression, "document.title");
@@ -495,7 +516,7 @@ fn maps_title_and_source_to_shared_devtools_commands() {
     );
 
     let source = page_source_command(&context);
-    let DevToolsCommand::GetOuterHtml(source) = source else {
+    let AutomationCommand::GetOuterHtml(source) = source else {
         panic!("expected GetOuterHtml command");
     };
     assert_eq!(source.reference, None);
@@ -523,7 +544,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         false,
     )
     .expect("find element command");
-    let DevToolsCommand::QuerySelector(single) = single else {
+    let AutomationCommand::QuerySelector(single) = single else {
         panic!("expected QuerySelector command");
     };
     assert_eq!(single.root, None);
@@ -547,7 +568,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         true,
     )
     .expect("find elements command");
-    let DevToolsCommand::QuerySelector(multiple) = multiple else {
+    let AutomationCommand::QuerySelector(multiple) = multiple else {
         panic!("expected QuerySelector command");
     };
     assert!(multiple.multiple);
@@ -568,7 +589,7 @@ fn maps_find_element_to_shared_dom_query_command() {
             false,
         )
         .unwrap_or_else(|error| panic!("{using} locator should map: {error:?}"));
-        let DevToolsCommand::QuerySelector(command) = command else {
+        let AutomationCommand::QuerySelector(command) = command else {
             panic!("expected QuerySelector command for {using}");
         };
         assert_eq!(command.selector, expected_selector, "locator {using}");
@@ -594,7 +615,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         false,
     )
     .expect("tag name locator should map");
-    let DevToolsCommand::LocateNodes(tag_name) = tag_name else {
+    let AutomationCommand::LocateNodes(tag_name) = tag_name else {
         panic!("expected LocateNodes command for tag name");
     };
     assert_eq!(
@@ -612,7 +633,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         true,
     )
     .expect("tag name locator should map for find elements");
-    let DevToolsCommand::LocateNodes(tag_name_all) = tag_name_all else {
+    let AutomationCommand::LocateNodes(tag_name_all) = tag_name_all else {
         panic!("expected LocateNodes command for tag name");
     };
     assert_eq!(tag_name_all.max_node_count, None);
@@ -648,7 +669,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         false,
     )
     .expect("xpath locator should map");
-    let DevToolsCommand::LocateNodes(xpath) = xpath else {
+    let AutomationCommand::LocateNodes(xpath) = xpath else {
         panic!("expected LocateNodes command for xpath");
     };
     assert_eq!(
@@ -666,7 +687,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         true,
     )
     .expect("xpath locator should map for find elements");
-    let DevToolsCommand::LocateNodes(xpath_all) = xpath_all else {
+    let AutomationCommand::LocateNodes(xpath_all) = xpath_all else {
         panic!("expected LocateNodes command for xpath");
     };
     assert_eq!(xpath_all.max_node_count, None);
@@ -691,7 +712,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         false,
     )
     .expect("link text locator should map");
-    let DevToolsCommand::LocateNodes(link_text) = link_text else {
+    let AutomationCommand::LocateNodes(link_text) = link_text else {
         panic!("expected LocateNodes command for link text");
     };
     assert_eq!(
@@ -712,7 +733,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         true,
     )
     .expect("partial link text locator should map");
-    let DevToolsCommand::LocateNodes(partial_link_text) = partial_link_text else {
+    let AutomationCommand::LocateNodes(partial_link_text) = partial_link_text else {
         panic!("expected LocateNodes command for partial link text");
     };
     assert_eq!(
@@ -756,7 +777,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         Some(DevToolsDomNodeReference::FrontendNodeId(7)),
     )
     .expect("root-scoped CSS locator should map");
-    let DevToolsCommand::QuerySelector(rooted) = rooted else {
+    let AutomationCommand::QuerySelector(rooted) = rooted else {
         panic!("expected QuerySelector command for root-scoped CSS");
     };
     assert_eq!(
@@ -787,7 +808,7 @@ fn maps_find_element_to_shared_dom_query_command() {
     let high_id_attribute =
         get_element_attributes_command(&context, "moli-node-2000000042-element-7")
             .expect("legacy element id should parse");
-    let DevToolsCommand::GetAttributes(high_id_attribute) = high_id_attribute else {
+    let AutomationCommand::GetAttributes(high_id_attribute) = high_id_attribute else {
         panic!("expected GetAttributes command for high legacy element id");
     };
     assert_eq!(
@@ -800,7 +821,7 @@ fn maps_find_element_to_shared_dom_query_command() {
         "classic-shadow",
     )
     .expect("legacy shadow root id should parse");
-    let DevToolsCommand::ResolveNode(high_id_shadow_root) = high_id_shadow_root else {
+    let AutomationCommand::ResolveNode(high_id_shadow_root) = high_id_shadow_root else {
         panic!("expected ResolveNode command for high legacy shadow root id");
     };
     assert_eq!(
@@ -840,7 +861,7 @@ fn maps_screenshot_endpoints_to_shared_page_capture_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let page = screenshot_command(&context);
-    let DevToolsCommand::CaptureScreenshot(page) = page else {
+    let AutomationCommand::CaptureScreenshot(page) = page else {
         panic!("expected CaptureScreenshot command");
     };
     assert_eq!(page.format.as_deref(), Some("png"));
@@ -854,7 +875,7 @@ fn maps_screenshot_endpoints_to_shared_page_capture_command() {
     );
 
     let element = element_screenshot_command(&context, "remote-element-1");
-    let DevToolsCommand::CaptureScreenshot(element) = element else {
+    let AutomationCommand::CaptureScreenshot(element) = element else {
         panic!("expected CaptureScreenshot command");
     };
     assert_eq!(element.format.as_deref(), Some("png"));
@@ -889,7 +910,7 @@ fn maps_print_page_to_shared_print_to_pdf_command() {
         }),
     )
     .expect("classic print page command should map");
-    let DevToolsCommand::PrintToPdf(command) = command else {
+    let AutomationCommand::PrintToPdf(command) = command else {
         panic!("expected PrintToPdf command");
     };
     assert_eq!(
@@ -937,7 +958,7 @@ fn maps_element_attribute_to_shared_dom_attributes_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let command = get_element_attributes_command(&context, "moli-node-42").expect("command");
-    let DevToolsCommand::GetAttributes(command) = command else {
+    let AutomationCommand::GetAttributes(command) = command else {
         panic!("expected GetAttributes command");
     };
     assert_eq!(
@@ -958,7 +979,7 @@ fn maps_element_attribute_to_shared_dom_attributes_command() {
 
     let value = classic_attribute_value(
         DevToolsGetAttributesResult {
-            attributes: vec![moli_protocol::devtools_runtime::DevToolsDomAttribute {
+            attributes: vec![moli_protocol::automation::DevToolsDomAttribute {
                 name: "data-kind".to_owned(),
                 value: "primary".to_owned(),
             }],
@@ -968,7 +989,7 @@ fn maps_element_attribute_to_shared_dom_attributes_command() {
     assert_eq!(value.as_deref(), Some("primary"));
     let boolean_value = classic_attribute_value(
         DevToolsGetAttributesResult {
-            attributes: vec![moli_protocol::devtools_runtime::DevToolsDomAttribute {
+            attributes: vec![moli_protocol::automation::DevToolsDomAttribute {
                 name: "disabled".to_owned(),
                 value: String::new(),
             }],
@@ -978,7 +999,7 @@ fn maps_element_attribute_to_shared_dom_attributes_command() {
     assert_eq!(boolean_value.as_deref(), Some("true"));
     let boolean_with_false_value = classic_attribute_value(
         DevToolsGetAttributesResult {
-            attributes: vec![moli_protocol::devtools_runtime::DevToolsDomAttribute {
+            attributes: vec![moli_protocol::automation::DevToolsDomAttribute {
                 name: "checked".to_owned(),
                 value: "false".to_owned(),
             }],
@@ -1036,7 +1057,7 @@ fn maps_element_text_to_shared_dom_text_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let command = get_element_text_command(&context, "moli-node-7").expect("command");
-    let DevToolsCommand::GetText(command) = command else {
+    let AutomationCommand::GetText(command) = command else {
         panic!("expected GetText command");
     };
     assert_eq!(
@@ -1075,7 +1096,7 @@ fn maps_element_property_to_shared_dom_property_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let command = get_element_property_command(&context, "moli-node-11", "value").expect("command");
-    let DevToolsCommand::GetProperty(command) = command else {
+    let AutomationCommand::GetProperty(command) = command else {
         panic!("expected GetProperty command");
     };
     assert_eq!(
@@ -1109,7 +1130,7 @@ fn maps_element_css_value_to_current_context_runtime_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "FRAME-1");
 
     let command = get_element_css_value_command(&context, "remote-42", "display");
-    let DevToolsCommand::CallFunction(command) = command else {
+    let AutomationCommand::CallFunction(command) = command else {
         panic!("expected CallFunction command");
     };
     assert_eq!(
@@ -1141,7 +1162,7 @@ fn maps_element_displayed_to_current_context_runtime_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "FRAME-1");
 
     let command = get_element_displayed_command(&context, "remote-17");
-    let DevToolsCommand::CallFunction(command) = command else {
+    let AutomationCommand::CallFunction(command) = command else {
         panic!("expected CallFunction command");
     };
     assert_eq!(
@@ -1170,7 +1191,7 @@ fn maps_element_rendered_text_to_current_context_runtime_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "FRAME-1");
 
     let command = get_element_rendered_text_command(&context, "remote-18");
-    let DevToolsCommand::CallFunction(command) = command else {
+    let AutomationCommand::CallFunction(command) = command else {
         panic!("expected CallFunction command");
     };
     assert_eq!(
@@ -1204,7 +1225,7 @@ fn maps_element_enabled_to_current_context_runtime_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "FRAME-1");
 
     let command = get_element_enabled_command(&context, "remote-19");
-    let DevToolsCommand::CallFunction(command) = command else {
+    let AutomationCommand::CallFunction(command) = command else {
         panic!("expected CallFunction command");
     };
     assert_eq!(
@@ -1237,7 +1258,7 @@ fn maps_shadow_root_commands_to_current_context_runtime_commands() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "FRAME-1");
 
     let get = get_element_shadow_root_command(&context, "host-remote-1");
-    let DevToolsCommand::CallFunction(get) = get else {
+    let AutomationCommand::CallFunction(get) = get else {
         panic!("expected get shadow root CallFunction command");
     };
     assert_eq!(
@@ -1252,7 +1273,7 @@ fn maps_shadow_root_commands_to_current_context_runtime_commands() {
     assert!(get.preserve_remote_metadata);
 
     let element_attached = verify_element_attached_command(&context, "host-remote-1");
-    let DevToolsCommand::CallFunction(element_attached) = element_attached else {
+    let AutomationCommand::CallFunction(element_attached) = element_attached else {
         panic!("expected element attachment CallFunction command");
     };
     assert_eq!(
@@ -1275,7 +1296,7 @@ fn maps_shadow_root_commands_to_current_context_runtime_commands() {
     assert!(!element_attached.preserve_remote_metadata);
 
     let describe = describe_node_command(&context, 42, 1, true);
-    let DevToolsCommand::DescribeNode(describe) = describe else {
+    let AutomationCommand::DescribeNode(describe) = describe else {
         panic!("expected DescribeNode command");
     };
     assert_eq!(
@@ -1291,7 +1312,7 @@ fn maps_shadow_root_commands_to_current_context_runtime_commands() {
         "webdriver-classic-shadow-root",
     )
     .expect("resolve command");
-    let DevToolsCommand::ResolveNode(resolve) = resolve else {
+    let AutomationCommand::ResolveNode(resolve) = resolve else {
         panic!("expected ResolveNode command");
     };
     assert_eq!(
@@ -1304,7 +1325,7 @@ fn maps_shadow_root_commands_to_current_context_runtime_commands() {
     );
 
     let attached = shadow_root_attached_command(&context, "shadow-remote-1");
-    let DevToolsCommand::CallFunction(attached) = attached else {
+    let AutomationCommand::CallFunction(attached) = attached else {
         panic!("expected shadow root attachment CallFunction command");
     };
     assert_eq!(
@@ -1327,7 +1348,7 @@ fn maps_element_tag_name_to_shared_dom_local_name_property_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let command = get_element_tag_name_command(&context, "moli-node-13").expect("command");
-    let DevToolsCommand::GetProperty(command) = command else {
+    let AutomationCommand::GetProperty(command) = command else {
         panic!("expected GetProperty command");
     };
     assert_eq!(
@@ -1354,7 +1375,7 @@ fn maps_active_element_to_shared_runtime_node_remote_command() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let command = active_element_command(&context);
-    let DevToolsCommand::EvaluateScript(command) = command else {
+    let AutomationCommand::EvaluateScript(command) = command else {
         panic!("expected EvaluateScript command");
     };
     assert!(command.expression.contains("document.activeElement"));
@@ -1377,7 +1398,7 @@ fn maps_get_element_rect_to_shared_dom_geometry_command_and_response() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let command = get_element_rect_command(&context, "moli-node-13").expect("command");
-    let DevToolsCommand::DomGeometry(command) = command else {
+    let AutomationCommand::DomGeometry(command) = command else {
         panic!("expected DOM geometry command");
     };
     assert_eq!(
@@ -1421,7 +1442,7 @@ fn maps_element_clear_to_shared_dom_resolve_and_runtime_command() {
 
     let resolve = resolve_element_command(&context, "moli-node-31", "webdriver-classic-clear")
         .expect("resolve command");
-    let DevToolsCommand::ResolveNode(resolve) = resolve else {
+    let AutomationCommand::ResolveNode(resolve) = resolve else {
         panic!("expected ResolveNode command");
     };
     assert_eq!(
@@ -1442,7 +1463,7 @@ fn maps_element_clear_to_shared_dom_resolve_and_runtime_command() {
     );
 
     let clear = clear_element_command(&context, "remote-object-1");
-    let DevToolsCommand::CallFunction(clear) = clear else {
+    let AutomationCommand::CallFunction(clear) = clear else {
         panic!("expected CallFunction command");
     };
     assert_eq!(
@@ -1457,7 +1478,7 @@ fn maps_element_clear_to_shared_dom_resolve_and_runtime_command() {
     assert!(clear.function_declaration.contains("invalid element state"));
 
     let release = release_remote_object_command(&context, "remote-object-1");
-    let DevToolsCommand::ReleaseObjects(release) = release else {
+    let AutomationCommand::ReleaseObjects(release) = release else {
         panic!("expected ReleaseObjects command");
     };
     assert_eq!(release.realm_id, None);
@@ -1485,12 +1506,13 @@ fn maps_element_clear_to_shared_dom_resolve_and_runtime_command() {
 }
 
 #[test]
-fn maps_element_click_to_shared_dom_geometry_and_input_commands() {
+fn maps_element_geometry_and_coordinate_input_commands() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
-    let commands = element_click_prepare_commands(&context, "moli-node-23").expect("commands");
+    let commands =
+        element_geometry_prepare_commands(&context, DevToolsDomNodeReference::FrontendNodeId(23));
     assert_eq!(commands.len(), 2);
-    let DevToolsCommand::ScrollIntoViewIfNeeded(scroll) = &commands[0] else {
+    let AutomationCommand::ScrollIntoViewIfNeeded(scroll) = &commands[0] else {
         panic!("expected scroll command");
     };
     assert_eq!(
@@ -1505,7 +1527,7 @@ fn maps_element_click_to_shared_dom_geometry_and_input_commands() {
             .map(DevToolsTargetId::as_str),
         Some("TID-1")
     );
-    let DevToolsCommand::DomGeometry(geometry) = &commands[1] else {
+    let AutomationCommand::DomGeometry(geometry) = &commands[1] else {
         panic!("expected DOM geometry command");
     };
     assert_eq!(
@@ -1519,15 +1541,15 @@ fn maps_element_click_to_shared_dom_geometry_and_input_commands() {
 
     let input = element_click_input_commands(
         &context,
-        &box_model_geometry([10.0, 20.0, 30.0, 20.0, 30.0, 40.0, 10.0, 40.0], 20, 20),
-    )
-    .expect("input commands");
-    assert_eq!(input.len(), 2);
+        ClassicViewportPoint::new(20.0, 30.0).expect("valid point"),
+    );
+    assert_eq!(input.len(), 3);
     for (command, (event_type, buttons)) in input.into_iter().zip([
+        (DevToolsMouseEventType::Moved, Some(0)),
         (DevToolsMouseEventType::Pressed, Some(1)),
         (DevToolsMouseEventType::Released, Some(0)),
     ]) {
-        let DevToolsCommand::DispatchMouseEvent(command) = command else {
+        let AutomationCommand::DispatchMouseEvent(command) = command else {
             panic!("expected mouse dispatch");
         };
         assert_eq!(command.event_type, event_type);
@@ -1536,10 +1558,6 @@ fn maps_element_click_to_shared_dom_geometry_and_input_commands() {
         assert_eq!(command.button, 0);
         assert_eq!(command.buttons, buttons);
     }
-
-    let invalid = element_click_prepare_commands(&context, "not-a-moli-node")
-        .expect_err("invalid element id should fail");
-    assert_eq!(invalid.code, ClassicErrorCode::NoSuchElement);
 }
 
 #[test]
@@ -1563,7 +1581,7 @@ fn maps_element_send_keys_to_shared_input_key_commands() {
         (DevToolsKeyEventType::KeyDown, "b", "b", true),
         (DevToolsKeyEventType::KeyUp, "b", "", false),
     ]) {
-        let DevToolsCommand::DispatchKeyEvent(command) = command else {
+        let AutomationCommand::DispatchKeyEvent(command) = command else {
             panic!("expected key dispatch");
         };
         assert_eq!(command.event_type, event_type);
@@ -1621,7 +1639,7 @@ fn maps_element_send_keys_to_shared_input_key_commands() {
     for (command, (event_type, key, code, text, should_insert_text)) in
         commands.into_iter().zip(expected)
     {
-        let DevToolsCommand::DispatchKeyEvent(command) = command else {
+        let AutomationCommand::DispatchKeyEvent(command) = command else {
             panic!("expected key dispatch");
         };
         assert_eq!(command.event_type, event_type);
@@ -1719,7 +1737,7 @@ fn maps_element_send_keys_to_shared_input_key_commands() {
     for (command, (event_type, key, code, text, modifiers, should_insert_text)) in
         commands.into_iter().zip(expected)
     {
-        let DevToolsCommand::DispatchKeyEvent(command) = command else {
+        let AutomationCommand::DispatchKeyEvent(command) = command else {
             panic!("expected key dispatch");
         };
         assert_eq!(command.event_type, event_type);
@@ -1749,8 +1767,10 @@ fn maps_element_send_keys_to_shared_input_key_commands() {
         ("F2", "F2", "", false),
     ];
     assert_eq!(commands.len(), expected.len() * 2);
-    for (pair, (key, code, text, should_insert_text)) in commands.chunks_exact(2).zip(expected) {
-        let DevToolsCommand::DispatchKeyEvent(key_down) = &pair[0] else {
+    for (pair, (key, code, text, should_insert_text)) in
+        commands.as_chunks::<2>().0.iter().zip(expected)
+    {
+        let AutomationCommand::DispatchKeyEvent(key_down) = &pair[0] else {
             panic!("expected keyDown dispatch");
         };
         assert_eq!(key_down.event_type, DevToolsKeyEventType::KeyDown);
@@ -1759,7 +1779,7 @@ fn maps_element_send_keys_to_shared_input_key_commands() {
         assert_eq!(key_down.text, text);
         assert_eq!(key_down.should_insert_text, should_insert_text);
 
-        let DevToolsCommand::DispatchKeyEvent(key_up) = &pair[1] else {
+        let AutomationCommand::DispatchKeyEvent(key_up) = &pair[1] else {
             panic!("expected keyUp dispatch");
         };
         assert_eq!(key_up.event_type, DevToolsKeyEventType::KeyUp);
@@ -1796,7 +1816,7 @@ fn maps_element_send_keys_to_shared_input_key_commands() {
     for (command, (event_type, key, code, text, modifiers, should_insert_text)) in
         commands.into_iter().zip(expected)
     {
-        let DevToolsCommand::DispatchKeyEvent(command) = command else {
+        let AutomationCommand::DispatchKeyEvent(command) = command else {
             panic!("expected key dispatch");
         };
         assert_eq!(command.event_type, event_type);
@@ -1849,7 +1869,7 @@ fn maps_pointer_actions_to_shared_input_commands() {
     for (command, (event_type, x, y, button, buttons, click_count)) in
         commands.into_iter().zip(expected)
     {
-        let DevToolsCommand::DispatchMouseEvent(command) = command else {
+        let AutomationCommand::DispatchMouseEvent(command) = command else {
             panic!("expected mouse dispatch command");
         };
         assert_eq!(command.event_type, event_type);
@@ -1913,7 +1933,7 @@ fn maps_touch_pointer_actions_to_shared_touch_commands() {
         (DevToolsTouchEventType::Move, 22.0, 24.0),
         (DevToolsTouchEventType::End, 22.0, 24.0),
     ]) {
-        let DevToolsCommand::DispatchTouchEvent(command) = command else {
+        let AutomationCommand::DispatchTouchEvent(command) = command else {
             panic!("expected touch dispatch command");
         };
         assert_eq!(command.event_type, event_type);
@@ -1986,7 +2006,7 @@ fn coalesces_same_tick_touch_sources_into_multi_point_commands() {
             [(0, 11.0, 12.0), (1, 31.0, 32.0)],
         ),
     ]) {
-        let DevToolsCommand::DispatchTouchEvent(command) = command else {
+        let AutomationCommand::DispatchTouchEvent(command) = command else {
             panic!("expected touch dispatch command");
         };
         assert_eq!(command.event_type, event_type);
@@ -2027,7 +2047,7 @@ fn releases_pressed_touch_pointer_source() {
 
     let release = release_actions_commands(&context, &mut state);
     assert_eq!(release.len(), 1);
-    let DevToolsCommand::DispatchTouchEvent(command) = &release[0] else {
+    let AutomationCommand::DispatchTouchEvent(command) = &release[0] else {
         panic!("expected touch release command");
     };
     assert_eq!(command.event_type, DevToolsTouchEventType::End);
@@ -2071,7 +2091,7 @@ fn maps_pen_pointer_actions_to_shared_mouse_commands_with_pointer_type() {
         DevToolsMouseEventType::Pressed,
         DevToolsMouseEventType::Released,
     ]) {
-        let DevToolsCommand::DispatchMouseEvent(command) = command else {
+        let AutomationCommand::DispatchMouseEvent(command) = command else {
             panic!("expected mouse dispatch command");
         };
         assert_eq!(command.event_type, event_type);
@@ -2208,26 +2228,26 @@ fn groups_action_commands_by_tick_duration() {
     assert_eq!(ticks[1].duration_ms, 0);
     assert_eq!(ticks[1].commands.len(), 2);
 
-    let DevToolsCommand::DispatchMouseEvent(pointer_move) = &ticks[0].commands[0] else {
+    let AutomationCommand::DispatchMouseEvent(pointer_move) = &ticks[0].commands[0] else {
         panic!("expected pointer move in first tick");
     };
     assert_eq!(pointer_move.event_type, DevToolsMouseEventType::Moved);
     assert_eq!(pointer_move.x, 20.0);
     assert_eq!(pointer_move.y, 21.0);
 
-    let DevToolsCommand::DispatchMouseEvent(wheel_scroll) = &ticks[0].commands[1] else {
+    let AutomationCommand::DispatchMouseEvent(wheel_scroll) = &ticks[0].commands[1] else {
         panic!("expected wheel scroll in first tick");
     };
     assert_eq!(wheel_scroll.event_type, DevToolsMouseEventType::Wheel);
     assert_eq!(wheel_scroll.delta_x, 1.0);
     assert_eq!(wheel_scroll.delta_y, 2.0);
 
-    let DevToolsCommand::DispatchMouseEvent(pointer_down) = &ticks[1].commands[0] else {
+    let AutomationCommand::DispatchMouseEvent(pointer_down) = &ticks[1].commands[0] else {
         panic!("expected pointer down in second tick");
     };
     assert_eq!(pointer_down.event_type, DevToolsMouseEventType::Pressed);
 
-    let DevToolsCommand::DispatchKeyEvent(key_down) = &ticks[1].commands[1] else {
+    let AutomationCommand::DispatchKeyEvent(key_down) = &ticks[1].commands[1] else {
         panic!("expected key down in second tick");
     };
     assert_eq!(key_down.event_type, DevToolsKeyEventType::KeyDown);
@@ -2285,7 +2305,7 @@ fn collects_action_element_origins_for_pointer_and_wheel_sources() {
                 "id": "mouse",
                 "actions": [{
                     "type": "pointerMove",
-                    "origin": { "element-6066-11e4-a52e-4f735466cecf": "moli-node-7" },
+                    "origin": { "element-6066-11e4-a52e-4f735466cecf": "moli:bidi-renderer-node:2000000007" },
                     "x": 0,
                     "y": 0
                 }]
@@ -2295,7 +2315,7 @@ fn collects_action_element_origins_for_pointer_and_wheel_sources() {
                 "id": "wheel",
                 "actions": [{
                     "type": "scroll",
-                    "origin": { "element-6066-11e4-a52e-4f735466cecf": "moli-node-9" },
+                    "origin": { "element-6066-11e4-a52e-4f735466cecf": "moli:bidi-renderer-node:2000000009" },
                     "x": 0,
                     "y": 0,
                     "deltaX": 0,
@@ -2312,7 +2332,10 @@ fn collects_action_element_origins_for_pointer_and_wheel_sources() {
     .expect("element origins should collect");
     assert_eq!(
         origins,
-        vec!["moli-node-7".to_owned(), "moli-node-9".to_owned()]
+        vec![
+            "moli:bidi-renderer-node:2000000007".to_owned(),
+            "moli:bidi-renderer-node:2000000009".to_owned()
+        ]
     );
 
     let invalid = action_element_origin_ids(&json!({
@@ -2369,7 +2392,7 @@ fn maps_pointer_actions_with_element_origin_to_shared_input_commands() {
         (DevToolsMouseEventType::Released, 23.0, 26.0, 0, Some(0)),
     ];
     for (command, (event_type, x, y, button, buttons)) in commands.into_iter().zip(expected) {
-        let DevToolsCommand::DispatchMouseEvent(command) = command else {
+        let AutomationCommand::DispatchMouseEvent(command) = command else {
             panic!("expected mouse dispatch command");
         };
         assert_eq!(command.event_type, event_type);
@@ -2447,7 +2470,7 @@ fn maintains_action_state_across_commands_and_releases_pressed_sources() {
     )
     .expect("pointer origin should use persisted pointer position");
     assert_eq!(moved.len(), 1);
-    let DevToolsCommand::DispatchMouseEvent(command) = &moved[0] else {
+    let AutomationCommand::DispatchMouseEvent(command) = &moved[0] else {
         panic!("expected mouse dispatch command");
     };
     assert_eq!(command.event_type, DevToolsMouseEventType::Moved);
@@ -2457,7 +2480,7 @@ fn maintains_action_state_across_commands_and_releases_pressed_sources() {
 
     let release = release_actions_commands(&context, &mut state);
     assert_eq!(release.len(), 2);
-    let DevToolsCommand::DispatchMouseEvent(mouse_up) = &release[0] else {
+    let AutomationCommand::DispatchMouseEvent(mouse_up) = &release[0] else {
         panic!("expected mouse release command first");
     };
     assert_eq!(mouse_up.event_type, DevToolsMouseEventType::Released);
@@ -2466,7 +2489,7 @@ fn maintains_action_state_across_commands_and_releases_pressed_sources() {
     assert_eq!(mouse_up.button, 0);
     assert_eq!(mouse_up.buttons, Some(0));
 
-    let DevToolsCommand::DispatchKeyEvent(key_up) = &release[1] else {
+    let AutomationCommand::DispatchKeyEvent(key_up) = &release[1] else {
         panic!("expected key release command second");
     };
     assert_eq!(key_up.event_type, DevToolsKeyEventType::KeyUp);
@@ -2573,7 +2596,8 @@ fn maps_wheel_actions_to_shared_input_commands() {
     .expect("wheel actions should map");
 
     assert_eq!(commands.len(), 1);
-    let DevToolsCommand::DispatchMouseEvent(command) = commands.into_iter().next().unwrap() else {
+    let AutomationCommand::DispatchMouseEvent(command) = commands.into_iter().next().unwrap()
+    else {
         panic!("expected mouse dispatch command");
     };
     assert_eq!(command.event_type, DevToolsMouseEventType::Wheel);
@@ -2649,7 +2673,8 @@ fn maps_wheel_actions_with_element_origin_to_shared_input_commands() {
     .expect("wheel element origin should map");
 
     assert_eq!(commands.len(), 1);
-    let DevToolsCommand::DispatchMouseEvent(command) = commands.into_iter().next().unwrap() else {
+    let AutomationCommand::DispatchMouseEvent(command) = commands.into_iter().next().unwrap()
+    else {
         panic!("expected mouse dispatch command");
     };
     assert_eq!(command.event_type, DevToolsMouseEventType::Wheel);
@@ -2742,7 +2767,7 @@ fn maps_key_actions_to_shared_input_commands() {
     for (command, (event_type, key, code, text, modifiers, auto_repeat, should_insert_text)) in
         commands.into_iter().zip(expected)
     {
-        let DevToolsCommand::DispatchKeyEvent(command) = command else {
+        let AutomationCommand::DispatchKeyEvent(command) = command else {
             panic!("expected key dispatch command");
         };
         assert_eq!(command.event_type, event_type);
@@ -2801,7 +2826,7 @@ fn maps_repeated_keydown_action_to_auto_repeat_key_event() {
     let repeats = commands
         .iter()
         .map(|command| {
-            let DevToolsCommand::DispatchKeyEvent(command) = command else {
+            let AutomationCommand::DispatchKeyEvent(command) = command else {
                 panic!("expected key dispatch command");
             };
             command.auto_repeat
@@ -2923,7 +2948,7 @@ fn maps_shift_modified_key_actions_to_shifted_key_and_text() {
     for (command, (event_type, key, code, text, modifiers, should_insert_text)) in
         commands.into_iter().zip(expected)
     {
-        let DevToolsCommand::DispatchKeyEvent(command) = command else {
+        let AutomationCommand::DispatchKeyEvent(command) = command else {
             panic!("expected key dispatch command");
         };
         assert_eq!(command.event_type, event_type);
@@ -2940,7 +2965,7 @@ fn maps_window_commands_to_shared_target_commands() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let handles = window_handles_command(&context);
-    let DevToolsCommand::GetTargets(handles) = handles else {
+    let AutomationCommand::GetTargets(handles) = handles else {
         panic!("expected GetTargets command");
     };
     assert!(handles.root.is_none());
@@ -2954,7 +2979,7 @@ fn maps_window_commands_to_shared_target_commands() {
     );
 
     let new_window = new_window_command(&context);
-    let DevToolsCommand::CreateTarget(new_window) = new_window else {
+    let AutomationCommand::CreateTarget(new_window) = new_window else {
         panic!("expected CreateTarget command");
     };
     assert_eq!(new_window.url, "about:blank");
@@ -2965,7 +2990,7 @@ fn maps_window_commands_to_shared_target_commands() {
 
     let switch =
         switch_window_command(&context, &json!({"handle": "TID-2"})).expect("switch command");
-    let DevToolsCommand::ActivateTarget(switch) = switch else {
+    let AutomationCommand::ActivateTarget(switch) = switch else {
         panic!("expected ActivateTarget command");
     };
     assert_eq!(switch.target_id.as_str(), "TID-2");
@@ -2979,13 +3004,13 @@ fn maps_window_commands_to_shared_target_commands() {
     );
 
     let close = close_window_command(&context).expect("close command");
-    let DevToolsCommand::CloseTarget(close) = close else {
+    let AutomationCommand::CloseTarget(close) = close else {
         panic!("expected CloseTarget command");
     };
     assert_eq!(close.target_id.as_str(), "TID-1");
 
     let set_rect = set_window_rect_command(&context, 640, 480);
-    let DevToolsCommand::SetViewport(set_rect) = set_rect else {
+    let AutomationCommand::SetViewport(set_rect) = set_rect else {
         panic!("expected SetViewport command");
     };
     assert_eq!(
@@ -3024,7 +3049,7 @@ fn maps_classic_window_state_to_headless_viewport_contract() {
         set_window_state_command(&context, ClassicWindowState::Minimized).is_none(),
         "minimize has no viewport command because Moli has no OS window"
     );
-    let DevToolsCommand::SetWindowState(minimize_surface) =
+    let AutomationCommand::SetWindowState(minimize_surface) =
         set_window_surface_state_command(&context, ClassicWindowState::Minimized)
     else {
         panic!("minimize should map to SetWindowState");
@@ -3049,7 +3074,7 @@ fn maps_classic_window_state_to_headless_viewport_contract() {
             height: CLASSIC_HEADLESS_AVAILABLE_HEIGHT,
         }
     );
-    let Some(DevToolsCommand::SetViewport(maximize_command)) =
+    let Some(AutomationCommand::SetViewport(maximize_command)) =
         set_window_state_command(&context, ClassicWindowState::Maximized)
     else {
         panic!("maximize should map to SetViewport");
@@ -3071,7 +3096,7 @@ fn maps_classic_window_state_to_headless_viewport_contract() {
             Some(CLASSIC_HEADLESS_SCREEN_HEIGHT)
         )
     );
-    let DevToolsCommand::SetWindowState(maximize_surface) =
+    let AutomationCommand::SetWindowState(maximize_surface) =
         set_window_surface_state_command(&context, ClassicWindowState::Maximized)
     else {
         panic!("maximize should map to SetWindowState");
@@ -3088,7 +3113,7 @@ fn maps_classic_window_state_to_headless_viewport_contract() {
             height: CLASSIC_HEADLESS_SCREEN_HEIGHT,
         }
     );
-    let Some(DevToolsCommand::SetViewport(fullscreen_command)) =
+    let Some(AutomationCommand::SetViewport(fullscreen_command)) =
         set_window_state_command(&context, ClassicWindowState::Fullscreen)
     else {
         panic!("fullscreen should map to SetViewport");
@@ -3110,13 +3135,13 @@ fn maps_classic_window_state_to_headless_viewport_contract() {
             Some(CLASSIC_HEADLESS_SCREEN_HEIGHT)
         )
     );
-    let DevToolsCommand::SetWindowState(fullscreen_surface) =
+    let AutomationCommand::SetWindowState(fullscreen_surface) =
         set_window_surface_state_command(&context, ClassicWindowState::Fullscreen)
     else {
         panic!("fullscreen should map to SetWindowState");
     };
     assert_eq!(fullscreen_surface.state, DevToolsWindowState::Fullscreen);
-    let DevToolsCommand::SetWindowState(normal_surface) =
+    let AutomationCommand::SetWindowState(normal_surface) =
         set_window_normal_surface_state_command(&context)
     else {
         panic!("set rect should map to normal SetWindowState");
@@ -3190,26 +3215,26 @@ fn parses_classic_window_rect_params_like_webdriver() {
 fn maps_alert_commands_to_shared_page_dialog_commands() {
     let context = ClassicDevToolsCommandContext::with_target_id("SID-1", "TID-1");
 
-    let DevToolsCommand::GetJavaScriptDialog(get) = alert_text_command(&context) else {
+    let AutomationCommand::GetJavaScriptDialog(get) = alert_text_command(&context) else {
         panic!("alert text should map to get dialog command");
     };
     assert_eq!(get.context.session_id.as_ref().unwrap().as_str(), "SID-1");
     assert_eq!(get.context.target_id.as_ref().unwrap().as_str(), "TID-1");
 
-    let DevToolsCommand::HandleJavaScriptDialog(accept) = alert_handle_command(&context, true)
+    let AutomationCommand::HandleJavaScriptDialog(accept) = alert_handle_command(&context, true)
     else {
         panic!("accept alert should map to handle dialog command");
     };
     assert!(accept.accept);
-    assert_eq!(accept.prompt_text, "");
+    assert_eq!(accept.prompt_text, None);
 
-    let DevToolsCommand::HandleJavaScriptDialog(dismiss) = alert_handle_command(&context, false)
+    let AutomationCommand::HandleJavaScriptDialog(dismiss) = alert_handle_command(&context, false)
     else {
         panic!("dismiss alert should map to handle dialog command");
     };
     assert!(!dismiss.accept);
 
-    let DevToolsCommand::SetJavaScriptDialogPromptText(send_text) =
+    let AutomationCommand::SetJavaScriptDialogPromptText(send_text) =
         alert_send_text_command(&context, &json!({"text": "cheese"})).expect("send text command")
     else {
         panic!("send alert text should map to set dialog prompt text command");
@@ -3224,6 +3249,10 @@ fn maps_alert_commands_to_shared_page_dialog_commands() {
 #[test]
 fn serializes_element_not_interactable_error_code() {
     assert_eq!(
+        error_response(ClassicErrorCode::ElementClickIntercepted, "obscured")["value"]["error"],
+        json!("element click intercepted")
+    );
+    assert_eq!(
         error_response(
             ClassicErrorCode::ElementNotInteractable,
             "current user prompt is not a prompt"
@@ -3236,7 +3265,7 @@ fn serializes_element_not_interactable_error_code() {
 fn extracts_classic_window_handles_from_page_targets() {
     let handles = window_handles_from_targets(DevToolsGetTargetsResult {
         targets: vec![
-            moli_protocol::devtools_runtime::DevToolsTargetInfo {
+            moli_protocol::automation::DevToolsTargetInfo {
                 target_id: Some(DevToolsTargetId::from("PAGE-1")),
                 kind: DevToolsTargetKind::Page,
                 title: String::new(),
@@ -3248,7 +3277,7 @@ fn extracts_classic_window_handles_from_page_targets() {
                 browser_context_id: None,
                 moli_popup_id: None,
             },
-            moli_protocol::devtools_runtime::DevToolsTargetInfo {
+            moli_protocol::automation::DevToolsTargetInfo {
                 target_id: Some(DevToolsTargetId::from("TAB-PAGE-1")),
                 kind: DevToolsTargetKind::Tab,
                 title: String::new(),
@@ -3260,7 +3289,7 @@ fn extracts_classic_window_handles_from_page_targets() {
                 browser_context_id: None,
                 moli_popup_id: None,
             },
-            moli_protocol::devtools_runtime::DevToolsTargetInfo {
+            moli_protocol::automation::DevToolsTargetInfo {
                 target_id: Some(DevToolsTargetId::from("WORKER-1")),
                 kind: DevToolsTargetKind::Worker,
                 title: String::new(),
@@ -3272,7 +3301,7 @@ fn extracts_classic_window_handles_from_page_targets() {
                 browser_context_id: None,
                 moli_popup_id: None,
             },
-            moli_protocol::devtools_runtime::DevToolsTargetInfo {
+            moli_protocol::automation::DevToolsTargetInfo {
                 target_id: None,
                 kind: DevToolsTargetKind::Browser,
                 title: String::new(),
@@ -3319,11 +3348,11 @@ fn rejects_invalid_classic_window_params() {
 }
 
 #[test]
-fn maps_refresh_and_history_traversal_to_shared_devtools_commands() {
+fn maps_refresh_and_history_traversal_to_shared_automation_commands() {
     let context = ClassicDevToolsCommandContext::with_target_id("classic-session-1", "TID-1");
 
     let refresh = refresh_command(&context, DevToolsNavigationWait::Load);
-    let DevToolsCommand::Reload(refresh) = refresh else {
+    let AutomationCommand::Reload(refresh) = refresh else {
         panic!("expected Reload command");
     };
     assert_eq!(refresh.wait, DevToolsNavigationWait::Load);
@@ -3337,7 +3366,7 @@ fn maps_refresh_and_history_traversal_to_shared_devtools_commands() {
     );
 
     let history_command = navigation_history_command(&context);
-    let DevToolsCommand::GetNavigationHistory(history_command) = history_command else {
+    let AutomationCommand::GetNavigationHistory(history_command) = history_command else {
         panic!("expected GetNavigationHistory command");
     };
     assert_eq!(
@@ -3352,14 +3381,14 @@ fn maps_refresh_and_history_traversal_to_shared_devtools_commands() {
     let history = DevToolsGetNavigationHistoryResult {
         current_index: 1,
         entries: vec![
-            moli_protocol::devtools_runtime::DevToolsNavigationHistoryEntry {
+            moli_protocol::automation::DevToolsNavigationHistoryEntry {
                 id: 7,
                 url: "https://example.test/first".to_owned(),
                 user_typed_url: "https://example.test/first".to_owned(),
                 title: "first".to_owned(),
                 transition_type: "typed".to_owned(),
             },
-            moli_protocol::devtools_runtime::DevToolsNavigationHistoryEntry {
+            moli_protocol::automation::DevToolsNavigationHistoryEntry {
                 id: 8,
                 url: "https://example.test/second".to_owned(),
                 user_typed_url: "https://example.test/second".to_owned(),
@@ -3380,7 +3409,7 @@ fn maps_refresh_and_history_traversal_to_shared_devtools_commands() {
         "https://example.test/first",
         DevToolsNavigationWait::Load,
     );
-    let DevToolsCommand::TraverseHistory(traverse) = traverse else {
+    let AutomationCommand::TraverseHistory(traverse) = traverse else {
         panic!("expected TraverseHistory command");
     };
     assert_eq!(
@@ -3417,7 +3446,7 @@ fn maps_execute_sync_to_shared_call_function_command() {
     )
     .expect("execute command");
 
-    let DevToolsCommand::CallFunction(execute) = execute else {
+    let AutomationCommand::CallFunction(execute) = execute else {
         panic!("expected CallFunction command");
     };
     assert_eq!(
@@ -3456,7 +3485,7 @@ fn maps_execute_async_to_shared_callback_call_function_command() {
     )
     .expect("execute async command");
 
-    let DevToolsCommand::CallFunction(execute) = execute else {
+    let AutomationCommand::CallFunction(execute) = execute else {
         panic!("expected CallFunction command");
     };
     assert!(
@@ -3497,7 +3526,7 @@ fn maps_cookie_commands_to_shared_storage_commands() {
     let current_url = "https://example.test/path";
 
     let get = get_cookies_command(&context, current_url);
-    let DevToolsCommand::GetCookies(get) = get else {
+    let AutomationCommand::GetCookies(get) = get else {
         panic!("expected GetCookies command");
     };
     assert_eq!(get.urls, Some(vec![current_url.to_owned()]));
@@ -3522,7 +3551,7 @@ fn maps_cookie_commands_to_shared_storage_commands() {
         current_url,
     )
     .expect("add cookie command");
-    let DevToolsCommand::SetCookies(add) = add else {
+    let AutomationCommand::SetCookies(add) = add else {
         panic!("expected SetCookies command");
     };
     assert_eq!(add.cookies.len(), 1);
@@ -3562,30 +3591,41 @@ fn maps_cookie_commands_to_shared_storage_commands() {
         current_url,
     )
     .expect("default add cookie command");
-    let DevToolsCommand::SetCookies(default_add) = default_add else {
+    let AutomationCommand::SetCookies(default_add) = default_add else {
         panic!("expected SetCookies command");
     };
     assert_eq!(default_add.cookies[0].secure, Some(false));
     assert!(default_add.cookies[0].same_site.is_none());
 
     let delete = delete_cookie_command(&context, "sid", current_url);
-    let DevToolsCommand::DeleteCookies(delete) = delete else {
+    let AutomationCommand::DeleteCookies(delete) = delete else {
         panic!("expected DeleteCookies command");
     };
-    assert_eq!(delete.name.as_deref(), Some("sid"));
-    assert_eq!(delete.url.as_deref(), Some(current_url));
+    let moli_protocol::automation::DevToolsCookieDeleteFilter::Scope { name, url, .. } =
+        delete.filter
+    else {
+        panic!("scope filter");
+    };
+    assert_eq!(name.as_deref(), Some("sid"));
+    assert_eq!(url.as_deref(), Some(current_url));
 
     let delete_all = delete_all_cookies_command(&context, current_url);
-    let DevToolsCommand::DeleteCookies(delete_all) = delete_all else {
+    let AutomationCommand::DeleteCookies(delete_all) = delete_all else {
         panic!("expected DeleteCookies command");
     };
-    assert!(delete_all.name.is_none());
-    assert_eq!(delete_all.url.as_deref(), Some(current_url));
+    let moli_protocol::automation::DevToolsCookieDeleteFilter::Scope { name, url, .. } =
+        delete_all.filter
+    else {
+        panic!("scope filter");
+    };
+    assert!(name.is_none());
+    assert_eq!(url.as_deref(), Some(current_url));
 }
 
 #[test]
 fn maps_devtools_cookies_to_classic_cookie_shape() {
     let result = DevToolsGetCookiesResult {
+        scope: Default::default(),
         cookies: vec![json!({
             "name": "sid",
             "value": "abc",
@@ -3615,6 +3655,7 @@ fn maps_devtools_cookies_to_classic_cookie_shape() {
     );
 
     let result = DevToolsGetCookiesResult {
+        scope: Default::default(),
         cookies: vec![json!({
             "name": "default",
             "value": "abc",

@@ -1,15 +1,40 @@
 use super::*;
 
-// This final thin slice keeps the runtime-core methods that are about owning `DocumentRuntime`
-// itself rather than any specific subsystem.
-//
-// The methods here are intentionally tiny:
-// - constructing the aggregate runtime state
-// - tracking whether we are currently inside a custom-element reaction
-//
-// Splitting them out is mostly about finishing the file-level separation so `document_runtime.rs`
-// stops carrying even a small "misc core methods" tail while the actual behavior remains unchanged.
+// Document ownership and the native media environment shared with Window bindings.
 impl DocumentRuntime {
+    pub(crate) fn emulated_media(&self) -> &crate::protocol_types::EmulatedMediaOverrides {
+        &self.dom_host.emulated_media
+    }
+
+    pub(crate) fn set_emulated_media(
+        &mut self,
+        media: &crate::protocol_types::EmulatedMediaOverrides,
+    ) {
+        self.dom_host.emulated_media = media.clone();
+    }
+
+    pub(crate) fn viewport_surface(&self) -> Option<crate::protocol_types::ViewportSurface> {
+        self.dom_host.viewport_surface
+    }
+
+    pub(crate) fn set_viewport_surface(
+        &mut self,
+        surface: Option<crate::protocol_types::ViewportSurface>,
+    ) {
+        self.dom_host.viewport_surface = surface;
+    }
+
+    pub(crate) fn style_viewport(&self) -> crate::style_engine::StyleViewport {
+        self.dom_host.style_viewport()
+    }
+
+    pub(crate) fn stylesheet_media_matches(&self, media: &str) -> bool {
+        crate::stylesheet_blocking::StylesheetBlockingReadView::media_query_matches(
+            &self.dom_host,
+            media,
+        )
+    }
+
     /// Constructs the runtime for an already-admitted main Document.
     ///
     /// The owner is part of the runtime's initial identity; production callers
@@ -73,14 +98,13 @@ impl DocumentRuntime {
             selector_engine: QueryEngine,
             selector_debug: SelectorDebugCounters::default(),
             document,
-            design_mode_documents: HashSet::new(),
+            timing: Default::default(),
             script_execution_control: Default::default(),
             author_styles_disabled: false,
             bypass_content_security_policy: false,
             policy_container: DocumentPolicyContainer::default(),
-            delivered_meta_content_security_policies: RefCell::new(HashMap::new()),
+            delivered_meta_content_security_policies: Arc::default(),
             processed_meta_content_security_policy_handles: RefCell::new(HashSet::new()),
-            document_character_set: "UTF-8".to_owned(),
             resource_loader_binding: None,
             script_context_stack: Vec::new(),
             root_document_parser: None,
@@ -113,7 +137,7 @@ impl DocumentRuntime {
             timeouts: HostTimeoutScheduler::default(),
             events: HostEventTargetRegistry::default(),
             mutations: MutationCoordinator,
-            meta_refresh_scheduler: super::meta_refresh::MetaRefreshScheduler::default(),
+            meta_refresh_scheduler: crate::meta_refresh_scheduler::MetaRefreshScheduler::default(),
             custom_element_reaction_depth: 0,
             structural_mutation_depth: 0,
             dom_content_loaded_dispatched: false,
@@ -123,9 +147,7 @@ impl DocumentRuntime {
             document_write_script_preload_scanner: None,
             main_document_script_preloads: Default::default(),
             document_write_script_preloads: HashMap::new(),
-            pending_document_write_external_script_load: None,
-            pending_document_write_stylesheet_blocked_script: None,
-            pending_document_write_stylesheet_parser_pause: None,
+            pending_parser_blocking_work: None,
         }
     }
 
@@ -204,14 +226,13 @@ impl DocumentRuntime {
             selector_engine: _,
             selector_debug: _,
             document: _,
-            design_mode_documents: _,
+            timing: _,
             script_execution_control: _,
             author_styles_disabled: _,
             bypass_content_security_policy: _,
             policy_container: _,
             delivered_meta_content_security_policies: _,
             processed_meta_content_security_policy_handles: _,
-            document_character_set: _,
             resource_loader_binding: _,
             script_context_stack: _,
             root_document_parser: _,
@@ -246,9 +267,7 @@ impl DocumentRuntime {
             document_write_script_preload_scanner: _,
             main_document_script_preloads: _,
             document_write_script_preloads: _,
-            pending_document_write_external_script_load: _,
-            pending_document_write_stylesheet_blocked_script: _,
-            pending_document_write_stylesheet_parser_pause: _,
+            pending_parser_blocking_work: _,
         } = self;
         dom_host.into_dom_host()
     }
@@ -263,7 +282,12 @@ impl DocumentRuntime {
     }
 
     pub(crate) fn document_character_set(&self) -> &str {
-        &self.document_character_set
+        self.document_character_set_for_handle(self.dom_host.document_handle())
+            .unwrap_or("UTF-8")
+    }
+
+    pub(crate) fn document_character_set_for_handle(&self, handle: DomHandle) -> Option<&str> {
+        self.dom_host.document_character_set_for_handle(handle)
     }
 
     pub(crate) fn set_script_execution_disabled(&mut self, disabled: bool) {
@@ -300,7 +324,10 @@ impl DocumentRuntime {
     }
 
     pub(crate) fn set_document_character_set(&mut self, character_set: impl Into<String>) {
-        self.document_character_set = character_set.into();
+        let character_set = character_set.into();
+        let handle = self.dom_host.document_handle();
+        self.dom_host
+            .set_document_character_set_for_handle(handle, &character_set);
     }
 
     pub(crate) fn set_document_default_language(&mut self, language: Option<String>) {

@@ -1,5 +1,5 @@
 use super::{
-    JsContextHost, OwnerDispatchScope, RuntimeObservableContextToken, WindowExecutionContextOwner,
+    OwnerDispatchScope, PageScriptHost, RuntimeObservableContextToken, WindowExecutionContextOwner,
     WindowTaskTarget,
 };
 use crate::page_task_queue::RendererPageWindowMessageTaskId;
@@ -8,6 +8,10 @@ use crate::{document_runtime::DomHandle, structured_clone::V8StructuredClonePayl
 pub(crate) struct PendingWindowMessage {
     pub(crate) target: WindowTaskTarget,
     pub(crate) source: PendingWindowMessageSource,
+    // Retain accepted same-origin local Windows and related-Page proxies.
+    // Other local sources resolve through their owner at delivery: endpoint
+    // ids may be reused, and retired cross-origin sources resolve to null.
+    pub(crate) source_window: Option<v8::Global<v8::Object>>,
     pub(crate) data: V8StructuredClonePayload,
     pub(crate) origin: String,
     pub(crate) intended_target_origin: Option<String>,
@@ -76,7 +80,7 @@ impl PendingWindowMessageEndpoint {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn enter_window_message_source_scope(
         &mut self,
         source: PendingWindowMessageEndpoint,
@@ -174,9 +178,9 @@ impl JsContextHost {
         &mut self,
         message: &PendingWindowMessage,
     ) {
-        for port_id in message.data.transferred_message_ports() {
-            if !self.retire_message_port(*port_id) {
-                self.message_port_registry.close_message_port(*port_id);
+        for port_id in message.data.transferred_message_port_ids() {
+            if !self.retire_message_port(port_id) {
+                self.message_port_registry.close_message_port(port_id);
             }
         }
     }

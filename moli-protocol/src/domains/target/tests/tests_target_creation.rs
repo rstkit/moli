@@ -1,5 +1,125 @@
 use super::*;
 
+#[tokio::test(flavor = "multi_thread")]
+async fn create_target_empty_url_initializes_blank_document_before_navigation() {
+    for isolated in [false, true] {
+        for disposition in ["initial", "foreground", "background"] {
+            for for_tab in [false, true] {
+                let mut ctx = TestContext::new();
+                let browser_context_id = if isolated {
+                    ctx.process_async(json!({"id": 1, "method": "Target.createBrowserContext"}))
+                        .await;
+                    Some(
+                        take_response_by_id(&mut ctx, 1)["result"]["browserContextId"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                let mut params = json!({"url": "about:blank"});
+                if let Some(context_id) = browser_context_id {
+                    params["browserContextId"] = json!(context_id);
+                }
+                if disposition != "initial" {
+                    ctx.process_async(
+                        json!({"id": 2, "method": "Target.createTarget", "params": params}),
+                    )
+                    .await;
+                    let anchor = take_response_by_id(&mut ctx, 2);
+                    assert!(anchor["result"]["targetId"].is_string(), "{anchor:?}");
+                }
+                params["url"] = json!("");
+                params["background"] = json!(disposition == "background");
+                params["forTab"] = json!(for_tab);
+                let context = format!("isolated={isolated}, {disposition}, forTab={for_tab}");
+                ctx.process_async(
+                    json!({"id": 3, "method": "Target.createTarget", "params": params}),
+                )
+                .await;
+                let created = take_response_by_id(&mut ctx, 3);
+                let target_id = created["result"]["targetId"].as_str().expect(&context);
+                let page_id = if for_tab {
+                    ctx.with_fixture(|conn| {
+                        conn.primary_page_target_id_for_tab_target_id(target_id)
+                            .unwrap()
+                            .to_owned()
+                    })
+                } else {
+                    target_id.to_owned()
+                };
+                ctx.process_async(json!({"id": 4, "method": "Target.getTargetInfo",
+                    "params": {"targetId": page_id}}))
+                    .await;
+                let info = take_response_by_id(&mut ctx, 4);
+                assert_eq!(
+                    info["result"]["targetInfo"]["url"], "about:blank",
+                    "{context}"
+                );
+                ctx.process_async(json!({"id": 5, "method": "Target.attachToTarget",
+                    "params": {"targetId": page_id, "flatten": true}}))
+                    .await;
+                let attached = take_response_by_id(&mut ctx, 5);
+                let session_id = attached["result"]["sessionId"].as_str().expect(&context);
+                ctx.process_async(
+                    json!({"id": 6, "method": "Runtime.enable", "sessionId": session_id}),
+                )
+                .await;
+                let enabled = take_response_by_id(&mut ctx, 6);
+                assert!(enabled.get("error").is_none(), "{context}: {enabled:?}");
+                ctx.process_async(json!({"id": 7, "method": "Runtime.evaluate", "sessionId": session_id,
+                    "params": {"expression": "[location.href, document.URL, history.length, document.readyState]", "returnByValue": true}})).await;
+                let initial = take_response_by_id(&mut ctx, 7);
+                assert_eq!(
+                    initial["result"]["result"]["value"],
+                    json!(["about:blank", "about:blank", 1, "complete"]),
+                    "{context}: {initial:?}"
+                );
+                ctx.process_async(json!({"id": 8, "method": "Page.getNavigationHistory", "sessionId": session_id})).await;
+                let history = take_response_by_id(&mut ctx, 8);
+                assert_eq!(
+                    history["result"]["currentIndex"], 0,
+                    "{context}: {history:?}"
+                );
+                let entries = history["result"]["entries"].as_array().unwrap();
+                assert_eq!(entries.len(), 1, "{context}: {history:?}");
+                assert_eq!(entries[0]["url"], "about:blank", "{context}");
+                let url = "data:text/html,<body>navigated</body>";
+                ctx.process_async(
+                    json!({"id": 9, "method": "Page.navigate", "sessionId": session_id,
+                    "params": {"url": url}}),
+                )
+                .await;
+                let navigation = take_response_by_id(&mut ctx, 9);
+                assert!(
+                    navigation.get("error").is_none(),
+                    "{context}: {navigation:?}"
+                );
+                assert!(
+                    navigation["result"].get("errorText").is_none(),
+                    "{context}: {navigation:?}"
+                );
+                crate::testing::wait_until_renderer_document_load(
+                    &mut ctx,
+                    Some(session_id),
+                    navigation["result"]["frameId"].as_str().expect(&context),
+                    navigation["result"]["loaderId"].as_str().expect(&context),
+                )
+                .await;
+                ctx.process_async(json!({"id": 10, "method": "Runtime.evaluate", "sessionId": session_id,
+                    "params": {"expression": "[location.href, history.length, document.body.textContent]", "returnByValue": true}})).await;
+                let navigated = take_response_by_id(&mut ctx, 10);
+                assert_eq!(
+                    navigated["result"]["result"]["value"],
+                    json!([url, 2, "navigated"]),
+                    "{context}: {navigated:?}"
+                );
+            }
+        }
+    }
+}
+
 fn stored_cookie(name: &str, value: &str) -> moli_cookie_jar::StoredCookie {
     moli_cookie_jar::StoredCookie {
         name: name.to_owned(),
@@ -16,6 +136,7 @@ fn stored_cookie(name: &str, value: &str) -> moli_cookie_jar::StoredCookie {
         source_scheme: moli_cookie_jar::StoredCookieSourceScheme::NonSecure,
         source_port: -1,
         creation_index: 0,
+        creation_time: None,
         last_access_index: 0,
     }
 }
@@ -24,37 +145,39 @@ fn stored_cookie(name: &str, value: &str) -> moli_cookie_jar::StoredCookie {
 async fn create_target_clears_stale_crash_state() {
     let mut ctx = TestContext::new();
     load_bc_with_target(&mut ctx, "BID-9", "TID-stale");
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .active_page_target_mut()
-        .owner_state
-        .target_crash_state
-        .mark_crashed();
+    ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_mut()
+            .unwrap()
+            .active_page_target_mut()
+            .owner_state
+            .target_crash_state
+            .mark_crashed()
+    });
 
     ctx.process_async(json!({"id": 9, "method": "Target.createTarget",
                        "params": {"browserContextId": "BID-9", "url": "about:blank"}}))
         .await;
     ctx.expect_event("Target.targetCreated", None);
-    let target_id = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .and_then(|bc| bc.active_target_id_owned())
-        .expect("target id after create");
+    let target_id = ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_ref()
+            .and_then(|bc| bc.active_target_id_owned())
+            .expect("target id after create")
+    });
     ctx.expect_result(9, json!({ "targetId": target_id }), None);
 
-    assert!(
-        !ctx.conn
-            .browser_context
-            .as_ref()
-            .expect("browser context")
-            .active_page_target()
-            .owner_state
-            .target_crash_state
-            .is_crashed()
-    );
+    ctx.with_fixture(|conn| {
+        assert!(!{
+            conn.browser_context
+                .as_ref()
+                .expect("browser context")
+                .active_page_target()
+                .owner_state
+                .target_crash_state
+                .is_crashed()
+        })
+    });
 }
 
 /// cdp.target: createTarget – no existing browser context, creates one
@@ -64,19 +187,25 @@ async fn create_target_creates_browser_context_if_none() {
     ctx.process_async(json!({"id": 10, "method": "Target.createTarget",
                        "params": {"url": "about:blank"}}))
         .await;
-    let bc = ctx.conn.browser_context.as_ref().unwrap();
-    let tid = bc.active_target_id_owned().unwrap();
+    let tid = ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().unwrap();
+
+        bc.active_target_id_owned().unwrap()
+    });
     let tab_target_id = tab_id_for_page(&ctx, &tid);
-    assert_eq!(
-        ctx.conn.tab_target_id_for_page_target_id(&tid),
-        Some(tab_target_id.as_str())
-    );
-    assert_eq!(
-        ctx.conn
-            .primary_page_target_id_for_tab_target_id(&tab_target_id),
-        Some(tid.as_str())
-    );
-    assert_eq!(ctx.conn.tab_target_count(), 1);
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.tab_target_id_for_page_target_id(&tid),
+            Some(tab_target_id.as_str())
+        )
+    });
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.primary_page_target_id_for_tab_target_id(&tab_target_id),
+            Some(tid.as_str())
+        )
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.tab_target_count(), 1));
     ctx.expect_event("Target.targetCreated", None);
     ctx.expect_result(10, json!({ "targetId": tid }), None);
 }
@@ -95,11 +224,11 @@ async fn create_target_for_tab_returns_the_stable_tab_host() {
         .as_str()
         .expect("created tab target id")
         .to_owned();
-    let page_target_id = ctx
-        .conn
-        .primary_page_target_id_for_tab_target_id(&tab_target_id)
-        .expect("created tab must expose its primary page")
-        .to_owned();
+    let page_target_id = ctx.with_fixture(|conn| {
+        conn.primary_page_target_id_for_tab_target_id(&tab_target_id)
+            .expect("created tab must expose its primary page")
+            .to_owned()
+    });
     assert_ne!(tab_target_id, page_target_id);
 
     ctx.process_async(json!({
@@ -627,19 +756,25 @@ async fn detached_browser_target_session_stops_receiving_discovery_events() {
     }))
     .await;
     ctx.expect_result(10059, json!({}), Some(&browser_session_id));
-    ctx.conn.set_auto_attach_owner(
-        Some(&browser_session_id),
-        true,
-        true,
-        crate::conn::CdpTargetFilter::default_auto_attach(),
-    );
-    ctx.conn
-        .download_behavior
-        .set_browser_events_enabled_for_session(Some(&browser_session_id), true);
-    ctx.conn
-        .set_service_worker_pause_on_start_owner(Some(&browser_session_id), true);
-    ctx.conn
-        .set_dedicated_worker_pause_on_start_owner(Some(&browser_session_id), true);
+    ctx.with_fixture(|conn| {
+        conn.set_auto_attach_owner(
+            Some(&browser_session_id),
+            true,
+            true,
+            crate::conn::CdpTargetFilter::default_auto_attach(),
+            true,
+        )
+    });
+    ctx.with_fixture(|conn| {
+        conn.download_behavior
+            .set_browser_events_enabled_for_session(Some(&browser_session_id), true)
+    });
+    ctx.with_fixture(|conn| {
+        conn.set_service_worker_pause_on_start_owner(Some(&browser_session_id), true)
+    });
+    ctx.with_fixture(|conn| {
+        conn.set_dedicated_worker_pause_on_start_owner(Some(&browser_session_id), true)
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -649,20 +784,22 @@ async fn detached_browser_target_session_stops_receiving_discovery_events() {
     }))
     .await;
     ctx.expect_result(10060, json!({}), None);
-    assert_eq!(ctx.conn.session_route(Some(&browser_session_id)), None);
-    assert!(
-        !ctx.conn
-            .auto_attach_owner_sessions_for_target_type("page")
-            .contains(&Some(browser_session_id.clone()))
-    );
-    assert!(
-        !ctx.conn
-            .download_behavior
-            .browser_event_session_ids()
-            .contains(&Some(browser_session_id.clone()))
-    );
-    assert!(!ctx.conn.service_worker_pause_on_start_for_devtools());
-    assert!(!ctx.conn.dedicated_worker_pause_on_start_for_devtools());
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some(&browser_session_id)), None));
+    ctx.with_fixture(|conn| {
+        assert!(!{
+            conn.auto_attach_owner_sessions_for_target_type("page")
+                .contains(&Some(browser_session_id.clone()))
+        })
+    });
+    ctx.with_fixture(|conn| {
+        assert!(!{
+            conn.download_behavior
+                .browser_event_session_ids()
+                .contains(&Some(browser_session_id.clone()))
+        })
+    });
+    ctx.with_fixture(|conn| assert!(!conn.service_worker_pause_on_start_for_devtools()));
+    ctx.with_fixture(|conn| assert!(!conn.dedicated_worker_pause_on_start_for_devtools()));
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -859,24 +996,24 @@ async fn window_open_emits_popup_target_created_from_runtime_work() {
             }
         })),
     );
-    let (targets_result, _) = ctx
-        .conn
-        .execute_devtools_command(crate::devtools_runtime::DevToolsCommand::GetTargets(
-            crate::devtools_runtime::DevToolsGetTargetsCommand {
-                context: crate::devtools_runtime::DevToolsCommandContext {
-                    protocol: crate::devtools_runtime::DevToolsProtocol::Cdp,
-                    session_id: None,
-                    target_id: None,
-                    browser_context_id: None,
+    let targets_result = ctx
+        .execute_automation_command_through_renderer_fence_for_test(
+            crate::automation::AutomationCommand::GetTargets(
+                crate::automation::DevToolsGetTargetsCommand {
+                    context: crate::automation::AutomationContext {
+                        protocol: crate::automation::FrontendProtocol::Cdp,
+                        session_id: None,
+                        target_id: None,
+                        browser_context_id: None,
+                    },
+                    root: None,
+                    max_depth: None,
+                    filter: None,
                 },
-                root: None,
-                max_depth: None,
-                filter: None,
-            },
-        ))
-        .await
-        .into_parts();
-    let crate::devtools_runtime::DevToolsCommandResult::GetTargets(targets) =
+            ),
+        )
+        .await;
+    let crate::automation::AutomationResult::GetTargets(targets) =
         targets_result.expect("GetTargets should return typed targets")
     else {
         panic!("GetTargets returned unexpected result");
@@ -1044,17 +1181,12 @@ async fn window_open_hands_off_session_storage_snapshot_and_initial_storage_key(
             Arc<tokio::sync::Semaphore>,
         )>,
     ) -> impl IntoResponse {
-        // The opener's lightweight WindowProxy facade starts its mirrored
-        // load before the concrete popup action can reach protocol. Let that
-        // renderer-local request finish; gate the second request, which is the
-        // real attached target navigation whose lifetime this test covers.
+        // The attached target owns the response shared with the opener's
+        // WindowProxy. Gate that one request while attaching the session.
         let request_index = request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if request_index == 0 {
-            return opener().await;
-        }
         assert_eq!(
-            request_index, 1,
-            "popup URL must have exactly two load owners"
+            request_index, 0,
+            "popup URL must have exactly one load owner"
         );
         request_started.add_permits(1);
         let permit = response_release
@@ -1099,23 +1231,24 @@ async fn window_open_hands_off_session_storage_snapshot_and_initial_storage_key(
 
     let mut ctx = TestContext::new();
     enable_root_target_discovery_for_test(&mut ctx);
-    let mut browser_context = ctx.conn.new_browser_context("BID-popup-storage".to_owned());
+    let mut browser_context =
+        ctx.with_fixture(|conn| conn.new_browser_context("BID-popup-storage".to_owned()));
     browser_context.set_active_target_id("TID-popup-storage-opener");
-    ctx.conn
-        .install_browser_context_fixture_for_test(browser_context);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(browser_context));
     let opener_url = format!("http://{addr}/opener");
     let page = ctx
-        .conn
-        .load_page_via_runtime_async(&opener_url)
+        .build_fixture_page(&opener_url)
         .await
         .expect("opener page should load");
     {
-        let browser_context = ctx.conn.browser_context.as_mut().unwrap();
-        browser_context.set_target_url(page.final_url().as_str().to_owned());
-        let _ = browser_context
-            .active_page_target_mut()
-            .runtime_slot
-            .replace_loaded_page(Some(page));
+        ctx.with_fixture(|conn| {
+            let browser_context = conn.browser_context.as_mut().unwrap();
+            browser_context.set_target_url(page.final_url().as_str().to_owned());
+            let _ = browser_context
+                .active_page_target_mut()
+                .runtime_slot
+                .replace_loaded_page(Some(page));
+        });
     }
     ctx.enable_background_navigation_scheduler_for_test();
 
@@ -1312,13 +1445,13 @@ async fn window_open_hands_off_session_storage_snapshot_and_initial_storage_key(
         .as_str()
         .unwrap_or_else(|| panic!("cross-origin popup session id: {attach_response:?}"))
         .to_owned();
-    assert!(
-        ctx.conn
+    ctx.with_fixture(|conn| { assert!(
+        conn
             .browser_context_by_id("BID-popup-storage")
             .is_some_and(|browser_context| browser_context
                 .has_pending_document_navigation_for_target(Some(&cross_origin_target_id))),
         "attaching a DevTools session must not replace the target-owned navigation"
-    );
+    ) });
     ctx.sent.clear();
     cross_origin_response_release.add_permits(1);
     let response_returned = tokio::time::timeout(
@@ -1428,10 +1561,13 @@ async fn puppeteer_window_open_uses_parent_context_and_reports_opener() {
     let popup_target_id = created["params"]["targetInfo"]["targetId"]
         .as_str()
         .expect("popup target id");
-    let browser_context = ctx.conn.browser_context.as_ref().unwrap();
-    let popup_info = browser_context
-        .devtools_target_info(popup_target_id)
-        .expect("popup target should remain discoverable in parent context");
+    let popup_info = ctx.with_fixture(|conn| {
+        let browser_context = conn.browser_context.as_ref().unwrap();
+
+        browser_context
+            .devtools_target_info(popup_target_id)
+            .expect("popup target should remain discoverable in parent context")
+    });
     assert_eq!(
         popup_info.browser_context_id.as_ref().map(|id| id.as_str()),
         Some("BID-puppeteer-popup-context")
@@ -1485,32 +1621,33 @@ async fn resetting_opener_target_clears_live_opener_but_keeps_frame_attribution(
         json!("TID-opener-reset")
     );
 
-    ctx.conn
-        .browser_context
-        .as_mut()
-        .unwrap()
-        .remove_active_page_target_async()
-        .await;
+    ctx.process_async(
+        json!({"id":116,"method":"Target.closeTarget","params":{"targetId":"TID-opener-reset"}}),
+    )
+    .await;
+    assert!(take_response_by_id(&mut ctx, 116).get("error").is_none());
 
-    let browser_context = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(
-        browser_context.target_opener_ids.get(&popup_target_id),
-        None,
-        "popup target must not retain a stale openerId after the opener target slot is reset"
-    );
-    assert_eq!(
-        browser_context
-            .target_opener_frame_ids
-            .get(&popup_target_id)
-            .map(String::as_str),
-        Some("TID-opener-reset"),
-        "popup target must retain immutable DevTools opener-frame attribution"
-    );
-    assert!(
-        !browser_context
-            .target_can_access_opener
-            .contains(&popup_target_id)
-    );
+    ctx.with_fixture(|conn| {
+        let browser_context = conn.browser_context.as_ref().unwrap();
+        assert_eq!(
+            browser_context.target_opener_ids.get(&popup_target_id),
+            None,
+            "popup target must not retain a stale openerId after the opener target slot is reset"
+        );
+        assert_eq!(
+            browser_context
+                .target_opener_frame_ids
+                .get(&popup_target_id)
+                .map(String::as_str),
+            Some("TID-opener-reset"),
+            "popup target must retain immutable DevTools opener-frame attribution"
+        );
+        assert!(
+            !browser_context
+                .target_can_access_opener
+                .contains(&popup_target_id)
+        );
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1524,9 +1661,11 @@ async fn popup_initial_empty_document_record_captures_creator_identity() {
     )
     .await;
     {
-        let browser_context = ctx.conn.browser_context.as_mut().unwrap();
-        browser_context.set_target_security_origin("https://opener.example".to_owned());
-        browser_context.set_target_secure_context_type("Secure".to_owned());
+        ctx.with_fixture(|conn| {
+            let browser_context = conn.browser_context.as_mut().unwrap();
+            browser_context.set_target_security_origin("https://opener.example".to_owned());
+            browser_context.set_target_secure_context_type("Secure".to_owned());
+        });
     }
 
     ctx.process_async(json!({
@@ -1547,19 +1686,27 @@ async fn popup_initial_empty_document_record_captures_creator_identity() {
         .as_str()
         .expect("popup target id");
 
-    let browser_context = ctx.conn.browser_context.as_ref().unwrap();
-    let initial = browser_context
-        .background_target(popup_target_id)
-        .expect("background target must exist")
-        .owner_state
-        .initial_empty_document_state()
-        .expect("popup target should record initial empty document");
-    let creator = initial
-        .creator()
-        .expect("window.open initial empty document should record creator identity");
-    assert_eq!(creator.target_id(), "TID-opener-creator");
-    assert_eq!(creator.security_origin(), "https://opener.example");
-    assert_eq!(creator.secure_context_type(), "Secure");
+    ctx.with_fixture(|conn| {
+        let creator = {
+            let initial = {
+                let browser_context = conn.browser_context.as_ref().unwrap();
+
+                browser_context
+                    .page_target(popup_target_id)
+                    .expect("popup target must exist")
+                    .owner_state
+                    .initial_empty_document_state()
+                    .expect("popup target should record initial empty document")
+            };
+
+            initial
+                .creator()
+                .expect("window.open initial empty document should record creator identity")
+        };
+        assert_eq!(creator.target_id(), "TID-opener-creator");
+        assert_eq!(creator.security_origin(), "https://opener.example");
+        assert_eq!(creator.secure_context_type(), "Secure");
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1573,9 +1720,11 @@ async fn popup_initial_empty_document_frame_tree_inherits_opener_origin() {
     )
     .await;
     {
-        let browser_context = ctx.conn.browser_context.as_mut().unwrap();
-        browser_context.set_target_security_origin("https://opener.example".to_owned());
-        browser_context.set_target_secure_context_type("Secure".to_owned());
+        ctx.with_fixture(|conn| {
+            let browser_context = conn.browser_context.as_mut().unwrap();
+            browser_context.set_target_security_origin("https://opener.example".to_owned());
+            browser_context.set_target_secure_context_type("Secure".to_owned());
+        });
     }
 
     ctx.process_async(json!({
@@ -1633,14 +1782,19 @@ async fn popup_initial_empty_document_frame_tree_inherits_opener_origin() {
     assert_eq!(frame["securityOrigin"], json!("https://opener.example"));
     assert_eq!(frame["secureContextType"], json!("Secure"));
 
-    let browser_context = ctx.conn.browser_context.as_ref().unwrap();
-    let initial = browser_context
-        .background_target(&popup_target_id)
-        .expect("background target must exist")
-        .owner_state
-        .initial_empty_document_state()
-        .expect("popup target should still record initial empty document");
-    assert!(initial.is_on_initial_empty_document());
+    ctx.with_fixture(|conn| {
+        let initial = {
+            let browser_context = conn.browser_context.as_ref().unwrap();
+
+            browser_context
+                .page_target(&popup_target_id)
+                .expect("popup target must exist")
+                .owner_state
+                .initial_empty_document_state()
+                .expect("popup target should still record initial empty document")
+        };
+        assert!(initial.is_on_initial_empty_document());
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1676,12 +1830,20 @@ async fn window_open_self_navigates_current_target_without_popup_target() {
             .any(|message| message["method"] == json!("Target.targetCreated")),
         "_self must not create a popup target: {sent:?}"
     );
-    let browser_context = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(
-        browser_context.target_url(),
-        "data:text/html,<main>self target</main>"
-    );
-    assert_eq!(browser_context.active_target_id(), Some("TID-opener-self"));
+    ctx.wait_until_scheduler_state("script navigation commit", |conn| {
+        conn.browser_context.as_ref().is_some_and(|browser| {
+            browser.target_url() == "data:text/html,<main>self target</main>"
+        })
+    })
+    .await;
+    ctx.with_fixture(|conn| {
+        let browser_context = conn.browser_context.as_ref().unwrap();
+        assert_eq!(
+            browser_context.target_url(),
+            "data:text/html,<main>self target</main>"
+        );
+        assert_eq!(browser_context.active_target_id(), Some("TID-opener-self"));
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1737,15 +1899,61 @@ async fn call_function_on_window_open_self_navigates_current_target_without_popu
             .any(|message| message["method"] == json!("Target.targetCreated")),
         "_self must not create a popup target from Runtime.callFunctionOn: {sent:?}"
     );
-    let browser_context = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(
-        browser_context.target_url(),
-        "data:text/html,<main>call self target</main>"
-    );
-    assert_eq!(
-        browser_context.active_target_id(),
-        Some("TID-call-opener-self")
-    );
+    ctx.wait_until_scheduler_state("script navigation commit", |conn| {
+        conn.browser_context.as_ref().is_some_and(|browser| {
+            browser.target_url() == "data:text/html,<main>call self target</main>"
+        })
+    })
+    .await;
+    ctx.with_fixture(|conn| {
+        let browser_context = conn.browser_context.as_ref().unwrap();
+        assert_eq!(
+            browser_context.target_url(),
+            "data:text/html,<main>call self target</main>"
+        );
+        assert_eq!(
+            browser_context.active_target_id(),
+            Some("TID-call-opener-self")
+        );
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn popup_initial_navigation_replaces_internal_blank_history_entry() {
+    let mut ctx = TestContext::new();
+    ctx.enable_background_navigation_scheduler_for_test();
+    tokio::task::LocalSet::new().run_until(async {
+        load_bc_with_titled_page_async(&mut ctx, "BID-popup-history", "TID-opener", "opener").await;
+        ctx.process_async(json!({
+            "id": 1, "method": "Runtime.evaluate",
+            "params": {"expression": "window.open('data:text/html,<title>Popup history</title>', 'history-window') !== null"}
+        })).await;
+        let messages = ctx.take_all();
+        let target_id = popup_target_id_for_url(&messages, "data:text/html,<title>Popup history</title>");
+        ctx.wait_until_scheduler_state("popup document committed", |conn| {
+            conn.browser_context_by_id("BID-popup-history")
+                .and_then(|context| loaded_page_for_target(context, &target_id))
+                .is_some_and(|page| page.final_url().as_str() == "data:text/html,<title>Popup history</title>")
+        }).await;
+        ctx.process_async(json!({
+            "id": 2, "method": "Target.attachToTarget", "params": {"targetId": target_id, "flatten": true}
+        })).await;
+        let session_id = take_response_by_id(&mut ctx, 2)["result"]["sessionId"].as_str().unwrap().to_owned();
+        ctx.process_async(json!({
+            "id": 3, "method": "Page.getNavigationHistory", "sessionId": session_id
+        })).await;
+        let history = take_response_by_id(&mut ctx, 3);
+        assert_eq!(history["result"]["currentIndex"], 0);
+        let entries = history["result"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the internal about:blank must not be traversable");
+        assert_eq!(entries[0]["url"], "data:text/html,<title>Popup history</title>");
+        assert_eq!(entries[0]["transitionType"], "link");
+        ctx.process_async(json!({
+            "id": 4, "method": "Runtime.evaluate", "sessionId": session_id,
+            "params": {"expression": "history.length", "returnByValue": true}
+        })).await;
+        assert_eq!(take_response_by_id(&mut ctx, 4)["result"]["result"]["value"], 1);
+    }).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1873,12 +2081,14 @@ async fn window_open_named_target_reuses_existing_popup_target() {
                     })
             })
             .await;
-            let browser_context = ctx.conn.browser_context.as_ref().unwrap();
+            ctx.with_fixture(|conn| {
+let browser_context = conn.browser_context.as_ref().unwrap();
             assert_eq!(browser_context.active_target_id(), Some(target_id.as_str()));
             assert_eq!(
                 browser_context.target_url(),
                 "data:text/html,second-popup"
             );
+});
         })
         .await;
 }
@@ -1935,15 +2145,24 @@ async fn window_open_named_target_reused_in_same_command_emits_one_page_event() 
         1,
         "same-command named reuse must create one target: {sent:?}"
     );
-    let browser_context = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(browser_context.background_target_count(), 1);
-    assert_eq!(
-        browser_context
-            .background_target_at(0)
-            .unwrap()
-            .target_url(),
-        "https://example.com/second-popup"
-    );
+    let target_id = sent
+        .iter()
+        .find(|message| message["method"] == "Target.targetCreated")
+        .unwrap()["params"]["targetInfo"]["targetId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ctx.with_fixture(|conn| {
+        let browser_context = conn.browser_context.as_ref().unwrap();
+        assert_eq!(browser_context.background_target_count(), 1);
+        assert_eq!(
+            browser_context
+                .page_target(&target_id)
+                .unwrap()
+                .target_url(),
+            "https://example.com/second-popup"
+        );
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2121,14 +2340,24 @@ async fn anchor_left_click_activates_blank_target_to_foreground() {
                 ),
             )
             .await;
+            ctx.capture_fixture_layout(None).await;
+            ctx.process_async(json!({
+                "id": 16_090, "method": "Runtime.evaluate",
+                "params": {"expression":"document.elementFromPoint(0, 0) !== null", "returnByValue":true}
+            })).await;
+            let geometry = ctx.take_response_by_id(16_090);
+            assert_eq!(geometry["result"]["result"]["value"], true);
             let _ = ctx.take_all();
 
             dispatch_anchor_left_click(&mut ctx, 16_100, 0).await;
 
             let sent = ctx.take_all();
             let popup_target_id = popup_target_id_for_url(&sent, POPUP_URL);
-            let browser_context = ctx
-                .conn
+            ctx.wait_until_scheduler_state("foreground popup selection", |conn| {
+                conn.browser_context_by_id("BID-anchor-foreground").is_some_and(|context| context.active_target_id() == Some(popup_target_id.as_str()))
+            }).await;
+            ctx.with_fixture(|conn| {
+let browser_context = conn
                 .browser_context_by_id("BID-anchor-foreground")
                 .expect("anchor browser context should remain available");
             assert_eq!(
@@ -2141,6 +2370,7 @@ async fn anchor_left_click_activates_blank_target_to_foreground() {
                     .is_some(),
                 "foreground popup should deactivate its opener"
             );
+});
         })
         .await;
 }
@@ -2163,6 +2393,13 @@ async fn anchor_left_click_activates_popup_while_initial_navigation_waits_for_de
                 ),
             )
             .await;
+            ctx.capture_fixture_layout(None).await;
+            ctx.process_async(json!({
+                "id": 16_090, "method": "Runtime.evaluate",
+                "params": {"expression":"document.elementFromPoint(0, 0) !== null", "returnByValue":true}
+            })).await;
+            let geometry = ctx.take_response_by_id(16_090);
+            assert_eq!(geometry["result"]["result"]["value"], true);
             let _ = ctx.take_all();
             ctx.process_async(json!({
                 "id": 16_150,
@@ -2194,8 +2431,11 @@ async fn anchor_left_click_activates_popup_while_initial_navigation_waits_for_de
                     panic!("foreground popup should be auto-attached: {sent:#?}")
                 })
                 .to_owned();
-            let browser_context = ctx
-                .conn
+            // Created/attached no longer imply Page adoption. The Page command
+            // joins initialization while retaining the debugger navigation gate.
+            ctx.process_async(json!({"id":16_152,"method":"Page.enable","sessionId":popup_session_id})).await;
+            ctx.expect_result(16_152, json!({}), Some(&popup_session_id));
+            ctx.with_fixture(|conn| { let browser_context = conn
                 .browser_context_by_id("BID-anchor-debugger-wait")
                 .expect("anchor browser context should remain available");
             assert_eq!(
@@ -2212,6 +2452,7 @@ async fn anchor_left_click_activates_popup_while_initial_navigation_waits_for_de
                 "waitForDebuggerOnStart should retain the active popup's initial about:blank document"
             );
 
+            });
             ctx.process_async(json!({
                 "id": 16_153,
                 "method": "Runtime.runIfWaitingForDebugger",
@@ -2252,6 +2493,13 @@ async fn anchor_platform_new_tab_click_keeps_blank_target_in_background() {
                 ),
             )
             .await;
+            ctx.capture_fixture_layout(None).await;
+            ctx.process_async(json!({
+                "id": 16_090, "method": "Runtime.evaluate",
+                "params": {"expression":"document.elementFromPoint(0, 0) !== null", "returnByValue":true}
+            })).await;
+            let geometry = ctx.take_response_by_id(16_090);
+            assert_eq!(geometry["result"]["result"]["value"], true);
             let _ = ctx.take_all();
 
             #[cfg(target_os = "macos")]
@@ -2262,8 +2510,8 @@ async fn anchor_platform_new_tab_click_keeps_blank_target_in_background() {
 
             let sent = ctx.take_all();
             let popup_target_id = popup_target_id_for_url(&sent, POPUP_URL);
-            let browser_context = ctx
-                .conn
+            ctx.with_fixture(|conn| {
+let browser_context = conn
                 .browser_context_by_id("BID-anchor-background")
                 .expect("anchor browser context should remain available");
             assert_eq!(
@@ -2276,6 +2524,7 @@ async fn anchor_platform_new_tab_click_keeps_blank_target_in_background() {
                     .is_some(),
                 "platform-new-tab-clicked popup should remain in the background"
             );
+});
         })
         .await;
 }
@@ -2326,26 +2575,27 @@ async fn create_target_seeds_browser_context_from_connection_cookie_profile() {
     let mut ctx = TestContext::from_conn(CdpConnection::new_with_initial_cookies(vec![
         stored_cookie("sid", "seeded"),
     ]));
-    ctx.conn.set_root_target_discovery_enabled(true);
+    ctx.with_fixture(|conn| conn.set_root_target_discovery_enabled(true));
     ctx.process_async(json!({"id": 11, "method": "Target.createTarget",
                        "params": {"url": "about:blank"}}))
         .await;
     ctx.expect_event("Target.targetCreated", None);
-    let tid = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .unwrap()
-        .active_target_id_owned()
-        .unwrap();
+    let tid = ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_ref()
+            .unwrap()
+            .active_target_id_owned()
+            .unwrap()
+    });
     ctx.expect_result(11, json!({ "targetId": tid }), None);
 
-    let cookies = ctx
-        .conn
-        .browser_context
-        .as_ref()
-        .unwrap()
-        .snapshot_cookies();
+    let cookies = ctx.with_fixture(|conn| {
+        conn.browser_context
+            .as_ref()
+            .unwrap()
+            .snapshot_cookies()
+            .unwrap()
+    });
     assert_eq!(cookies.len(), 1);
     assert_eq!(cookies[0].name, "sid");
     assert_eq!(cookies[0].value, "seeded");
@@ -2582,7 +2832,7 @@ async fn tab_auto_attach_does_not_own_browser_level_service_worker_pause() {
     }))
     .await;
     ctx.expect_result(9032, json!({}), None);
-    assert_eq!(ctx.conn.service_worker_pause_on_start_owner_count(), 1);
+    ctx.with_fixture(|conn| assert_eq!(conn.service_worker_pause_on_start_owner_count(), 1));
 
     ctx.process_async(json!({
         "id": 9033,
@@ -2604,12 +2854,14 @@ async fn tab_auto_attach_does_not_own_browser_level_service_worker_pause() {
     .await;
     ctx.expect_result(9034, json!({}), None);
 
-    assert_eq!(ctx.conn.service_worker_pause_on_start_owner_count(), 0);
-    assert!(ctx.conn.browser_contexts().all(|browser_context| {
-        !browser_context
-            .renderer_runtime()
-            .service_worker_pause_on_start_for_devtools()
-    }));
+    ctx.with_fixture(|conn| assert_eq!(conn.service_worker_pause_on_start_owner_count(), 0));
+    ctx.with_fixture(|conn| {
+        assert!(conn.browser_contexts().all(|browser_context| {
+            !browser_context
+                .renderer_runtime()
+                .service_worker_pause_on_start_for_devtools()
+        }))
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2679,13 +2931,15 @@ async fn window_open_with_puppeteer_tab_filter_auto_attaches_popup_tab() {
     let tab_session_id = attached["params"]["sessionId"]
         .as_str()
         .expect("popup tab session id");
-    assert!(matches!(
-        ctx.conn.session_route(Some(tab_session_id)),
-        Some(crate::conn::CdpSessionRoute::TabTarget {
-            tab_target_id: route_tab_target_id,
-            ..
-        }) if route_tab_target_id == tab_target_id
-    ));
+    ctx.with_fixture(|conn| {
+        assert!(matches!(
+            conn.session_route(Some(tab_session_id)),
+            Some(crate::conn::CdpSessionRoute::TabTarget {
+                tab_target_id: route_tab_target_id,
+                ..
+            }) if route_tab_target_id == tab_target_id
+        ))
+    });
     assert!(
         !sent.iter().any(|message| {
             message["method"] == json!("Target.attachedToTarget")
@@ -2785,19 +3039,22 @@ async fn browser_session_auto_attach_routes_popup_tab_attached_event_to_owner_se
         .as_str()
         .expect("popup tab session id")
         .to_owned();
-    assert!(matches!(
-        ctx.conn.session_route(Some(&tab_session_id)),
-        Some(crate::conn::CdpSessionRoute::TabTarget {
-            tab_target_id: route_tab_target_id,
-            ..
-        }) if route_tab_target_id == tab_target_id
-    ));
-    assert!(
-        ctx.conn
-            .auto_attached_sessions_for_owner(Some(&browser_session_id))
-            .contains(&tab_session_id),
-        "popup tab session must be committed under the browser owner"
-    );
+    ctx.with_fixture(|conn| {
+        assert!(matches!(
+            conn.session_route(Some(&tab_session_id)),
+            Some(crate::conn::CdpSessionRoute::TabTarget {
+                tab_target_id: route_tab_target_id,
+                ..
+            }) if route_tab_target_id == tab_target_id
+        ))
+    });
+    ctx.with_fixture(|conn| {
+        assert!(
+            conn.auto_attached_sessions_for_owner(Some(&browser_session_id))
+                .contains(&tab_session_id),
+            "popup tab session must be committed under the browser owner"
+        )
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2882,10 +3139,32 @@ async fn tab_session_auto_attach_catchall_attaches_child_page() {
     let page_session_id = page_attached["params"]["sessionId"]
         .as_str()
         .expect("page session id");
-    assert!(matches!(
-        ctx.conn.session_route(Some(page_session_id)),
-        Some(crate::conn::CdpSessionRoute::PageTarget { .. })
-    ));
+    ctx.with_fixture(|conn| {
+        assert!(matches!(
+            conn.session_route(Some(page_session_id)),
+            Some(crate::conn::CdpSessionRoute::PageTarget { .. })
+        ))
+    });
+    ctx.with_fixture(|conn| assert!(conn.target_has_waiting_for_debugger_session(&tab_target_id)));
+    for id in [19_034, 19_035] {
+        ctx.process_async(json!({
+            "id": id, "sessionId": tab_session_id,
+            "method": "Runtime.runIfWaitingForDebugger"
+        }))
+        .await;
+        ctx.expect_result(id, json!({}), Some(&tab_session_id));
+    }
+    ctx.with_fixture(|conn| assert!(!conn.target_has_waiting_for_debugger_session(&tab_target_id)));
+    ctx.process_async(json!({
+        "id": 19_036, "sessionId": tab_session_id, "method": "Runtime.enable"
+    }))
+    .await;
+    let unsupported = take_response_by_id(&mut ctx, 19_036);
+    assert_eq!(
+        unsupported["error"]["code"],
+        json!(-32601),
+        "the browser-side resume handler must not expose a Page Runtime on the Tab"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2951,8 +3230,8 @@ async fn root_auto_attach_disable_detaches_auto_attached_tab_child_page_cascade(
         .as_str()
         .expect("page session id")
         .to_owned();
-    assert!(ctx.conn.session_route(Some(&tab_session_id)).is_some());
-    assert!(ctx.conn.session_route(Some(&page_session_id)).is_some());
+    ctx.with_fixture(|conn| assert!(conn.session_route(Some(&tab_session_id)).is_some()));
+    ctx.with_fixture(|conn| assert!(conn.session_route(Some(&page_session_id)).is_some()));
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -2976,14 +3255,15 @@ async fn root_auto_attach_disable_detaches_auto_attached_tab_child_page_cascade(
             && message["params"]["targetId"] == json!(tab_target_id)
             && message["params"]["sessionId"] == json!(tab_session_id)
     });
-    assert_eq!(ctx.conn.session_route(Some(&page_session_id)), None);
-    assert_eq!(ctx.conn.session_route(Some(&tab_session_id)), None);
-    assert!(ctx.conn.auto_attached_sessions_for_owner(None).is_empty());
-    assert!(
-        ctx.conn
-            .auto_attached_sessions_for_owner(Some(&tab_session_id))
-            .is_empty()
-    );
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some(&page_session_id)), None));
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some(&tab_session_id)), None));
+    ctx.with_fixture(|conn| assert!(conn.auto_attached_sessions_for_owner(None).is_empty()));
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.auto_attached_sessions_for_owner(Some(&tab_session_id))
+                .is_empty()
+        })
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3062,196 +3342,212 @@ async fn tab_session_auto_attach_only_attaches_its_own_child_page() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn incomplete_popup_rollback_clears_tab_page_sessions_and_target_graph() {
+async fn incomplete_popup_close_clears_tab_page_sessions_and_target_graph() {
     let mut ctx = TestContext::new_with_target_discovery(false);
     load_bc_with_target(&mut ctx, "BID-popup-rollback", "TID-popup-opener");
 
     let page_target_id = "TID-popup-rollback";
-    let tab_target_id = ctx.conn.register_top_level_page_target(page_target_id);
+    let tab_target_id =
+        ctx.with_fixture(|conn| conn.register_top_level_page_target(page_target_id));
     {
-        let browser_context = ctx.conn.browser_context.as_mut().expect("browser context");
-        browser_context.stage_background_target(
-            page_target_id.to_owned(),
-            Some("SID-popup-page-primary".to_owned()),
-            "about:blank".to_owned(),
-            Some("about:blank".to_owned()),
-            None,
-        );
-        assert!(browser_context.assign_auto_attached_session_to_target(
-            page_target_id,
-            "SID-popup-page-attached".to_owned()
-        ));
-        browser_context.remember_target_window_name("popupName", page_target_id);
-        browser_context.remember_target_popup_id(Some(42), page_target_id);
+        ctx.with_fixture(|conn| {
+            let browser_context = conn.browser_context.as_mut().expect("browser context");
+            browser_context.stage_background_target(
+                page_target_id.to_owned(),
+                Some("SID-popup-page-primary".to_owned()),
+                "about:blank".to_owned(),
+                Some("about:blank".to_owned()),
+                None,
+            );
+            assert!(browser_context.assign_auto_attached_session_to_target(
+                page_target_id,
+                "SID-popup-page-attached".to_owned()
+            ));
+            browser_context.remember_target_window_name("popupName", page_target_id);
+            browser_context.remember_target_popup_id(Some(42), page_target_id);
+        });
     }
-    ctx.conn
-        .attach_tab_target_session_event_plan(
+    ctx.with_fixture(|conn| {
+        conn.attach_tab_target_session_event_plan(
             "SID-popup-tab".to_owned(),
             None,
             &tab_target_id,
             false,
         )
-        .expect("popup tab session should commit");
-    ctx.conn.commit_declared_session_fixtures_for_test();
-    ctx.conn
-        .mark_session_auto_attached_for_test("SID-popup-tab".to_owned(), None);
-    ctx.conn
-        .mark_session_auto_attached_for_test("SID-popup-page-primary".to_owned(), None);
-    ctx.conn
-        .mark_session_auto_attached_for_test("SID-popup-page-attached".to_owned(), None);
+        .expect("popup tab session should commit")
+    });
+    ctx.with_fixture(|conn| conn.commit_declared_session_fixtures_for_test());
+    ctx.with_fixture(|conn| {
+        conn.mark_session_auto_attached_for_test("SID-popup-tab".to_owned(), None)
+    });
+    ctx.with_fixture(|conn| {
+        conn.mark_session_auto_attached_for_test("SID-popup-page-primary".to_owned(), None)
+    });
+    ctx.with_fixture(|conn| {
+        conn.mark_session_auto_attached_for_test("SID-popup-page-attached".to_owned(), None)
+    });
 
-    assert!(ctx.conn.session_route(Some("SID-popup-tab")).is_some());
-    assert!(
-        ctx.conn
-            .session_route(Some("SID-popup-page-primary"))
-            .is_some()
-    );
-    assert!(
-        ctx.conn
-            .session_route(Some("SID-popup-page-attached"))
-            .is_some()
-    );
-    assert_eq!(ctx.conn.tab_target_count(), 1);
+    ctx.with_fixture(|conn| assert!(conn.session_route(Some("SID-popup-tab")).is_some()));
+    ctx.with_fixture(|conn| assert!(conn.session_route(Some("SID-popup-page-primary")).is_some()));
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.session_route(Some("SID-popup-page-attached"))
+                .is_some()
+        })
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.tab_target_count(), 1));
 
-    popup::rollback_incomplete_popup_target_async(
-        &mut ctx.conn,
-        Some("BID-popup-rollback"),
-        page_target_id,
+    ctx.process_async(
+        json!({"id":901,"method":"Target.closeTarget","params":{"targetId":page_target_id}}),
     )
     .await;
+    assert!(ctx.take_response_by_id(901).get("error").is_none());
 
-    assert_eq!(ctx.conn.session_route(Some("SID-popup-tab")), None);
-    assert_eq!(ctx.conn.session_route(Some("SID-popup-page-primary")), None);
-    assert_eq!(
-        ctx.conn.session_route(Some("SID-popup-page-attached")),
-        None
-    );
-    assert!(ctx.conn.auto_attached_sessions_for_owner(None).is_empty());
-    assert_eq!(ctx.conn.tab_target_count(), 0);
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .expect("browser context")
-            .background_target(page_target_id)
-            .is_none()
-    );
-    assert!(
-        ctx.conn
-            .primary_page_target_id_for_tab_target_id(&tab_target_id)
-            .is_none()
-    );
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some("SID-popup-tab")), None));
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some("SID-popup-page-primary")), None));
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some("SID-popup-page-attached")), None));
+    ctx.with_fixture(|conn| assert!(conn.auto_attached_sessions_for_owner(None).is_empty()));
+    ctx.with_fixture(|conn| assert_eq!(conn.tab_target_count(), 0));
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.browser_context
+                .as_ref()
+                .expect("browser context")
+                .background_target(page_target_id)
+                .is_none()
+        })
+    });
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.primary_page_target_id_for_tab_target_id(&tab_target_id)
+                .is_none()
+        })
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn incomplete_active_popup_rollback_clears_active_slot_sessions_and_target_graph() {
+async fn incomplete_active_popup_close_clears_active_slot_sessions_and_target_graph() {
     let mut ctx = TestContext::new_with_target_discovery(false);
     load_bc(&mut ctx, "BID-active-popup-rollback");
 
     let page_target_id = "TID-active-popup-rollback";
-    let tab_target_id = ctx.conn.register_top_level_page_target(page_target_id);
+    let tab_target_id =
+        ctx.with_fixture(|conn| conn.register_top_level_page_target(page_target_id));
     {
-        let browser_context = ctx.conn.browser_context.as_mut().expect("browser context");
-        browser_context.set_active_target_id(page_target_id);
-        browser_context.set_target_url("about:blank".to_owned());
-        browser_context.begin_active_target_initial_empty_document("about:blank".to_owned());
-        browser_context.attach_active_session("SID-active-popup-page-primary");
-        assert!(browser_context.assign_auto_attached_session_to_target(
-            page_target_id,
-            "SID-active-popup-page-attached".to_owned()
-        ));
+        ctx.with_fixture(|conn| {
+            let browser_context = conn.browser_context.as_mut().expect("browser context");
+            browser_context.set_active_target_id(page_target_id);
+            browser_context.set_target_url("about:blank".to_owned());
+            browser_context.begin_active_target_initial_empty_document("about:blank".to_owned());
+            browser_context.attach_active_session("SID-active-popup-page-primary");
+            assert!(browser_context.assign_auto_attached_session_to_target(
+                page_target_id,
+                "SID-active-popup-page-attached".to_owned()
+            ));
+        });
     }
-    ctx.conn
-        .attach_tab_target_session_event_plan(
+    ctx.with_fixture(|conn| {
+        conn.attach_tab_target_session_event_plan(
             "SID-active-popup-tab".to_owned(),
             None,
             &tab_target_id,
             false,
         )
-        .expect("active popup tab session should commit");
-    ctx.conn.commit_declared_session_fixtures_for_test();
-    ctx.conn
-        .mark_session_auto_attached_for_test("SID-active-popup-tab".to_owned(), None);
-    ctx.conn
-        .mark_session_auto_attached_for_test("SID-active-popup-page-primary".to_owned(), None);
-    ctx.conn
-        .mark_session_auto_attached_for_test("SID-active-popup-page-attached".to_owned(), None);
+        .expect("active popup tab session should commit")
+    });
+    ctx.with_fixture(|conn| conn.commit_declared_session_fixtures_for_test());
+    ctx.with_fixture(|conn| {
+        conn.mark_session_auto_attached_for_test("SID-active-popup-tab".to_owned(), None)
+    });
+    ctx.with_fixture(|conn| {
+        conn.mark_session_auto_attached_for_test("SID-active-popup-page-primary".to_owned(), None)
+    });
+    ctx.with_fixture(|conn| {
+        conn.mark_session_auto_attached_for_test("SID-active-popup-page-attached".to_owned(), None)
+    });
 
-    assert!(
-        ctx.conn
-            .session_route(Some("SID-active-popup-tab"))
-            .is_some()
-    );
-    assert!(
-        ctx.conn
-            .session_route(Some("SID-active-popup-page-primary"))
-            .is_some()
-    );
-    assert!(
-        ctx.conn
-            .session_route(Some("SID-active-popup-page-attached"))
-            .is_some()
-    );
-    assert_eq!(ctx.conn.tab_target_count(), 1);
+    ctx.with_fixture(|conn| assert!(conn.session_route(Some("SID-active-popup-tab")).is_some()));
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.session_route(Some("SID-active-popup-page-primary"))
+                .is_some()
+        })
+    });
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.session_route(Some("SID-active-popup-page-attached"))
+                .is_some()
+        })
+    });
+    ctx.with_fixture(|conn| assert_eq!(conn.tab_target_count(), 1));
 
-    popup::rollback_incomplete_popup_target_async(
-        &mut ctx.conn,
-        Some("BID-active-popup-rollback"),
-        page_target_id,
+    ctx.process_async(
+        json!({"id":901,"method":"Target.closeTarget","params":{"targetId":page_target_id}}),
     )
     .await;
+    assert!(ctx.take_response_by_id(901).get("error").is_none());
 
-    assert_eq!(ctx.conn.session_route(Some("SID-active-popup-tab")), None);
-    assert_eq!(
-        ctx.conn
-            .session_route(Some("SID-active-popup-page-primary")),
-        None
-    );
-    assert_eq!(
-        ctx.conn
-            .session_route(Some("SID-active-popup-page-attached")),
-        None
-    );
-    assert!(ctx.conn.auto_attached_sessions_for_owner(None).is_empty());
-    assert_eq!(ctx.conn.tab_target_count(), 0);
-    assert_eq!(
-        ctx.conn
-            .browser_context
-            .as_ref()
-            .expect("browser context")
-            .active_target_id(),
-        None
-    );
-    assert!(
-        ctx.conn
-            .primary_page_target_id_for_tab_target_id(&tab_target_id)
-            .is_none()
-    );
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some("SID-active-popup-tab")), None));
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.session_route(Some("SID-active-popup-page-primary")),
+            None
+        )
+    });
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.session_route(Some("SID-active-popup-page-attached")),
+            None
+        )
+    });
+    ctx.with_fixture(|conn| assert!(conn.auto_attached_sessions_for_owner(None).is_empty()));
+    ctx.with_fixture(|conn| assert_eq!(conn.tab_target_count(), 0));
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.browser_context
+                .as_ref()
+                .expect("browser context")
+                .active_target_id(),
+            None
+        )
+    });
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.primary_page_target_id_for_tab_target_id(&tab_target_id)
+                .is_none()
+        })
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unannounced_page_session_cleanup_clears_route_and_auto_attached_owner_index() {
     let mut ctx = TestContext::new_with_target_discovery(false);
     load_bc_with_target(&mut ctx, "BID-page-session-cleanup", "TID-page-cleanup");
-    assert!(
-        ctx.conn
-            .browser_context
-            .as_mut()
-            .expect("browser context")
-            .assign_auto_attached_session_to_target(
-                "TID-page-cleanup",
-                "SID-page-cleanup".to_owned()
-            )
-    );
-    ctx.conn.commit_declared_session_fixtures_for_test();
-    ctx.conn
-        .mark_session_auto_attached_for_test("SID-page-cleanup".to_owned(), Some("SID-tab-owner"));
-    assert!(ctx.conn.session_route(Some("SID-page-cleanup")).is_some());
-    assert_eq!(
-        ctx.conn
-            .auto_attached_sessions_for_owner(Some("SID-tab-owner")),
-        vec!["SID-page-cleanup".to_owned()]
-    );
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.browser_context
+                .as_mut()
+                .expect("browser context")
+                .assign_auto_attached_session_to_target(
+                    "TID-page-cleanup",
+                    "SID-page-cleanup".to_owned(),
+                )
+        })
+    });
+    ctx.with_fixture(|conn| conn.commit_declared_session_fixtures_for_test());
+    ctx.with_fixture(|conn| {
+        conn.mark_session_auto_attached_for_test(
+            "SID-page-cleanup".to_owned(),
+            Some("SID-tab-owner"),
+        )
+    });
+    ctx.with_fixture(|conn| assert!(conn.session_route(Some("SID-page-cleanup")).is_some()));
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.auto_attached_sessions_for_owner(Some("SID-tab-owner")),
+            vec!["SID-page-cleanup".to_owned()]
+        )
+    });
 
     let prepared = crate::conn::TargetAttachSessionCommit::auto_attached(
         "SID-page-cleanup",
@@ -3263,22 +3559,25 @@ async fn unannounced_page_session_cleanup_clears_route_and_auto_attached_owner_i
         },
         false,
     );
-    let rollback_plan = ctx
-        .conn
-        .rollback_prepared_attach_session_without_event_async(&prepared)
-        .await;
+    let rollback_plan = crate::domains::target::rollback_attachment(
+        &mut crate::conn::ProtocolWorkflowDriver::new(ctx.handle()),
+        prepared.clone(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         rollback_plan.rolled_back_session_ids(),
         &["SID-page-cleanup".to_owned()]
     );
     assert!(rollback_plan.into_background_events().is_empty());
 
-    assert_eq!(ctx.conn.session_route(Some("SID-page-cleanup")), None);
-    assert!(
-        ctx.conn
-            .auto_attached_sessions_for_owner(Some("SID-tab-owner"))
-            .is_empty()
-    );
+    ctx.with_fixture(|conn| assert_eq!(conn.session_route(Some("SID-page-cleanup")), None));
+    ctx.with_fixture(|conn| {
+        assert!({
+            conn.auto_attached_sessions_for_owner(Some("SID-tab-owner"))
+                .is_empty()
+        })
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3401,7 +3700,7 @@ async fn create_target_with_wait_for_debugger_auto_attach_marks_attached_event()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn create_target_waiting_for_debugger_does_not_replay_replaced_initial_document_load() {
+async fn create_target_waiting_metadata_does_not_hold_the_initial_blank_document() {
     let mut ctx = TestContext::new();
     ctx.process_async(json!({
         "id": 9012,
@@ -3462,9 +3761,20 @@ async fn create_target_waiting_for_debugger_does_not_replay_replaced_initial_doc
         "the internal initial about:blank lifecycle must not satisfy waits for the requested target URL: {:?}",
         ctx.sent
     );
-    assert!(
-        ctx.conn
-            .runtime_session_owner_initial_empty_document_has_replacement_url(Some(&session_id))
+    ctx.with_fixture(|conn| {
+        assert!(!{
+            conn.runtime_session_owner_initial_empty_document_has_replacement_url(Some(&session_id))
+        })
+    });
+    ctx.process_async(json!({
+        "id":9016,"sessionId":session_id,"method":"Runtime.evaluate",
+        "params":{"expression":"[location.href,document.title]","returnByValue":true}
+    }))
+    .await;
+    let response = take_response_by_id(&mut ctx, 9016);
+    assert_eq!(
+        response["result"]["result"]["value"],
+        json!([target_url, "replacement-ready"])
     );
 }
 
@@ -3562,9 +3872,11 @@ async fn create_target_with_bc_id() {
     ctx.process_async(json!({"id": 10, "method": "Target.createTarget",
                        "params": {"browserContextId": "BID-9"}}))
         .await;
-    let bc = ctx.conn.browser_context.as_ref().unwrap();
-    assert!(bc.has_active_target());
-    let tid = bc.active_target_id().unwrap().to_owned();
+    let tid = ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().unwrap();
+        assert!(bc.has_active_target());
+        bc.active_target_id().unwrap().to_owned()
+    });
     ctx.expect_event("Target.targetCreated", None);
     ctx.expect_result(10, json!({ "targetId": tid }), None);
 }
@@ -3578,10 +3890,12 @@ async fn create_target_with_background_true_stages_second_target_in_background_s
                        "params": {"browserContextId": "BID-9", "url": "about:blank", "background": true}}))
         .await;
     let created = take_created_target_id(&mut ctx, 10);
-    let bc = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
-    assert_eq!(bc.background_target_count(), 1);
-    assert_eq!(bc.background_target_at(0).unwrap().target_id(), created);
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().unwrap();
+        assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
+        assert_eq!(bc.background_target_count(), 1);
+        assert_eq!(bc.background_target_at(0).unwrap().target_id(), created);
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3601,10 +3915,12 @@ async fn create_target_with_focus_false_stages_second_target_in_background_slot(
     }))
     .await;
     let created = take_created_target_id(&mut ctx, 11);
-    let bc = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
-    assert_eq!(bc.background_target_count(), 1);
-    assert_eq!(bc.background_target_at(0).unwrap().target_id(), created);
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().unwrap();
+        assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
+        assert_eq!(bc.background_target_count(), 1);
+        assert_eq!(bc.background_target_at(0).unwrap().target_id(), created);
+    });
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3628,7 +3944,9 @@ async fn create_target_rejects_focus_in_background() {
         -32602,
         "Can't focus a target in the background. Use background=false instead.",
     );
-    let bc = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
-    assert!(bc.has_no_background_targets());
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().unwrap();
+        assert_eq!(bc.active_target_id(), Some("TID-000000000A"));
+        assert!(bc.has_no_background_targets());
+    });
 }

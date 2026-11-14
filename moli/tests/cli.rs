@@ -74,9 +74,12 @@ fn parses_explicit_fetch_command_with_compatibility_flags() {
     assert_eq!(
         cli.command,
         Commands::Fetch(Box::new(FetchArgs {
+            fail: false,
+            fail_with_body: false,
             dump: Some(DumpFormat::SemanticTree),
             eval: None,
             eval_file: None,
+            cookie_jar: None,
             headers: vec![
                 RequestHeaderArg {
                     name: "X-Test".to_owned(),
@@ -140,6 +143,7 @@ fn parses_explicit_fetch_command_with_compatibility_flags() {
                 resource: false,
                 disable_subframes: false,
                 layout: false,
+                scrollbars: false,
                 cookie_file: Vec::new(),
                 document_start_script: Vec::new(),
                 document_start_script_file: Vec::new(),
@@ -157,6 +161,45 @@ fn parses_explicit_fetch_command_with_compatibility_flags() {
             url: "https://example.com".to_owned(),
         }))
     );
+}
+
+#[test]
+fn parses_http_failure_flags_in_explicit_and_inferred_fetch_commands() {
+    for explicit_command in [true, false] {
+        for (flag, fail, fail_with_body) in
+            [("--fail", true, false), ("--fail-with-body", false, true)]
+        {
+            let raw = if explicit_command {
+                vec!["moli", "fetch", flag, "https://example.com"]
+            } else {
+                vec!["moli", "https://example.com", flag]
+            };
+            let cli = Cli::try_parse_from(normalize_args_for_compat(raw)).unwrap();
+            let Commands::Fetch(args) = cli.command else {
+                panic!("expected fetch command");
+            };
+            assert_eq!(args.fail, fail);
+            assert_eq!(args.fail_with_body, fail_with_body);
+        }
+    }
+}
+
+#[test]
+fn http_failure_flags_are_mutually_exclusive() {
+    for flags in [
+        ["--fail", "--fail-with-body"],
+        ["--fail-with-body", "--fail"],
+    ] {
+        let err = Cli::try_parse_from(normalize_args_for_compat([
+            "moli",
+            "fetch",
+            flags[0],
+            flags[1],
+            "https://example.com",
+        ]))
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 }
 
 #[test]
@@ -308,19 +351,46 @@ fn web_bot_auth_flags_require_key_and_domain_together() {
 
 #[test]
 fn app_config_accepts_cookie_file_for_cdp_serve() {
-    let cli = Cli::try_parse_from(normalize_args_for_compat([
-        "moli",
-        "serve",
-        "--cookie-file",
-        "/tmp/browser-cookies.txt",
-    ]))
-    .unwrap();
+    for flag in ["--cookie", "--cookie-file"] {
+        let cli = Cli::try_parse_from(normalize_args_for_compat([
+            "moli",
+            "serve",
+            flag,
+            "/tmp/browser-cookies.txt",
+        ]))
+        .unwrap();
 
-    let config = AppConfig::from_cli(&cli).unwrap();
-    assert_eq!(
-        config.fetch.cookie_files,
-        vec!["/tmp/browser-cookies.txt".to_owned()]
-    );
+        let config = AppConfig::from_cli(&cli).unwrap();
+        assert_eq!(
+            config.fetch.cookie_files,
+            vec!["/tmp/browser-cookies.txt".to_owned()]
+        );
+    }
+}
+
+#[test]
+fn serve_cookie_jar_output_is_independent_of_cookie_inputs() {
+    for output in ["/tmp/final-cookies.txt", "-"] {
+        let cli = Cli::try_parse_from([
+            "moli",
+            "serve",
+            "--cookie-file",
+            "/tmp/input-cookies.txt",
+            "--cookie-jar",
+            "/tmp/overridden.txt",
+            "--cookie-jar",
+            output,
+        ])
+        .unwrap();
+        let Commands::Serve(args) = &cli.command else {
+            panic!("expected serve command");
+        };
+        assert_eq!(args.cookie_jar.as_deref(), Some(output));
+        assert_eq!(
+            AppConfig::from_cli(&cli).unwrap().fetch.cookie_files,
+            ["/tmp/input-cookies.txt"]
+        );
+    }
 }
 
 #[test]
@@ -422,9 +492,12 @@ fn infers_fetch_mode_from_bare_url() {
     assert_eq!(
         cli.command,
         Commands::Fetch(Box::new(FetchArgs {
+            fail: false,
+            fail_with_body: false,
             dump: None,
             eval: None,
             eval_file: None,
+            cookie_jar: None,
             headers: vec![],
             disable_js: false,
             disable_css: false,
@@ -465,9 +538,12 @@ fn parses_bare_dump_with_explicit_fetch_command_and_defaults_to_html() {
     assert_eq!(
         cli.command,
         Commands::Fetch(Box::new(FetchArgs {
+            fail: false,
+            fail_with_body: false,
             dump: Some(DumpFormat::Html),
             eval: None,
             eval_file: None,
+            cookie_jar: None,
             headers: vec![],
             disable_js: false,
             disable_css: false,
@@ -509,9 +585,12 @@ fn parses_header_flag_with_explicit_fetch_command() {
     assert_eq!(
         cli.command,
         Commands::Fetch(Box::new(FetchArgs {
+            fail: false,
+            fail_with_body: false,
             dump: None,
             eval: None,
             eval_file: None,
+            cookie_jar: None,
             headers: vec![RequestHeaderArg {
                 name: "X-Test".to_owned(),
                 value: "one".to_owned(),
@@ -611,9 +690,13 @@ fn infers_serve_mode_when_called_without_args() {
     assert_eq!(
         cli.command,
         Commands::Serve(Box::new(ServeArgs {
+            cookie_jar: None,
+            debugger: false,
             host: "127.0.0.1".to_owned(),
             port: 9222,
             timeout: 10,
+            remote_allow_origins: Vec::new(),
+            screencast_interval: None,
             common: CommonArgs::default(),
         }))
     );
@@ -636,12 +719,80 @@ fn parses_serve_flags_with_explicit_command() {
     assert_eq!(
         cli.command,
         Commands::Serve(Box::new(ServeArgs {
+            cookie_jar: None,
+            debugger: false,
             host: "0.0.0.0".to_owned(),
             port: 9333,
             timeout: 42,
+            remote_allow_origins: Vec::new(),
+            screencast_interval: None,
             common: CommonArgs::default(),
         }))
     );
+}
+
+#[test]
+fn serve_remote_allow_origins_defaults_to_empty_and_reaches_server_config() {
+    let cli = Cli::try_parse_from(["moli", "serve"]).unwrap();
+    let Commands::Serve(args) = &cli.command else {
+        panic!("expected serve command");
+    };
+    assert!(args.remote_allow_origins.is_empty());
+    assert!(
+        AppConfig::from_cli(&cli)
+            .unwrap()
+            .server
+            .remote_allow_origins
+            .is_empty()
+    );
+
+    let cli = Cli::try_parse_from([
+        "moli",
+        "serve",
+        "--remote-allow-origins=https://first.example,http://localhost:3000",
+        "--remote-allow-origins",
+        "https://second.example",
+    ])
+    .unwrap();
+    let expected = [
+        "https://first.example",
+        "http://localhost:3000",
+        "https://second.example",
+    ];
+    let Commands::Serve(args) = &cli.command else {
+        panic!("expected serve command");
+    };
+    assert_eq!(args.remote_allow_origins, expected);
+    assert_eq!(
+        AppConfig::from_cli(&cli)
+            .unwrap()
+            .server
+            .remote_allow_origins,
+        expected
+    );
+}
+
+#[test]
+fn serve_remote_allow_origins_accepts_wildcard_and_is_serve_only() {
+    let cli = Cli::try_parse_from(["moli", "serve", "--remote-allow-origins", "*"]).unwrap();
+    assert_eq!(
+        AppConfig::from_cli(&cli)
+            .unwrap()
+            .server
+            .remote_allow_origins,
+        ["*"]
+    );
+    assert!(
+        Cli::try_parse_from([
+            "moli",
+            "fetch",
+            "--remote-allow-origins",
+            "*",
+            "https://example.com",
+        ])
+        .is_err()
+    );
+    assert!(Cli::try_parse_from(["moli", "serve", "--remote-allow-origins"]).is_err());
 }
 
 #[test]
@@ -654,6 +805,10 @@ fn rejects_removed_version_and_help_subcommands() {
 
 #[test]
 fn standard_version_and_help_flags_remain_available() {
+    assert_eq!(
+        moli_protocol::version::MOLI_VERSION,
+        env!("CARGO_PKG_VERSION")
+    );
     for (flag, expected_kind) in [
         ("--version", clap::error::ErrorKind::DisplayVersion),
         ("--help", clap::error::ErrorKind::DisplayHelp),
@@ -979,23 +1134,42 @@ fn fetch_eval_sources_are_mutually_exclusive() {
 }
 
 #[test]
-fn fetch_eval_rejects_page_dump_output_options() {
+fn fetch_eval_can_prepare_page_dump_output() {
     for eval_args in [
         &["--eval", "document.title"][..],
         &["--eval-file", "extract.js"][..],
     ] {
-        for conflicting_args in [
-            &["--dump", "json"][..],
+        for dump in ["html", "markdown", "json"] {
+            let mut args = vec!["moli", "fetch"];
+            args.extend_from_slice(eval_args);
+            args.extend_from_slice(&[
+                "--dump",
+                dump,
+                "--with-base",
+                "--with-frames",
+                "--strip-mode",
+                "js",
+            ]);
+            args.push("https://example.com");
+            let cli = Cli::try_parse_from(normalize_args_for_compat(args)).unwrap();
+            AppConfig::from_cli(&cli).unwrap();
+        }
+    }
+}
+
+#[test]
+fn eval_value_output_rejects_unused_page_options() {
+    for eval in ["--eval", "--eval-file"] {
+        for option in [
             &["--with-base"][..],
             &["--with-frames"][..],
             &["--strip-mode", "js"][..],
         ] {
-            let mut args = vec!["moli", "fetch"];
-            args.extend_from_slice(eval_args);
-            args.extend_from_slice(conflicting_args);
+            let mut args = vec!["moli", "fetch", eval, "prepare.js"];
+            args.extend_from_slice(option);
             args.push("https://example.com");
-            let error = Cli::try_parse_from(normalize_args_for_compat(args)).unwrap_err();
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            let cli = Cli::try_parse_from(normalize_args_for_compat(args)).unwrap();
+            assert!(AppConfig::from_cli(&cli).is_err());
         }
     }
 }
@@ -1039,24 +1213,26 @@ fn does_not_infer_subcommand_from_flag() {
 }
 
 #[test]
-fn parses_fetch_wait_until_and_timeout() {
-    let cli = Cli::try_parse_from(normalize_args_for_compat([
-        "moli",
-        "fetch",
-        "--wait-until",
-        "networkidle",
-        "--timeout",
-        "1500",
-        "https://example.com",
-    ]))
-    .unwrap();
+fn parses_fetch_wait_until_and_timeout_spellings_as_milliseconds() {
+    for flag in ["--timeout-ms", "--timeout", "--wait-ms", "-t"] {
+        let cli = Cli::try_parse_from(normalize_args_for_compat([
+            "moli",
+            "fetch",
+            "--wait-until",
+            "networkidle",
+            flag,
+            "1500",
+            "https://example.com",
+        ]))
+        .unwrap();
 
-    let Commands::Fetch(args) = cli.command else {
-        panic!("expected fetch command");
-    };
+        let Commands::Fetch(args) = cli.command else {
+            panic!("expected fetch command");
+        };
 
-    assert_eq!(args.wait_until, FetchWaitUntil::NetworkIdle);
-    assert_eq!(args.timeout, 1500);
+        assert_eq!(args.wait_until, FetchWaitUntil::NetworkIdle);
+        assert_eq!(args.timeout, 1500, "{flag}");
+    }
 }
 
 #[test]
@@ -1285,6 +1461,8 @@ fn parses_fetch_network_policy_flags() {
         "/tmp/browser-cookies.txt",
         "--cookie-file",
         "/tmp/extra-cookies.txt",
+        "--cookie-jar",
+        "/tmp/final-cookies.txt",
         "--block-private-networks",
         "--block-cidrs",
         "198.18.0.0/15,203.0.113.0/24",
@@ -1318,6 +1496,7 @@ fn parses_fetch_network_policy_flags() {
             "/tmp/extra-cookies.txt".to_owned()
         ]
     );
+    assert_eq!(args.cookie_jar.as_deref(), Some("/tmp/final-cookies.txt"));
     assert!(args.common.block_private_networks);
     assert_eq!(
         args.common.block_cidrs.as_deref(),
@@ -1364,6 +1543,78 @@ fn app_config_rejects_invalid_http_host_resolve_entry() {
             .contains("invalid --http-host-resolve port"),
         "{error:#}"
     );
+}
+
+#[test]
+fn app_config_rejects_prefixed_http_host_resolve_entries() {
+    for entry in [
+        "+web-platform.test:8443:127.0.0.1",
+        "-web-platform.test:8443",
+        "-web-platform.test:8443:127.0.0.1",
+    ] {
+        let option = format!("--http-host-resolve={entry}");
+        let cli = Cli::try_parse_from(normalize_args_for_compat([
+            "moli",
+            "serve",
+            option.as_str(),
+        ]))
+        .unwrap();
+
+        let error = AppConfig::from_cli(&cli).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support `+` or `-` prefixes"),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
+fn app_config_applies_block_cidrs() {
+    let cli = Cli::try_parse_from(normalize_args_for_compat([
+        "moli",
+        "serve",
+        "--block-cidrs",
+        "198.18.0.0/15, 2001:db8::/32",
+    ]))
+    .unwrap();
+
+    let config = AppConfig::from_cli(&cli).unwrap();
+    let block_cidrs: Vec<_> = config
+        .browser
+        .fetch()
+        .block_cidrs()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(block_cidrs, ["198.18.0.0/15", "2001:db8::/32"]);
+}
+
+#[test]
+fn app_config_rejects_invalid_block_cidrs() {
+    for (value, expected) in [
+        (
+            "198.18.0.0/15,not-a-cidr,203.0.113.0/24",
+            "invalid --block-cidrs entry `not-a-cidr`",
+        ),
+        (
+            "198.18.0.0/15,,203.0.113.0/24",
+            "invalid --block-cidrs entry: CIDR must not be empty",
+        ),
+        ("", "invalid --block-cidrs entry: CIDR must not be empty"),
+    ] {
+        let option = format!("--block-cidrs={value}");
+        let cli = Cli::try_parse_from(normalize_args_for_compat([
+            "moli",
+            "serve",
+            option.as_str(),
+        ]))
+        .unwrap();
+
+        let error = AppConfig::from_cli(&cli).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+    }
 }
 
 #[test]
@@ -1550,6 +1801,7 @@ fn app_config_defaults_layout_to_mock_for_fetch_and_serve() {
             config.browser.layout_policy(),
             moli_core::LayoutPolicy::Mock
         );
+        assert!(!config.browser.scrollbars_hidden());
     }
 }
 
@@ -1569,23 +1821,196 @@ fn layout_selects_on_demand_policy_for_fetch_and_serve() {
 }
 
 #[test]
-fn env_flags_are_fallbacks_and_cli_flags_take_priority() {
-    for (case, env_value, expected) in [
-        ("env-enables", "true", true),
-        ("env-disables", "false", false),
-        ("env-one-enables", "1", true),
-        ("env-zero-disables", "0", false),
-        ("cli-overrides-env", "0", true),
+fn scrollbars_are_opt_in_for_layout_fetch_and_serve() {
+    for command in ["fetch", "serve"] {
+        for visible in [false, true] {
+            let mut args = vec!["moli", command, "--layout"];
+            if visible {
+                args.push("--scrollbars");
+            }
+            if command == "fetch" {
+                args.push("about:blank");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let config = AppConfig::from_cli(&cli).unwrap();
+            assert_eq!(config.browser.scrollbars_hidden(), !visible);
+            assert_eq!(
+                config.browser.layout_policy(),
+                moli_core::LayoutPolicy::OnDemand
+            );
+        }
+    }
+}
+
+#[test]
+fn scrollbars_require_enabled_layout_from_cli_or_environment() {
+    for command in ["fetch", "serve"] {
+        for (case, layout_env, explicit_layout, scrollbars_env, expected) in [
+            ("missing", None, false, None, false),
+            ("true", Some("true"), false, None, true),
+            ("one", Some("1"), false, None, true),
+            ("false", Some("false"), false, None, false),
+            ("zero", Some("0"), false, None, false),
+            ("cli-overrides", Some("false"), true, None, true),
+            ("env-true-without-layout", None, false, Some("true"), false),
+            ("env-one-without-layout", None, false, Some("1"), false),
+            (
+                "env-true-layout-disabled",
+                Some("false"),
+                false,
+                Some("true"),
+                false,
+            ),
+            (
+                "env-one-layout-disabled",
+                Some("0"),
+                false,
+                Some("1"),
+                false,
+            ),
+        ] {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "parse_scrollbars_in_child_process",
+                    "--nocapture",
+                ])
+                .env_remove("MOLI_LAYOUT")
+                .env_remove("MOLI_SCROLLBARS")
+                .env("MOLI_TEST_SCROLLBARS_COMMAND", command)
+                .env(
+                    "MOLI_TEST_SCROLLBARS_CLI_FLAG",
+                    scrollbars_env.is_none().to_string(),
+                )
+                .env(
+                    "MOLI_TEST_SCROLLBARS_CLI_LAYOUT",
+                    explicit_layout.to_string(),
+                )
+                .env("MOLI_TEST_SCROLLBARS_EXPECTED", expected.to_string());
+            if let Some(value) = layout_env {
+                child.env("MOLI_LAYOUT", value);
+            }
+            if let Some(value) = scrollbars_env {
+                child.env("MOLI_SCROLLBARS", value);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{command}/{case}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn parse_scrollbars_in_child_process() {
+    let Ok(command) = std::env::var("MOLI_TEST_SCROLLBARS_COMMAND") else {
+        return;
+    };
+    let explicit_layout = std::env::var("MOLI_TEST_SCROLLBARS_CLI_LAYOUT").unwrap() == "true";
+    let expected = std::env::var("MOLI_TEST_SCROLLBARS_EXPECTED").unwrap() == "true";
+    let mut args = vec!["moli", command.as_str()];
+    if std::env::var("MOLI_TEST_SCROLLBARS_CLI_FLAG").unwrap() == "true" {
+        args.push("--scrollbars");
+    }
+    if explicit_layout {
+        args.push("--layout");
+    }
+    if command == "fetch" {
+        args.push("about:blank");
+    }
+    let result = Cli::try_parse_from(args)
+        .map_err(anyhow::Error::from)
+        .and_then(|cli| AppConfig::from_cli(&cli));
+    if expected {
+        let config = result.unwrap();
+        assert!(!config.browser.scrollbars_hidden());
+        assert_eq!(
+            config.browser.layout_policy(),
+            moli_core::LayoutPolicy::OnDemand
+        );
+    } else {
+        assert!(result.unwrap_err().to_string().contains("--layout"));
+    }
+}
+
+#[test]
+fn screencast_interval_requires_layout_and_accepts_positive_milliseconds() {
+    for interval_ms in ["1", "16", "17", "33", "250", "1000", "1500", "4294967295"] {
+        let cli = Cli::try_parse_from(normalize_args_for_compat([
+            "moli",
+            "serve",
+            "--layout",
+            "--screencast-interval",
+            interval_ms,
+        ]))
+        .unwrap();
+        let config = AppConfig::from_cli(&cli).unwrap();
+        assert_eq!(
+            config.server.screencast_interval_ms,
+            interval_ms.parse::<u32>().unwrap()
+        );
+    }
+
+    for args in [
+        vec!["moli", "serve", "--screencast-interval", "33"],
+        vec!["moli", "serve", "--layout", "--screencast-interval", "0"],
+        vec!["moli", "serve", "--layout", "--screencast-interval", "-1"],
+        vec!["moli", "serve", "--layout", "--screencast-interval", "1.5"],
+        vec![
+            "moli",
+            "serve",
+            "--layout",
+            "--screencast-interval",
+            "4294967296",
+        ],
+        vec!["moli", "serve", "--layout", "--cdp-screencast-fps", "30"],
     ] {
-        let output = Command::new(std::env::current_exe().unwrap())
+        assert!(Cli::try_parse_from(normalize_args_for_compat(args)).is_err());
+    }
+}
+
+#[test]
+fn screencast_interval_defaults_to_one_second() {
+    for args in [vec!["moli", "serve"], vec!["moli", "serve", "--layout"]] {
+        let cli = Cli::try_parse_from(normalize_args_for_compat(args)).unwrap();
+        let config = AppConfig::from_cli(&cli).unwrap();
+        assert_eq!(config.server.screencast_interval_ms, 1000);
+    }
+}
+
+#[test]
+fn env_flags_are_fallbacks_and_cli_flags_take_priority() {
+    for (case, env_value, expected, scrollbars_env, expected_scrollbars) in [
+        ("env-enables", "true", true, Some("true"), true),
+        ("env-disables", "false", false, Some("false"), false),
+        ("env-one-enables", "1", true, Some("1"), true),
+        ("env-zero-disables", "0", false, Some("0"), false),
+        ("cli-overrides-env", "0", true, Some("0"), true),
+        ("scrollbars-hidden", "true", true, Some("false"), false),
+        ("scrollbars-hidden-zero", "true", true, Some("0"), false),
+        ("scrollbars-default", "true", true, None, false),
+    ] {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
             .args(["--exact", "parse_env_flags_in_child_process", "--nocapture"])
             .env("MOLI_TEST_ENV_FLAG_CASE", case)
             .env("MOLI_TEST_ENV_FLAG_EXPECTED", expected.to_string())
+            .env(
+                "MOLI_TEST_ENV_FLAG_SCROLLBARS_EXPECTED",
+                expected_scrollbars.to_string(),
+            )
             .env("MOLI_LAYOUT", env_value)
             .env("MOLI_RESOURCE", env_value)
             .env("MOLI_BLOCK_PRIVATE_NETWORKS", env_value)
-            .output()
-            .unwrap();
+            .env_remove("MOLI_SCROLLBARS");
+        if let Some(value) = scrollbars_env {
+            child.env("MOLI_SCROLLBARS", value);
+        }
+        let output = child.output().unwrap();
 
         assert!(
             output.status.success(),
@@ -1605,30 +2030,46 @@ fn parse_env_flags_in_child_process() {
         .unwrap()
         .parse::<bool>()
         .unwrap();
+    let expected_scrollbars = std::env::var("MOLI_TEST_ENV_FLAG_SCROLLBARS_EXPECTED")
+        .unwrap()
+        .parse::<bool>()
+        .unwrap();
 
-    let args = if case == "cli-overrides-env" {
-        vec![
-            "moli",
-            "serve",
-            "--layout",
-            "--resource",
-            "--block-private-networks",
-        ]
-    } else {
-        vec!["moli", "serve"]
-    };
-    let cli = Cli::try_parse_from(normalize_args_for_compat(args)).unwrap();
-    let Commands::Serve(args) = cli.command else {
-        panic!("expected serve command");
-    };
-    assert_eq!(args.common.layout, expected);
-    assert_eq!(args.common.resource, expected);
-    assert_eq!(args.common.block_private_networks, expected);
+    for command in ["fetch", "serve"] {
+        let mut args = vec!["moli", command];
+        if case == "cli-overrides-env" {
+            args.extend([
+                "--layout",
+                "--scrollbars",
+                "--resource",
+                "--block-private-networks",
+            ]);
+        }
+        if command == "fetch" {
+            args.push("about:blank");
+        }
+        let cli = Cli::try_parse_from(normalize_args_for_compat(args)).unwrap();
+        let config = AppConfig::from_cli(&cli).unwrap();
+        assert_eq!(
+            config.browser.scrollbars_hidden(),
+            expected && !expected_scrollbars
+        );
+        let common = match cli.command {
+            Commands::Fetch(args) => args.common,
+            Commands::Serve(args) => args.common,
+            Commands::Import(_) => panic!("expected fetch or serve command"),
+        };
+        assert_eq!(common.layout, expected);
+        assert_eq!(common.scrollbars, expected_scrollbars);
+        assert_eq!(common.resource, expected);
+        assert_eq!(common.block_private_networks, expected);
+    }
 }
 
 #[test]
 fn removed_long_form_flags_are_rejected() {
     for flag in [
+        "--hide-scrollbars",
         "--cdp-max-connections",
         "--cdp-max-pending-connections",
         "--no-layout",

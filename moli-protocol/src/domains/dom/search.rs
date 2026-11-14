@@ -5,10 +5,10 @@ use serde_json::json;
 
 use super::resolve::{
     DomCommandOutput, DomCommandTaskStep, PendingDomCommandDispatch, PendingDomCommandKind,
-    PendingDomCommandStartError, PendingDomCommandWork,
+    PendingDomCommandStartError,
 };
 use super::*;
-use crate::devtools_runtime::{
+use crate::automation::{
     DevToolsDiscardSearchResultsCommand, DevToolsGetSearchResultsCommand,
     DevToolsPerformSearchCommand,
 };
@@ -27,7 +27,7 @@ pub(super) fn build_cdp_perform_search_command(
         .map(|(browser_context_id, target_id)| (Some(browser_context_id), target_id))
         .unwrap_or((None, None));
     Ok(DevToolsPerformSearchCommand {
-        context: cmd.devtools_command_context(target_id.as_deref(), browser_context_id.as_deref()),
+        context: cmd.automation_context(target_id.as_deref(), browser_context_id.as_deref()),
         query: params.query,
         include_user_agent_shadow_dom: params.include_user_agent_shadow_dom.unwrap_or(false),
     })
@@ -55,7 +55,7 @@ pub(super) fn build_cdp_get_search_results_command(
         .map(|(browser_context_id, target_id)| (Some(browser_context_id), target_id))
         .unwrap_or((None, None));
     Ok(DevToolsGetSearchResultsCommand {
-        context: cmd.devtools_command_context(target_id.as_deref(), browser_context_id.as_deref()),
+        context: cmd.automation_context(target_id.as_deref(), browser_context_id.as_deref()),
         search_id: params.search_id,
         from_index,
         to_index,
@@ -72,7 +72,7 @@ pub(super) fn build_cdp_discard_search_results_command(
         .map(|(browser_context_id, target_id)| (Some(browser_context_id), target_id))
         .unwrap_or((None, None));
     Some(DevToolsDiscardSearchResultsCommand {
-        context: cmd.devtools_command_context(target_id.as_deref(), browser_context_id.as_deref()),
+        context: cmd.automation_context(target_id.as_deref(), browser_context_id.as_deref()),
         search_id: params.search_id,
     })
 }
@@ -102,7 +102,7 @@ pub(super) fn start_devtools_perform_search_command(
         command_id,
         owner_scope: owner.clone(),
         kind: PendingDomCommandKind::PerformSearchLive,
-        pending: PendingDomCommandWork::Page(pending),
+        pending,
     }))
 }
 
@@ -129,7 +129,7 @@ pub(super) fn start_devtools_get_search_results_command(
         command_id,
         owner_scope: owner.clone(),
         kind: PendingDomCommandKind::GetSearchResultsLive,
-        pending: PendingDomCommandWork::Page(pending),
+        pending,
     }))
 }
 
@@ -151,7 +151,7 @@ pub(super) fn start_devtools_discard_search_results_command(
         command_id,
         owner_scope: owner.clone(),
         kind: PendingDomCommandKind::DiscardSearchResultsLive,
-        pending: PendingDomCommandWork::Page(pending),
+        pending,
     }))
 }
 
@@ -216,7 +216,7 @@ pub(super) fn complete_get_search_results_live(
     completion: CompletedPageCommand,
     out: &mut DomCommandOutput,
 ) -> DomCommandTaskStep {
-    let resolution = {
+    let (resolution, snapshot_events) = {
         let Some(page) = super::loaded_page_mut_for_owner(conn, owner) else {
             out.push_error(-32000, "NoDocumentLoaded");
             return DomCommandTaskStep::Complete;
@@ -229,6 +229,19 @@ pub(super) fn complete_get_search_results_live(
             }
         }
     };
+    if let Some(snapshot_events) = snapshot_events {
+        let top_frame_id = super::top_frame_id_for_owner(conn, owner);
+        for event in snapshot_events.events {
+            super::resolve::push_set_child_nodes_event_from_snapshots(
+                owner.session_id(),
+                event.parent_frontend_node_id,
+                &event.snapshots,
+                snapshot_events.top_snapshot_node_id,
+                top_frame_id.as_deref(),
+                out,
+            );
+        }
+    }
     match resolution {
         RendererDomSearchResultsResolution::Found(nodes) => {
             let node_ids = nodes
@@ -272,7 +285,7 @@ pub(super) fn complete_discard_search_results_live(
 
 #[cfg(test)]
 mod protocol_neutral_tests {
-    use crate::devtools_runtime::DevToolsProtocol;
+    use crate::automation::FrontendProtocol;
     use serde_json::{Value, json};
 
     use crate::conn::{CdpConnection, Cmd, CommandOwnerScope};
@@ -297,7 +310,7 @@ mod protocol_neutral_tests {
             panic!("valid performSearch command");
         };
 
-        assert_eq!(command.context.protocol, DevToolsProtocol::Cdp);
+        assert_eq!(command.context.protocol, FrontendProtocol::Cdp);
         assert_eq!(command.query, "article.result");
         assert!(command.include_user_agent_shadow_dom);
     }
@@ -350,7 +363,7 @@ mod protocol_neutral_tests {
             panic!("valid getSearchResults command");
         };
 
-        assert_eq!(command.context.protocol, DevToolsProtocol::Cdp);
+        assert_eq!(command.context.protocol, FrontendProtocol::Cdp);
         assert_eq!(
             command.context.session_id.as_ref().map(|id| id.as_str()),
             Some("SID-dom")
@@ -379,7 +392,7 @@ mod protocol_neutral_tests {
             panic!("valid discardSearchResults command");
         };
 
-        assert_eq!(command.context.protocol, DevToolsProtocol::Cdp);
+        assert_eq!(command.context.protocol, FrontendProtocol::Cdp);
         assert_eq!(
             command.context.session_id.as_ref().map(|id| id.as_str()),
             Some("SID-dom")

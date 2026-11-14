@@ -11,13 +11,13 @@ use crate::definitions::{
     define_native_data_property as define_attr_instance_native_data_property,
     define_native_data_property_with_setter as define_attr_instance_native_data_property_with_setter,
 };
+use crate::native_bridge::document::attributes::nullable_state_string as nullable_attr_state_string;
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Attr")]
+#[webapi(interface = web_api_interfaces::Attr)]
 struct AttrInstanceMethodsDeclaration {
-    #[webapi(method, length = 0, callback = attr_instance_is_same_node_callback)]
-    is_same_node: (),
     #[webapi(method, length = 0, callback = attr_instance_clone_node_callback)]
     clone_node: (),
     #[webapi(
@@ -62,14 +62,6 @@ fn attr_instance_clone_node_callback<'a>(
         Some(attr) => rv.set(attr.into()),
         None => rv.set_null(),
     }
-}
-
-fn attr_instance_is_same_node_callback<'a>(
-    _scope: &mut v8::PinScope<'a, '_>,
-    args: v8::FunctionCallbackArguments<'a>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    rv.set_bool(args.this().strict_equals(args.get(0)));
 }
 
 fn attr_instance_lookup_namespace_uri_callback<'a>(
@@ -166,20 +158,4 @@ pub(super) fn install_attr_instance_properties<'s>(
     AttrInstanceMethodsDeclaration::new()
         .initialize(scope, object)
         .expect("Attr instance method declaration should initialize");
-}
-
-fn nullable_attr_state_string<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    state: v8::Local<'s, v8::Object>,
-    property: &str,
-) -> Option<String> {
-    let key = v8_string(scope, property)?;
-    let value = state.get(scope, key.into())?;
-    if value.is_null_or_undefined() {
-        return None;
-    }
-    value
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-        .filter(|value| !value.is_empty())
 }

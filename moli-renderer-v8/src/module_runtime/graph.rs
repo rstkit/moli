@@ -97,6 +97,7 @@ pub(crate) struct NativeModuleGraphFetchRequest {
     tree_graph_level: Option<module_tree::ModuleGraphLevel>,
     module_key: Option<ModuleMapKey>,
     dependency: Option<NativeModuleGraphDependencyRequest>,
+    csp_context: Option<crate::content_security_policy::ModuleFetchCspContext>,
 }
 
 pub(crate) struct ModuleScriptGraphFetchContinuation {
@@ -138,9 +139,8 @@ impl ModuleScriptGraphFetchContinuation {
         job: &mut NativeModuleGraphJob,
         source: std::result::Result<ModuleSource, ModuleLoadError>,
     ) -> std::result::Result<NativeModuleGraphJobAdvance, ModuleLoadError> {
-        let source = source.map(|source| {
-            ModuleGraphFetchedSource::new(self.request.source_url.clone(), false, source)
-        });
+        let source = source
+            .map(|source| ModuleGraphFetchedSource::new(self.request.source_url.clone(), source));
         self.finish_fetch_into_job(vm, job, source)
     }
 }
@@ -196,7 +196,7 @@ impl ModuleScriptGraphFetchBatch {
         let source_url = self.request().source_url().clone();
         self.finish_fetch(
             vm,
-            source.map(|source| ModuleGraphFetchedSource::new(source_url, false, source)),
+            source.map(|source| ModuleGraphFetchedSource::new(source_url, source)),
         )
     }
 
@@ -226,6 +226,7 @@ impl NativeModuleGraphFetchRequest {
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
     }
 
@@ -242,12 +243,26 @@ impl NativeModuleGraphFetchRequest {
         self.initiator_url()
     }
 
-    pub(crate) fn nonce(&self) -> Option<&str> {
-        self.fetch_metadata.nonce()
-    }
-
     pub(crate) fn fetch_metadata(&self) -> &ModuleFetchMetadata {
         &self.fetch_metadata
+    }
+
+    pub(crate) fn kind(&self) -> ModuleKind {
+        self.kind
+    }
+
+    pub(crate) fn with_csp_context(
+        mut self,
+        context: Option<crate::content_security_policy::ModuleFetchCspContext>,
+    ) -> Self {
+        self.csp_context = context;
+        self
+    }
+
+    pub(crate) fn csp_context(
+        &self,
+    ) -> Option<&crate::content_security_policy::ModuleFetchCspContext> {
+        self.csp_context.as_ref()
     }
 
     pub(crate) fn pending_fetch_key(&self) -> Option<&ModuleMapKey> {
@@ -348,23 +363,34 @@ impl NativeModuleGraphFetchRequest {
         self.fetch_metadata.request_metadata.integrity.as_deref()
     }
 
-    fn request(&self) -> anyhow::Result<Request> {
+    fn request(&self, request_origin: &moli_url::WebOrigin) -> anyhow::Result<Request> {
         let request = Request::new("GET", self.source_url.as_str(), None, vec![])
             .expect("module graph URL should already be parsed")
             .with_page_network_policy()
             .with_initiator_url(&self.initiator_url)
+            .with_request_origin(request_origin.clone())
             .with_credentials_mode(self.fetch_metadata.credentials_mode)
             .with_script_fetch_metadata(self.fetch_metadata.request_metadata.clone());
-        Ok(match self.kind {
+        let request = match self.kind {
             ModuleKind::Css => request
                 .with_resource_type(RequestResourceType::CssStyleSheet)
                 .with_browser_request_metadata(BrowserRequestMetadata::StyleModule),
             ModuleKind::Json => {
                 request.with_browser_request_metadata(BrowserRequestMetadata::JsonModule)
             }
-            ModuleKind::JavaScript | ModuleKind::ModulePreloadText | ModuleKind::WebAssembly => {
-                request
+            ModuleKind::Text => {
+                request.with_browser_request_metadata(BrowserRequestMetadata::TextModule)
             }
+            ModuleKind::JavaScript | ModuleKind::WebAssembly => {
+                request.with_browser_request_metadata(BrowserRequestMetadata::Script)
+            }
+        };
+        Ok(match &self.csp_context {
+            Some(context) => {
+                context.check_initial_request(&request.url)?;
+                context.apply(request)
+            }
+            None => request,
         })
     }
 
@@ -372,6 +398,7 @@ impl NativeModuleGraphFetchRequest {
         &self,
         loader: &ResourceRequestClient,
         load: crate::network::loads::ResourceLoadLease,
+        request_origin: moli_url::WebOrigin,
         callback: F,
     ) -> anyhow::Result<()>
     where
@@ -381,7 +408,7 @@ impl NativeModuleGraphFetchRequest {
             ) + Send
             + 'static,
     {
-        self.fetch_source_callback_inner(loader, load, callback)
+        self.fetch_source_callback_inner(loader, load, request_origin, callback)
     }
 
     pub(crate) fn fetch_source_for_document<F>(
@@ -404,13 +431,19 @@ impl NativeModuleGraphFetchRequest {
             )
             .ok_or_else(|| anyhow::anyhow!("Document detached before module fetch registration"))?;
         let request_client = load.request_client();
-        self.fetch_source_callback_with_load(&request_client, load, callback)
+        self.fetch_source_callback_with_load(
+            &request_client,
+            load,
+            loader.fetch_context().request_origin(),
+            callback,
+        )
     }
 
     fn fetch_source_callback_inner<F>(
         &self,
         loader: &ResourceRequestClient,
         load: crate::network::loads::ResourceLoadLease,
+        request_origin: moli_url::WebOrigin,
         callback: F,
     ) -> anyhow::Result<()>
     where
@@ -423,7 +456,10 @@ impl NativeModuleGraphFetchRequest {
         let source_url = self.source_url.clone();
         let kind = self.kind;
         let integrity = self.fetch_metadata.request_metadata.integrity.clone();
-        let request = self.request()?;
+        let request = self.request(&request_origin)?;
+        let request_mode = request.request_mode;
+        let credentials_mode = request.credentials_mode;
+        let csp_context = self.csp_context.clone();
         let completion = move |response: anyhow::Result<moli_fetch::Response>| {
             let mut network_result: Option<SharedNavigationResponseResult> = None;
             let result = response
@@ -436,6 +472,13 @@ impl NativeModuleGraphFetchRequest {
                     .to_owned()
                 })
                 .and_then(|response| {
+                    // Main/child parser, runtime, dynamic import and modulepreload
+                    // all convert responses here, including cached/coalesced results.
+                    // Decide CSP from the admitted request snapshot before source
+                    // construction; owner completions only dispatch its reports.
+                    if let Some(context) = &csp_context {
+                        context.check_response(&response).map_err(|error| error.to_string())?;
+                    }
                     let response = NavigationResponse::from(response);
                     network_result = Some(std::sync::Arc::new(Ok(response.clone())));
                     if !(200..=299).contains(&response.status) {
@@ -449,39 +492,68 @@ impl NativeModuleGraphFetchRequest {
                         .message()
                         .to_owned());
                     }
-                    if matches!(kind, ModuleKind::JavaScript | ModuleKind::WebAssembly)
-                        && let Err(error) = crate::planning::validate_external_script_response_mime(
-                            &source_url,
-                            ScriptKind::Module,
-                            &response,
-                        )
-                    {
+                    let mime_result = match kind {
+                        ModuleKind::JavaScript | ModuleKind::WebAssembly => {
+                            crate::planning::validate_external_script_response_mime(
+                                &source_url,
+                                ScriptKind::Module,
+                                &response,
+                            )
+                        }
+                        ModuleKind::Json => {
+                            super::validate_json_module_response_mime(&response.headers)
+                        }
+                        ModuleKind::Css => {
+                            super::validate_css_module_response_mime(&response.headers)
+                        }
+                        ModuleKind::Text => Ok(()),
+                    };
+                    if let Err(error) = mime_result {
                         return Err(ModuleLoadError::new(ModuleLoadStage::Fetch, error)
                             .message()
                             .to_owned());
                     }
-                    crate::subresource_integrity::observe_subresource_integrity_metadata(
-                        integrity.as_deref(),
-                    );
                     let response_referrer_policy =
                         crate::referrer_policy::response_referrer_policy_from_headers(
                             &response.headers,
                         );
-                    let (head, body, body_bytes) = response.into_parts();
+                    let (head, body_bytes) = response.into_byte_parts();
+                    crate::network_host::validate_cors_response_chain(
+                        &request_origin,
+                        &head,
+                        credentials_mode,
+                    ).map_err(|error| ModuleLoadError::new(ModuleLoadStage::Fetch, error).message().to_owned())?;
+                    let response_is_eligible = crate::network_host::network_response_filter(
+                        &request_origin,
+                        &head,
+                        request_mode,
+                    ).is_none();
+                    if !crate::subresource_integrity::response_matches_subresource_integrity_metadata(
+                        &body_bytes,
+                        integrity.as_deref(),
+                        response_is_eligible,
+                    ) {
+                        return Err(ModuleLoadError::new(
+                            ModuleLoadStage::Fetch,
+                            format!(
+                                "module request `{source_url}` failed its integrity check (FailedToLoad)"
+                            ),
+                        )
+                        .message()
+                        .to_owned());
+                    }
                     Ok(match kind {
                         ModuleKind::WebAssembly => ModuleGraphFetchedSource::new(
                             head.final_url,
-                            head.redirected,
                             ModuleSource::binary(body_bytes),
                         )
                         .with_response_referrer_policy(response_referrer_policy),
                         ModuleKind::JavaScript
                         | ModuleKind::Json
                         | ModuleKind::Css
-                        | ModuleKind::ModulePreloadText => ModuleGraphFetchedSource::new(
+                        | ModuleKind::Text => ModuleGraphFetchedSource::new(
                             head.final_url,
-                            head.redirected,
-                            ModuleSource::text(body),
+                            ModuleSource::text(moli_encoding::decode_utf8(&body_bytes)),
                         )
                         .with_response_referrer_policy(response_referrer_policy),
                     })
@@ -800,23 +872,8 @@ impl NativeModuleGraphJob {
         request: &NativeModuleGraphFetchRequest,
         source: std::result::Result<ModuleGraphFetchedSource, ModuleLoadError>,
     ) -> std::result::Result<NativeModuleGraphJobAdvance, ModuleLoadError> {
-        let client = request.tree_client.ok_or_else(|| {
-            ModuleLoadError::new(
-                ModuleLoadStage::Fetch,
-                "module graph fetch request was missing its module tree client token",
-            )
-        })?;
-        if let Err(error) = &source {
-            let key = request.pending_fetch_key().cloned().ok_or_else(|| {
-                ModuleLoadError::new(
-                    ModuleLoadStage::Fetch,
-                    "failed module graph fetch request was missing its module map key",
-                )
-            })?;
-            vm.document_runtime
-                .mark_native_module_failed(key, error.clone());
-        }
-        self.finish_pending_chromium_tree_fetch_for_client(vm, client, request, source)
+        let mut owner = NativeModuleTreeDocumentOwner::new(vm);
+        self.finish_pending_chromium_tree_fetch_for_request_with_owner(&mut owner, request, source)
     }
 
     fn finish_pending_chromium_tree_fetch_for_request_with_owner<O>(
@@ -834,26 +891,20 @@ impl NativeModuleGraphJob {
                 "module graph fetch request was missing its module tree client token",
             )
         })?;
+        if let Err(error) = &source {
+            let key = request.pending_fetch_key().cloned().ok_or_else(|| {
+                ModuleLoadError::new(
+                    ModuleLoadStage::Fetch,
+                    "failed module graph fetch request was missing its module map key",
+                )
+            })?;
+            // Settle the shared fetch before failing this graph, so joined
+            // clients and later imports observe the cached fetch failure.
+            owner.mark_module_failed(key, error.clone());
+        }
         self.finish_pending_chromium_tree_fetch_for_client_with_owner(
             owner, client, request, source,
         )
-    }
-
-    fn finish_pending_chromium_tree_fetch_for_client(
-        &mut self,
-        vm: &mut ScriptVm,
-        client: module_tree::SingleModuleClientToken,
-        request: &NativeModuleGraphFetchRequest,
-        source: std::result::Result<ModuleGraphFetchedSource, ModuleLoadError>,
-    ) -> std::result::Result<NativeModuleGraphJobAdvance, ModuleLoadError> {
-        trace_module_tree_fetch_completed_to_job(client, source.is_ok());
-        let outcome = match source {
-            Ok(source) => module_tree::ModuleFetchOutcome::Fetched(Box::new(
-                chromium_fetched_source_for_request(source, request)?,
-            )),
-            Err(error) => module_tree::ModuleFetchOutcome::Failed(chromium_error(error)),
-        };
-        self.resume_chromium_tree_fetch_outcome(vm, client, outcome)
     }
 
     fn finish_pending_chromium_tree_fetch_for_client_with_owner<O>(
@@ -874,16 +925,6 @@ impl NativeModuleGraphJob {
             Err(error) => module_tree::ModuleFetchOutcome::Failed(chromium_error(error)),
         };
         self.resume_chromium_tree_fetch_outcome_with_owner(owner, client, outcome)
-    }
-
-    fn resume_chromium_tree_fetch_outcome(
-        &mut self,
-        vm: &mut ScriptVm,
-        client: module_tree::SingleModuleClientToken,
-        outcome: module_tree::ModuleFetchOutcome,
-    ) -> std::result::Result<NativeModuleGraphJobAdvance, ModuleLoadError> {
-        let mut owner = NativeModuleTreeDocumentOwner::new(vm);
-        self.resume_chromium_tree_fetch_outcome_with_owner(&mut owner, client, outcome)
     }
 
     pub(crate) fn resume_chromium_tree_fetch_outcome_with_owner<O>(
@@ -937,16 +978,22 @@ impl NativeModuleGraphJob {
                         key.clone(),
                         fetch.dependency().cloned(),
                     );
-                    owner.dispatch_module_fetch_csp_report_only_violation(
-                        &key,
-                        &request.fetch_metadata,
-                    );
-                    if let Some(error) =
-                        owner.csp_blocked_module_fetch_error(&key, &request.fetch_metadata)
-                    {
+                    let context =
+                        match owner.module_fetch_csp_context(&key, &request.fetch_metadata) {
+                            Ok(context) => context,
+                            Err(error) => {
+                                owner.mark_module_failed(key.clone(), error.clone());
+                                return Err(error);
+                            }
+                        };
+                    let admission = context.check_initial_request(key.url());
+                    owner.queue_module_fetch_csp_violations(&context);
+                    if let Err(error) = admission {
+                        let error = ModuleLoadError::new(ModuleLoadStage::Fetch, error.to_string());
                         owner.mark_module_failed(key.clone(), error.clone());
                         return Err(error);
                     }
+                    let request = request.with_csp_context(Some(context));
                     trace_module_tree_fetch_emitted(fetch.request(), &key);
                     requests.push(request);
                 }
@@ -989,6 +1036,7 @@ fn trace_module_graph_job_created(kind: &'static str, root: &ModuleRootInput) {
         initiator_url = %root.initiator_url,
         phase = ?root.phase,
         parser_owned = root.parser_owned,
+        integrity = ?root.fetch_metadata.request_metadata.integrity,
     );
 }
 
@@ -1327,6 +1375,7 @@ impl<O: NativeModuleTreeDocumentOwnerAdapter> module_tree::ModuleScriptTreeHost
                     module_tree::ModuleLoadStage::Resolve,
                     format!("{message} for import `{specifier}`"),
                 )
+                .with_error_constructor(module_tree::ModuleErrorConstructorKind::TypeError)
             },
         )?;
         if requested_phase == module_tree::ModuleImportPhase::Source
@@ -1493,8 +1542,6 @@ impl<O: NativeModuleTreeDocumentOwnerAdapter> module_tree::ModuleScriptTreeHost
             effective_fetch_metadata: fetched_source.effective_fetch_metadata,
             requested_modules: requests,
             phase,
-            has_parse_error: false,
-            parse_error: None,
         })
     }
 
@@ -1520,6 +1567,15 @@ impl<O: NativeModuleTreeDocumentOwnerAdapter> module_tree::ModuleScriptTreeHost
             effective_fetch_metadata: chromium_fetch_metadata(&effective_fetch_metadata),
             requested_modules,
         })
+    }
+
+    fn module_creation_error(
+        &self,
+        entry: module_tree::ModuleEntryId,
+    ) -> Option<module_tree::ModuleLoadError> {
+        let error = self.owner.module_failure(local_entry_id(entry))?;
+        (error.stage() == ModuleLoadStage::Compile)
+            .then(|| chromium_error(error).with_module_entry(entry))
     }
 
     fn link_module_graph(
@@ -1838,6 +1894,10 @@ fn local_module_key(
             key.url.clone(),
             attributes,
         )),
+        module_tree::ModuleKind::Text => Ok(ModuleMapKey::text_with_attributes(
+            key.url.clone(),
+            attributes,
+        )),
         module_tree::ModuleKind::WebAssembly => Ok(ModuleMapKey::webassembly(key.url.clone())),
     }
 }
@@ -1851,6 +1911,7 @@ fn local_module_kind(kind: module_tree::ModuleKind) -> ModuleKind {
         module_tree::ModuleKind::JavaScript => ModuleKind::JavaScript,
         module_tree::ModuleKind::Json => ModuleKind::Json,
         module_tree::ModuleKind::Css => ModuleKind::Css,
+        module_tree::ModuleKind::Text => ModuleKind::Text,
         module_tree::ModuleKind::WebAssembly => ModuleKind::WebAssembly,
     }
 }
@@ -1865,9 +1926,23 @@ fn local_graph(graph: module_tree::ModuleGraphHandle) -> ModuleGraphHandle {
 fn chromium_error(error: ModuleLoadError) -> module_tree::ModuleLoadError {
     let mut converted =
         module_tree::ModuleLoadError::new(chromium_load_stage(error.stage()), error.message());
-    if error.error_constructor() == Some(ScriptErrorConstructorKind::SyntaxError) {
-        converted =
-            converted.with_error_constructor(module_tree::ModuleErrorConstructorKind::SyntaxError);
+    if let Some(constructor) = error.error_constructor() {
+        let constructor = match constructor {
+            ScriptErrorConstructorKind::Error => module_tree::ModuleErrorConstructorKind::Error,
+            ScriptErrorConstructorKind::SyntaxError => {
+                module_tree::ModuleErrorConstructorKind::SyntaxError
+            }
+            ScriptErrorConstructorKind::TypeError => {
+                module_tree::ModuleErrorConstructorKind::TypeError
+            }
+            ScriptErrorConstructorKind::WebAssemblyCompileError => {
+                module_tree::ModuleErrorConstructorKind::WebAssemblyCompileError
+            }
+            ScriptErrorConstructorKind::WebAssemblyLinkError => {
+                module_tree::ModuleErrorConstructorKind::WebAssemblyLinkError
+            }
+        };
+        converted = converted.with_error_constructor(constructor);
     }
     converted
 }
@@ -1884,8 +1959,16 @@ fn local_error_constructor(
     constructor: module_tree::ModuleErrorConstructorKind,
 ) -> ScriptErrorConstructorKind {
     match constructor {
+        module_tree::ModuleErrorConstructorKind::Error => ScriptErrorConstructorKind::Error,
         module_tree::ModuleErrorConstructorKind::SyntaxError => {
             ScriptErrorConstructorKind::SyntaxError
+        }
+        module_tree::ModuleErrorConstructorKind::TypeError => ScriptErrorConstructorKind::TypeError,
+        module_tree::ModuleErrorConstructorKind::WebAssemblyCompileError => {
+            ScriptErrorConstructorKind::WebAssemblyCompileError
+        }
+        module_tree::ModuleErrorConstructorKind::WebAssemblyLinkError => {
+            ScriptErrorConstructorKind::WebAssemblyLinkError
         }
     }
 }
@@ -1985,6 +2068,7 @@ fn module_key_for_root(
             ModuleLoadStage::Resolve,
             format!("{message} for module `{}`", root.source_url),
         )
+        .with_error_constructor(ScriptErrorConstructorKind::TypeError)
     })?;
     validate_source_phase_key(root.phase, &key, "module", root.source_url.as_str())?;
     Ok(key)
@@ -2145,7 +2229,7 @@ fn chromium_module_kind(kind: ModuleKind) -> moli_module_script_tree::ModuleKind
         ModuleKind::JavaScript => moli_module_script_tree::ModuleKind::JavaScript,
         ModuleKind::Json => moli_module_script_tree::ModuleKind::Json,
         ModuleKind::Css => moli_module_script_tree::ModuleKind::Css,
-        ModuleKind::ModulePreloadText => moli_module_script_tree::ModuleKind::JavaScript,
+        ModuleKind::Text => moli_module_script_tree::ModuleKind::Text,
         ModuleKind::WebAssembly => moli_module_script_tree::ModuleKind::WebAssembly,
     }
 }
@@ -2240,12 +2324,13 @@ fn module_script_inline_tree_job(
     vm: &mut ScriptVm,
     root: ModuleRootInput,
 ) -> std::result::Result<NativeModuleGraphJob, ModuleLoadError> {
-    module_script_inline_tree_job_for_owner(vm, root, ModuleScriptCompletionOwner::Parser)
+    module_script_inline_tree_job_for_owner(vm, root, true, ModuleScriptCompletionOwner::Parser)
 }
 
 fn module_script_inline_tree_job_for_owner(
     vm: &mut ScriptVm,
     root: ModuleRootInput,
+    source_is_external: bool,
     completion_owner: ModuleScriptCompletionOwner,
 ) -> std::result::Result<NativeModuleGraphJob, ModuleLoadError> {
     let trace_label = match completion_owner {
@@ -2254,11 +2339,24 @@ fn module_script_inline_tree_job_for_owner(
     };
     trace_module_graph_job_created(trace_label, &root);
     let key = module_key_for_root(&root)?;
-    vm.dispatch_module_fetch_csp_report_only_violation_for_owner(&key, &root.fetch_metadata);
-    if let Some(error) = vm.csp_blocked_module_fetch_error_for_owner(&key, &root.fetch_metadata) {
-        vm.document_runtime
-            .mark_native_module_failed(key.clone(), error.clone());
-        return Err(error);
+    // This adapter also accepts externally sourced roots whose bytes are already
+    // loaded. Only those roots have a fetch URL to check. Actual inline roots
+    // passed source-text CSP before graph creation; their synthetic identity URL
+    // is not a request. Dependency fetches keep their own URL policy checks.
+    if source_is_external {
+        let context = vm.document_runtime.module_fetch_csp_context(
+            key.url(),
+            key.kind(),
+            &root.fetch_metadata,
+        );
+        let admission = context.check_initial_request(key.url());
+        vm.queue_module_fetch_csp_violations(&context);
+        if let Err(error) = admission {
+            let error = ModuleLoadError::new(ModuleLoadStage::Fetch, error.to_string());
+            vm.document_runtime
+                .mark_native_module_failed(key.clone(), error.clone());
+            return Err(error);
+        }
     }
     if let Some(entry) = reusable_inline_module_entry(vm, &key)? {
         return Ok(native_module_graph_job_for_inline_entry(
@@ -2283,7 +2381,7 @@ fn module_script_inline_tree_job_for_owner(
     let (record, identity) = match vm.compile_native_module_record(
         key.clone(),
         &source,
-        &root.source_url,
+        &root.base_url,
         &root.fetch_metadata,
     ) {
         Ok(result) => result,
@@ -2369,24 +2467,7 @@ fn native_module_graph_job_for_inline_entry(
 }
 
 #[cfg(test)]
-fn module_script_graph_job(
-    vm: &mut ScriptVm,
-    source: ModuleSource,
-    base_url: &Url,
-    initiator_url: &Url,
-    fetch_metadata: &ScriptFetchMetadata,
-    source_is_external: bool,
-) -> std::result::Result<NativeModuleGraphJob, ModuleLoadError> {
-    module_script_graph_job_for_owner(
-        vm,
-        source,
-        base_url,
-        initiator_url,
-        fetch_metadata,
-        source_is_external,
-        ModuleScriptCompletionOwner::Parser,
-    )
-}
+use self::parser_owned_loaded_module_script_graph_job as module_script_graph_job;
 
 fn module_script_graph_job_for_owner(
     vm: &mut ScriptVm,
@@ -2406,7 +2487,7 @@ fn module_script_graph_job_for_owner(
         source_is_external,
         completion_owner,
     );
-    module_script_inline_tree_job_for_owner(vm, root, completion_owner)
+    module_script_inline_tree_job_for_owner(vm, root, source_is_external, completion_owner)
 }
 
 pub(crate) fn parser_owned_loaded_module_script_graph_job(
@@ -2613,6 +2694,159 @@ mod tests {
     }
 
     #[test]
+    fn child_module_csp_context_missing_fails_before_emitting_fetch() {
+        use super::super::tree_owner::NativeModuleTreeFrameDocumentOwner;
+        use crate::frame_owner_model::{
+            DocumentId, FrameDocumentOwner, FrameRealmId, LocalWindowId,
+        };
+        for module_type in [None, Some("text"), Some("json"), Some("css")] {
+            let mut vm = new_test_vm("https://app.example.test/page");
+            let mut modulator = super::super::NativeDocumentModulator::default();
+            let root_url = url("https://app.example.test/module");
+            let attributes = module_type.map_or_else(ModuleAttributesKey::empty, |kind| {
+                ModuleAttributesKey::from_pairs(vec![("type".into(), kind.into())])
+            });
+            let key = ModuleMapKey::from_url_and_attributes(&root_url, &attributes).unwrap();
+            let mut job = NativeModuleGraphJob::runtime_module_script(ModuleRootInput {
+                source_url: root_url.clone(),
+                base_url: root_url,
+                initiator_url: url("https://app.example.test/page"),
+                attributes,
+                phase: ModuleImportPhase::Evaluation,
+                source_override: None,
+                fetch_metadata: ModuleFetchMetadata::default(),
+                parser_owned: false,
+            });
+            let mut owner = NativeModuleTreeFrameDocumentOwner::new(
+                &mut vm,
+                &mut modulator,
+                FrameDocumentOwner::new(LocalWindowId(u64::MAX), DocumentId(u64::MAX)),
+                FrameRealmId(-999),
+                url("https://app.example.test/page"),
+            );
+            let error = match job.advance_chromium_tree_owner_lane_with_owner(&mut owner) {
+                Err(error) => error,
+                Ok(_) => panic!("missing Child CSP authority must not emit a fetch"),
+            };
+            assert!(
+                error
+                    .message()
+                    .contains("Child module CSP context unavailable")
+            );
+            let entry = owner.module_entry_id(&key).expect("module-map entry");
+            assert!(
+                owner.module_failure(entry).is_some(),
+                "failed admission must settle the reserved entry"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_text_module_compilation_shares_fetched_source_and_releases_map_reference() {
+        for (module_type, text) in [
+            ("json", r#"{"answer":42}"#),
+            ("css", "body { color: red; }"),
+            ("text", "plain text, not JavaScript"),
+        ] {
+            let mut vm = new_test_vm("https://app.example.test/page");
+            let source_url = url(&format!("https://app.example.test/source.{module_type}"));
+            let attributes =
+                ModuleAttributesKey::from_pairs(vec![("type".to_owned(), module_type.to_owned())]);
+            let key = ModuleMapKey::from_url_and_attributes(&source_url, &attributes).unwrap();
+            let text_source: std::sync::Arc<str> = text.into();
+            let weak_source = std::sync::Arc::downgrade(&text_source);
+            let source = ModuleSource::text(text_source);
+            let fetched = module_tree::FetchedModuleSource::new(
+                chromium_module_key(&key),
+                chromium_module_key(&key),
+                source_url.clone(),
+                source_url,
+                chromium_source(source.clone()),
+                module_tree::ModuleFetchMetadata::default(),
+            );
+            let snapshot = {
+                let mut host =
+                    RendererModuleScriptTreeHost::new(NativeModuleTreeDocumentOwner::new(&mut vm));
+                module_tree::ModuleScriptTreeHost::compile_module_source(
+                    &mut host,
+                    fetched.clone(),
+                    module_tree::ModuleImportPhase::Evaluation,
+                )
+                .expect("synthetic module should compile")
+            };
+            let entry = local_entry_id(snapshot.entry);
+            assert!(vm.document_runtime.native_compiled_module(entry).is_some());
+            assert!(
+                vm.document_runtime.native_module_source(entry).is_none(),
+                "{module_type}: compiled module map must release its fetched source",
+            );
+            drop(fetched);
+            drop(source);
+            assert_eq!(
+                weak_source.strong_count(),
+                1,
+                "{module_type}: only the compiled record should own the original text allocation",
+            );
+            assert_eq!(weak_source.upgrade().unwrap().as_ref(), text);
+            drop(vm);
+            assert!(weak_source.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn wasm_module_compilation_shares_fetched_bytes_and_preserves_map_source() {
+        let bytes = b"\0asm\x01\0\0\0";
+        for phase in [
+            module_tree::ModuleImportPhase::Evaluation,
+            module_tree::ModuleImportPhase::Source,
+        ] {
+            let mut vm = new_test_vm("https://app.example.test/page");
+            let source_url = url("https://app.example.test/source.wasm");
+            let key = ModuleMapKey::webassembly(source_url.clone());
+            let shared_bytes: std::sync::Arc<[u8]> = bytes.as_slice().into();
+            let weak_source = std::sync::Arc::downgrade(&shared_bytes);
+            let source = ModuleSource::binary(shared_bytes);
+            let source_pointer = source.binary_source().unwrap().as_ptr();
+            let fetched = module_tree::FetchedModuleSource::new(
+                chromium_module_key(&key),
+                chromium_module_key(&key),
+                source_url.clone(),
+                source_url,
+                chromium_source(source.clone()),
+                module_tree::ModuleFetchMetadata::default(),
+            );
+            let snapshot = {
+                let mut host =
+                    RendererModuleScriptTreeHost::new(NativeModuleTreeDocumentOwner::new(&mut vm));
+                module_tree::ModuleScriptTreeHost::compile_module_source(
+                    &mut host,
+                    fetched.clone(),
+                    phase,
+                )
+                .expect("Wasm module should compile")
+            };
+            let entry = local_entry_id(snapshot.entry);
+            let retained_source = vm.document_runtime.native_module_source(entry).unwrap();
+            assert_eq!(retained_source.binary_source(), Some(bytes.as_slice()));
+            assert_eq!(
+                retained_source.binary_source().unwrap().as_ptr(),
+                source_pointer,
+                "{phase:?}: compilation must share the original fetched byte allocation",
+            );
+            drop(retained_source);
+            drop(fetched);
+            drop(source);
+            assert_eq!(
+                weak_source.strong_count(),
+                1,
+                "{phase:?}: the module map should retain the original byte allocation",
+            );
+            drop(vm);
+            assert!(weak_source.upgrade().is_none());
+        }
+    }
+
+    #[test]
     fn native_json_module_fetch_request_uses_json_destination_metadata() {
         let fetch_request = NativeModuleGraphFetchRequest::new_for_test(
             url("https://app.example.test/data.json"),
@@ -2620,7 +2854,9 @@ mod tests {
             ModuleFetchMetadata::default(),
             ModuleKind::Json,
         )
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("native JSON module request should build");
 
         assert_eq!(
@@ -2637,7 +2873,9 @@ mod tests {
             ModuleFetchMetadata::default(),
             ModuleKind::Css,
         )
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("native CSS module request should build");
 
         assert_eq!(
@@ -2655,14 +2893,15 @@ mod tests {
         let root_url = url("https://app.example.test/data.json");
         let single_fetch = NativeModuleSingleFetchRequest::new(
             root_url.clone(),
-            root_url.clone(),
             url("https://app.example.test/page"),
             ModuleMapKey::json_with_attributes(root_url, ModuleAttributesKey::empty()),
             ModuleFetchMetadata::default(),
         );
         let graph_request = single_fetch.fetch_request();
         let fetch_request = graph_request
-            .request()
+            .request(&moli_url::WebOrigin::from_url(&url(
+                "https://app.example.test/page",
+            )))
             .expect("modulepreload JSON fetch request should build");
 
         assert_eq!(
@@ -2676,14 +2915,15 @@ mod tests {
         let root_url = url("https://app.example.test/sheet.css");
         let single_fetch = NativeModuleSingleFetchRequest::new(
             root_url.clone(),
-            root_url.clone(),
             url("https://app.example.test/page"),
             ModuleMapKey::css_with_attributes(root_url, ModuleAttributesKey::empty()),
             ModuleFetchMetadata::default(),
         );
         let graph_request = single_fetch.fetch_request();
         let fetch_request = graph_request
-            .request()
+            .request(&moli_url::WebOrigin::from_url(&url(
+                "https://app.example.test/page",
+            )))
             .expect("modulepreload CSS fetch request should build");
 
         assert_eq!(
@@ -2707,7 +2947,6 @@ mod tests {
         let module_key = ModuleMapKey::java_script(root_url.clone());
         NativeModuleSingleFetchRequest::new(
             root_url.clone(),
-            root_url,
             url("https://app.example.test/page"),
             module_key,
             metadata,
@@ -2857,6 +3096,71 @@ mod tests {
     }
 
     #[test]
+    fn loaded_external_module_roots_still_enforce_url_csp() {
+        for owner in [
+            ModuleScriptCompletionOwner::Parser,
+            ModuleScriptCompletionOwner::Runtime,
+        ] {
+            let mut vm = new_test_vm("https://app.example.test/page");
+            vm.set_response_content_security_policies(&["script-src 'unsafe-inline'".to_owned()]);
+            let root_url = url("https://app.example.test/root.mjs");
+            let Err(error) = module_script_graph_job_for_owner(
+                &mut vm,
+                ModuleSource::text("globalThis.__externalModuleRan = true;".to_owned()),
+                &root_url,
+                &url("https://app.example.test/page"),
+                &ScriptFetchMetadata::default(),
+                true,
+                owner,
+            ) else {
+                panic!("having loaded source must not bypass external module URL policy");
+            };
+            assert_eq!(error.stage(), ModuleLoadStage::Fetch);
+            assert!(error.message().contains(root_url.as_str()));
+            assert_eq!(vm.eval("typeof __externalModuleRan").unwrap(), "undefined");
+        }
+    }
+
+    #[test]
+    fn inline_module_roots_preserve_dependency_url_csp() {
+        let dependency_url = url("https://dependencies.example.test/child.mjs");
+        for owner in [
+            ModuleScriptCompletionOwner::Parser,
+            ModuleScriptCompletionOwner::Runtime,
+        ] {
+            for allow_dependency in [false, true] {
+                let mut vm = new_test_vm("https://app.example.test/page");
+                vm.set_response_content_security_policies(&[if allow_dependency {
+                    "script-src 'unsafe-inline' https://dependencies.example.test".to_owned()
+                } else {
+                    "script-src 'unsafe-inline'".to_owned()
+                }]);
+                let job = module_script_graph_job_for_owner(
+                    &mut vm,
+                    ModuleSource::text(format!("import '{}';", dependency_url)),
+                    &url("https://app.example.test/page"),
+                    &url("https://app.example.test/page"),
+                    &ScriptFetchMetadata::default(),
+                    false,
+                    owner,
+                )
+                .expect("an admitted inline root must not undergo external URL CSP checks");
+                let advance = advance_module_script_graph(&mut vm, job);
+                if allow_dependency {
+                    let fetch = expect_single_fetch(advance.unwrap(), "allowed inline dependency");
+                    assert_eq!(fetch.pending_fetch_key().unwrap().url(), &dependency_url);
+                } else {
+                    let Err(error) = advance else {
+                        panic!("inline roots must not exempt their imports from CSP");
+                    };
+                    assert_eq!(error.stage(), ModuleLoadStage::Fetch);
+                    assert!(error.message().contains(dependency_url.as_str()));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn source_override_tree_fetches_sibling_dependencies_in_one_batch() {
         let mut vm = new_test_vm("https://app.example.test/page");
         let root_url = url("https://app.example.test/root.mjs");
@@ -2913,8 +3217,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         assert_eq!(
@@ -2952,8 +3259,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         assert_eq!(request.credentials_mode, RequestCredentialsMode::Include);
@@ -2999,8 +3309,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         let request_metadata = request
@@ -3033,8 +3346,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         assert_eq!(request.credentials_mode, RequestCredentialsMode::Include);
@@ -3086,8 +3402,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         let request_metadata = request
@@ -3131,8 +3450,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         let request_metadata = request
@@ -3165,8 +3487,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         let request_metadata = request
@@ -3192,8 +3517,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         assert_eq!(
@@ -3363,7 +3691,7 @@ import "./c.mjs";
     }
 
     #[test]
-    fn static_import_with_text_module_type_fails_before_dependency_fetch() {
+    fn static_import_with_unsupported_module_type_fails_before_dependency_fetch() {
         let mut vm = new_test_vm("https://app.example.test/page");
         let root_url = url("https://app.example.test/root.mjs");
         let job = parser_owned_external_module_script_graph_job(
@@ -3376,30 +3704,36 @@ import "./c.mjs";
         let root_fetch = expect_single_fetch(
             advance_module_script_graph(&mut vm, job)
                 .expect("external parser graph should request root"),
-            "text module type root",
+            "unsupported module type root",
         );
         let error = match root_fetch.finish_source_for_test(
             &mut vm,
             Ok(ModuleSource::text(
-                r#"import text from "./dep.txt" with { type: "text" };"#.to_owned(),
+                r#"import text from "./dep.txt" with { type: "unsupported" };"#.to_owned(),
             )),
         ) {
-            Ok(_) => panic!("text import attribute type should fail before dependency fetch"),
+            Ok(_) => {
+                panic!("unsupported import attribute type should fail before dependency fetch")
+            }
             Err(error) => error,
         };
 
         assert_eq!(error.stage(), ModuleLoadStage::Resolve);
+        assert_eq!(
+            error.error_constructor(),
+            Some(ScriptErrorConstructorKind::TypeError)
+        );
         assert!(
-            error
-                .message()
-                .contains("module type `text` is not a valid module type for import `./dep.txt`"),
+            error.message().contains(
+                "module type `unsupported` is not a valid module type for import `./dep.txt`"
+            ),
             "{}",
             error.message()
         );
     }
 
     #[test]
-    fn dynamic_import_with_text_module_type_fails_before_fetch() {
+    fn dynamic_import_with_unsupported_module_type_fails_before_fetch() {
         let mut vm = new_test_vm("https://example.test/app/page.html");
         let _js_runtime = crate::JsRuntime::initialize();
         let mut isolate = v8::Isolate::new(Default::default());
@@ -3414,12 +3748,12 @@ import "./c.mjs";
             crate::module_runtime::DynamicModuleImportOwner::main_for_test(),
             "./dep.txt",
             url("https://example.test/app/page.html"),
-            ModuleAttributesKey::from_pairs(vec![("type".to_owned(), "text".to_owned())]),
+            ModuleAttributesKey::from_pairs(vec![("type".to_owned(), "unsupported".to_owned())]),
             ModuleImportPhase::Evaluation,
         ));
 
         let error = match job.advance_dynamic_import_owner_lane(&mut vm) {
-            Ok(_) => panic!("text module type dynamic import should fail before root fetch"),
+            Ok(_) => panic!("unsupported module type dynamic import should fail before root fetch"),
             Err(error) => error,
         };
 
@@ -3427,7 +3761,7 @@ import "./c.mjs";
         assert_eq!(error.stage(), ModuleLoadStage::Resolve);
         assert!(
             error.message().contains(
-                "module type `text` is not a valid module type for module `https://example.test/app/dep.txt`"
+                "module type `unsupported` is not a valid module type for module `https://example.test/app/dep.txt`"
             ),
             "{}",
             error.message()
@@ -3461,7 +3795,6 @@ import "./c.mjs";
                     &mut vm,
                     Ok(ModuleGraphFetchedSource::new(
                         response_url.clone(),
-                        true,
                         ModuleSource::text("import './dep.mjs';".to_owned()),
                     )
                     .with_response_referrer_policy(Some("no-referrer".to_owned()))),
@@ -3531,7 +3864,6 @@ import "./c.mjs";
                     &mut vm,
                     Ok(ModuleGraphFetchedSource::new(
                         response_url.clone(),
-                        true,
                         ModuleSource::text("import './dep.mjs';".to_owned()),
                     )),
                 )
@@ -3745,6 +4077,7 @@ import "./c.mjs";
         let first_response = fetch_module_for_test(
             &loader,
             module_url.clone(),
+            ModuleKind::JavaScript,
             Url::parse(&format!("http://{addr}/first-page.html"))?,
             ModuleFetchMetadata::default(),
         )
@@ -3752,6 +4085,7 @@ import "./c.mjs";
         let second_response = fetch_module_for_test(
             &loader,
             module_url,
+            ModuleKind::JavaScript,
             Url::parse(&format!("http://{addr}/second-page.html"))?,
             ModuleFetchMetadata::default(),
         )
@@ -3771,7 +4105,7 @@ import "./c.mjs";
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn module_graph_fetch_allows_invalid_integrity() -> anyhow::Result<()> {
+    async fn module_graph_fetch_rejects_integrity_mismatch() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let server = tokio::spawn(async move {
@@ -3792,30 +4126,126 @@ import "./c.mjs";
         let module_url = Url::parse(&format!("http://{addr}/bad-integrity.js"))?;
         let metadata = ModuleFetchMetadata {
             request_metadata: ScriptFetchRequestMetadata {
-                integrity: Some("sha384-invalid".to_owned()),
+                integrity: Some(
+                    "sha384-Li9vy3DqF8tnTXuiaAJuML3ky+er10rcgNR/VqsVpcw+ThHmYcwiB1pbOxEbzJr7"
+                        .to_owned(),
+                ),
                 ..ScriptFetchRequestMetadata::default()
             },
             ..ModuleFetchMetadata::default()
         };
-        let response = fetch_module_for_test(
+        let error = fetch_module_for_test(
             &loader,
             module_url,
+            ModuleKind::JavaScript,
             Url::parse(&format!("http://{addr}/page.html"))?,
             metadata,
         )
-        .await?;
+        .await
+        .expect_err("an integrity mismatch must reject the module fetch");
 
         assert!(
-            !response.from_cache,
-            "module graph fetch should complete normally even with invalid integrity"
+            error.to_string().contains("failed its integrity check"),
+            "module graph fetch should report an integrity mismatch: {error:#}"
         );
         server.await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn module_graph_fetch_enforces_response_mime_for_module_kinds() -> anyhow::Result<()> {
+        for (kind, mime, body) in [
+            (
+                ModuleKind::JavaScript,
+                "text/javascript",
+                "export const answer = 42;",
+            ),
+            (ModuleKind::Json, "application/json", r#"{"answer":42}"#),
+            (ModuleKind::Json, "text/json", r#"{"answer":42}"#),
+            (ModuleKind::Css, "text/css", "#test { color: red; }"),
+            (
+                ModuleKind::WebAssembly,
+                "application/wasm",
+                "\0asm\x01\0\0\0",
+            ),
+        ] {
+            let cases = [
+                (vec![mime.to_owned()], true),
+                (
+                    vec![format!("{}; charset=utf-16", mime.to_ascii_uppercase())],
+                    true,
+                ),
+                (vec!["text/plain".to_owned(), mime.to_owned()], true),
+                (vec![format!("text/plain, {mime}")], true),
+                (
+                    vec![mime.to_owned(), "invalid".to_owned(), "*/*".to_owned()],
+                    true,
+                ),
+                (vec![mime.to_owned(), "text/plain".to_owned()], false),
+                (vec![format!("{mime}, text/plain")], false),
+                (vec![format!(r#"text/plain; a=",{mime}""#)], false),
+                (
+                    vec![r#"text/plain; a=""#.to_owned(), mime.to_owned()],
+                    false,
+                ),
+                (vec!["text/plain".to_owned()], false),
+                (vec!["applic(ation/vnd.api+json".to_owned()], false),
+                (vec!["application/vnd)api+json".to_owned()], false),
+                (vec!["*/*".to_owned()], false),
+                (vec![String::new()], false),
+                (vec![], false),
+            ];
+            for (values, accepts) in cases {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+                let addr = listener.local_addr()?;
+                let fields: String = values
+                    .iter()
+                    .map(|value| format!("Content-Type: {value}\r\n"))
+                    .collect();
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    read_http_request_head(&mut stream).await.unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\n{fields}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                        .await
+                        .unwrap();
+                });
+                let loader = ResourceRequestClient::new(&FetchConfig::default())?;
+                let result = fetch_module_for_test(
+                    &loader,
+                    Url::parse(&format!("http://{addr}/module"))?,
+                    kind,
+                    Url::parse(&format!("http://{addr}/page"))?,
+                    ModuleFetchMetadata::default(),
+                )
+                .await;
+                server.await?;
+                assert_eq!(result.is_ok(), accepts, "{kind:?}: {values:?}: {result:?}");
+                if let Err(error) = result {
+                    let expected = match kind {
+                        ModuleKind::JavaScript | ModuleKind::WebAssembly => {
+                            "unsupported script MIME type"
+                        }
+                        ModuleKind::Json => "non-JSON module response",
+                        ModuleKind::Css => "non-CSS module response",
+                        ModuleKind::Text => {
+                            unreachable!("text modules do not enforce a response MIME type")
+                        }
+                    };
+                    assert!(error.to_string().contains(expected), "{error:#}");
+                }
+            }
+        }
         Ok(())
     }
 
     async fn fetch_module_for_test(
         loader: &ResourceRequestClient,
         source_url: Url,
+        kind: ModuleKind,
         initiator_url: Url,
         fetch_metadata: ModuleFetchMetadata,
     ) -> anyhow::Result<crate::protocol_types::NavigationResponse> {
@@ -3823,11 +4253,12 @@ import "./c.mjs";
             source_url,
             initiator_url,
             fetch_metadata,
-            kind: ModuleKind::JavaScript,
+            kind,
             tree_client: None,
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         };
         let (tx, rx) = oneshot::channel();
         let registry = ResourceLoadRegistry::new(
@@ -3842,9 +4273,14 @@ import "./c.mjs";
                 None,
             )
             .expect("module fetch test load should register");
-        request.fetch_source_callback_with_load(loader, load, move |result, network_result| {
-            let _ = tx.send((result, network_result));
-        })?;
+        request.fetch_source_callback_with_load(
+            loader,
+            load,
+            moli_url::WebOrigin::from_url(request.initiator_url()),
+            move |result, network_result| {
+                let _ = tx.send((result, network_result));
+            },
+        )?;
         let (result, network_result) = rx.await?;
         let source_result = result.map_err(anyhow::Error::msg);
         let network_result = network_result.expect("module fetch should record network result");
@@ -3893,8 +4329,11 @@ import "./c.mjs";
             tree_graph_level: None,
             module_key: None,
             dependency: None,
+            csp_context: None,
         }
-        .request()
+        .request(&moli_url::WebOrigin::from_url(&url(
+            "https://app.example.test/page",
+        )))
         .expect("request should build");
 
         assert_eq!(request.credentials_mode, RequestCredentialsMode::SameOrigin);
@@ -4459,7 +4898,6 @@ import "./shared.mjs";
             request_url: root_url.clone(),
             result: Ok(ModuleGraphFetchedSource::new(
                 root_url,
-                false,
                 ModuleSource::text("import './dep.mjs'; export const root = 1;".to_owned()),
             )),
             network_result: None,
@@ -4571,7 +5009,6 @@ import "./shared.mjs";
             request_url: root_url.clone(),
             result: Ok(ModuleGraphFetchedSource::new(
                 root_url.clone(),
-                false,
                 ModuleSource::text(root_source.to_owned()),
             )),
             network_result: None,

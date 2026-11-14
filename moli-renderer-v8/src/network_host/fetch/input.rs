@@ -3,11 +3,10 @@ use crate::webidl;
 use std::str::FromStr;
 
 pub(super) struct ParsedWindowFetchInput {
-    pub(super) url: String,
+    pub(super) url: RequestInputUrl,
     pub(super) method: String,
-    pub(super) body: Option<Vec<u8>>,
+    pub(super) body: Option<bytes::Bytes>,
     pub(super) headers: Vec<(String, String)>,
-    pub(super) suppress_default_content_type: bool,
     pub(super) request_mode: moli_fetch::RequestMode,
     pub(super) credentials_mode: moli_fetch::RequestCredentialsMode,
     pub(super) redirect_mode: moli_fetch::RequestRedirectMode,
@@ -17,25 +16,28 @@ pub(super) struct ParsedWindowFetchInput {
     pub(super) referrer_policy: String,
     pub(super) integrity: String,
     pub(super) keepalive: bool,
+    pub(super) signal: Option<v8::Global<v8::Object>>,
     pub(super) request_body_owner: Option<v8::Global<v8::Object>>,
 }
 
 pub(super) fn parse_window_fetch_input<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
-) -> Result<ParsedWindowFetchInput, String> {
+) -> Result<ParsedWindowFetchInput, FetchArgumentError> {
     if args.length() < 1 {
         return Err(
-            webidl::WebIdlError::missing_required(webidl::Context::argument("fetch", 1))
-                .to_string(),
+            webidl::WebIdlError::missing_required(webidl::Context::argument("fetch", 1)).into(),
         );
     }
-    let arg0 = args.get(0);
-    let inherited = request_input_snapshot(scope, arg0).map_err(|error| error.to_string())?;
+    let args = webidl::try_parse_args::<crate::network_host::FetchArgs>(scope, args)?;
+    let inherit_body = !args.init.body_is_present();
+    let (url, inherited, source) = args.input.materialize_for_fetch(scope, inherit_body)?;
     if let Some(inherited) = inherited {
-        let req_obj = v8::Local::<v8::Object>::try_from(arg0).expect("request-like object");
-        let url = inherited.url.clone();
-        let init = parse_fetch_init(scope, args, 1)?;
+        let req_obj = source.expect("request input source");
+        let init = parse_fetch_init(scope, args.init)?;
+        if inherited.body_unusable && !init.body_present {
+            return Err(crate::network_host::request_body_already_used_error().into());
+        }
         let request_body_owner = (!init.body_present && inherited.body.is_some())
             .then(|| v8::Global::new(scope, req_obj));
         let method = if init.method_present {
@@ -53,25 +55,20 @@ pub(super) fn parse_window_fetch_input<'s>(
         } else {
             inherited.headers.clone()
         };
-        let suppress_default_content_type = if init.body_present {
-            if !init.headers_present {
-                append_default_body_content_type(&mut headers, init.body_content_type.as_deref());
-            }
-            init.suppress_default_content_type
-                || (body.is_some()
-                    && init.body_content_type.is_none()
-                    && !has_header(&headers, "content-type"))
-        } else {
-            body.is_some() && !has_header(&headers, "content-type")
-        };
+        if init.body_present && !init.headers_present {
+            append_default_body_content_type(&mut headers, init.body_content_type.as_deref());
+        }
         let inherited_credentials = request_object_credentials_mode(scope, req_obj)?;
         let request_mode = init
             .request_mode
             .or_else(|| moli_fetch::RequestMode::from_str(&inherited.mode).ok())
             .unwrap_or(moli_fetch::RequestMode::Cors);
         validate_no_cors_method(request_mode, &method)?;
+        crate::network_host::validate_request_method_body(&method, body.as_ref())?;
         if request_mode == moli_fetch::RequestMode::NoCors {
             headers = filter_headers_for_guard(&headers, HeadersGuard::RequestNoCors);
+        } else {
+            headers = filter_headers_for_guard(&headers, HeadersGuard::Request);
         }
         let credentials_mode = init
             .credentials_mode
@@ -85,12 +82,22 @@ pub(super) fn parse_window_fetch_input<'s>(
             (inherited.priority != moli_fetch::FetchPriorityHint::Auto)
                 .then_some(inherited.priority)
         });
+        // Legacy request-like signals have not passed RequestInit conversion.
+        // Validate the selected value so an explicit init.signal can override it.
+        let signal = init.signal.unwrap_or(inherited.signal);
+        if let Some(signal) = signal.as_ref() {
+            let signal = v8::Local::new(scope, signal);
+            webidl::convert::<crate::abort_signal_route::ResolvedAbortSignal>(
+                scope,
+                signal.into(),
+                webidl::Context::member("Request", "signal"),
+            )?;
+        }
         Ok(ParsedWindowFetchInput {
             url,
             method,
             body,
             headers,
-            suppress_default_content_type,
             request_mode,
             credentials_mode,
             redirect_mode,
@@ -100,17 +107,18 @@ pub(super) fn parse_window_fetch_input<'s>(
             referrer_policy: init.referrer_policy.unwrap_or(inherited.referrer_policy),
             integrity: init.integrity.unwrap_or(inherited.integrity),
             keepalive: init.keepalive.unwrap_or(inherited.keepalive),
+            signal,
             request_body_owner,
         })
     } else {
-        let url = fetch_request_info_url(scope, arg0)?;
-        let init = parse_fetch_init(scope, args, 1)?;
+        let init = parse_fetch_init(scope, args.init)?;
         let request_mode = init.request_mode.unwrap_or(moli_fetch::RequestMode::Cors);
         validate_no_cors_method(request_mode, &init.method)?;
+        crate::network_host::validate_request_method_body(&init.method, init.body.as_ref())?;
         let headers = if request_mode == moli_fetch::RequestMode::NoCors {
             filter_headers_for_guard(&init.headers, HeadersGuard::RequestNoCors)
         } else {
-            init.headers
+            filter_headers_for_guard(&init.headers, HeadersGuard::Request)
         };
         let credentials_mode = init
             .credentials_mode
@@ -123,7 +131,6 @@ pub(super) fn parse_window_fetch_input<'s>(
             method: init.method,
             body: init.body,
             headers,
-            suppress_default_content_type: init.suppress_default_content_type,
             request_mode,
             credentials_mode,
             redirect_mode,
@@ -133,6 +140,7 @@ pub(super) fn parse_window_fetch_input<'s>(
             referrer_policy: init.referrer_policy.unwrap_or_default(),
             integrity: init.integrity.unwrap_or_default(),
             keepalive: init.keepalive.unwrap_or(false),
+            signal: init.signal.flatten(),
             request_body_owner: None,
         })
     }
@@ -141,22 +149,14 @@ pub(super) fn parse_window_fetch_input<'s>(
 fn validate_no_cors_method(
     request_mode: moli_fetch::RequestMode,
     method: &str,
-) -> Result<(), String> {
+) -> Result<(), FetchArgumentError> {
     if request_mode == moli_fetch::RequestMode::NoCors
         && !moli_fetch::is_cors_safelisted_method(method)
     {
-        return Err(format!(
-            "Failed to execute 'fetch': method `{method}` is unsupported in no-cors mode."
-        ));
+        return Err(FetchArgumentError::UnsupportedNoCorsMethod {
+            method: method.to_owned(),
+            interface: None,
+        });
     }
     Ok(())
-}
-
-fn fetch_request_info_url<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Result<String, String> {
-    webidl::convert::<webidl::UsvString>(scope, value, webidl::Context::argument("fetch", 1))
-        .map(Into::into)
-        .map_err(|error| error.to_string())
 }

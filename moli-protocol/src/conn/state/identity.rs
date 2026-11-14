@@ -85,6 +85,37 @@ pub struct TargetPageResidenceIdentity {
     page_attachment_id: TargetPageAttachmentId,
 }
 
+/// Captures both the target Page and the Document that owns a DOM reference.
+/// Page residence alone cannot authorize an element after cross-document
+/// navigation, since the Page and its WindowProxy remain resident.
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
+pub struct DevToolsDocumentResidenceIdentity {
+    page: TargetPageResidenceIdentity,
+    document: moli_core::RendererDocumentLifecycleIdentity,
+}
+
+impl DevToolsDocumentResidenceIdentity {
+    pub(crate) fn new(
+        page: TargetPageResidenceIdentity,
+        document: moli_core::RendererDocumentLifecycleIdentity,
+    ) -> Self {
+        Self { page, document }
+    }
+}
+
+/// A node exported by this WebDriver session. Keeping native provenance (and
+/// no V8 handle) lets Classic distinguish an unknown reference, another frame,
+/// and a known node whose Document has since been replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDriverNodeReference {
+    pub page_residence: DevToolsDocumentResidenceIdentity,
+    pub target_id: String,
+    pub browsing_context_id: String,
+    pub backend_node_id: u32,
+    pub kind: crate::automation::WebDriverNodeKind,
+    pub(crate) frame_document: Option<moli_core::RendererDocumentLifecycleIdentity>,
+}
+
 impl TargetPageResidenceIdentity {
     pub(crate) fn new(
         browser_context_id: String,

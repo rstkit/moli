@@ -1,15 +1,12 @@
-use super::super::{ChildBrowsingContextBootstrap, ChildBrowsingContextSnapshot, JsContextHost};
-use super::configure_child_document_navigation_request;
+use super::super::{ChildBrowsingContextBootstrap, ChildBrowsingContextSnapshot, PageScriptHost};
+use crate::document_response_decoder::decode_document_response;
 use crate::document_runtime::{DocumentPolicyContainer, DomHandle};
-use moli_encoding::decode_html_document_with_fallback;
-use moli_fetch::Request;
 use moli_web_mime::{
-    is_dom_parser_xml_mime, is_html_document_mime, resource_mime_essence_for_url,
-    response_document_content_type,
+    is_html_document_mime, resource_mime_essence_for_url, response_document_content_type,
 };
 use url::Url;
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(in crate::native_bridge::context_host) fn apply_page_csp_bypass_to_child_snapshot(
         &self,
         mut snapshot: ChildBrowsingContextSnapshot,
@@ -52,7 +49,7 @@ impl JsContextHost {
                 if !mime_type.is_empty() && !is_html_document_mime(&mime_type) {
                     return None;
                 }
-                let character_set = self.child_document_fallback_character_set(Some("text/html"));
+                let character_set = self.document_character_set().to_owned();
                 Some(ChildBrowsingContextSnapshot::with_character_set(
                     url.clone(),
                     body,
@@ -64,11 +61,12 @@ impl JsContextHost {
             "data" => crate::network_host::local_url_response(url).map(|response| {
                 let head = response.head();
                 let content_type = child_document_content_type_from_headers(&head.headers);
-                let fallback = self.child_document_fallback_character_set(content_type.as_deref());
-                let (body, character_set) = decode_html_document_with_fallback(
+                let (body, character_set) = decode_document_response(
                     response.body_bytes(),
                     &head.headers,
-                    Some(&fallback),
+                    content_type.as_deref(),
+                    &head.final_url,
+                    Some(self.document_character_set()),
                 );
                 let policy_container = DocumentPolicyContainer::from_navigation_response_headers(
                     &head.headers,
@@ -84,59 +82,6 @@ impl JsContextHost {
             }),
             _ => None,
         }
-    }
-
-    pub(crate) fn materialize_child_snapshot_for_url_blocking(
-        &self,
-        owner_node: crate::document_runtime::DomHandle,
-        url: &Url,
-    ) -> Option<ChildBrowsingContextSnapshot> {
-        if let Some(snapshot) = self.materialize_local_child_snapshot_for_url(url) {
-            return Some(self.apply_page_csp_bypass_to_child_snapshot(snapshot));
-        }
-        if !matches!(url.scheme(), "http" | "https") {
-            return None;
-        }
-        let dispatch_scope = self
-            .owner_dispatch_scope_for_node(owner_node)
-            .unwrap_or(crate::native_bridge::OwnerDispatchScope::Top);
-        let loader = self
-            .document_resource_loader_for_dispatch_scope(dispatch_scope)?
-            .request_client()
-            .clone();
-        let initiator_url = self.document_url_for_child_context(owner_node);
-        let browser_context = self.host_document().cookie_browser_context();
-        let request = configure_child_document_navigation_request(
-            Request::new("GET", url.as_str(), None, Vec::new()).ok()?,
-            &initiator_url,
-            &browser_context,
-        )
-        .with_page_network_policy();
-        let response = loader.fetch_raw_for_blocking_boundary(request).ok()?;
-        let head = response.head();
-        let content_type = child_document_content_type_from_headers(&head.headers)
-            .or_else(|| child_document_content_type_for_url(&head.final_url));
-        let fallback = self.child_document_fallback_character_set(content_type.as_deref());
-        let (markup, character_set) = decode_html_document_with_fallback(
-            response.body_bytes(),
-            &head.headers,
-            Some(&fallback),
-        );
-        let policy_container = DocumentPolicyContainer::from_navigation_response_headers(
-            &head.headers,
-            &head.final_url,
-        );
-        Some(
-            self.apply_page_csp_bypass_to_child_snapshot(
-                ChildBrowsingContextSnapshot::with_character_set(
-                    head.final_url,
-                    markup,
-                    content_type,
-                    character_set,
-                )
-                .with_policy_container(policy_container),
-            ),
-        )
     }
 
     pub(in crate::native_bridge::context_host) fn materialize_local_child_snapshot_for_bootstrap(
@@ -170,21 +115,10 @@ impl JsContextHost {
             ChildBrowsingContextBootstrap::Request(_) => None,
         }
     }
-
-    pub(in crate::native_bridge::context_host) fn child_document_fallback_character_set(
-        &self,
-        content_type: Option<&str>,
-    ) -> String {
-        if content_type.is_some_and(is_dom_parser_xml_mime) {
-            "UTF-8".to_owned()
-        } else {
-            self.document_character_set().to_owned()
-        }
-    }
 }
 
 pub(in crate::native_bridge::context_host) fn child_document_content_type_from_headers(
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> Option<String> {
     response_document_content_type(headers)
 }
@@ -205,11 +139,11 @@ mod tests {
 
     #[test]
     fn child_document_content_type_routes_through_web_mime_helpers() {
-        let headers = vec![
-            ("content-type".to_owned(), "text/plain".to_owned()),
+        let headers: Vec<(String, Vec<u8>)> = vec![
+            ("content-type".to_owned(), b"text/plain".to_vec()),
             (
                 "Content-Type".to_owned(),
-                " Image/SVG+XML ; charset=utf-8 ".to_owned(),
+                b" Image/SVG+XML ; charset=utf-8 ".to_vec(),
             ),
         ];
         assert_eq!(
@@ -217,10 +151,7 @@ mod tests {
             Some("image/svg+xml")
         );
         assert_eq!(
-            child_document_content_type_from_headers(&[(
-                "Content-Type".to_owned(),
-                " ".to_owned()
-            )]),
+            child_document_content_type_from_headers(&[("Content-Type".to_owned(), b" ".to_vec())]),
             None
         );
         assert_eq!(

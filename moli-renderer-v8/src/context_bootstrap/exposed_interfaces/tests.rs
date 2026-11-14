@@ -1,8 +1,12 @@
+use crate::web_api_interfaces;
 use std::cell::Cell;
 use std::pin::pin;
 
 use crate::context_bootstrap::specs::{ConstructorKind, ConstructorSpec};
 use crate::util::v8str;
+
+mod finalization;
+mod url_exposure;
 
 thread_local! {
     static LAZY_GETTER_CALLS: Cell<u32> = const { Cell::new(0) };
@@ -158,8 +162,7 @@ fn insecure_window_filter_rejects_a_failed_interface_deletion() {
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
     let specs = vec![ConstructorSpec {
-        name: "StorageManager",
-        parent: None,
+        interface: web_api_interfaces::StorageManager::DESCRIPTOR,
         kind: ConstructorKind::StorageManager,
     }];
     super::template_registry::ExposedInterfaceTemplateRegistry::install(
@@ -298,8 +301,296 @@ fn entered_context_template_build_is_isolate_cached_and_realm_neutral() {
 }
 
 #[test]
+fn intrinsic_dom_string_map_materializes_without_reading_the_public_binding() {
+    crate::ensure_v8_for_test();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let registry = super::template_registry::ExposedInterfaceTemplateRegistry::install(
+        scope,
+        crate::context_bootstrap::specs::constructor_specs(),
+        super::metadata::TemplateBuildProfile::Window,
+    )
+    .expect("template registry");
+    let realm = super::realm_registry::IntrinsicInterfaceRegistry::initialize_for_current_context(
+        scope,
+        registry.len(),
+        super::RealmKind::Window,
+    )
+    .expect("realm registry");
+    let id = registry
+        .id_by_name("DOMStringMap")
+        .expect("dataset interface");
+    let constructor = registry
+        .get_or_build_template(scope, id)
+        .expect("dataset template")
+        .get_function(scope)
+        .expect("dataset constructor");
+    let prototype = crate::util::constructor_prototype_object(scope, constructor.into())
+        .expect("dataset prototype");
+    let global = context.global(scope);
+    moli_v8_util::install_web_api_intrinsic_resolver(
+        scope,
+        super::materialize::resolve_web_api_intrinsic,
+    );
+    assert_eq!(
+        global.set_lazy_data_property(
+            scope,
+            v8str(scope, "DOMStringMap").into(),
+            counting_lazy_getter,
+        ),
+        Some(true)
+    );
+    reset_lazy_getter_calls();
+
+    let intrinsic = crate::util::global_constructor_prototype(scope, "DOMStringMap")
+        .expect("the shared helper must materialize the trusted dataset prototype");
+
+    assert!(intrinsic.strict_equals(prototype.into()));
+    assert!(matches!(
+        &*realm.entry(id).unwrap(),
+        super::realm_registry::RealmInterfaceEntry::Ready
+    ));
+    assert!(
+        super::ensure_intrinsic_interface_constructor(scope, "DOMStringMap")
+            .expect("trusted dataset constructor")
+            .strict_equals(constructor.into())
+    );
+    assert!(
+        super::materialize::materialize_interface(scope, id)
+            .expect("repeated dataset materialization")
+            .strict_equals(constructor.into())
+    );
+    assert_eq!(registry.build_count(id), 1);
+    assert_eq!(
+        lazy_getter_calls(),
+        0,
+        "materialization must not read the public binding"
+    );
+}
+
+#[test]
+fn materialization_cycle_keeps_intrinsic_objects_unpublished() {
+    crate::ensure_v8_for_test();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let registry = super::template_registry::ExposedInterfaceTemplateRegistry::install(
+        scope,
+        crate::context_bootstrap::specs::constructor_specs(),
+        super::metadata::TemplateBuildProfile::Window,
+    )
+    .expect("template registry");
+    let realm = super::realm_registry::IntrinsicInterfaceRegistry::initialize_for_current_context(
+        scope,
+        registry.len(),
+        super::RealmKind::Window,
+    )
+    .expect("realm registry");
+    let id = registry.id_by_name("Crypto").expect("Crypto interface");
+    realm
+        .begin_materialization(id)
+        .expect("start materialization");
+
+    let error = super::materialize::materialize_interface(scope, id)
+        .expect_err("a reentrant lookup must report a cycle");
+
+    assert!(error.to_string().contains("materialization cycle"));
+    assert!(realm.constructor(scope, id).is_none());
+    assert!(realm.prototype(scope, id).is_none());
+    assert!(realm.public_interface(scope, id).is_none());
+    assert_eq!(registry.materialization_count(id), 0);
+}
+
+#[test]
+fn ecmascript_intrinsic_capture_rejects_partial_registration_on_retry() {
+    crate::ensure_v8_for_test();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    crate::util::initialize_ecmascript_intrinsic_registry(scope, global);
+    let prototypes = crate::util::get_private_object(scope, global, "__moliEcmascriptPrototypes")
+        .expect("private prototype registry");
+    assert_eq!(
+        prototypes.set_integrity_level(scope, v8::IntegrityLevel::Frozen),
+        Some(true)
+    );
+
+    super::install::capture_ecmascript_intrinsic(scope, global, "Error")
+        .expect_err("the first capture must report its failed prototype publication");
+    assert!(crate::util::registered_ecmascript_constructor(scope, global, "Error").is_some());
+    assert!(crate::util::registered_ecmascript_prototype(scope, global, "Error").is_none());
+    let error = super::install::capture_ecmascript_intrinsic(scope, global, "Error")
+        .expect_err("retrying a partial Error pair must not report success");
+    assert!(error.to_string().contains("partial registry state"));
+}
+
+#[test]
+fn ecmascript_intrinsic_capture_rejects_prototype_without_constructor() {
+    crate::ensure_v8_for_test();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    crate::util::initialize_ecmascript_intrinsic_registry(scope, global);
+    let prototypes = crate::util::get_private_object(scope, global, "__moliEcmascriptPrototypes")
+        .expect("private prototype registry");
+    let constructor = crate::util::constructor_object(scope, global, "Error")
+        .expect("ECMAScript Error constructor");
+    let prototype = crate::util::constructor_prototype_object(scope, constructor)
+        .expect("ECMAScript Error prototype");
+    assert_eq!(
+        prototypes.set(scope, v8str(scope, "Error").into(), prototype.into()),
+        Some(true)
+    );
+
+    let error = super::install::capture_ecmascript_intrinsic(scope, global, "Error")
+        .expect_err("a prototype-only Error registration must not be completed from the global");
+
+    assert!(error.to_string().contains("partial registry state"));
+    assert!(crate::util::registered_ecmascript_constructor(scope, global, "Error").is_none());
+}
+
+#[test]
+fn repeated_eager_capture_preserves_intrinsics_and_lazy_public_proxies() {
+    fn eager_constructor<'s>(
+        _scope: &mut v8::PinScope<'s, '_>,
+        _args: v8::FunctionCallbackArguments<'s>,
+        _rv: v8::ReturnValue<'s>,
+    ) {
+    }
+
+    crate::ensure_v8_for_test();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let registry = super::template_registry::ExposedInterfaceTemplateRegistry::install(
+        scope,
+        crate::context_bootstrap::specs::constructor_specs(),
+        super::metadata::TemplateBuildProfile::Window,
+    )
+    .expect("template registry");
+    let global = context.global(scope);
+    let constructor = v8::Function::new(scope, eager_constructor).expect("eager constructor");
+    let prototype = crate::util::constructor_prototype_object(scope, constructor.into())
+        .expect("eager prototype");
+    assert_eq!(
+        global.set(scope, v8str(scope, "Window").into(), constructor.into()),
+        Some(true)
+    );
+    super::capture_eager_intrinsic_interfaces(scope, global, super::RealmKind::Window)
+        .expect("first eager capture");
+    let id = registry
+        .id_by_name("HTMLDivElement")
+        .expect("HTML interface");
+    let public = super::materialize::materialize_interface(scope, id)
+        .expect("HTML interface materialization");
+    assert!(public.is_proxy());
+    assert_eq!(
+        global.set(scope, v8str(scope, "Window").into(), v8::null(scope).into()),
+        Some(true)
+    );
+
+    super::capture_eager_intrinsic_interfaces(scope, global, super::RealmKind::Window)
+        .expect("repeat eager capture must preserve existing entries");
+
+    assert!(
+        crate::util::global_constructor_object(scope, "Window")
+            .unwrap()
+            .strict_equals(constructor.into())
+    );
+    assert!(
+        crate::util::global_constructor_prototype(scope, "Window")
+            .unwrap()
+            .strict_equals(prototype.into())
+    );
+    assert!(
+        super::materialize::materialize_interface(scope, id)
+            .unwrap()
+            .strict_equals(public)
+    );
+    assert_eq!(registry.materialization_count(id), 1);
+}
+
+#[test]
+fn failed_intrinsic_finalization_does_not_expose_registered_objects() {
+    crate::ensure_v8_for_test();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let registry = super::template_registry::ExposedInterfaceTemplateRegistry::install(
+        scope,
+        crate::context_bootstrap::specs::constructor_specs(),
+        super::metadata::TemplateBuildProfile::Window,
+    )
+    .expect("template registry");
+    let realm = super::realm_registry::IntrinsicInterfaceRegistry::initialize_for_current_context(
+        scope,
+        registry.len(),
+        super::RealmKind::Window,
+    )
+    .expect("realm registry");
+    let id = registry.id_by_name("Crypto").expect("Crypto interface");
+    let constructor = registry
+        .get_or_build_template(scope, id)
+        .expect("Crypto template")
+        .get_function(scope)
+        .expect("Crypto constructor");
+    let prototype = crate::util::constructor_prototype_object(scope, constructor.into())
+        .expect("Crypto prototype");
+    let global = context.global(scope);
+    moli_v8_util::install_web_api_intrinsic_resolver(
+        scope,
+        super::materialize::resolve_web_api_intrinsic,
+    );
+    let subtle_crypto_available = v8::Boolean::new(scope, true);
+    crate::util::set_private_value(
+        scope,
+        global,
+        "__moliWindowCryptoSubtleAvailable",
+        subtle_crypto_available.into(),
+    );
+    assert_eq!(
+        prototype.set_integrity_level(scope, v8::IntegrityLevel::Frozen),
+        Some(true)
+    );
+
+    super::ensure_intrinsic_interface_prototype(scope, "Crypto")
+        .expect_err("a frozen prototype must reject secure-context finalization");
+
+    assert!(matches!(
+        &*realm.entry(id).unwrap(),
+        super::realm_registry::RealmInterfaceEntry::Failed
+    ));
+    assert!(realm.constructor(scope, id).is_none());
+    assert!(realm.prototype(scope, id).is_none());
+    assert!(realm.public_interface(scope, id).is_none());
+    assert!(super::ensure_intrinsic_interface_constructor(scope, "Crypto").is_err());
+    assert!(super::ensure_intrinsic_interface_prototype(scope, "Crypto").is_err());
+    assert!(super::materialized_intrinsic_interface_prototype(scope, "Crypto").is_none());
+    assert_eq!(registry.materialization_count(id), 0);
+    assert!(crate::util::global_constructor_object(scope, "Crypto").is_none());
+    assert!(crate::util::global_constructor_prototype(scope, "Crypto").is_none());
+    assert!(crate::util::registered_ecmascript_constructor(scope, global, "Crypto").is_none());
+    assert!(crate::util::registered_ecmascript_prototype(scope, global, "Crypto").is_none());
+}
+
+#[test]
 fn worker_realm_lazy_properties_follow_chromium_exposure_sets() {
-    fn own_properties(realm: super::RealmKind) -> Vec<bool> {
+    fn own_properties(realm: super::RealmKind, secure_context: bool) -> Vec<bool> {
         crate::ensure_v8_for_test();
         let mut isolate = v8::Isolate::new(Default::default());
         let scope = pin!(v8::HandleScope::new(&mut isolate));
@@ -308,7 +599,10 @@ fn worker_realm_lazy_properties_follow_chromium_exposure_sets() {
         let scope = &mut v8::ContextScope::new(scope, context);
         let global = context.global(scope);
         crate::context_bootstrap::install_worker_lazy_exposed_interfaces(
-            scope, global, realm, true,
+            scope,
+            global,
+            realm,
+            secure_context,
         )
         .expect("worker lazy interfaces should install");
         let registry = super::template_registry::ExposedInterfaceTemplateRegistry::current(scope)
@@ -329,6 +623,49 @@ fn worker_realm_lazy_properties_follow_chromium_exposure_sets() {
         assert!(first_url.strict_equals(second_url));
         assert_eq!(registry.build_count(url_id), 1);
 
+        let source = v8str(
+            scope,
+            r#"(() => {
+              const Original = URL;
+              const parse = Original.parse;
+              globalThis.URL = null;
+              try {
+                const value = parse('https://example.test/?q=value');
+                return value instanceof Original &&
+                  Object.getPrototypeOf(value) === Original.prototype &&
+                  value.searchParams.get('q') === 'value' && globalThis.URL === null;
+              } finally {
+                globalThis.URL = Original;
+              }
+            })()"#,
+        );
+        let script = v8::Script::compile(scope, source, None).expect("worker URL factory script");
+        assert!(
+            crate::script_execution::execute_compiled_script(scope, script)
+                .expect("worker URL factory evaluation")
+                .is_true(),
+            "worker URL factories must not follow the public constructor binding"
+        );
+        assert_eq!(registry.build_count(url_id), 1);
+
+        if secure_context {
+            let event_target = super::ensure_intrinsic_interface_prototype(scope, "EventTarget")
+                .expect("worker EventTarget prototype");
+            let key = v8str(scope, "addEventListener");
+            let canonical_add = event_target.get(scope, key.into()).unwrap();
+            for name in ["ServiceWorkerContainer", "ServiceWorker"] {
+                let prototype = super::ensure_intrinsic_interface_prototype(scope, name)
+                    .expect("native Service Worker objects need their prototype independently of global exposure");
+                let key = v8str(scope, "addEventListener");
+                assert!(
+                    prototype
+                        .get(scope, key.into())
+                        .unwrap()
+                        .strict_equals(canonical_add)
+                );
+            }
+        }
+
         [
             "Worker",
             "XMLHttpRequest",
@@ -337,6 +674,12 @@ fn worker_realm_lazy_properties_follow_chromium_exposure_sets() {
             "FileSystemSyncAccessHandle",
             "URL",
             "WorkerLocation",
+            "webkitURL",
+            "BatteryManager",
+            "NetworkInformation",
+            "ServiceWorkerContainer",
+            "ServiceWorkerRegistration",
+            "ServiceWorker",
         ]
         .iter()
         .map(|name| {
@@ -348,15 +691,224 @@ fn worker_realm_lazy_properties_follow_chromium_exposure_sets() {
     }
 
     assert_eq!(
-        own_properties(super::RealmKind::DedicatedWorker),
-        vec![true, true, true, false, true, true, false]
+        own_properties(super::RealmKind::DedicatedWorker, true),
+        vec![
+            true, true, true, false, true, true, false, false, false, true, false, true, false
+        ]
     );
     assert_eq!(
-        own_properties(super::RealmKind::SharedWorker),
-        vec![true, true, true, false, false, true, false]
+        own_properties(super::RealmKind::SharedWorker, true),
+        vec![
+            true, true, true, false, false, true, false, false, false, true, false, true, false
+        ]
     );
     assert_eq!(
-        own_properties(super::RealmKind::ServiceWorker),
-        vec![false, false, false, false, false, true, false]
+        own_properties(super::RealmKind::ServiceWorker, true),
+        vec![
+            false, false, false, false, false, true, false, false, false, true, false, true, true
+        ]
+    );
+    for realm in [
+        super::RealmKind::DedicatedWorker,
+        super::RealmKind::SharedWorker,
+        super::RealmKind::ServiceWorker,
+    ] {
+        assert_eq!(
+            &own_properties(realm, false)[8..],
+            &[false, true, false, false, false]
+        );
+    }
+}
+
+#[test]
+fn worker_rectangle_interfaces_share_native_state_and_inheritance() {
+    crate::ensure_v8_for_test();
+    for realm in [
+        super::RealmKind::DedicatedWorker,
+        super::RealmKind::SharedWorker,
+        super::RealmKind::ServiceWorker,
+    ] {
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let global = context.global(scope);
+        crate::context_bootstrap::install_worker_lazy_exposed_interfaces(
+            scope, global, realm, true,
+        )
+        .expect("worker rectangle interfaces should install");
+        let source = v8::String::new(
+            scope,
+            r#"
+          (() => {
+            const readonly = new DOMRectReadOnly(12, 34, -30, -40);
+            const mutable = DOMRect.fromRect(readonly);
+            mutable.x = 55;
+            mutable.width = 9;
+            const copy = DOMRectReadOnly.fromRect(mutable);
+            return JSON.stringify([
+              typeof DOMRect, typeof DOMRectReadOnly,
+              DOMRect.length, DOMRectReadOnly.length,
+              Object.getPrototypeOf(DOMRect.prototype) === DOMRectReadOnly.prototype,
+              mutable instanceof DOMRectReadOnly,
+              [readonly.x, readonly.y, readonly.width, readonly.height,
+               readonly.top, readonly.right, readonly.bottom, readonly.left],
+              [mutable.x, mutable.y, mutable.width, mutable.height],
+              [copy.x, copy.y, copy.width, copy.height],
+              Object.getOwnPropertyDescriptor(DOMRectReadOnly.prototype, "x").set === undefined,
+              String(readonly), String(mutable), String(copy)
+            ]);
+          })()
+        "#,
+        )
+        .expect("worker rectangle test source");
+        let script =
+            v8::Script::compile(scope, source, None).expect("worker rectangle test compile");
+        let result = crate::script_execution::execute_compiled_script(scope, script)
+            .expect("worker rectangle test evaluation")
+            .to_rust_string_lossy(scope);
+        assert_eq!(
+            result,
+            r#"["function","function",0,0,true,true,[12,34,-30,-40,-6,12,34,-18],[55,34,9,-40],[55,34,9,-40],true,"[object DOMRectReadOnly]","[object DOMRect]","[object DOMRectReadOnly]"]"#,
+            "realm {realm:?}"
+        );
+    }
+}
+
+#[test]
+fn source_buffer_interfaces_are_exposed_only_to_window_and_dedicated_workers() {
+    crate::ensure_v8_for_test();
+    for (realm, expected) in [
+        (super::RealmKind::DedicatedWorker, true),
+        (super::RealmKind::SharedWorker, false),
+        (super::RealmKind::ServiceWorker, false),
+    ] {
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let global = context.global(scope);
+        crate::context_bootstrap::install_worker_lazy_exposed_interfaces(
+            scope, global, realm, true,
+        )
+        .expect("worker interfaces");
+        for name in ["MediaSourceHandle", "SourceBuffer", "SourceBufferList"] {
+            assert_eq!(
+                global.has_own_property(scope, v8str(scope, name).into()),
+                Some(expected),
+                "{realm:?}/{name}"
+            );
+            if expected {
+                assert!(
+                    global
+                        .get(scope, v8str(scope, name).into())
+                        .unwrap()
+                        .is_function(),
+                    "{name} materialization"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn worker_geometry_interfaces_use_worker_specific_matrix_surface() {
+    crate::ensure_v8_for_test();
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    crate::context_bootstrap::install_worker_lazy_exposed_interfaces(
+        scope,
+        global,
+        super::RealmKind::DedicatedWorker,
+        true,
+    )
+    .expect("worker geometry interfaces should install");
+
+    let source = v8::String::new(
+        scope,
+        r#"
+        (() => {
+          const names = [
+            "DOMPointReadOnly", "DOMPoint", "DOMRectReadOnly", "DOMRect",
+            "DOMQuad", "DOMMatrixReadOnly", "DOMMatrix"
+          ];
+          const errorName = callback => {
+            try {
+              callback();
+              return "missing";
+            } catch (error) {
+              return error.name;
+            }
+          };
+          const operationSets = [
+            [DOMPointReadOnly, ["fromPoint"]],
+            [DOMPointReadOnly.prototype, ["matrixTransform"]],
+            [DOMPoint, ["fromPoint"]],
+            [DOMRectReadOnly, ["fromRect"]],
+            [DOMRect, ["fromRect"]],
+            [DOMQuad, ["fromRect", "fromQuad"]],
+            [DOMMatrixReadOnly, [
+              "fromMatrix", "fromFloat32Array", "fromFloat64Array"
+            ]],
+            [DOMMatrixReadOnly.prototype, [
+              "translate", "scale", "scaleNonUniform", "scale3d", "rotate",
+              "rotateFromVector", "rotateAxisAngle", "skewX", "skewY",
+              "multiply", "flipX", "flipY", "inverse", "transformPoint",
+              "toFloat32Array", "toFloat64Array"
+            ]],
+            [DOMMatrix, [
+              "fromMatrix", "fromFloat32Array", "fromFloat64Array"
+            ]],
+            [DOMMatrix.prototype, [
+              "multiplySelf", "preMultiplySelf", "translateSelf", "scaleSelf",
+              "scale3dSelf", "rotateSelf", "rotateFromVectorSelf",
+              "rotateAxisAngleSelf", "skewXSelf", "skewYSelf", "invertSelf"
+            ]]
+          ];
+          const hasWebIdlOperationDescriptor = (owner, name) => {
+            const descriptor = Object.getOwnPropertyDescriptor(owner, name);
+            return descriptor !== undefined &&
+              typeof descriptor.value === "function" &&
+              descriptor.enumerable && descriptor.writable && descriptor.configurable;
+          };
+          return JSON.stringify({
+            constructors: names.map(name => typeof globalThis[name]).join(","),
+            strings: [
+              errorName(() => new DOMMatrix("matrix(1,0,0,1,0,0)")),
+              errorName(() => new DOMMatrixReadOnly(""))
+            ].join(","),
+            tags: [
+              String(new DOMMatrix()),
+              String(DOMMatrixReadOnly.fromMatrix({is2D: false})),
+              String(new DOMMatrix([1, 0, 0, NaN, Infinity, -Infinity]))
+            ].join(","),
+            windowOnly: [
+              Object.hasOwn(DOMMatrixReadOnly.prototype, "toString"),
+              "setMatrixValue" in DOMMatrix.prototype,
+              "WebKitCSSMatrix" in globalThis
+            ].join(","),
+            operations: operationSets.every(([owner, operationNames]) =>
+              operationNames.every(name => hasWebIdlOperationDescriptor(owner, name))
+            ),
+            lengths: [DOMMatrix.length, DOMMatrixReadOnly.length].join(",")
+          });
+        })()
+        "#,
+    )
+    .expect("worker geometry test source");
+    let script = v8::Script::compile(scope, source, None).expect("worker geometry test compile");
+    let result = crate::script_execution::execute_compiled_script(scope, script)
+        .expect("worker geometry test evaluation")
+        .to_rust_string_lossy(scope);
+
+    assert_eq!(
+        result,
+        r#"{"constructors":"function,function,function,function,function,function,function","strings":"TypeError,TypeError","tags":"[object DOMMatrix],[object DOMMatrixReadOnly],[object DOMMatrix]","windowOnly":"false,false,false","operations":true,"lengths":"0,0"}"#
     );
 }

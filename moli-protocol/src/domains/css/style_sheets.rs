@@ -1,8 +1,9 @@
-use crate::conn::{BackgroundProtocolEvent, CdpConnection, Cmd, build_event};
+use crate::conn::{BackgroundProtocolEvent, CdpConnection, Cmd};
 use crate::domains::command_output::CommandOutputPlan;
 use moli_core::page::{
     RendererStyleSheetHeader, RendererStyleSheetInventoryUpdate, RendererStyleSheetPayload,
 };
+use moli_protocol_cdp_defs::LocalCdpEvent;
 use serde_json::{Value, json};
 
 use super::{
@@ -67,32 +68,38 @@ pub(super) fn complete_enable_command_output_plan(
     update: RendererStyleSheetInventoryUpdate,
 ) -> CommandOutputPlan {
     let mut plan = CommandOutputPlan::success();
-    for style_sheet_id in update.removed {
-        plan.push_background_event(BackgroundProtocolEvent::immediate(build_event(
-            "CSS.styleSheetRemoved",
-            json!({
-                "styleSheetId": style_sheet_id,
-            }),
-            session_id,
-        )));
-    }
-    for header in update.added {
-        plan.push_background_event(BackgroundProtocolEvent::immediate(build_event(
-            "CSS.styleSheetAdded",
-            json!({
-                "header": style_sheet_header_value(frame_id, &header),
-            }),
-            session_id,
-        )));
+    for (method, params) in style_sheet_inventory_notifications(frame_id, update) {
+        plan.push_background_event(BackgroundProtocolEvent::immediate_event(
+            method, params, session_id,
+        ));
     }
     plan
 }
 
-pub(super) fn get_style_sheet_command_output_plan(
+pub(super) fn style_sheet_inventory_notifications(
+    frame_id: &str,
+    update: RendererStyleSheetInventoryUpdate,
+) -> impl Iterator<Item = (LocalCdpEvent, Value)> + '_ {
+    let removed = update.removed.into_iter().map(|style_sheet_id| {
+        (
+            LocalCdpEvent::CssStyleSheetRemoved,
+            json!({ "styleSheetId": style_sheet_id }),
+        )
+    });
+    let added = update.added.into_iter().map(move |header| {
+        (
+            LocalCdpEvent::CssStyleSheetAdded,
+            json!({ "header": style_sheet_header_value(frame_id, &header) }),
+        )
+    });
+    removed.chain(added)
+}
+
+pub(super) fn get_style_sheet_result(
     style_sheet_id: &str,
     frame_id: &str,
     payload: RendererStyleSheetPayload,
-) -> CommandOutputPlan {
+) -> Value {
     let RendererStyleSheetPayload {
         text,
         title,
@@ -102,7 +109,7 @@ pub(super) fn get_style_sheet_command_output_plan(
     } = payload;
     let (end_line, end_column) = style_sheet_text_end_position(&text);
 
-    CommandOutputPlan::result(json!({
+    json!({
         "styleSheet": {
             "styleSheetId": style_sheet_id,
             "frameId": frame_id,
@@ -118,7 +125,7 @@ pub(super) fn get_style_sheet_command_output_plan(
             "length": text.len(),
             "text": text,
         }
-    }))
+    })
 }
 
 fn set_css_enabled(conn: &mut CdpConnection, cmd: &Cmd<'_>, enabled: bool) {
@@ -127,7 +134,7 @@ fn set_css_enabled(conn: &mut CdpConnection, cmd: &Cmd<'_>, enabled: bool) {
     });
 }
 
-fn style_sheet_header_value(frame_id: &str, header: &RendererStyleSheetHeader) -> Value {
+pub(super) fn style_sheet_header_value(frame_id: &str, header: &RendererStyleSheetHeader) -> Value {
     json!({
         "styleSheetId": header.style_sheet_id,
         "frameId": frame_id,
@@ -144,12 +151,4 @@ fn style_sheet_header_value(frame_id: &str, header: &RendererStyleSheetHeader) -
     })
 }
 
-fn style_sheet_text_end_position(text: &str) -> (u32, u32) {
-    let end_line = text.lines().count().saturating_sub(1) as u32;
-    let end_column = text
-        .lines()
-        .last()
-        .map(|line| line.chars().count())
-        .unwrap_or(0) as u32;
-    (end_line, end_column)
-}
+use moli_css_parse::style_sheet_text_end_position;

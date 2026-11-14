@@ -55,7 +55,7 @@ const WEBASSEMBLY_DEFAULT_PROTOTYPE_NAMES: &[&str] = &[
 ];
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyStreamingDataDeclaration<'scope> {
     #[webapi(slot = STREAMING_OPTIONS_SLOT)]
     options: v8::Local<'scope, v8::Value>,
@@ -64,7 +64,7 @@ struct WebAssemblyStreamingDataDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyInstantiateStreamingResultDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     module: v8::Local<'scope, v8::Object>,
@@ -73,7 +73,7 @@ struct WebAssemblyInstantiateStreamingResultDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyMemoryNativeDescriptorDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     initial: v8::Local<'scope, v8::Value>,
@@ -84,7 +84,7 @@ struct WebAssemblyMemoryNativeDescriptorDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyMemoryTypeDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     minimum: v8::Local<'scope, v8::Value>,
@@ -95,7 +95,7 @@ struct WebAssemblyMemoryTypeDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyMemoryTypeCloneDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     minimum: v8::Local<'scope, v8::Value>,
@@ -106,7 +106,7 @@ struct WebAssemblyMemoryTypeCloneDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyTableNativeDescriptorDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     element: v8::Local<'scope, v8::Value>,
@@ -117,7 +117,7 @@ struct WebAssemblyTableNativeDescriptorDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyTableTypeDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     minimum: v8::Local<'scope, v8::Value>,
@@ -128,7 +128,7 @@ struct WebAssemblyTableTypeDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyTableTypeCloneDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     minimum: v8::Local<'scope, v8::Value>,
@@ -139,7 +139,7 @@ struct WebAssemblyTableTypeCloneDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyGlobalNativeDescriptorDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     mutable: v8::Local<'scope, v8::Value>,
@@ -148,7 +148,7 @@ struct WebAssemblyGlobalNativeDescriptorDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyGlobalTypeDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     mutable: bool,
@@ -157,7 +157,7 @@ struct WebAssemblyGlobalTypeDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyGlobalTypeCloneDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     r#mutable: v8::Local<'scope, v8::Value>,
@@ -166,21 +166,21 @@ struct WebAssemblyGlobalTypeCloneDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyTagTypeDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     parameters: v8::Local<'scope, v8::Array>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyMemoryFallbackTypeDeclaration {
     #[webapi(data_property, enumerable)]
     minimum: f64,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyTableFallbackTypeDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     minimum: f64,
@@ -189,7 +189,7 @@ struct WebAssemblyTableFallbackTypeDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebAssemblyTagTypeCloneDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     parameters: Option<v8::Local<'scope, v8::Array>>,
@@ -472,8 +472,12 @@ fn install_constructor_wrapper<'s>(
         .ok_or_else(|| anyhow!("failed to build WebAssembly.{name} wrapper"))?;
     wrapper.set_name(v8str(scope, name));
 
-    if let Some(function_prototype) = native_constructor.get_prototype(scope) {
-        let _ = wrapper.set_prototype(scope, function_prototype);
+    if let Some(function_prototype) = native_constructor.get_prototype(scope)
+        && wrapper.set_prototype(scope, function_prototype) != Some(true)
+    {
+        return Err(anyhow!(
+            "failed to set WebAssembly.{name} wrapper prototype"
+        ));
     }
 
     let Some(native_prototype) = native_constructor
@@ -640,18 +644,6 @@ fn normalized_wasm_argument<'s>(
     })
 }
 
-fn forwarded_namespace_arguments<'s>(
-    args: &v8::FunctionCallbackArguments<'s>,
-    first: v8::Local<'s, v8::Value>,
-) -> Vec<v8::Local<'s, v8::Value>> {
-    let mut forwarded = Vec::with_capacity(args.length().max(1) as usize);
-    forwarded.push(first);
-    for index in 1..args.length() {
-        forwarded.push(args.get(index));
-    }
-    forwarded
-}
-
 fn call_original_namespace_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     slot: &'static str,
@@ -796,7 +788,7 @@ fn module_with_v8_limit_compatibility_callback<'s>(
     }
     let normalized = normalized_wasm_argument(scope, args.get(0));
     let forwarded = if let Some(normalized) = &normalized {
-        forwarded_namespace_arguments(&args, normalized.value)
+        moli_v8_util::callback_arguments_with_first(&args, normalized.value)
     } else {
         (0..args.length())
             .map(|index| args.get(index))
@@ -824,7 +816,7 @@ fn validate_with_v8_limit_compatibility_callback<'s>(
 ) {
     let first = normalized_wasm_argument(scope, args.get(0))
         .map_or_else(|| args.get(0), |normalized| normalized.value);
-    let forwarded = forwarded_namespace_arguments(&args, first);
+    let forwarded = moli_v8_util::callback_arguments_with_first(&args, first);
     if let Some(value) =
         call_original_namespace_function(scope, ORIGINAL_VALIDATE_FN_SLOT, &forwarded)
     {
@@ -841,7 +833,7 @@ fn compile_with_v8_limit_compatibility_callback<'s>(
     let first = normalized
         .as_ref()
         .map_or_else(|| args.get(0), |normalized| normalized.value);
-    let forwarded = forwarded_namespace_arguments(&args, first);
+    let forwarded = moli_v8_util::callback_arguments_with_first(&args, first);
     let Some(value) = call_original_namespace_function(scope, ORIGINAL_COMPILE_FN_SLOT, &forwarded)
     else {
         return;
@@ -897,7 +889,7 @@ fn instantiate_with_v8_limit_compatibility_callback<'s>(
     let first = normalized
         .as_ref()
         .map_or(source, |normalized| normalized.value);
-    let forwarded = forwarded_namespace_arguments(&args, first);
+    let forwarded = moli_v8_util::callback_arguments_with_first(&args, first);
     if let Some(value) =
         call_original_namespace_function(scope, ORIGINAL_INSTANTIATE_FN_SLOT, &forwarded)
     {

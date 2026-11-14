@@ -78,7 +78,7 @@ impl LiveStylesheetRegistry {
             .get(&key)
             .and_then(StdWeak::upgrade);
         if let Some(shared_contents) = shared_contents {
-            // The registry belongs to one JsContextHost and therefore one
+            // The registry belongs to one PageScriptHost and therefore one
             // author-lock domain. Assert that invariant before reusing parsed
             // contents so an accidental cross-engine call fails at the owner.
             {
@@ -141,7 +141,7 @@ impl LiveStylesheetRegistry {
         shared_contents: StdArc<SharedStylesheetContents>,
         shared_lock: SharedRwLock,
     ) -> LiveStylesheetRef {
-        // Shared contents are scoped to one JsContextHost author lock. Reading
+        // Shared contents are scoped to one PageScriptHost author lock. Reading
         // through the destination lock makes an accidental cross-domain use
         // fail at the ownership boundary before the stylesheet is installed.
         {
@@ -258,7 +258,10 @@ impl LiveStylesheetRegistry {
         }
         let mut ancestors = HashSet::new();
         if let Some(url) = root_resource_url {
+            // Both the original resource URL and the response's parser base
+            // identify an external ancestor, including redirects and fragments.
             ancestors.insert(import_url_identity(url));
+            ancestors.insert(import_url_identity(root.base_url()));
         }
         let mut responses_by_request_identity = HashMap::new();
         for response in responses {
@@ -345,39 +348,41 @@ impl LiveStylesheetRegistry {
                     continue;
                 }
 
-                let response = if request.url.scheme() == "data" {
-                    *data_expansions = data_expansions.saturating_add(1);
-                    let decoded = (*data_expansions <= MAX_DATA_STYLESHEET_IMPORT_EXPANSIONS)
-                        .then(|| decode_data_stylesheet(&request.url))
-                        .flatten();
-                    match decoded {
-                        Some(css_text) => LiveStylesheetImportResponse {
-                            request_url: request.url.clone(),
-                            response_url: request.url.clone(),
-                            css_text,
-                            successful: true,
-                            origin_clean: true,
-                        },
-                        None => LiveStylesheetImportResponse {
-                            request_url: request.url.clone(),
-                            response_url: request.url.clone(),
-                            css_text: String::new(),
-                            successful: false,
-                            origin_clean: true,
-                        },
-                    }
-                } else {
-                    responses_by_request_identity
-                        .get(&request_identity)
-                        .map(|response| (**response).clone())
-                        .unwrap_or_else(|| LiveStylesheetImportResponse {
+                let response =
+                    if let Some(response) = responses_by_request_identity.get(&request_identity) {
+                        // An explicitly refused data: import must not be decoded
+                        // again after the fetch graph has applied Document policy.
+                        (**response).clone()
+                    } else if request.url.scheme() == "data" {
+                        *data_expansions = data_expansions.saturating_add(1);
+                        let decoded = (*data_expansions <= MAX_DATA_STYLESHEET_IMPORT_EXPANSIONS)
+                            .then(|| decode_data_stylesheet(&request.url))
+                            .flatten();
+                        match decoded {
+                            Some(css_text) => LiveStylesheetImportResponse {
+                                request_url: request.url.clone(),
+                                response_url: request.url.clone(),
+                                css_text,
+                                successful: true,
+                                origin_clean: true,
+                            },
+                            None => LiveStylesheetImportResponse {
+                                request_url: request.url.clone(),
+                                response_url: request.url.clone(),
+                                css_text: String::new(),
+                                successful: false,
+                                origin_clean: true,
+                            },
+                        }
+                    } else {
+                        LiveStylesheetImportResponse {
                             request_url: request.url.clone(),
                             response_url: request.url.clone(),
                             css_text: String::new(),
                             successful: false,
                             origin_clean: false,
-                        })
-                };
+                        }
+                    };
                 all_successful &= response.successful;
                 if self
                     .install_import_response(

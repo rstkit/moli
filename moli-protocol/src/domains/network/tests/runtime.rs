@@ -82,20 +82,21 @@ async fn runtime_capture_without_network_listener_does_not_advance_subresource_c
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
         .await;
-    assert_eq!(
-        ctx.conn
-            .runtime_session_owner_slot(Some("SID-1"))
-            .unwrap()
-            .loaded_page()
-            .unwrap()
-            .subresource_network_records()
-            .len(),
-        1
-    );
+    ctx.with_fixture(|conn| {
+        assert_eq!(
+            conn.runtime_session_owner_slot(Some("SID-1"))
+                .unwrap()
+                .loaded_page()
+                .unwrap()
+                .subresource_network_records()
+                .len(),
+            1
+        )
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -111,12 +112,14 @@ async fn runtime_capture_without_network_listener_does_not_advance_subresource_c
         Some("SID-1"),
     );
 
-    let bc = ctx.conn.browser_context.as_ref().unwrap();
-    assert_eq!(
-        bc.subresource_network_emitted_record_count_for_test(),
-        0,
-        "without a Network listener, post-eval work must not claim subresource history"
-    );
+    ctx.with_fixture(|conn| {
+        let bc = conn.browser_context.as_ref().unwrap();
+        assert_eq!(
+            bc.subresource_network_emitted_record_count_for_test(),
+            0,
+            "without a Network listener, post-eval work must not claim subresource history"
+        );
+    });
 
     server.abort();
 }
@@ -149,7 +152,7 @@ async fn runtime_script_uses_document_referer_and_script_cdp_initiator() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.enable_page_events_for_test(Some("SID-1"));
 
     ctx.process_async(json!({
@@ -250,7 +253,7 @@ async fn runtime_fetch_post_body_is_available_by_network_request_id() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("SID-1".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
         .await;
     ctx.sent.clear();
@@ -339,7 +342,7 @@ async fn runtime_form_post_navigation_body_is_available_by_network_request_id() 
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("SID-1".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
         .await;
     ctx.sent.clear();
@@ -404,33 +407,59 @@ async fn runtime_form_post_navigation_body_is_available_by_network_request_id() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn websocket_runtime_activity_emits_cdp_websocket_events_without_payload() {
+    assert_websocket_runtime_activity_events(axum::http::Version::HTTP_11).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http10_websocket_upgrade_emits_cdp_frames_and_closes_cleanly() {
+    assert_websocket_runtime_activity_events(axum::http::Version::HTTP_10).await;
+}
+
+async fn assert_websocket_runtime_activity_events(version: axum::http::Version) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{Message, handshake::server};
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new()
-                .route("/page", get(plain_page))
-                .route("/socket", get(websocket_echo_handler)),
-        )
-        .await
-        .unwrap();
+        axum::serve(listener, Router::new().route("/page", get(plain_page)))
+            .await
+            .unwrap();
+    });
+    let websocket_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket_url = format!("ws://{}/socket", websocket_listener.local_addr().unwrap());
+    let websocket_server = tokio::spawn(async move {
+        let (stream, _) = websocket_listener.accept().await.unwrap();
+        // tungstenite requires its unboxed HTTP error response in this callback.
+        #[allow(clippy::result_large_err)]
+        let response_version = move |_: &server::Request, mut response: server::Response| {
+            *response.version_mut() = version;
+            Ok(response)
+        };
+        let mut socket = tokio_tungstenite::accept_hdr_async(stream, response_version)
+            .await
+            .unwrap();
+        let message = socket.next().await.unwrap().unwrap();
+        assert_eq!(message, Message::Text("hello".into()));
+        socket.send(message).await.unwrap();
+        assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+        socket.flush().await.unwrap();
     });
 
     let page_url = format!("http://{addr}/page");
-    let socket_url = format!("ws://{addr}/socket");
     let socket_literal = serde_json::to_string(&socket_url).unwrap();
     let mut ctx = TestContext::new();
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("SID-1".to_owned());
-    ctx.conn.insert_browser_context(bc);
+    ctx.with_fixture(|conn| conn.insert_browser_context(bc));
     ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
         .await;
-    ctx.conn
-        .runtime_session_owner_slot_mut(Some("SID-1"))
-        .expect("websocket fixture target")
-        .enable_primary_network_events();
+    ctx.with_fixture(|conn| {
+        conn.runtime_session_owner_slot_mut(Some("SID-1"))
+            .expect("websocket fixture target")
+            .enable_primary_network_events()
+    });
     ctx.sent.clear();
 
     ctx.process_async(json!({
@@ -441,6 +470,9 @@ async fn websocket_runtime_activity_emits_cdp_websocket_events_without_payload()
             "expression": format!(r#"(() => {{
                 globalThis.__lm_ws_done = false;
                 const socket = new WebSocket({socket_literal});
+                globalThis.__lm_ws_closed = new Promise(resolve => {{
+                    socket.addEventListener('close', event => resolve(event.wasClean));
+                }});
                 socket.addEventListener('open', () => socket.send('hello'));
                 socket.addEventListener('message', () => {{
                     globalThis.__lm_ws_done = true;
@@ -515,6 +547,23 @@ async fn websocket_runtime_activity_emits_cdp_websocket_events_without_payload()
             && message["params"]["response"]["payloadData"] == json!("")
             && message["params"]["response"]["payloadLength"] == json!(5)
     }));
+    assert!(ctx.sent.iter().all(|message| {
+        message["method"] != json!("Network.webSocketFrameError")
+            || message["params"]["requestId"] != json!(request_id)
+    }));
+
+    ctx.process_async(json!({
+        "id": 7_005,
+        "method": "Runtime.evaluate",
+        "sessionId": "SID-1",
+        "params": { "expression": "globalThis.__lm_ws_closed", "awaitPromise": true }
+    }))
+    .await;
+    ctx.expect_result(
+        7_005,
+        json!({ "result": { "type": "boolean", "value": true } }),
+        Some("SID-1"),
+    );
 
     ctx.sent.clear();
     ctx.process_async(json!({
@@ -549,6 +598,7 @@ async fn websocket_runtime_activity_emits_cdp_websocket_events_without_payload()
         ctx.sent
     );
 
+    websocket_server.await.unwrap();
     server.abort();
 }
 
@@ -569,7 +619,7 @@ async fn rejected_websocket_handshake_emits_frame_error_then_closed() {
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1".to_owned());
     bc.attach_active_session("SID-1".to_owned());
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
     ctx.install_navigation_fixture_for_session_owner(&page_url, Some("SID-1"))
         .await;
     ctx.sent.clear();
@@ -716,7 +766,7 @@ document.write('<script src="/written.js"><\/script>');
     let mut bc = BrowserContext::new("BID-1".into());
     bc.set_active_target_id("TID-1");
     bc.attach_active_session("SID-1");
-    ctx.conn.install_browser_context_fixture_for_test(bc);
+    ctx.with_fixture(|conn| conn.install_browser_context_fixture_for_test(bc));
 
     ctx.process_async(json!({
         "id": 70_007,

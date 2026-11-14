@@ -1,27 +1,61 @@
 use super::*;
 
+fn browser_owned_history_seed(url: &str) -> moli_page_types::NavigationHistoryEntrySeed {
+    use moli_session_history::{
+        JointSessionHistory, SessionHistoryContextId, SessionHistoryEntry, SessionHistoryPosition,
+    };
+
+    let mut seed = moli_page_types::initial_navigation_history_seed(false, url);
+    let mut history = JointSessionHistory::new(SessionHistoryPosition::new(1, 3).unwrap());
+    history.attach(
+        SessionHistoryContextId::ROOT,
+        None,
+        SessionHistoryEntry {
+            key: seed.entries[0].key.clone(),
+            document: seed.entries[0].document_id.clone(),
+        },
+    );
+    seed.session_history.traversable = Some(Box::new(history));
+    seed
+}
+
+#[test]
+fn noop_history_traversal_preserves_pending_location_navigation() {
+    let url = "https://browser-owned-history.test/current";
+    for delta in [-999, -1, 1, 999] {
+        let mut vm = new_storage_test_vm(url);
+        vm.install_navigation_bootstrap_entry(Some(
+            moli_page_types::initial_navigation_history_seed(false, url),
+        ));
+        vm.eval(&format!(
+            "location.assign('/location-wins'); history.go({delta}); 'queued'"
+        ))
+        .unwrap();
+        assert!(
+            vm.take_pending_top_level_history_traversal().is_none(),
+            "out-of-range delta {delta} must not produce a History action"
+        );
+        assert_eq!(
+            vm.take_pending_location_navigation_with_seed()
+                .expect("a Noop must preserve the pending Location navigation")
+                .url
+                .as_str(),
+            "https://browser-owned-history.test/location-wins"
+        );
+    }
+}
+
 #[test]
 fn top_level_history_back_delegates_to_the_browser_history_controller() {
     let url = "https://browser-owned-history.test/current";
     let mut vm = new_storage_test_vm(url);
-
-    vm.eval("history.back(); 'queued'")
-        .expect("hidden renderer bookkeeping entry should delegate to the browser");
-    assert!(!vm.has_pending_location_navigation());
-    assert_eq!(
-        vm.take_pending_top_level_history_traversal()
-            .expect("browser-owned back traversal request")
-            .delta,
-        -1
-    );
-
-    vm.install_navigation_bootstrap_entry(Some(moli_page_types::initial_navigation_history_seed(
-        false, url,
-    )));
+    // Previous and next entries exist in joint history but have no local
+    // Document projection. They still require the browser's history controller.
+    vm.install_navigation_bootstrap_entry(Some(browser_owned_history_seed(url)));
     assert_eq!(
         vm.eval("String(history.length)")
-            .expect("single renderer-visible history entry"),
-        "1"
+            .expect("browser-owned joint history length"),
+        "3"
     );
     vm.eval("history.back(); 'queued'")
         .expect("unknown browser-side back entry should queue");
@@ -48,9 +82,7 @@ fn top_level_history_back_delegates_to_the_browser_history_controller() {
 fn top_level_navigation_intents_keep_one_last_writer_state() {
     let url = "https://browser-owned-history.test/current";
     let mut vm = new_storage_test_vm(url);
-    vm.install_navigation_bootstrap_entry(Some(moli_page_types::initial_navigation_history_seed(
-        false, url,
-    )));
+    vm.install_navigation_bootstrap_entry(Some(browser_owned_history_seed(url)));
 
     vm.eval("history.back(); location.assign('/location-wins'); 'queued'")
         .expect("location navigation should replace the history traversal intent");
@@ -72,6 +104,94 @@ fn top_level_navigation_intents_keep_one_last_writer_state() {
             .delta,
         1
     );
+}
+
+#[tokio::test]
+async fn browser_owned_history_traversal_checks_active_source_sandbox() {
+    use moli_session_history::{
+        JointSessionHistory, SessionHistoryContextId, SessionHistoryEntry, SessionHistoryPosition,
+    };
+
+    let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).unwrap();
+    let url = "https://browser-owned-history.test/current";
+    let restricted = "allow-scripts allow-same-origin";
+    let permitted = "allow-scripts allow-same-origin allow-top-navigation";
+    for (initial, changed, allowed) in [
+        (None, Some(restricted), true),
+        (Some(permitted), Some(restricted), true),
+        (Some(restricted), None, false),
+        (Some(restricted), Some(permitted), false),
+    ] {
+        let mut vm = new_storage_page_task_executor_test_vm_with_loader(url, &loader);
+        let mut seed = moli_page_types::initial_navigation_history_seed(false, url);
+        let mut traversable = JointSessionHistory::new(SessionHistoryPosition::new(1, 3).unwrap());
+        traversable.attach(
+            SessionHistoryContextId::ROOT,
+            None,
+            SessionHistoryEntry {
+                key: seed.entries[0].key.clone(),
+                document: seed.entries[0].document_id.clone(),
+            },
+        );
+        seed.session_history.traversable = Some(Box::new(traversable));
+        vm.install_navigation_bootstrap_entry(Some(seed));
+        let initial = serde_json::to_string(&initial).unwrap();
+        let changed = serde_json::to_string(&changed).unwrap();
+        vm.eval(&format!(
+            r#"
+globalThis.frame = document.createElement('iframe');
+if ({initial} !== null) frame.setAttribute('sandbox', {initial});
+(document.body || document.documentElement || document).appendChild(frame);
+frame.contentWindow;
+"#
+        ))
+        .unwrap();
+        vm.drain_ready_page_task_executor_turns_for_setup(&loader, 128)
+            .await
+            .unwrap();
+        vm.eval(&format!(
+            "if ({changed} === null) frame.removeAttribute('sandbox'); else frame.setAttribute('sandbox', {changed});"
+        ))
+        .unwrap();
+        {
+            let mut host = vm._context_host.borrow_mut();
+            let model = host.session_histories.get_mut(None);
+            // Both destinations exist in browser history but have no renderer ROOT entry.
+            for delta in [-1, 1] {
+                let step = model.step_by_delta(delta).unwrap();
+                assert!(
+                    !model
+                        .entries_at(step)
+                        .unwrap()
+                        .contains_key(&SessionHistoryContextId::ROOT)
+                );
+            }
+        }
+        for (call, delta) in [
+            ("back()", -1),
+            ("forward()", 1),
+            ("go(-1)", -1),
+            ("go(1)", 1),
+        ] {
+            vm.eval(&format!("frame.contentWindow.history.{call}"))
+                .unwrap();
+            let pending = vm
+                .take_pending_top_level_history_traversal()
+                .map(|pending| pending.delta);
+            assert_eq!(
+                pending,
+                allowed.then_some(delta),
+                "initial={initial}, changed={changed}, call={call}"
+            );
+        }
+        // A method borrowed from the child still uses its top-level History receiver.
+        vm.eval("frame.contentWindow.history.back.call(history)")
+            .unwrap();
+        assert_eq!(
+            vm.take_pending_top_level_history_traversal().unwrap().delta,
+            -1
+        );
+    }
 }
 
 #[test]
@@ -1345,43 +1465,70 @@ result.finished.catch(error => __lmClosedHistoryRoute.push("finished:" + error.n
 }
 
 #[tokio::test]
-async fn history_back_calls_from_default_and_isolated_world_coalesce_per_window() {
+async fn history_back_calls_from_default_and_isolated_world_preserve_each_step() {
     let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default()).expect("loader");
-    let mut vm =
-        new_storage_page_task_executor_test_vm_with_loader("https://example.com/base", &loader);
+    for isolated_calls in [[false, false], [false, true], [true, false], [true, true]] {
+        let mut vm =
+            new_storage_page_task_executor_test_vm_with_loader("https://example.com/base", &loader);
 
-    vm.eval(
-        r##"
+        vm.eval(
+            r##"
 history.pushState(null, "", "#one");
 history.pushState(null, "", "#two");
+globalThis.traversed = [];
+addEventListener("popstate", () => traversed.push(location.hash));
 "created"
 "##,
-    )
-    .expect("multi-realm history fixture should create entries");
-    vm.advance_timers_until_deadline_for_test(&loader)
-        .await
-        .expect("multi-realm entry-creation timers should drain");
-    let isolated_context_id = vm
-        .create_isolated_world("history-traversal-owner", false)
-        .expect("history traversal isolated world should be created");
-
-    vm.eval("history.back(); 'default-queued'")
-        .expect("default realm should queue traversal");
-    vm.eval_in_isolated_context(isolated_context_id, "history.back(); 'isolated-queued'")
-        .expect("isolated realm should queue its own exact traversal");
-    assert!(
-        !vm.has_ready_timeout(),
-        "neither realm should route history traversal through PageTimer"
-    );
-
-    assert!(
-        vm.run_one_history_traversal_executor_turn(&loader)
+        )
+        .expect("multi-realm history fixture should create entries");
+        vm.advance_timers_until_deadline_for_test(&loader)
             .await
-            .expect("default realm traversal should run")
-    );
-    assert!(
-        !vm.run_one_history_traversal_executor_turn(&loader)
-            .await
-            .expect("history source should be drained after one Window traversal position")
-    );
+            .expect("multi-realm entry-creation timers should drain");
+        let isolated_context_id = vm
+            .create_isolated_world("history-traversal-owner", false)
+            .expect("history traversal isolated world should be created");
+
+        for (script, destinations) in [
+            ("history.back(); 'queued'", ["#one", ""]),
+            ("history.forward(); 'queued'", ["#one", "#two"]),
+        ] {
+            for isolated in isolated_calls {
+                if isolated {
+                    vm.eval_in_isolated_context(isolated_context_id, script)
+                } else {
+                    vm.eval(script)
+                }
+                .expect("each realm should queue its own traversal");
+            }
+            assert!(
+                !vm.has_ready_timeout(),
+                "neither realm should route history traversal through PageTimer"
+            );
+
+            for destination in destinations {
+                assert!(
+                    vm.run_one_history_traversal_executor_turn(&loader)
+                        .await
+                        .expect("each queued traversal should run")
+                );
+                assert_eq!(
+                    vm.eval("location.hash")
+                        .expect("each queued traversal should preserve its destination"),
+                    destination,
+                    "isolated calls: {isolated_calls:?}, script: {script}"
+                );
+            }
+            assert!(
+                !vm.run_one_history_traversal_executor_turn(&loader)
+                    .await
+                    .expect("history source should be drained after both traversals")
+            );
+        }
+        assert_eq!(
+            vm.eval("traversed.join('|')")
+                .expect("each step should dispatch popstate on the owning Window"),
+            "#one||#one|#two",
+            "isolated calls: {isolated_calls:?}"
+        );
+    }
 }

@@ -1,5 +1,5 @@
 use super::super::window_runtime::{
-    PERMISSIONS_BRAND_SLOT, build_legacy_storage_quota_object, build_navigator_ua_data_object,
+    build_legacy_storage_quota_object, build_navigator_ua_data_object,
     install_initial_service_worker_ready_promise, navigator_get_battery_callback,
     navigator_java_enabled_callback, navigator_permissions_query_callback,
     navigator_send_beacon_callback, navigator_service_worker_controller_getter_callback,
@@ -36,6 +36,7 @@ use crate::util::{
     callback_data_index_value, callback_data_item, get_private_value, serialize_v8_array,
     set_private_value, throw_type_error,
 };
+use crate::web_api_interfaces;
 use moli_browser_profile::{BrowserIdentityProfile, navigator_app_version};
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
@@ -73,6 +74,8 @@ const NAVIGATOR_RUNTIME_DATA_KEYS: &[&str] = &[
     "storageBuckets",
     "geolocation",
     "mediaCapabilities",
+    "credentials",
+    "mediaSession",
 ];
 const WORKER_NAVIGATOR_INSTALLED_SLOT: &str = "__moliWorkerNavigatorInstalled";
 const WORKER_NAVIGATOR_MATERIALIZING_SLOT: &str = "__moliWorkerNavigatorMaterializing";
@@ -82,25 +85,19 @@ const WORKER_NAVIGATOR_USER_AGENT_SEED_SLOT: &str = "__moliWorkerNavigatorUserAg
 const WORKER_NAVIGATOR_ACCEPT_LANGUAGE_SEED_SLOT: &str = "__moliWorkerNavigatorAcceptLanguageSeed";
 const WORKER_NAVIGATOR_BACKING_SLOT: &str = "__moliWorkerNavigatorBacking";
 
-const NAVIGATOR_BRAND_SLOT: &str = "__moliNavigatorBrand";
 const NAVIGATOR_STORAGE_OWNER_CHILD_HANDLE_SLOT: &str = "__moliNavigatorStorageOwnerChildHandle";
 const NAVIGATOR_STORAGE_OWNER_POPUP_ID_SLOT: &str = "__moliNavigatorStorageOwnerPopupId";
 const NAVIGATOR_ACCEPT_LANGUAGE_SLOT: &str = "__moliNavigatorAcceptLanguage";
 pub(in crate::context_bootstrap) const NAVIGATOR_IDENTITY_PROFILE_SLOT: &str =
     "__moliNavigatorIdentityProfile";
-pub(in crate::context_bootstrap) const STORAGE_MANAGER_BRAND_SLOT: &str =
-    "__moliStorageManagerBrand";
 pub(in crate::context_bootstrap) const STORAGE_MANAGER_CHILD_HANDLE_SLOT: &str =
     "__moliStorageManagerChildHandle";
 pub(in crate::context_bootstrap) const STORAGE_MANAGER_POPUP_ID_SLOT: &str =
     "__moliStorageManagerPopupId";
-pub(in crate::context_bootstrap) const STORAGE_BUCKET_MANAGER_BRAND_SLOT: &str =
-    "__moliStorageBucketManagerBrand";
 pub(in crate::context_bootstrap) const STORAGE_BUCKET_MANAGER_CHILD_HANDLE_SLOT: &str =
     "__moliStorageBucketManagerChildHandle";
 pub(in crate::context_bootstrap) const STORAGE_BUCKET_MANAGER_POPUP_ID_SLOT: &str =
     "__moliStorageBucketManagerPopupId";
-const SERVICE_WORKER_CONTAINER_LISTENERS_SLOT: &str = "__moliServiceWorkerContainerEvents";
 const SERVICE_WORKER_CONTAINER_ONMESSAGE_SLOT: &str = "__moliServiceWorkerContainerOnmessage";
 const SERVICE_WORKER_CONTAINER_ONMESSAGEERROR_SLOT: &str =
     "__moliServiceWorkerContainerOnmessageerror";
@@ -109,35 +106,27 @@ const SERVICE_WORKER_CONTAINER_ONCONTROLLERCHANGE_SLOT: &str =
 const SERVICE_WORKER_CONTAINER_CONTROLLER_SLOT: &str = "__moliServiceWorkerContainerController";
 pub(in crate::context_bootstrap) const SERVICE_WORKER_OWNER_TOKEN_SLOT: &str =
     "__moliServiceWorkerOwner";
-const USER_ACTIVATION_BRAND_SLOT: &str = "__moliUserActivationBrand";
-const NAVIGATOR_CONNECTION_BRAND_SLOT: &str = "__moliNavigatorConnectionBrand";
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Permissions", allow_empty)]
-struct PermissionsObjectDeclaration {
-    #[webapi(slot = PERMISSIONS_BRAND_SLOT, init = true)]
-    brand: (),
-}
+#[webapi(interface = web_api_interfaces::Permissions)]
+struct PermissionsObjectDeclaration {}
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "Permissions", enumerable)]
+#[webapi(interface = web_api_interfaces::Permissions, enumerable, receiver)]
 struct PermissionsPrototypeMethodsDeclaration {
-    #[webapi(method, length = 1, callback = navigator_permissions_query_callback)]
+    #[webapi(method, length = 1, callback = navigator_permissions_query_callback, returns_promise)]
     query: (),
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Navigator")]
+#[webapi(interface = web_api_interfaces::Navigator)]
 struct NavigatorObjectDeclaration<'scope> {
-    #[webapi(slot = NAVIGATOR_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = NAVIGATOR_RUNTIME_DATA_SLOT)]
     runtime_data: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "Navigator", enumerable)]
+#[webapi(interface = web_api_interfaces::Navigator, enumerable)]
 struct NavigatorRuntimeDataPrototypeDeclaration {
     #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 0))]
     user_agent: (),
@@ -205,12 +194,21 @@ struct NavigatorRuntimeDataPrototypeDeclaration {
     geolocation: (),
     #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 32))]
     media_capabilities: (),
-    #[webapi(accessor_property, getter = navigator_cookie_enabled_getter_callback)]
+    #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 34), receiver = web_api_interfaces::Navigator::is_instance)]
+    media_session: (),
+    #[webapi(accessor_property, getter = navigator_cookie_enabled_getter_callback, receiver = web_api_interfaces::Navigator::is_instance)]
     cookie_enabled: (),
 }
 
+#[derive(Default, WebApiObject)]
+#[webapi(fragment, prototype = "Navigator")]
+struct NavigatorCredentialsPrototypeDeclaration {
+    #[webapi(accessor_property, enumerable, receiver = web_api_interfaces::Navigator::is_instance, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 33))]
+    credentials: (),
+}
+
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "Navigator")]
+#[webapi(interface = web_api_interfaces::Navigator, receiver)]
 struct NavigatorPrototypeMethodsDeclaration {
     #[webapi(method, enumerable, length = 0, callback = navigator_get_gamepads_callback)]
     get_gamepads: (),
@@ -221,7 +219,7 @@ struct NavigatorPrototypeMethodsDeclaration {
     #[webapi(method, enumerable, length = 1, callback = navigator_send_beacon_callback)]
     send_beacon: (),
 
-    #[webapi(method, enumerable, length = 0, callback = navigator_get_battery_callback)]
+    #[webapi(method, enumerable, length = 0, callback = navigator_get_battery_callback, returns_promise)]
     get_battery: (),
 
     #[webapi(method, enumerable, length = 1, callback = navigator_vibrate_callback)]
@@ -232,14 +230,14 @@ struct NavigatorPrototypeMethodsDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "WorkerNavigator")]
+#[webapi(interface = web_api_interfaces::WorkerNavigator)]
 struct WorkerNavigatorObjectDeclaration<'scope> {
     #[webapi(slot = NAVIGATOR_RUNTIME_DATA_SLOT)]
     runtime_data: v8::Local<'scope, v8::Object>,
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "WorkerNavigator", enumerable)]
+#[webapi(interface = web_api_interfaces::WorkerNavigator, enumerable)]
 struct WorkerNavigatorRuntimeDataPrototypeDeclaration {
     #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 0))]
     user_agent: (),
@@ -269,6 +267,8 @@ struct WorkerNavigatorRuntimeDataPrototypeDeclaration {
     languages: (),
     #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 18))]
     device_memory: (),
+    #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 20))]
+    connection: (),
     #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 21))]
     user_agent_data: (),
     #[webapi(accessor_property, getter = navigator_runtime_data_getter_callback, data = callback_data_index_value(scope, 23))]
@@ -282,7 +282,7 @@ struct WorkerNavigatorRuntimeDataPrototypeDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "PermissionStatus", enumerable)]
+#[webapi(interface = web_api_interfaces::PermissionStatus, enumerable)]
 struct PermissionStatusPrototypeDeclaration {
     #[webapi(accessor_property, getter = permission_status_name_getter_callback)]
     name: (),
@@ -291,11 +291,11 @@ struct PermissionStatusPrototypeDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(
+    interface = web_api_interfaces::NetworkInformation,
+    receiver
+)]
 struct NavigatorConnectionDeclaration {
-    #[webapi(slot = NAVIGATOR_CONNECTION_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(data_property, name = "type", enumerable, value = DEFAULT_CONNECTION_TYPE)]
     connection_type: (),
 
@@ -311,38 +311,22 @@ struct NavigatorConnectionDeclaration {
     #[webapi(data_property, enumerable, value = DEFAULT_CONNECTION_RTT)]
     rtt: (),
 
-    #[webapi(data_property, enumerable, value = DEFAULT_CONNECTION_SAVE_DATA)]
+    #[webapi(accessor_property, getter = navigator_connection_save_data_getter_callback, enumerable)]
     save_data: (),
 
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(accessor_property, enumerable, getter = simple_event_target_handler_getter_callback, setter = simple_event_target_handler_setter_callback, data = v8str(scope, "onchange"), setter_data = v8str(scope, "onchange"))]
     onchange: (),
 
-    #[webapi(
-        method,
-        enumerable,
-        length = 2,
-        callback = navigator_connection_event_target_noop_callback
-    )]
-    add_event_listener: (),
-
-    #[webapi(
-        method,
-        enumerable,
-        length = 2,
-        callback = navigator_connection_event_target_noop_callback
-    )]
-    remove_event_listener: (),
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "StorageManager")]
-struct StorageManagerObjectDeclaration {
-    #[webapi(slot, name = STORAGE_MANAGER_BRAND_SLOT, constructor_default = true)]
-    brand: bool,
-}
+#[webapi(interface = web_api_interfaces::StorageManager)]
+struct StorageManagerObjectDeclaration {}
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "StorageManager", enumerable)]
+#[webapi(interface = web_api_interfaces::StorageManager, enumerable)]
 struct StorageManagerTemplateMethodsDeclaration {
     #[webapi(method, length = 0, callback = navigator_storage_persisted_callback)]
     persisted: (),
@@ -358,7 +342,7 @@ struct StorageManagerTemplateMethodsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "StorageManager", enumerable)]
+#[webapi(interface = web_api_interfaces::StorageManager, enumerable)]
 struct StorageManagerWorkerTemplateMethodsDeclaration {
     #[webapi(method, length = 0, callback = navigator_storage_persisted_callback)]
     persisted: (),
@@ -392,34 +376,24 @@ pub(in crate::context_bootstrap) fn install_storage_manager_constructor_template
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "StorageBucketManager")]
-struct StorageBucketManagerObjectDeclaration {
-    #[webapi(
-        slot,
-        name = STORAGE_BUCKET_MANAGER_BRAND_SLOT,
-        constructor_default = true
-    )]
-    brand: bool,
-}
+#[webapi(interface = web_api_interfaces::StorageBucketManager)]
+struct StorageBucketManagerObjectDeclaration {}
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "NavigatorUAData", enumerable)]
+#[webapi(interface = web_api_interfaces::NavigatorUAData, enumerable, receiver)]
 struct NavigatorUaDataPrototypeMethodsDeclaration {
     #[webapi(method, name = "toJSON", length = 0, callback = navigator_ua_data_to_json_callback)]
     to_json: (),
 
-    #[webapi(method, length = 1, callback = navigator_ua_data_get_high_entropy_values_callback)]
+    #[webapi(method, length = 1, callback = navigator_ua_data_get_high_entropy_values_callback, returns_promise)]
     get_high_entropy_values: (),
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(interface = web_api_interfaces::ServiceWorkerContainer)]
 struct ServiceWorkerContainerDeclaration {
-    #[webapi(slot = SIMPLE_EVENT_TARGET_SLOT, value = SERVICE_WORKER_CONTAINER_LISTENERS_SLOT)]
-    event_target_slot: (),
-
-    #[webapi(slot = SIMPLE_EVENT_TARGET_ORDERED_HANDLERS_SLOT, init = true)]
-    ordered_handlers: (),
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
 
     #[webapi(slot = SERVICE_WORKER_CONTAINER_ONMESSAGE_SLOT, init = "null")]
     _onmessage: (),
@@ -436,23 +410,35 @@ struct ServiceWorkerContainerDeclaration {
     #[webapi(accessor_property = "controller", enumerable, getter = navigator_service_worker_controller_getter_callback)]
     controller: (),
 
-    #[webapi(method, enumerable, callback = navigator_service_worker_register_callback, length = 1)]
+    #[webapi(
+        method,
+        enumerable,
+        callback = navigator_service_worker_register_callback,
+        receiver = web_api_interfaces::ServiceWorkerContainer::is_instance,
+        returns_promise,
+        length = 1
+    )]
     register: (),
 
-    #[webapi(method, enumerable, callback = navigator_service_worker_get_registration_callback, length = 1)]
+    #[webapi(
+        method,
+        enumerable,
+        callback = navigator_service_worker_get_registration_callback,
+        receiver = web_api_interfaces::ServiceWorkerContainer::is_instance,
+        returns_promise,
+        length = 0
+    )]
     get_registration: (),
 
-    #[webapi(method, enumerable, callback = navigator_service_worker_get_registrations_callback, length = 0)]
+    #[webapi(
+        method,
+        enumerable,
+        callback = navigator_service_worker_get_registrations_callback,
+        receiver = web_api_interfaces::ServiceWorkerContainer::is_instance,
+        returns_promise,
+        length = 0
+    )]
     get_registrations: (),
-
-    #[webapi(method, enumerable, callback = simple_event_target_add_event_listener_callback)]
-    add_event_listener: (),
-
-    #[webapi(method, enumerable, callback = simple_event_target_remove_event_listener_callback)]
-    remove_event_listener: (),
-
-    #[webapi(method, enumerable, callback = simple_event_target_dispatch_event_callback)]
-    dispatch_event: (),
 
     #[webapi(
         accessor_property,
@@ -480,11 +466,8 @@ struct ServiceWorkerContainerDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "UserActivation")]
+#[webapi(interface = web_api_interfaces::UserActivation)]
 struct UserActivationObjectDeclaration {
-    #[webapi(slot = USER_ACTIVATION_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(accessor_property, getter = navigator_user_activation_state_getter_callback, enumerable)]
     is_active: (),
 
@@ -493,7 +476,7 @@ struct UserActivationObjectDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", scope_lifetime = 'scope)]
+#[webapi(plain, scope_lifetime = 'scope)]
 struct WindowNavigatorBackingDeclaration<'scope, 'profile> {
     #[webapi(data_property, enumerable)]
     user_agent: &'profile str,
@@ -593,10 +576,12 @@ struct WindowNavigatorBackingDeclaration<'scope, 'profile> {
 
     #[webapi(data_property, enumerable)]
     media_capabilities: v8::Local<'scope, v8::Value>,
+    #[webapi(data_property, enumerable)]
+    credentials: v8::Local<'scope, v8::Value>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", scope_lifetime = 'scope)]
+#[webapi(plain, scope_lifetime = 'scope)]
 struct WorkerNavigatorBackingDeclaration<'scope, 'profile> {
     #[webapi(data_property, enumerable)]
     user_agent: &'profile str,
@@ -674,6 +659,45 @@ fn navigator_runtime_data_getter_callback<'s>(
         rv.set(v8::undefined(scope).into());
         return;
     };
+    if matches!(key, "language" | "languages" | "userAgentData")
+        && let Some(identity) = worker_navigator_identity(scope, backing)
+    {
+        match key {
+            "language" => {
+                if let Some(value) = v8_string(scope, identity.language()) {
+                    rv.set(value.into());
+                }
+                return;
+            }
+            "userAgentData" => {
+                // Like Chromium, each access takes a metadata snapshot. An
+                // already held NavigatorUAData keeps its original values.
+                rv.set(build_navigator_ua_data_object(scope, &identity).into());
+                return;
+            }
+            "languages" => {
+                let previous = get_private_value(scope, backing, NAVIGATOR_ACCEPT_LANGUAGE_SLOT)
+                    .and_then(|value| value.to_string(scope))
+                    .map(|value| value.to_rust_string_lossy(scope));
+                if previous.as_deref() != Some(identity.accept_language()) {
+                    if let Some(value) = v8_string(scope, identity.accept_language()) {
+                        set_private_value(
+                            scope,
+                            backing,
+                            NAVIGATOR_ACCEPT_LANGUAGE_SLOT,
+                            value.into(),
+                        );
+                    }
+                    let _ = backing.set(
+                        scope,
+                        v8str(scope, "languages").into(),
+                        v8::undefined(scope).into(),
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
     if let Some(subobject) = NavigatorSubobject::from_key(key) {
         match ensure_navigator_subobject(scope, backing, subobject) {
             Ok(value) => rv.set(value),
@@ -695,32 +719,42 @@ fn navigator_runtime_data_getter_callback<'s>(
             _ => {}
         }
     }
+    if key == "webdriver" && navigator_query_overrides(scope).automation {
+        rv.set_bool(true);
+        return;
+    }
+    if key == "hardwareConcurrency"
+        && let Some(value) = navigator_query_overrides(scope).hardware_concurrency
+    {
+        rv.set_uint32(value.get());
+        return;
+    }
     match backing.get(scope, v8str(scope, key).into()) {
         Some(value) => rv.set(value),
         None => rv.set(v8::undefined(scope).into()),
     }
 }
 
+fn navigator_query_overrides(
+    scope: &mut v8::PinScope<'_, '_>,
+) -> moli_page_types::NavigatorQueryOverrides {
+    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
+        return unsafe { &*host_ptr }.navigator_overrides().queries;
+    }
+    scope
+        .get_slot::<std::rc::Rc<std::cell::RefCell<moli_page_types::NavigatorEmulationSessions>>>()
+        .map(|sessions| sessions.borrow().effective())
+        .unwrap_or_default()
+}
+
 fn navigator_cookie_enabled_getter_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
+    _args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if !navigator_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let enabled = context_host_ptr_from_global_bridge(scope)
         .is_some_and(|host_ptr| unsafe { (&*host_ptr).browser_cookie_enabled() });
     rv.set(v8::Boolean::new(scope, enabled).into());
-}
-
-pub(in crate::context_bootstrap) fn navigator_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    navigator: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, navigator, NAVIGATOR_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }
 
 pub(crate) fn current_protocol_user_gesture_activation(scope: &mut v8::PinScope<'_, '_>) -> bool {
@@ -733,9 +767,7 @@ fn navigator_user_activation_state_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if get_private_value(scope, args.this(), USER_ACTIVATION_BRAND_SLOT)
-        .is_none_or(|value| !value.boolean_value(scope))
-    {
+    if !web_api_interfaces::UserActivation::is_instance(scope, args.this()) {
         throw_type_error(scope, "Illegal invocation");
         return;
     }
@@ -743,14 +775,16 @@ fn navigator_user_activation_state_getter_callback<'s>(
     rv.set(v8::Boolean::new(scope, active).into());
 }
 
-fn navigator_connection_event_target_noop_callback<'s>(
+fn navigator_connection_save_data_getter_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
+    _args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !navigator_connection_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-    }
+    rv.set_bool(
+        navigator_query_overrides(scope)
+            .data_saver
+            .unwrap_or(DEFAULT_CONNECTION_SAVE_DATA),
+    );
 }
 
 fn navigator_get_autoplay_policy_callback<'s>(
@@ -758,10 +792,6 @@ fn navigator_get_autoplay_policy_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !navigator_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     if args.length() == 0 {
         throw_type_error(
             scope,
@@ -806,14 +836,6 @@ fn navigator_get_autoplay_policy_callback<'s>(
     }
 }
 
-fn navigator_connection_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, NAVIGATOR_CONNECTION_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-}
-
 pub(in crate::context_bootstrap) fn install_navigator_template_bindings<'s>(
     scope: &mut v8::PinScope<'s, '_, ()>,
     template: v8::Local<'s, v8::FunctionTemplate>,
@@ -822,10 +844,15 @@ pub(in crate::context_bootstrap) fn install_navigator_template_bindings<'s>(
     install_clipboard_template_bindings(scope, template, interface_name);
     install_geolocation_template_bindings(scope, template, interface_name);
     install_navigator_collection_template_bindings(scope, template, interface_name);
+    super::gamepad::install(scope, template, interface_name);
     install_media_capabilities_template_bindings(scope, template, interface_name);
+    super::credentials::install(scope, template, interface_name);
+    super::media_session::install(scope, template, interface_name);
     let prototype = template.prototype_template(scope);
     match interface_name {
-        "MediaDevices" => install_media_devices_template_bindings(scope, template),
+        "MediaDevices" | "MediaDeviceInfo" | "InputDeviceInfo" => {
+            install_media_devices_template_bindings(scope, template, interface_name)
+        }
         "Navigator" => {
             NavigatorRuntimeDataPrototypeDeclaration::initialize_prototype_template(
                 scope, prototype,
@@ -852,6 +879,19 @@ pub(in crate::context_bootstrap) fn install_navigator_template_bindings<'s>(
     }
 }
 
+pub(in crate::context_bootstrap) fn finalize_navigator_credentials_realm_bindings<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    prototype: v8::Local<'s, v8::Object>,
+) -> Result<()> {
+    let global = scope.get_current_context().global(scope);
+    if super::super::runtime_state::window_realm_secure_context_available(scope, global) {
+        NavigatorCredentialsPrototypeDeclaration::default()
+            .initialize(scope, prototype)
+            .map_err(|error| anyhow!("failed to initialize Navigator credentials: {error}"))?;
+    }
+    Ok(())
+}
+
 fn filter_navigator_secure_context_exposure<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     prototype: v8::Local<'s, v8::Object>,
@@ -859,6 +899,7 @@ fn filter_navigator_secure_context_exposure<'s>(
 ) -> Result<()> {
     if !secure_context {
         delete_object_property(scope, prototype, "clipboard")?;
+        delete_object_property(scope, prototype, "credentials")?;
         delete_object_property(scope, prototype, "mediaDevices")?;
         delete_object_property(scope, prototype, "storage")?;
         delete_object_property(scope, prototype, "storageBuckets")?;
@@ -897,10 +938,16 @@ fn delete_object_property(
 fn build_languages_array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     languages: &[String],
-) -> v8::Local<'s, v8::Array> {
-    serialize_v8_array(scope, languages)
+) -> Result<v8::Local<'s, v8::Array>> {
+    let array = serialize_v8_array(scope, languages)
         .or_else(|| serialize_v8_array(scope, [""]))
-        .unwrap_or_else(|| v8::Array::new(scope, 0))
+        .unwrap_or_else(|| v8::Array::new(scope, 0));
+    // NavigatorLanguage returns a FrozenArray in both Window and Worker realms.
+    // Freeze the native snapshot before it can enter the lazy subobject cache.
+    if array.set_integrity_level(scope, v8::IntegrityLevel::Frozen) != Some(true) {
+        return Err(anyhow!("failed to freeze Navigator.languages"));
+    }
+    Ok(array)
 }
 
 fn build_navigator_connection<'s>(
@@ -983,7 +1030,7 @@ pub(super) fn build_lazy_navigator_subobject_in_current_realm<'s>(
     let value: v8::Local<'s, v8::Value> = match subobject {
         NavigatorSubobject::Languages => {
             let languages = effective_navigator_languages(scope, backing);
-            build_languages_array(scope, &languages).into()
+            build_languages_array(scope, &languages)?.into()
         }
         NavigatorSubobject::MimeTypes | NavigatorSubobject::Plugins => {
             build_navigator_plugin_collection_subobject(scope, backing, subobject)?
@@ -1011,6 +1058,10 @@ pub(super) fn build_lazy_navigator_subobject_in_current_realm<'s>(
             build_service_worker_container(scope, owner_child, owner_popup)?.into()
         }
         NavigatorSubobject::Clipboard => build_clipboard_object(scope)?.into(),
+        NavigatorSubobject::Credentials => super::credentials::build_container(scope)?.into(),
+        NavigatorSubobject::MediaSession => {
+            super::media_session::build(scope, backing, owner_child, owner_popup)?.into()
+        }
         NavigatorSubobject::UserActivation => build_user_activation(scope)?.into(),
         NavigatorSubobject::StorageBuckets => {
             build_storage_bucket_manager(scope, owner_child, owner_popup)?.into()
@@ -1081,6 +1132,9 @@ fn navigator_identity_from_backing<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     backing: v8::Local<'s, v8::Object>,
 ) -> BrowserIdentityProfile {
+    if let Some(identity) = worker_navigator_identity(scope, backing) {
+        return identity;
+    }
     if let Some(identity) = navigator_identity_profile(scope, backing) {
         return identity;
     }
@@ -1094,6 +1148,38 @@ fn navigator_identity_from_backing<'s>(
         .map(|value| value.to_rust_string_lossy(scope))
         .unwrap_or_else(|| moli_browser_profile::DEFAULT_ACCEPT_LANGUAGE.to_owned());
     BrowserIdentityProfile::new(user_agent, accept_language)
+}
+
+fn worker_navigator_identity<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    backing: v8::Local<'s, v8::Object>,
+) -> Option<BrowserIdentityProfile> {
+    if !get_private_value(scope, backing, WORKER_NAVIGATOR_BACKING_SLOT)
+        .is_some_and(|value| value.boolean_value(scope))
+    {
+        return None;
+    }
+    let base = navigator_identity_profile(scope, backing)?;
+    let value = scope
+        .get_slot::<std::rc::Rc<std::cell::RefCell<moli_page_types::NavigatorEmulationSessions>>>()
+        .and_then(|sessions| sessions.borrow().effective_user_agent_override());
+    Some(match value {
+        Some(value) => BrowserIdentityProfile::from_devtools_override(
+            &base,
+            // WorkerGlobalScope falls back to its creation metadata when the
+            // active UA override has no metadata. Its UA/appVersion/platform
+            // getters themselves continue to use the creation-time backing.
+            if value.user_agent_metadata.is_some() {
+                value.user_agent
+            } else {
+                String::new()
+            },
+            value.accept_language,
+            None,
+            value.user_agent_metadata,
+        ),
+        None => base,
+    })
 }
 
 pub(in crate::context_bootstrap) fn set_navigator_identity_profile<'s>(
@@ -1165,6 +1251,7 @@ fn build_window_navigator_backing_for_owner<'s>(
         storage_buckets: v8::undefined(scope).into(),
         geolocation: v8::undefined(scope).into(),
         media_capabilities: v8::undefined(scope).into(),
+        credentials: v8::undefined(scope).into(),
     }
     .bind(scope)
     .map_err(|error| anyhow!("failed to bind Navigator backing object: {error}"))
@@ -1575,6 +1662,29 @@ fn navigator_runtime_data_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     navigator: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Object>> {
+    let navigator = moli_webapi_declare::web_api_object_target(scope, navigator)?;
     get_private_value(scope, navigator, NAVIGATOR_RUNTIME_DATA_SLOT)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+}
+
+pub(in crate::context_bootstrap) fn service_worker_container_for_window<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    window: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    // Native notifications address the Window's associated container. Neither
+    // Window.navigator nor Navigator.serviceWorker invokes author code here.
+    let navigator = get_private_value(scope, window, WINDOW_NAVIGATOR_SLOT)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+        .or_else(|| {
+            super::super::window_lazy_surface::ensure_window_lazy_surface_object(
+                scope,
+                window,
+                super::super::window_lazy_surface::WindowLazySurface::Navigator,
+            )
+            .ok()
+        })?;
+    let backing = navigator_runtime_data_object(scope, navigator)?;
+    ensure_navigator_subobject(scope, backing, NavigatorSubobject::ServiceWorker)
+        .ok()
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
 }

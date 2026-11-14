@@ -13,6 +13,7 @@ use super::*;
 use crate::util::{
     callback_data_index_value, callback_data_item, get_private_value, set_private_value,
 };
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 const CRYPTO_SUBTLE_SLOT: &str = "__moliCryptoSubtle";
@@ -20,21 +21,15 @@ const CRYPTO_SUBTLE_AVAILABLE_SLOT: &str = "__moliCryptoSubtleAvailable";
 const WINDOW_CRYPTO_SUBTLE_AVAILABLE_SLOT: &str = "__moliWindowCryptoSubtleAvailable";
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Crypto")]
-struct CryptoObjectDeclaration {
-    #[webapi(slot = CRYPTO_BRAND_SLOT, init = true)]
-    brand: (),
-}
+#[webapi(interface = web_api_interfaces::Crypto)]
+struct CryptoObjectDeclaration {}
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "SubtleCrypto")]
-struct SubtleCryptoObjectDeclaration {
-    #[webapi(slot = CRYPTO_SUBTLE_BRAND_SLOT, init = true)]
-    brand: (),
-}
+#[webapi(interface = web_api_interfaces::SubtleCrypto)]
+struct SubtleCryptoObjectDeclaration {}
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Crypto")]
+#[webapi(fragment, prototype = "Crypto")]
 struct CryptoPrototypeAccessorsDeclaration {
     #[webapi(
         accessor_property,
@@ -46,7 +41,7 @@ struct CryptoPrototypeAccessorsDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "Crypto")]
+#[webapi(interface = web_api_interfaces::Crypto)]
 struct CryptoPrototypeOperationsDeclaration {
     #[webapi(
         method = "getRandomValues",
@@ -58,7 +53,7 @@ struct CryptoPrototypeOperationsDeclaration {
 }
 
 #[derive(Default, WebApiObject)]
-#[webapi(interface = "Crypto")]
+#[webapi(fragment, prototype = "Crypto")]
 struct CryptoSecurePrototypeOperationsDeclaration {
     #[webapi(
         method = "randomUUID",
@@ -70,7 +65,7 @@ struct CryptoSecurePrototypeOperationsDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "SubtleCrypto")]
+#[webapi(interface = web_api_interfaces::SubtleCrypto)]
 struct SubtleCryptoPrototypeOperationsDeclaration {
     #[webapi(method, enumerable, length = 2, callback = crypto_subtle_digest_callback)]
     digest: (),
@@ -101,7 +96,7 @@ struct SubtleCryptoPrototypeOperationsDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "SubtleCrypto")]
+#[webapi(interface = web_api_interfaces::SubtleCrypto)]
 struct SubtleCryptoStaticOperationsDeclaration {
     #[webapi(
         static_method,
@@ -239,7 +234,7 @@ fn crypto_attribute_getter_callback<'s>(
         rv.set_undefined();
         return;
     };
-    if get_private_value(scope, args.this(), CRYPTO_BRAND_SLOT).is_none() {
+    if !web_api_interfaces::Crypto::is_instance(scope, args.this()) {
         throw_type_error(scope, "Illegal invocation");
         return;
     }

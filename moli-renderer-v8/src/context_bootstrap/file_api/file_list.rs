@@ -1,19 +1,20 @@
-use super::*;
 use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 const FILE_LIST_LENGTH_SLOT: &str = "__lmFileListLength";
+const FILE_LIST_FILES_SLOT: &str = "__lmFileListFiles";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "FileList", require_prototype)]
+#[webapi(interface = web_api_interfaces::FileList, require_prototype)]
 struct FileListObjectDeclaration {
     #[webapi(slot = FILE_LIST_LENGTH_SLOT)]
     length: f64,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "FileList")]
+#[webapi(interface = web_api_interfaces::FileList, receiver)]
 struct FileListPrototypeAccessorsDeclaration {
     #[webapi(accessor_property, getter = file_list_length_getter_callback, enumerable)]
     length: (),
@@ -40,32 +41,22 @@ pub(super) fn install_file_list_template_bindings<'s>(
     );
 }
 
-pub(in crate::context_bootstrap) fn file_list_constructor_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    if !args.is_construct_call() {
-        throw_type_error(
-            scope,
-            "Failed to construct 'FileList': Please use the 'new' operator.",
-        );
-        return;
-    }
-    initialize_file_list_object(scope, args.this(), args.get(0));
-    rv.set(args.this().into());
-}
-
 pub(crate) fn build_file_list_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     files: &[v8::Local<'s, v8::Object>],
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let object = FileListObjectDeclaration::new(files.len() as f64)
+    let length = u32::try_from(files.len()).ok()?;
+    let contents = build_file_list_contents_array(scope, files);
+    let object = FileListObjectDeclaration::new(f64::from(length))
         .bind(scope)
         .ok()?;
     for (index, file) in files.iter().enumerate() {
-        let _ = object.set_index(scope, index as u32, (*file).into());
+        let index = u32::try_from(index).ok()?;
+        if define_file_list_index(scope, object, index, *file) != Some(true) {
+            return None;
+        }
     }
+    set_private_value(scope, object, FILE_LIST_FILES_SLOT, contents.into());
     Some(object)
 }
 
@@ -74,18 +65,81 @@ pub(crate) fn sync_file_list_contents<'s>(
     object: v8::Local<'s, v8::Object>,
     files: &[v8::Local<'s, v8::Object>],
 ) {
+    let Ok(length) = u32::try_from(files.len()) else {
+        return;
+    };
+    let contents = build_file_list_contents_array(scope, files);
     let previous_length = file_list_length_from_object(scope, object)
-        .filter(|value| value.is_finite() && *value >= 0.0)
+        .filter(|value| {
+            value.is_finite()
+                && *value >= 0.0
+                && value.fract() == 0.0
+                && *value <= f64::from(u32::MAX)
+        })
         .map(|value| value as u32)
         .unwrap_or(0);
     for index in 0..previous_length {
         let _ = object.delete_index(scope, index);
     }
     for (index, file) in files.iter().enumerate() {
-        let _ = object.set_index(scope, index as u32, (*file).into());
+        let _ = define_file_list_index(scope, object, index as u32, *file);
     }
-    let length = v8::Number::new(scope, files.len() as f64);
+    set_private_value(scope, object, FILE_LIST_FILES_SLOT, contents.into());
+    let length = v8::Number::new(scope, f64::from(length));
     set_private_value(scope, object, FILE_LIST_LENGTH_SLOT, length.into());
+}
+
+fn define_file_list_index<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    index: u32,
+    file: v8::Local<'s, v8::Object>,
+) -> Option<bool> {
+    // Native indexed properties must not invoke inherited author setters.
+    let key = v8::String::new(scope, &index.to_string())?;
+    object.create_data_property(scope, key.into(), file.into())
+}
+
+fn build_file_list_contents_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    files: &[v8::Local<'s, v8::Object>],
+) -> v8::Local<'s, v8::Array> {
+    // Populate own elements without invoking author Array.prototype setters.
+    let values = files.iter().map(|file| (*file).into()).collect::<Vec<_>>();
+    v8::Array::new_with_elements(scope, &values)
+}
+
+pub(crate) fn is_file_list_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> bool {
+    web_api_interfaces::FileList::is_instance(scope, object)
+}
+
+pub(crate) fn file_list_files_from_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Vec<v8::Local<'s, v8::Object>>> {
+    if !is_file_list_object(scope, object) {
+        return None;
+    }
+    let length = file_list_length_from_object(scope, object)?;
+    if !length.is_finite() || length < 0.0 || length.fract() != 0.0 || length > f64::from(u32::MAX)
+    {
+        return None;
+    }
+    let contents = get_private_value(scope, object, FILE_LIST_FILES_SLOT)
+        .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())?;
+    let length = length as u32;
+    let mut files = Vec::new();
+    files.try_reserve_exact(length as usize).ok()?;
+    for index in 0..length {
+        let file = contents
+            .get_index(scope, index)
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
+        files.push(file);
+    }
+    Some(files)
 }
 
 pub(in crate::context_bootstrap) fn file_list_item_callback<'s>(
@@ -96,7 +150,9 @@ pub(in crate::context_bootstrap) fn file_list_item_callback<'s>(
     let Some(parsed) = webidl::parse_args::<FileListItemArgs>(scope, &args) else {
         return;
     };
-    let Some(value) = args.this().get_index(scope, parsed.index) else {
+    let receiver = moli_webapi_declare::web_api_object_target(scope, args.this())
+        .expect("FileList receiver validated by WebIDL");
+    let Some(value) = receiver.get_index(scope, parsed.index) else {
         rv.set(v8::null(scope).into());
         return;
     };
@@ -122,32 +178,7 @@ fn file_list_length_from_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> Option<f64> {
+    let object = moli_webapi_declare::web_api_object_target(scope, object)?;
     get_private_value(scope, object, FILE_LIST_LENGTH_SLOT)
         .and_then(|value| value.number_value(scope))
-}
-
-fn initialize_file_list_object<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-    files_value: v8::Local<'s, v8::Value>,
-) {
-    let files = if files_value.is_null_or_undefined() {
-        None
-    } else {
-        files_value.to_object(scope)
-    };
-    let length = files
-        .and_then(|value| value.get(scope, v8str(scope, "length").into()))
-        .and_then(|value| value.number_value(scope))
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .map(|value| value as u32)
-        .unwrap_or(0);
-    for index in 0..length {
-        if let Some(file) = files.and_then(|files| files.get_index(scope, index)) {
-            let _ = object.set_index(scope, index, file);
-        }
-    }
-    FileListObjectDeclaration::new(length as f64)
-        .initialize(scope, object)
-        .expect("FileList declaration should initialize object");
 }

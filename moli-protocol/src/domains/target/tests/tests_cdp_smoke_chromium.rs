@@ -239,6 +239,7 @@ async fn rust_cdp_chromium_page_layout_metrics_are_populated() {
     )
     .await;
 
+    ctx.capture_fixture_layout(Some(&attached.session_id)).await;
     ctx.process_async(json!({
         "id": 74_006,
         "method": "Page.getLayoutMetrics",
@@ -276,10 +277,12 @@ async fn rust_cdp_chromium_page_layout_metrics_are_populated() {
 async fn rust_cdp_chromium_shared_worker_target_and_runtime_smoke() {
     let fixture = SmokeFixtureServer::start().await;
     let mut ctx = TestContext::new();
-    ctx.conn.set_target_discovery_for_owner(
-        None,
-        crate::conn::CdpTargetFilter::default_target_discovery(),
-    );
+    ctx.with_fixture(|conn| {
+        conn.set_target_discovery_for_owner(
+            None,
+            crate::conn::CdpTargetFilter::default_target_discovery(),
+        )
+    });
     let attached = attached_smoke_session(&mut ctx, 75_000).await;
 
     ctx.process_async(json!({
@@ -533,10 +536,12 @@ async fn rust_cdp_chromium_shared_worker_target_and_runtime_smoke() {
 async fn rust_cdp_chromium_dedicated_worker_target_runtime_and_lifecycle_smoke() {
     let fixture = SmokeFixtureServer::start().await;
     let mut ctx = TestContext::new();
-    ctx.conn.set_target_discovery_for_owner(
-        None,
-        crate::conn::CdpTargetFilter::default_target_discovery(),
-    );
+    ctx.with_fixture(|conn| {
+        conn.set_target_discovery_for_owner(
+            None,
+            crate::conn::CdpTargetFilter::default_target_discovery(),
+        )
+    });
     let attached = attached_smoke_session(&mut ctx, 75_100).await;
     let page_url = fixture.url("/chromium-cdp-lifecycle-page");
     let worker_url = fixture.url("/dedicated-worker-smoke.js");
@@ -1307,6 +1312,7 @@ async fn rust_cdp_chromium_dom_get_node_for_location_contract() {
         .as_u64()
         .expect("hit target backend node id");
 
+    ctx.capture_fixture_layout(Some(&attached.session_id)).await;
     ctx.process_async(json!({
         "id": 80_009,
         "method": "DOM.getNodeForLocation",

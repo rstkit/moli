@@ -1,3 +1,4 @@
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{Error, Expr, Field, Ident, LitInt, LitStr, Path};
 
@@ -6,12 +7,20 @@ pub(crate) struct ContainerAttrs {
     pub(crate) prefix: Option<LitStr>,
     pub(crate) scope_lifetime: Option<syn::Lifetime>,
     pub(crate) rename_all: Option<RenameRule>,
+    pub(crate) snapshot: bool,
 }
 
 pub(crate) fn parse_container_attrs(attrs: &[syn::Attribute]) -> Result<ContainerAttrs, Error> {
     let mut parsed = ContainerAttrs::default();
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("webidl")) {
         attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("snapshot") {
+                if parsed.snapshot {
+                    return Err(meta.error("duplicate snapshot attribute"));
+                }
+                parsed.snapshot = true;
+                return Ok(());
+            }
             if meta.path.is_ident("prefix") {
                 parsed.prefix = Some(meta.value()?.parse()?);
                 return Ok(());
@@ -52,27 +61,88 @@ pub(crate) fn parse_rename_rule(value: &LitStr) -> Result<RenameRule, Error> {
 
 #[derive(Default)]
 pub(crate) struct FieldAttrs {
+    pub(crate) inherit: bool,
     pub(crate) required: bool,
     pub(crate) name: Option<LitStr>,
     pub(crate) default: Option<Expr>,
     pub(crate) converter: Option<crate::converter::ConverterKind>,
+    pub(crate) dictionary: bool,
+    pub(crate) sequence: bool,
+    pub(crate) interface: Option<Path>,
+    pub(crate) brand_check: Option<Path>,
     pub(crate) missing_message: Option<LitStr>,
     pub(crate) index: Option<usize>,
     pub(crate) legacy_nullish: bool,
     pub(crate) treat_null_as_empty_string: bool,
+    pub(crate) allow_shared: bool,
     pub(crate) nullable: bool,
     pub(crate) with: Option<Path>,
     pub(crate) variadic: bool,
+    pub(crate) snapshot_with: Option<Path>,
+    pub(crate) snapshot_state_with: Option<Path>,
+    pub(crate) snapshot_kind: Option<Expr>,
+    pub(crate) snapshot_default: Option<Expr>,
+    pub(crate) snapshot_slot: Option<Expr>,
+    pub(crate) snapshot_attributes: Option<Expr>,
+    pub(crate) snapshot_frozen: bool,
+    pub(crate) snapshot_order: Option<u32>,
 }
 
 pub(crate) fn parse_field_attrs(field: &Field) -> Result<FieldAttrs, Error> {
     let mut parsed = FieldAttrs::default();
+    let mut snapshot_attributes = std::collections::HashSet::new();
     for attr in field
         .attrs
         .iter()
         .filter(|attr| attr.path().is_ident("webidl"))
     {
         attr.parse_nested_meta(|meta| {
+            if let Some(ident) = meta.path.get_ident()
+                && ident.to_string().starts_with("snapshot_")
+                && !snapshot_attributes.insert(ident.to_string())
+            {
+                return Err(meta.error("duplicate snapshot attribute"));
+            }
+            if meta.path.is_ident("snapshot_with") {
+                parsed.snapshot_with = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("snapshot_state_with") {
+                parsed.snapshot_state_with = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("snapshot_kind") {
+                parsed.snapshot_kind = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("snapshot_default") {
+                parsed.snapshot_default = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("snapshot_slot") {
+                parsed.snapshot_slot = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("snapshot_attributes") {
+                parsed.snapshot_attributes = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("snapshot_frozen") {
+                parsed.snapshot_frozen = true;
+                return Ok(());
+            }
+            if meta.path.is_ident("snapshot_order") {
+                let order: LitInt = meta.value()?.parse()?;
+                parsed.snapshot_order = Some(order.base10_parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("inherit") {
+                if parsed.inherit {
+                    return Err(meta.error("duplicate inherit attribute"));
+                }
+                parsed.inherit = true;
+                return Ok(());
+            }
             if meta.path.is_ident("required") {
                 parsed.required = true;
                 return Ok(());
@@ -102,6 +172,13 @@ pub(crate) fn parse_field_attrs(field: &Field) -> Result<FieldAttrs, Error> {
                 parsed.treat_null_as_empty_string = true;
                 return Ok(());
             }
+            if meta.path.is_ident("allow_shared") {
+                if parsed.allow_shared {
+                    return Err(meta.error("duplicate allow_shared attribute"));
+                }
+                parsed.allow_shared = true;
+                return Ok(());
+            }
             if meta.path.is_ident("nullable") {
                 parsed.nullable = true;
                 return Ok(());
@@ -119,10 +196,142 @@ pub(crate) fn parse_field_attrs(field: &Field) -> Result<FieldAttrs, Error> {
                 parsed.converter = Some(crate::converter::ConverterKind::from_lit(&converter)?);
                 return Ok(());
             }
+            if meta.path.is_ident("interface") {
+                if parsed.interface.is_some() {
+                    return Err(meta.error("duplicate interface attribute"));
+                }
+                parsed.interface = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
+            if meta.path.is_ident("dictionary") {
+                if parsed.dictionary {
+                    return Err(meta.error("duplicate dictionary attribute"));
+                }
+                parsed.dictionary = true;
+                return Ok(());
+            }
+            if meta.path.is_ident("sequence") {
+                if parsed.sequence {
+                    return Err(meta.error("duplicate sequence attribute"));
+                }
+                parsed.sequence = true;
+                return Ok(());
+            }
+            if meta.path.is_ident("brand_check") {
+                if parsed.brand_check.is_some() {
+                    return Err(meta.error("duplicate brand_check attribute"));
+                }
+                parsed.brand_check = Some(meta.value()?.parse()?);
+                return Ok(());
+            }
             Err(meta.error("unsupported #[webidl(...)] field attribute"))
         })?;
     }
+    if parsed.inherit
+        && (parsed.required
+            || parsed.name.is_some()
+            || parsed.default.is_some()
+            || parsed.converter.is_some()
+            || parsed.dictionary
+            || parsed.sequence
+            || parsed.interface.is_some()
+            || parsed.brand_check.is_some()
+            || parsed.missing_message.is_some()
+            || parsed.index.is_some()
+            || parsed.legacy_nullish
+            || parsed.treat_null_as_empty_string
+            || parsed.allow_shared
+            || parsed.nullable
+            || parsed.with.is_some()
+            || parsed.snapshot_with.is_some()
+            || parsed.snapshot_state_with.is_some()
+            || parsed.snapshot_kind.is_some()
+            || parsed.snapshot_default.is_some()
+            || parsed.snapshot_slot.is_some()
+            || parsed.snapshot_attributes.is_some()
+            || parsed.snapshot_frozen
+            || parsed.snapshot_order.is_some()
+            || parsed.variadic)
+    {
+        return Err(Error::new(
+            field.span(),
+            "inherit cannot be combined with member or conversion attributes",
+        ));
+    }
+    if parsed.allow_shared && (parsed.with.is_some() || parsed.treat_null_as_empty_string) {
+        return Err(Error::new(
+            field.span(),
+            "allow_shared cannot be combined with with or string conversion options",
+        ));
+    }
+    if let Some(brand_check) = &parsed.brand_check
+        && parsed.interface.is_none()
+    {
+        return Err(Error::new(
+            brand_check.span(),
+            "brand_check requires #[webidl(interface = Type)]",
+        ));
+    }
+    if let Some(interface) = &parsed.interface {
+        if parsed.converter.is_some() || parsed.with.is_some() {
+            return Err(Error::new(
+                interface.span(),
+                "interface cannot be combined with converter or with",
+            ));
+        }
+        if parsed.treat_null_as_empty_string {
+            return Err(Error::new(
+                interface.span(),
+                "treat_null_as_empty_string only applies to string converters",
+            ));
+        }
+    }
+    if parsed.dictionary {
+        if parsed.sequence {
+            return Err(Error::new(
+                field.span(),
+                "dictionary cannot be combined with sequence",
+            ));
+        }
+        if parsed.interface.is_some() || parsed.converter.is_some() || parsed.with.is_some() {
+            return Err(Error::new(
+                field.span(),
+                "dictionary cannot be combined with interface, converter or with",
+            ));
+        }
+        if parsed.variadic {
+            return Err(Error::new(
+                field.span(),
+                "dictionary cannot be combined with variadic",
+            ));
+        }
+        if parsed.treat_null_as_empty_string {
+            return Err(Error::new(
+                field.span(),
+                "treat_null_as_empty_string only applies to string converters",
+            ));
+        }
+    }
+    if parsed.sequence && (parsed.variadic || parsed.with.is_some()) {
+        return Err(Error::new(
+            field.span(),
+            "sequence cannot be combined with variadic or with",
+        ));
+    }
     Ok(parsed)
+}
+
+impl FieldAttrs {
+    pub(crate) fn has_snapshot_attributes(&self) -> bool {
+        self.snapshot_with.is_some()
+            || self.snapshot_state_with.is_some()
+            || self.snapshot_kind.is_some()
+            || self.snapshot_default.is_some()
+            || self.snapshot_slot.is_some()
+            || self.snapshot_attributes.is_some()
+            || self.snapshot_frozen
+            || self.snapshot_order.is_some()
+    }
 }
 
 #[derive(Default)]
@@ -285,7 +494,7 @@ pub(crate) fn field_member_name(
         return Ok(name);
     }
     let ident = field_ident(field)?;
-    let raw_name = ident.to_string();
+    let raw_name = ident.unraw().to_string();
     let renamed = apply_rename_rule(&raw_name, rename_all);
     Ok(LitStr::new(&renamed, ident.span()))
 }

@@ -1,4 +1,4 @@
-use super::super::{JsContextHost, security_policy::DocumentCspOutcome};
+use super::super::{PageScriptHost, security_policy::DocumentCspOutcome};
 use super::WebSocketConnectionState;
 use crate::document_runtime::document_content_security_policy_error_message;
 use crate::network_host::BLOCKED_BY_CLIENT_ERROR_TEXT;
@@ -8,23 +8,32 @@ use crate::types::{
     SubresourceResponseBody,
 };
 use moli_websocket::{
-    Command as WebSocketCommand, ConnectOptions as WebSocketConnectOptions, spawn_connection,
-    spawn_failed_connection, spawn_synthetic_connection, websocket_cookie_url,
+    ConnectOptions as WebSocketConnectOptions, spawn_connection,
+    spawn_connection_with_handshake_pause, spawn_failed_connection, spawn_standalone_connection,
+    spawn_standalone_connection_with_handshake_pause, spawn_synthetic_connection,
+    websocket_cookie_url,
 };
 use url::Url;
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn register_websocket_for_document(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
         wrapper: v8::Local<'_, v8::Object>,
         owner: super::super::WindowExecutionContextBinding,
-        frame_id: Option<String>,
-        document_url: Url,
+        environment: crate::network::context::SubresourceRequestEnvironment,
         url: Url,
         protocols: Vec<String>,
         csp_outcome: DocumentCspOutcome,
     ) -> u64 {
+        let crate::network::context::SubresourceRequestEnvironment {
+            document_url,
+            request_origin,
+            frame_id,
+            ..
+        } = environment;
+        let origin = request_origin.ascii_serialization().to_owned();
+        let origin_is_opaque = request_origin.is_opaque();
         let socket_id = self.next_websocket_id;
         self.next_websocket_id += 1;
         let resource_loader =
@@ -33,8 +42,23 @@ impl JsContextHost {
             .as_ref()
             .map(crate::network::context::DocumentResourceLoader::request_client);
         let cookie_url = websocket_cookie_url(&url);
-        let cookie_context = moli_cookie_jar::NetworkCookieRequestContext::subresource("GET")
-            .with_initiator_url(&cookie_url, &document_url);
+        let mut cookie_request = moli_fetch::Request::new_browser(
+            "GET",
+            cookie_url.clone(),
+            None,
+            Vec::new(),
+            request_origin,
+        )
+        .with_credentials_mode(moli_fetch::RequestCredentialsMode::Include);
+        // The cookie adapter takes its initiator from the native origin;
+        // about:blank and mutable <base> URLs cannot supply that identity.
+        if origin_is_opaque {
+            cookie_request = cookie_request.with_cross_site_cookie_context();
+        }
+        if let Some(browser_context) = loader.and_then(|loader| loader.browser_site_context()) {
+            cookie_request = cookie_request.with_browser_site_context(browser_context.clone());
+        }
+        let cookie_context = cookie_request.network_cookie_context();
         let cookie_header = if let Some(loader) = loader {
             moli_fetch::cookie_header_for_request(
                 &loader.cookie_store(),
@@ -48,40 +72,43 @@ impl JsContextHost {
             .as_ref()
             .ok()
             .and_then(|header| header.clone());
+        let connector = loader.map(|loader| loader.websocket_connector());
         let context = WebSocketConnectOptions {
-            origin: moli_url::origin_ascii_serialization(&document_url),
+            origin,
             user_agent: loader
                 .map(|loader| loader.user_agent().to_owned())
                 .unwrap_or_else(|| moli_fetch::FetchConfig::DEFAULT_USER_AGENT.to_owned()),
             extra_headers: self.extra_http_headers.clone(),
             http_proxy: loader.and_then(|loader| loader.http_proxy().map(ToOwned::to_owned)),
             http_no_proxy: loader.and_then(|loader| loader.http_no_proxy().map(ToOwned::to_owned)),
+            http_host_resolve: loader
+                .map(|loader| loader.http_host_resolve().to_vec())
+                .unwrap_or_default(),
             proxy_bearer_token: loader
                 .and_then(|loader| loader.proxy_bearer_token().map(ToOwned::to_owned)),
-            tls_verify_host: loader
-                .map(|loader| loader.tls_verify_host())
-                .unwrap_or(true),
+            tls: loader
+                .map(|loader| loader.tls_config().clone())
+                .unwrap_or_default(),
             cookie_header: cookie_header_for_context,
-            pause_after_handshake: false,
         };
         let dispatch_scope = owner.dispatch_scope();
         let csp_failure_message = csp_outcome.into_blocking_violation().map(|violation| {
             document_content_security_policy_error_message(&violation, "WebSocket")
         });
-        let (command_tx, fetch_internal_id) = if let Some(message) = csp_failure_message {
-            let command_tx = spawn_failed_connection(
+        let (connection, fetch_internal_id) = if let Some(message) = csp_failure_message {
+            let connection = spawn_failed_connection(
                 socket_id,
                 message,
                 self.page_websocket_sender().event_sender(),
             );
-            (Some(command_tx), None)
+            (Some(connection), None)
         } else if self.is_url_blocked(&url) {
-            let command_tx = spawn_failed_connection(
+            let connection = spawn_failed_connection(
                 socket_id,
                 BLOCKED_BY_CLIENT_ERROR_TEXT.to_owned(),
                 self.page_websocket_sender().event_sender(),
             );
-            (Some(command_tx), None)
+            (Some(connection), None)
         } else if cookie_header.is_ok()
             && self.should_intercept_subresource(SubresourceResourceType::WebSocket)
         {
@@ -90,6 +117,7 @@ impl JsContextHost {
                 v8::Global::new(scope, scope.get_current_context()),
                 dispatch_scope,
                 PendingWebSocketConnection {
+                    connector,
                     socket_id,
                     protocols,
                     connect_options: context,
@@ -111,21 +139,31 @@ impl JsContextHost {
             );
             (None, Some(internal_id))
         } else {
-            let command_tx = match cookie_header {
-                Ok(_) => spawn_connection(
-                    socket_id,
-                    url.to_string(),
-                    protocols,
-                    context,
-                    self.page_websocket_sender().event_sender(),
-                ),
+            let connection = match cookie_header {
+                Ok(_) => match connector {
+                    Some(connector) => spawn_connection(
+                        connector,
+                        socket_id,
+                        url.to_string(),
+                        protocols,
+                        context,
+                        self.page_websocket_sender().event_sender(),
+                    ),
+                    None => spawn_standalone_connection(
+                        socket_id,
+                        url.to_string(),
+                        protocols,
+                        context,
+                        self.page_websocket_sender().event_sender(),
+                    ),
+                },
                 Err(error) => spawn_failed_connection(
                     socket_id,
                     format!("failed to build WebSocket cookie header: {error}"),
                     self.page_websocket_sender().event_sender(),
                 ),
             };
-            (Some(command_tx), None)
+            (Some(connection), None)
         };
         self.websockets.insert(
             socket_id,
@@ -133,12 +171,13 @@ impl JsContextHost {
                 owner,
                 resource_loader,
                 wrapper: v8::Global::new(scope, wrapper),
-                command_tx,
+                connection,
                 url,
                 frame_id,
                 document_url,
                 opened: false,
-                synthetic: false,
+                synthetic_peer: None,
+                handshake_controller: None,
                 fetch_internal_id,
                 response_interception_pending: None,
             },
@@ -150,7 +189,7 @@ impl JsContextHost {
         &mut self,
         pending: PendingWebSocketConnection,
         url: Url,
-        headers: Vec<(String, String)>,
+        headers: moli_fetch::RequestHeaders,
         headers_overridden: bool,
         intercept_response: bool,
     ) -> Result<(), String> {
@@ -163,16 +202,48 @@ impl JsContextHost {
         if headers_overridden {
             context.cookie_header = None;
         }
-        context.pause_after_handshake = intercept_response;
-        let command_tx = spawn_connection(
-            pending.socket_id,
-            url.to_string(),
-            pending.protocols,
-            context,
-            event_sender,
-        );
+        let (connection, handshake_controller) = if intercept_response {
+            let (connection, controller) = match pending.connector {
+                Some(connector) => spawn_connection_with_handshake_pause(
+                    connector,
+                    pending.socket_id,
+                    url.to_string(),
+                    pending.protocols,
+                    context,
+                    event_sender,
+                ),
+                None => spawn_standalone_connection_with_handshake_pause(
+                    pending.socket_id,
+                    url.to_string(),
+                    pending.protocols,
+                    context,
+                    event_sender,
+                ),
+            };
+            (connection, Some(controller))
+        } else {
+            let connection = match pending.connector {
+                Some(connector) => spawn_connection(
+                    connector,
+                    pending.socket_id,
+                    url.to_string(),
+                    pending.protocols,
+                    context,
+                    event_sender,
+                ),
+                None => spawn_standalone_connection(
+                    pending.socket_id,
+                    url.to_string(),
+                    pending.protocols,
+                    context,
+                    event_sender,
+                ),
+            };
+            (connection, None)
+        };
+        state.handshake_controller = handshake_controller;
         state.url = url;
-        state.command_tx = Some(command_tx);
+        state.connection = Some(connection);
         state.response_interception_pending =
             if intercept_response {
                 Some(state.fetch_internal_id.ok_or_else(|| {
@@ -193,8 +264,8 @@ impl JsContextHost {
         let Some(state) = self.websockets.get_mut(&pending.socket_id) else {
             return Err(format!("unknown pending WebSocket `{}`", pending.socket_id));
         };
-        let command_tx = spawn_failed_connection(pending.socket_id, error_text, event_sender);
-        state.command_tx = Some(command_tx);
+        let connection = spawn_failed_connection(pending.socket_id, error_text, event_sender);
+        state.connection = Some(connection);
         Ok(())
     }
 
@@ -202,33 +273,33 @@ impl JsContextHost {
         &mut self,
         pending: PendingWebSocketConnection,
         request_url: Url,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
     ) -> Result<(), String> {
         let event_sender = self.page_websocket_sender().event_sender();
         let Some(state) = self.websockets.get_mut(&pending.socket_id) else {
             return Err(format!("unknown pending WebSocket `{}`", pending.socket_id));
         };
-        let command_tx = spawn_synthetic_connection(
+        let (connection, peer) = spawn_synthetic_connection(
             pending.socket_id,
             request_headers,
             response_status,
-            response_headers,
+            moli_fetch::ResponseHeaders::from_bytes(response_headers),
             event_sender,
         );
         state.url = request_url;
-        state.command_tx = Some(command_tx);
-        state.synthetic = true;
+        state.connection = Some(connection);
+        state.synthetic_peer = Some(peer);
         Ok(())
     }
 
     pub(crate) fn pause_websocket_handshake_response(
         &mut self,
         socket_id: u64,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         response_status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: moli_fetch::ResponseHeaders,
     ) -> bool {
         let Some((internal_id, url)) = self.websockets.get_mut(&socket_id).and_then(|state| {
             state
@@ -254,9 +325,10 @@ impl JsContextHost {
                 request_cookie_report: None,
                 network_request_headers: None,
                 response_status,
-                response_headers,
+                response_headers: response_headers.into_iter().collect(),
                 response_body: SubresourceResponseBody::from_bytes(Vec::new()),
                 from_cache: false,
+                cache_state: Default::default(),
             }),
         );
         true
@@ -266,23 +338,23 @@ impl JsContextHost {
         &mut self,
         pending: PendingWebSocketResponseState,
         response_status: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) -> Result<(), String> {
-        let Some(state) = self.websockets.get(&pending.socket_id) else {
+        let Some(state) = self.websockets.get_mut(&pending.socket_id) else {
             return Err(format!("unknown pending WebSocket `{}`", pending.socket_id));
         };
-        let Some(command_tx) = state.command_tx.as_ref() else {
+        let Some(controller) = state.handshake_controller.take() else {
             return Err(format!(
-                "pending WebSocket `{}` has no command sender",
+                "pending WebSocket `{}` has no handshake controller",
                 pending.socket_id
             ));
         };
-        command_tx
-            .send(WebSocketCommand::ContinueOpen {
+        controller
+            .continue_open(
                 response_status,
-                response_headers,
-            })
-            .map_err(|_| format!("pending WebSocket `{}` is closed", pending.socket_id))
+                response_headers.map(moli_fetch::ResponseHeaders::from_bytes),
+            )
+            .map_err(|error| format!("pending WebSocket `{}`: {error}", pending.socket_id))
     }
 
     pub(crate) fn fail_websocket_handshake_response(
@@ -290,43 +362,46 @@ impl JsContextHost {
         pending: PendingWebSocketResponseState,
         error_text: String,
     ) -> Result<(), String> {
-        let Some(state) = self.websockets.get(&pending.socket_id) else {
+        let Some(state) = self.websockets.get_mut(&pending.socket_id) else {
             return Err(format!("unknown pending WebSocket `{}`", pending.socket_id));
         };
-        let Some(command_tx) = state.command_tx.as_ref() else {
+        let Some(controller) = state.handshake_controller.take() else {
             return Err(format!(
-                "pending WebSocket `{}` has no command sender",
+                "pending WebSocket `{}` has no handshake controller",
                 pending.socket_id
             ));
         };
-        command_tx
-            .send(WebSocketCommand::FailOpen(error_text))
-            .map_err(|_| format!("pending WebSocket `{}` is closed", pending.socket_id))
+        controller
+            .fail(error_text)
+            .map_err(|error| format!("pending WebSocket `{}`: {error}", pending.socket_id))
     }
 }
 
 fn websocket_interception_request_headers(
     context: &WebSocketConnectOptions,
-) -> Vec<(String, String)> {
+) -> moli_fetch::RequestHeaders {
     let mut headers = context.extra_headers.clone();
     if !headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("origin"))
     {
-        headers.push(("Origin".to_owned(), context.origin.clone()));
+        headers.push(("Origin".to_owned(), context.origin.as_bytes().to_vec()));
     }
     if !headers
         .iter()
         .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
     {
-        headers.push(("User-Agent".to_owned(), context.user_agent.clone()));
+        headers.push((
+            "User-Agent".to_owned(),
+            context.user_agent.as_bytes().to_vec(),
+        ));
     }
     if let Some(cookie) = context.cookie_header.as_ref()
         && !headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("cookie"))
     {
-        headers.push(("Cookie".to_owned(), cookie.clone()));
+        headers.push(("Cookie".to_owned(), cookie.as_bytes().to_vec()));
     }
     headers
 }

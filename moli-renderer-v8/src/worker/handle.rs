@@ -3,9 +3,10 @@
 use crate::RendererSyntheticResponseBody;
 use crate::protocol_types::{
     PendingSubresourceContinueEvent, PendingSubresourceFetchInfo, SubresourceAuthCredentials,
-    SubresourceNetworkRecord, SubresourceNetworkRequestHandle, SubresourceResourceType,
-    WebSocketFrameDirection, WebSocketFrameOpcode,
+    SubresourceNetworkRecord, SubresourceNetworkRequestHandle, WebSocketFrameDirection,
+    WebSocketFrameOpcode,
 };
+use crate::runtime::WorkerInspectorError;
 use crate::runtime::{
     RendererRuntimeInspectorMessage, RendererRuntimeInspectorResponseSender,
     ServiceWorkerClientFocus, ServiceWorkerClientFocusResult, ServiceWorkerClientMessage,
@@ -34,6 +35,7 @@ use crate::runtime::{
 use crate::structured_clone::V8StructuredClonePayload;
 use crate::types::{BroadcastChannelId, DedicatedWorkerId, MessagePortId, NetworkBodySourceId};
 use crate::worker::inspector_task_runner::{WorkerInspectorTaskMode, WorkerInspectorTaskRunner};
+use anyhow::Result;
 use moli_crypto::sha256_hex;
 use moli_fetch::{RequestCredentialsMode, ResponseHead};
 use moli_shared_worker::SharedWorkerInstanceId;
@@ -48,17 +50,31 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 use url::Url;
 
-pub(crate) fn worker_secure_context_for_script_url(
-    script_url: &Url,
-    creator_secure_context: bool,
-) -> bool {
-    match script_url.scheme() {
-        // Blink's secure-context tests expect workers created from blob URLs to
-        // inherit the creator context's HTTPS state. Chromium also treats data
-        // workers created by a secure page as secure, even though a standalone
-        // data URL is not itself a trustworthy URL.
-        "blob" | "data" => creator_secure_context,
-        _ => moli_url::is_potentially_trustworthy_url(script_url),
+/// How to determine a worker's secure-context state during startup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WorkerSecureContextPolicy {
+    /// Starts without a creator, including restored service workers.
+    #[default]
+    ScriptUrl,
+    /// Use the creator's security state as a prerequisite for the worker.
+    Inherited(bool),
+}
+
+impl WorkerSecureContextPolicy {
+    pub(crate) fn resolve(self, script_url: &Url) -> bool {
+        match self {
+            Self::ScriptUrl => {
+                !matches!(script_url.scheme(), "blob" | "data")
+                    && moli_url::is_potentially_trustworthy_url(script_url)
+            }
+            Self::Inherited(secure) => {
+                // Blob/data workers inherit the creator's state even though a
+                // standalone data URL is not itself trustworthy.
+                secure
+                    && (matches!(script_url.scheme(), "blob" | "data")
+                        || moli_url::is_potentially_trustworthy_url(script_url))
+            }
+        }
     }
 }
 
@@ -137,8 +153,14 @@ pub(crate) enum WorkerMessage {
     ServiceWorkerShowNotificationResult(ServiceWorkerShowNotificationResult),
     /// Resolve a Service Worker `ServiceWorkerRegistration.getNotifications()` request in the worker.
     ServiceWorkerGetNotificationsResult(ServiceWorkerGetNotificationsResult),
+    /// Dispatch a CSP violation after the current worker script turn.
+    DispatchContentSecurityPolicyViolation(
+        Box<crate::content_security_policy::ContentSecurityPolicyUrlViolation>,
+    ),
     /// Run the worker's queued unhandled promise rejection notification task.
     DispatchPendingPromiseRejections,
+    /// Run one task from the worker's networking task source.
+    RunNetworkingTask,
     /// A worker spawned from this worker has queued a parent-facing event.
     NestedWorkerEvent {
         worker_id: DedicatedWorkerId,
@@ -146,24 +168,21 @@ pub(crate) enum WorkerMessage {
     },
     /// Owner-thread dispatch or fallback for one queued Inspector task.
     RunInspectorTask(WorkerInspectorTaskMode),
+    /// One coalesced fallback wake for the isolate's environment mailbox.
+    RunEnvironmentNotification,
     #[cfg(test)]
     /// Inspect worker resource-owner V8 slots from inside the worker thread.
     ResourceOwnerSlotDiagnostics {
         response_tx: oneshot::Sender<Result<WorkerResourceOwnerSlotDiagnostics, String>>,
     },
     /// Update the Network.setExtraHTTPHeaders state visible to worker-owned fetch/XHR.
-    SetExtraHttpHeaders(Vec<(String, String)>),
+    SetExtraHttpHeaders(moli_fetch::RequestHeaders),
     /// Update the Network.emulateNetworkConditions offline state visible to worker-owned fetch/XHR.
     SetNetworkOffline(bool),
     /// Update the effective Network.setCacheDisabled state visible to worker-owned fetch/XHR.
     SetCacheDisabled(bool),
     /// Update the Network.setBlockedURLs state visible to worker-owned fetch/XHR.
     SetBlockedUrlPatterns(Vec<String>),
-    /// Update Fetch domain subresource interception visible to worker-owned fetch/XHR.
-    SetFetchSubresourceInterception {
-        enabled: bool,
-        resource_type: Option<SubresourceResourceType>,
-    },
     /// Continue a worker-owned fetch() that was paused for Fetch domain interception.
     ContinuePendingFetch(WorkerPendingFetchContinue),
     /// Continue a worker-owned XHR that was paused for Fetch domain interception.
@@ -174,13 +193,13 @@ pub(crate) enum WorkerMessage {
     ContinuePendingFetchResponse {
         request: WorkerPendingFetchContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     },
     /// Continue a worker-owned XHR response that was paused for Fetch domain interception.
     ContinuePendingXhrResponse {
         request: WorkerPendingXhrContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     },
     /// Fail a worker-owned fetch() that was paused for Fetch domain interception.
     FailPendingFetch {
@@ -221,35 +240,35 @@ pub(crate) enum WorkerMessage {
     FulfillPendingFetch {
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     },
     /// Fulfill a worker-owned XHR that was paused for Fetch domain interception.
     FulfillPendingXhr {
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     },
     /// Fulfill a worker-owned CSP report that was paused for Fetch domain interception.
     FulfillPendingCspReport {
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     },
     /// Fulfill a worker-owned fetch() response that was paused for Fetch domain interception.
     FulfillPendingFetchResponse {
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     },
     /// Fulfill a worker-owned XHR response that was paused for Fetch domain interception.
     FulfillPendingXhrResponse {
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     },
     /// Request the worker to terminate.
@@ -390,7 +409,7 @@ pub(crate) struct WorkerScriptResource {
     pub(crate) final_url: Url,
     pub(crate) kind: WorkerScriptResourceKind,
     pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) headers: Vec<(String, Vec<u8>)>,
     pub(crate) body_len: usize,
     pub(crate) body_sha256: String,
     pub(crate) response_time_ms: u64,
@@ -559,13 +578,15 @@ pub(crate) struct WorkerPendingSubresourceFetch {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerPendingFetchContinue {
+    pub(crate) redirect_headers: Option<moli_fetch::RequestHeaders>,
     pub(crate) fetch_id: u32,
     pub(crate) internal_id: u64,
     pub(crate) network_request_handle: Option<SubresourceNetworkRequestHandle>,
     pub(crate) url: Url,
     pub(crate) method: String,
-    pub(crate) body: Option<String>,
-    pub(crate) headers: Vec<(String, String)>,
+    /// Upload bytes after applying explicit overrides, including an empty body.
+    pub(crate) body: Option<bytes::Bytes>,
+    pub(crate) headers: moli_fetch::RequestHeaders,
     pub(crate) intercept_response: bool,
     pub(crate) handle_auth_requests: bool,
     pub(crate) auth: Option<SubresourceAuthCredentials>,
@@ -573,13 +594,15 @@ pub(crate) struct WorkerPendingFetchContinue {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerPendingXhrContinue {
+    pub(crate) redirect_headers: Option<moli_fetch::RequestHeaders>,
     pub(crate) xhr_id: u32,
     pub(crate) internal_id: u64,
     pub(crate) network_request_handle: Option<SubresourceNetworkRequestHandle>,
     pub(crate) url: Url,
     pub(crate) method: String,
-    pub(crate) body: Option<String>,
-    pub(crate) headers: Vec<(String, String)>,
+    /// Upload bytes after applying explicit overrides, including an empty body.
+    pub(crate) body: Option<bytes::Bytes>,
+    pub(crate) headers: moli_fetch::RequestHeaders,
     pub(crate) intercept_response: bool,
     pub(crate) handle_auth_requests: bool,
     pub(crate) auth: Option<SubresourceAuthCredentials>,
@@ -636,18 +659,17 @@ pub(crate) struct WorkerWebSocketFrameEvent {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkerNetworkPolicy {
-    /// Secure-context state for APIs guarded by `[SecureContext]`.
+    /// Startup policy for APIs guarded by `[SecureContext]`.
     ///
-    /// Dedicated workers normally derive this from their script URL, but
-    /// blob/data workers inherit it from the creator context instead.
-    pub(crate) secure_context: bool,
+    /// Page-created workers inherit the creator's state, including insecure
+    /// ancestors. Native starts without a creator derive it from the script
+    /// URL; blob/data workers require an explicit creator state.
+    pub(crate) secure_context: WorkerSecureContextPolicy,
     pub(crate) permission_overrides: Vec<crate::protocol_types::PermissionOverrideRegistration>,
-    pub(crate) extra_http_headers: Vec<(String, String)>,
+    pub(crate) extra_http_headers: moli_fetch::RequestHeaders,
     pub(crate) network_offline: bool,
     pub(crate) blocked_url_patterns: Vec<String>,
     pub(crate) network_partition_key: Option<String>,
-    pub(crate) fetch_subresource_interception_enabled: bool,
-    pub(crate) fetch_subresource_interception_resource_type: Option<SubresourceResourceType>,
 }
 
 #[derive(Debug)]
@@ -679,6 +701,8 @@ impl WorkerRuntimeEvent {
 /// running worker.
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerDevToolsHandle {
+    network_cancel: moli_fetch::FetchCancelHandle,
+    isolate_handle: Arc<Mutex<Option<v8::IsolateHandle>>>,
     worker_tx: mpsc::UnboundedSender<WorkerMessage>,
     inspector_tasks: WorkerInspectorTaskRunner,
 }
@@ -689,9 +713,15 @@ impl WorkerDevToolsHandle {
         isolate_handle: Arc<Mutex<Option<v8::IsolateHandle>>>,
     ) -> Self {
         Self {
+            network_cancel: moli_fetch::FetchCancelHandle::new(),
+            isolate_handle: Arc::clone(&isolate_handle),
             inspector_tasks: WorkerInspectorTaskRunner::new(wake_tx.clone(), isolate_handle),
             worker_tx: wake_tx,
         }
+    }
+
+    pub(crate) fn network_cancel_handle(&self) -> moli_fetch::FetchCancelHandle {
+        self.network_cancel.clone()
     }
 
     pub(crate) fn inspector_tasks(&self) -> &WorkerInspectorTaskRunner {
@@ -703,7 +733,7 @@ impl WorkerDevToolsHandle {
         inspector_session_id: Option<String>,
         raw_json: String,
         deferred_response: Option<RendererRuntimeInspectorResponseSender>,
-        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>, String>>,
+        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>>>,
     ) -> bool {
         self.inspector_tasks.append_protocol_message(
             inspector_session_id,
@@ -723,7 +753,7 @@ impl WorkerDevToolsHandle {
     pub(crate) fn detach_runtime_inspector_session(
         &self,
         inspector_session_id: Option<String>,
-    ) -> bool {
+    ) -> tokio::sync::oneshot::Receiver<anyhow::Result<()>> {
         self.inspector_tasks.append_detach(inspector_session_id)
     }
 
@@ -731,12 +761,16 @@ impl WorkerDevToolsHandle {
         self.inspector_tasks.append_run_if_waiting_for_debugger()
     }
 
-    pub(crate) fn dispose(&self, message: &str) {
-        self.inspector_tasks.dispose(message);
+    pub(crate) fn dispose(&self, error: WorkerInspectorError) {
+        self.network_cancel.cancel();
+        self.inspector_tasks.dispose(error);
     }
 
     pub(crate) fn terminate_for_devtools(&self) -> bool {
-        self.dispose("Worker closed before Inspector task dispatch");
+        if let Some(handle) = self.isolate_handle.lock().as_ref() {
+            handle.terminate_execution();
+        }
+        self.dispose(WorkerInspectorError::Closed);
         self.worker_tx.send(WorkerMessage::Terminate).is_ok()
     }
 }
@@ -817,10 +851,9 @@ impl WorkerHandle {
         // Publish the lifecycle transition before interrupting V8. The worker
         // event loop can then reject an already-selected task without relying
         // on ordering between cloned mpsc senders.
-        self.devtools
-            .dispose("Worker terminated before Inspector task dispatch");
         self.termination_requested.store(true, Ordering::Release);
         self.terminate_execution_if_ready();
+        self.devtools.dispose(WorkerInspectorError::Terminated);
         let _ = self.tx.send(WorkerMessage::Terminate);
     }
 
@@ -848,7 +881,7 @@ impl WorkerHandle {
         inspector_session_id: Option<String>,
         raw_json: String,
         deferred_response: Option<RendererRuntimeInspectorResponseSender>,
-        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>, String>>,
+        response_tx: oneshot::Sender<Result<Vec<RendererRuntimeInspectorMessage>>>,
     ) -> bool {
         self.devtools.dispatch_runtime_protocol_message(
             inspector_session_id,
@@ -870,7 +903,7 @@ impl WorkerHandle {
     pub(crate) fn detach_runtime_inspector_session(
         &self,
         inspector_session_id: Option<String>,
-    ) -> bool {
+    ) -> tokio::sync::oneshot::Receiver<anyhow::Result<()>> {
         self.devtools
             .detach_runtime_inspector_session(inspector_session_id)
     }
@@ -883,10 +916,10 @@ impl WorkerHandle {
         self.devtools.clone()
     }
 
-    pub(crate) fn set_extra_http_headers(&self, headers: &[(String, String)]) {
+    pub(crate) fn set_extra_http_headers(&self, headers: &moli_fetch::RequestHeaders) {
         let _ = self
             .tx
-            .send(WorkerMessage::SetExtraHttpHeaders(headers.to_vec()));
+            .send(WorkerMessage::SetExtraHttpHeaders(headers.clone()));
     }
 
     pub(crate) fn set_network_offline(&self, offline: bool) {
@@ -901,19 +934,6 @@ impl WorkerHandle {
         let _ = self
             .tx
             .send(WorkerMessage::SetBlockedUrlPatterns(patterns.to_vec()));
-    }
-
-    pub(crate) fn set_fetch_subresource_interception(
-        &self,
-        enabled: bool,
-        resource_type: Option<SubresourceResourceType>,
-    ) {
-        let _ = self
-            .tx
-            .send(WorkerMessage::SetFetchSubresourceInterception {
-                enabled,
-                resource_type,
-            });
     }
 
     pub(crate) fn dispatch_service_worker_lifecycle_event(
@@ -1184,7 +1204,7 @@ impl WorkerHandle {
         &self,
         request: WorkerPendingFetchContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) {
         let _ = self.tx.send(WorkerMessage::ContinuePendingFetchResponse {
             request,
@@ -1197,7 +1217,7 @@ impl WorkerHandle {
         &self,
         request: WorkerPendingXhrContinue,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     ) {
         let _ = self.tx.send(WorkerMessage::ContinuePendingXhrResponse {
             request,
@@ -1283,7 +1303,7 @@ impl WorkerHandle {
         &self,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) {
         let _ = self.tx.send(WorkerMessage::FulfillPendingFetch {
@@ -1298,7 +1318,7 @@ impl WorkerHandle {
         &self,
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) {
         let _ = self.tx.send(WorkerMessage::FulfillPendingXhr {
@@ -1313,7 +1333,7 @@ impl WorkerHandle {
         &self,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) {
         let _ = self.tx.send(WorkerMessage::FulfillPendingCspReport {
@@ -1328,7 +1348,7 @@ impl WorkerHandle {
         &self,
         request: WorkerPendingFetchContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) {
         let _ = self.tx.send(WorkerMessage::FulfillPendingFetchResponse {
@@ -1343,7 +1363,7 @@ impl WorkerHandle {
         &self,
         request: WorkerPendingXhrContinue,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     ) {
         let _ = self.tx.send(WorkerMessage::FulfillPendingXhrResponse {

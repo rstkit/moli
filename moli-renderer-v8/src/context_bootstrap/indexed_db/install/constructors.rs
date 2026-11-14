@@ -2,7 +2,7 @@ use super::*;
 
 mod cursor_key_range;
 mod database_transaction;
-mod factory_request;
+mod factory;
 mod object_store_index;
 
 pub(in crate::context_bootstrap) fn install_indexed_db_template_bindings<'s>(
@@ -11,12 +11,14 @@ pub(in crate::context_bootstrap) fn install_indexed_db_template_bindings<'s>(
     interface_name: &str,
 ) {
     let prototype = template.prototype_template(scope);
-    install_dom_string_list_template_bindings(scope, prototype, interface_name);
-    factory_request::install_factory_and_request_template_bindings(
+    super::super::event_target::install_version_change_event_template_bindings(
         scope,
         prototype,
         interface_name,
     );
+    super::super::record::install_record_template_bindings(scope, prototype, interface_name);
+    install_dom_string_list_template_bindings(scope, prototype, interface_name);
+    factory::install_factory_template_bindings(scope, prototype, interface_name);
     database_transaction::install_database_and_transaction_template_bindings(
         scope,
         prototype,

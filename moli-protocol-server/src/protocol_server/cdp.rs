@@ -6,16 +6,12 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use moli_protocol::{
-    DEFAULT_CDP_PAGE_TARGET_ID, DEFAULT_CDP_TAB_TARGET_ID, DevToolsTargetInfo, DevToolsTargetKind,
-    version,
-};
-use moli_protocol_cdp::CDP_PROTOCOL_JSON;
+use moli_protocol::{DevToolsTargetInfo, DevToolsTargetKind, version};
 use percent_encoding::percent_decode_str;
 use serde_json::json;
 
 use super::{
-    AppState, DEFAULT_BROWSER_ID, DEFAULT_TARGET_URL,
+    AppState, DEFAULT_TARGET_URL,
     cdp_owner::SharedCdpOwnerRegistry,
     cdp_socket::{CdpFrontendSocketKind, run_cdp_frontend_socket},
 };
@@ -23,10 +19,12 @@ use super::{
 pub(super) async fn json_version(State(state): State<AppState>) -> impl IntoResponse {
     axum::Json(json!({
         "Browser": version::PRODUCT,
+        "Moli-Version": version::MOLI_VERSION,
         "Protocol-Version": version::PROTOCOL_VERSION,
-        "User-Agent": state.fetch_config.user_agent(),
+        "User-Agent": state.navigation_runtime_config.fetch_config().user_agent(),
         "V8-Version": version::js_version(),
         "WebKit-Version": version::WEBKIT_VERSION,
+        "File-Path-Style": version::NATIVE_FILE_PATH_STYLE,
         "webSocketDebuggerUrl": state.browser_ws_url,
     }))
 }
@@ -52,7 +50,7 @@ pub(super) async fn json_list(State(state): State<AppState>, uri: Uri) -> impl I
 pub(super) async fn json_protocol() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/json")],
-        CDP_PROTOCOL_JSON,
+        moli_protocol_cdp::advertised_protocol_json(),
     )
 }
 
@@ -122,19 +120,6 @@ pub(super) async fn json_activate_target(
     Path(target_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
-    if is_default_target_id(&target_id)
-        && state
-            .cdp_agent_host_directory
-            .lookup_target(&target_id)
-            .is_none()
-        && let Err(error) = ensure_default_target_is_published(&state).await
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Unable to create default target: {error}"),
-        )
-            .into_response();
-    }
     let route = state.cdp_agent_host_directory.lookup_target(&target_id);
     let Some(route) = route else {
         return no_such_target_response(&target_id);
@@ -153,19 +138,6 @@ pub(super) async fn json_close_target(
     Path(target_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
-    if is_default_target_id(&target_id)
-        && state
-            .cdp_agent_host_directory
-            .lookup_target(&target_id)
-            .is_none()
-        && let Err(error) = ensure_default_target_is_published(&state).await
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Unable to create default target: {error}"),
-        )
-            .into_response();
-    }
     let Some(route) = state.cdp_agent_host_directory.lookup_target(&target_id) else {
         return no_such_target_response(&target_id);
     };
@@ -194,7 +166,7 @@ fn target_json(state: &AppState, target_info: DevToolsTargetInfo) -> Option<serd
         DevToolsTargetKind::Tab => "tab",
         _ => return None,
     };
-    let (devtools_frontend_url, websocket_debugger_url) = target_endpoint_urls(state, target_id)?;
+    let (devtools_frontend_url, websocket_debugger_url) = target_endpoint_urls(state, target_id);
     Some(json!({
         "description": "",
         "devtoolsFrontendUrl": devtools_frontend_url,
@@ -217,15 +189,12 @@ async fn ensure_default_target_is_published(state: &AppState) -> Result<(), Stri
         .map_err(|error| error.to_string())
 }
 
-fn target_endpoint_urls(state: &AppState, target_id: &str) -> Option<(String, String)> {
-    let websocket_prefix = state.page_ws_url.strip_suffix(DEFAULT_CDP_PAGE_TARGET_ID)?;
-    let frontend_prefix = state
-        .devtools_frontend_url
-        .strip_suffix(DEFAULT_CDP_PAGE_TARGET_ID)?;
-    Some((
-        format!("{frontend_prefix}{target_id}"),
-        format!("{websocket_prefix}{target_id}"),
-    ))
+fn target_endpoint_urls(state: &AppState, target_id: &str) -> (String, String) {
+    let addr = state.addr;
+    (
+        format!("/devtools/inspector.html?ws={addr}/devtools/page/{target_id}"),
+        format!("ws://{addr}/devtools/page/{target_id}"),
+    )
 }
 
 fn requested_target_url(uri: &Uri) -> String {
@@ -258,24 +227,19 @@ fn requests_tab_targets(uri: &Uri) -> bool {
         .is_some_and(|query| query.split('&').any(|component| component == "for_tab"))
 }
 
-fn is_default_target_id(target_id: &str) -> bool {
-    matches!(
-        target_id,
-        DEFAULT_CDP_PAGE_TARGET_ID | DEFAULT_CDP_TAB_TARGET_ID
-    )
-}
-
 pub(super) async fn ws_browser_upgrade_handler(
-    Path(browser_id): Path<String>,
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> Response {
-    if browser_id != DEFAULT_BROWSER_ID {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     let owner_registry = state.cdp_owner_registry;
+    let control = state.control;
     ws.on_upgrade(move |socket| {
-        run_shared_frontend_socket(socket, owner_registry, CdpFrontendSocketKind::Browser)
+        run_shared_frontend_socket(
+            socket,
+            owner_registry,
+            CdpFrontendSocketKind::Browser,
+            control,
+        )
     })
 }
 
@@ -284,25 +248,17 @@ pub(super) async fn ws_target_upgrade_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> Response {
-    if is_default_target_id(&target_id)
-        && state
-            .cdp_agent_host_directory
-            .lookup_target(&target_id)
-            .is_none()
-        && ensure_default_target_is_published(&state).await.is_err()
-    {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     let Some(route) = state.cdp_agent_host_directory.lookup_target(&target_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    target_ws_upgrade_response(ws, target_id, route.endpoint)
+    target_ws_upgrade_response(ws, target_id, route.endpoint, state.control)
 }
 
 async fn run_shared_frontend_socket(
     socket: WebSocket,
     owner_registry: SharedCdpOwnerRegistry,
     kind: CdpFrontendSocketKind,
+    control: super::BrowserInstanceControl,
 ) {
     let endpoint = match owner_registry.shared_owner() {
         Ok(endpoint) => endpoint,
@@ -311,19 +267,21 @@ async fn run_shared_frontend_socket(
             return;
         }
     };
-    run_cdp_frontend_socket(socket, endpoint, kind).await;
+    run_cdp_frontend_socket(socket, endpoint, kind, control).await;
 }
 
 fn target_ws_upgrade_response(
     ws: WebSocketUpgrade,
     target_id: String,
     endpoint: crate::cdp_frontend::CdpFrontendEndpoint,
+    control: super::BrowserInstanceControl,
 ) -> Response {
     ws.on_upgrade(move |socket| async move {
         run_cdp_frontend_socket(
             socket,
             endpoint,
             CdpFrontendSocketKind::Target { target_id },
+            control,
         )
         .await;
     })

@@ -1,4 +1,4 @@
-use super::super::{ChildBrowsingContextBootstrap, ChildBrowsingContextSnapshot, JsContextHost};
+use super::super::{ChildBrowsingContextBootstrap, ChildBrowsingContextSnapshot, PageScriptHost};
 use super::{ChildDocumentCommitResult, ChildDocumentNavigationInitiator};
 use crate::{
     document_runtime::DomHandle,
@@ -6,7 +6,7 @@ use crate::{
 };
 use url::Url;
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(in crate::native_bridge::context_host) fn commit_child_document_bootstrap_or_start_load(
         &mut self,
         scope: &mut v8::PinScope<'_, '_>,
@@ -17,6 +17,24 @@ impl JsContextHost {
     ) -> Option<ChildDocumentCommitResult> {
         if !self.child_browsing_contexts.contains_key(&handle) {
             return None;
+        }
+        if self
+            .child_browsing_contexts
+            .get(&handle)
+            .and_then(|entry| entry.navigation_entry_seed().session_history.admitted_entry)
+            .is_some_and(|entry| {
+                !self
+                    .session_histories
+                    .entry_is_current(super::super::OwnerDispatchScope::Child(handle), &entry)
+            })
+        {
+            self.clear_child_browsing_context_pending_navigation(handle);
+            if let Some(entry) = self.child_browsing_contexts.get_mut(&handle) {
+                entry.restore_navigation_entry_seed_from_committed();
+            }
+            let _ =
+                self.finish_child_frame_navigation_without_load_dispatch(handle, navigation_load);
+            return Some(ChildDocumentCommitResult::ready(None));
         }
         let creation_kind = child_document_creation_kind_for_bootstrap(&bootstrap);
         if let Some(request_url) = child_document_frame_csp_request_url(&bootstrap) {
@@ -79,8 +97,15 @@ impl JsContextHost {
                 return Some(ChildDocumentCommitResult::ready(None));
             }
             let sandbox = self.child_browsing_context_sandbox_policy_from_owner(handle);
+            let permissions_policy = self.child_browsing_context_permissions_policy_for_document(
+                handle,
+                &bootstrap,
+                sandbox,
+                &snapshot.policy_container.permissions_policy,
+            );
             {
                 let entry = self.child_browsing_contexts.get_mut(&handle)?;
+                entry.set_document_permissions_policy(permissions_policy);
                 entry.commit_child_document_after_failed_async_start(
                     bootstrap,
                     &snapshot,
@@ -122,8 +147,18 @@ impl JsContextHost {
                 self.finish_child_frame_navigation_without_load_dispatch(handle, navigation_load);
             return Some(ChildDocumentCommitResult::ready(None));
         }
+        let permissions_policy = self.child_browsing_context_permissions_policy_for_document(
+            handle,
+            &bootstrap,
+            sandbox,
+            &cached_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.policy_container.permissions_policy.clone())
+                .unwrap_or_default(),
+        );
         {
             let entry = self.child_browsing_contexts.get_mut(&handle)?;
+            entry.set_document_permissions_policy(permissions_policy);
             entry.commit_new_child_document(
                 bootstrap,
                 cached_snapshot.as_ref(),
@@ -155,7 +190,7 @@ impl JsContextHost {
             ChildDocumentCommitResult::from_install(install)
         } else {
             self.disconnect_shared_worker_clients_for_child_context(handle);
-            self.clear_child_window_document_event_state(scope, handle);
+            self.clear_child_window_event_listeners(handle);
             self.replace_child_custom_elements_registry_for_document_commit(scope, handle);
             self.clear_child_browsing_context_current_document(handle);
             ChildDocumentCommitResult::ready(None)
@@ -191,7 +226,7 @@ impl JsContextHost {
         self.clear_child_browsing_context_pending_navigation(handle);
         if let Some(entry) = self.child_browsing_contexts.get_mut(&handle) {
             entry.clear_pending_document_load();
-            entry.clear_pending_top_level_history_length_increment();
+
             entry.restore_navigation_entry_seed_from_committed();
         }
     }

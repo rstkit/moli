@@ -11,19 +11,11 @@ use crate::context_bootstrap::stream_adapter::{
     new_lazy_readable_stream_object, new_writable_stream_object, readable_stream_queue_total_size,
 };
 use crate::util::{get_private_value, set_private_value};
+use crate::web_api_interfaces;
 use moli_webapi_declare::WebApiObject;
 
-#[derive(Default, WebApiObject)]
-#[webapi(interface = "Object")]
-struct WebSocketStreamPromiseResolverRecordDeclaration {
-    #[webapi(slot = WEBSOCKET_STREAM_PROMISE_RESOLVE_SLOT, init = "undefined")]
-    resolve: (),
-    #[webapi(slot = WEBSOCKET_STREAM_PROMISE_REJECT_SLOT, init = "undefined")]
-    reject: (),
-}
-
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebSocketStreamOpenInfoDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     readable: v8::Local<'scope, v8::Object>,
@@ -36,7 +28,7 @@ struct WebSocketStreamOpenInfoDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebSocketStreamWritableSinkDeclaration<'scope> {
     #[webapi(slot = WEBSOCKET_ID_SLOT)]
     socket_id: f64,
@@ -53,7 +45,7 @@ struct WebSocketStreamWritableSinkDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebSocketStreamReadableSourceDeclaration {
     #[webapi(slot = WEBSOCKET_ID_SLOT)]
     socket_id: f64,
@@ -64,73 +56,17 @@ struct WebSocketStreamReadableSourceDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct WebSocketStreamPendingWriteDeclaration<'scope> {
-    #[webapi(slot = WEBSOCKET_STREAM_PROMISE_SLOT)]
-    promise: v8::Local<'scope, v8::Promise>,
-    #[webapi(slot = WEBSOCKET_STREAM_PROMISE_RESOLVE_SLOT)]
-    resolve: v8::Local<'scope, v8::Function>,
-    #[webapi(slot = WEBSOCKET_STREAM_PROMISE_REJECT_SLOT)]
-    reject: v8::Local<'scope, v8::Function>,
+    #[webapi(slot = WEBSOCKET_STREAM_PROMISE_RESOLVER_SLOT)]
+    resolver: v8::Local<'scope, v8::PromiseResolver>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct WebSocketStreamCloseInfoDeclaration<'scope> {
     close_code: f64,
     reason: Option<v8::Local<'scope, v8::String>>,
-}
-
-pub(super) fn new_websocket_stream_promise<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> Option<(
-    v8::Local<'s, v8::Promise>,
-    v8::Local<'s, v8::Function>,
-    v8::Local<'s, v8::Function>,
-)> {
-    let entry = WebSocketStreamPromiseResolverRecordDeclaration::default()
-        .bind(scope)
-        .expect("WebSocketStream promise resolver record declaration should bind");
-    let executor = v8::Function::builder(websocket_stream_promise_executor_callback)
-        .data(entry.into())
-        .length(2)
-        .build(scope)?;
-    let global = scope.get_current_context().global(scope);
-    let promise_constructor = global
-        .get(scope, v8str(scope, "Promise").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
-    let promise = promise_constructor
-        .new_instance(scope, &[executor.into()])
-        .and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok())?;
-    let resolve = get_private_value(scope, entry, WEBSOCKET_STREAM_PROMISE_RESOLVE_SLOT)
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
-    let reject = get_private_value(scope, entry, WEBSOCKET_STREAM_PROMISE_REJECT_SLOT)
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
-    Some((promise, resolve, reject))
-}
-
-fn websocket_stream_promise_executor_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Ok(entry) = v8::Local::<v8::Object>::try_from(args.data()) else {
-        rv.set_undefined();
-        return;
-    };
-    set_private_value(
-        scope,
-        entry,
-        WEBSOCKET_STREAM_PROMISE_RESOLVE_SLOT,
-        args.get(0),
-    );
-    set_private_value(
-        scope,
-        entry,
-        WEBSOCKET_STREAM_PROMISE_REJECT_SLOT,
-        args.get(1),
-    );
-    rv.set_undefined();
 }
 
 pub(super) fn dispatch_websocket_stream_event<'s>(
@@ -170,10 +106,10 @@ pub(super) fn dispatch_websocket_stream_event<'s>(
             )
             .bind(scope)
             .expect("WebSocketStream open info declaration should bind");
-            call_websocket_stream_function_slot(
+            resolve_websocket_stream_promise(
                 scope,
                 stream,
-                WEBSOCKET_STREAM_OPENED_RESOLVE_SLOT,
+                WEBSOCKET_STREAM_OPENED_RESOLVER_SLOT,
                 open_info.into(),
             );
             WebSocketDispatchResult::Dispatched
@@ -208,14 +144,13 @@ pub(super) fn dispatch_websocket_stream_event<'s>(
             let _ = enqueue_chunk(scope, readable, value.into());
             WebSocketDispatchResult::Dispatched
         }
-        WebSocketEvent::FrameSent { .. } => {
+        WebSocketEvent::SendCompleted { .. } => {
             if resolve_next_websocket_stream_pending_write(scope, stream) {
                 WebSocketDispatchResult::Dispatched
             } else {
                 WebSocketDispatchResult::Noop
             }
         }
-        WebSocketEvent::BufferedAmountConsumed { .. } => WebSocketDispatchResult::Noop,
         WebSocketEvent::Error { message, .. } => {
             let error = new_websocket_error_object(scope, message, Some(1006), "");
             set_websocket_value_slot(scope, stream, WEBSOCKET_STREAM_ERROR_SLOT, error);
@@ -230,16 +165,16 @@ pub(super) fn dispatch_websocket_stream_event<'s>(
                 reject_all_websocket_stream_pending_writes(scope, writable, error);
                 error_writable_stream_with_value(scope, writable, error);
             }
-            call_websocket_stream_function_slot(
+            reject_websocket_stream_promise(
                 scope,
                 stream,
-                WEBSOCKET_STREAM_OPENED_REJECT_SLOT,
+                WEBSOCKET_STREAM_OPENED_RESOLVER_SLOT,
                 error,
             );
-            call_websocket_stream_function_slot(
+            reject_websocket_stream_promise(
                 scope,
                 stream,
-                WEBSOCKET_STREAM_CLOSED_REJECT_SLOT,
+                WEBSOCKET_STREAM_CLOSED_RESOLVER_SLOT,
                 error,
             );
             WebSocketDispatchResult::Dispatched
@@ -252,7 +187,7 @@ pub(super) fn dispatch_websocket_stream_event<'s>(
             ..
         } => {
             if *was_clean {
-                let mut had_pending_write = false;
+                let mut had_interrupted_write = false;
                 if let Some(readable) =
                     websocket_object_slot(scope, stream, WEBSOCKET_STREAM_READABLE_SLOT)
                 {
@@ -261,8 +196,7 @@ pub(super) fn dispatch_websocket_stream_event<'s>(
                 if let Some(writable) =
                     websocket_object_slot(scope, stream, WEBSOCKET_STREAM_WRITABLE_SLOT)
                 {
-                    had_pending_write =
-                        websocket_stream_pending_write_count_for_writable(scope, writable) > 0;
+                    had_interrupted_write = websocket_stream_has_interrupted_write(scope, writable);
                     let error = websocket_dom_exception_value(
                         scope,
                         "InvalidStateError",
@@ -272,23 +206,23 @@ pub(super) fn dispatch_websocket_stream_event<'s>(
                     reject_all_websocket_stream_pending_writes(scope, writable, error);
                     error_writable_stream_with_value(scope, writable, error);
                 }
-                if had_pending_write {
+                if had_interrupted_write {
                     // WPT treats remote close that interrupts a queued write as a
                     // WebSocketStream close error, while the interrupted write and
                     // later writes reject with InvalidStateError from the writable.
                     let error = new_websocket_error_object(scope, "", Some(*code), reason);
-                    call_websocket_stream_function_slot(
+                    reject_websocket_stream_promise(
                         scope,
                         stream,
-                        WEBSOCKET_STREAM_CLOSED_REJECT_SLOT,
+                        WEBSOCKET_STREAM_CLOSED_RESOLVER_SLOT,
                         error,
                     );
                 } else {
                     let close_info = new_websocket_stream_close_info(scope, *code, reason);
-                    call_websocket_stream_function_slot(
+                    resolve_websocket_stream_promise(
                         scope,
                         stream,
-                        WEBSOCKET_STREAM_CLOSED_RESOLVE_SLOT,
+                        WEBSOCKET_STREAM_CLOSED_RESOLVER_SLOT,
                         close_info.into(),
                     );
                 }
@@ -311,10 +245,10 @@ pub(super) fn dispatch_websocket_stream_event<'s>(
                     reject_all_websocket_stream_pending_writes(scope, writable, error);
                     error_writable_stream_with_value(scope, writable, error);
                 }
-                call_websocket_stream_function_slot(
+                reject_websocket_stream_promise(
                     scope,
                     stream,
-                    WEBSOCKET_STREAM_CLOSED_REJECT_SLOT,
+                    WEBSOCKET_STREAM_CLOSED_RESOLVER_SLOT,
                     error,
                 );
             }
@@ -359,8 +293,8 @@ pub(super) fn reject_websocket_stream_abort<'s>(
         20,
         "The WebSocketStream connection was aborted.",
     );
-    call_websocket_stream_function_slot(scope, stream, WEBSOCKET_STREAM_OPENED_REJECT_SLOT, error);
-    call_websocket_stream_function_slot(scope, stream, WEBSOCKET_STREAM_CLOSED_REJECT_SLOT, error);
+    reject_websocket_stream_promise(scope, stream, WEBSOCKET_STREAM_OPENED_RESOLVER_SLOT, error);
+    reject_websocket_stream_promise(scope, stream, WEBSOCKET_STREAM_CLOSED_RESOLVER_SLOT, error);
 }
 
 fn new_websocket_stream_writable_sink<'s>(
@@ -404,30 +338,37 @@ fn websocket_stream_sink_write_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some((promise, resolve, reject)) = new_websocket_stream_promise(scope) else {
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
         rv.set_undefined();
         return;
     };
+    let promise = resolver.get_promise(scope);
     let payload = match websocket_stream_send_payload_from_value(scope, args.get(0)) {
         Ok(payload) => payload,
         Err(error) => {
-            call_websocket_stream_function(scope, reject, error);
+            let _ = resolver.reject(scope, error);
             rv.set(promise.into());
             return;
         }
     };
-    let mut sent = false;
-    if let Some(socket_id) = websocket_id(scope, args.this())
+    let admission = if let Some(socket_id) = websocket_id(scope, args.this())
         && let Some(host_ptr) = context_host_ptr_from_global_bridge(scope)
     {
-        let host = unsafe { &mut *host_ptr };
-        sent = match payload {
+        let host = unsafe { &*host_ptr };
+        match payload {
             WebSocketSendPayload::Text(text) => host.send_websocket_text(socket_id, text),
             WebSocketSendPayload::Binary(bytes) => host.send_websocket_binary(socket_id, bytes),
-        };
-    }
-    if sent {
-        enqueue_websocket_stream_pending_write(scope, args.this(), promise, resolve, reject);
+            WebSocketSendPayload::Blob(data) => host.send_websocket_blob(socket_id, data),
+        }
+    } else {
+        None
+    };
+    if admission.is_some() {
+        // The transport may already have queued its terminal event when command
+        // admission fails. Keep the write pending until that owner's Close or
+        // Error task settles it together with the stream, instead of exposing
+        // the transport's state before the realm has observed closure.
+        enqueue_websocket_stream_pending_write(scope, args.this(), resolver);
     } else {
         let error = websocket_dom_exception_value(
             scope,
@@ -435,7 +376,7 @@ fn websocket_stream_sink_write_callback<'s>(
             11,
             "The WebSocketStream writable is closed.",
         );
-        call_websocket_stream_function(scope, reject, error);
+        let _ = resolver.reject(scope, error);
     }
     rv.set(promise.into());
 }
@@ -443,14 +384,12 @@ fn websocket_stream_sink_write_callback<'s>(
 fn enqueue_websocket_stream_pending_write<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     sink: v8::Local<'s, v8::Object>,
-    promise: v8::Local<'s, v8::Promise>,
-    resolve: v8::Local<'s, v8::Function>,
-    reject: v8::Local<'s, v8::Function>,
+    resolver: v8::Local<'s, v8::PromiseResolver>,
 ) {
     let Some(pending) = websocket_stream_pending_writes(scope, sink) else {
         return;
     };
-    let entry = WebSocketStreamPendingWriteDeclaration::new(promise, resolve, reject)
+    let entry = WebSocketStreamPendingWriteDeclaration::new(resolver)
         .bind(scope)
         .expect("WebSocketStream pending write declaration should bind");
     let _ = pending.set_index(scope, pending.length(), entry.into());
@@ -473,10 +412,10 @@ fn resolve_next_websocket_stream_pending_write<'s>(
         return false;
     };
     replace_websocket_stream_pending_writes_from_index(scope, sink, pending, 1);
-    if let Some(resolve) = get_private_value(scope, entry, WEBSOCKET_STREAM_PROMISE_RESOLVE_SLOT)
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+    if let Some(resolver) =
+        websocket_stream_resolver(scope, entry, WEBSOCKET_STREAM_PROMISE_RESOLVER_SLOT)
     {
-        call_websocket_stream_function(scope, resolve, v8::undefined(scope).into());
+        let _ = resolver.resolve(scope, v8::undefined(scope).into());
         return true;
     }
     false
@@ -500,10 +439,10 @@ fn reject_all_websocket_stream_pending_writes<'s>(
         else {
             continue;
         };
-        if let Some(reject) = get_private_value(scope, entry, WEBSOCKET_STREAM_PROMISE_REJECT_SLOT)
-            .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+        if let Some(resolver) =
+            websocket_stream_resolver(scope, entry, WEBSOCKET_STREAM_PROMISE_RESOLVER_SLOT)
         {
-            call_websocket_stream_function(scope, reject, reason);
+            let _ = resolver.reject(scope, reason);
         }
     }
     set_private_value(
@@ -524,14 +463,14 @@ fn websocket_stream_pending_writes_for_stream<'s>(
     Some((sink, pending))
 }
 
-fn websocket_stream_pending_write_count_for_writable<'s>(
+fn websocket_stream_has_interrupted_write<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     writable: v8::Local<'s, v8::Object>,
-) -> u32 {
-    stream_slot_object(scope, writable, WRITABLE_STREAM_SINK_SLOT)
-        .and_then(|sink| websocket_stream_pending_writes(scope, sink))
-        .map(|pending| pending.length())
-        .unwrap_or(0)
+) -> bool {
+    let Some(sink) = stream_slot_object(scope, writable, WRITABLE_STREAM_SINK_SLOT) else {
+        return false;
+    };
+    websocket_stream_pending_writes(scope, sink).is_some_and(|pending| pending.length() > 0)
 }
 
 fn websocket_stream_pending_writes<'s>(
@@ -594,14 +533,11 @@ fn websocket_stream_sink_close_promise<'s>(
     sink: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let promise = get_private_value(scope, sink, WEBSOCKET_STREAM_SINK_CLOSED_PROMISE_SLOT)
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
-    let then = promise
-        .get(scope, v8str(scope, "then").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
+        .and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok())?;
     let on_fulfilled = v8::Function::builder(websocket_stream_return_undefined_callback)
         .length(0)
         .build(scope)?;
-    then.call(scope, promise.into(), &[on_fulfilled.into()])
+    promise.then(scope, on_fulfilled).map(Into::into)
 }
 
 fn websocket_stream_return_undefined_callback<'s>(
@@ -640,30 +576,41 @@ pub(super) fn is_websocket_stream_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
 ) -> bool {
-    websocket_value_slot(scope, object, WEBSOCKET_STREAM_URL_SLOT).is_some()
+    web_api_interfaces::WebSocketStream::is_instance(scope, object)
 }
 
-fn call_websocket_stream_function_slot<'s>(
+fn resolve_websocket_stream_promise<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     stream: v8::Local<'s, v8::Object>,
     slot_name: &'static str,
     value: v8::Local<'s, v8::Value>,
 ) {
-    let Some(function) = websocket_value_slot(scope, stream, slot_name)
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
-    else {
-        return;
-    };
-    call_websocket_stream_function(scope, function, value);
+    if let Some(resolver) = websocket_stream_resolver(scope, stream, slot_name) {
+        let _ = resolver.resolve(scope, value);
+    }
 }
 
-fn call_websocket_stream_function<'s>(
+fn reject_websocket_stream_promise<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    function: v8::Local<'s, v8::Function>,
+    stream: v8::Local<'s, v8::Object>,
+    slot_name: &'static str,
     value: v8::Local<'s, v8::Value>,
 ) {
-    let undefined = v8::undefined(scope);
-    let _ = function.call(scope, undefined.into(), &[value]);
+    if let Some(resolver) = websocket_stream_resolver(scope, stream, slot_name) {
+        let _ = resolver.reject(scope, value);
+    }
+}
+
+fn websocket_stream_resolver<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<'s, v8::Object>,
+    slot_name: &'static str,
+) -> Option<v8::Local<'s, v8::PromiseResolver>> {
+    let object = get_private_value(scope, target, slot_name)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())?;
+    // These private slots are populated only with PromiseResolver::new results
+    // by the stream constructor and native pending-write declarations.
+    Some(unsafe { v8::Local::<v8::PromiseResolver>::cast_unchecked(object) })
 }
 
 fn new_websocket_stream_close_info<'s>(

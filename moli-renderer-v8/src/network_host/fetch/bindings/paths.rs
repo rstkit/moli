@@ -1,31 +1,41 @@
 use super::super::*;
 use super::request::PreparedWindowFetchRequest;
 use moli_fetch::{
-    BrowserRequestMetadata, FetchCancelHandle, RequestCacheMode, ScriptFetchRequestMetadata,
+    BrowserRequestMetadata, FetchCancelHandle, ScriptFetchRequestMetadata,
     should_request_be_blocked_due_to_bad_port,
 };
 
 pub(super) fn record_intercepted_fetch(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     resolver: v8::Local<'_, v8::PromiseResolver>,
     prepared: PreparedWindowFetchRequest,
-) {
+) -> Result<u64, String> {
+    let cache_mode = prepared.cache_mode();
+    let request = prepared
+        .resource_loader
+        .request_client()
+        .bind_browser_site_context(native_window_fetch_request(&prepared)?);
     let request_cookie_report = observe_subresource_request_cookie_report(
         prepared.resource_loader.request_client(),
         &prepared.document_url,
+        &prepared.request_origin,
         &prepared.resolved_url,
         &prepared.method,
         prepared.credentials_mode,
     );
-    host.record_pending_subresource_fetch(
+    Ok(host.record_pending_subresource_fetch(
         prepared.fetch_context,
         v8::Global::new(scope, resolver),
+        prepared.resource_timing,
         prepared.keepalive,
         prepared.connect_policy,
         prepared.csp_report_context,
         prepared.credentials_mode,
         prepared.request_mode,
+        cache_mode,
+        request,
+        prepared.request_origin.clone(),
         prepared.network_partition_key,
         prepared.policy_context,
         PendingSubresourceFetchInfo {
@@ -42,11 +52,11 @@ pub(super) fn record_intercepted_fetch(
             resource_type: SubresourceResourceType::Fetch,
             request_cookie_report,
         },
-    );
+    ))
 }
 
 pub(super) fn reject_offline_fetch(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     prepared: PreparedWindowFetchRequest,
 ) -> String {
     let message = "Network emulation offline".to_owned();
@@ -64,7 +74,7 @@ pub(super) fn reject_offline_fetch(
 }
 
 pub(super) fn reject_blocked_fetch(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     prepared: PreparedWindowFetchRequest,
 ) -> String {
     let message = BLOCKED_BY_CLIENT_ERROR_TEXT.to_owned();
@@ -81,8 +91,8 @@ pub(super) fn reject_blocked_fetch(
     message
 }
 
-pub(super) fn reject_csp_fetch(
-    host: &mut JsContextHost,
+pub(super) fn reject_policy_blocked_fetch(
+    host: &mut PageScriptHost,
     prepared: PreparedWindowFetchRequest,
     message: String,
 ) -> String {
@@ -99,26 +109,12 @@ pub(super) fn reject_csp_fetch(
     message
 }
 
-pub(super) fn reject_url_policy_fetch(
-    host: &mut JsContextHost,
-    prepared: PreparedWindowFetchRequest,
-    message: String,
-) -> String {
-    host.record_subresource_network(SubresourceNetworkRecord::failure(
-        prepared.frame_id,
-        prepared.document_url,
-        prepared.resolved_url,
-        prepared.method,
-        prepared.request_headers,
-        request_body_text(&prepared.body),
-        SubresourceResourceType::Fetch,
-        message.clone(),
-    ));
-    message
-}
+pub(super) use self::reject_policy_blocked_fetch as reject_csp_fetch;
+
+pub(super) use self::reject_policy_blocked_fetch as reject_url_policy_fetch;
 
 pub(super) fn reject_bad_port_fetch(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     prepared: PreparedWindowFetchRequest,
 ) -> String {
     debug_assert!(should_request_be_blocked_due_to_bad_port(
@@ -138,15 +134,21 @@ pub(super) fn reject_bad_port_fetch(
     message
 }
 
+pub(super) fn local_fetch_error_text(error: &LocalUrlError) -> String {
+    match error {
+        LocalUrlError::BlobUnavailable { .. } => FILE_NOT_FOUND_ERROR_TEXT.to_owned(),
+        _ => error.to_string(),
+    }
+}
+
 pub(super) fn resolve_local_fetch(
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     prepared: &PreparedWindowFetchRequest,
-) -> Result<Option<(url::Url, Response)>, String> {
-    let Some(response) = local_url_response(&prepared.resolved_url) else {
-        if prepared.resolved_url.scheme() != "blob" {
-            return Ok(None);
-        }
-        let message = FILE_NOT_FOUND_ERROR_TEXT.to_owned();
+) -> Result<Option<Response>, LocalUrlError> {
+    let Some(result) = local_url_response_result(&prepared.resolved_url, &prepared.method) else {
+        return Ok(None);
+    };
+    let response = result.inspect_err(|error| {
         host.record_subresource_network(SubresourceNetworkRecord::failure(
             prepared.frame_id.clone(),
             prepared.document_url.clone(),
@@ -155,11 +157,9 @@ pub(super) fn resolve_local_fetch(
             prepared.request_headers.clone(),
             request_body_text(&prepared.body),
             SubresourceResourceType::Fetch,
-            message.clone(),
+            local_fetch_error_text(error),
         ));
-        return Err(message);
-    };
-    let document_url = prepared.document_url.clone();
+    })?;
     host.record_subresource_network(
         SubresourceNetworkRecord::success_with_body(
             prepared.frame_id.clone(),
@@ -185,71 +185,58 @@ pub(super) fn resolve_local_fetch(
         .with_from_cache(response.from_cache)
         .with_negotiated_http_version(response.negotiated_http_version),
     );
-    Ok(Some((document_url, response)))
+    Ok(Some(response))
 }
 
 pub(super) fn spawn_network_fetch(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     resolver: v8::Local<'_, v8::PromiseResolver>,
     prepared: PreparedWindowFetchRequest,
 ) -> Result<u64, String> {
+    let cache_mode = prepared.cache_mode();
     let loader = prepared.resource_loader.request_client().clone();
-    let mut request = Request::new_bytes(
-        &prepared.method,
-        prepared.resolved_url.as_str(),
-        prepared.body.clone(),
-        prepared.request_headers.clone(),
-    )
-    .map_err(|error| error.to_string())?
-    .with_initiator_url(&prepared.document_url)
-    .with_request_mode(prepared.request_mode)
-    .with_credentials_mode(prepared.credentials_mode)
-    .with_network_partition_key(prepared.network_partition_key.clone())
-    .with_redirect_mode(prepared.redirect_mode)
-    .with_cache_mode(window_fetch_cache_mode(&prepared.cache))
-    .with_fetch_priority_hint(prepared.priority);
-    if prepared.referrer.is_empty() {
-        request = request.without_inferred_referrer();
-    }
-    if let Some(metadata) = window_fetch_script_metadata(&prepared) {
-        request = request.with_script_fetch_metadata(metadata);
-    }
-    request = request
-        .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
-        .with_subframe_context(prepared.frame_id.is_some());
+    let request = native_window_fetch_request(&prepared)?;
 
     let request_cookie_report = observe_subresource_request_cookie_report(
         prepared.resource_loader.request_client(),
         &prepared.document_url,
+        &prepared.request_origin,
         &prepared.resolved_url,
         &prepared.method,
         prepared.credentials_mode,
     );
     let network_context = AsyncSubresourceNetworkContext {
         frame_id: prepared.frame_id.clone(),
+        request_origin: prepared.request_origin.clone(),
         document_url: prepared.document_url.clone(),
         resource_type: SubresourceResourceType::Fetch,
         policy_context: prepared.policy_context,
     };
     let cancel_handle = FetchCancelHandle::new();
-    let requires_preflight = prepared.request_mode != moli_fetch::RequestMode::NoCors
+    let requires_preflight = prepared.request_mode == moli_fetch::RequestMode::Cors
         && crate::network_host::cors_preflight_request_headers(
-            &prepared.document_url,
+            !prepared
+                .request_origin
+                .same_origin(&(&prepared.resolved_url).into()),
             &prepared.resolved_url,
             &prepared.method,
             &prepared.cors_preflight_request_headers,
+            false,
         )
         .is_some();
     let internal_id = host.record_async_subresource_fetch(
         prepared.fetch_context,
         v8::Global::new(scope, resolver),
+        prepared.resource_timing,
         prepared.keepalive,
         prepared.connect_policy,
         prepared.csp_report_context,
         Some(cancel_handle.clone()),
         prepared.credentials_mode,
         prepared.request_mode,
+        cache_mode,
+        prepared.request_origin.clone(),
         prepared.network_partition_key.clone(),
         prepared.policy_context,
         PendingSubresourceFetchInfo {
@@ -285,12 +272,32 @@ pub(super) fn spawn_network_fetch(
     Ok(internal_id)
 }
 
-fn window_fetch_cache_mode(cache: &str) -> RequestCacheMode {
-    match cache {
-        "no-store" => RequestCacheMode::NoStore,
-        "no-cache" | "reload" => RequestCacheMode::Validate,
-        _ => RequestCacheMode::Default,
+pub(super) fn native_window_fetch_request(
+    prepared: &PreparedWindowFetchRequest,
+) -> Result<Request, String> {
+    let mut request = Request::new_browser(
+        &prepared.method,
+        prepared.resolved_url.clone(),
+        prepared.body.clone(),
+        prepared.request_headers.clone(),
+        prepared.request_origin.clone(),
+    )
+    .with_initiator_url(&prepared.document_url)
+    .with_request_mode(prepared.request_mode)
+    .with_credentials_mode(prepared.credentials_mode)
+    .with_network_partition_key(prepared.network_partition_key.clone())
+    .with_redirect_mode(prepared.redirect_mode)
+    .with_cache_mode(prepared.cache_mode())
+    .with_fetch_priority_hint(prepared.priority)
+    .with_fetch_referrer(&prepared.referrer)
+    .map_err(|error| error.to_string())?;
+    if let Some(metadata) = window_fetch_script_metadata(prepared) {
+        request = request.with_script_fetch_metadata(metadata);
     }
+    request = request
+        .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
+        .with_subframe_context(prepared.frame_id.is_some());
+    Ok(request)
 }
 
 fn window_fetch_script_metadata(
@@ -313,7 +320,7 @@ fn window_fetch_script_metadata(
     })
 }
 
-fn request_body_text(body: &Option<Vec<u8>>) -> Option<String> {
+fn request_body_text(body: &Option<bytes::Bytes>) -> Option<String> {
     body.as_ref()
         .map(|body| String::from_utf8_lossy(body).into_owned())
 }

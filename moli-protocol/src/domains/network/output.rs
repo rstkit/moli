@@ -5,16 +5,21 @@ use moli_core::page::{
 use serde_json::Value;
 use url::Url;
 
+use crate::automation::DevToolsNetworkInterceptId;
 use crate::conn::PendingSubresourceFetchRequest;
-use crate::devtools_runtime::DevToolsNetworkInterceptId;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TargetSubresourceFetchPauseOutput {
     network_output: TargetSubresourceFetchPauseNetworkOutput,
-    fetch_event_session_id: Option<String>,
-    fetch_request_id: String,
-    pending_fetch_request: PendingSubresourceFetchRequest,
-    fetch_payload: Value,
+    fetch: Option<TargetSubresourceFetchPause>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TargetSubresourceFetchPause {
+    pub(crate) session_id: Option<String>,
+    pub(crate) request_id: String,
+    pub(crate) pending: PendingSubresourceFetchRequest,
+    pub(crate) payload: Value,
 }
 
 impl TargetSubresourceFetchPauseOutput {
@@ -27,10 +32,19 @@ impl TargetSubresourceFetchPauseOutput {
     ) -> Self {
         Self {
             network_output,
-            fetch_event_session_id,
-            fetch_request_id,
-            pending_fetch_request,
-            fetch_payload,
+            fetch: Some(TargetSubresourceFetchPause {
+                session_id: fetch_event_session_id,
+                request_id: fetch_request_id,
+                pending: pending_fetch_request,
+                payload: fetch_payload,
+            }),
+        }
+    }
+
+    pub(crate) fn network_only(network_output: TargetSubresourceFetchPauseNetworkOutput) -> Self {
+        Self {
+            network_output,
+            fetch: None,
         }
     }
 
@@ -38,20 +52,8 @@ impl TargetSubresourceFetchPauseOutput {
         &self.network_output
     }
 
-    pub(crate) fn into_fetch_event_parts(
-        self,
-    ) -> (
-        Option<String>,
-        String,
-        PendingSubresourceFetchRequest,
-        Value,
-    ) {
-        (
-            self.fetch_event_session_id,
-            self.fetch_request_id,
-            self.pending_fetch_request,
-            self.fetch_payload,
-        )
+    pub(crate) fn into_fetch_event_parts(self) -> Option<TargetSubresourceFetchPause> {
+        self.fetch
     }
 }
 
@@ -67,10 +69,13 @@ pub(crate) struct TargetSubresourceFetchPauseNetworkOutput {
     method: String,
     request_headers: Vec<(String, String)>,
     request_body: Option<String>,
+    request_body_bytes: Option<bytes::Bytes>,
     resource_type: SubresourceResourceType,
     request_cookie_report: Option<StoredCookieQueryReport>,
     blocked_intercepts: Vec<DevToolsNetworkInterceptId>,
     fetch_request_id: Option<String>,
+    child_document: Option<moli_core::page::ChildDocumentFetchRequest>,
+    redirect: Option<moli_page_types::NavigationRedirect>,
 }
 
 impl TargetSubresourceFetchPauseNetworkOutput {
@@ -91,13 +96,44 @@ impl TargetSubresourceFetchPauseNetworkOutput {
             document_url,
             request_url: info.url.clone(),
             method: info.method.clone(),
-            request_headers: info.request_headers.clone(),
+            request_headers: info.request_headers.to_byte_strings(),
             request_body: info.request_body.clone(),
+            request_body_bytes: info.request_body_bytes.clone(),
             resource_type: info.resource_type,
             request_cookie_report: info.request_cookie_report.clone(),
             blocked_intercepts: Vec::new(),
             fetch_request_id: None,
+            child_document: None,
+            redirect: None,
         }
+    }
+
+    pub(crate) fn with_redirect(
+        mut self,
+        redirect: Option<moli_page_types::NavigationRedirect>,
+    ) -> Self {
+        self.redirect = redirect;
+        self
+    }
+
+    pub(crate) fn redirect(&self) -> Option<&moli_page_types::NavigationRedirect> {
+        self.redirect.as_ref().or_else(|| {
+            self.child_document
+                .as_ref()
+                .and_then(|document| document.redirect.as_ref())
+        })
+    }
+
+    pub(crate) fn with_child_document(
+        mut self,
+        child_document: Option<moli_core::page::ChildDocumentFetchRequest>,
+    ) -> Self {
+        self.child_document = child_document;
+        self
+    }
+
+    pub(crate) fn child_document(&self) -> Option<&moli_core::page::ChildDocumentFetchRequest> {
+        self.child_document.as_ref()
     }
 
     pub(crate) fn with_blocked_intercepts(
@@ -115,6 +151,10 @@ impl TargetSubresourceFetchPauseNetworkOutput {
 
     pub(crate) fn network_request_id(&self) -> &str {
         &self.network_request_id
+    }
+
+    pub(crate) fn request_handle(&self) -> Option<SubresourceNetworkRequestHandle> {
+        self.request_handle
     }
 
     pub(crate) fn frame_id(&self) -> &str {
@@ -147,6 +187,10 @@ impl TargetSubresourceFetchPauseNetworkOutput {
 
     pub(crate) fn request_body(&self) -> Option<&str> {
         self.request_body.as_deref()
+    }
+
+    pub(crate) fn request_body_bytes(&self) -> Option<&bytes::Bytes> {
+        self.request_body_bytes.as_ref()
     }
 
     pub(crate) fn resource_type(&self) -> SubresourceResourceType {
@@ -185,9 +229,9 @@ mod tests {
             url: Url::parse(url).expect("request URL should parse"),
             websocket_socket_id: None,
             method: "POST".to_owned(),
-            request_headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+            request_headers: vec![("content-type".to_owned(), "text/plain".to_owned())].into(),
             request_body: Some("payload".to_owned()),
-            request_body_bytes: Some(b"payload".to_vec()),
+            request_body_bytes: Some(bytes::Bytes::from(b"payload".to_vec())),
             resource_type: SubresourceResourceType::Fetch,
             request_cookie_report: None,
         }
@@ -224,6 +268,11 @@ mod tests {
             &[("content-type".to_owned(), "text/plain".to_owned())]
         );
         assert_eq!(output.request_body(), Some("payload"));
+        assert_eq!(
+            output.request_body_bytes().unwrap().as_ptr(),
+            info.request_body_bytes.as_ref().unwrap().as_ptr(),
+            "the pause output must share the original upload allocation"
+        );
         assert_eq!(output.resource_type(), SubresourceResourceType::Fetch);
         assert!(output.request_cookie_report().is_none());
     }

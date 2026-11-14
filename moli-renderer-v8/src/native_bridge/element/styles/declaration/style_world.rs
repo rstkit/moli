@@ -12,7 +12,7 @@ use crate::{
     stylesheet_blocking::link_rel_includes_token,
 };
 
-use super::super::super::super::JsContextHost;
+use super::super::super::super::PageScriptHost;
 use super::observation::StyleComputationContext;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -23,7 +23,7 @@ pub(super) struct StyleObservationKey {
 
 impl StyleObservationKey {
     pub(super) fn for_document(
-        runtime: &JsContextHost,
+        runtime: &PageScriptHost,
         source_document: Option<DomHandle>,
     ) -> Self {
         Self {
@@ -45,14 +45,14 @@ impl StyleObservationKey {
 }
 
 pub(super) fn stylesheet_source_document_for_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
     runtime.dom_host().owner_document_handle(handle)
 }
 
 pub(in crate::native_bridge::element) fn style_base_url(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> url::Url {
     let document_handle = if runtime
@@ -87,7 +87,7 @@ pub(in crate::native_bridge::element) fn style_base_url(
 }
 
 pub(super) fn prepare_style_world_update(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     key: &StyleObservationKey,
     context: StyleComputationContext,
     media: StyloStyleEnvironment,
@@ -148,7 +148,7 @@ pub(super) fn prepare_style_world_update(
 }
 
 pub(super) fn stylesheet_query_fallback(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     key: &StyleObservationKey,
     context: StyleComputationContext,
     environment: StyloStyleEnvironment,
@@ -157,25 +157,28 @@ pub(super) fn stylesheet_query_fallback(
 }
 
 pub(super) fn stylo_style_environment(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     document: Option<DomHandle>,
+    environment_override: Option<StyloStyleEnvironment>,
 ) -> StyloStyleEnvironment {
     #[cfg(test)]
     runtime.note_style_observation_environment_resolution_for_test();
-    StyloStyleEnvironment::from_emulated_media(runtime.emulated_media()).with_page_color_schemes(
-        document
-            .map(|document| {
-                crate::document_color_scheme::document_page_color_schemes(
-                    runtime.dom_host(),
-                    document,
-                )
-            })
-            .unwrap_or_default(),
-    )
+    environment_override
+        .unwrap_or_else(|| StyloStyleEnvironment::from_emulated_media(runtime.emulated_media()))
+        .with_page_color_schemes(
+            document
+                .map(|document| {
+                    crate::document_color_scheme::document_page_color_schemes(
+                        runtime.dom_host(),
+                        document,
+                    )
+                })
+                .unwrap_or_default(),
+        )
 }
 
 fn complete_style_world_snapshot(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     key: &StyleObservationKey,
     context: StyleComputationContext,
     environment: StyloStyleEnvironment,
@@ -203,7 +206,10 @@ fn complete_style_world_snapshot(
     Rc::new(inputs)
 }
 
-fn quirks_mode(runtime: &JsContextHost, document: Option<DomHandle>) -> style::context::QuirksMode {
+fn quirks_mode(
+    runtime: &PageScriptHost,
+    document: Option<DomHandle>,
+) -> style::context::QuirksMode {
     document
         .and_then(|document| runtime.dom_host().node(document))
         .and_then(Node::as_document)
@@ -229,8 +235,30 @@ fn connected_shadow_roots(host: &DomHost, document: DomHandle) -> Vec<DomHandle>
     roots
 }
 
+impl PageScriptHost {
+    pub(crate) fn document_has_active_author_stylesheet_sources(
+        &self,
+        document: DomHandle,
+    ) -> bool {
+        // Keep detached-source handling aligned with the ordinary document
+        // style observation used by stylesheet resource reconciliation.
+        if !active_stylesheet_handles(self, document, false).is_empty()
+            || self.document_has_adopted_style_sheet_sources(document)
+        {
+            return true;
+        }
+
+        connected_shadow_roots(self.dom_host(), document)
+            .into_iter()
+            .any(|root| {
+                !active_stylesheet_handles(self, root, false).is_empty()
+                    || self.shadow_root_has_adopted_style_sheet_sources(root)
+            })
+    }
+}
+
 fn document_stylesheet_sources(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     source_document: Option<DomHandle>,
     context: StyleComputationContext,
 ) -> Vec<StyloStylesheetSource> {
@@ -267,7 +295,7 @@ fn document_stylesheet_sources(
 }
 
 fn shadow_stylesheet_sources(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     context: StyleComputationContext,
 ) -> Vec<StyloStylesheetSource> {
@@ -297,7 +325,7 @@ fn shadow_stylesheet_sources(
 }
 
 pub(super) fn active_stylesheet_handles(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     include_detached: bool,
 ) -> Vec<DomHandle> {
@@ -349,7 +377,7 @@ pub(super) fn active_stylesheet_handles(
 }
 
 pub(super) fn effective_raw_stylesheet_sources(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     include_detached: bool,
     viewport: StyleViewport,
@@ -361,7 +389,7 @@ pub(super) fn effective_raw_stylesheet_sources(
         .collect()
 }
 
-fn stylesheet_source(runtime: &JsContextHost, handle: DomHandle) -> StyloStylesheetSource {
+fn stylesheet_source(runtime: &PageScriptHost, handle: DomHandle) -> StyloStylesheetSource {
     let media = runtime
         .dom_host()
         .get_attribute(handle, "media")
@@ -393,7 +421,7 @@ fn stylesheet_source(runtime: &JsContextHost, handle: DomHandle) -> StyloStylesh
         .with_owner_media_text(&media)
 }
 
-fn link_stylesheet_is_enabled(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn link_stylesheet_is_enabled(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     if runtime
         .dom_host()
         .get_attribute(handle, "disabled")
@@ -418,7 +446,7 @@ fn link_stylesheet_is_enabled(runtime: &JsContextHost, handle: DomHandle) -> boo
 }
 
 fn stylesheet_is_active_in_scope(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     root: DomHandle,
     handle: DomHandle,
 ) -> bool {

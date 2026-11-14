@@ -1,4 +1,4 @@
-use super::{JsContextHost, WindowDocumentTaskTarget};
+use super::{PageScriptHost, WindowDocumentTaskTarget};
 use crate::runtime::{
     RendererJavaScriptDialogId, RendererJavaScriptDialogResult, RendererPendingJavaScriptDialog,
 };
@@ -16,16 +16,10 @@ impl PendingJavaScriptDialogRecord {
     }
 }
 
-impl JsContextHost {
-    pub(crate) fn set_javascript_dialog_handler_enabled(&mut self, enabled: bool) {
-        self.javascript_dialog_handler_enabled = enabled;
-    }
-
+impl PageScriptHost {
     pub(crate) fn javascript_dialog_handler_enabled(&self) -> bool {
-        self.javascript_dialog_handler_enabled
-            || self
-                .browser_context_runtime
-                .javascript_dialog_handler_enabled()
+        self.browser_context_runtime
+            .javascript_dialog_handler_enabled()
     }
 
     pub(crate) fn record_pending_javascript_dialog(
@@ -58,6 +52,7 @@ impl JsContextHost {
             self.record_pending_javascript_dialog(target, dialog);
             return None;
         }
+        self.publish_related_document_prefix_before_native_wait();
         let (dialog, modal) = self.javascript_dialog_runtime.begin_modal(dialog);
         if self.append_live_turn_owner_action(
             crate::runtime::RendererOwnerAction::JavaScriptDialog(dialog),

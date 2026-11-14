@@ -63,12 +63,77 @@ fn extracts_request_header_content_type_essence_for_fetch_rules() {
         request_header_content_type_essence("text/plain, text/plain"),
         None
     );
+    for input in [
+        "application/json, text/plain",
+        "text/plain, application/json",
+    ] {
+        assert_eq!(request_header_content_type_essence(input), None, "{input}");
+    }
+    for input in [
+        "text/plain;charset=utf8, extra",
+        "text/plain;charset=utf8, application/json",
+    ] {
+        assert_eq!(
+            request_header_content_type_essence(input).as_deref(),
+            Some("text/plain"),
+            "{input}"
+        );
+    }
     assert_eq!(request_header_content_type_essence("text"), None);
     assert_eq!(request_header_content_type_essence("text/"), None);
     assert_eq!(request_header_content_type_essence("te xt/plain"), None);
     assert_eq!(request_header_content_type_essence("text /plain"), None);
     assert_eq!(request_header_content_type_essence("text/ plain"), None);
     assert_eq!(request_header_content_type_essence("text / plain"), None);
+}
+
+#[test]
+fn document_classification_uses_the_extracted_content_type() {
+    let cases: &[(&[&str], Option<&str>, bool)] = &[
+        (&["", "invalid", "*/*"], None, false),
+        (&["text/plain", ""], Some("text/plain"), false),
+        (&["text/html", "text/plain"], Some("text/plain"), false),
+        (&["text/html", "*/*;charset=GBK"], Some("text/html"), false),
+        (
+            &[r#"text/html;x=""#, "text/plain"],
+            Some("text/html"),
+            false,
+        ),
+        (
+            &["application/octet-stream", "text/html", "invalid"],
+            Some("text/html"),
+            false,
+        ),
+        (
+            &["text/html", "application/octet-stream", "*/*"],
+            Some("application/octet-stream"),
+            true,
+        ),
+        (
+            &["text/html", "application/xhtml+xml", ""],
+            Some("application/xhtml+xml"),
+            false,
+        ),
+    ];
+    for (values, expected, binary) in cases {
+        for fields in [values.to_vec(), vec![&values.join(",")]] {
+            let headers: Vec<_> = fields
+                .iter()
+                .map(|value| ("cOnTeNt-TyPe".to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            assert_eq!(
+                response_document_content_type(&headers).as_deref(),
+                *expected,
+                "{fields:?}"
+            );
+            assert_eq!(response_headers_indicate_binary_document(&headers), *binary);
+            assert_eq!(response_headers_indicate_raw_document(&headers), *binary);
+
+            let mut attachment = headers;
+            attachment.push(("Content-Disposition".to_owned(), b"attachment".to_vec()));
+            assert!(response_headers_indicate_raw_document(&attachment));
+        }
+    }
 }
 
 #[test]
@@ -80,11 +145,11 @@ fn matches_document_types() {
 
 #[test]
 fn classifies_document_resource_mime_from_headers_and_url() {
-    let headers = vec![
-        ("Content-Type".to_owned(), "text/plain".to_owned()),
+    let headers: Vec<(String, Vec<u8>)> = vec![
+        ("Content-Type".to_owned(), b"text/plain".to_vec()),
         (
             "content-type".to_owned(),
-            " Application/XHTML+XML ; charset=utf-8 ".to_owned(),
+            b" Application/XHTML+XML ; charset=utf-8 ".to_vec(),
         ),
     ];
     assert_eq!(
@@ -92,7 +157,7 @@ fn classifies_document_resource_mime_from_headers_and_url() {
         Some("application/xhtml+xml")
     );
     assert_eq!(
-        response_document_content_type(&[("Content-Type".to_owned(), " ".to_owned())]),
+        response_document_content_type(&[("Content-Type".to_owned(), b" ".to_vec())]),
         None
     );
 
@@ -121,27 +186,35 @@ fn classifies_document_resource_mime_from_headers_and_url() {
 fn classifies_binary_main_document_headers() {
     assert!(response_headers_indicate_raw_document(&[(
         "Content-Type".to_owned(),
-        "application/pdf; charset=binary".to_owned(),
+        b"application/pdf; charset=binary".to_vec(),
     )]));
     assert!(response_headers_indicate_raw_document(&[(
         "Content-Type".to_owned(),
-        "image/png".to_owned(),
+        b"application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_vec(),
+    )]));
+    assert!(response_headers_indicate_raw_document(&[(
+        "Content-Type".to_owned(),
+        b"image/png".to_vec(),
     )]));
     assert!(response_headers_indicate_raw_document(&[(
         "Content-Disposition".to_owned(),
-        "attachment; filename=report.html".to_owned(),
+        b"attachment; filename=report.html".to_vec(),
+    )]));
+    assert!(response_headers_indicate_raw_document(&[(
+        "Content-Type".to_owned(),
+        b"application/wasm".to_vec(),
     )]));
     assert!(!response_headers_indicate_raw_document(&[(
         "Content-Type".to_owned(),
-        "text/html; charset=utf-8".to_owned(),
+        b"text/html; charset=utf-8".to_vec(),
     )]));
     assert!(!response_headers_indicate_raw_document(&[(
         "Content-Type".to_owned(),
-        "text/plain".to_owned(),
+        b"text/plain".to_vec(),
     )]));
     assert!(!response_headers_indicate_raw_document(&[(
         "Content-Disposition".to_owned(),
-        "inline; filename=report.pdf".to_owned(),
+        b"inline; filename=report.pdf".to_vec(),
     )]));
 }
 
@@ -168,6 +241,12 @@ fn classifies_supported_lightweight_document_mime_types() {
         "application/pdf",
         "application/zip",
         "application/wasm",
+        "application/msword",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "font/woff2",
     ] {
         assert!(
@@ -221,7 +300,7 @@ fn matches_script_and_form_content_types() {
     assert!(is_video_mime_essence("video/webm"));
     assert!(is_font_mime("font/woff2"));
     assert!(is_font_mime_essence("font/ttf"));
-    assert!(!is_font_mime("application/font-woff"));
+    assert!(is_font_mime("application/font-woff"));
     assert_eq!(
         media_mime_support("Video/MP4; codecs=\"avc1.42E01E\""),
         MediaMimeSupport::Probably
@@ -245,9 +324,12 @@ fn matches_script_and_form_content_types() {
     );
     assert_eq!(multipart_form_data_boundary("text/plain"), None);
 
-    assert!(is_json_module_mime("Application/JSON; charset=utf-8"));
-    assert!(is_json_module_mime("application/manifest+json"));
-    assert!(!is_json_module_mime("text/json"));
+    assert!(is_json_mime("Application/JSON; charset=utf-8"));
+    assert!(is_json_mime("application/manifest+json"));
+    assert!(is_json_mime("text/json"));
+    assert!(is_json_mime("Text/JSON; charset=utf-8"));
+    assert!(!is_json_mime("text/json+blah"));
+    assert!(!is_json_mime("image/json"));
 
     assert!(is_media_source_type_supported(
         "video/mp4; codecs=\"avc1.42E01E\""
@@ -282,10 +364,10 @@ fn normalizes_valid_web_api_mime_types() {
 
 #[test]
 fn reads_response_header_values_case_insensitively() {
-    let headers = vec![
-        ("Content-Type".to_owned(), "text/html".to_owned()),
-        ("content-type".to_owned(), "application/json".to_owned()),
-        ("Bad Header".to_owned(), "ignored".to_owned()),
+    let headers: Vec<(String, Vec<u8>)> = vec![
+        ("Content-Type".to_owned(), b"text/html".to_vec()),
+        ("content-type".to_owned(), b"application/json".to_vec()),
+        ("Bad Header".to_owned(), b"ignored".to_vec()),
     ];
 
     assert_eq!(
@@ -305,10 +387,150 @@ fn reads_response_header_values_case_insensitively() {
 }
 
 #[test]
+fn extracts_response_mime_essence_from_the_combined_header_list() {
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (&[], None),
+        (&[""], None),
+        (&["*/*", "not-a-mime-type"], None),
+        (&["application/json"], Some("application/json")),
+        (&["Text/CSS; charset=utf-16"], Some("text/css")),
+        (
+            &["text/plain", "application/json"],
+            Some("application/json"),
+        ),
+        (&["application/json", "text/plain"], Some("text/plain")),
+        (&["application/json", "invalid"], Some("application/json")),
+        (&["application/json", "*/*", ""], Some("application/json")),
+        (&["text/plain, application/json"], Some("application/json")),
+        (&["application/json, text/plain"], Some("text/plain")),
+        (
+            &["application/json, invalid, */*"],
+            Some("application/json"),
+        ),
+        (&["text/plain; charset=gbk, text/css"], Some("text/css")),
+        (
+            &[r#"text/plain; a=",application/json""#],
+            Some("text/plain"),
+        ),
+        (
+            &[r#"text/plain; a="x\",application/json""#],
+            Some("text/plain"),
+        ),
+        (
+            &[r#"text/plain; a="x\\", application/json"#],
+            Some("application/json"),
+        ),
+        (
+            &[r#"text/plain; a=""#, "application/json"],
+            Some("text/plain"),
+        ),
+        (&[r#"text/plain;""#, "application/json"], Some("text/plain")),
+        (&["applic(ation/vnd.api+json"], None),
+        (&["application/vnd)api+json"], None),
+        (&["text /css"], None),
+        (&["application/vnd.中文+json"], None),
+    ];
+    for (values, expected) in cases {
+        let mut headers: Vec<(String, Vec<u8>)> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                (
+                    if index % 2 == 0 {
+                        "Content-Type"
+                    } else {
+                        "cOnTeNt-TyPe"
+                    }
+                    .to_owned(),
+                    value.as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        headers.push(("X-Content-Type".to_owned(), b"application/json".to_vec()));
+        assert_eq!(
+            extract_response_mime_essence(&headers).as_deref(),
+            *expected,
+            "{values:?}"
+        );
+    }
+}
+
+#[test]
+fn extracts_response_mime_parameters_with_charset_inheritance() {
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (&[], None),
+        (&["", "invalid", "*/*"], None),
+        (&["TEXT/PLAIN;CHARSET=GBK"], Some("text/plain;charset=GBK")),
+        (&["text/plain;p=MiXeD"], Some("text/plain;p=MiXeD")),
+        (&["text/plain;p=ÿ"], Some("text/plain;p=\"ÿ\"")),
+        (&["text/plain;charset=GBK", "text/html"], Some("text/html")),
+        (
+            &["text/html;charset=GBK;a=b", "text/html;x=y"],
+            Some("text/html;x=y;charset=GBK"),
+        ),
+        (
+            &["text/html;charset=GBK;a=b, text/html;x=y"],
+            Some("text/html;x=y;charset=GBK"),
+        ),
+        (
+            &[
+                "text/html;charset=GBK",
+                "text/html;charset=UTF-8",
+                "text/html",
+            ],
+            Some("text/html;charset=GBK"),
+        ),
+        (
+            &["text/html", "text/html;charset=GBK", "text/html"],
+            Some("text/html"),
+        ),
+        (
+            &["text/html;charset=GBK", "x/x", "text/html;x=y"],
+            Some("text/html;x=y"),
+        ),
+        (
+            &["text/html;charset=GBK", "invalid", "*/*", "", "text/html"],
+            Some("text/html;charset=GBK"),
+        ),
+        (
+            &["text/html;charset=\"\"", "text/html;x=y"],
+            Some("text/html;x=y;charset=\"\""),
+        ),
+        (
+            &[r#"text/html;charset="A\"B""#, "text/html"],
+            Some(r#"text/html;charset="A\"B""#),
+        ),
+        (
+            &[r#"text/html;x="A,B";charset=GBK"#, "text/html"],
+            Some("text/html;charset=GBK"),
+        ),
+        (
+            &[r#"text/html;x="A"#, "text/plain;charset=GBK"],
+            Some(r#"text/html;x="A, text/plain;charset=GBK""#),
+        ),
+    ];
+    for (values, expected) in cases {
+        let headers = values
+            .iter()
+            .map(|value| ("cOnTeNt-TyPe".to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>();
+        let mut headers = moli_header_field::headers_from_byte_strings(&headers).unwrap();
+        headers.push(("X-Content-Type".to_owned(), b"text/ignored".to_vec()));
+        assert_eq!(
+            extract_response_mime_type(&headers)
+                .map(|mime| mime.to_string())
+                .as_deref(),
+            *expected,
+            "{values:?}"
+        );
+    }
+}
+
+#[test]
 fn derives_effective_response_mime_for_body_consumers() {
-    let headers = vec![(
+    let headers: Vec<(String, Vec<u8>)> = vec![(
         "Content-Type".to_owned(),
-        "Text/HTML; Charset=UTF-8".to_owned(),
+        b"Text/HTML; Charset=UTF-8".to_vec(),
     )];
 
     assert_eq!(
@@ -323,51 +545,44 @@ fn derives_effective_response_mime_for_body_consumers() {
         effective_response_mime_essence(&headers, Some("Application/XHTML+XML")),
         Some("application/xhtml+xml".to_owned())
     );
-    assert_eq!(
-        response_blob_mime_type(&headers),
-        "text/html; charset=utf-8"
-    );
-
-    let invalid = vec![("Content-Type".to_owned(), "text/plain\n".to_owned())];
-    assert_eq!(response_blob_mime_type(&invalid), "");
 }
 
 #[test]
 fn determines_nosniff_from_first_option_token() {
     assert!(determine_nosniff(&[(
         "X-Content-Type-Options".to_owned(),
-        "NoSniff".to_owned()
+        b"NoSniff".to_vec()
     )]));
     assert!(determine_nosniff(&[(
         "x-content-type-options".to_owned(),
-        "nosniff, other".to_owned()
+        b"nosniff, other".to_vec()
     )]));
     assert!(!determine_nosniff(&[(
         "x-content-type-options".to_owned(),
-        "other, nosniff".to_owned()
+        b"other, nosniff".to_vec()
     )]));
     assert!(!determine_nosniff(&[(
         "x-content-type-options".to_owned(),
-        "sniff".to_owned()
+        b"sniff".to_vec()
     )]));
 }
 
 #[test]
 fn nosniff_blocks_script_like_and_style_mismatches_only() {
-    let html_nosniff = vec![
-        ("content-type".to_owned(), "text/html".to_owned()),
-        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+    let html_nosniff: Vec<(String, Vec<u8>)> = vec![
+        ("content-type".to_owned(), b"text/html".to_vec()),
+        ("x-content-type-options".to_owned(), b"nosniff".to_vec()),
     ];
-    let script_nosniff = vec![
+    let script_nosniff: Vec<(String, Vec<u8>)> = vec![
         (
             "content-type".to_owned(),
-            "application/javascript".to_owned(),
+            b"application/javascript".to_vec(),
         ),
-        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+        ("x-content-type-options".to_owned(), b"nosniff".to_vec()),
     ];
-    let css_nosniff = vec![
-        ("content-type".to_owned(), "text/css".to_owned()),
-        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+    let css_nosniff: Vec<(String, Vec<u8>)> = vec![
+        ("content-type".to_owned(), b"text/css".to_vec()),
+        ("x-content-type-options".to_owned(), b"nosniff".to_vec()),
     ];
 
     assert!(should_response_be_blocked_due_to_nosniff(
@@ -394,7 +609,8 @@ fn nosniff_blocks_script_like_and_style_mismatches_only() {
 
 #[test]
 fn nosniff_blocks_missing_content_type_for_script_like_and_style() {
-    let headers = vec![("x-content-type-options".to_owned(), "nosniff".to_owned())];
+    let headers: Vec<(String, Vec<u8>)> =
+        vec![("x-content-type-options".to_owned(), b"nosniff".to_vec())];
 
     assert!(should_response_be_blocked_due_to_nosniff(
         &headers,
@@ -428,7 +644,7 @@ fn orb_blocks_opaque_response_blocklisted_mime_types() {
         assert!(
             should_opaque_response_be_blocked_by_orb(&[(
                 "Content-Type".to_owned(),
-                content_type.to_owned()
+                content_type.as_bytes().to_vec()
             )]),
             "{content_type} should be ORB-blocked"
         );
@@ -447,7 +663,7 @@ fn orb_allows_safelisted_opaque_response_mime_types() {
         assert!(
             !should_opaque_response_be_blocked_by_orb(&[(
                 "Content-Type".to_owned(),
-                content_type.to_owned()
+                content_type.as_bytes().to_vec()
             )]),
             "{content_type} should be ORB-allowed"
         );
@@ -458,11 +674,11 @@ fn orb_allows_safelisted_opaque_response_mime_types() {
 fn orb_blocks_missing_or_empty_content_type_with_nosniff() {
     assert!(should_opaque_response_be_blocked_by_orb(&[(
         "X-Content-Type-Options".to_owned(),
-        "nosniff".to_owned()
+        b"nosniff".to_vec()
     )]));
     assert!(should_opaque_response_be_blocked_by_orb(&[
-        ("Content-Type".to_owned(), String::new()),
-        ("X-Content-Type-Options".to_owned(), "nosniff".to_owned()),
+        ("Content-Type".to_owned(), Vec::new()),
+        ("X-Content-Type-Options".to_owned(), b"nosniff".to_vec()),
     ]));
     assert!(!should_opaque_response_be_blocked_by_orb(&[]));
 }
@@ -470,11 +686,11 @@ fn orb_blocks_missing_or_empty_content_type_with_nosniff() {
 #[test]
 fn orb_body_sniffing_allows_mislabeled_images() {
     assert!(!should_opaque_response_be_blocked_by_orb_with_body(
-        &[("Content-Type".to_owned(), "text/html".to_owned())],
+        &[("Content-Type".to_owned(), b"text/html".to_vec())],
         b"\x89PNG\r\n\x1A\nrest"
     ));
     assert!(should_opaque_response_be_blocked_by_orb_with_body(
-        &[("Content-Type".to_owned(), "text/html".to_owned())],
+        &[("Content-Type".to_owned(), b"text/html".to_vec())],
         b"<!doctype html><title>secret</title>"
     ));
 }
@@ -482,11 +698,11 @@ fn orb_body_sniffing_allows_mislabeled_images() {
 #[test]
 fn orb_body_sniffing_allows_mislabeled_javascript_but_blocks_json() {
     assert!(!should_opaque_response_be_blocked_by_orb_with_body(
-        &[("Content-Type".to_owned(), "application/json".to_owned())],
+        &[("Content-Type".to_owned(), b"application/json".to_vec())],
         b"\"use strict\";\nfunction fn() { return 42; }"
     ));
     assert!(should_opaque_response_be_blocked_by_orb_with_body(
-        &[("Content-Type".to_owned(), "application/json".to_owned())],
+        &[("Content-Type".to_owned(), b"application/json".to_vec())],
         br#"{"hello":"world"}"#
     ));
 }
@@ -500,9 +716,48 @@ fn orb_body_sniffing_decodes_utf16_javascript_candidates() {
     assert!(!should_opaque_response_be_blocked_by_orb_with_body(
         &[(
             "Content-Type".to_owned(),
-            "application/json; charset=utf-16".to_owned()
+            b"application/json; charset=utf-16".to_vec()
         )],
         &body
+    ));
+}
+
+#[test]
+fn orb_mime_checks_and_body_decoding_use_the_extracted_response_type() {
+    for (values, blocked) in [
+        (vec!["text/javascript", "text/json"], true),
+        (vec!["text/javascript, text/json"], true),
+        (vec!["text/json", "text/javascript"], false),
+        (vec!["text/json", "invalid", "*/*"], true),
+    ] {
+        let headers: Vec<_> = values
+            .iter()
+            .map(|value| ("Content-Type".to_owned(), value.as_bytes().to_vec()))
+            .collect();
+        assert_eq!(
+            should_opaque_response_be_blocked_by_orb(&headers),
+            blocked,
+            "{values:?}"
+        );
+        assert_eq!(
+            should_opaque_response_be_blocked_by_orb_with_body(&headers, br#"{"ok":true}"#),
+            blocked,
+            "{values:?}"
+        );
+    }
+    let headers = [
+        ("Content-Type".to_owned(), b"text/plain".to_vec()),
+        (
+            "Content-Type".to_owned(),
+            b"text/json; charset=utf-16, text/json".to_vec(),
+        ),
+    ];
+    let body: Vec<u8> = "\"use strict\";"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    assert!(!should_opaque_response_be_blocked_by_orb_with_body(
+        &headers, &body
     ));
 }
 
@@ -513,7 +768,7 @@ fn computes_response_mime_type_from_headers_and_body() {
     assert_eq!(image_without_type, "image/png");
 
     let explicit_script = computed_response_mime_type(
-        &[("Content-Type".to_owned(), "Text/JavaScript".to_owned())],
+        &[("Content-Type".to_owned(), b"Text/JavaScript".to_vec())],
         MimeSniffingContext::Script,
         b"",
     );
@@ -584,23 +839,23 @@ fn maps_known_url_path_mime_essences() {
 
 #[test]
 fn checks_script_response_mime_for_nosniff_strict_and_classic_rules() {
-    let html_nosniff = vec![
-        ("content-type".to_owned(), "text/html".to_owned()),
-        ("x-content-type-options".to_owned(), "nosniff".to_owned()),
+    let html_nosniff: Vec<(String, Vec<u8>)> = vec![
+        ("content-type".to_owned(), b"text/html".to_vec()),
+        ("x-content-type-options".to_owned(), b"nosniff".to_vec()),
     ];
     assert_eq!(
         check_script_response_mime(&html_nosniff, b"", FetchDestination::Script, false),
         Err(ScriptResponseMimeError::Nosniff)
     );
 
-    let html = vec![("content-type".to_owned(), "text/html".to_owned())];
+    let html: Vec<(String, Vec<u8>)> = vec![("content-type".to_owned(), b"text/html".to_vec())];
     assert_eq!(
         check_script_response_mime(&html, b"", FetchDestination::Script, true),
         Err(ScriptResponseMimeError::Unsupported("text/html".to_owned()))
     );
     assert!(check_script_response_mime(&html, b"", FetchDestination::Script, false).is_ok());
 
-    let image = vec![("content-type".to_owned(), "image/png".to_owned())];
+    let image: Vec<(String, Vec<u8>)> = vec![("content-type".to_owned(), b"image/png".to_vec())];
     assert_eq!(
         check_script_response_mime(&image, b"", FetchDestination::Script, false),
         Err(ScriptResponseMimeError::Unsupported("image/png".to_owned()))
@@ -608,11 +863,50 @@ fn checks_script_response_mime_for_nosniff_strict_and_classic_rules() {
 }
 
 #[test]
+fn strict_script_response_mime_never_uses_a_sniffing_default() {
+    for content_type in [None, Some(""), Some("not a mime type"), Some("text/")] {
+        let headers: Vec<_> = content_type
+            .map(|value| ("Content-Type".to_owned(), value.as_bytes().to_vec()))
+            .into_iter()
+            .collect();
+        for body in [b"".as_slice(), b"self.executed = true;"] {
+            for destination in [FetchDestination::Script, FetchDestination::Worker] {
+                assert_eq!(
+                    check_script_response_mime(&headers, body, destination, true),
+                    Err(ScriptResponseMimeError::Unsupported(String::new())),
+                    "{content_type:?}, {destination:?}"
+                );
+            }
+            // Classic document scripts retain their permissive MIME rules.
+            assert!(
+                check_script_response_mime(&headers, body, FetchDestination::Script, false).is_ok()
+            );
+        }
+    }
+}
+
+#[test]
+fn strict_script_response_mime_accepts_supplied_javascript_essences() {
+    for content_type in [
+        "Text/JavaScript; charset=utf-8",
+        "text/javascript; broken parameter",
+        "application/x-javascript",
+        "text/javascript1.5",
+    ] {
+        let headers = [("Content-Type".to_owned(), content_type.as_bytes().to_vec())];
+        assert!(
+            check_script_response_mime(&headers, b"", FetchDestination::Worker, true).is_ok(),
+            "{content_type}"
+        );
+    }
+}
+
+#[test]
 fn script_like_mime_type_block_matches_fetch_response_rule() {
-    let image = vec![("content-type".to_owned(), "image/png".to_owned())];
-    let video = vec![("content-type".to_owned(), "video/mp4".to_owned())];
-    let csv = vec![("content-type".to_owned(), "text/csv".to_owned())];
-    let html = vec![("content-type".to_owned(), "text/html".to_owned())];
+    let image: Vec<(String, Vec<u8>)> = vec![("content-type".to_owned(), b"image/png".to_vec())];
+    let video: Vec<(String, Vec<u8>)> = vec![("content-type".to_owned(), b"video/mp4".to_vec())];
+    let csv: Vec<(String, Vec<u8>)> = vec![("content-type".to_owned(), b"text/csv".to_vec())];
+    let html: Vec<(String, Vec<u8>)> = vec![("content-type".to_owned(), b"text/html".to_vec())];
 
     assert!(should_script_like_response_be_blocked_due_to_mime_type(
         &image
@@ -627,4 +921,233 @@ fn script_like_mime_type_block_matches_fetch_response_rule() {
         &html
     ));
     assert!(!should_script_like_response_be_blocked_due_to_mime_type(&[]));
+}
+#[test]
+fn document_text_classification_excludes_html_and_xml() {
+    for mime in [
+        "text/plain",
+        "Text/Css; charset=utf-8",
+        "application/json",
+        "application/ld+json",
+        "application/javascript",
+    ] {
+        assert!(crate::is_text_document_mime(mime), "{mime}");
+    }
+    for mime in [
+        "text/html",
+        "text/xml",
+        "application/xhtml+xml",
+        "image/svg+xml",
+        "application/atom+xml",
+        "application/rss+xml",
+        "text/example+xml; charset=utf-8",
+        "image/png",
+        "application/octet-stream",
+    ] {
+        assert!(!crate::is_text_document_mime(mime), "{mime}");
+    }
+}
+
+#[test]
+fn navigation_xml_mime_classification_keeps_dom_parser_allowlist_separate() {
+    for mime in [
+        "text/xml",
+        "application/xml",
+        "application/xhtml+xml",
+        "image/svg+xml",
+    ] {
+        assert!(is_xml_document_mime(mime), "{mime}");
+        assert!(is_dom_parser_xml_mime(mime), "{mime}");
+    }
+    for mime in [
+        "Application/Atom+XML; charset=utf-8",
+        "application/rss+xml",
+        "text/example+xml",
+    ] {
+        assert!(is_xml_document_mime(mime), "{mime}");
+        assert!(!is_dom_parser_xml_mime(mime), "{mime}");
+        assert!(!is_text_document_mime(mime), "{mime}");
+    }
+    for mime in [
+        "text/html",
+        "text/plain",
+        "application/xml-dtd",
+        "invalid+xml",
+    ] {
+        assert!(!is_xml_document_mime(mime), "{mime}");
+    }
+}
+
+#[test]
+fn json_mime_group_includes_text_json_and_valid_suffixes() {
+    for mime in [
+        "application/json",
+        "application/problem+json",
+        "text/html+json",
+        "image/svg+json",
+        "text/json",
+        "Text/JSON; charset=utf-8",
+        "text/json; charset=windows-1250",
+        "text/json; boundary=something",
+        "text/json; foo=bar",
+        "text/json; +json",
+    ] {
+        assert!(is_json_mime(mime), "{mime}");
+    }
+    for mime in [
+        "text/plain",
+        "application/javascript",
+        "application/jsonp",
+        "text/jsonp",
+        "application/json+xml",
+        "text/plain; json=application/json",
+        "invalid+json",
+        "text /json",
+        "text/ json",
+    ] {
+        assert!(!is_json_mime(mime), "{mime}");
+    }
+}
+
+#[test]
+fn font_mime_group_includes_registered_application_aliases() {
+    for mime in [
+        "font/woff2",
+        "application/font-cff",
+        "application/font-otf",
+        "application/font-sfnt",
+        "application/font-ttf",
+        "application/font-woff",
+        "application/vnd.ms-fontobject",
+        "application/vnd.ms-opentype",
+    ] {
+        assert!(is_font_mime_essence(mime), "{mime}");
+        assert!(is_font_mime(mime), "{mime}");
+        assert!(is_font_mime(&format!(
+            "{}; version=1",
+            mime.to_ascii_uppercase()
+        )));
+        assert!(is_binary_document_mime_type(mime), "{mime}");
+        assert!(
+            should_opaque_response_be_blocked_by_orb(&[(
+                "Content-Type".to_owned(),
+                mime.as_bytes().to_vec(),
+            )]),
+            "{mime}"
+        );
+    }
+    for mime in [
+        "application/font-woff2",
+        "application/x-font-ttf",
+        "fontish/woff",
+        "font/",
+    ] {
+        assert!(!is_font_mime(mime), "{mime}");
+    }
+}
+
+#[test]
+fn script_and_style_policies_extract_mime_from_the_complete_header_list() {
+    for (mime, destination) in [
+        ("text/javascript", FetchDestination::Script),
+        ("text/javascript", FetchDestination::Worker),
+        ("text/css", FetchDestination::Style),
+    ] {
+        for (values, accepts) in [
+            (vec!["text/plain".to_owned(), mime.to_owned()], true),
+            (vec![format!("text/plain, {mime}")], true),
+            (
+                vec![mime.to_owned(), "invalid".to_owned(), "*/*".to_owned()],
+                true,
+            ),
+            (vec![mime.to_owned(), "text/plain".to_owned()], false),
+            (vec![format!("{mime}, text/plain")], false),
+            (vec![format!(r#"text/plain; a=",{mime}""#)], false),
+            (
+                vec![r#"text/plain; a=""#.to_owned(), mime.to_owned()],
+                false,
+            ),
+            (vec!["invalid".to_owned(), "*/*".to_owned()], false),
+            (vec![], false),
+        ] {
+            let mut headers: Vec<_> = values
+                .iter()
+                .map(|value| ("Content-Type".to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            if destination.is_script_like() {
+                assert_eq!(
+                    check_script_response_mime(&headers, b"", destination, true).is_ok(),
+                    accepts,
+                    "{destination:?}: {values:?}"
+                );
+            }
+            headers.push(("X-Content-Type-Options".to_owned(), b"nosniff".to_vec()));
+            assert_eq!(
+                should_response_be_blocked_due_to_nosniff(&headers, destination),
+                !accepts,
+                "{destination:?}: {values:?}"
+            );
+            if destination.is_script_like() {
+                assert_eq!(
+                    check_script_response_mime(&headers, b"", destination, true).is_ok(),
+                    accepts,
+                    "{destination:?}: {values:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn classic_script_mime_block_uses_extracted_type_and_keeps_fetch_prefix_rules() {
+    for blocked in ["audio/mpeg", "image/png", "video/mp4", "text/csv"] {
+        for values in [
+            vec!["text/javascript".to_owned(), blocked.to_owned()],
+            vec![format!("text/javascript, {blocked}")],
+        ] {
+            let headers: Vec<_> = values
+                .iter()
+                .map(|value| ("Content-Type".to_owned(), value.as_bytes().to_vec()))
+                .collect();
+            assert!(
+                should_script_like_response_be_blocked_due_to_mime_type(&headers),
+                "{values:?}"
+            );
+            assert_eq!(
+                check_script_response_mime(&headers, b"", FetchDestination::Script, false),
+                Err(ScriptResponseMimeError::Unsupported(blocked.to_owned())),
+                "{values:?}"
+            );
+        }
+        let headers = [(
+            "Content-Type".to_owned(),
+            format!("{blocked}, text/javascript").into_bytes(),
+        )];
+        assert!(!should_script_like_response_be_blocked_due_to_mime_type(
+            &headers
+        ));
+        assert!(check_script_response_mime(&headers, b"", FetchDestination::Script, false).is_ok());
+    }
+    let ogg = [("Content-Type".to_owned(), b"application/ogg".to_vec())];
+    assert!(!should_script_like_response_be_blocked_due_to_mime_type(
+        &ogg
+    ));
+}
+
+#[test]
+fn nosniff_tokens_only_trim_http_tab_and_space() {
+    assert!(determine_nosniff(&[(
+        "X-Content-Type-Options".to_owned(),
+        b" \tNoSniff \t, other".to_vec(),
+    )]));
+    for value in [
+        b"nosniff\x0b".as_slice(),
+        b"nosniff\x0c",
+        b"nosniff\x0b,nosniff",
+        b"\x0cnosniff",
+        b"nosniff\xa0",
+    ] {
+        let headers = vec![("X-Content-Type-Options".to_owned(), value.to_vec())];
+        assert!(!determine_nosniff(&headers), "{value:?}");
+    }
 }

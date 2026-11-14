@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::{error::Error, fmt};
 
@@ -111,6 +111,7 @@ impl Error for CdpCommandParseError {
 /// retains unknown top-level fields so frontend routing can rewrite `id` and
 /// `sessionId` without discarding extensions from a newer CDP version.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(try_from = "IncomingCdpRequest")]
 pub struct CdpRequest {
     id: u64,
     method: String,
@@ -120,6 +121,56 @@ pub struct CdpRequest {
     session_id: Option<String>,
     #[serde(flatten)]
     extension_fields: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct IncomingCdpRequest {
+    id: u64,
+    method: String,
+    #[serde(default)]
+    params: Option<Value>,
+    #[serde(
+        rename = "sessionId",
+        default,
+        deserialize_with = "deserialize_session_id"
+    )]
+    session_id: Option<String>,
+    #[serde(flatten)]
+    extension_fields: Map<String, Value>,
+}
+
+fn deserialize_session_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Absent routing is allowed; an explicitly supplied route must be a string.
+    String::deserialize(deserializer).map(Some)
+}
+
+impl TryFrom<IncomingCdpRequest> for CdpRequest {
+    type Error = &'static str;
+
+    fn try_from(incoming: IncomingCdpRequest) -> Result<Self, Self::Error> {
+        // Chromium's parameterless Browser.close ignores its entire params
+        // value. Keep that rule in the canonical parser, including arrays and
+        // scalars, so transport control uses the same validated envelope.
+        let params = if incoming.method == "Browser.close" {
+            None
+        } else {
+            match incoming.params {
+                None => None,
+                Some(Value::Object(params)) => Some(params),
+                Some(_) => return Err("params must be an object"),
+            }
+        };
+        Ok(Self {
+            id: incoming.id,
+            method: incoming.method,
+            params,
+            session_id: incoming.session_id,
+            extension_fields: incoming.extension_fields,
+        })
+    }
 }
 
 impl CdpRequest {
@@ -381,6 +432,20 @@ impl ParsedCdpCommand {
 
     pub const fn renderer_policy(&self) -> CdpRendererCommandPolicy {
         self.renderer_policy
+    }
+
+    /// Whether dispatch joins an already pending initial Page build. This is
+    /// distinct from renderer thread access: Page.enable also needs installed
+    /// agents, while dialog handling, close, and cancellation remain available.
+    pub fn requires_initial_document_adoption(&self) -> bool {
+        match self.method().split_once('.') {
+            Some(("Runtime", action)) => !matches!(action, "terminateExecution" | "disable"),
+            Some(("Page", action)) => matches!(
+                action,
+                "enable" | "navigate" | "getFrameTree" | "getResourceTree" | "createIsolatedWorld"
+            ),
+            _ => false,
+        }
     }
 
     pub fn renderer_access(&self) -> CdpRendererCommandAccess {
@@ -679,6 +744,61 @@ mod tests {
     }
 
     #[test]
+    fn initial_document_adoption_is_required_for_agent_queries() {
+        for method in [
+            "Runtime.enable",
+            "Runtime.evaluate",
+            "Runtime.awaitPromise",
+            "Runtime.getIsolateId",
+            "Page.enable",
+            "Page.navigate",
+            "Page.getFrameTree",
+            "Page.getResourceTree",
+            "Page.createIsolatedWorld",
+        ] {
+            let command =
+                ParsedCdpCommand::parse_value(serde_json::json!({"id": 1, "method": method}))
+                    .unwrap();
+            assert!(command.requires_initial_document_adoption(), "{method}");
+            let rewritten = command
+                .rewrite_frontend_route(2, Some("SID-adoption"))
+                .unwrap();
+            assert!(
+                rewritten.requires_initial_document_adoption(),
+                "routing must preserve {method} policy"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_close_and_execution_controls_do_not_wait_for_initial_document_adoption() {
+        for method in [
+            "Page.handleJavaScriptDialog",
+            "Page.close",
+            "Target.closeTarget",
+            "Target.disposeBrowserContext",
+            "Browser.close",
+            "Page.stopLoading",
+            "Runtime.terminateExecution",
+            "Runtime.disable",
+            "Debugger.resume",
+            "Debugger.disable",
+            "Fetch.continueRequest",
+            "Fetch.continueResponse",
+            "IO.close",
+            "HeapProfiler.moliDiagnostics",
+        ] {
+            let command =
+                ParsedCdpCommand::parse_value(serde_json::json!({"id": 1, "method": method}))
+                    .unwrap();
+            assert!(
+                !command.requires_initial_document_adoption(),
+                "{method} must remain available before adoption"
+            );
+        }
+    }
+
+    #[test]
     fn parsed_cdp_command_keeps_navigation_control_commands_unblocked() {
         let command = parse(
             r#"{"id":9,"method":"Fetch.continueResponse","params":{"requestId":"r"},"sessionId":"s1"}"#,
@@ -894,19 +1014,36 @@ mod tests {
     }
 
     #[test]
-    fn null_session_id_uses_absent_optional_route_semantics() {
-        let command = parse(r#"{"id":14,"method":"Runtime.enable","sessionId":null}"#)
-            .rewrite_frontend_route(91, None)
-            .expect("null optional session must normalize during route rewrite");
+    fn explicit_null_session_id_is_an_invalid_request() {
+        for method in ["Runtime.enable", "Browser.close"] {
+            let error = ParsedCdpCommand::parse_value(serde_json::json!({
+                "id": 14, "method": method, "sessionId": null,
+            }))
+            .err()
+            .expect("a present sessionId must be a string");
+            assert_eq!(error.kind(), CdpCommandParseErrorKind::InvalidRequest);
+            assert_eq!(error.command_id(), Some(14));
+            assert_eq!(error.response_code(), -32600);
+        }
+    }
 
-        assert_eq!(command.session_id(), None);
-        assert_eq!(
-            serde_json::from_str::<Value>(command.json()).expect("rewritten dispatch JSON"),
-            serde_json::json!({
-                "id": 91,
-                "method": "Runtime.enable",
-            })
-        );
+    #[test]
+    fn browser_close_ignores_params_without_loosening_the_wire_envelope() {
+        for params in [
+            serde_json::json!({"ignored": true}),
+            serde_json::json!([]),
+            serde_json::json!(true),
+            serde_json::json!("ignored"),
+            Value::Null,
+        ] {
+            let command = ParsedCdpCommand::parse_value(serde_json::json!({
+                "id": 14, "method": "Browser.close", "params": params,
+                "sessionId": "owned-session",
+            }))
+            .expect("Browser.close ignores params");
+            assert!(command.request().params().is_none());
+            assert_eq!(command.session_id(), Some("owned-session"));
+        }
     }
 
     #[test]

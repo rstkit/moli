@@ -88,11 +88,47 @@ pub(crate) fn filter_headers_for_guard(
     entries: &[(String, String)],
     guard: HeadersGuard,
 ) -> Vec<(String, String)> {
-    entries
+    let mut filtered = Vec::with_capacity(entries.len());
+    for (name, value) in entries {
+        if header_append_allowed_by_guard(guard, name, value, &filtered) {
+            filtered.push((name.clone(), value.clone()));
+        }
+    }
+    filtered
+}
+
+pub(in crate::network_host::headers) fn header_append_allowed_by_guard(
+    guard: HeadersGuard,
+    name: &str,
+    value: &str,
+    entries: &[(String, String)],
+) -> bool {
+    if guard != HeadersGuard::RequestNoCors {
+        return header_allowed_by_guard(guard, name, value);
+    }
+    // Filling Headers runs append for each entry. The no-cors check applies
+    // to the resulting combined value, including separators and empty values;
+    // a rejected append must leave previously accepted entries intact.
+    let mut combined = None::<String>;
+    for (_, existing) in entries
         .iter()
-        .filter(|(name, value)| header_allowed_by_guard(guard, name, value))
-        .cloned()
-        .collect()
+        .filter(|(field, _)| field.eq_ignore_ascii_case(name))
+    {
+        if let Some(combined) = &mut combined {
+            combined.push_str(", ");
+            combined.push_str(existing);
+        } else {
+            combined = Some(existing.clone());
+        }
+    }
+    match combined {
+        Some(mut combined) => {
+            combined.push_str(", ");
+            combined.push_str(value);
+            header_allowed_by_guard(guard, name, &combined)
+        }
+        None => header_allowed_by_guard(guard, name, value),
+    }
 }
 
 pub(in crate::network_host) fn set_headers_entries(
@@ -108,37 +144,59 @@ pub(in crate::network_host) fn set_headers_entries(
 }
 
 pub(in crate::network_host) fn headers_entries_json(entries: &[(String, String)]) -> String {
-    let entries = normalized_headers_entries(entries);
+    // Keep the underlying header list intact. Request construction can refill
+    // this list under a different guard, which must see each original entry.
+    let entries = normalized_header_list(entries);
     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_owned())
 }
 
-pub(in crate::network_host::headers) fn normalized_headers_entries(
-    entries: &[(String, String)],
-) -> Vec<(String, String)> {
+fn normalized_header_list(entries: &[(String, String)]) -> Vec<(String, String)> {
     let mut normalized = Vec::<(String, String)>::new();
+    let mut first_names = std::collections::HashMap::new();
     for (name, value) in entries {
-        let Some(lower) = normalized_header_name(name) else {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
             continue;
         };
         let value = normalize_header_value(value);
         if !is_valid_header_value(&value) {
             continue;
         }
-        if lower == "set-cookie" {
-            normalized.push((lower, value));
+        let first_name = *first_names.entry(header_name).or_insert(name.as_str());
+        normalized.push((first_name.to_owned(), value));
+    }
+    normalized
+}
+
+/// Combine values for network dispatch without losing the first field spelling.
+/// Keep Set-Cookie separate and retain the existing case-insensitive name order.
+pub(crate) fn combined_headers_entries(entries: &[(String, String)]) -> Vec<(String, String)> {
+    let mut normalized = Vec::<(String, String)>::new();
+    for (name, value) in normalized_header_list(entries) {
+        if name.eq_ignore_ascii_case("set-cookie") {
+            normalized.push((name, value));
             continue;
         }
         if let Some((_, existing)) = normalized
             .iter_mut()
-            .find(|(entry_name, _)| *entry_name == lower)
+            .find(|(entry_name, _)| entry_name.eq_ignore_ascii_case(&name))
         {
             existing.push_str(", ");
             existing.push_str(&value);
         } else {
-            normalized.push((lower, value));
+            normalized.push((name, value));
         }
     }
-    normalized.sort_by(|(left, _), (right, _)| left.cmp(right));
+    normalized.sort_by_cached_key(|(name, _)| name.to_ascii_lowercase());
+    normalized
+}
+
+// Public iteration and XHR's serialized response headers use sorted-lowercase
+// names; the internal list and network projection retain their original case.
+pub(crate) fn normalized_headers_entries(entries: &[(String, String)]) -> Vec<(String, String)> {
+    let mut normalized = combined_headers_entries(entries);
+    for (name, _) in &mut normalized {
+        name.make_ascii_lowercase();
+    }
     normalized
 }
 
@@ -150,12 +208,18 @@ pub(in crate::network_host::headers) fn normalized_header_name_or_throw(
     scope: &mut v8::PinScope<'_, '_>,
     name: &str,
 ) -> Option<String> {
-    match normalized_header_name(name) {
-        Some(name) => Some(name),
-        None => {
-            throw_type_error(scope, "Invalid header name");
-            None
-        }
+    validated_header_name_or_throw(scope, name).map(str::to_ascii_lowercase)
+}
+
+pub(in crate::network_host::headers) fn validated_header_name_or_throw<'a>(
+    scope: &mut v8::PinScope<'_, '_>,
+    name: &'a str,
+) -> Option<&'a str> {
+    if HeaderName::from_bytes(name.as_bytes()).is_ok() {
+        Some(name)
+    } else {
+        throw_type_error(scope, "Invalid header name");
+        None
     }
 }
 
@@ -172,20 +236,14 @@ pub(in crate::network_host::headers) fn normalized_header_value_or_throw(
     }
 }
 
-pub(in crate::network_host) fn normalized_header_entry_or_throw(
+pub(super) fn validated_header_entry_or_throw(
     scope: &mut v8::PinScope<'_, '_>,
     name: String,
     value: String,
 ) -> Option<(String, String)> {
-    let name = normalized_header_name_or_throw(scope, &name)?;
+    validated_header_name_or_throw(scope, &name)?;
     let value = normalized_header_value_or_throw(scope, &value)?;
     Some((name, value))
-}
-
-fn normalized_header_name(name: &str) -> Option<String> {
-    HeaderName::from_bytes(name.as_bytes())
-        .ok()
-        .map(|name| name.as_str().to_owned())
 }
 
 fn is_valid_header_value(value: &str) -> bool {
@@ -198,26 +256,22 @@ fn is_http_whitespace(ch: char) -> bool {
     matches!(ch, '\t' | '\n' | '\r' | ' ')
 }
 
+/// The sorted, combined view used by public iteration and header consumers.
 pub(crate) fn headers_entries<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     obj: v8::Local<'s, v8::Object>,
 ) -> Vec<(String, String)> {
-    headers_entries_if_present(scope, obj).unwrap_or_default()
+    normalized_headers_entries(&headers_list(scope, obj))
 }
 
-pub(in crate::network_host) fn headers_entries_if_present<'s>(
+/// The internal header list, before the public sort-and-combine projection.
+pub(in crate::network_host) fn headers_list<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     obj: v8::Local<'s, v8::Object>,
-) -> Option<Vec<(String, String)>> {
+) -> Vec<(String, String)> {
     private_string_value(scope, obj, HEADERS_ENTRIES_SLOT)
         .and_then(|json| serde_json::from_str::<Vec<(String, String)>>(&json).ok())
-}
-
-pub(in crate::network_host::headers) fn headers_entries_slot_present<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    obj: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, obj, HEADERS_ENTRIES_SLOT).is_some()
+        .unwrap_or_default()
 }
 
 fn private_string_value<'s>(
@@ -232,7 +286,32 @@ fn private_string_value<'s>(
 
 #[cfg(test)]
 mod tests {
-    use super::{HeadersGuard, header_allowed_by_guard, normalized_headers_entries};
+    use super::{
+        HeadersGuard, header_allowed_by_guard, headers_entries_json, normalized_headers_entries,
+    };
+
+    #[test]
+    fn headers_storage_preserves_duplicate_entries_and_order() {
+        let entries = [
+            ("X-Test".to_owned(), " one ".to_owned()),
+            ("Set-Cookie".to_owned(), "a=1".to_owned()),
+            ("x-test".to_owned(), String::new()),
+            ("set-cookie".to_owned(), "b=2".to_owned()),
+            ("X-TEST".to_owned(), "two".to_owned()),
+        ];
+        let stored: Vec<(String, String)> =
+            serde_json::from_str(&headers_entries_json(&entries)).unwrap();
+        assert_eq!(
+            stored,
+            vec![
+                ("X-Test".to_owned(), "one".to_owned()),
+                ("Set-Cookie".to_owned(), "a=1".to_owned()),
+                ("X-Test".to_owned(), String::new()),
+                ("Set-Cookie".to_owned(), "b=2".to_owned()),
+                ("X-Test".to_owned(), "two".to_owned()),
+            ]
+        );
+    }
 
     #[test]
     fn normalized_headers_entries_keeps_set_cookie_values_separate() {

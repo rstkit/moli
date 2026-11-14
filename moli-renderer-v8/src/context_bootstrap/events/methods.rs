@@ -1,9 +1,10 @@
 use super::*;
 
-pub(super) fn set_event_default_prevented(
+pub(in crate::context_bootstrap) fn set_event_default_prevented(
     scope: &mut v8::PinScope<'_, '_>,
     event: v8::Local<'_, v8::Object>,
 ) {
+    let event = super::base::event_backing(scope, event);
     let key = v8str(scope, "defaultPrevented");
     let value = v8::Boolean::new(scope, true).into();
     let _ = event.define_own_property(scope, key.into(), value, Default::default());
@@ -15,7 +16,7 @@ pub(in crate::context_bootstrap) fn event_prevent_default_callback<'s>(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let event = args.this();
-    if !object_bool_property(scope, event, "cancelable").unwrap_or(false) {
+    if !crate::context_bootstrap::event_bool_attribute(scope, event, "cancelable") {
         return;
     }
     if event_internal_bool_flag(scope, event, EVENT_PASSIVE_SLOT) {
@@ -34,7 +35,7 @@ pub(in crate::context_bootstrap) fn event_return_value_getter_function<'s>(
         return;
     }
     let default_prevented =
-        object_bool_property(scope, args.this(), "defaultPrevented").unwrap_or(false);
+        crate::context_bootstrap::event_bool_attribute(scope, args.this(), "defaultPrevented");
     rv.set(v8::Boolean::new(scope, !default_prevented).into());
 }
 
@@ -49,7 +50,7 @@ pub(in crate::context_bootstrap) fn event_return_value_setter_function<'s>(
         return;
     }
     if args.get(0).boolean_value(scope)
-        || !object_bool_property(scope, event, "cancelable").unwrap_or(false)
+        || !crate::context_bootstrap::event_bool_attribute(scope, event, "cancelable")
         || event_internal_bool_flag(scope, event, EVENT_PASSIVE_SLOT)
     {
         return;

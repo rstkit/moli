@@ -6,6 +6,35 @@ use moli_protocol::ParsedCdpCommand;
 
 use super::*;
 
+mod target_message;
+
+#[test]
+fn raw_inspector_notifications_retain_bytes_without_schema_gating() {
+    let router = CdpFrontendRouter::new();
+    let (sink, mut writer) = CdpSocketSink::with_stalled_writer_for_test(2);
+    router
+        .register_browser_frontend(5, "SID-browser".into(), sink)
+        .unwrap();
+    for text in [
+        r#"{"method":"Runtime.consoleAPICalled","sessionId":"SID-browser","params":{"args":[{"value":"\ud800"}]}}"#,
+        r#"{"method":"Runtime.someUnknownEvent","sessionId":"SID-browser","params":{"args":[{"value":"\udfff"}]}}"#,
+    ] {
+        let raw = InspectorJson::from_slice(text.as_bytes()).unwrap();
+        let mut expected = raw.clone();
+        expected.set_session_id(None);
+        let event =
+            moli_protocol::conn::BackgroundProtocolEvent::inspector_message(raw.clone(), None);
+        assert!(event.has_protocol_wire_message());
+        assert!(router.enqueue_protocol_output_sequence(
+            ProtocolOutputSequence::from_background_events(vec![event])
+        ));
+        assert_eq!(writer.take_text(), expected.to_string());
+        assert!(!raw.is_materialized());
+        assert!(writer.is_open());
+        assert!(writer.is_empty());
+    }
+}
+
 fn test_sink() -> CdpSocketSink {
     CdpSocketSink::for_test()
 }
@@ -23,6 +52,54 @@ fn expect_prepared_command(
         CdpPreparedFrontendCommand::ImmediateResponse { .. } => {
             panic!("{label} command unexpectedly produced an immediate response")
         }
+        CdpPreparedFrontendCommand::TargetMessage { .. } => {
+            panic!("{label} command unexpectedly used a Target transport")
+        }
+    }
+}
+
+#[test]
+fn instance_command_responses_use_normal_command_and_session_routes_once() {
+    let router = CdpFrontendRouter::new();
+    let (sink, mut writer) = CdpSocketSink::with_stalled_writer_for_test(4);
+    router
+        .register_browser_frontend(5, "SID-browser".into(), sink)
+        .unwrap();
+    assert!(
+        router.enqueue_protocol_output_sequence(ProtocolOutputSequence::from_messages(vec![
+            json!({
+                "method": "Target.attachedToTarget",
+                "sessionId": "SID-browser",
+                "params": {
+                    "sessionId": "SID-child",
+                    "targetInfo": {"targetId": "TID-child"},
+                },
+            }),
+        ]))
+    );
+    assert_eq!(writer.take_message()["method"], "Target.attachedToTarget");
+
+    for session_id in [None, Some("SID-child")] {
+        let mut request = json!({"id": 42, "method": "Browser.close"});
+        if let Some(session_id) = session_id {
+            request["sessionId"] = json!(session_id);
+        }
+        let command = expect_prepared_command(
+            router.prepare_command(5, ParsedCdpCommand::parse_value(request)),
+            "instance close",
+        );
+        assert_ne!(command.request().id(), 42);
+        let response = json!({"id": command.request().id(), "result": {}});
+        assert!(router.enqueue_response(response.clone()).is_some());
+        let mut expected = json!({"id": 42, "result": {}});
+        if let Some(session_id) = session_id {
+            expected["sessionId"] = json!(session_id);
+        }
+        assert_eq!(writer.take_message(), expected);
+        assert!(
+            router.enqueue_response(response).is_none(),
+            "responding consumes the ordinary pending-command route"
+        );
     }
 }
 
@@ -72,11 +149,12 @@ fn browser_and_page_client_command_ids_are_isolated_and_restored() {
                 "sessionId": "SID-browser",
             }),
             Some("SID-browser"),
+            None,
         )
         .expect("route browser response");
     assert_eq!(browser_frontend.frontend_id, 5);
-    assert_eq!(browser_response["id"], json!(7));
-    assert!(browser_response.get("sessionId").is_none());
+    assert_eq!(browser_response.id_u64(), Some(7));
+    assert!(browser_response.session_id().is_none());
 
     let (page_frontend, page_response) = routing
         .route_message(
@@ -86,11 +164,12 @@ fn browser_and_page_client_command_ids_are_isolated_and_restored() {
                 "sessionId": "SID-page",
             }),
             Some("SID-page"),
+            None,
         )
         .expect("route page response");
     assert_eq!(page_frontend.frontend_id, 10);
-    assert_eq!(page_response["id"], json!(7));
-    assert!(page_response.get("sessionId").is_none());
+    assert_eq!(page_response.id_u64(), Some(7));
+    assert!(page_response.session_id().is_none());
 }
 
 #[test]
@@ -131,12 +210,13 @@ fn browser_frontends_with_the_same_client_command_id_route_independently() {
                 "sessionId": "SID-browser-2",
             }),
             Some("SID-browser-2"),
+            None,
         )
         .expect("route second response");
     assert_eq!(frontend.frontend_id(), 6);
-    assert_eq!(response["id"], json!(7));
-    assert_eq!(response["result"]["product"], json!("second"));
-    assert!(response.get("sessionId").is_none());
+    assert_eq!(response.id_u64(), Some(7));
+    assert_eq!(response.value()["result"]["product"], json!("second"));
+    assert!(response.session_id().is_none());
 
     let (frontend, response) = routing
         .route_message(
@@ -146,12 +226,13 @@ fn browser_frontends_with_the_same_client_command_id_route_independently() {
                 "sessionId": "SID-browser-1",
             }),
             Some("SID-browser-1"),
+            None,
         )
         .expect("route first response");
     assert_eq!(frontend.frontend_id(), 5);
-    assert_eq!(response["id"], json!(7));
-    assert_eq!(response["result"]["product"], json!("first"));
-    assert!(response.get("sessionId").is_none());
+    assert_eq!(response.id_u64(), Some(7));
+    assert_eq!(response.value()["result"]["product"], json!("first"));
+    assert!(response.session_id().is_none());
 }
 
 #[test]
@@ -172,10 +253,11 @@ fn browser_base_session_events_are_private_and_frontend_scoped() {
                 "params": { "targetInfo": { "targetId": "TID-1" } },
             }),
             Some("SID-browser-1"),
+            None,
         )
         .expect("route first browser event");
     assert_eq!(frontend.frontend_id(), 5);
-    assert!(event.get("sessionId").is_none());
+    assert!(event.session_id().is_none());
 
     assert!(
         routing
@@ -184,6 +266,7 @@ fn browser_base_session_events_are_private_and_frontend_scoped() {
                     "method": "Target.targetCreated",
                     "params": { "targetInfo": { "targetId": "TID-root" } },
                 }),
+                None,
                 None,
             )
             .is_none(),
@@ -200,8 +283,8 @@ fn root_detach_with_a_known_child_routes_to_its_exact_frontend() {
     routing
         .register_browser_frontend(6, "SID-browser-2".to_owned(), test_sink())
         .expect("register second browser frontend");
-    routing.register_child_session(5, Some("SID-browser-1"), "SID-child-1", Some("TID-1"));
-    routing.register_child_session(6, Some("SID-browser-2"), "SID-child-2", Some("TID-1"));
+    routing.register_child_session(5, Some("SID-browser-1"), "SID-child-1", Some("TID-1"), true);
+    routing.register_child_session(6, Some("SID-browser-2"), "SID-child-2", Some("TID-1"), true);
 
     let (frontend, event) = routing
         .route_message(
@@ -213,10 +296,11 @@ fn root_detach_with_a_known_child_routes_to_its_exact_frontend() {
                 },
             }),
             None,
+            None,
         )
         .expect("route owner-qualified root detach");
     assert_eq!(frontend.frontend_id(), 5);
-    assert!(event.get("sessionId").is_none());
+    assert!(event.session_id().is_none());
 
     assert!(matches!(
         routing.prepare_command(
@@ -254,12 +338,13 @@ fn root_detach_restores_visible_parent_for_nested_child() {
     routing
         .register_browser_frontend(5, "SID-browser".to_owned(), test_sink())
         .expect("register browser frontend");
-    routing.register_child_session(5, Some("SID-browser"), "SID-child", Some("TID-child"));
+    routing.register_child_session(5, Some("SID-browser"), "SID-child", Some("TID-child"), true);
     routing.register_child_session(
         5,
         Some("SID-child"),
         "SID-grandchild",
         Some("TID-grandchild"),
+        true,
     );
 
     let (_, event) = routing
@@ -272,9 +357,10 @@ fn root_detach_restores_visible_parent_for_nested_child() {
                 },
             }),
             None,
+            None,
         )
         .expect("route nested root detach");
-    assert_eq!(event["sessionId"], json!("SID-child"));
+    assert_eq!(event.session_id(), Some("SID-child"));
 }
 
 #[test]
@@ -322,6 +408,7 @@ fn unregistering_one_browser_drops_only_its_pending_commands() {
                     "sessionId": "SID-browser-1",
                 }),
                 Some("SID-browser-1"),
+                None,
             )
             .is_none()
     );
@@ -333,10 +420,11 @@ fn unregistering_one_browser_drops_only_its_pending_commands() {
                 "sessionId": "SID-browser-2",
             }),
             Some("SID-browser-2"),
+            None,
         )
         .expect("second browser response remains routable");
     assert_eq!(frontend.frontend_id(), 6);
-    assert_eq!(response["id"], json!(1));
+    assert_eq!(response.id_u64(), Some(1));
 }
 
 #[test]
@@ -350,6 +438,7 @@ fn browser_child_session_is_preserved_on_browser_frontend() {
         Some("SID-browser"),
         "SID-client-child",
         Some("TID-child"),
+        true,
     );
 
     let command = expect_prepared_command(
@@ -379,9 +468,10 @@ fn browser_child_session_is_preserved_on_browser_frontend() {
                 "sessionId": "SID-client-child",
             }),
             Some("SID-client-child"),
+            None,
         )
         .expect("route child response");
-    assert_eq!(response["sessionId"], json!("SID-client-child"));
+    assert_eq!(response.session_id(), Some("SID-client-child"));
 }
 
 #[test]
@@ -393,8 +483,20 @@ fn legacy_target_session_references_cannot_cross_browser_frontends() {
     routing
         .register_browser_frontend(6, "SID-browser-2".to_owned(), test_sink())
         .expect("register second browser frontend");
-    routing.register_child_session(5, Some("SID-browser-1"), "SID-child-1", Some("TID-shared"));
-    routing.register_child_session(6, Some("SID-browser-2"), "SID-child-2", Some("TID-shared"));
+    routing.register_child_session(
+        5,
+        Some("SID-browser-1"),
+        "SID-child-1",
+        Some("TID-shared"),
+        true,
+    );
+    routing.register_child_session(
+        6,
+        Some("SID-browser-2"),
+        "SID-child-2",
+        Some("TID-shared"),
+        true,
+    );
 
     for method in ["Target.detachFromTarget", "Target.sendMessageToTarget"] {
         let Some(CdpPreparedFrontendCommand::ImmediateResponse {
@@ -448,13 +550,26 @@ fn legacy_target_id_reference_requires_one_direct_child_session() {
     routing
         .register_browser_frontend(5, "SID-browser".to_owned(), test_sink())
         .expect("register browser frontend");
-    routing.register_child_session(5, Some("SID-browser"), "SID-child-1", Some("TID-shared"));
-    routing.register_child_session(5, Some("SID-browser"), "SID-child-2", Some("TID-shared"));
+    routing.register_child_session(
+        5,
+        Some("SID-browser"),
+        "SID-child-1",
+        Some("TID-shared"),
+        true,
+    );
+    routing.register_child_session(
+        5,
+        Some("SID-browser"),
+        "SID-child-2",
+        Some("TID-shared"),
+        true,
+    );
     routing.register_child_session(
         5,
         Some("SID-child-1"),
         "SID-grandchild",
         Some("TID-grandchild"),
+        true,
     );
 
     let Some(CdpPreparedFrontendCommand::ImmediateResponse { message, .. }) = routing
@@ -517,13 +632,14 @@ fn rejected_nested_detach_preserves_the_request_session_route() {
     routing
         .register_browser_frontend(5, "SID-browser".to_owned(), test_sink())
         .expect("register browser frontend");
-    routing.register_child_session(5, Some("SID-browser"), "SID-page", Some("TID-page"));
-    routing.register_child_session(5, Some("SID-page"), "SID-worker", Some("TID-worker"));
+    routing.register_child_session(5, Some("SID-browser"), "SID-page", Some("TID-page"), true);
+    routing.register_child_session(5, Some("SID-page"), "SID-worker", Some("TID-worker"), true);
     routing.register_child_session(
         5,
         Some("SID-worker"),
         "SID-shared-worker",
         Some("TID-shared-worker"),
+        true,
     );
 
     let Some(CdpPreparedFrontendCommand::ImmediateResponse { message, .. }) = routing
@@ -573,7 +689,7 @@ fn target_command_errors_preserve_only_valid_client_session_routes() {
     routing
         .register_browser_frontend(5, "SID-browser".to_owned(), test_sink())
         .expect("register browser frontend");
-    routing.register_child_session(5, Some("SID-browser"), "SID-page", Some("TID-page"));
+    routing.register_child_session(5, Some("SID-browser"), "SID-page", Some("TID-page"), true);
 
     for (id, method, params, expected_message) in [
         (
@@ -686,11 +802,12 @@ fn attached_event_registers_child_before_attach_response() {
                 },
             }),
             Some("SID-browser"),
+            None,
         )
         .expect("route attached event");
     assert_eq!(frontend.frontend_id(), 5);
-    assert!(event.get("sessionId").is_none());
-    assert_eq!(event["params"]["sessionId"], json!("SID-child"));
+    assert!(event.session_id().is_none());
+    assert_eq!(event.value()["params"]["sessionId"], json!("SID-child"));
 
     let child_command = expect_prepared_command(
         routing.prepare_command(
@@ -720,10 +837,11 @@ fn attached_event_registers_child_before_attach_response() {
                 "sessionId": "SID-browser",
             }),
             Some("SID-browser"),
+            None,
         )
         .expect("route attach response");
-    assert_eq!(response["id"], json!(30));
-    assert!(response.get("sessionId").is_none());
+    assert_eq!(response.id_u64(), Some(30));
+    assert!(response.session_id().is_none());
 }
 
 #[test]
@@ -753,10 +871,11 @@ fn browser_frontend_hides_base_session_on_wire() {
                 "sessionId": "SID-browser",
             }),
             Some("SID-browser"),
+            None,
         )
         .expect("route browser response");
-    assert_eq!(response["id"], json!(9));
-    assert!(response.get("sessionId").is_none());
+    assert_eq!(response.id_u64(), Some(9));
+    assert!(response.session_id().is_none());
 }
 
 #[test]
@@ -848,6 +967,7 @@ fn private_page_session_detach_does_not_fall_back_to_browser_frontend() {
         Some("SID-browser"),
         "SID-browser-child",
         Some("TID-root"),
+        true,
     );
 
     assert!(
@@ -861,6 +981,7 @@ fn private_page_session_detach_does_not_fall_back_to_browser_frontend() {
                         "reason": "Render process gone.",
                     },
                 }),
+                None,
                 None
             )
             .is_none()
@@ -877,10 +998,14 @@ fn private_page_session_detach_does_not_fall_back_to_browser_frontend() {
                 },
             }),
             Some("SID-browser"),
+            None,
         )
         .expect("route browser-owned target detach");
     assert_eq!(frontend.frontend_id, 5);
-    assert_eq!(message["params"]["sessionId"], json!("SID-browser-child"));
+    assert_eq!(
+        message.value()["params"]["sessionId"],
+        json!("SID-browser-child")
+    );
 }
 
 #[test]
@@ -919,6 +1044,7 @@ fn page_child_sessions_are_scoped_to_their_frontend_and_removed_on_detach() {
                 "sessionId": "SID-page-1",
             }),
             Some("SID-page-1"),
+            None,
         )
         .expect("route attach response");
 
@@ -971,6 +1097,7 @@ fn page_child_sessions_are_scoped_to_their_frontend_and_removed_on_detach() {
                 },
             }),
             Some("SID-page-1"),
+            None,
         )
         .expect("route child detach");
     assert!(matches!(
@@ -1067,6 +1194,7 @@ fn private_control_session_events_do_not_reach_browser_frontend() {
                         "targetInfo": { "targetId": "browser" },
                     },
                 }),
+                None,
                 None
             )
             .is_none()
@@ -1079,7 +1207,8 @@ fn private_control_session_events_do_not_reach_browser_frontend() {
                     "sessionId": "SID-control",
                     "params": { "targetInfo": { "targetId": "TID-private" } },
                 }),
-                Some("SID-control")
+                Some("SID-control"),
+                None
             )
             .is_none()
     );
@@ -1090,6 +1219,7 @@ fn private_control_session_events_do_not_reach_browser_frontend() {
                     "method": "Target.detachedFromTarget",
                     "params": { "sessionId": "SID-control" },
                 }),
+                None,
                 None
             )
             .is_none()
@@ -1105,7 +1235,7 @@ fn orphaned_responses_and_unknown_session_events_do_not_fall_back_to_browser() {
 
     assert!(
         routing
-            .route_message(json!({ "id": 999, "result": {} }), None)
+            .route_message(json!({ "id": 999, "result": {} }), None, None)
             .is_none()
     );
     assert!(
@@ -1116,8 +1246,52 @@ fn orphaned_responses_and_unknown_session_events_do_not_fall_back_to_browser() {
                     "sessionId": "SID-stale",
                     "params": { "type": "log" },
                 }),
-                Some("SID-stale")
+                Some("SID-stale"),
+                None
             )
             .is_none()
     );
+}
+
+#[test]
+fn raw_inspector_response_rewrites_frontend_ids_without_decoding_the_body() {
+    let mut routing = CdpFrontendRoutingState::default();
+    routing
+        .register_browser_frontend(5, "SID-browser".into(), test_sink())
+        .unwrap();
+    routing
+        .register_target_frontend(10, "TID-1".into(), "SID-page".into(), test_sink())
+        .unwrap();
+    for frontend in [5, 10] {
+        let command = expect_prepared_command(
+            routing.prepare_command(
+                frontend,
+                parsed_command(
+                    json!({"id":7,"method":"Runtime.evaluate","params":{"expression":"'x'"}})
+                        .to_string(),
+                ),
+            ),
+            "evaluate",
+        );
+        let message = InspectorJson::from_slice(
+            format!(
+                r#"{{"id":{},"result":{{"result":{{"type":"string","value":"\ud800"}}}}}}"#,
+                command.request().id()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let source = message.clone();
+        let (destination, wire) = routing.route_message(message, None, None).unwrap();
+        assert_eq!(destination.frontend_id(), frontend);
+        assert_eq!(wire.id_u64(), Some(7));
+        assert_eq!(wire.session_id(), None);
+        assert!(wire.to_string().contains(r#""value":"\ud800""#));
+        assert!(!wire.is_materialized());
+        assert!(!source.is_materialized());
+        assert!(
+            routing.route_message(source, None, None).is_none(),
+            "response authority is consumed once"
+        );
+    }
 }

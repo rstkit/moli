@@ -1,11 +1,12 @@
 use crate::context_bootstrap::{
-    dispatch_simple_event_target_event, mark_simple_event_target_slot, set_text_track_cue_track,
+    dispatch_simple_event_target_event, initialize_simple_event_target, set_text_track_cue_track,
+    simple_object_event_set_handler, text_track_cue_id, text_track_cue_times, text_track_cue_track,
 };
 use crate::document_runtime::DomHandle;
 use crate::dom::native::Node;
 use crate::native_bridge::bridge::throw_dom_exception;
 use crate::native_bridge::{
-    JsContextHost, MediaLoadSequenceId, PendingMediaTextTrackGateRegistration,
+    MediaLoadSequenceId, PageScriptHost, PendingMediaTextTrackGateRegistration,
     PendingTextTrackLoadTerminal, PendingTextTrackLoadTerminalFollowup, TextTrackLoadSequenceId,
 };
 use crate::page_task_queue::{RendererPageTextTrackLoadTaskId, RendererPageTextTrackLoadTaskKind};
@@ -14,6 +15,7 @@ use crate::util::{
     node_wrapper_from_handle, serialize_v8_array, set_private_value, throw_type_error, v8_string,
     v8str,
 };
+use crate::web_api_interfaces;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 use super::super::super::node::node_runtime_and_handle_from_object_or_detached;
@@ -25,7 +27,6 @@ use super::super::{
 const TEXT_TRACK_CACHE_SLOT: &str = "__moliTextTrack";
 const TEXT_TRACKS_CACHE_SLOT: &str = "__moliTextTracks";
 const TEXT_TRACKS_MANUAL_SLOT: &str = "__moliTextTracksManual";
-const TEXT_TRACK_LIST_LISTENERS_SLOT: &str = "__moliTextTrackListListeners";
 const TEXT_TRACK_OWNER_HANDLE_SLOT: &str = "__moliTextTrackOwnerHandle";
 const TEXT_TRACK_MEDIA_HANDLE_SLOT: &str = "__moliTextTrackMediaHandle";
 const TEXT_TRACK_KIND_SLOT: &str = "__moliTextTrackKind";
@@ -37,8 +38,6 @@ const TEXT_TRACK_ACTIVE_CUES_SLOT: &str = "__moliTextTrackActiveCues";
 const TEXT_TRACK_INSERTION_COUNTER_SLOT: &str = "__moliTextTrackInsertionCounter";
 const TEXT_TRACK_CUE_ORDER_SLOT: &str = "__moliTextTrackCueOrder";
 const TEXT_TRACK_LIST_ITEMS_SLOT: &str = "__moliTextTrackListItems";
-const TEXT_TRACK_LIST_BRAND_SLOT: &str = "__moliTextTrackListBrand";
-const TEXT_TRACK_CUE_LIST_BRAND_SLOT: &str = "__moliTextTrackCueListBrand";
 const TEXT_TRACK_ONCUECHANGE_SLOT: &str = "__moliTextTrackOnCueChange";
 const TEXT_TRACK_LIST_ONADDTRACK_SLOT: &str = "__moliTextTrackListOnAddTrack";
 const TEXT_TRACK_LIST_ONREMOVETRACK_SLOT: &str = "__moliTextTrackListOnRemoveTrack";
@@ -50,17 +49,14 @@ const TRACK_READY_STATE_LOADED: u32 = 2;
 const TRACK_READY_STATE_ERROR: u32 = 3;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextTrackCueList")]
+#[webapi(interface = web_api_interfaces::TextTrackCueList)]
 struct TextTrackCueListObjectDeclaration<'scope> {
     #[webapi(slot = TEXT_TRACK_LIST_ITEMS_SLOT)]
     items: Vec<v8::Local<'scope, v8::Value>>,
-
-    #[webapi(slot = TEXT_TRACK_CUE_LIST_BRAND_SLOT, constructor_default = true)]
-    _brand: bool,
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextTrackCueList", enumerable)]
+#[webapi(interface = web_api_interfaces::TextTrackCueList, enumerable)]
 struct TextTrackCueListTemplateDeclaration {
     #[webapi(
         intrinsic_data_property = v8::Intrinsic::ArrayProtoValues,
@@ -81,13 +77,10 @@ struct TextTrackCueListTemplateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextTrackList")]
+#[webapi(interface = web_api_interfaces::TextTrackList)]
 struct TextTrackListObjectDeclaration<'scope> {
     #[webapi(slot = TEXT_TRACK_LIST_ITEMS_SLOT)]
     items: Vec<v8::Local<'scope, v8::Value>>,
-
-    #[webapi(slot = TEXT_TRACK_LIST_BRAND_SLOT, constructor_default = true)]
-    _brand: bool,
 
     #[webapi(slot = TEXT_TRACK_LIST_ONADDTRACK_SLOT, init = "null")]
     _onaddtrack: (),
@@ -97,7 +90,7 @@ struct TextTrackListObjectDeclaration<'scope> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextTrackList", enumerable)]
+#[webapi(interface = web_api_interfaces::TextTrackList, enumerable)]
 struct TextTrackListTemplateDeclaration {
     #[webapi(
         intrinsic_data_property = v8::Intrinsic::ArrayProtoValues,
@@ -132,7 +125,7 @@ struct TextTrackListTemplateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "TextTrack")]
+#[webapi(interface = web_api_interfaces::TextTrack)]
 struct TextTrackObjectDeclaration {
     #[webapi(slot = TEXT_TRACK_KIND_SLOT)]
     kind: String,
@@ -160,7 +153,7 @@ struct TextTrackObjectDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextTrack", enumerable)]
+#[webapi(interface = web_api_interfaces::TextTrack, enumerable)]
 struct TextTrackTemplateDeclaration {
     #[webapi(accessor_property, getter = text_track_kind_getter)]
     kind: (),
@@ -202,7 +195,7 @@ struct TextTrackTemplateDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct TrackEventInitDeclaration<'scope> {
     track: v8::Local<'scope, v8::Object>,
 }
@@ -232,7 +225,7 @@ fn text_track_receiver<'s>(
     args: &v8::FunctionCallbackArguments<'s>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let receiver = args.this();
-    if get_private_value(scope, receiver, TEXT_TRACK_KIND_SLOT).is_some() {
+    if web_api_interfaces::TextTrack::is_instance(scope, receiver) {
         return Some(receiver);
     }
     throw_type_error(scope, "Illegal invocation");
@@ -244,7 +237,7 @@ fn text_track_list_receiver<'s>(
     args: &v8::FunctionCallbackArguments<'s>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let receiver = args.this();
-    if get_private_value(scope, receiver, TEXT_TRACK_LIST_BRAND_SLOT).is_some() {
+    if web_api_interfaces::TextTrackList::is_instance(scope, receiver) {
         return Some(receiver);
     }
     throw_type_error(scope, "Illegal invocation");
@@ -256,7 +249,7 @@ fn text_track_cue_list_receiver<'s>(
     args: &v8::FunctionCallbackArguments<'s>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let receiver = args.this();
-    if get_private_value(scope, receiver, TEXT_TRACK_CUE_LIST_BRAND_SLOT).is_some() {
+    if web_api_interfaces::TextTrackCueList::is_instance(scope, receiver) {
         return Some(receiver);
     }
     throw_type_error(scope, "Illegal invocation");
@@ -371,7 +364,7 @@ fn make_text_track_list<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Loca
     let list = TextTrackListObjectDeclaration::new(Vec::new())
         .bind(scope)
         .ok()?;
-    mark_simple_event_target_slot(scope, list, TEXT_TRACK_LIST_LISTENERS_SLOT);
+    initialize_simple_event_target(scope, list);
     update_indexed_list(scope, list, &[]);
     Some(list)
 }
@@ -441,6 +434,7 @@ fn text_track_list_onaddtrack_setter<'s>(
         scope,
         receiver,
         args.get(0),
+        "addtrack",
         TEXT_TRACK_LIST_ONADDTRACK_SLOT,
     );
 }
@@ -468,6 +462,7 @@ fn text_track_list_onremovetrack_setter<'s>(
         scope,
         receiver,
         args.get(0),
+        "removetrack",
         TEXT_TRACK_LIST_ONREMOVETRACK_SLOT,
     );
 }
@@ -477,10 +472,9 @@ fn update_indexed_list<'s>(
     list: v8::Local<'s, v8::Object>,
     items: &[v8::Local<'s, v8::Value>],
 ) {
-    let old_len = list
-        .get(scope, v8str(scope, "length").into())
-        .and_then(|value| value.uint32_value(scope))
-        .unwrap_or(0);
+    let old_len = get_private_value(scope, list, TEXT_TRACK_LIST_ITEMS_SLOT)
+        .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
+        .map_or(0, |items| items.length());
     for index in 0..old_len.max(items.len() as u32) {
         let Some(key) = v8_string(scope, &index.to_string()) else {
             continue;
@@ -528,7 +522,7 @@ fn make_text_track<'s>(
     )
     .bind(scope)
     .ok()?;
-    mark_simple_event_target_slot(scope, track, "__moliTextTrackListeners");
+    initialize_simple_event_target(scope, track);
     let cues = make_cue_list(scope)?;
     let active_cues = make_cue_list(scope)?;
     set_private_value(scope, track, TEXT_TRACK_CUES_SLOT, cues.into());
@@ -566,7 +560,7 @@ pub(in crate::native_bridge) fn track_text_track_getter_function<'s>(
 
 fn ensure_track_element_text_track<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     wrapper: v8::Local<'s, v8::Object>,
     handle: DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
@@ -917,7 +911,13 @@ fn text_track_oncuechange_setter<'s>(
     let Some(receiver) = text_track_receiver(scope, &args) else {
         return;
     };
-    text_track_event_handler_setter(scope, receiver, args.get(0), TEXT_TRACK_ONCUECHANGE_SLOT);
+    text_track_event_handler_setter(
+        scope,
+        receiver,
+        args.get(0),
+        "cuechange",
+        TEXT_TRACK_ONCUECHANGE_SLOT,
+    );
 }
 
 fn text_track_event_handler_getter<'s>(
@@ -933,18 +933,10 @@ fn text_track_event_handler_setter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     receiver: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
+    event_type: &str,
     slot: &'static str,
 ) {
-    set_private_value(
-        scope,
-        receiver,
-        slot,
-        if value.is_function() {
-            value
-        } else {
-            v8::null(scope).into()
-        },
-    );
+    simple_object_event_set_handler(scope, receiver, event_type, slot, value);
 }
 
 fn text_track_add_cue_callback<'s>(
@@ -1044,10 +1036,7 @@ pub(crate) fn resort_text_track_cues_for_cue<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     cue: v8::Local<'s, v8::Object>,
 ) {
-    let Some(track) = cue
-        .get(scope, v8str(scope, "track").into())
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-    else {
+    let Some(track) = text_track_cue_track(scope, cue) else {
         return;
     };
     let Some(cues) = get_private_value(scope, track, TEXT_TRACK_CUES_SLOT)
@@ -1068,14 +1057,8 @@ fn cue_sort_key<'s>(
     let Ok(cue) = v8::Local::<v8::Object>::try_from(cue) else {
         return (f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY);
     };
-    let start = cue
-        .get(scope, v8str(scope, "startTime").into())
-        .and_then(|value| value.number_value(scope))
-        .unwrap_or(f64::INFINITY);
-    let end = cue
-        .get(scope, v8str(scope, "endTime").into())
-        .and_then(|value| value.number_value(scope))
-        .unwrap_or(f64::NEG_INFINITY);
+    let (start, end) =
+        text_track_cue_times(scope, cue).unwrap_or((f64::INFINITY, f64::NEG_INFINITY));
     let order = private_number(scope, cue, TEXT_TRACK_CUE_ORDER_SLOT).unwrap_or(f64::INFINITY);
     (start, end, order)
 }
@@ -1107,7 +1090,7 @@ fn remove_cue_from_track<'s>(
 
 pub(in crate::native_bridge) fn refresh_media_active_text_track_cues(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     media_handle: DomHandle,
 ) {
     let Some(media) = node_wrapper_from_handle(scope, media_handle) else {
@@ -1149,7 +1132,7 @@ fn refresh_text_track_active_cues<'s>(
 
 fn refresh_text_track_active_cues_with_runtime<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     track: v8::Local<'s, v8::Object>,
 ) {
     let Some(active_cues) = get_private_value(scope, track, TEXT_TRACK_ACTIVE_CUES_SLOT)
@@ -1191,7 +1174,7 @@ fn refresh_text_track_active_cues_with_runtime<'s>(
 
 fn text_track_media_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     track: v8::Local<'s, v8::Object>,
 ) -> Option<DomHandle> {
     if let Some(handle) = private_dom_handle(scope, track, TEXT_TRACK_MEDIA_HANDLE_SLOT) {
@@ -1208,14 +1191,9 @@ fn cue_is_active_at<'s>(
     let Ok(cue) = v8::Local::<v8::Object>::try_from(cue) else {
         return false;
     };
-    let start = cue
-        .get(scope, v8str(scope, "startTime").into())
-        .and_then(|value| value.number_value(scope))
-        .unwrap_or(f64::INFINITY);
-    let end = cue
-        .get(scope, v8str(scope, "endTime").into())
-        .and_then(|value| value.number_value(scope))
-        .unwrap_or(f64::NEG_INFINITY);
+    let Some((start, end)) = text_track_cue_times(scope, cue) else {
+        return false;
+    };
     start <= current_time && current_time < end
 }
 
@@ -1239,12 +1217,7 @@ fn text_track_cue_list_get_cue_by_id_callback<'s>(
         let Ok(cue) = v8::Local::<v8::Object>::try_from(item) else {
             continue;
         };
-        let cue_id = cue
-            .get(scope, v8str(scope, "id").into())
-            .and_then(|value| value.to_string(scope))
-            .map(|value| value.to_rust_string_lossy(scope))
-            .unwrap_or_default();
-        if cue_id == id {
+        if text_track_cue_id(scope, cue).as_deref() == Some(&id) {
             rv.set(cue.into());
             return;
         }
@@ -1283,7 +1256,7 @@ fn text_track_list_get_track_by_id_callback<'s>(
 
 pub(in crate::native_bridge) fn apply_default_text_track_modes_for_media(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     media_handle: DomHandle,
 ) {
     let runtime = unsafe { &*runtime_ptr };
@@ -1299,7 +1272,7 @@ pub(in crate::native_bridge) fn apply_default_text_track_modes_for_media(
 
 pub(crate) fn queue_default_text_track_mode_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     let runtime = unsafe { &*runtime_ptr };
@@ -1313,7 +1286,7 @@ pub(crate) fn queue_default_text_track_mode_if_needed(
 
 pub(crate) fn apply_default_text_track_mode_for_track(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> bool {
     let runtime = unsafe { &*runtime_ptr };
@@ -1339,7 +1312,7 @@ pub(crate) fn apply_default_text_track_mode_for_track(
 
 pub(crate) fn queue_text_track_load_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     queue_text_track_load_with_media_gate(scope, runtime_ptr, handle, None);
@@ -1347,7 +1320,7 @@ pub(crate) fn queue_text_track_load_if_needed(
 
 pub(crate) fn queue_media_selection_text_track_loads(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     media_handle: DomHandle,
     media_sequence: MediaLoadSequenceId,
 ) {
@@ -1383,7 +1356,7 @@ pub(crate) fn queue_media_selection_text_track_loads(
 
 fn queue_text_track_load_with_media_gate(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     media_gate: Option<(DomHandle, MediaLoadSequenceId)>,
 ) {
@@ -1443,7 +1416,7 @@ fn queue_text_track_load_with_media_gate(
 
 fn register_media_text_track_gate(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     media_handle: DomHandle,
     media_sequence: MediaLoadSequenceId,
     track_handle: DomHandle,
@@ -1455,7 +1428,7 @@ fn register_media_text_track_gate(
 }
 
 fn queue_track_load_start(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     sequence: TextTrackLoadSequenceId,
 ) -> bool {
@@ -1469,7 +1442,7 @@ fn queue_track_load_start(
 
 fn apply_track_load_start(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     task_id: RendererPageTextTrackLoadTaskId,
 ) -> bool {
     let handle = task_id.track();
@@ -1514,7 +1487,11 @@ fn apply_track_load_start(
         Ok(crate::network_host::TextTrackResourceFetchStart::Pending) => {}
         Ok(crate::network_host::TextTrackResourceFetchStart::PolicySkipped) => {
             let followup = unsafe { &mut *runtime_ptr }
-                .complete_pending_text_track_local_if_matches(handle, sequence, Ok(String::new()));
+                .complete_pending_text_track_local_if_matches(
+                    handle,
+                    sequence,
+                    PendingTextTrackLoadTerminal::Ready(String::new()),
+                );
             queue_text_track_terminal_followup(scope, runtime_ptr, handle, sequence, followup);
         }
         Ok(crate::network_host::TextTrackResourceFetchStart::Local(result)) => {
@@ -1523,8 +1500,18 @@ fn apply_track_load_start(
             queue_text_track_terminal_followup(scope, runtime_ptr, handle, sequence, followup);
         }
         Err(error) => {
+            tracing::debug!(
+                track = handle.index(),
+                sequence = sequence.get(),
+                %error,
+                "text-track resource selection failed"
+            );
             let followup = unsafe { &mut *runtime_ptr }
-                .complete_pending_text_track_local_if_matches(handle, sequence, Err(error));
+                .complete_pending_text_track_local_if_matches(
+                    handle,
+                    sequence,
+                    PendingTextTrackLoadTerminal::FetchFailed,
+                );
             queue_text_track_terminal_followup(scope, runtime_ptr, handle, sequence, followup);
         }
     }
@@ -1533,7 +1520,7 @@ fn apply_track_load_start(
 
 pub(crate) fn queue_text_track_terminal_followup(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     sequence: TextTrackLoadSequenceId,
     followup: Option<PendingTextTrackLoadTerminalFollowup>,
@@ -1560,7 +1547,7 @@ pub(crate) fn queue_text_track_terminal_followup(
 
 fn apply_track_terminal(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     task_id: RendererPageTextTrackLoadTaskId,
     kind: RendererPageTextTrackLoadTaskKind,
 ) -> bool {
@@ -1638,7 +1625,7 @@ fn apply_track_terminal(
 
 pub(crate) fn apply_text_track_load_task(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     task_id: RendererPageTextTrackLoadTaskId,
     kind: RendererPageTextTrackLoadTaskKind,
 ) -> bool {
@@ -1655,7 +1642,7 @@ pub(crate) fn apply_text_track_load_task(
 
 fn cancel_text_track_sequence_and_settle_media(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     let followup =
@@ -1663,13 +1650,13 @@ fn cancel_text_track_sequence_and_settle_media(
     super::queue_media_canplay_after_text_tracks(scope, runtime_ptr, followup);
 }
 
-fn track_source_still_matches(runtime: &JsContextHost, handle: DomHandle, src: &str) -> bool {
+fn track_source_still_matches(runtime: &PageScriptHost, handle: DomHandle, src: &str) -> bool {
     element_attribute(runtime, handle, "src").unwrap_or_default() == src
 }
 
 fn queue_text_track_list_track_event<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     media_handle: DomHandle,
     list: v8::Local<'s, v8::Object>,
     track: v8::Local<'s, v8::Object>,
@@ -1694,24 +1681,18 @@ pub(crate) fn dispatch_text_track_list_event<'s>(
         return false;
     };
     if let Some(event) = construct_event(scope, "TrackEvent", event_type, init) {
-        let _ = dispatch_simple_event_target_event(
-            scope,
-            list,
-            TEXT_TRACK_LIST_LISTENERS_SLOT,
-            event_type,
-            event,
-        );
+        let _ = dispatch_simple_event_target_event(scope, list, event_type, event);
         true
     } else {
         false
     }
 }
 
-fn track_has_media_parent(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn track_has_media_parent(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     track_media_parent(runtime, handle).is_some()
 }
 
-fn track_media_parent(runtime: &JsContextHost, handle: DomHandle) -> Option<DomHandle> {
+fn track_media_parent(runtime: &PageScriptHost, handle: DomHandle) -> Option<DomHandle> {
     runtime
         .dom_host()
         .node(handle)
@@ -1724,7 +1705,7 @@ fn track_media_parent(runtime: &JsContextHost, handle: DomHandle) -> Option<DomH
 
 pub(in crate::native_bridge) fn queue_text_track_load_if_source(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     name: &str,
 ) {

@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use moli_cookie_jar::new_shared_browser_cookie_store;
 use parking_lot::Mutex;
 use rcgen::{
@@ -12,6 +12,7 @@ use tokio::{
     net::TcpListener,
     sync::oneshot,
     task::{JoinHandle, JoinSet},
+    time::{Duration, timeout},
 };
 use tokio_rustls::{
     TlsAcceptor,
@@ -24,7 +25,8 @@ use tokio_rustls::{
 use url::Url;
 
 use crate::{
-    FetchCancelHandle, FetchClient, FetchClientHandle, FetchConfig, Request, RequestCredentialsMode,
+    FetchCancelHandle, FetchClient, FetchClientHandle, FetchConfig, RedirectInfo, RedirectSource,
+    Request, RequestCredentialsMode, RequestMode, network_fetch_result::NetworkObservationRecorder,
 };
 
 use super::support::unique_test_cache_dir;
@@ -121,6 +123,85 @@ struct TlsServer {
     task: JoinHandle<()>,
 }
 
+#[derive(Debug)]
+struct ObservedHttpsProxyRequest {
+    request_head: String,
+    server_name: Option<String>,
+    client_certificates: Vec<CertificateDer<'static>>,
+}
+
+struct HttpsProxy {
+    url: String,
+    task: Option<JoinHandle<Result<ObservedHttpsProxyRequest>>>,
+}
+
+impl HttpsProxy {
+    async fn spawn(credentials: &TlsCredentials) -> Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let acceptor = credentials.acceptor.clone();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut stream = acceptor.accept(stream).await?;
+            let server_name = stream.get_ref().1.server_name().map(str::to_owned);
+            let client_certificates = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .unwrap_or_default()
+                .to_vec();
+            let mut request_head = Vec::new();
+            while !request_head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                if stream.read(&mut byte).await? == 0 {
+                    bail!("HTTPS proxy client closed before completing its request");
+                }
+                request_head.push(byte[0]);
+                if request_head.len() > 64 * 1024 {
+                    bail!("HTTPS proxy request headers are too large");
+                }
+            }
+            let body = b"through-https-proxy";
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stream.write_all(body).await?;
+            stream.flush().await?;
+            Ok(ObservedHttpsProxyRequest {
+                request_head: String::from_utf8(request_head)?,
+                server_name,
+                client_certificates,
+            })
+        });
+        Ok(Self {
+            url: format!("https://localhost:{port}"),
+            task: Some(task),
+        })
+    }
+
+    async fn finish(mut self) -> Result<ObservedHttpsProxyRequest> {
+        let task = self
+            .task
+            .take()
+            .expect("HTTPS proxy task should be present");
+        timeout(Duration::from_secs(5), task).await??
+    }
+}
+
+impl Drop for HttpsProxy {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl TlsServer {
     async fn spawn(credentials: &TlsCredentials) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -154,6 +235,10 @@ impl TlsServer {
                         }
                         let head = String::from_utf8(head)?;
                         let path = head.split_whitespace().nth(1).unwrap().to_owned();
+                        let cors_headers = head.lines().filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("Origin"))
+                            .map(|(_, origin)| format!("Access-Control-Allow-Origin: {}\r\nAccess-Control-Allow-Credentials: true\r\n", origin.trim()))
+                            .unwrap_or_default();
                         observed.lock().push(ObservedRequest {
                             connection_id,
                             path: path.clone(),
@@ -161,12 +246,12 @@ impl TlsServer {
                         });
                         let response = match path.as_str() {
                             "/redirect-cross" => format!(
-                                "HTTP/1.1 302 Found\r\nLocation: https://localhost:{port}/redirect-back\r\nContent-Length: 0\r\n\r\n"
+                                "HTTP/1.1 302 Found\r\n{cors_headers}Location: https://localhost:{port}/redirect-back\r\nContent-Length: 0\r\n\r\n"
                             ),
                             "/redirect-back" => format!(
-                                "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{port}/whoami\r\nContent-Length: 0\r\n\r\n"
+                                "HTTP/1.1 302 Found\r\n{cors_headers}Location: https://127.0.0.1:{port}/whoami\r\nContent-Length: 0\r\n\r\n"
                             ),
-                            _ => "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok".to_owned(),
+                            _ => format!("HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"),
                         };
                         // HTTP/1.1 stays open for further requests, including
                         // any incorrect reuse of an authenticated connection.
@@ -231,6 +316,82 @@ impl Transport {
 }
 
 #[tokio::test]
+async fn tls_trust_failure_reports_curl_details_in_every_transport() -> Result<()> {
+    let credentials = TlsCredentials::new()?;
+    let server = TlsServer::spawn(&credentials).await?;
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(String::new()));
+    config.set_request_timeout_ms(5_000);
+    // The generated CA is intentionally absent from the client's trust store.
+    for transport in Transport::ALL {
+        let client = FetchClient::new(&config, new_shared_browser_cookie_store());
+        let request = Request::get(server.url.as_str())?
+            .with_network_observation_recorder(NetworkObservationRecorder::default());
+        let error = transport.fetch(&client, request).await.unwrap_err();
+        let curl_error = error.downcast_ref::<curl::Error>().unwrap();
+        assert!(curl_error.is_peer_failed_verification(), "{error:#}");
+        let detail = curl_error
+            .extra_description()
+            .expect("libcurl should preserve its TLS error buffer");
+        assert!(!detail.is_empty());
+        let reason = match transport {
+            // The callback API returns the original error chain, which the
+            // CLI's fallback formatting must also preserve.
+            Transport::Buffered => format!("{error:#}"),
+            Transport::Html | Transport::Raw => {
+                let failure = error
+                    .downcast_ref::<crate::NetworkFetchFailureContext>()
+                    .unwrap();
+                assert_eq!(
+                    failure.network_error_text(),
+                    "net::ERR_CERT_AUTHORITY_INVALID"
+                );
+                failure.reason().to_owned()
+            }
+        };
+        assert!(reason.contains("curl request failed"), "{reason}");
+        assert!(reason.contains("[60]"), "{reason}");
+        assert!(reason.contains(detail), "{reason}");
+        assert!(client.shutdown().is_clean());
+    }
+    assert!(server.requests.lock().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn https_proxy_uses_shared_dns_and_proxy_hostname_tls() -> Result<()> {
+    let credentials = TlsCredentials::new()?;
+    let proxy = HttpsProxy::spawn(&credentials).await?;
+    let mut config = credentials.fetch_config();
+    config.set_http_proxy(Some(proxy.url.clone()));
+    config.set_http_no_proxy(Some(String::new()));
+    let client = FetchClient::new(&config, new_shared_browser_cookie_store());
+
+    let response = client
+        .fetch(Request::get(
+            "http://fetch-target.invalid/through-https-proxy",
+        )?)
+        .await?;
+    assert_eq!(response.body_text(), "through-https-proxy");
+    assert!(client.shutdown().is_clean());
+
+    let observed = proxy.finish().await?;
+    assert_eq!(observed.server_name.as_deref(), Some("localhost"));
+    assert!(
+        observed
+            .request_head
+            .starts_with("GET http://fetch-target.invalid/through-https-proxy HTTP/1.1\r\n"),
+        "unexpected HTTPS proxy request: {:?}",
+        observed.request_head
+    );
+    assert!(
+        observed.client_certificates.is_empty(),
+        "origin client identity must not be sent to the HTTPS proxy"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn tls_client_certificate_respects_credentials_in_every_transport() -> Result<()> {
     let credentials = TlsCredentials::new()?;
     let server = TlsServer::spawn(&credentials).await?;
@@ -249,6 +410,7 @@ async fn tls_client_certificate_respects_credentials_in_every_transport() -> Res
             );
             let request = Request::get(server.url.as_str())?
                 .with_initiator_url(initiator)
+                .with_request_origin(moli_url::WebOrigin::from_url(initiator))
                 .with_credentials_mode(mode);
             transport.fetch(&client, request).await?;
             let observed = server.requests.lock().pop().unwrap();
@@ -286,6 +448,7 @@ async fn tls_client_certificate_isolated_on_reused_connections() -> Result<()> {
         ] {
             let request = Request::get(server.url.as_str())?
                 .with_initiator_url(initiator)
+                .with_request_origin(moli_url::WebOrigin::from_url(initiator))
                 .with_credentials_mode(mode);
             transport.fetch(&client, request).await?;
         }
@@ -310,14 +473,14 @@ async fn tls_client_certificate_isolated_on_reused_connections() -> Result<()> {
 }
 
 #[tokio::test]
-async fn tls_client_certificate_uses_current_redirect_origin() -> Result<()> {
+async fn tls_client_certificate_preserves_cross_origin_redirect_taint() -> Result<()> {
     let credentials = TlsCredentials::new()?;
     let server = TlsServer::spawn(&credentials).await?;
     for transport in Transport::ALL {
         for (mode, expected_authentication) in [
             (RequestCredentialsMode::Include, [true, true, true]),
             (RequestCredentialsMode::Omit, [false, false, false]),
-            (RequestCredentialsMode::SameOrigin, [true, false, true]),
+            (RequestCredentialsMode::SameOrigin, [true, false, false]),
         ] {
             let client = FetchClient::new(
                 &credentials.fetch_config(),
@@ -325,6 +488,8 @@ async fn tls_client_certificate_uses_current_redirect_origin() -> Result<()> {
             );
             let request = Request::get(server.url.join("/redirect-cross")?.as_str())?
                 .with_initiator_url(&server.url)
+                .with_request_origin(moli_url::WebOrigin::from_url(&server.url))
+                .with_request_mode(RequestMode::Cors)
                 .with_credentials_mode(mode);
             transport.fetch(&client, request).await?;
             let observed = std::mem::take(&mut *server.requests.lock());
@@ -348,6 +513,63 @@ async fn tls_client_certificate_uses_current_redirect_origin() -> Result<()> {
             }
             assert!(client.shutdown().is_clean());
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn tls_client_certificate_preserves_service_worker_redirect_taint() -> Result<()> {
+    let credentials = TlsCredentials::new()?;
+    let server = TlsServer::spawn(&credentials).await?;
+    let mut cross_origin = server.url.clone();
+    cross_origin.set_host(Some("localhost"))?;
+    for transport in Transport::ALL {
+        let client = FetchClient::new(
+            &credentials.fetch_config(),
+            new_shared_browser_cookie_store(),
+        );
+        // Populate an authenticated keep-alive connection before handing a
+        // redirected same-origin-credentials request to this same endpoint.
+        transport
+            .fetch(&client, Request::get(server.url.as_str())?)
+            .await?;
+        let request = Request::get(server.url.as_str())?
+            .with_initiator_url(&server.url)
+            .with_request_origin(moli_url::WebOrigin::from_url(&server.url))
+            .with_request_mode(RequestMode::Cors)
+            .with_credentials_mode(RequestCredentialsMode::SameOrigin)
+            .with_redirect_chain(vec![RedirectInfo {
+                source: RedirectSource::ServiceWorker,
+                from_url: cross_origin.clone(),
+                to_url: server.url.clone(),
+                status: 302,
+                headers: vec![(
+                    "Location".to_owned(),
+                    server.url.as_str().as_bytes().to_vec(),
+                )],
+                network_extra_info_available: false,
+                request_extra_info: None,
+                dispatched_request: None,
+                response_extra_info: None,
+                redirect_has_extra_info: false,
+                request_cookie_report: None,
+                cookie_set_reports: Vec::new(),
+                from_cache: false,
+                negotiated_http_version: None,
+            }]);
+        transport.fetch(&client, request).await?;
+        let observed = std::mem::take(&mut *server.requests.lock());
+        assert_eq!(observed.len(), 2, "{transport:?}");
+        assert_eq!(
+            observed[0].client_certificates.as_slice(),
+            std::slice::from_ref(&credentials.client_certificate)
+        );
+        assert!(
+            observed[1].client_certificates.is_empty(),
+            "{transport:?}: {observed:?}"
+        );
+        assert_ne!(observed[0].connection_id, observed[1].connection_id);
+        assert!(client.shutdown().is_clean());
     }
     Ok(())
 }

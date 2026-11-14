@@ -1,24 +1,25 @@
 use super::*;
 use crate::util::{
-    callback_data_index_value, get_private_value, global_constructor_object,
-    serialize_v8_iter_array, set_private_value,
+    callback_data_index_value, get_private_value, serialize_v8_iter_array, set_private_value,
 };
+use crate::web_api_interfaces;
+use moli_v8_util::buffer_source_bytes_from_value as buffer_source_value_bytes;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct NamedAlgorithmDeclaration<'scope> {
     name: Option<v8::Local<'scope, v8::String>>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct AlgorithmNameCloneDeclaration<'scope> {
     name: v8::Local<'scope, v8::Value>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct AlgorithmCloneDeclaration<'scope> {
     name: v8::Local<'scope, v8::Value>,
     hash: Option<v8::Local<'scope, v8::Object>>,
@@ -29,7 +30,7 @@ struct AlgorithmCloneDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct HmacAlgorithmDeclaration<'scope> {
     name: Option<v8::Local<'scope, v8::String>>,
     hash: v8::Local<'scope, v8::Object>,
@@ -37,14 +38,14 @@ struct HmacAlgorithmDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct SymmetricAlgorithmDeclaration<'scope> {
     name: Option<v8::Local<'scope, v8::String>>,
     length: usize,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct RsaAlgorithmDeclaration<'scope> {
     name: Option<v8::Local<'scope, v8::String>>,
     hash: v8::Local<'scope, v8::Object>,
@@ -53,7 +54,7 @@ struct RsaAlgorithmDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties, enumerable)]
+#[webapi(plain, data_properties, enumerable)]
 struct NamedCurveAlgorithmDeclaration<'scope> {
     name: Option<v8::Local<'scope, v8::String>>,
     named_curve: Option<v8::Local<'scope, v8::String>>,
@@ -139,7 +140,7 @@ const CRYPTO_KEY_USAGE_ORDER: &[&str] = &[
 ];
 
 #[derive(WebApiObject)]
-#[webapi(interface = "CryptoKey", require_prototype, scope_lifetime = 'scope)]
+#[webapi(interface = web_api_interfaces::CryptoKey, require_prototype, scope_lifetime = 'scope)]
 struct CryptoKeyObjectDeclaration<'scope, 'value> {
     #[webapi(slot = CRYPTO_KEY_KIND_SLOT)]
     key_type: &'value str,
@@ -158,7 +159,7 @@ struct CryptoKeyObjectDeclaration<'scope, 'value> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "CryptoKey")]
+#[webapi(interface = web_api_interfaces::CryptoKey)]
 struct CryptoKeyPrototypeAccessorsDeclaration {
     #[webapi(
         accessor_property,
@@ -274,7 +275,7 @@ pub(crate) fn is_crypto_key_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     key: v8::Local<'s, v8::Object>,
 ) -> bool {
-    get_private_value(scope, key, CRYPTO_KEY_KIND_SLOT).is_some()
+    web_api_interfaces::CryptoKey::is_instance(scope, key)
 }
 
 pub(crate) fn crypto_key_clone_payload_from_object<'s>(
@@ -294,7 +295,13 @@ pub(crate) fn crypto_key_object_from_clone_payload<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     payload: CryptoKeyClonePayload,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    global_constructor_object(scope, "CryptoKey")?;
+    // Like Blink's ExecutionContextExposesInterface(kCryptoKeyTag), check
+    // native exposure before resolving the intrinsic identity. Public globals
+    // can be deleted or replaced independently of secure-context policy.
+    if !super::super::exposed_interfaces::is_realm_interface_exposed(scope, "CryptoKey") {
+        return None;
+    }
+    super::super::ensure_intrinsic_interface_constructor(scope, "CryptoKey").ok()?;
     if !clone_payload_algorithm_is_supported(&payload.key_type, &payload.algorithm) {
         return None;
     }
@@ -578,26 +585,6 @@ fn cloned_public_exponent_view<'s>(
         .and_then(|value| buffer_source_value_bytes(scope, value))
         .and_then(|bytes| blob::array_buffer_from_bytes(scope, bytes))
         .and_then(|buffer| v8::Uint8Array::new(scope, buffer, 0, buffer.byte_length()))
-}
-
-fn buffer_source_value_bytes<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-) -> Option<Vec<u8>> {
-    if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
-        let view = v8::Uint8Array::new(scope, buffer, 0, buffer.byte_length())?;
-        let mut bytes = vec![0; view.byte_length()];
-        let written = view.copy_contents(&mut bytes);
-        bytes.truncate(written);
-        return Some(bytes);
-    }
-    if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
-        let mut bytes = vec![0; view.byte_length()];
-        let written = view.copy_contents(&mut bytes);
-        bytes.truncate(written);
-        return Some(bytes);
-    }
-    None
 }
 
 fn cloned_usages_array<'s>(

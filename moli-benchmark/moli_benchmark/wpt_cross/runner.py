@@ -1,8 +1,8 @@
 """Per-engine WPT case runner.
 
-Connects to a launched :class:`EngineDriver` and executes either testharness
-cases (through ``window.__bench_wpt__``) or manifest-backed screenshot
-reftests at a fixed viewport.
+Connects to a launched :class:`EngineDriver` and executes testharness cases
+(through ``window.__bench_wpt__``), crashtests (through WPT readiness and crash
+signals), or manifest-backed screenshot reftests at a fixed viewport.
 
 Classifies each result as ``pass`` / ``fail`` / ``timeout`` / ``crash`` /
 ``error`` so that the cross-engine matrix can be built without rewriting raw
@@ -25,9 +25,10 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 from PIL import Image, ImageChops
 
-from ..raw_cdp import RawCdpClient, RawCdpError, connect_raw_cdp
+from ..raw_cdp import RawCdpClient, RawCdpCommandError, RawCdpError, connect_raw_cdp
 from .case_set import FuzzyTolerance
 from .engine import EngineDriver, EngineDriverHandle
+from .native_input import NativeInput
 
 LAYOUT_VIEWPORT_WIDTH = 800
 LAYOUT_VIEWPORT_HEIGHT = 600
@@ -60,7 +61,14 @@ class ReftestRun:
     references: tuple[ReftestReferenceRun, ...]
 
 
-CaseRun = tuple[str, str] | tuple[str, str, float] | ReftestRun
+@dataclass(frozen=True)
+class CrashtestRun:
+    case_path: str
+    url: str
+    timeout_seconds: float
+
+
+CaseRun = tuple[str, str] | tuple[str, str, float] | ReftestRun | CrashtestRun
 
 
 # WPT testharness.js status constants (testharness.js: TestsStatus)
@@ -147,6 +155,7 @@ class _AttachedPage:
     target_id: str
     session_id: str
     baseline_target_ids: frozenset[str] | None
+    native_input: NativeInput | None = None
 
 
 @dataclass(frozen=True)
@@ -252,7 +261,14 @@ def _target_ids(infos: list[dict[str, Any]]) -> frozenset[str]:
 
 async def _close_target(client: RawCdpClient, target_id: str) -> None:
     command_id = await client.send("Target.closeTarget", {"targetId": target_id})
-    response, _ = await client.recv_until_id(command_id, timeout=5)
+    try:
+        response, _ = await client.recv_until_id(command_id, timeout=5)
+    except RawCdpError:
+        # Another target/context cleanup can win this race. Confirm that the
+        # requested target is gone before accepting the close failure.
+        if target_id not in _target_ids(await _target_infos(client)):
+            return
+        raise
     success = (response.get("result") or {}).get("success")
     if success is False:
         raise RawCdpError(f"Target.closeTarget rejected target {target_id}")
@@ -260,6 +276,13 @@ async def _close_target(client: RawCdpClient, target_id: str) -> None:
 
 async def _close_page(client: RawCdpClient, page: _AttachedPage) -> None:
     """Dispose one case's storage context and every target created inside it."""
+
+    input_cleanup_error = None
+    if page.native_input is not None:
+        try:
+            await page.native_input.close()
+        except Exception as error:
+            input_cleanup_error = error
 
     try:
         before = await _target_infos(client)
@@ -293,6 +316,8 @@ async def _close_page(client: RawCdpClient, page: _AttachedPage) -> None:
     try:
         after = await _target_infos(client)
     except (RawCdpError, asyncio.TimeoutError):
+        if input_cleanup_error is not None and page.browser_context_id is None:
+            raise input_cleanup_error
         return
 
     residual_ids = {
@@ -327,12 +352,15 @@ async def _close_page(client: RawCdpClient, page: _AttachedPage) -> None:
             raise RawCdpError(
                 f"case cleanup left auxiliary targets alive: {sorted(leaked)}"
             )
+    if input_cleanup_error is not None and page.browser_context_id is None:
+        raise input_cleanup_error
 
 
 async def _attach_page(
     client: RawCdpClient,
     *,
     viewport: Viewport | None = None,
+    input_endpoint: str | None = None,
 ) -> _AttachedPage:
     """Create an isolated BrowserContext + Target for exactly one WPT case."""
 
@@ -402,6 +430,11 @@ async def _attach_page(
             target_id=target,
             session_id=session_id,
             baseline_target_ids=baseline_target_ids,
+            native_input=(
+                await NativeInput.attach(input_endpoint, target, browser_context_id)
+                if input_endpoint
+                else None
+            ),
         )
     except BaseException:
         if target is not None:
@@ -610,7 +643,11 @@ async def _run_one_case(
             )
             response, eval_seen = await client.recv_until_id(
                 eval_id,
-                timeout=max(0.01, min(5.0, deadline - time.perf_counter())),
+                # A synchronous test can keep the renderer busy for longer than
+                # an ordinary CDP command timeout.  Once the probe is in flight,
+                # let it use the case's remaining budget instead of turning a
+                # progressing test into an infrastructure error after 5 seconds.
+                timeout=max(0.01, deadline - time.perf_counter()),
             )
             seen_messages.extend(eval_seen)
         except (RawCdpError, asyncio.TimeoutError) as error:
@@ -689,6 +726,185 @@ async def _run_one_case(
         js_exceptions=js_exceptions,
         error=error,
     )
+
+
+_CRASHTEST_READY_SCRIPT = Path(__file__).with_name("crashtest_ready.js").read_text(encoding="utf-8")
+
+
+async def _run_one_crashtest(
+    *,
+    client: RawCdpClient,
+    session_id: str,
+    target_id: str,
+    case: CrashtestRun,
+) -> CaseResult:
+    started = time.perf_counter()
+    deadline = started + case.timeout_seconds
+    seen: list[dict[str, Any]] = []
+
+    def result(status: str, error: str | None = None) -> CaseResult:
+        console_errors, js_exceptions = _count_traces(seen)
+        return CaseResult(
+            case_path=case.case_path,
+            url=case.url,
+            status=status,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            error=error,
+            console_errors=console_errors,
+            js_exceptions=js_exceptions,
+            test_type="crashtest",
+            payload_source="crashtest-ready" if status == "pass" else None,
+        )
+
+    async def receive() -> dict[str, Any]:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        message = await asyncio.wait_for(client.recv(), timeout=remaining)
+        seen.append(message)
+        # A renderer crash need not terminate the browser process or reply
+        # to the outstanding command. Observe it as soon as it arrives.
+        if (
+            message.get("method") == "Inspector.targetCrashed"
+            and message.get("sessionId") == session_id
+        ) or (
+            message.get("method") == "Target.targetCrashed"
+            and (message.get("params") or {}).get("targetId") == target_id
+        ):
+            raise _PageSessionUnusable(result("crash", "crashtest target crashed"))
+        return message
+
+    async def command(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        command_started = time.perf_counter()
+        message_index = len(seen)
+        command_id = await client.send(method, params, session_id=session_id)
+        while True:
+            message = await receive()
+            if message.get("id") == command_id:
+                if "error" in message:
+                    raise RawCdpCommandError(
+                        method=method,
+                        message_id=command_id,
+                        error=message["error"],
+                        messages=seen[message_index:],
+                        elapsed_ms=(time.perf_counter() - command_started) * 1000.0,
+                    )
+                return message
+
+    def replacement_document(current: _NavigationIdentity) -> _NavigationIdentity | None:
+        replacement = None
+        current_committed = False
+        for message in seen:
+            if (
+                message.get("sessionId") != session_id
+                or message.get("method") != "Page.frameNavigated"
+            ):
+                continue
+            frame = (message.get("params") or {}).get("frame") or {}
+            if frame.get("id") != current.frame_id:
+                continue
+            loader = frame.get("loaderId")
+            url = frame.get("url")
+            if loader == current.loader_id:
+                current_committed = True
+            elif current_committed and isinstance(loader, str) and loader and isinstance(url, str):
+                replacement = _NavigationIdentity(session_id, current.frame_id, loader, url)
+        return replacement
+
+    async def wait_for_loaded_document(current: _NavigationIdentity) -> _NavigationIdentity:
+        latest = current
+        committed = False
+        loaded = False
+        cursor = 0
+        while True:
+            for message in seen[cursor:]:
+                if message.get("sessionId") != session_id:
+                    continue
+                method = message.get("method")
+                params = message.get("params") or {}
+                if method == "Page.frameNavigated":
+                    frame = params.get("frame") or {}
+                    if frame.get("id") != current.frame_id:
+                        continue
+                    loader = frame.get("loaderId")
+                    url = frame.get("url")
+                    if not committed:
+                        committed = loader == current.loader_id
+                    elif (
+                        isinstance(loader, str) and loader
+                        and loader != latest.loader_id and isinstance(url, str)
+                    ):
+                        latest = _NavigationIdentity(session_id, current.frame_id, loader, url)
+                        loaded = False
+                elif committed and method == "Page.documentOpened":
+                    frame = params.get("frame") or {}
+                    if frame.get("id") == latest.frame_id and frame.get("loaderId") == latest.loader_id:
+                        loaded = False
+                elif (
+                    committed
+                    and method == "Page.lifecycleEvent"
+                    and params.get("frameId") == latest.frame_id
+                    and params.get("loaderId") == latest.loader_id
+                ):
+                    if params.get("name") == "init":
+                        loaded = False
+                    elif params.get("name") == "load":
+                        loaded = True
+            cursor = len(seen)
+            if loaded:
+                return latest
+            await receive()
+
+    try:
+        await command("Inspector.enable")
+        response = await command("Page.navigate", {"url": case.url})
+        identity = _navigation_identity(response, session_id=session_id, expected_url=case.url)
+        current = identity
+        # Bind the initial test Document using protocol identity before running
+        # any readiness script. A test may then navigate or use replaceState;
+        # its current URL is not a stable identity for that initial commit.
+        while (committed_url := _navigation_commit_url(seen, identity)) is None:
+            await receive()
+        commit_error = _navigation_commit_error(identity, committed_url)
+        if commit_error is not None:
+            return result("error", commit_error)
+        while True:
+            # document.open() can erase a load listener without destroying its
+            # realm. Observe the current main-frame load before injecting the
+            # unchanged WPT readiness sequence into that Document.
+            current = await wait_for_loaded_document(current)
+            try:
+                response = await command(
+                    "Runtime.evaluate",
+                    {
+                        "expression": f"({_CRASHTEST_READY_SCRIPT})()",
+                        "returnByValue": True,
+                        "awaitPromise": True,
+                    },
+                )
+                value = _remote_object_value(response)
+                if not isinstance(value, dict) or value.get("complete") is not True:
+                    return result("error", f"crashtest readiness script failed: {response}")
+                return result("pass")
+            except RawCdpCommandError as error:
+                if (
+                    error.method != "Runtime.evaluate"
+                    or error.error.get("code") != -32000
+                    or error.error.get("message") != "Execution context was destroyed."
+                    or not _has_navigation_evidence(seen, identity)
+                ):
+                    raise
+                # A navigating crashtest can retire its pending readiness
+                # promise. Continue only after this same frame commits a new
+                # Document, then require its full readiness sequence. This is
+                # one case and one navigation command with the original budget.
+                while (replacement := replacement_document(current)) is None:
+                    await receive()
+                current = replacement
+    except asyncio.TimeoutError as error:
+        raise _PageSessionUnusable(result("timeout", "crashtest did not become ready within timeout")) from error
+    except RawCdpError as error:
+        raise _PageSessionUnusable(result("error", f"crashtest command failed: {error}")) from error
 
 
 _REFTEST_LOCATION_EXPRESSION = """
@@ -1389,7 +1605,7 @@ async def _run_async(
         effective_viewport = LAYOUT_VIEWPORT
 
     try:
-        page = await _attach_page(client, viewport=effective_viewport)
+        page = await _attach_page(client, viewport=effective_viewport, input_endpoint=handle.endpoint)
     except Exception as error:
         result.setup_error = f"attach failed: {error}"
         try:
@@ -1444,6 +1660,8 @@ async def _run_async(
                 consecutive_relaunch_failures = 0
                 relaunch_count += 1
                 # Swap in a fresh engine and the isolated page for its next case.
+                if page.native_input is not None:
+                    await page.native_input.close()
                 try:
                     await client.websocket.close()
                 except Exception:
@@ -1454,6 +1672,8 @@ async def _run_async(
                 continue
 
             try:
+                if page.native_input is not None:
+                    page.native_input.deadline = time.perf_counter() + timeout_seconds
                 if isinstance(case, ReftestRun):
                     if effective_viewport is None:
                         raise RuntimeError("reftest requires a fixed viewport")
@@ -1465,6 +1685,13 @@ async def _run_async(
                         engine=driver.name,
                         artifact_output_dir=artifact_output_dir,
                         reference_cache=reference_cache,
+                    )
+                elif isinstance(case, CrashtestRun):
+                    case_result = await _run_one_crashtest(
+                        client=client,
+                        session_id=page.session_id,
+                        target_id=page.target_id,
+                        case=case,
                     )
                 else:
                     case_result = await _run_one_case(
@@ -1502,6 +1729,8 @@ async def _run_async(
                         )
                     break
                 # Tear down current connection + engine, relaunch fresh.
+                if page.native_input is not None:
+                    await page.native_input.close()
                 try:
                     await client.websocket.close()
                 except Exception:
@@ -1556,7 +1785,7 @@ async def _run_async(
             if case_index + 1 < len(cases):
                 try:
                     await _close_page(client, page)
-                    page = await _attach_page(client, viewport=effective_viewport)
+                    page = await _attach_page(client, viewport=effective_viewport, input_endpoint=handle.endpoint)
                 except Exception:
                     # The completed case keeps its result, but no later case may
                     # inherit an incompletely disposed context or target set.
@@ -1636,7 +1865,7 @@ async def _try_relaunch(
             pass
         return None
     try:
-        new_page = await _attach_page(new_client, viewport=viewport)
+        new_page = await _attach_page(new_client, viewport=viewport, input_endpoint=new_handle.endpoint)
     except Exception:
         try:
             await new_client.websocket.close()
@@ -1683,7 +1912,7 @@ async def _wait_then_retry_launch(
 
 
 def _case_parts(case: CaseRun, default_timeout: float) -> tuple[str, str, float]:
-    if isinstance(case, ReftestRun):
+    if isinstance(case, (ReftestRun, CrashtestRun)):
         return case.case_path, case.url, case.timeout_seconds
     if len(case) == 3:
         return case[0], case[1], case[2]
@@ -1691,6 +1920,8 @@ def _case_parts(case: CaseRun, default_timeout: float) -> tuple[str, str, float]
 
 
 def _case_test_type(case: CaseRun) -> str:
+    if isinstance(case, CrashtestRun):
+        return "crashtest"
     return "reftest" if isinstance(case, ReftestRun) else "testharness"
 
 

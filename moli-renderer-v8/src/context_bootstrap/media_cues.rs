@@ -1,10 +1,11 @@
 use super::super::util::{throw_type_error, v8_string};
 use super::context_host_ptr_from_global_bridge;
-use super::mark_simple_event_target_slot;
+use super::{initialize_simple_event_target, simple_object_event_set_handler};
 use crate::document_runtime::DomHandle;
-use crate::native_bridge::JsContextHost;
+use crate::native_bridge::PageScriptHost;
 use crate::native_bridge::throw_dom_exception;
 use crate::util::{get_private_value, set_private_value, v8str};
+use crate::web_api_interfaces;
 use crate::webidl;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
@@ -25,6 +26,39 @@ const TEXT_TRACK_CUE_TEXT_SLOT: &str = "__moliTextTrackCueText";
 const MEDIA_ERROR_CODE_SLOT: &str = "__moliMediaErrorCode";
 const MEDIA_ERROR_MESSAGE_SLOT: &str = "__moliMediaErrorMessage";
 
+pub(crate) fn text_track_cue_times<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    cue: v8::Local<'s, v8::Object>,
+) -> Option<(f64, f64)> {
+    let cue = moli_webapi_declare::web_api_object_target(scope, cue)?;
+    let start = get_private_value(scope, cue, TEXT_TRACK_CUE_START_TIME_SLOT)
+        .and_then(|value| v8::Local::<v8::Number>::try_from(value).ok())?
+        .value();
+    let end = get_private_value(scope, cue, TEXT_TRACK_CUE_END_TIME_SLOT)
+        .and_then(|value| v8::Local::<v8::Number>::try_from(value).ok())?
+        .value();
+    Some((start, end))
+}
+
+pub(crate) fn text_track_cue_track<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    cue: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let cue = moli_webapi_declare::web_api_object_target(scope, cue)?;
+    get_private_value(scope, cue, TEXT_TRACK_CUE_TRACK_SLOT)
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+}
+
+pub(crate) fn text_track_cue_id<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    cue: v8::Local<'s, v8::Object>,
+) -> Option<String> {
+    let cue = moli_webapi_declare::web_api_object_target(scope, cue)?;
+    get_private_value(scope, cue, TEXT_TRACK_CUE_ID_SLOT)
+        .and_then(|value| v8::Local::<v8::String>::try_from(value).ok())
+        .map(|value| value.to_rust_string_lossy(scope))
+}
+
 #[derive(webidl::WebIdlArgs)]
 #[webidl(prefix = "VTTCue")]
 struct VttCueConstructorArgs {
@@ -37,7 +71,7 @@ struct VttCueConstructorArgs {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "VTTCue")]
+#[webapi(interface = web_api_interfaces::VTTCue)]
 struct VttCuePrivateStateDeclaration {
     #[webapi(slot = TEXT_TRACK_CUE_START_TIME_SLOT)]
     _start_time: f64,
@@ -83,7 +117,7 @@ struct VttCuePrivateStateDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "TextTrackCue", enumerable)]
+#[webapi(interface = web_api_interfaces::TextTrackCue, enumerable)]
 struct TextTrackCueTemplateDeclaration {
     #[webapi(accessor_property, getter = text_track_cue_track_getter)]
     track: (),
@@ -132,7 +166,7 @@ struct TextTrackCueTemplateDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "VTTCue", enumerable)]
+#[webapi(interface = web_api_interfaces::VTTCue, enumerable)]
 struct VttCueTemplateDeclaration {
     #[webapi(
         accessor_property,
@@ -193,7 +227,7 @@ struct VttCueTemplateDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MediaError", enumerable)]
+#[webapi(interface = web_api_interfaces::MediaError, enumerable)]
 struct MediaErrorConstantsDeclaration {
     #[webapi(constant = "MEDIA_ERR_ABORTED", value = 1u32)]
     media_err_aborted: (),
@@ -206,7 +240,7 @@ struct MediaErrorConstantsDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MediaError", enumerable)]
+#[webapi(interface = web_api_interfaces::MediaError, enumerable)]
 struct MediaErrorPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -251,12 +285,9 @@ pub(crate) fn new_media_error_value<'s>(
     code: u32,
     message: &str,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let global = scope.get_current_context().global(scope);
-    let constructor = global.get(scope, v8str(scope, "MediaError").into())?;
-    let constructor = v8::Local::<v8::Object>::try_from(constructor).ok()?;
-    let prototype = constructor.get(scope, v8str(scope, "prototype").into())?;
+    let prototype = super::ensure_intrinsic_interface_prototype(scope, "MediaError").ok()?;
     let object = v8::Object::new(scope);
-    if object.set_prototype(scope, prototype) != Some(true) {
+    if object.set_prototype(scope, prototype.into()) != Some(true) {
         return None;
     }
     set_private_value(
@@ -302,7 +333,7 @@ pub(super) fn vtt_cue_constructor_callback<'s>(
         return;
     };
 
-    mark_simple_event_target_slot(scope, args.this(), "__moliTextTrackCueListeners");
+    initialize_simple_event_target(scope, args.this());
     VttCuePrivateStateDeclaration::new(parsed.start_time, parsed.end_time, parsed.text)
         .initialize(scope, args.this())
         .expect("VTTCue private state declaration should initialize");
@@ -323,7 +354,7 @@ fn text_track_cue_receiver<'s>(
     args: &v8::FunctionCallbackArguments<'s>,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let receiver = args.this();
-    if get_private_value(scope, receiver, TEXT_TRACK_CUE_START_TIME_SLOT).is_some() {
+    if web_api_interfaces::TextTrackCue::is_instance(scope, receiver) {
         return Some(receiver);
     }
     throw_type_error(scope, "Illegal invocation");
@@ -456,9 +487,10 @@ fn text_track_cue_get_cue_as_html_callback<'s>(
     let runtime = unsafe { &mut *runtime_ptr };
     let fragment = runtime.create_document_fragment();
     append_vtt_cue_fragment(scope, runtime_ptr, runtime, fragment, &text);
-    if let Some(fragment) = runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, fragment)
+    if let Some(fragment) =
+        runtime
+            .native_bridge_mut()
+            .wrap_handle_for_receiver(scope, runtime_ptr, receiver, fragment)
     {
         rv.set(fragment.into());
     }
@@ -466,8 +498,8 @@ fn text_track_cue_get_cue_as_html_callback<'s>(
 
 fn append_vtt_cue_fragment(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
-    runtime: &mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
+    runtime: &mut PageScriptHost,
     fragment: DomHandle,
     source: &str,
 ) {
@@ -527,8 +559,8 @@ struct VttCueFragmentNode {
 
 fn flush_vtt_cue_text(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
-    runtime: &mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
+    runtime: &mut PageScriptHost,
     stack: &[VttCueFragmentNode],
     text: &mut String,
 ) {
@@ -546,8 +578,8 @@ fn flush_vtt_cue_text(
 
 fn apply_vtt_cue_tag(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
-    runtime: &mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
+    runtime: &mut PageScriptHost,
     stack: &mut Vec<VttCueFragmentNode>,
     raw: &str,
 ) {
@@ -1018,7 +1050,7 @@ fn text_track_cue_onenter_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    event_handler_setter(scope, args, TEXT_TRACK_CUE_ONENTER_SLOT);
+    event_handler_setter(scope, args, "enter", TEXT_TRACK_CUE_ONENTER_SLOT);
 }
 
 fn text_track_cue_onexit_getter<'s>(
@@ -1034,7 +1066,7 @@ fn text_track_cue_onexit_setter<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    event_handler_setter(scope, args, TEXT_TRACK_CUE_ONEXIT_SLOT);
+    event_handler_setter(scope, args, "exit", TEXT_TRACK_CUE_ONEXIT_SLOT);
 }
 
 fn event_handler_getter<'s>(
@@ -1052,34 +1084,16 @@ fn event_handler_getter<'s>(
 fn event_handler_setter<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
+    event_type: &str,
     slot: &'static str,
 ) {
     let Some(receiver) = text_track_cue_receiver(scope, &args) else {
         return;
     };
-    let value = args.get(0);
-    if value.is_function() {
-        set_private_value(scope, receiver, slot, value);
-    } else {
-        set_private_value(scope, receiver, slot, v8::null(scope).into());
-    }
+    simple_object_event_set_handler(scope, receiver, event_type, slot, args.get(0));
 }
 
-fn finite_double_property<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    value: v8::Local<'s, v8::Value>,
-    owner: &'static str,
-    property: &'static str,
-) -> Option<f64> {
-    match webidl::convert::<webidl::Double>(scope, value, webidl::Context::member(owner, property))
-    {
-        Ok(value) => Some(value.0),
-        Err(error) => {
-            webidl::throw_error(scope, &error);
-            None
-        }
-    }
-}
+use crate::webidl::finite_double_property_value as finite_double_property;
 
 fn private_number<'s>(
     scope: &mut v8::PinScope<'s, '_>,

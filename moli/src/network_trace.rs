@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NetworkTraceConfigSummary {
     pub(crate) explicit_http_proxy: bool,
-    pub(crate) libcurl_env_proxy_fallback: bool,
+    pub(crate) env_proxy_fallback: bool,
     pub(crate) http_no_proxy: bool,
     pub(crate) proxy_bearer_token: bool,
     pub(crate) tls_verify_host: bool,
@@ -38,7 +38,7 @@ impl From<&FetchConfig> for NetworkTraceConfigSummary {
     fn from(config: &FetchConfig) -> Self {
         Self {
             explicit_http_proxy: config.http_proxy().is_some(),
-            libcurl_env_proxy_fallback: config.http_proxy().is_none(),
+            env_proxy_fallback: config.http_proxy().is_none(),
             http_no_proxy: config.http_no_proxy().is_some(),
             proxy_bearer_token: config.proxy_bearer_token().is_some(),
             tls_verify_host: config.tls_verify_host(),
@@ -59,29 +59,19 @@ impl From<&FetchConfig> for NetworkTraceConfigSummary {
     }
 }
 
-pub(crate) fn render_network_trace(
+/// Freeze the readiness result before an export command can adopt a newer
+/// Document and replace the Page's script-execution report. These are already
+/// the JSON values needed by the output; no additional Page/DOM copy is kept.
+pub(crate) fn capture_network_activity(
     page: &Page,
-    main_document_html: &str,
     response_wait: Option<&SubresourceResponseWaitCriteria>,
     config: Option<&NetworkTraceConfigSummary>,
     options: NetworkTraceOptions,
-) -> Value {
+) -> Map<String, Value> {
     let mut payload = Map::new();
     if let Some(config) = config {
         payload.insert("config".to_owned(), render_config_summary(config));
     }
-    payload.insert(
-        "main_document".to_owned(),
-        render_main_document_trace_from_parts(
-            page.requested_url(),
-            page.final_url(),
-            page.status(),
-            page.headers(),
-            main_document_html,
-            page.navigation_redirected(),
-            page.navigation_redirect_count(),
-        ),
-    );
     payload.insert(
         "subresources".to_owned(),
         Value::Array(
@@ -130,7 +120,27 @@ pub(crate) fn render_network_trace(
             ),
         );
     }
-    Value::Object(payload)
+    payload
+}
+
+pub(crate) fn render_network_trace(
+    page: &Page,
+    main_document_html: &str,
+    mut activity: Map<String, Value>,
+) -> Value {
+    activity.insert(
+        "main_document".to_owned(),
+        render_main_document_trace_from_parts(
+            page.requested_url(),
+            page.final_url(),
+            page.status(),
+            page.headers(),
+            main_document_html,
+            page.navigation_redirected(),
+            page.navigation_redirect_count(),
+        ),
+    );
+    Value::Object(activity)
 }
 
 fn render_websocket_network_event(event: &WebSocketNetworkEvent) -> Value {
@@ -249,7 +259,7 @@ fn render_websocket_summary(
 pub(crate) fn render_http_error_network_trace(
     final_url: &url::Url,
     status: u16,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     body: &str,
     config: Option<&NetworkTraceConfigSummary>,
 ) -> Value {
@@ -276,7 +286,7 @@ pub(crate) fn render_http_error_network_trace(
 fn render_config_summary(config: &NetworkTraceConfigSummary) -> Value {
     json!({
         "explicit_http_proxy": config.explicit_http_proxy,
-        "libcurl_env_proxy_fallback": config.libcurl_env_proxy_fallback,
+        "env_proxy_fallback": config.env_proxy_fallback,
         "http_no_proxy": config.http_no_proxy,
         "proxy_bearer_token": config.proxy_bearer_token,
         "tls_verify_host": config.tls_verify_host,
@@ -300,7 +310,7 @@ fn render_main_document_trace_from_parts(
     requested_url: &url::Url,
     final_url: &url::Url,
     status: u16,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
     body: &str,
     redirected: bool,
     redirect_count: usize,
@@ -417,7 +427,7 @@ fn render_success_response_diagnostics(
     request_url: &url::Url,
     final_url: &url::Url,
     status: u16,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     response_body: &str,
     redirect_count: usize,
     redirect_chain: &[NavigationRedirect],
@@ -503,7 +513,8 @@ fn render_diagnostics_payload(
     Some(Value::Object(payload))
 }
 
-fn auth_schemes(headers: &[(String, String)], name: &str) -> Vec<String> {
+fn auth_schemes(headers: &[(String, Vec<u8>)], name: &str) -> Vec<String> {
+    let headers = moli_fetch::headers_to_byte_strings(headers);
     let mut schemes = headers
         .iter()
         .filter(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
@@ -519,7 +530,7 @@ fn auth_schemes(headers: &[(String, String)], name: &str) -> Vec<String> {
 fn gate_hint_reasons(
     request_url: &url::Url,
     final_url: &url::Url,
-    response_headers: &[(String, String)],
+    response_headers: &[(String, Vec<u8>)],
     response_body: &str,
     redirect_chain: &[NavigationRedirect],
     body_mode: GateHintBodyMode,
@@ -700,14 +711,17 @@ where
     names
 }
 
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+fn header_value<'a>(
+    headers: &'a [(String, Vec<u8>)],
+    name: &str,
+) -> Option<std::borrow::Cow<'a, str>> {
     headers
         .iter()
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| moli_fetch::decode_header_value(value))
 }
 
-fn json_response_summary(headers: &[(String, String)], body: &str) -> Option<Value> {
+fn json_response_summary(headers: &[(String, Vec<u8>)], body: &str) -> Option<Value> {
     let content_type = header_value(headers, "content-type")?;
     if !content_type
         .split(';')
@@ -761,7 +775,7 @@ fn clamp_diagnostic_string(text: &str) -> String {
     output
 }
 
-fn json_response_error_like(headers: &[(String, String)], body: &str) -> bool {
+fn json_response_error_like(headers: &[(String, Vec<u8>)], body: &str) -> bool {
     let Some(content_type) = header_value(headers, "content-type") else {
         return false;
     };
@@ -864,7 +878,7 @@ mod tests {
             "http://example.test/page".parse()?,
             "http://example.test/api".parse()?,
             "GET".to_owned(),
-            Vec::new(),
+            Default::default(),
             None,
             SubresourceResourceType::Fetch,
             None,
@@ -873,7 +887,7 @@ mod tests {
             401,
             vec![(
                 "WWW-Authenticate".to_owned(),
-                "Basic realm=\"private\"".to_owned(),
+                b"Basic realm=\"private\"".to_vec(),
             )],
             "auth required".to_owned(),
             Vec::new(),
@@ -900,7 +914,7 @@ mod tests {
             "http://example.test/page".parse().unwrap(),
             "http://example.test/api".parse().unwrap(),
             "GET".to_owned(),
-            Vec::new(),
+            Default::default(),
             None,
             SubresourceResourceType::Xhr,
             "proxy connection timed out".to_owned(),
@@ -923,14 +937,14 @@ mod tests {
             "https://example.test/page".parse()?,
             "wss://example.test/socket".parse()?,
             "GET".to_owned(),
-            vec![("origin".to_owned(), "https://example.test".to_owned())],
+            vec![("origin".to_owned(), "https://example.test".to_owned())].into(),
             None,
             SubresourceResourceType::WebSocket,
             None,
             Vec::new(),
             "wss://example.test/socket".parse()?,
             101,
-            vec![("sec-websocket-accept".to_owned(), "accept-token".to_owned())],
+            vec![("sec-websocket-accept".to_owned(), b"accept-token".to_vec())],
             String::new(),
             Vec::new(),
         );
@@ -1046,12 +1060,14 @@ mod tests {
     #[test]
     fn subresource_trace_diagnostics_classify_login_gate_and_json_error() -> anyhow::Result<()> {
         let redirect_chain = vec![NavigationRedirect {
+            source: moli_fetch::RedirectSource::Network,
             from_url: "http://example.test/api/detail".parse()?,
             to_url: "http://login.example.test/security/baxia".parse()?,
             status: 302,
             headers: Vec::new(),
             network_extra_info_available: true,
             request_extra_info: None,
+            dispatched_request: None,
             response_extra_info: None,
             redirect_has_extra_info: true,
             request_cookie_report: None,
@@ -1064,7 +1080,7 @@ mod tests {
             "http://example.test/page".parse()?,
             "http://example.test/api/detail".parse()?,
             "GET".to_owned(),
-            Vec::new(),
+            Default::default(),
             None,
             SubresourceResourceType::Fetch,
             None,
@@ -1072,8 +1088,8 @@ mod tests {
             "http://login.example.test/security/baxia".parse()?,
             200,
             vec![
-                ("content-type".to_owned(), "application/json".to_owned()),
-                ("x-baxia-info".to_owned(), "challenge".to_owned()),
+                ("content-type".to_owned(), b"application/json".to_vec()),
+                ("x-baxia-info".to_owned(), b"challenge".to_vec()),
             ],
             r#"{"success":false,"code":"AUTH_REQUIRED","message":"login required","ret":["FAIL_SYS_USER_VALIDATE"]}"#.to_owned(),
             Vec::new(),
@@ -1109,7 +1125,7 @@ mod tests {
             &requested_url,
             &final_url,
             200,
-            &[("content-type".to_owned(), "text/html".to_owned())],
+            &[("content-type".to_owned(), b"text/html".to_vec())],
             "<html><body>login keyword in body should not drive main document diagnostics</body></html>",
             true,
             1,
@@ -1137,7 +1153,7 @@ mod tests {
     fn trace_config_summary_reports_proxy_state_without_sensitive_values() {
         let summary = NetworkTraceConfigSummary {
             explicit_http_proxy: true,
-            libcurl_env_proxy_fallback: false,
+            env_proxy_fallback: false,
             http_no_proxy: true,
             proxy_bearer_token: true,
             tls_verify_host: false,
@@ -1159,7 +1175,7 @@ mod tests {
         let rendered = render_config_summary(&summary);
 
         assert_eq!(rendered["explicit_http_proxy"], true);
-        assert_eq!(rendered["libcurl_env_proxy_fallback"], false);
+        assert_eq!(rendered["env_proxy_fallback"], false);
         assert_eq!(rendered["http_no_proxy"], true);
         assert_eq!(rendered["proxy_bearer_token"], true);
         assert_eq!(rendered["tls_verify_host"], false);
@@ -1177,7 +1193,7 @@ mod tests {
     fn http_error_network_trace_includes_config_and_auth_diagnostics() -> anyhow::Result<()> {
         let config = NetworkTraceConfigSummary {
             explicit_http_proxy: false,
-            libcurl_env_proxy_fallback: true,
+            env_proxy_fallback: true,
             http_no_proxy: false,
             proxy_bearer_token: false,
             tls_verify_host: true,
@@ -1200,13 +1216,13 @@ mod tests {
             401,
             &[(
                 "www-authenticate".to_owned(),
-                "Bearer realm=\"api\"".to_owned(),
+                b"Bearer realm=\"api\"".to_vec(),
             )],
             "unauthorized",
             Some(&config),
         );
 
-        assert_eq!(trace["config"]["libcurl_env_proxy_fallback"], true);
+        assert_eq!(trace["config"]["env_proxy_fallback"], true);
         assert_eq!(trace["main_document"]["status"], 401);
         assert_eq!(
             trace["main_document"]["diagnostics"]["server_auth_schemes"][0],

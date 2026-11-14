@@ -1,9 +1,10 @@
 use super::*;
+use crate::web_api_interfaces;
 
 const BIQUAD_FREQUENCY_SLOT: &str = "__moliBiquadFrequency";
 
 #[derive(WebApiObject)]
-#[webapi(interface = "BiquadFilterNode")]
+#[webapi(interface = web_api_interfaces::BiquadFilterNode)]
 struct BiquadFilterNodeObjectDeclaration<'scope> {
     #[webapi(data_property = "type")]
     kind: &'static str,
@@ -17,14 +18,10 @@ struct BiquadFilterNodeObjectDeclaration<'scope> {
     q: v8::Local<'scope, v8::Object>,
     #[webapi(data_property, readonly)]
     gain: v8::Local<'scope, v8::Object>,
-    #[webapi(method, length = 1, callback = audio_node_connect_callback)]
-    connect: (),
-    #[webapi(method, length = 0, callback = audio_node_disconnect_callback)]
-    disconnect: (),
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "BiquadFilterNode", enumerable)]
+#[webapi(interface = web_api_interfaces::BiquadFilterNode, enumerable)]
 struct BiquadFilterNodePrototypeDeclaration {
     #[webapi(method, length = 3, callback = get_frequency_response)]
     get_frequency_response: (),

@@ -9,10 +9,12 @@ use anyhow::{Context, Result, anyhow};
 use moli_cookie_jar::{
     BrowserCookieFacadeContext, SharedBrowserCookieStore, new_shared_browser_cookie_store,
 };
+use moli_disk_pool::DiskPool;
 use moli_fetch::{
     FetchCancelHandle, FetchConfig, NetworkFetchResult, RawResponse, Request, Response,
     ResponseHead, StreamingRawResponse,
 };
+use moli_parkable_image::ParkableImageManager;
 
 use crate::{protocol_types::OptionalResourceFetchMask, types::SubresourceResourceType};
 
@@ -52,6 +54,10 @@ impl ResourceRequestClient {
         Self::new_with_cookie_store(config, new_shared_browser_cookie_store())
     }
 
+    pub(crate) fn resource_task_runner(&self) -> super::RendererResourceTaskRunner {
+        self.resource_runtime.task_runner()
+    }
+
     pub fn memory_cache_diagnostics(&self) -> SharedMemoryResourceCacheDiagnostics {
         self.resource_runtime.memory_cache_diagnostics()
     }
@@ -69,6 +75,19 @@ impl ResourceRequestClient {
         resource_runtime: BrowserResourceRuntime,
     ) {
         self.resource_runtime = resource_runtime;
+    }
+
+    pub fn disk_pool(&self) -> Option<DiskPool> {
+        self.resource_runtime.disk_pool()
+    }
+
+    pub(crate) fn parkable_image_manager(
+        &self,
+        runner: &crate::network::RendererResourceTaskRunner,
+    ) -> ParkableImageManager {
+        self.resource_runtime
+            .ensure_parkable_image_scheduler(runner);
+        self.resource_runtime.parkable_image_manager()
     }
 
     pub fn shares_resource_runtime_with(&self, other: &Self) -> bool {
@@ -135,7 +154,9 @@ impl ResourceRequestClient {
         self.page_network_policy.clone()
     }
 
-    pub(crate) fn frozen_request_client(&self) -> Self {
+    /// Captures page request configuration for an owned operation. Headers,
+    /// cache and blocked-URL policy stay fixed; network emulation stays live.
+    pub fn frozen_request_client(&self) -> Self {
         let mut client = Self::from_browser_resource_runtime_with_page_network_policy(
             self.resource_runtime.clone(),
             self.page_network_policy.frozen_request_view(),
@@ -203,10 +224,19 @@ impl ResourceRequestClient {
         &self,
         request: Request,
     ) -> Result<NetworkFetchResult<RawResponse>> {
+        self.fetch_raw_with_cancel_and_network_metadata(request, FetchCancelHandle::new())
+            .await
+    }
+
+    pub async fn fetch_raw_with_cancel_and_network_metadata(
+        &self,
+        request: Request,
+        cancel_handle: FetchCancelHandle,
+    ) -> Result<NetworkFetchResult<RawResponse>> {
         let request = self.apply_network_policy(request)?;
         self.resource_runtime
             .client()
-            .fetch_raw_with_network_metadata(request)
+            .fetch_raw_with_cancel_and_network_metadata(request, cancel_handle)
             .await
     }
 
@@ -258,7 +288,7 @@ impl ResourceRequestClient {
         cancel_handle: FetchCancelHandle,
     ) -> Result<NetworkFetchResult<Response>> {
         let request = self.apply_network_policy(request)?;
-        if request.auth_requires_buffered_transport() || !request.follow_redirects {
+        if request.auth_requires_buffered_transport() || !request.transport_follows_redirects() {
             return self
                 .resource_runtime
                 .client()
@@ -279,10 +309,13 @@ impl ResourceRequestClient {
 
     pub(crate) async fn fetch_cacheable_script_text_stream(
         &self,
-        request: Request,
+        mut request: Request,
     ) -> Result<Response> {
+        request
+            .browser_request_metadata
+            .get_or_insert(moli_fetch::BrowserRequestMetadata::Script);
         let request = self.apply_network_policy(request)?;
-        if let Some(result) = local_text_response(&request.url) {
+        if let Some(result) = local_text_response(&request) {
             return result;
         }
         let timing_enabled = moli_trace::cdp_nav_timing_enabled();
@@ -332,7 +365,7 @@ impl ResourceRequestClient {
         let key = script_text_cache_key(&request).for_page_cache_partition(page_cache_partition_id);
         let lookup = {
             let mut cache = self.resource_runtime.memory_cache().lock();
-            if request.cache_mode().allows_memory_cache_lookup() {
+            if request.effective_cache_mode().allows_memory_cache_lookup() {
                 cache.lookup_script_text(key.clone())
             } else {
                 cache.replace_script_text(key.clone())
@@ -438,15 +471,18 @@ impl ResourceRequestClient {
 
     fn fetch_cacheable_script_text_callback_inner<F>(
         &self,
-        request: Request,
+        mut request: Request,
         resource_load: loads::ResourceLoadLease,
         callback: F,
     ) -> Result<()>
     where
         F: FnOnce(Result<Response>) + Send + 'static,
     {
+        request
+            .browser_request_metadata
+            .get_or_insert(moli_fetch::BrowserRequestMetadata::Script);
         let request = self.apply_network_policy(request)?;
-        if let Some(result) = local_text_response(&request.url) {
+        if let Some(result) = local_text_response(&request) {
             let task_runner = resource_load.task_runner();
             task_runner.spawn(async move {
                 resource_load.finish();
@@ -512,7 +548,7 @@ impl ResourceRequestClient {
         let key = script_text_cache_key(&request).for_page_cache_partition(page_cache_partition_id);
         let lookup = {
             let mut cache = self.resource_runtime.memory_cache().lock();
-            if request.cache_mode().allows_memory_cache_lookup() {
+            if request.effective_cache_mode().allows_memory_cache_lookup() {
                 cache.lookup_script_text(key.clone())
             } else {
                 cache.replace_script_text(key.clone())
@@ -634,7 +670,7 @@ impl ResourceRequestClient {
         request: Request,
         cancel_handle: FetchCancelHandle,
     ) -> Result<Response> {
-        if request.auth_requires_buffered_transport() || !request.follow_redirects {
+        if request.auth_requires_buffered_transport() || !request.transport_follows_redirects() {
             // Challenge-response schemes still need libcurl's buffered auth
             // retry behavior until the streaming collector models
             // intermediate authentication challenges explicitly. Manual
@@ -662,7 +698,7 @@ impl ResourceRequestClient {
     where
         F: FnOnce(Result<Response>) + Send + 'static,
     {
-        if let Some(result) = local_text_response(&request.url) {
+        if let Some(result) = local_text_response(&request) {
             callback(result);
             return Ok(());
         }
@@ -676,14 +712,14 @@ impl ResourceRequestClient {
         request: Request,
         cancel_handle: FetchCancelHandle,
     ) -> Result<StreamingRawResponse> {
-        if let Some(response) = local_text_response(&request.url) {
+        if let Some(response) = local_text_response(&request) {
             return streaming_raw_response_from_local_response(response?);
         }
 
         let cache_key = raw_subresource_memory_cache_key(&request).map(|key| {
             key.for_page_cache_partition(self.page_network_policy.memory_cache_partition_id())
         });
-        if request.cache_mode().allows_memory_cache_lookup()
+        if request.effective_cache_mode().allows_memory_cache_lookup()
             && let Some(cache_key) = cache_key.as_ref()
             && let Some(cached) = self
                 .resource_runtime
@@ -712,7 +748,7 @@ impl ResourceRequestClient {
         request: Request,
         cancel_handle: FetchCancelHandle,
     ) -> Result<NetworkFetchResult<StreamingRawResponse>> {
-        if let Some(response) = local_text_response(&request.url) {
+        if let Some(response) = local_text_response(&request) {
             return Ok(NetworkFetchResult::without_request_observation(
                 streaming_raw_response_from_local_response(response?)?,
             ));
@@ -721,7 +757,7 @@ impl ResourceRequestClient {
         let cache_key = raw_subresource_memory_cache_key(&request).map(|key| {
             key.for_page_cache_partition(self.page_network_policy.memory_cache_partition_id())
         });
-        if request.cache_mode().allows_memory_cache_lookup()
+        if request.effective_cache_mode().allows_memory_cache_lookup()
             && let Some(cache_key) = cache_key.as_ref()
             && let Some(cached) = self
                 .resource_runtime
@@ -894,32 +930,13 @@ impl ResourceRequestClient {
             .context("worker script fetch thread dropped response channel")?
     }
 
-    pub(crate) fn fetch_raw_for_blocking_boundary(&self, request: Request) -> Result<RawResponse> {
-        let request_client = self.clone();
-        let (response_tx, response_rx) = mpsc::sync_channel(1);
-        thread::Builder::new()
-            .name("lm-blocking-raw-fetch".to_owned())
-            .spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to build blocking raw fetch runtime")
-                    .and_then(|runtime| runtime.block_on(request_client.fetch_raw(request)));
-                let _ = response_tx.send(result);
-            })
-            .context("failed to spawn blocking raw fetch thread")?;
-        response_rx
-            .recv()
-            .context("blocking raw fetch thread dropped response channel")?
-    }
-
     async fn fetch_with_optional_cancel(
         &self,
         request: Request,
         cancel_handle: Option<FetchCancelHandle>,
     ) -> Result<Response> {
         let request = self.apply_network_policy(request)?;
-        if request.auth_requires_buffered_transport() || !request.follow_redirects {
+        if request.auth_requires_buffered_transport() || !request.transport_follows_redirects() {
             // Digest auth retries are still completed inside libcurl on the
             // buffered path. Keep auth requests there until the streaming
             // collector can distinguish intermediate auth challenges from
@@ -951,8 +968,20 @@ impl ResourceRequestClient {
         self.resource_runtime.client().browser_identity()
     }
 
+    pub(crate) fn effective_browser_identity(
+        &self,
+    ) -> std::sync::Arc<moli_browser_profile::BrowserIdentityProfile> {
+        self.page_network_policy
+            .browser_identity_override()
+            .unwrap_or_else(|| std::sync::Arc::new(self.browser_identity().clone()))
+    }
+
     pub fn http_proxy(&self) -> Option<&str> {
         self.resource_runtime.client().http_proxy()
+    }
+
+    pub fn http_host_resolve(&self) -> &[String] {
+        self.resource_runtime.client().http_host_resolve()
     }
 
     pub fn http_no_proxy(&self) -> Option<&str> {
@@ -967,6 +996,14 @@ impl ResourceRequestClient {
         self.resource_runtime.client().tls_verify_host()
     }
 
+    pub fn websocket_connector(&self) -> moli_fetch::CurlWebSocketConnector {
+        self.resource_runtime.client().websocket_connector()
+    }
+
+    pub fn tls_config(&self) -> &moli_fetch::CurlTlsConfig {
+        self.resource_runtime.client().tls_config()
+    }
+
     pub fn request_timeout_ms(&self) -> u64 {
         self.resource_runtime.client().request_timeout_ms()
     }
@@ -975,7 +1012,7 @@ impl ResourceRequestClient {
         self.resource_runtime.client().cookie_store()
     }
 
-    pub fn set_extra_http_headers(&self, headers: &[(String, String)]) {
+    pub fn set_extra_http_headers(&self, headers: &moli_fetch::RequestHeaders) {
         self.page_network_policy.set_extra_http_headers(headers);
     }
 
@@ -1043,13 +1080,42 @@ impl ResourceRequestClient {
         self.page_network_policy.set_cache_disabled(disabled);
     }
 
-    fn apply_network_policy(&self, mut request: Request) -> Result<Request> {
-        if let Some(browser_site_context) = self.browser_site_context.as_deref() {
-            request = request.with_browser_site_context(browser_site_context.clone());
-        }
+    pub(crate) fn prepare_service_worker_request(&self, request: &mut Request) {
+        // Controlled fetch reconstructs requests without the full network-policy
+        // opt-in. Apply headers before defaults, while allowing offline workers
+        // to serve cached or synthetic responses.
         self.page_network_policy
             .snapshot()
-            .apply_to_request(request)
+            .apply_request_headers(request);
+        self.resource_runtime.client().prepare_request(request);
+    }
+
+    /// Bind the owner's cookie scope before a caller retains redirect state,
+    /// using the same partition handling as transport dispatch.
+    pub(crate) fn bind_browser_site_context(&self, mut request: Request) -> Request {
+        if let Some(browser_site_context) = self.browser_site_context.as_deref() {
+            let mut browser_site_context = browser_site_context.clone();
+            // Child navigations bind the destination frame's partition before
+            // entering its parent's loader. Keep that key while applying the
+            // owner's other cookie settings, including Storage Access policy.
+            if let Some(key) = request.network_partition_key() {
+                browser_site_context = browser_site_context.with_serialized_storage_key(key);
+            }
+            request = request.with_browser_site_context(browser_site_context);
+        }
+        request
+    }
+
+    fn apply_network_policy(&self, request: Request) -> Result<Request> {
+        request.browser_origin()?;
+        let request = self.bind_browser_site_context(request);
+        let mut request = self
+            .page_network_policy
+            .snapshot()
+            .apply_to_request(request)?;
+        request.admit_request_url(&request.url)?;
+        self.resource_runtime.client().prepare_request(&mut request);
+        Ok(request)
     }
 }
 
@@ -1094,6 +1160,7 @@ fn streaming_raw_response_from_cached_subresource(
 ) -> Result<StreamingRawResponse> {
     let mut head = response.head();
     head.from_cache = true;
+    head.cache_state = moli_fetch::ResponseCacheState::Local;
     for redirect in &mut head.redirect_chain {
         redirect.from_cache = true;
         redirect.network_extra_info_available = false;
@@ -1101,8 +1168,8 @@ fn streaming_raw_response_from_cached_subresource(
     streaming_raw_response_from_head_and_body(head, response.clone_body_bytes())
 }
 
-fn local_text_response(url: &url::Url) -> Option<Result<Response>> {
-    crate::network_host::local_url_response_result(url)
+fn local_text_response(request: &Request) -> Option<Result<Response>> {
+    crate::network_host::local_url_response_result(&request.url, &request.method)
         .map(|result| result.map_err(anyhow::Error::msg))
 }
 
@@ -1113,6 +1180,7 @@ fn streaming_raw_response_from_local_response(response: Response) -> Result<Stre
 
 fn response_with_memory_cache_hit(mut response: Response) -> Response {
     response.from_cache = true;
+    response.cache_state = moli_fetch::ResponseCacheState::Local;
     for redirect in &mut response.redirect_chain {
         redirect.from_cache = true;
         redirect.network_extra_info_available = false;

@@ -19,8 +19,8 @@ use super::*;
 use crate::document_runtime::parser_script_preparation_failure_page_owned_work;
 use crate::dom::native::{Attribute, DomMutationEffects, NativeNodeId};
 use crate::live_document_parser::{
-    DocumentParserFinishRequestState, LiveDocumentParserOwner, LiveDocumentParserStepOutcome,
-    ParserSuspensionCause,
+    DocumentParserFinishRequestState, DocumentParserRunState, LiveDocumentParserOwner,
+    LiveDocumentParserStepOutcome, ParserResumeOwner, ParserSuspensionCause,
 };
 use crate::parser::{
     ParserDomMutation, ParserDomMutationConsumer, ParserDomReadConsumer,
@@ -46,6 +46,30 @@ struct PhaseOneParserOwner<'a> {
     vm: &'a mut ScriptVm,
 }
 
+pub(in crate::runtime) fn rebind_main_document_parser_before_parsing(
+    parser: &mut DocumentParserSession,
+    vm: &mut ScriptVm,
+    scripting_enabled: bool,
+) {
+    let document_url = vm.document_runtime.document_url().clone();
+    let document_handle = vm.document_runtime.document_handle();
+    let content_type = vm
+        .document_runtime
+        .dom_host()
+        .document_content_type_for_handle(document_handle)
+        .unwrap_or("text/html")
+        .to_owned();
+    vm.with_dom_host_parse_step(|vm| {
+        parser.rebind_main_document_before_parsing(
+            document_url,
+            document_handle,
+            &mut PhaseOneParserOwner { vm },
+            scripting_enabled,
+            &content_type,
+        );
+    });
+}
+
 impl LiveDocumentParserOwner for PhaseOneParserOwner<'_> {}
 
 impl ParserMutationEffectConsumer for PhaseOneParserOwner<'_> {
@@ -54,9 +78,19 @@ impl ParserMutationEffectConsumer for PhaseOneParserOwner<'_> {
             .vm
             .apply_parser_stream_mutation_effects_to_live_dom_host_in_default_context(effects);
     }
+    fn finish_parser_dom_mutations(&mut self) -> std::ops::ControlFlow<()> {
+        let _ = self
+            .vm
+            .run_pending_parser_post_step_runtime_work_in_default_context();
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 impl ParserDomReadConsumer for PhaseOneParserOwner<'_> {
+    fn stylesheet_media_matches(&mut self, media: &str) -> bool {
+        self.vm.document_runtime.stylesheet_media_matches(media)
+    }
+
     fn snapshot_parser_document(&mut self) -> Option<crate::dom::native::NativeDom> {
         Some(self.vm.document_runtime.snapshot_document())
     }
@@ -194,25 +228,9 @@ impl ParserDomMutationConsumer for PhaseOneParserOwner<'_> {
         let _ = self
             .vm
             .apply_parser_dom_mutation_to_live_dom_host_in_default_context(mutation);
-        let _ = self
-            .vm
-            .run_pending_parser_post_step_runtime_work_in_default_context();
     }
 
-    fn create_parser_element_without_attributes(
-        &mut self,
-        local_name: String,
-        namespace: String,
-        prefix: Option<String>,
-    ) -> NativeNodeId {
-        self.vm
-            .document_runtime
-            .create_parser_element_without_attributes_in_live_dom_host(
-                local_name, namespace, prefix,
-            )
-    }
-
-    fn create_parser_element_for_document_without_attributes(
+    fn create_element_for_document_without_attributes(
         &mut self,
         document_handle: NativeNodeId,
         local_name: String,
@@ -221,7 +239,26 @@ impl ParserDomMutationConsumer for PhaseOneParserOwner<'_> {
     ) -> NativeNodeId {
         self.vm
             .document_runtime
+            .create_element_for_document_without_attributes_in_live_dom_host(
+                document_handle,
+                local_name,
+                namespace,
+                prefix,
+            )
+    }
+
+    fn create_parser_element_for_document_without_attributes(
+        &mut self,
+        construction: &moli_dom::native::ParserConstruction,
+        document_handle: NativeNodeId,
+        local_name: String,
+        namespace: String,
+        prefix: Option<String>,
+    ) -> NativeNodeId {
+        self.vm
+            .document_runtime
             .create_parser_element_for_document_without_attributes_in_live_dom_host(
+                construction,
                 document_handle,
                 local_name,
                 namespace,
@@ -289,16 +326,24 @@ impl ParserDomMutationConsumer for PhaseOneParserOwner<'_> {
             )
     }
 
-    fn prepend_text_to_text_node(&mut self, node_id: NativeNodeId, text: String) {
+    fn prepend_text_to_text_node(
+        &mut self,
+        node_id: NativeNodeId,
+        text: String,
+    ) -> DomMutationEffects {
         self.vm
             .document_runtime
-            .prepend_text_to_text_node_in_live_dom_host(node_id, text);
+            .prepend_text_to_text_node_in_live_dom_host(node_id, text)
     }
 
-    fn append_text_to_text_node(&mut self, node_id: NativeNodeId, text: String) {
+    fn append_text_to_text_node(
+        &mut self,
+        node_id: NativeNodeId,
+        text: String,
+    ) -> DomMutationEffects {
         self.vm
             .document_runtime
-            .append_text_to_text_node_in_live_dom_host(node_id, text);
+            .append_text_to_text_node_in_live_dom_host(node_id, text)
     }
 
     fn push_parse_error(&mut self, error: String) {
@@ -319,20 +364,14 @@ impl ParserDomMutationConsumer for PhaseOneParserOwner<'_> {
             .mark_script_already_started_for_parser_in_live_dom_host(node_id);
     }
 
-    fn finish_parsing_script_children(&mut self, node_id: NativeNodeId) {
-        let _ = self
-            .vm
-            .document_runtime
-            .dom_host_mut()
-            .finish_parsing_script_children(node_id);
-    }
-
-    fn finish_parsing_link_children(&mut self, node_id: NativeNodeId) {
-        let _ = self
-            .vm
-            .document_runtime
-            .dom_host_mut()
-            .finish_parsing_link_children(node_id);
+    fn finish_parsing_children(
+        &mut self,
+        construction: &moli_dom::native::ParserConstruction,
+        node_id: NativeNodeId,
+    ) {
+        let effects =
+            construction.finish_children(self.vm.document_runtime.dom_host_mut(), node_id);
+        self.consume_parser_mutation_effects(effects);
     }
 
     fn attach_declarative_shadow_for_parser(
@@ -358,13 +397,10 @@ impl ParserElementCreationConsumer for PhaseOneParserOwner<'_> {
         &mut self,
         request: ParserElementCreationRequest<'_>,
     ) -> Option<NativeNodeId> {
-        let document_has_body = self
-            .document_body_handle_for_document(request.document_handle)
-            .is_some();
         self.vm
             .create_and_construct_parser_custom_element_direct_in_default_context(
+                request.construction,
                 request.document_handle,
-                document_has_body,
                 request.local_name,
                 request.namespace,
                 request.prefix,
@@ -458,8 +494,6 @@ pub(super) struct ParserDriver<'loader, 'state> {
     pub(super) final_url: &'state Url,
     pub(super) parser_session: &'state mut DocumentParserSession,
     pub(super) scheduler: &'state mut DocumentScriptScheduler,
-    pub(super) pending_parsing_blocking_script:
-        &'state mut PendingParsingBlockingClassicScriptRunner,
     pub(super) buffered_document_preloads: &'state mut BufferedDocumentPreloadState,
     pub(super) service_worker_preload_context: Option<&'state ServiceWorkerScriptPreloadContext>,
     pub(super) input_closed: &'state bool,
@@ -527,8 +561,36 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
             );
             return Ok(owner_step_progress_after_current_document_stop(page_vm));
         }
-        match self.parser_session.suspension_cause() {
-            Some(ParserSuspensionCause::ParserCreatedStylesheet { .. }) => {
+        match self.parser_session.run_state() {
+            DocumentParserRunState::Suspended {
+                resume_owner: ParserResumeOwner::DocumentWrite,
+                cause:
+                    ParserSuspensionCause::ParserClassicStylesheets { .. }
+                    | ParserSuspensionCause::ParserCreatedStylesheet { .. },
+                ..
+            } => {
+                // The insertion retains this suspension's resume permit.
+                // Its continuation must run through the Page scheduler.
+                return Ok(suspend_parser_for_stylesheet_page_task(
+                    owner,
+                    pending_parsing_blocking_wait,
+                ));
+            }
+            DocumentParserRunState::Suspended {
+                resume_owner: ParserResumeOwner::DocumentWrite,
+                cause: ParserSuspensionCause::ParserClassicSource { .. },
+                ..
+            } => {
+                *owner = ParseTimeOwner::Document;
+                *pending_parsing_blocking_wait =
+                    PendingParsingBlockingWait::PageNetworkingDocumentWriteExternalScript;
+                return Ok(OwnerStepProgress::BlockedOnPageTask);
+            }
+            DocumentParserRunState::Suspended {
+                resume_owner: ParserResumeOwner::ParserDriver,
+                cause: ParserSuspensionCause::ParserCreatedStylesheet { .. },
+                ..
+            } => {
                 if !page_vm
                     .vm()
                     .document_runtime
@@ -548,39 +610,17 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
                     "the admitted stylesheet continuation must resume its exact parser suspension"
                 );
             }
-            Some(ParserSuspensionCause::DocumentWriteExternalScript { .. }) => {
-                if page_vm
-                    .vm()
-                    .document_runtime
-                    .has_pending_document_write_external_script_load()
-                {
-                    *owner = ParseTimeOwner::Document;
-                    *pending_parsing_blocking_wait =
-                        PendingParsingBlockingWait::PageNetworkingDocumentWriteExternalScript;
-                    return Ok(OwnerStepProgress::BlockedOnPageTask);
-                }
-                let permit = self
-                    .parser_session
-                    .current_resume_permit()
-                    .expect("a document.write-suspended parser must retain its resume permit");
-                assert!(
-                    self.parser_session.resume(permit),
-                    "the admitted document.write continuation must resume its exact parser suspension"
-                );
-            }
-            Some(
-                ParserSuspensionCause::ParserClassicSource { .. }
-                | ParserSuspensionCause::ParserClassicStylesheets { .. },
-            )
-            | None => {}
+            _ => {}
         }
         debug_assert!(
             !pending_parsing_blocking_wait.is_pending(),
             "parser owner should not enqueue a new parsing turn while a blocking-wait document turn is still pending"
         );
-        if !self
-            .pending_parsing_blocking_script
-            .has_parser_blocking_script()
+        if page_vm
+            .vm()
+            .document_runtime
+            .pending_main_parser_script()
+            .is_none()
         {
             if self.parser_session.input_is_empty() {
                 if *self.input_closed {
@@ -593,15 +633,19 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
                 return Ok(OwnerStepProgress::Continue);
             }
         }
-        if self
-            .pending_parsing_blocking_script
-            .has_parser_blocking_script()
+        if let Some(pending) = page_vm
+            .vm_mut()
+            .document_runtime
+            .take_pending_main_parser_script()
         {
-            let parser_blocking_script_handle = self
-                .pending_parsing_blocking_script
-                .current_parser_blocking_script_handle();
-            let preload_candidate = self
-                .pending_parsing_blocking_script
+            // Release the Document's pending slot before any script or callback
+            // can reenter. The local runner owns only this execution, and may
+            // never clear a newer blocker installed by document.write().
+            let mut pending_runner =
+                PendingParsingBlockingClassicScriptRunner::from_parser_blocking_script(pending);
+            let parser_blocking_script_handle =
+                pending_runner.current_parser_blocking_script_handle();
+            let preload_candidate = pending_runner
                 .current_parser_blocking_script()
                 .filter(|pending| pending.context().source_load.is_none())
                 .and_then(|pending| pending.runner_script().cloned());
@@ -630,31 +674,37 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
                 && applied_preload.is_some()
             {
                 debug_assert!(
-                    self.pending_parsing_blocking_script
-                        .apply_current_parser_blocking_preloaded_script(
-                            script_handle,
-                            prepared_script,
-                        ),
+                    pending_runner.apply_current_parser_blocking_preloaded_script(
+                        script_handle,
+                        prepared_script,
+                    ),
                     "a parser-blocking preload must complete the same external pending script"
                 );
             }
-            if !apply_pending_parser_blocking_source_load_if_ready(
-                page_vm,
-                self.pending_parsing_blocking_script,
-            ) {
+            if !apply_pending_parser_blocking_source_load_if_ready(page_vm, &mut pending_runner) {
+                page_vm
+                    .vm_mut()
+                    .document_runtime
+                    .install_pending_main_parser_script(
+                        pending_runner
+                            .take_current_parser_blocking_script()
+                            .expect("waiting script remains pending"),
+                    );
                 return Ok(OwnerStepProgress::BlockedOnParserScriptSourceLoad);
             }
             let progress = match resolve_main_parser_blocking_classic_after_runtime_gate(
                 self.parser_session,
                 page_vm,
-                self.pending_parsing_blocking_script,
+                &mut pending_runner,
                 "executing stylesheet-unblocked parser-blocking classic script",
             )
             .await?
             {
                 MainParserBlockingExecutionOutcome::BlockedOnStylesheet(pending) => {
-                    self.pending_parsing_blocking_script
-                        .install_parser_blocking_script_blocked_on_execution(*pending);
+                    page_vm
+                        .vm_mut()
+                        .document_runtime
+                        .install_pending_main_parser_script(pending.into_script());
                     None
                 }
                 MainParserBlockingExecutionOutcome::StoppedCurrentDocument => {
@@ -665,10 +715,6 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
                 }
                 MainParserBlockingExecutionOutcome::BlockedOnDocumentWriteExternalLoad => {
                     self.finish_parser_blocking_pause();
-                    if let Some(script_handle) = parser_blocking_script_handle {
-                        self.pending_parsing_blocking_script
-                            .discard_current_parser_blocking_script_if_handle(script_handle);
-                    }
                     *pending_parsing_blocking_wait = if page_vm.has_page_resource_completion_route()
                     {
                         PendingParsingBlockingWait::PageNetworkingDocumentWriteExternalScript
@@ -685,10 +731,6 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
             };
             if let Some(progress) = progress {
                 self.finish_parser_blocking_pause();
-                if let Some(script_handle) = parser_blocking_script_handle {
-                    self.pending_parsing_blocking_script
-                        .discard_current_parser_blocking_script_if_handle(script_handle);
-                }
                 return Ok(progress);
             }
             return Ok(suspend_parser_for_stylesheet_page_task(
@@ -767,16 +809,20 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
                     owner_step_progress_after_current_document_stop(page_vm)
                 }
                 ParserStepAdvanceOutcome::BlockedOnStylesheet(script) => {
-                    self.pending_parsing_blocking_script
-                        .install_parser_blocking_script_blocked_on_execution(*script);
+                    page_vm
+                        .vm_mut()
+                        .document_runtime
+                        .install_pending_main_parser_script(script.into_script());
                     suspend_parser_for_stylesheet_page_task(owner, pending_parsing_blocking_wait)
                 }
                 ParserStepAdvanceOutcome::BlockedOnStylesheetParserPause => {
                     suspend_parser_for_stylesheet_page_task(owner, pending_parsing_blocking_wait)
                 }
                 ParserStepAdvanceOutcome::BlockedOnExternalSource(script) => {
-                    self.pending_parsing_blocking_script
-                        .install_parser_blocking_script_blocked_on_source_load(*script);
+                    page_vm
+                        .vm_mut()
+                        .document_runtime
+                        .install_pending_main_parser_script(script.into_script());
                     *pending_parsing_blocking_wait = PendingParsingBlockingWait::None;
                     *owner = ParseTimeOwner::Parser;
                     OwnerStepProgress::NeedMoreInput
@@ -1104,6 +1150,7 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
                         .recover_parse_time_async_handoff_with_load_delay_binding(
                             script,
                             self.loader,
+                            page_vm.vm().current_main_document_resource_loader().expect("parser script requires its Document authority").fetch_context().request_origin(),
                             resource_task_runner,
                             shared_preload,
                             Some(&document_character_set),
@@ -1471,10 +1518,10 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
             async_prefetch_scripts,
             modulepreload_link_candidates,
             parser_meta_csp_candidates,
-            blocking_stylesheet_inputs,
+            stylesheet_inputs,
         } = discovery_signals;
         self.buffered_document_preloads
-            .claim_pending_stylesheet_preloads_for_parser(&blocking_stylesheet_inputs);
+            .claim_pending_stylesheet_preloads_for_parser(&stylesheet_inputs);
         for handle in &parser_meta_csp_candidates {
             page_vm
                 .vm()
@@ -1509,6 +1556,7 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
                 let _ = self.scheduler.accept_parser_discovered_async_candidate(
                     script,
                     self.loader,
+                    page_vm.vm().current_main_document_resource_loader().expect("parser script requires its Document authority").fetch_context().request_origin(),
                     resource_task_runner,
                     shared_preload,
                     Some(&document_character_set),
@@ -1534,10 +1582,7 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
         }
         page_vm
             .vm_mut()
-            .accept_main_document_blocking_stylesheet_inputs(
-                parser_document_owner,
-                &blocking_stylesheet_inputs,
-            );
+            .accept_main_document_stylesheet_inputs(parser_document_owner, &stylesheet_inputs);
     }
 
     async fn advance_next_parser_step_for_owner(
@@ -1755,18 +1800,22 @@ impl<'loader, 'state> ParserDriver<'loader, 'state> {
     }
 
     fn document_write_suspension_step_outcome(&self) -> Option<ParserStepAdvanceOutcome> {
-        match self.parser_session.suspension_cause() {
-            Some(ParserSuspensionCause::ParserCreatedStylesheet { .. }) => {
-                Some(ParserStepAdvanceOutcome::BlockedOnStylesheetParserPause)
+        let DocumentParserRunState::Suspended {
+            resume_owner: ParserResumeOwner::DocumentWrite,
+            cause,
+            ..
+        } = self.parser_session.run_state()
+        else {
+            return None;
+        };
+        Some(match cause {
+            ParserSuspensionCause::ParserClassicStylesheets { .. }
+            | ParserSuspensionCause::ParserCreatedStylesheet { .. } => {
+                ParserStepAdvanceOutcome::BlockedOnStylesheetParserPause
             }
-            Some(ParserSuspensionCause::DocumentWriteExternalScript { .. }) => {
-                Some(ParserStepAdvanceOutcome::BlockedOnDocumentWriteExternalLoad)
+            ParserSuspensionCause::ParserClassicSource { .. } => {
+                ParserStepAdvanceOutcome::BlockedOnDocumentWriteExternalLoad
             }
-            Some(
-                ParserSuspensionCause::ParserClassicSource { .. }
-                | ParserSuspensionCause::ParserClassicStylesheets { .. },
-            )
-            | None => None,
-        }
+        })
     }
 }

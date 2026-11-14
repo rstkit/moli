@@ -613,6 +613,42 @@ mod tests {
     }
 
     #[test]
+    fn stylo_inheritance_crosses_shadow_roots_without_changing_selector_parents() {
+        for mode in ["open", "closed"] {
+            for connected in [false, true] {
+                let url = url::Url::parse("https://example.test/").unwrap();
+                let mut host = DomHost::from_dom(NativeDom::new_html(url));
+                host.reset_html_document_shell();
+                let body = host.document_body_handle().unwrap();
+                let shadow_host = host.create_element("div");
+                if connected {
+                    assert!(host.append_child(body, shadow_host));
+                }
+                let root = host.attach_shadow_root(shadow_host, mode).unwrap();
+                let child = host.create_element("span");
+                let descendant = host.create_element("em");
+                assert!(host.append_child(root, child));
+                assert!(host.append_child(child, descendant));
+
+                let adapter = StyloDomStyleAdapter::new();
+                adapter.with_bound_host(&host, |adapter| {
+                    let host_element = adapter.element(&host, shadow_host).unwrap();
+                    let child = adapter.element(&host, child).unwrap();
+                    let descendant = adapter.element(&host, descendant).unwrap();
+                    assert!(selectors::Element::parent_element(&child).is_none());
+                    assert_eq!(child.inheritance_parent(), Some(host_element));
+                    assert_eq!(descendant.inheritance_parent(), Some(child));
+                    assert_eq!(selectors::Element::parent_element(&descendant), Some(child));
+                    assert_eq!(
+                        host_element.inheritance_parent(),
+                        connected.then(|| adapter.element(&host, body).unwrap()),
+                    );
+                });
+            }
+        }
+    }
+
+    #[test]
     fn stylo_style_adapter_exposes_dom_traits_and_document_bucketed_element_data() {
         let url = url::Url::parse("https://example.test/").unwrap();
         let mut host = DomHost::from_dom(NativeDom::new_html(url));
@@ -642,7 +678,7 @@ mod tests {
             assert!(element.is_html_element());
             assert_eq!(element.id().map(AsRef::as_ref), Some("target"));
             let mut classes = Vec::new();
-            element.each_class(|class| classes.push(class.as_ref().to_owned()));
+            element.each_class(|class| classes.push(AsRef::<str>::as_ref(&class.0).to_owned()));
             assert_eq!(classes, vec!["card", "selected"]);
             assert!(element.state().contains(ElementState::DISABLED));
 
@@ -922,10 +958,10 @@ mod tests {
             url_data: &url_data,
             for_supports_rule: false,
         };
-        let mut input = cssparser::ParserInput::new(selector);
+        let input = selector;
         let selectors = SelectorList::parse(
             &parser,
-            &mut cssparser::Parser::new(&mut input),
+            &mut cssparser::Parser::new(input),
             ParseRelative::No,
         )
         .expect("style selector should parse");
@@ -1357,6 +1393,33 @@ mod tests {
     }
 
     #[test]
+    fn dom_api_selectors_design_mode_marks_connected_elements_read_write() {
+        let url = url::Url::parse("https://example.test/").unwrap();
+        let mut host = DomHost::from_dom(NativeDom::new_html(url));
+        host.reset_html_document_shell();
+        let body = host.document_body_handle().unwrap();
+        let paragraph = host.create_element("p");
+        let blocked = host.create_element("div");
+        assert!(host.set_attribute(blocked, "contenteditable", "false"));
+        let detached = host.create_element("section");
+        assert!(host.append_child(body, paragraph));
+        assert!(host.append_child(body, blocked));
+        assert!(host.set_document_design_mode_enabled_for_handle(host.document_handle(), true));
+
+        let engine = QueryEngine;
+        assert!(
+            engine
+                .matches_host(&host, paragraph, ":read-write")
+                .unwrap()
+        );
+        assert!(!engine.matches_host(&host, paragraph, ":read-only").unwrap());
+        assert!(!engine.matches_host(&host, blocked, ":read-write").unwrap());
+        assert!(engine.matches_host(&host, blocked, ":read-only").unwrap());
+        assert!(!engine.matches_host(&host, detached, ":read-write").unwrap());
+        assert!(engine.matches_host(&host, detached, ":read-only").unwrap());
+    }
+
+    #[test]
     fn dom_api_selectors_lang_uses_nearest_language_attribute() {
         let url = url::Url::parse("https://example.test/").unwrap();
         let mut host = DomHost::from_dom(NativeDom::new_html(url));
@@ -1425,6 +1488,35 @@ mod tests {
     }
 
     #[test]
+    fn dir_auto_ignores_directionally_isolated_html_descendants() {
+        for local_name in ["script", "style", "textarea", "bdi", "span"] {
+            let url = url::Url::parse("https://example.test/").unwrap();
+            let mut host = DomHost::from_dom(NativeDom::new_html(url));
+            host.reset_html_document_shell();
+            let body = host.document_body_handle().unwrap();
+            let parent = host.create_element("div");
+            let descendant = host.create_element(local_name);
+            let latin = host.create_text_node("A");
+            let hebrew = host.create_text_node("\u{05ea}");
+            assert!(host.set_attribute(parent, "dir", "auto"));
+            assert!(host.append_child(descendant, latin));
+            assert!(host.append_child(parent, descendant));
+            assert!(host.append_child(parent, hebrew));
+            assert!(host.append_child(body, parent));
+            let engine = QueryEngine;
+            assert_eq!(
+                engine.matches_host(&host, parent, ":dir(rtl)").unwrap(),
+                local_name != "span",
+                "{local_name} must use its HTML auto-direction isolation rule"
+            );
+            assert_eq!(
+                engine.matches_host(&host, parent, ":dir(ltr)").unwrap(),
+                local_name == "span"
+            );
+        }
+    }
+
+    #[test]
     fn dom_api_selectors_dir_auto_uses_first_strong_text() {
         let url = url::Url::parse("https://example.test/").unwrap();
         let mut host = DomHost::from_dom(NativeDom::new_html(url));
@@ -1458,6 +1550,36 @@ mod tests {
         assert!(host.set_attribute(isolated, "dir", ""));
         assert!(!engine.matches_host(&host, parent, ":dir(ltr)").unwrap());
         assert!(engine.matches_host(&host, parent, ":dir(rtl)").unwrap());
+    }
+
+    #[test]
+    fn dom_api_selectors_dir_auto_tracks_clean_and_dirty_textarea_values() {
+        let url = url::Url::parse("https://example.test/").unwrap();
+        let mut host = DomHost::from_dom(NativeDom::new_html(url));
+        host.reset_html_document_shell();
+        let body = host.document_body_handle().unwrap();
+        let engine = QueryEngine;
+        let textarea = host.create_element("textarea");
+        assert!(host.set_attribute(textarea, "dir", "auto"));
+        let text = host.create_text_node("\u{05ea}");
+        assert!(host.append_child(textarea, text));
+        assert!(host.append_child(body, textarea));
+        assert!(!engine.matches_host(&host, textarea, ":dir(ltr)").unwrap());
+        assert!(engine.matches_host(&host, textarea, ":dir(rtl)").unwrap());
+
+        assert!(host.set_text_content(textarea, "A"));
+        assert!(engine.matches_host(&host, textarea, ":dir(ltr)").unwrap());
+        assert!(!engine.matches_host(&host, textarea, ":dir(rtl)").unwrap());
+
+        assert!(host.set_input_value(textarea, "\u{05ea}"));
+        assert!(host.set_text_content(textarea, "A"));
+        assert!(!engine.matches_host(&host, textarea, ":dir(ltr)").unwrap());
+        assert!(engine.matches_host(&host, textarea, ":dir(rtl)").unwrap());
+
+        assert!(host.set_input_value(textarea, "A"));
+        assert!(host.set_text_content(textarea, "\u{05ea}"));
+        assert!(engine.matches_host(&host, textarea, ":dir(ltr)").unwrap());
+        assert!(!engine.matches_host(&host, textarea, ":dir(rtl)").unwrap());
     }
 
     #[test]

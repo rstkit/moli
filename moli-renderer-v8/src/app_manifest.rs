@@ -181,6 +181,7 @@ impl RendererAppManifestLoadPublication {
 
 pub struct RendererPreparedAppManifestLoad {
     document_url: Url,
+    request_origin: moli_url::WebOrigin,
     requested_manifest_url: Url,
     link_identity: RendererAppManifestLinkIdentity,
     resource: RendererPreparedNetworkResourceLoad,
@@ -189,7 +190,7 @@ pub struct RendererPreparedAppManifestLoad {
 
 pub(crate) struct RendererAppManifestNetworkObservation {
     frame_id: Option<String>,
-    request_headers: Vec<(String, String)>,
+    request_headers: moli_fetch::RequestHeaders,
     credentials_mode: RequestCredentialsMode,
     load: ResourceLoadLease,
     cancel_handle: FetchCancelHandle,
@@ -198,7 +199,7 @@ pub(crate) struct RendererAppManifestNetworkObservation {
 impl RendererAppManifestNetworkObservation {
     pub(crate) fn new(
         frame_id: Option<String>,
-        request_headers: Vec<(String, String)>,
+        request_headers: moli_fetch::RequestHeaders,
         credentials_mode: RequestCredentialsMode,
         load: ResourceLoadLease,
         cancel_handle: FetchCancelHandle,
@@ -216,6 +217,7 @@ impl RendererAppManifestNetworkObservation {
 impl RendererPreparedAppManifestLoad {
     pub(crate) fn new(
         document_url: Url,
+        request_origin: moli_url::WebOrigin,
         requested_manifest_url: Url,
         link_identity: RendererAppManifestLinkIdentity,
         resource: RendererPreparedNetworkResourceLoad,
@@ -223,6 +225,7 @@ impl RendererPreparedAppManifestLoad {
     ) -> Self {
         Self {
             document_url,
+            request_origin,
             requested_manifest_url,
             link_identity,
             resource,
@@ -233,6 +236,7 @@ impl RendererPreparedAppManifestLoad {
     pub async fn execute(self) -> RendererAppManifestLoadOutcome {
         let Self {
             document_url,
+            request_origin,
             requested_manifest_url,
             link_identity,
             resource,
@@ -266,10 +270,9 @@ impl RendererPreparedAppManifestLoad {
             RendererNetworkResourceLoadOutcome::Response(response) => {
                 let response = *response;
                 let security_error = response.completion_error.clone().or_else(|| {
-                    crate::network_host::validate_cors_response(
-                        &document_url,
-                        &response.final_url,
-                        &response.headers,
+                    crate::network_host::validate_cors_response_chain(
+                        &request_origin,
+                        &response.head(),
                         credentials_mode,
                     )
                     .err()
@@ -342,7 +345,7 @@ impl RendererPreparedAppManifestLoad {
     }
 }
 
-fn decode_manifest_source(body: &[u8], headers: &[(String, String)]) -> String {
+fn decode_manifest_source(body: &[u8], headers: &[(String, Vec<u8>)]) -> String {
     let content_type = moli_web_mime::response_content_type(headers);
     let charset = content_type
         .as_deref()
@@ -962,7 +965,7 @@ mod tests {
             b"{\"name\":\"caf\xe9\"}",
             &[(
                 "content-type".to_owned(),
-                "application/manifest+json; charset=windows-1252".to_owned(),
+                b"application/manifest+json; charset=windows-1252".to_vec(),
             )],
         );
         assert_eq!(source, "{\"name\":\"caf\u{e9}\"}");

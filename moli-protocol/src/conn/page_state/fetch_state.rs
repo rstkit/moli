@@ -41,12 +41,14 @@ impl BrowserContext {
         self.page_targets.background_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn background_target_at(&self, index: usize) -> Option<&PageTargetHost> {
-        self.page_targets.background_at(index)
+        self.background_targets().nth(index)
     }
 
+    #[cfg(test)]
     pub(crate) fn background_target_at_mut(&mut self, index: usize) -> Option<&mut PageTargetHost> {
-        self.page_targets.background_at_mut(index)
+        self.background_targets_mut().nth(index)
     }
 
     pub(crate) fn background_target_count(&self) -> usize {
@@ -57,24 +59,36 @@ impl BrowserContext {
         self.page_targets.background_is_empty()
     }
 
-    pub(crate) fn insert_page_target_host(&mut self, mut host: PageTargetHost) -> bool {
+    pub(crate) fn insert_page_target_host(&mut self, host: PageTargetHost) -> bool {
+        let window_id = self.page_targets.default_window_id();
+        self.insert_page_target_host_in_window(host, window_id)
+    }
+
+    pub(crate) fn insert_page_target_host_in_window(
+        &mut self,
+        mut host: PageTargetHost,
+        window_id: u32,
+    ) -> bool {
         if self.page_targets.is_empty() {
             host.document_cookie_manager_surface =
                 self.default_document_cookie_manager_surface.clone();
         }
         host.set_base_cache_disabled(self.global_cache_disabled);
         if let Some(config) = self.page_navigation_runtime_config.clone() {
-            let engine = self.new_page_navigation_engine(config);
+            let engine = self.new_page_navigation_engine_for_auxiliary(
+                config,
+                host.runtime_slot.pending_auxiliary_page(),
+            );
             host.install_navigation_engine(engine);
         }
-        self.page_targets.insert(host)
+        self.page_targets.insert(host, window_id)
     }
 
     #[cfg(test)]
     pub(crate) fn open_pending_fetch_response_body_stream(
         &mut self,
         request_id: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> anyhow::Result<Option<String>> {
         let handle = self
             .active_page_target_mut()
             .runtime_slot
@@ -327,7 +341,7 @@ mod tests {
 
     fn pending_subresource_fetch(internal_id: u64) -> PendingSubresourceFetchRequest {
         PendingSubresourceFetchRequest {
-            residence: crate::conn::PendingSubresourceFetchResidence::InstalledPage(
+            residence: crate::conn::PendingSubresourceFetchResidence::Page(
                 crate::conn::TargetPageResidenceIdentity::new_for_test(
                     "BID-fetch-state".to_owned(),
                     Some("TID-1".to_owned()),
@@ -350,6 +364,12 @@ mod tests {
 
     fn navigation_state(url: &Url) -> NavigationDispatchState {
         NavigationDispatchState {
+            web_mcp_invocation: None,
+            navigation_initiator: None,
+            initial_document_environment: None,
+            auxiliary_document_response: None,
+            redirect_chain: Vec::new(),
+            redirect_headers: None,
             navigate_id: Some(1),
             owner: crate::conn::CommandOwnerScope::for_session("SID-1"),
             result_projection: NavigationResultProjection::Cdp(
@@ -360,11 +380,12 @@ mod tests {
             request_id: Some("REQ-1".to_owned()),
             loader_id: "LID-0000000001".to_owned(),
             request_announced: false,
+            announced_redirects: 0,
             requested_url: url.clone(),
             request_method: "GET".to_owned(),
             request_body: None,
             request_body_bytes: None,
-            request_headers: Vec::new(),
+            request_headers: Vec::new().into(),
             request_load_policy: crate::conn::NavigationRequestLoadPolicy::DocumentInitiated,
             timestamp: 0.0,
             source_document_security: Default::default(),
@@ -375,17 +396,19 @@ mod tests {
         DocumentBodySource::BufferedRaw {
             requested_url: url.clone(),
             request_method: "GET".to_owned(),
-            request_headers: Vec::new(),
+            request_headers: Vec::new().into(),
             response: RawResponse::from_head_and_body(
                 ResponseHead {
+                    status_text: None,
                     final_url: url.clone(),
                     status: 200,
-                    headers: vec![("content-type".to_owned(), "text/html".to_owned())],
+                    headers: vec![("content-type".to_owned(), b"text/html".to_vec())],
                     request_cookie_report: None,
                     cookie_set_reports: Vec::new(),
                     redirected: false,
                     redirect_chain: Vec::new(),
                     from_cache: false,
+                    cache_state: Default::default(),
                     negotiated_http_version: None,
                 },
                 body.to_vec(),

@@ -4,8 +4,10 @@ use crate::exception_reporting::{
 };
 use crate::{
     host::WINDOW_EVENT_SLOT,
-    native_bridge::{JsContextHost, WindowExecutionContextIdentity},
-    util::v8str,
+    native_bridge::{
+        PageScriptHost, RuntimeObservableContextToken, WindowExecutionContextIdentity,
+    },
+    util::{get_private_value, set_private_value},
 };
 use moli_webidl_callback::{
     PreparedWebIdlCallbackFunction, PreparedWebIdlCallbackInterface, WebIdlCallbackInvocation,
@@ -131,11 +133,13 @@ pub(crate) struct CallbackInvocation<'s, 'a> {
     relevant_context: v8::Local<'s, v8::Context>,
     incumbent_context: v8::Local<'s, v8::Context>,
     relevant_identity: Option<WindowExecutionContextIdentity>,
-    host_ptr: Option<*mut JsContextHost>,
+    host_ptr: Option<*mut PageScriptHost>,
     is_callable: bool,
+    legacy_event_handler: bool,
     operation_name: &'a str,
     arguments: &'a [v8::Local<'s, v8::Value>],
     current_event: Option<v8::Local<'s, v8::Object>>,
+    resource_initiator: Option<crate::resource_initiator::CallbackInitiator>,
 }
 
 impl<'s, 'a> CallbackInvocation<'s, 'a> {
@@ -158,15 +162,32 @@ impl<'s, 'a> CallbackInvocation<'s, 'a> {
             relevant_identity: None,
             host_ptr: None,
             is_callable,
+            legacy_event_handler: false,
             operation_name,
             arguments,
             current_event,
+            resource_initiator: None,
         }
+    }
+
+    /// HTML event handlers retain non-callable objects but do not look up
+    /// callback-interface operations or enter their realm when invoked.
+    pub(crate) fn with_legacy_event_handler(mut self) -> Self {
+        self.legacy_event_handler = true;
+        self
+    }
+
+    pub(crate) fn with_resource_initiator(
+        mut self,
+        initiator: crate::resource_initiator::CallbackInitiator,
+    ) -> Self {
+        self.resource_initiator = Some(initiator);
+        self
     }
 
     pub(crate) fn with_execution_context_currentness(
         mut self,
-        host_ptr: *mut JsContextHost,
+        host_ptr: *mut PageScriptHost,
         relevant_identity: Option<WindowExecutionContextIdentity>,
     ) -> Self {
         self.host_ptr = Some(host_ptr);
@@ -195,13 +216,38 @@ impl CallbackInvoker {
         if let Some(host_ptr) = invocation.host_ptr {
             unsafe { &*host_ptr }.debug_assert_not_in_structural_mutation("callback invocation");
         }
-        if let (Some(host_ptr), Some(identity)) =
-            (invocation.host_ptr, invocation.relevant_identity)
-            && !unsafe { &*host_ptr }.window_execution_context_identity_is_current(identity)
-        {
-            return CallbackInvocationOutcome::Retired;
+        if invocation.legacy_event_handler && !invocation.is_callable {
+            let value: v8::Local<v8::Value> = v8::undefined(scope).into();
+            return CallbackInvocationOutcome::Returned(v8::Global::new(scope, value));
+        }
+        if let Some(host_ptr) = invocation.host_ptr {
+            let host = unsafe { &*host_ptr };
+            // Popup dispatch uses scoped registrations in a shared V8
+            // context. A callback from another live Window can lack that
+            // scoped identity while its own concrete realm is still current.
+            let relevant_identity = invocation.relevant_identity.or_else(|| {
+                host.window_execution_context_identity_for_access_check(invocation.relevant_context)
+            });
+            let is_retired = match relevant_identity {
+                Some(identity) => !host.window_execution_context_identity_is_current(identity),
+                // A retained Window can keep its V8 global attached after its
+                // registry entry is removed. Missing authority is not an
+                // unrestricted callback realm. Worker contexts have no Window
+                // token and continue using their own delivery authority.
+                None => invocation
+                    .relevant_context
+                    .get_slot::<RuntimeObservableContextToken>()
+                    .is_some(),
+            };
+            if is_retired {
+                return CallbackInvocationOutcome::Retired;
+            }
         }
 
+        let resource_initiator = crate::resource_initiator::callback_anchor(
+            scope,
+            invocation.resource_initiator.as_ref(),
+        );
         let result = with_webidl_callback_contexts(
             scope,
             invocation.relevant_context,
@@ -214,11 +260,9 @@ impl CallbackInvoker {
                         .and(invocation.current_event)
                         .map(|event| {
                             let global = relevant_context.global(scope);
-                            let event_key = v8str(scope, WINDOW_EVENT_SLOT);
-                            let previous = global
-                                .get(scope, event_key.into())
+                            let previous = get_private_value(scope, global, WINDOW_EVENT_SLOT)
                                 .unwrap_or_else(|| v8::undefined(scope).into());
-                            let _ = global.set(scope, event_key.into(), event.into());
+                            set_private_value(scope, global, WINDOW_EVENT_SLOT, event.into());
                             previous
                         });
 
@@ -229,35 +273,41 @@ impl CallbackInvoker {
                     invocation.operation_name,
                     invocation.arguments,
                 );
-                let result = invoke_webidl_callback(
+                let result = crate::resource_initiator::with_callback_anchor(
                     scope,
-                    webidl_invocation,
-                    |scope, callback, receiver, arguments| {
-                        invoke_callback_with_report(
+                    resource_initiator,
+                    |scope| {
+                        invoke_webidl_callback(
                             scope,
-                            callback_kind,
-                            log_label,
-                            log_level,
-                            callback_name,
-                            callback,
-                            receiver,
-                            arguments,
-                        )
-                    },
-                    |scope, failure| {
-                        capture_callback_resolution_failure(
-                            scope,
-                            log_label,
-                            log_level,
-                            callback_name,
-                            failure,
+                            webidl_invocation,
+                            |scope, callback, receiver, arguments| {
+                                invoke_callback_with_report(
+                                    scope,
+                                    callback_kind,
+                                    log_label,
+                                    log_level,
+                                    callback_name,
+                                    callback,
+                                    receiver,
+                                    arguments,
+                                )
+                            },
+                            |scope, failure| {
+                                capture_callback_resolution_failure(
+                                    scope,
+                                    log_label,
+                                    log_level,
+                                    callback_name,
+                                    failure,
+                                )
+                            },
                         )
                     },
                 );
 
                 if let Some(previous) = previous_window_event {
                     let global = relevant_context.global(scope);
-                    let _ = global.set(scope, v8str(scope, WINDOW_EVENT_SLOT).into(), previous);
+                    set_private_value(scope, global, WINDOW_EVENT_SLOT, previous);
                 }
                 result
             },

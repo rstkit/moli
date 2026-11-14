@@ -1,6 +1,5 @@
-// tokio-tungstenite's accept_hdr_async callback fixes the error type to an
-// unboxed HTTP response, so these test-server callbacks cannot shrink it.
-#![allow(clippy::result_large_err)]
+mod tls;
+pub use tls::TlsWebSocketFixture;
 
 use std::sync::Arc;
 
@@ -17,7 +16,8 @@ use tokio_tungstenite::tungstenite::{
 };
 
 use crate::{
-    ConnectOptions, Event, FrameOpcode, proxy::websocket_proxy_url_with_env, spawn_connection,
+    ConnectOptions, Event, FrameOpcode, proxy::websocket_proxy_route_with_env,
+    spawn_standalone_connection,
 };
 
 struct InfallibleHandshakeCallback<F>(F);
@@ -35,27 +35,28 @@ pub fn test_websocket_context() -> ConnectOptions {
     ConnectOptions {
         origin: "https://example.com".to_owned(),
         user_agent: "Moli-WebSocket-Test/1.0".to_owned(),
-        extra_headers: Vec::new(),
+        extra_headers: Default::default(),
         http_proxy: None,
         http_no_proxy: None,
+        http_host_resolve: Vec::new(),
         proxy_bearer_token: None,
-        tls_verify_host: true,
+        tls: Default::default(),
         cookie_header: None,
-        pause_after_handshake: false,
     }
 }
 
 pub fn test_websocket_proxy_url_with_env(
-    uri: &http::Uri,
+    url: &url::Url,
     context: &ConnectOptions,
     env: &[(&str, &str)],
 ) -> Option<String> {
-    websocket_proxy_url_with_env(uri, context, |name| {
+    websocket_proxy_route_with_env(url, context, |name| {
         env.iter()
             .find_map(|(env_name, value)| (*env_name == name).then(|| (*value).to_owned()))
     })
     .expect("websocket proxy url should resolve")
-    .map(|url| url.to_string())
+    .proxy()
+    .map(|proxy| proxy.url().to_owned())
 }
 
 pub async fn websocket_raw_handshake_failure_message(
@@ -85,7 +86,8 @@ pub async fn websocket_computed_accept_handshake_failure_message(
 
 async fn websocket_handshake_failure_message(url: String, protocols: Vec<String>) -> String {
     let (event_tx, mut event_rx) = mpsc::channel(32);
-    let _command_tx = spawn_connection(90, url, protocols, test_websocket_context(), event_tx);
+    let _command_tx =
+        spawn_standalone_connection(90, url, protocols, test_websocket_context(), event_tx);
     recv_handshake_failure_events(&mut event_rx).await
 }
 
@@ -120,8 +122,7 @@ pub async fn recv_open_event(event_rx: &mut mpsc::Receiver<Event>) -> OpenEvent 
             }
             Event::TextMessage { .. }
             | Event::BinaryMessage { .. }
-            | Event::FrameSent { .. }
-            | Event::BufferedAmountConsumed { .. }
+            | Event::SendCompleted { .. }
             | Event::Closing { .. } => {}
         }
     }
@@ -142,8 +143,7 @@ pub async fn recv_handshake_failure_events(event_rx: &mut mpsc::Receiver<Event>)
             }
             Event::TextMessage { .. }
             | Event::BinaryMessage { .. }
-            | Event::FrameSent { .. }
-            | Event::BufferedAmountConsumed { .. }
+            | Event::SendCompleted { .. }
             | Event::Closing { .. } => {}
         }
     };
@@ -172,8 +172,7 @@ pub async fn recv_handshake_failure_events(event_rx: &mut mpsc::Receiver<Event>)
             }
             Event::TextMessage { .. }
             | Event::BinaryMessage { .. }
-            | Event::FrameSent { .. }
-            | Event::BufferedAmountConsumed { .. }
+            | Event::SendCompleted { .. }
             | Event::Closing { .. } => {}
         }
     }
@@ -186,14 +185,14 @@ async fn recv_next_event(event_rx: &mut mpsc::Receiver<Event>) -> Event {
         .expect("websocket event channel should stay open")
 }
 
-pub async fn assert_frame_sent(
+pub async fn assert_send_completed(
     event_rx: &mut mpsc::Receiver<Event>,
     expected_socket_id: u64,
     expected_opcode: FrameOpcode,
     expected_payload_length: usize,
 ) {
     match recv_next_event(event_rx).await {
-        Event::FrameSent {
+        Event::SendCompleted {
             socket_id,
             opcode,
             payload_length,
@@ -202,21 +201,7 @@ pub async fn assert_frame_sent(
             assert_eq!(opcode, expected_opcode);
             assert_eq!(payload_length, expected_payload_length);
         }
-        event => panic!("expected frame-sent event, got {event:?}"),
-    }
-}
-
-pub async fn assert_buffered_amount_consumed(
-    event_rx: &mut mpsc::Receiver<Event>,
-    expected_socket_id: u64,
-    expected_amount: usize,
-) {
-    match recv_next_event(event_rx).await {
-        Event::BufferedAmountConsumed { socket_id, amount } => {
-            assert_eq!(socket_id, expected_socket_id);
-            assert_eq!(amount, expected_amount);
-        }
-        event => panic!("expected buffered amount event, got {event:?}"),
+        event => panic!("expected send completion, got {event:?}"),
     }
 }
 
@@ -423,15 +408,20 @@ pub async fn spawn_computed_accept_websocket_response_with_body_server(
         response.push_str("Sec-WebSocket-Accept: ");
         response.push_str(&accept);
         response.push_str("\r\n\r\n");
+        let mut packet = response.into_bytes();
+        packet.extend_from_slice(body);
         stream
-            .write_all(response.as_bytes())
+            .write_all(&packet)
             .await
-            .expect("write computed websocket body response headers");
-        if !body.is_empty() {
-            stream
-                .write_all(body)
-                .await
-                .expect("write computed websocket response body");
+            .expect("write computed handshake and frames");
+        if body.first().is_some_and(|opcode| opcode & 0x0f == 8) {
+            let mut socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                stream,
+                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                None,
+            )
+            .await;
+            assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
         }
     });
     (format!("ws://{addr}/{path}"), handle)
@@ -514,6 +504,70 @@ pub async fn spawn_http_connect_proxy() -> (
     (format!("http://{addr}"), request_rx, handle)
 }
 
+#[derive(Debug)]
+pub struct HttpsProxyObservation {
+    pub request: String,
+    pub server_name: Option<String>,
+    pub client_certificates: Vec<Vec<u8>>,
+}
+
+pub async fn spawn_https_connect_proxy(
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> (
+    String,
+    oneshot::Receiver<HttpsProxyObservation>,
+    tokio::task::JoinHandle<Result<(), String>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind HTTPS WebSocket proxy");
+    let port = listener.local_addr().expect("HTTPS proxy addr").port();
+    let (observation_tx, observation_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let (client, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("accept HTTPS proxy client: {error}"))?;
+        let mut client = acceptor
+            .accept(client)
+            .await
+            .map_err(|error| format!("accept HTTPS proxy TLS: {error}"))?;
+        let server_name = client.get_ref().1.server_name().map(str::to_owned);
+        let client_certificates = client
+            .get_ref()
+            .1
+            .peer_certificates()
+            .unwrap_or_default()
+            .iter()
+            .map(|certificate| certificate.to_vec())
+            .collect();
+        let request = try_read_http_headers(&mut client)
+            .await
+            .map_err(|error| format!("read HTTPS proxy request: {error}"))?;
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("HTTPS proxy CONNECT target")
+            .to_owned();
+        let _ = observation_tx.send(HttpsProxyObservation {
+            request,
+            server_name,
+            client_certificates,
+        });
+        let mut upstream = TcpStream::connect(&target)
+            .await
+            .map_err(|error| format!("connect HTTPS proxy upstream: {error}"))?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .map_err(|error| format!("write HTTPS proxy CONNECT response: {error}"))?;
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        Ok(())
+    });
+    (format!("https://localhost:{port}"), observation_rx, handle)
+}
+
 pub async fn spawn_http_connect_proxy_response(
     response: &'static [u8],
 ) -> (
@@ -541,6 +595,79 @@ pub async fn spawn_http_connect_proxy_response(
             .expect("write proxy CONNECT response");
     });
     (format!("http://{addr}"), request_rx, handle)
+}
+
+pub async fn spawn_socks5_proxy(
+    upstream_addr: std::net::SocketAddr,
+) -> (
+    String,
+    oneshot::Receiver<(String, u16)>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind WebSocket SOCKS proxy");
+    let addr = listener.local_addr().expect("WebSocket SOCKS proxy addr");
+    let (request_tx, request_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let (mut client, _) = listener.accept().await.expect("accept SOCKS client");
+        let mut greeting = [0u8; 2];
+        client
+            .read_exact(&mut greeting)
+            .await
+            .expect("read SOCKS greeting");
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0; usize::from(greeting[1])];
+        client
+            .read_exact(&mut methods)
+            .await
+            .expect("read SOCKS methods");
+        assert!(methods.contains(&0), "SOCKS client must offer no-auth");
+        client
+            .write_all(&[5, 0])
+            .await
+            .expect("write SOCKS method selection");
+
+        let mut request_head = [0u8; 4];
+        client
+            .read_exact(&mut request_head)
+            .await
+            .expect("read SOCKS request head");
+        assert_eq!(&request_head[..3], &[5, 1, 0]);
+        let host = match request_head[3] {
+            3 => {
+                let mut length = [0u8; 1];
+                client
+                    .read_exact(&mut length)
+                    .await
+                    .expect("read SOCKS domain length");
+                let mut domain = vec![0; usize::from(length[0])];
+                client
+                    .read_exact(&mut domain)
+                    .await
+                    .expect("read SOCKS domain");
+                String::from_utf8(domain).expect("SOCKS domain should be UTF-8")
+            }
+            atyp => panic!("SOCKS5 must send a domain target, got address type {atyp}"),
+        };
+        let mut port = [0u8; 2];
+        client
+            .read_exact(&mut port)
+            .await
+            .expect("read SOCKS target port");
+        let port = u16::from_be_bytes(port);
+        let _ = request_tx.send((host, port));
+
+        let mut upstream = TcpStream::connect(upstream_addr)
+            .await
+            .expect("connect SOCKS upstream");
+        client
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .await
+            .expect("write SOCKS success response");
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+    });
+    (format!("socks5://{addr}"), request_rx, handle)
 }
 
 pub async fn spawn_text_echo_websocket_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -571,8 +698,9 @@ pub async fn spawn_text_binary_echo_websocket_server() -> (String, tokio::task::
                         .await
                         .expect("echo websocket binary");
                 }
-                Ok(Message::Close(frame)) => {
-                    let _ = socket.close(frame).await;
+                Ok(Message::Close(_frame)) => {
+                    // Reading Close has already queued the echo; flush it before dropping TCP.
+                    let _ = socket.flush().await;
                     break;
                 }
                 Ok(Message::Ping(payload)) => {
@@ -686,6 +814,7 @@ pub async fn spawn_server_close_websocket_server_with_frame(
             reason: reason.into(),
         });
         let _ = socket.send(Message::Close(frame)).await;
+        let _ = socket.next().await;
     });
     (format!("ws://{addr}/server-close"), handle)
 }
@@ -714,13 +843,21 @@ pub async fn spawn_close_after_goodbye_websocket_server() -> (String, tokio::tas
                             reason: "goodbye".into(),
                         })))
                         .await;
+                    // Keep reading until the client's reply, including a data
+                    // fragment that was already being sent when we closed.
+                    while let Some(message) = socket.next().await {
+                        if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                            break;
+                        }
+                    }
                     break;
                 }
                 Ok(Message::Ping(payload)) => {
                     let _ = socket.send(Message::Pong(payload)).await;
                 }
-                Ok(Message::Close(frame)) => {
-                    let _ = socket.close(frame).await;
+                Ok(Message::Close(_frame)) => {
+                    // Reading Close has already queued the echo; flush it before dropping TCP.
+                    let _ = socket.flush().await;
                     break;
                 }
                 Ok(Message::Text(_))
@@ -832,9 +969,10 @@ pub async fn spawn_delayed_passive_close_websocket_server() -> (String, tokio::t
         };
         while let Some(message) = socket.next().await {
             match message {
-                Ok(Message::Close(frame)) => {
+                Ok(Message::Close(_frame)) => {
                     tokio::time::sleep(Duration::from_millis(1000)).await;
-                    let _ = socket.close(frame).await;
+                    // Reading Close has already queued the echo; flush it before dropping TCP.
+                    let _ = socket.flush().await;
                     break;
                 }
                 Ok(Message::Ping(payload)) => {
@@ -880,8 +1018,9 @@ pub async fn spawn_backpressure_websocket_server() -> (String, tokio::task::Join
                         .await
                         .expect("send websocket backpressure text ack");
                 }
-                Message::Close(frame) => {
-                    let _ = socket.close(frame).await;
+                Message::Close(_frame) => {
+                    // Reading Close has already queued the echo; flush it before dropping TCP.
+                    let _ = socket.flush().await;
                     break;
                 }
                 Message::Ping(payload) => {
@@ -915,8 +1054,9 @@ pub async fn spawn_send_backpressure_websocket_server() -> (String, tokio::task:
                 Message::Binary(_) | Message::Text(_) => {
                     let _ = socket.close(None).await;
                 }
-                Message::Close(frame) => {
-                    let _ = socket.close(frame).await;
+                Message::Close(_frame) => {
+                    // Reading Close has already queued the echo; flush it before dropping TCP.
+                    let _ = socket.flush().await;
                 }
                 Message::Ping(payload) => {
                     let _ = socket.send(Message::Pong(payload)).await;
@@ -1009,18 +1149,31 @@ pub async fn spawn_dropping_websocket_server() -> (String, tokio::task::JoinHand
     (format!("ws://{addr}/drop"), handle)
 }
 
-async fn read_http_headers(stream: &mut TcpStream) -> String {
+async fn read_http_headers(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> String {
+    try_read_http_headers(stream)
+        .await
+        .expect("read HTTP request")
+}
+
+async fn try_read_http_headers(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<String, String> {
     let mut request_bytes = Vec::new();
     let mut chunk = [0_u8; 512];
     loop {
-        let count = stream.read(&mut chunk).await.expect("read HTTP request");
-        assert!(count > 0, "client closed before HTTP headers completed");
+        let count = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Err("client closed before HTTP headers completed".to_owned());
+        }
         request_bytes.extend_from_slice(&chunk[..count]);
         if request_bytes.windows(4).any(|window| window == b"\r\n\r\n") {
             break;
         }
     }
-    String::from_utf8_lossy(&request_bytes).into_owned()
+    Ok(String::from_utf8_lossy(&request_bytes).into_owned())
 }
 
 fn websocket_request_header(request: &str, name: &str) -> Option<String> {
@@ -1049,4 +1202,25 @@ pub fn header_value(headers: &[(String, String)], name: &str) -> Option<String> 
     headers
         .iter()
         .find_map(|(header_name, value)| (header_name == name).then(|| value.clone()))
+}
+
+/// Observes physical transport retirement without cooperating in a Close handshake.
+pub async fn spawn_transport_retirement_websocket_server() -> (String, tokio::task::JoinHandle<()>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind retirement server");
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let terminal = timeout(Duration::from_secs(3), socket.next())
+            .await
+            .expect("retirement must physically release TCP");
+        assert!(
+            terminal.is_none() || terminal.is_some_and(|event| event.is_err()),
+            "retirement cancels without a graceful Close"
+        );
+    });
+    (format!("ws://{addr}/retirement"), server)
 }

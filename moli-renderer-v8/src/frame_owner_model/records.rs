@@ -91,25 +91,113 @@ impl FrameDocumentTaskOwner {
     }
 }
 
-/// The main-frame document-owner change produced by `document.open()`.
-///
-/// `document.open()` keeps the current LocalWindow and realm, but the document
-/// identity still changes so pending owner work cannot target the replacement
-/// through the browsing-context identity alone.
+/// Inspector ownership changes independently from Document and LocalWindow
+/// ownership. In particular, initial main-document navigation retains the
+/// Window but replaces its Inspector agent; `document.open()` retains both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentInspectorBindingTransition {
+    Preserved,
+    Replaced,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentContextTransition {
+    retired_owner: Option<FrameDocumentTaskOwner>,
+    current_owner: Option<FrameDocumentTaskOwner>,
+    inspector_binding: DocumentInspectorBindingTransition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentIsolatedWorldTransition {
+    Unchanged,
+    Rebind {
+        retired: FrameDocumentTaskOwner,
+        current: FrameDocumentTaskOwner,
+    },
+    Retire {
+        retired: FrameDocumentTaskOwner,
+    },
+}
+
+impl DocumentContextTransition {
+    fn new(
+        retired_owner: Option<FrameDocumentTaskOwner>,
+        current_owner: Option<FrameDocumentTaskOwner>,
+        inspector_binding: DocumentInspectorBindingTransition,
+    ) -> Self {
+        Self {
+            retired_owner,
+            current_owner,
+            inspector_binding,
+        }
+    }
+
+    pub(crate) fn inspector_binding(self) -> DocumentInspectorBindingTransition {
+        self.inspector_binding
+    }
+
+    pub(crate) fn local_window_owner_transition(self) -> FrameLocalWindowOwnerTransition {
+        match (self.retired_owner, self.current_owner) {
+            (None, Some(current)) => FrameLocalWindowOwnerTransition::Installed {
+                current: current.local_window_id,
+            },
+            (Some(retired), Some(current))
+                if retired.local_window_id == current.local_window_id =>
+            {
+                FrameLocalWindowOwnerTransition::Preserved {
+                    current: current.local_window_id,
+                }
+            }
+            (Some(retired), Some(current)) => FrameLocalWindowOwnerTransition::Replaced {
+                retired: retired.local_window_id,
+                current: current.local_window_id,
+            },
+            (Some(retired), None) => FrameLocalWindowOwnerTransition::Retired {
+                retired: retired.local_window_id,
+            },
+            (None, None) => {
+                unreachable!("a document owner transition must install or retire an owner")
+            }
+        }
+    }
+
+    pub(crate) fn isolated_world_transition(self) -> DocumentIsolatedWorldTransition {
+        let Some(retired) = self.retired_owner else {
+            return DocumentIsolatedWorldTransition::Unchanged;
+        };
+        if self.inspector_binding == DocumentInspectorBindingTransition::Preserved
+            && let Some(current) = self.current_owner
+            && matches!(
+                self.local_window_owner_transition(),
+                FrameLocalWindowOwnerTransition::Preserved { .. }
+            )
+        {
+            DocumentIsolatedWorldTransition::Rebind { retired, current }
+        } else {
+            DocumentIsolatedWorldTransition::Retire { retired }
+        }
+    }
+}
+
+/// An exact main-document replacement, prepared before a navigation commit or
+/// journaled by `document.open()` for the runtime turn boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MainDocumentOwnerTransition {
     retired_owner: FrameDocumentTaskOwner,
     current_owner: FrameDocumentTaskOwner,
+    inspector_binding: DocumentInspectorBindingTransition,
 }
 
 impl MainDocumentOwnerTransition {
     pub(crate) fn new(
         retired_owner: FrameDocumentTaskOwner,
         current_owner: FrameDocumentTaskOwner,
+        inspector_binding: DocumentInspectorBindingTransition,
     ) -> Self {
         Self {
             retired_owner,
             current_owner,
+            inspector_binding,
         }
     }
 
@@ -119,6 +207,14 @@ impl MainDocumentOwnerTransition {
 
     pub(crate) fn current_owner(self) -> FrameDocumentTaskOwner {
         self.current_owner
+    }
+
+    pub(crate) fn context_transition(self) -> DocumentContextTransition {
+        DocumentContextTransition::new(
+            Some(self.retired_owner),
+            Some(self.current_owner),
+            self.inspector_binding,
+        )
     }
 }
 
@@ -164,6 +260,25 @@ pub(crate) enum FrameDocumentLocalWindowTransition {
     ReuseInitialEmptyLocalWindow,
 }
 
+impl FrameDocumentLocalWindowTransition {
+    pub(crate) fn for_document_commit(
+        initial_empty: bool,
+        security_origin_allows_reuse: bool,
+        old_policy: &crate::document_runtime::DocumentPolicyContainer,
+        new_policy: &crate::document_runtime::DocumentPolicyContainer,
+    ) -> Self {
+        if initial_empty
+            && security_origin_allows_reuse
+            && old_policy.credentialless == new_policy.credentialless
+            && old_policy.sandbox.forces_opaque_origin == new_policy.sandbox.forces_opaque_origin
+        {
+            Self::ReuseInitialEmptyLocalWindow
+        } else {
+            Self::ReplaceLocalWindow
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DocumentCreationKind {
     InitialEmpty,
@@ -204,29 +319,17 @@ impl FrameDocumentOwnerTransition {
         self.current_owner
     }
 
+    pub(crate) fn context_transition(self) -> DocumentContextTransition {
+        // Child-document commits remain under the Page's Inspector agent.
+        DocumentContextTransition::new(
+            self.retired_owner,
+            self.current_owner,
+            DocumentInspectorBindingTransition::Preserved,
+        )
+    }
+
     pub(crate) fn local_window_owner_transition(self) -> FrameLocalWindowOwnerTransition {
-        match (self.retired_owner, self.current_owner) {
-            (None, Some(current)) => FrameLocalWindowOwnerTransition::Installed {
-                current: current.local_window_id,
-            },
-            (Some(retired), Some(current))
-                if retired.local_window_id == current.local_window_id =>
-            {
-                FrameLocalWindowOwnerTransition::Preserved {
-                    current: current.local_window_id,
-                }
-            }
-            (Some(retired), Some(current)) => FrameLocalWindowOwnerTransition::Replaced {
-                retired: retired.local_window_id,
-                current: current.local_window_id,
-            },
-            (Some(retired), None) => FrameLocalWindowOwnerTransition::Retired {
-                retired: retired.local_window_id,
-            },
-            (None, None) => {
-                unreachable!("a document owner transition must install or retire an owner")
-            }
-        }
+        self.context_transition().local_window_owner_transition()
     }
 }
 
@@ -481,6 +584,13 @@ pub(crate) struct LocalWindowRecord {
     pub(crate) document_id: DocumentId,
     pub(crate) realm_id: Option<FrameRealmId>,
     pub(crate) settings: FrameSettingsObject,
+    // Import maps and the resolved-module set belong to the Window's settings,
+    // surviving document.open() and remaining usable by retained pure resolvers.
+    pub(crate) import_map_registry: moli_import_map::ImportMapRegistryState,
+    // Captured when an inherited Document moves into a new host. The host's
+    // own LocalWindow id cannot reconstruct the creator's opaque origin.
+    pub(crate) inherited_opaque_origin:
+        Option<std::sync::Arc<crate::structured_clone::RuntimeMessageOpaqueOrigin>>,
     pub(crate) lifecycle: LocalWindowLifecycleState,
 }
 
@@ -502,7 +612,6 @@ pub(crate) struct DocumentRecord {
     pub(crate) lifecycle: DocumentLifecycleState,
     pub(crate) lifecycle_progress: DocumentLifecycleRecord,
     pub(crate) active_requests: BTreeMap<FrameRequestId, FrameRequestRecord>,
-    pub(crate) import_map_registry: moli_import_map::ImportMapRegistryState,
 }
 
 #[derive(Debug)]
@@ -832,6 +941,19 @@ impl DocumentLifecycleRecord {
                     | DocumentLoadEventProgress::WindowLoadDispatched
                     | DocumentLoadEventProgress::OwnerElementLoadDispatched
                     | DocumentLoadEventProgress::PageShowDispatched
+            )
+    }
+
+    pub(super) fn child_owner_load_is_complete(&self) -> bool {
+        self.load_delivery_kind == DocumentLoadDeliveryKind::Child
+            && matches!(
+                self.load,
+                DocumentLoadEventProgress::Suppressed
+                    | DocumentLoadEventProgress::OwnerElementLoadDispatched
+                    | DocumentLoadEventProgress::DispatchingPageShow
+                    | DocumentLoadEventProgress::PageShowDispatched
+                    | DocumentLoadEventProgress::DispatchingFrameFinish
+                    | DocumentLoadEventProgress::Dispatched
             )
     }
 
@@ -1354,6 +1476,19 @@ pub(crate) struct FrameSettingsObject {
     pub(crate) subresource_policy_context: SubresourcePolicyContext,
     pub(crate) service_worker_client_id: Option<ServiceWorkerClientId>,
     pub(crate) module_map_owner: ModuleMapOwner,
+}
+
+impl FrameSettingsObject {
+    pub(crate) fn request_initiator_url(&self, base_url: &Url) -> Url {
+        // URL resolution uses the document base, but fetch security uses the
+        // Window's origin, including inherited and sandboxed opaque origins.
+        if moli_url::origin_ascii_serialization(base_url) == self.origin {
+            base_url.clone()
+        } else {
+            Url::parse(&self.origin)
+                .unwrap_or_else(|_| Url::parse("about:blank").expect("valid opaque initiator URL"))
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

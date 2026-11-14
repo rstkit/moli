@@ -1,4 +1,4 @@
-use std::{str, time::Duration};
+use std::{num::NonZeroUsize, str, time::Duration};
 
 use anyhow::{Error, Result};
 use curl::easy::{Easy2, Handler, WriteError};
@@ -7,13 +7,18 @@ use moli_cookie_jar::{
     StoredCookieSetReport,
 };
 use moli_http_cache::HttpCacheBodyWriter;
+use moli_url::WebOrigin;
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
 use url::Url;
 
 use crate::{
-    FetchCancelHandle, FetchConfig, NegotiatedHttpVersion, NetworkRequestExtraInfo, Request,
+    CrossOriginResourcePolicy, FetchCancelHandle, FetchConfig, NegotiatedHttpVersion,
+    NetworkRequestExtraInfo, Request, RequestRedirectHandling,
+    cancellation::ResponseProgress,
     client_hints::{ClientHintResponseAction, ClientHintResponsePolicy},
+    headers::{decode_http_header_bytes, parse_http_response_header_line},
+    response::parse_http_response_status_line,
 };
 
 use crate::RedirectInfo;
@@ -49,9 +54,10 @@ pub(crate) struct RequestTransferMetrics {
 
 pub(crate) fn transfer_metrics_from_easy<H: Handler>(
     easy: &Easy2<H>,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> RequestTransferMetrics {
-    let content_encoding = response_header_value(headers, "content-encoding").map(str::to_owned);
+    let content_encoding =
+        response_header_value(headers, "content-encoding").map(std::borrow::Cow::into_owned);
     let content_length = response_header_value(headers, "content-length")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0);
@@ -85,11 +91,14 @@ fn duration_to_ms(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn response_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+fn response_header_value<'a>(
+    headers: &'a [(String, Vec<u8>)],
+    name: &str,
+) -> Option<std::borrow::Cow<'a, str>> {
     headers
         .iter()
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| crate::decode_header_value(value))
 }
 
 pub(crate) fn log_request_completion(
@@ -120,49 +129,84 @@ pub(crate) fn log_request_completion(
 #[derive(Debug, Default)]
 pub(crate) struct ResponseCollector {
     body: Vec<u8>,
-    headers: Vec<(String, String)>,
+    headers: Vec<(String, Vec<u8>)>,
+    status: u16,
+    status_text: Option<String>,
+    stop_at_redirect: bool,
+    header_terminated: bool,
     max_response_size: Option<usize>,
     response_too_large: bool,
     cancel_handle: Option<FetchCancelHandle>,
+    response_progress: Option<ResponseProgress>,
 }
 
 impl ResponseCollector {
+    pub(crate) fn response_progress(&self) -> Option<&ResponseProgress> {
+        self.response_progress.as_ref()
+    }
+
     pub(crate) fn new(cancel_handle: Option<FetchCancelHandle>) -> Self {
         Self {
+            response_progress: cancel_handle
+                .as_ref()
+                .map(FetchCancelHandle::response_progress),
             cancel_handle,
             ..Self::default()
         }
     }
 
-    pub(crate) fn begin_request(&mut self, max_response_size: Option<usize>) {
+    pub(crate) fn begin_request(
+        &mut self,
+        max_response_size: Option<usize>,
+        stop_at_redirect: bool,
+    ) {
+        if let Some(cancel) = &self.cancel_handle {
+            self.response_progress = Some(cancel.response_progress());
+        }
         self.body.clear();
         self.headers.clear();
+        self.status = 0;
+        self.status_text = None;
+        self.stop_at_redirect = stop_at_redirect;
+        self.header_terminated = false;
         self.max_response_size = max_response_size;
         self.response_too_large = false;
     }
 
-    pub(crate) fn headers(&self) -> &[(String, String)] {
+    pub(crate) fn status_text(&self) -> Option<&str> {
+        self.status_text.as_deref()
+    }
+
+    pub(crate) fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
     }
 
     pub(crate) fn body(&self) -> &[u8] {
         &self.body
     }
+
+    pub(crate) fn header_terminated(&self) -> bool {
+        self.header_terminated
+    }
 }
 
 #[derive(Debug)]
 pub struct StreamingResponseCollector {
     cookie_store: SharedBrowserCookieStore,
-    headers: Vec<(String, String)>,
+    corp_origin: Option<WebOrigin>,
+    headers: Vec<(String, Vec<u8>)>,
+    status_text: Option<String>,
     current_url: Option<Url>,
     current_cookie_context: Option<NetworkCookieRequestContext>,
     status: u16,
     max_response_size: Option<usize>,
     response_too_large: bool,
     response_bytes_received: usize,
+    declared_identity_body_length: Option<NonZeroUsize>,
     cache_body_writer: Option<HttpCacheBodyWriter>,
     cache_plan: Option<StreamingCachePlan>,
     started: bool,
+    headers_finalized: bool,
     header_terminated: bool,
     start_tx: Option<oneshot::Sender<Result<StreamingHtmlResponseStart>>>,
     body_tx: Option<mpsc::UnboundedSender<String>>,
@@ -174,6 +218,7 @@ pub struct StreamingResponseCollector {
     client_hint_response_policy: Option<ClientHintResponsePolicy>,
     client_hint_restart_requested: bool,
     cancel_handle: FetchCancelHandle,
+    response_progress: ResponseProgress,
     utf8_pending: Vec<u8>,
     negotiated_http_version: Option<NegotiatedHttpVersion>,
     network_request_extra_info: Option<NetworkRequestExtraInfo>,
@@ -205,7 +250,7 @@ impl StreamingCachePlan {
     fn create_body_writer(
         &self,
         status: u16,
-        headers: &[(String, String)],
+        headers: &[(String, Vec<u8>)],
     ) -> Result<Option<HttpCacheBodyWriter>> {
         create_streaming_cache_body_writer_for_response_parts(
             &self.config,
@@ -221,17 +266,20 @@ impl StreamingCachePlan {
 #[derive(Debug)]
 pub struct RawStreamingResponseCollector {
     cookie_store: SharedBrowserCookieStore,
-    headers: Vec<(String, String)>,
+    corp_origin: Option<WebOrigin>,
+    headers: Vec<(String, Vec<u8>)>,
+    status_text: Option<String>,
     current_url: Option<Url>,
     current_cookie_context: Option<NetworkCookieRequestContext>,
     status: u16,
     max_response_size: Option<usize>,
     response_too_large: bool,
     response_bytes_received: usize,
-    declared_identity_body_length: Option<usize>,
+    declared_identity_body_length: Option<NonZeroUsize>,
     cache_body_writer: Option<HttpCacheBodyWriter>,
     cache_plan: Option<StreamingCachePlan>,
     started: bool,
+    headers_finalized: bool,
     header_terminated: bool,
     start_tx: Option<oneshot::Sender<Result<StreamingHtmlResponseStart>>>,
     body_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
@@ -244,11 +292,21 @@ pub struct RawStreamingResponseCollector {
     client_hint_response_policy: Option<ClientHintResponsePolicy>,
     client_hint_restart_requested: bool,
     cancel_handle: FetchCancelHandle,
+    response_progress: ResponseProgress,
+    redirect_handling: RequestRedirectHandling,
     negotiated_http_version: Option<NegotiatedHttpVersion>,
     network_request_extra_info: Option<NetworkRequestExtraInfo>,
 }
 
 impl StreamingResponseCollector {
+    pub(crate) fn set_corp_origin(&mut self, origin: Option<&WebOrigin>) {
+        self.corp_origin = origin.cloned();
+    }
+
+    pub(crate) fn response_progress(&self) -> &ResponseProgress {
+        &self.response_progress
+    }
+
     pub fn new(
         cookie_store: SharedBrowserCookieStore,
         start_tx: oneshot::Sender<Result<StreamingHtmlResponseStart>>,
@@ -257,16 +315,20 @@ impl StreamingResponseCollector {
     ) -> Self {
         Self {
             cookie_store,
+            corp_origin: None,
             headers: Vec::new(),
             current_url: None,
             current_cookie_context: None,
             status: 0,
+            status_text: None,
             max_response_size: None,
             response_too_large: false,
             response_bytes_received: 0,
+            declared_identity_body_length: None,
             cache_body_writer: None,
             cache_plan: None,
             started: false,
+            headers_finalized: false,
             header_terminated: false,
             start_tx: Some(start_tx),
             body_tx: Some(body_tx),
@@ -277,6 +339,7 @@ impl StreamingResponseCollector {
             callback_error: None,
             client_hint_response_policy: None,
             client_hint_restart_requested: false,
+            response_progress: cancel_handle.response_progress(),
             cancel_handle,
             utf8_pending: Vec::new(),
             negotiated_http_version: None,
@@ -294,16 +357,21 @@ impl StreamingResponseCollector {
         redirect_chain: Vec<RedirectInfo>,
         cache_body_writer: Option<HttpCacheBodyWriter>,
     ) {
+        self.response_progress = self.cancel_handle.response_progress();
         self.headers.clear();
+        self.status_text = None;
         self.current_url = Some(current_url);
+        self.corp_origin = None;
         self.current_cookie_context = Some(current_cookie_context);
         self.status = 0;
         self.max_response_size = max_response_size;
         self.response_too_large = false;
         self.response_bytes_received = 0;
+        self.declared_identity_body_length = None;
         self.cache_body_writer = cache_body_writer;
         self.cache_plan = None;
         self.started = false;
+        self.headers_finalized = false;
         self.header_terminated = false;
         self.request_cookie_report = request_cookie_report;
         self.response_credentials_allowed = response_credentials_allowed;
@@ -327,6 +395,7 @@ impl StreamingResponseCollector {
         redirect_chain: Vec<RedirectInfo>,
         network_request_extra_info: Option<NetworkRequestExtraInfo>,
         cache_plan: Option<StreamingCachePlan>,
+        response_progress: ResponseProgress,
     ) {
         self.begin_request(
             max_response_size,
@@ -337,11 +406,16 @@ impl StreamingResponseCollector {
             redirect_chain,
             None,
         );
+        self.response_progress = response_progress;
         self.network_request_extra_info = network_request_extra_info;
         self.cache_plan = cache_plan;
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
+    pub(crate) fn status_text(&self) -> Option<&str> {
+        self.status_text.as_deref()
+    }
+
+    pub fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
     }
 
@@ -389,6 +463,24 @@ impl StreamingResponseCollector {
         self.client_hint_restart_requested
     }
 
+    pub(crate) fn finish_headers_at_eof(&mut self) -> Result<()> {
+        if self.headers_finalized || self.cancel_handle.is_cancelled() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.status != 0 && !is_interim_response_status(self.status),
+            "response ended without final HTTP headers"
+        );
+        // Curl may accept EOF after complete header lines without delivering
+        // the empty separator. Run the usual cookie/cache/client-hint policy
+        // before the owner decides whether to publish or retry this response.
+        self.finalize_headers();
+        if let Some(error) = &self.callback_error {
+            return Err(Error::msg(error.clone()));
+        }
+        Ok(())
+    }
+
     fn finalize_headers(&mut self) -> bool {
         if self.response_too_large {
             return false;
@@ -402,6 +494,7 @@ impl StreamingResponseCollector {
             return true;
         };
 
+        self.headers_finalized = true;
         if self.response_credentials_allowed {
             let Some(request_context) = self.current_cookie_context.as_ref() else {
                 self.callback_error =
@@ -436,10 +529,19 @@ impl StreamingResponseCollector {
             self.client_hint_restart_requested = true;
             return false;
         }
+        if let Some(origin) = &self.corp_origin
+            && let Some(policy) = CrossOriginResourcePolicy::from_headers(&self.headers)
+            && let Err(error) = policy.check(origin, &current_url)
+        {
+            self.callback_error = Some(error);
+            return false;
+        }
+        let declared_body_length = identity_encoded_content_length(&self.headers);
+        self.declared_identity_body_length = declared_body_length.and_then(NonZeroUsize::new);
         // Create the cache writer only after final response headers prove the
         // response is cacheable.
         self.maybe_create_cache_body_writer();
-        self.maybe_emit_start();
+        self.maybe_emit_start(declared_body_length == Some(0));
         if response_body_ends_at_headers(self.status) && self.started {
             self.finish_streaming_body();
             self.header_terminated = true;
@@ -467,7 +569,7 @@ impl StreamingResponseCollector {
         }
     }
 
-    fn maybe_emit_start(&mut self) {
+    fn maybe_emit_start(&mut self, body_is_empty: bool) {
         if self.started || self.response_too_large {
             return;
         }
@@ -481,17 +583,22 @@ impl StreamingResponseCollector {
         {
             return;
         }
+        if body_is_empty || response_body_ends_at_headers(self.status) {
+            self.response_progress.commit();
+        }
         self.started = true;
         if let Some(start_tx) = self.start_tx.take() {
             let _ = start_tx.send(Ok(StreamingHtmlResponseStart {
                 final_url: current_url,
                 status: self.status,
+                status_text: self.status_text.clone(),
                 headers: self.headers.clone(),
                 request_cookie_report: self.request_cookie_report.clone(),
                 cookie_set_reports: self.cookie_set_reports.clone(),
                 redirected: !self.redirect_chain.is_empty(),
                 redirect_chain: self.redirect_chain.clone(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: self.negotiated_http_version,
                 network_request_extra_info: self.network_request_extra_info.clone(),
             }));
@@ -604,18 +711,29 @@ impl StreamingResponseCollector {
 }
 
 impl RawStreamingResponseCollector {
+    pub(crate) fn set_corp_origin(&mut self, origin: Option<&WebOrigin>) {
+        self.corp_origin = origin.cloned();
+    }
+
+    pub(crate) fn response_progress(&self) -> &ResponseProgress {
+        &self.response_progress
+    }
+
     pub fn new(
         cookie_store: SharedBrowserCookieStore,
         start_tx: oneshot::Sender<Result<StreamingHtmlResponseStart>>,
         body_tx: mpsc::UnboundedSender<Vec<u8>>,
         cancel_handle: FetchCancelHandle,
     ) -> Self {
+        let response_progress = cancel_handle.response_progress();
         Self {
             cookie_store,
+            corp_origin: None,
             headers: Vec::new(),
             current_url: None,
             current_cookie_context: None,
             status: 0,
+            status_text: None,
             max_response_size: None,
             response_too_large: false,
             response_bytes_received: 0,
@@ -623,6 +741,7 @@ impl RawStreamingResponseCollector {
             cache_body_writer: None,
             cache_plan: None,
             started: false,
+            headers_finalized: false,
             header_terminated: false,
             start_tx: Some(start_tx),
             body_tx: Some(body_tx),
@@ -635,12 +754,14 @@ impl RawStreamingResponseCollector {
             client_hint_response_policy: None,
             client_hint_restart_requested: false,
             cancel_handle,
+            response_progress,
+            redirect_handling: RequestRedirectHandling::Follow,
             negotiated_http_version: None,
             network_request_extra_info: None,
         }
     }
 
-    pub fn begin_request(
+    fn begin_request(
         &mut self,
         max_response_size: Option<usize>,
         current_url: Url,
@@ -648,19 +769,24 @@ impl RawStreamingResponseCollector {
         request_cookie_report: Option<StoredCookieQueryReport>,
         response_credentials_allowed: bool,
         redirect_chain: Vec<RedirectInfo>,
+        response_progress: ResponseProgress,
     ) {
         self.headers.clear();
+        self.status_text = None;
         self.current_url = Some(current_url);
+        self.corp_origin = None;
         self.current_cookie_context = Some(current_cookie_context);
         self.status = 0;
         self.max_response_size = max_response_size;
         self.response_too_large = false;
         self.response_bytes_received = 0;
         self.declared_identity_body_length = None;
-        self.cancel_handle.reset_response_progress();
+        self.response_progress = response_progress;
+        self.redirect_handling = RequestRedirectHandling::Follow;
         self.cache_body_writer = None;
         self.cache_plan = None;
         self.started = false;
+        self.headers_finalized = false;
         self.header_terminated = false;
         self.request_cookie_report = request_cookie_report;
         self.response_credentials_allowed = response_credentials_allowed;
@@ -685,6 +811,8 @@ impl RawStreamingResponseCollector {
         network_request_extra_info: Option<NetworkRequestExtraInfo>,
         cache_plan: Option<StreamingCachePlan>,
         defer_not_modified_start: bool,
+        response_progress: ResponseProgress,
+        redirect_handling: RequestRedirectHandling,
     ) {
         self.begin_request(
             max_response_size,
@@ -693,13 +821,19 @@ impl RawStreamingResponseCollector {
             request_cookie_report,
             response_credentials_allowed,
             redirect_chain,
+            response_progress,
         );
         self.network_request_extra_info = network_request_extra_info;
         self.cache_plan = cache_plan;
         self.defer_not_modified_start = defer_not_modified_start;
+        self.redirect_handling = redirect_handling;
     }
 
-    pub fn headers(&self) -> &[(String, String)] {
+    pub(crate) fn status_text(&self) -> Option<&str> {
+        self.status_text.as_deref()
+    }
+
+    pub fn headers(&self) -> &[(String, Vec<u8>)] {
         &self.headers
     }
 
@@ -747,6 +881,23 @@ impl RawStreamingResponseCollector {
         self.client_hint_restart_requested
     }
 
+    pub(crate) fn finish_headers_at_eof(&mut self) -> Result<()> {
+        if self.headers_finalized || self.cancel_handle.is_cancelled() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.status != 0 && !is_interim_response_status(self.status),
+            "response ended without final HTTP headers"
+        );
+        // A deferred redirect or 304 has not started either, so track header
+        // finalization separately to avoid applying its response policy twice.
+        self.finalize_headers();
+        if let Some(error) = &self.callback_error {
+            return Err(Error::msg(error.clone()));
+        }
+        Ok(())
+    }
+
     fn finalize_headers(&mut self) -> bool {
         if self.response_too_large {
             return false;
@@ -760,6 +911,7 @@ impl RawStreamingResponseCollector {
             return true;
         };
 
+        self.headers_finalized = true;
         if self.response_credentials_allowed {
             let Some(request_context) = self.current_cookie_context.as_ref() else {
                 self.callback_error =
@@ -794,13 +946,31 @@ impl RawStreamingResponseCollector {
             self.client_hint_restart_requested = true;
             return false;
         }
-        self.declared_identity_body_length = identity_encoded_content_length(&self.headers);
-        if self.declared_identity_body_length == Some(0) {
-            self.cancel_handle.mark_declared_response_body_complete();
+        // A 304 is checked against the merged cached response before delivery.
+        if !(self.status == 304 && self.defer_not_modified_start)
+            && let Some(origin) = &self.corp_origin
+            && let Some(policy) = CrossOriginResourcePolicy::from_headers(&self.headers)
+            && let Err(error) = policy.check(origin, &current_url)
+        {
+            self.callback_error = Some(error);
+            return false;
+        }
+        let declared_body_length = identity_encoded_content_length(&self.headers);
+        self.declared_identity_body_length = declared_body_length.and_then(NonZeroUsize::new);
+        if declared_body_length == Some(0) {
+            self.response_progress.commit();
         }
         self.maybe_create_cache_body_writer();
-        self.maybe_emit_start();
-        if response_body_ends_at_headers(self.status) && self.started {
+        let is_redirect_response =
+            next_redirect_url_from_parts(&current_url, self.status, &self.headers, 0)
+                .ok()
+                .flatten()
+                .is_some();
+        self.maybe_emit_start(is_redirect_response);
+        if self.started && (response_body_ends_at_headers(self.status) || is_redirect_response) {
+            // Manual redirects expose their head with an empty body. Stop the
+            // transport here so neither streaming nor buffered callers wait
+            // for bytes that this API discards.
             self.finish_streaming_body();
             self.header_terminated = true;
             return false;
@@ -827,18 +997,14 @@ impl RawStreamingResponseCollector {
         }
     }
 
-    fn maybe_emit_start(&mut self) {
+    fn maybe_emit_start(&mut self, is_redirect_response: bool) {
         if self.started || self.response_too_large {
             return;
         }
         let Some(current_url) = self.current_url.clone() else {
             return;
         };
-        if next_redirect_url_from_parts(&current_url, self.status, &self.headers, 0)
-            .ok()
-            .flatten()
-            .is_some()
-        {
+        if self.redirect_handling.transport_follows_redirects() && is_redirect_response {
             return;
         }
         if self.defer_not_modified_start && self.status == 304 {
@@ -849,12 +1015,14 @@ impl RawStreamingResponseCollector {
             let _ = start_tx.send(Ok(StreamingHtmlResponseStart {
                 final_url: current_url,
                 status: self.status,
+                status_text: self.status_text.clone(),
                 headers: self.headers.clone(),
                 request_cookie_report: self.request_cookie_report.clone(),
                 cookie_set_reports: self.cookie_set_reports.clone(),
                 redirected: !self.redirect_chain.is_empty(),
                 redirect_chain: self.redirect_chain.clone(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: self.negotiated_http_version,
                 network_request_extra_info: self.network_request_extra_info.clone(),
             }));
@@ -945,30 +1113,50 @@ impl Handler for ResponseCollector {
     }
 
     fn header(&mut self, data: &[u8]) -> bool {
-        let line = String::from_utf8_lossy(data);
+        let line = decode_http_header_bytes(data);
         let line = line.trim_end_matches(['\r', '\n']);
 
         if line.is_empty() {
+            if self.stop_at_redirect
+                && matches!(self.status, 301 | 302 | 303 | 307 | 308)
+                && self.headers.iter().any(|(name, _)| name == "location")
+            {
+                // The caller owns the next hop. Its unused body must not
+                // delay redirects, including libcurl's buffered auth path.
+                self.header_terminated = true;
+                return false;
+            }
             return !self.response_too_large;
         }
 
-        if line.starts_with("HTTP/") {
+        if let Some(parsed) = parse_http_response_status_line(data) {
             self.headers.clear();
+            self.status = parsed.status;
+            self.status_text = Some(parsed.status_text);
             self.body.clear();
+            if let Some(progress) = &self.response_progress {
+                if is_interim_response_status(parsed.status) {
+                    progress.mark_interim_response_started();
+                } else {
+                    progress.mark_response_started();
+                }
+            }
             return true;
         }
 
-        let Some((name, value)) = line.split_once(':') else {
+        let Some((mut name, value)) = parse_http_response_header_line(data) else {
             return true;
         };
-
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_owned();
+        name.make_ascii_lowercase();
 
         if name == "content-length"
             && self
                 .max_response_size
-                .zip(value.parse::<usize>().ok())
+                .zip(
+                    std::str::from_utf8(&value)
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok()),
+                )
                 .is_some_and(|(limit, content_length)| content_length > limit)
         {
             self.response_too_large = true;
@@ -994,6 +1182,13 @@ impl Handler for StreamingResponseCollector {
         }
 
         self.response_bytes_received += data.len();
+        if self.started
+            && self
+                .declared_identity_body_length
+                .is_some_and(|length| length.get() == self.response_bytes_received)
+        {
+            self.response_progress.commit();
+        }
         self.write_cache_body_bytes(data);
         self.stream_body_bytes(data);
         if self.cancel_handle.is_cancelled() {
@@ -1003,38 +1198,44 @@ impl Handler for StreamingResponseCollector {
     }
 
     fn header(&mut self, data: &[u8]) -> bool {
-        let line = String::from_utf8_lossy(data);
+        let line = decode_http_header_bytes(data);
         let line = line.trim_end_matches(['\r', '\n']);
 
         if line.is_empty() {
             return self.finalize_headers();
         }
 
-        if let Some(status) = line
-            .strip_prefix("HTTP/")
-            .and_then(|rest| rest.split_whitespace().nth(1))
-            .and_then(|status| status.parse::<u16>().ok())
-        {
+        if let Some(parsed) = parse_http_response_status_line(data) {
             self.headers.clear();
-            self.status = status;
-            self.negotiated_http_version = NegotiatedHttpVersion::from_status_line(line);
+            self.headers_finalized = false;
+            self.status = parsed.status;
+            self.status_text = Some(parsed.status_text);
+            self.negotiated_http_version = parsed.version;
             self.response_bytes_received = 0;
+            self.declared_identity_body_length = None;
             self.response_too_large = false;
             self.cookie_set_reports.clear();
+            if is_interim_response_status(self.status) {
+                self.response_progress.mark_interim_response_started();
+            } else {
+                self.response_progress.mark_response_started();
+            }
             return true;
         }
 
-        let Some((name, value)) = line.split_once(':') else {
+        let Some((mut name, value)) = parse_http_response_header_line(data) else {
             return true;
         };
-
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_owned();
+        name.make_ascii_lowercase();
 
         if name == "content-length"
             && self
                 .max_response_size
-                .zip(value.parse::<usize>().ok())
+                .zip(
+                    std::str::from_utf8(&value)
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok()),
+                )
                 .is_some_and(|(limit, content_length)| content_length > limit)
         {
             self.response_too_large = true;
@@ -1064,8 +1265,11 @@ impl Handler for RawStreamingResponseCollector {
         }
 
         self.response_bytes_received += data.len();
-        if self.declared_identity_body_length == Some(self.response_bytes_received) {
-            self.cancel_handle.mark_declared_response_body_complete();
+        if self
+            .declared_identity_body_length
+            .is_some_and(|length| length.get() == self.response_bytes_received)
+        {
+            self.response_progress.commit();
         }
         self.write_cache_body_bytes(data);
         self.send_chunk(data);
@@ -1076,38 +1280,43 @@ impl Handler for RawStreamingResponseCollector {
     }
 
     fn header(&mut self, data: &[u8]) -> bool {
-        let line = String::from_utf8_lossy(data);
+        let line = decode_http_header_bytes(data);
         let line = line.trim_end_matches(['\r', '\n']);
 
         if line.is_empty() {
             return self.finalize_headers();
         }
 
-        if let Some(status) = line
-            .strip_prefix("HTTP/")
-            .and_then(|rest| rest.split_whitespace().nth(1))
-            .and_then(|status| status.parse::<u16>().ok())
-        {
+        if let Some(parsed) = parse_http_response_status_line(data) {
             self.headers.clear();
-            self.status = status;
-            self.negotiated_http_version = NegotiatedHttpVersion::from_status_line(line);
+            self.headers_finalized = false;
+            self.status = parsed.status;
+            self.status_text = Some(parsed.status_text);
+            self.negotiated_http_version = parsed.version;
             self.response_bytes_received = 0;
             self.response_too_large = false;
             self.cookie_set_reports.clear();
+            if is_interim_response_status(self.status) {
+                self.response_progress.mark_interim_response_started();
+            } else {
+                self.response_progress.mark_response_started();
+            }
             return true;
         }
 
-        let Some((name, value)) = line.split_once(':') else {
+        let Some((mut name, value)) = parse_http_response_header_line(data) else {
             return true;
         };
-
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_owned();
+        name.make_ascii_lowercase();
 
         if name == "content-length"
             && self
                 .max_response_size
-                .zip(value.parse::<usize>().ok())
+                .zip(
+                    std::str::from_utf8(&value)
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok()),
+                )
                 .is_some_and(|(limit, content_length)| content_length > limit)
         {
             self.response_too_large = true;
@@ -1123,7 +1332,8 @@ impl Handler for RawStreamingResponseCollector {
     }
 }
 
-fn identity_encoded_content_length(headers: &[(String, String)]) -> Option<usize> {
+fn identity_encoded_content_length(headers: &[(String, Vec<u8>)]) -> Option<usize> {
+    let headers = crate::headers_to_byte_strings(headers);
     let cannot_compare_delivered_body_length = headers.iter().any(|(name, value)| {
         (name.eq_ignore_ascii_case("content-encoding")
             && !value.trim().eq_ignore_ascii_case("identity"))
@@ -1149,6 +1359,60 @@ mod tests {
     use super::*;
     use moli_cookie_jar::new_shared_browser_cookie_store;
 
+    #[test]
+    fn buffered_status_message_tracks_final_response_and_resets_between_requests() {
+        let mut collector = ResponseCollector::new(None);
+        collector.begin_request(None, false);
+        assert!(collector.header(b"HTTP/1.1 103 Early Hints\r\n"));
+        assert!(collector.header(b"Link: </early.css>; rel=preload\r\n"));
+        assert!(collector.header(b"\r\n"));
+        assert!(collector.header(b"HTTP/1.1 200 \xa0caf\xe9\xff\r\n"));
+        assert!(collector.header(b"\r\n"));
+        assert_eq!(collector.status_text(), Some("\u{a0}caf\u{e9}\u{ff}"));
+        assert!(collector.headers().is_empty());
+
+        collector.begin_request(None, false);
+        assert_eq!(collector.status_text(), None);
+        assert!(collector.header(b"HTTP/1.1 200 \r\n"));
+        assert_eq!(collector.status_text(), Some(""));
+    }
+
+    #[test]
+    fn buffered_single_hop_stops_at_redirect_headers_but_preserves_auth_and_final_bodies() {
+        let mut collector = ResponseCollector::new(None);
+        collector.begin_request(None, true);
+        assert!(collector.header(b"HTTP/1.1 401 Unauthorized\r\n"));
+        assert!(collector.header(b"WWW-Authenticate: Digest realm=\"test\"\r\n"));
+        assert!(collector.header(b"\r\n"));
+        assert_eq!(collector.write(b"challenge").unwrap(), 9);
+        assert!(!collector.header_terminated());
+        assert!(collector.header(b"HTTP/1.1 302 Found\r\n"));
+        assert!(collector.header(b"Location: /next\r\n"));
+        assert!(!collector.header(b"\r\n"));
+        assert!(collector.header_terminated());
+        assert!(collector.body().is_empty());
+
+        collector.begin_request(None, true);
+        assert!(collector.header(b"HTTP/1.1 200 OK\r\n"));
+        assert!(collector.header(b"\r\n"));
+        assert_eq!(collector.write(b"final").unwrap(), 5);
+        assert!(!collector.header_terminated());
+        assert_eq!(collector.body(), b"final");
+
+        collector.begin_request(None, false);
+        assert!(collector.header(b"HTTP/1.1 302 Found\r\n"));
+        assert!(collector.header(b"Location: /next\r\n"));
+        assert!(collector.header(b"\r\n"));
+        assert_eq!(collector.write(b"redirect body").unwrap(), 13);
+        assert!(!collector.header_terminated());
+
+        collector.begin_request(None, true);
+        assert!(collector.header(b"HTTP/1.1 302 Found\r\n"));
+        assert!(collector.header(b"\r\n"));
+        assert_eq!(collector.write(b"no Location").unwrap(), 11);
+        assert!(!collector.header_terminated());
+    }
+
     fn raw_streaming_collector_with_headers(
         cancel_handle: FetchCancelHandle,
         headers: &[&str],
@@ -1158,6 +1422,7 @@ mod tests {
     ) {
         let (start_tx, _start_rx) = oneshot::channel();
         let (body_tx, body_rx) = mpsc::unbounded_channel();
+        let response_progress = cancel_handle.begin_response_progress();
         let mut collector = RawStreamingResponseCollector::new(
             new_shared_browser_cookie_store(),
             start_tx,
@@ -1171,6 +1436,7 @@ mod tests {
             None,
             true,
             Vec::new(),
+            response_progress,
         );
         assert!(collector.header(b"HTTP/1.1 200 OK\r\n"));
         for header in headers {
@@ -1193,6 +1459,49 @@ mod tests {
     }
 
     #[test]
+    fn html_zero_length_commits_only_for_an_accepted_response() {
+        for (status, headers, committed) in [
+            ("HTTP/1.1 200 OK", vec!["Content-Length: 0"], true),
+            ("HTTP/1.1 200 OK", vec![], false),
+            (
+                "HTTP/1.1 302 Found",
+                vec!["Location: /next", "Content-Length: 0"],
+                false,
+            ),
+        ] {
+            let cancel = FetchCancelHandle::new();
+            let (start_tx, _start_rx) = oneshot::channel();
+            let (body_tx, _body_rx) = mpsc::unbounded_channel();
+            let mut collector = StreamingResponseCollector::new(
+                new_shared_browser_cookie_store(),
+                start_tx,
+                body_tx,
+                cancel.clone(),
+            );
+            collector.begin_request(
+                None,
+                Url::parse("https://example.test/body").unwrap(),
+                NetworkCookieRequestContext::top_level_navigation("GET"),
+                None,
+                true,
+                Vec::new(),
+                None,
+            );
+            assert!(collector.header(format!("{status}\r\n").as_bytes()));
+            for header in headers {
+                assert!(collector.header(format!("{header}\r\n").as_bytes()));
+            }
+            assert!(collector.header(b"\r\n"));
+            assert_eq!(cancel.response_completion_is_committed(), committed);
+            assert_eq!(
+                cancel.response_timing().response_end_at().is_some(),
+                committed
+            );
+            assert_eq!(cancel.cancel_if_response_pending(), !committed);
+        }
+    }
+
+    #[test]
     fn raw_streaming_exact_identity_content_length_commits_response_completion() {
         let cancel_handle = FetchCancelHandle::new();
         let (mut collector, _body_rx) =
@@ -1201,6 +1510,20 @@ mod tests {
         assert_eq!(collector.write(b"abc").unwrap(), 3);
         assert!(!cancel_handle.response_completion_is_committed());
         assert_eq!(collector.write(b"d").unwrap(), 1);
+        assert!(cancel_handle.response_completion_is_committed());
+    }
+
+    #[test]
+    fn raw_streaming_late_callback_cannot_commit_a_reused_handle() {
+        let cancel_handle = FetchCancelHandle::new();
+        let (mut old, _old_body) =
+            raw_streaming_collector_with_headers(cancel_handle.clone(), &["Content-Length: 4"]);
+        let (mut current, _current_body) =
+            raw_streaming_collector_with_headers(cancel_handle.clone(), &["Content-Length: 4"]);
+
+        assert_eq!(old.write(b"late").unwrap(), 4);
+        assert!(!cancel_handle.response_completion_is_committed());
+        assert_eq!(current.write(b"body").unwrap(), 4);
         assert!(cancel_handle.response_completion_is_committed());
     }
 
@@ -1217,5 +1540,37 @@ mod tests {
             assert_eq!(collector.write(b"body").unwrap(), 4);
             assert!(!cancel_handle.response_completion_is_committed());
         }
+    }
+    #[test]
+    fn raw_streaming_timing_starts_at_final_status_before_headers_finish() {
+        let handle = FetchCancelHandle::new();
+        let (mut collector, _body) = raw_streaming_collector_with_headers(handle.clone(), &[]);
+        collector.begin_request(
+            None,
+            Url::parse("https://example.test/empty").unwrap(),
+            NetworkCookieRequestContext::top_level_navigation("GET"),
+            None,
+            true,
+            Vec::new(),
+            handle.begin_response_progress(),
+        );
+        assert!(handle.response_timing().response_started_at().is_none());
+        assert!(collector.header(b"HTTP/1.1 103 Early Hints\r\n"));
+        assert!(collector.header(b"\r\n"));
+        assert!(handle.response_timing().response_started_at().is_none());
+        let first = handle
+            .response_timing()
+            .first_interim_response_started_at()
+            .unwrap();
+        assert!(collector.header(b"HTTP/1.1 200 OK\r\n"));
+        let started = handle.response_timing().response_started_at().unwrap();
+        assert!(handle.response_timing().response_end_at().is_none());
+        assert!(collector.header(b"Content-Length: 0\r\n"));
+        assert!(collector.header(b"\r\n"));
+        let complete = handle.response_timing();
+        assert_eq!(complete.first_interim_response_started_at(), Some(first));
+        assert_eq!(complete.response_started_at(), Some(started));
+        assert!(started >= first);
+        assert!(complete.response_end_at().unwrap() >= started);
     }
 }

@@ -3,6 +3,11 @@ use thiserror::Error;
 /// A structured failure while constructing or evaluating one layout pass.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum LayoutError {
+    /// The published page does not contain the requested Document's geometry.
+    #[error(
+        "no published layout is available for the requested document; call Page.captureScreenshot, or start Page.startScreencast and wait for a frame, then retry. Geometry queries and input do not refresh an existing layout"
+    )]
+    NoLayoutSnapshot,
     /// A geometry consumer forced layout before the Document had an element root.
     #[error("current document has no element root to lay out")]
     NoLayoutRoot,

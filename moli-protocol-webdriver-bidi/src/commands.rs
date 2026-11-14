@@ -1,10 +1,10 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use moli_protocol::devtools_runtime::{
-    DevToolsActivateTargetCommand, DevToolsAddNetworkDataCollectorCommand,
+use moli_protocol::automation::{
+    AutomationCommand, DevToolsActivateTargetCommand, DevToolsAddNetworkDataCollectorCommand,
     DevToolsAddNetworkInterceptCommand, DevToolsAddPreloadScriptCommand,
     DevToolsAuthChallengeAction, DevToolsAuthCredentials, DevToolsBrowserContextId,
     DevToolsCallFunctionCommand, DevToolsCaptureScreenshotClip, DevToolsCaptureScreenshotCommand,
-    DevToolsCloseTargetCommand, DevToolsCommand, DevToolsContinueInterceptedRequestCommand,
+    DevToolsCloseTargetCommand, DevToolsContinueInterceptedRequestCommand,
     DevToolsContinueInterceptedResponseCommand, DevToolsContinueWithAuthCommand,
     DevToolsCreateBrowserContextCommand, DevToolsDevicePixelRatioSetting,
     DevToolsDisownNetworkDataCommand, DevToolsDownloadBehaviorSetting,
@@ -20,9 +20,9 @@ use moli_protocol::devtools_runtime::{
     DevToolsPreloadScriptSource, DevToolsPrintToPdfCommand, DevToolsPrintToPdfTransferMode,
     DevToolsRealmId, DevToolsReleaseObjectsCommand, DevToolsReloadCommand, DevToolsRemoteHandleId,
     DevToolsRemoveBrowserContextCommand, DevToolsRemoveNetworkDataCollectorCommand,
-    DevToolsRemoveNetworkInterceptCommand, DevToolsRemovePreloadScriptCommand, DevToolsRequestId,
-    DevToolsResultOwnership, DevToolsScreenshotClip, DevToolsScreenshotElementClip,
-    DevToolsSerializationOptions, DevToolsSetCacheBehaviorCommand,
+    DevToolsRemoveNetworkInterceptCommand, DevToolsRemovePreloadScriptCommand,
+    DevToolsRequestFailure, DevToolsRequestId, DevToolsResultOwnership, DevToolsScreenshotClip,
+    DevToolsScreenshotElementClip, DevToolsSerializationOptions, DevToolsSetCacheBehaviorCommand,
     DevToolsSetClientWindowStateCommand, DevToolsSetDownloadBehaviorCommand,
     DevToolsSetExtraHeadersCommand, DevToolsSetGeolocationOverrideCommand,
     DevToolsSetLocaleOverrideCommand, DevToolsSetNetworkConditionsCommand,
@@ -42,34 +42,34 @@ const CENTIMETERS_PER_INCH: f64 = 2.54;
 const MIN_PRINT_PAGE_SIZE_CM: f64 = CENTIMETERS_PER_INCH / 72.0;
 const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 
-pub fn devtools_command_from_bidi_command(
+pub fn automation_command_from_bidi_command(
     command: &BidiCommand,
     context: &BidiDevToolsCommandContext,
-) -> Result<DevToolsCommand, BidiError> {
+) -> Result<AutomationCommand, BidiError> {
     match command.method.as_str() {
-        "browser.createUserContext" => Ok(DevToolsCommand::CreateBrowserContext(
+        "browser.createUserContext" => Ok(AutomationCommand::CreateBrowserContext(
             bidi_create_user_context_command(command, context)?,
         )),
-        "browser.getUserContexts" => Ok(DevToolsCommand::GetBrowserContexts(
+        "browser.getUserContexts" => Ok(AutomationCommand::GetBrowserContexts(
             DevToolsGetBrowserContextsCommand {
                 context: context.command_context(None),
             },
         )),
-        "browser.getClientWindows" => Ok(DevToolsCommand::GetClientWindows(
+        "browser.getClientWindows" => Ok(AutomationCommand::GetClientWindows(
             DevToolsGetClientWindowsCommand {
                 context: context.command_context(None),
             },
         )),
-        "browser.setClientWindowState" => Ok(DevToolsCommand::SetClientWindowState(
+        "browser.setClientWindowState" => Ok(AutomationCommand::SetClientWindowState(
             bidi_set_client_window_state_command(command, context)?,
         )),
-        "browser.removeUserContext" => Ok(DevToolsCommand::RemoveBrowserContext(
+        "browser.removeUserContext" => Ok(AutomationCommand::RemoveBrowserContext(
             bidi_remove_user_context_command(command, context)?,
         )),
-        "browser.setDownloadBehavior" => Ok(DevToolsCommand::SetDownloadBehavior(
+        "browser.setDownloadBehavior" => Ok(AutomationCommand::SetDownloadBehavior(
             bidi_set_download_behavior_command(command, context)?,
         )),
-        "permissions.setPermission" => Ok(DevToolsCommand::SetPermission(
+        "permissions.setPermission" => Ok(AutomationCommand::SetPermission(
             bidi_set_permission_command(command, context)?,
         )),
         "browsingContext.create" => {
@@ -88,8 +88,8 @@ pub fn devtools_command_from_bidi_command(
                 context,
                 reference_context.as_ref(),
             )?;
-            Ok(DevToolsCommand::CreateTarget(
-                moli_protocol::devtools_runtime::DevToolsCreateTargetCommand {
+            Ok(AutomationCommand::CreateTarget(
+                moli_protocol::automation::DevToolsCreateTargetCommand {
                     context: context.command_context_with_browser_context_id(
                         reference_context.clone(),
                         browser_context_id.clone(),
@@ -103,14 +103,14 @@ pub fn devtools_command_from_bidi_command(
         "browsingContext.close" => {
             let target_id = required_string(&command.params, "context")?;
             validate_optional_bool(&command.params, "promptUnload")?;
-            Ok(DevToolsCommand::CloseTarget(DevToolsCloseTargetCommand {
+            Ok(AutomationCommand::CloseTarget(DevToolsCloseTargetCommand {
                 context: context.command_context(Some(DevToolsTargetId::from(target_id))),
                 target_id: DevToolsTargetId::from(target_id),
             }))
         }
         "browsingContext.activate" => {
             let target_id = required_string(&command.params, "context")?;
-            Ok(DevToolsCommand::ActivateTarget(
+            Ok(AutomationCommand::ActivateTarget(
                 DevToolsActivateTargetCommand {
                     context: context.command_context(Some(DevToolsTargetId::from(target_id))),
                     target_id: DevToolsTargetId::from(target_id),
@@ -118,15 +118,15 @@ pub fn devtools_command_from_bidi_command(
             ))
         }
         "browsingContext.getTree" => bidi_get_tree_command(command, context),
-        "browsingContext.locateNodes" => Ok(DevToolsCommand::LocateNodes(
+        "browsingContext.locateNodes" => Ok(AutomationCommand::LocateNodes(
             bidi_locate_nodes_command(command, context)?,
         )),
         "browsingContext.navigate" => {
             let target_id = required_string(&command.params, "context")?;
             let url = required_string(&command.params, "url")?;
             validate_bidi_navigation_url(url)?;
-            Ok(DevToolsCommand::Navigate(
-                moli_protocol::devtools_runtime::DevToolsNavigateCommand {
+            Ok(AutomationCommand::Navigate(
+                moli_protocol::automation::DevToolsNavigateCommand {
                     context: context.command_context(Some(DevToolsTargetId::from(target_id))),
                     url: url.to_owned(),
                     referrer: None,
@@ -136,107 +136,107 @@ pub fn devtools_command_from_bidi_command(
         }
         "browsingContext.reload" => {
             let target_id = required_string(&command.params, "context")?;
-            Ok(DevToolsCommand::Reload(DevToolsReloadCommand {
+            Ok(AutomationCommand::Reload(DevToolsReloadCommand {
                 context: context.command_context(Some(DevToolsTargetId::from(target_id))),
                 ignore_cache: optional_bool(&command.params, "ignoreCache")?.unwrap_or(false),
                 script_to_evaluate_on_load: None,
                 wait: bidi_navigation_wait(command.params.get("wait"))?,
             }))
         }
-        "browsingContext.traverseHistory" => Ok(DevToolsCommand::TraverseHistory(
+        "browsingContext.traverseHistory" => Ok(AutomationCommand::TraverseHistory(
             bidi_traverse_history_command(command, context)?,
         )),
-        "browsingContext.handleUserPrompt" => Ok(DevToolsCommand::HandleJavaScriptDialog(
+        "browsingContext.handleUserPrompt" => Ok(AutomationCommand::HandleJavaScriptDialog(
             bidi_handle_user_prompt_command(command, context)?,
         )),
-        "browsingContext.captureScreenshot" => Ok(DevToolsCommand::CaptureScreenshot(
+        "browsingContext.captureScreenshot" => Ok(AutomationCommand::CaptureScreenshot(
             bidi_capture_screenshot_command(command, context)?,
         )),
-        "browsingContext.print" => Ok(DevToolsCommand::PrintToPdf(bidi_print_command(
+        "browsingContext.print" => Ok(AutomationCommand::PrintToPdf(bidi_print_command(
             command, context,
         )?)),
-        "browsingContext.setViewport" => Ok(DevToolsCommand::SetViewport(
+        "browsingContext.setViewport" => Ok(AutomationCommand::SetViewport(
             bidi_set_viewport_command(command, context)?,
         )),
-        "emulation.setUserAgentOverride" => Ok(DevToolsCommand::SetUserAgentOverride(
+        "emulation.setUserAgentOverride" => Ok(AutomationCommand::SetUserAgentOverride(
             bidi_set_user_agent_override_command(command, context)?,
         )),
-        "emulation.setLocaleOverride" => Ok(DevToolsCommand::SetLocaleOverride(
+        "emulation.setLocaleOverride" => Ok(AutomationCommand::SetLocaleOverride(
             bidi_set_locale_override_command(command, context)?,
         )),
-        "emulation.setTimezoneOverride" => Ok(DevToolsCommand::SetTimezoneOverride(
+        "emulation.setTimezoneOverride" => Ok(AutomationCommand::SetTimezoneOverride(
             bidi_set_timezone_override_command(command, context)?,
         )),
-        "emulation.setGeolocationOverride" => Ok(DevToolsCommand::SetGeolocationOverride(
+        "emulation.setGeolocationOverride" => Ok(AutomationCommand::SetGeolocationOverride(
             bidi_set_geolocation_override_command(command, context)?,
         )),
-        "emulation.setNetworkConditions" => Ok(DevToolsCommand::SetNetworkConditions(
+        "emulation.setNetworkConditions" => Ok(AutomationCommand::SetNetworkConditions(
             bidi_set_network_conditions_command(command, context)?,
         )),
-        "network.addIntercept" => Ok(DevToolsCommand::AddNetworkIntercept(
+        "network.addIntercept" => Ok(AutomationCommand::AddNetworkIntercept(
             bidi_network_add_intercept_command(command, context)?,
         )),
-        "network.removeIntercept" => Ok(DevToolsCommand::RemoveNetworkIntercept(
+        "network.removeIntercept" => Ok(AutomationCommand::RemoveNetworkIntercept(
             bidi_network_remove_intercept_command(command, context)?,
         )),
-        "network.addDataCollector" => Ok(DevToolsCommand::AddNetworkDataCollector(
+        "network.addDataCollector" => Ok(AutomationCommand::AddNetworkDataCollector(
             bidi_network_add_data_collector_command(command, context)?,
         )),
-        "network.removeDataCollector" => Ok(DevToolsCommand::RemoveNetworkDataCollector(
+        "network.removeDataCollector" => Ok(AutomationCommand::RemoveNetworkDataCollector(
             bidi_network_remove_data_collector_command(command, context)?,
         )),
-        "network.disownData" => Ok(DevToolsCommand::DisownNetworkData(
+        "network.disownData" => Ok(AutomationCommand::DisownNetworkData(
             bidi_network_disown_data_command(command, context)?,
         )),
-        "network.getData" => Ok(DevToolsCommand::GetNetworkData(
+        "network.getData" => Ok(AutomationCommand::GetNetworkData(
             bidi_network_get_data_command(command, context)?,
         )),
-        "network.setCacheBehavior" => Ok(DevToolsCommand::SetCacheBehavior(
+        "network.setCacheBehavior" => Ok(AutomationCommand::SetCacheBehavior(
             bidi_network_set_cache_behavior_command(command, context)?,
         )),
-        "network.setExtraHeaders" => Ok(DevToolsCommand::SetExtraHeaders(
+        "network.setExtraHeaders" => Ok(AutomationCommand::SetExtraHeaders(
             bidi_network_set_extra_headers_command(command, context)?,
         )),
-        "network.continueRequest" => Ok(DevToolsCommand::ContinueInterceptedRequest(
+        "network.continueRequest" => Ok(AutomationCommand::ContinueInterceptedRequest(
             bidi_network_continue_request_command(command, context)?,
         )),
-        "network.continueResponse" => Ok(DevToolsCommand::ContinueInterceptedResponse(
+        "network.continueResponse" => Ok(AutomationCommand::ContinueInterceptedResponse(
             bidi_network_continue_response_command(command, context)?,
         )),
-        "network.continueWithAuth" => Ok(DevToolsCommand::ContinueWithAuth(
+        "network.continueWithAuth" => Ok(AutomationCommand::ContinueWithAuth(
             bidi_network_continue_with_auth_command(command, context)?,
         )),
-        "network.failRequest" => Ok(DevToolsCommand::FailInterceptedRequest(
+        "network.failRequest" => Ok(AutomationCommand::FailInterceptedRequest(
             bidi_network_fail_request_command(command, context)?,
         )),
-        "network.provideResponse" => Ok(DevToolsCommand::FulfillInterceptedRequest(
+        "network.provideResponse" => Ok(AutomationCommand::FulfillInterceptedRequest(
             bidi_network_provide_response_command(command, context)?,
         )),
-        "storage.getCookies" => Ok(DevToolsCommand::GetCookies(bidi_get_cookies_command(
+        "storage.getCookies" => Ok(AutomationCommand::GetCookies(bidi_get_cookies_command(
             command, context,
         )?)),
-        "storage.setCookie" => Ok(DevToolsCommand::SetCookies(bidi_set_cookie_command(
+        "storage.setCookie" => Ok(AutomationCommand::SetCookies(bidi_set_cookie_command(
             command, context,
         )?)),
-        "storage.deleteCookies" => Ok(DevToolsCommand::DeleteCookies(bidi_delete_cookies_command(
-            command, context,
-        )?)),
-        "script.evaluate" => Ok(DevToolsCommand::EvaluateScript(
+        "storage.deleteCookies" => Ok(AutomationCommand::DeleteCookies(
+            bidi_delete_cookies_command(command, context)?,
+        )),
+        "script.evaluate" => Ok(AutomationCommand::EvaluateScript(
             bidi_evaluate_script_command(command, context)?,
         )),
-        "script.callFunction" => Ok(DevToolsCommand::CallFunction(bidi_call_function_command(
+        "script.callFunction" => Ok(AutomationCommand::CallFunction(bidi_call_function_command(
             command, context,
         )?)),
-        "script.getRealms" => Ok(DevToolsCommand::GetRealms(bidi_get_realms_command(
+        "script.getRealms" => Ok(AutomationCommand::GetRealms(bidi_get_realms_command(
             command, context,
         )?)),
-        "script.disown" => Ok(DevToolsCommand::ReleaseObjects(bidi_disown_command(
+        "script.disown" => Ok(AutomationCommand::ReleaseObjects(bidi_disown_command(
             command, context,
         )?)),
-        "script.addPreloadScript" => Ok(DevToolsCommand::AddPreloadScript(
+        "script.addPreloadScript" => Ok(AutomationCommand::AddPreloadScript(
             bidi_add_preload_script_command(command, context)?,
         )),
-        "script.removePreloadScript" => Ok(DevToolsCommand::RemovePreloadScript(
+        "script.removePreloadScript" => Ok(AutomationCommand::RemovePreloadScript(
             bidi_remove_preload_script_command(command, context)?,
         )),
         method => Err(BidiError::new(BidiErrorCode::UnknownCommand, method)),
@@ -805,7 +805,9 @@ fn network_intercept_url_pattern(
     let url_pattern = match type_name {
         "string" => {
             let pattern = required_object_string(pattern, "pattern")?;
-            validate_network_intercept_string_pattern(pattern)?.to_string()
+            let mut parsed = validate_network_intercept_string_pattern(pattern)?;
+            parsed.set_fragment(None);
+            parsed.to_string()
         }
         "pattern" => network_intercept_pattern_object(pattern)?,
         _ => {
@@ -983,63 +985,33 @@ fn bidi_network_set_extra_headers_command(
     })
 }
 
-fn required_network_extra_headers(params: &Value) -> Result<Vec<(String, String)>, BidiError> {
-    let Some(value) = params.get("headers") else {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            "headers must be an array",
-        ));
-    };
-    let Some(headers) = value.as_array() else {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            "headers must be an array",
-        ));
-    };
-    let mut out = Vec::with_capacity(headers.len());
-    for header in headers {
-        let (name, value) = network_extra_header_pair(header)?;
-        out.retain(|(existing, _)| existing != &name);
+fn required_network_extra_headers(
+    params: &Value,
+) -> Result<moli_header_field::HeaderFields, BidiError> {
+    let headers = optional_network_headers(params, "headers")?.ok_or_else(|| {
+        BidiError::new(BidiErrorCode::InvalidArgument, "headers must be an array")
+    })?;
+    let mut out = moli_header_field::HeaderFields::default();
+    for (name, value) in headers {
+        if value.contains(&0)
+            || value.contains(&b'\n')
+            || value.contains(&b'\r')
+            || value
+                .first()
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+            || value
+                .last()
+                .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            return Err(BidiError::new(
+                BidiErrorCode::InvalidArgument,
+                "header value is invalid",
+            ));
+        }
+        out.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
         out.push((name, value));
     }
     Ok(out)
-}
-
-fn network_extra_header_pair(value: &Value) -> Result<(String, String), BidiError> {
-    let Some(header) = value.as_object() else {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            "headers entries must be objects",
-        ));
-    };
-    let name = required_object_string(header, "name")?;
-    validate_network_header_name(name, "header name")?;
-    let value = required_network_extra_header_value(required_object_value(header, "value")?)?;
-    Ok((name.to_owned(), value))
-}
-
-fn required_network_extra_header_value(value: &Value) -> Result<String, BidiError> {
-    let Some(value) = value.as_object() else {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            "value must be a network bytes value",
-        ));
-    };
-    let type_name = required_object_string(value, "type")?;
-    if type_name != "string" {
-        return Err(BidiError::new(
-            BidiErrorCode::UnsupportedOperation,
-            "Only string headers values are supported",
-        ));
-    }
-    let raw = required_object_string(value, "value")?;
-    if raw.contains(['\0', '\n', '\r']) || raw.trim() != raw {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            "header value is invalid",
-        ));
-    }
-    Ok(raw.to_owned())
 }
 
 fn bidi_network_continue_request_command(
@@ -1054,7 +1026,7 @@ fn bidi_network_continue_request_command(
         request_id: DevToolsRequestId::from(request),
         url: optional_string(&command.params, "url")?.map(str::to_owned),
         method: optional_string(&command.params, "method")?.map(str::to_owned),
-        post_data: optional_network_bytes_string(&command.params, "body")?,
+        post_data: optional_network_bytes(&command.params, "body")?.map(bytes::Bytes::from),
         headers,
         intercept_response: optional_bool(&command.params, "interceptResponse")?.unwrap_or(false),
     })
@@ -1079,7 +1051,7 @@ fn bidi_network_continue_response_command(
         context: context.command_context(None),
         request_id: DevToolsRequestId::from(request),
         response_code: optional_network_status_code(&command.params)?,
-        response_headers,
+        response_headers: response_headers.map(|headers| headers.into_iter().collect()),
         response_phrase: optional_string(&command.params, "reasonPhrase")?.map(str::to_owned),
         auth_credentials: optional_network_auth_credentials(&command.params)?,
     })
@@ -1157,7 +1129,7 @@ fn bidi_network_fail_request_command(
     Ok(DevToolsFailInterceptedRequestCommand {
         context: context.command_context(None),
         request_id: DevToolsRequestId::from(required_network_request_id(&command.params)?),
-        error_text: "Failed".to_owned(),
+        failure: DevToolsRequestFailure::Failed("Failed".to_owned()),
     })
 }
 
@@ -1172,7 +1144,7 @@ fn bidi_network_provide_response_command(
         context: context.command_context(None),
         request_id: DevToolsRequestId::from(request),
         response_code: optional_network_status_code(&command.params)?.unwrap_or(200),
-        response_headers: headers,
+        response_headers: headers.into_iter().collect(),
         body: optional_network_bytes(&command.params, "body")?,
         response_phrase: optional_string(&command.params, "reasonPhrase")?.map(str::to_owned),
     })
@@ -1200,13 +1172,6 @@ fn optional_network_status_code(params: &Value) -> Result<Option<u16>, BidiError
         ));
     }
     Ok(Some(code as u16))
-}
-
-fn optional_network_bytes_string(params: &Value, field: &str) -> Result<Option<String>, BidiError> {
-    params
-        .get(field)
-        .map(|value| required_network_bytes_value(value, field))
-        .transpose()
 }
 
 fn optional_network_bytes(params: &Value, field: &str) -> Result<Option<Vec<u8>>, BidiError> {
@@ -1243,7 +1208,7 @@ fn required_network_bytes(value: &Value, field: &str) -> Result<Vec<u8>, BidiErr
 fn optional_network_headers(
     params: &Value,
     field: &str,
-) -> Result<Option<Vec<(String, String)>>, BidiError> {
+) -> Result<Option<moli_header_field::HeaderFields>, BidiError> {
     let Some(value) = params.get(field) else {
         return Ok(None);
     };
@@ -1257,10 +1222,10 @@ fn optional_network_headers(
     for header in headers {
         out.push(network_header_pair(header, field)?);
     }
-    Ok(Some(out))
+    Ok(Some(moli_header_field::HeaderFields::from_bytes(out)))
 }
 
-fn network_header_pair(value: &Value, field: &str) -> Result<(String, String), BidiError> {
+fn network_header_pair(value: &Value, field: &str) -> Result<(String, Vec<u8>), BidiError> {
     let Some(header) = value.as_object() else {
         return Err(BidiError::new(
             BidiErrorCode::InvalidArgument,
@@ -1269,24 +1234,24 @@ fn network_header_pair(value: &Value, field: &str) -> Result<(String, String), B
     };
     let name = required_object_string(header, "name")?;
     validate_network_header_name(name, "header name")?;
-    let value = required_network_bytes_value(required_object_value(header, "value")?, "value")?;
+    let value = required_network_bytes(required_object_value(header, "value")?, "value")?;
     Ok((name.to_owned(), value))
 }
 
 fn apply_network_request_cookies(
-    headers: &mut Option<Vec<(String, String)>>,
+    headers: &mut Option<moli_header_field::HeaderFields>,
     params: &Value,
 ) -> Result<(), BidiError> {
     let Some(cookie_header) = optional_network_request_cookie_header(params)? else {
         return Ok(());
     };
-    let headers = headers.get_or_insert_with(Vec::new);
+    let headers = headers.get_or_insert_with(Default::default);
     headers.retain(|(name, _)| !name.eq_ignore_ascii_case("cookie"));
     headers.push(("Cookie".to_owned(), cookie_header));
     Ok(())
 }
 
-fn optional_network_request_cookie_header(params: &Value) -> Result<Option<String>, BidiError> {
+fn optional_network_request_cookie_header(params: &Value) -> Result<Option<Vec<u8>>, BidiError> {
     let Some(cookies) = params.get("cookies") else {
         return Ok(None);
     };
@@ -1296,17 +1261,24 @@ fn optional_network_request_cookie_header(params: &Value) -> Result<Option<Strin
             "cookies must be an array",
         ));
     };
-    let mut values = Vec::with_capacity(cookies.len());
+    let mut header = Vec::new();
     for cookie in cookies {
+        if !header.is_empty() {
+            header.extend_from_slice(b"; ");
+        }
         let (name, value) = network_cookie_name_value(cookie)?;
-        values.push(format!("{name}={value}"));
+        header.extend_from_slice(name.as_bytes());
+        header.push(b'=');
+        header.extend(value);
     }
-    Ok(Some(values.join("; ")))
+    Ok(Some(header))
 }
 
-fn network_response_cookie_headers(params: &Value) -> Result<Vec<(String, String)>, BidiError> {
+fn network_response_cookie_headers(
+    params: &Value,
+) -> Result<moli_header_field::HeaderFields, BidiError> {
     let Some(cookies) = params.get("cookies") else {
-        return Ok(Vec::new());
+        return Ok(Default::default());
     };
     let Some(cookies) = cookies.as_array() else {
         return Err(BidiError::new(
@@ -1318,10 +1290,10 @@ fn network_response_cookie_headers(params: &Value) -> Result<Vec<(String, String
     for cookie in cookies {
         headers.push(("Set-Cookie".to_owned(), network_set_cookie_header(cookie)?));
     }
-    Ok(headers)
+    Ok(moli_header_field::HeaderFields::from_bytes(headers))
 }
 
-fn network_cookie_name_value(value: &Value) -> Result<(String, String), BidiError> {
+fn network_cookie_name_value(value: &Value) -> Result<(String, Vec<u8>), BidiError> {
     let Some(cookie) = value.as_object() else {
         return Err(BidiError::new(
             BidiErrorCode::InvalidArgument,
@@ -1330,11 +1302,11 @@ fn network_cookie_name_value(value: &Value) -> Result<(String, String), BidiErro
     };
     let name = required_object_string(cookie, "name")?;
     validate_network_cookie_name(name)?;
-    let value = required_network_bytes_value(required_object_value(cookie, "value")?, "value")?;
+    let value = required_network_bytes(required_object_value(cookie, "value")?, "value")?;
     Ok((name.to_owned(), value))
 }
 
-fn network_set_cookie_header(value: &Value) -> Result<String, BidiError> {
+fn network_set_cookie_header(value: &Value) -> Result<Vec<u8>, BidiError> {
     let Some(cookie) = value.as_object() else {
         return Err(BidiError::new(
             BidiErrorCode::InvalidArgument,
@@ -1342,7 +1314,9 @@ fn network_set_cookie_header(value: &Value) -> Result<String, BidiError> {
         ));
     };
     let (name, value) = network_cookie_name_value(value)?;
-    let mut header = format!("{name}={value}");
+    let mut header = name.into_bytes();
+    header.push(b'=');
+    header.extend(value);
     for field in ["domain", "expiry", "path"] {
         if let Some(value) = optional_object_string(cookie, field)? {
             let attribute = match field {
@@ -1351,11 +1325,11 @@ fn network_set_cookie_header(value: &Value) -> Result<String, BidiError> {
                 "path" => "Path",
                 _ => unreachable!(),
             };
-            header.push_str(&format!("; {attribute}={value}"));
+            header.extend_from_slice(format!("; {attribute}={value}").as_bytes());
         }
     }
     if let Some(max_age) = optional_object_uint(cookie, "maxAge")? {
-        header.push_str(&format!("; Max-Age={max_age}"));
+        header.extend_from_slice(format!("; Max-Age={max_age}").as_bytes());
     }
     if let Some(same_site) = optional_object_string(cookie, "sameSite")? {
         if !matches!(
@@ -1367,13 +1341,13 @@ fn network_set_cookie_header(value: &Value) -> Result<String, BidiError> {
                 "sameSite must be strict, lax, or none",
             ));
         }
-        header.push_str(&format!("; SameSite={same_site}"));
+        header.extend_from_slice(format!("; SameSite={same_site}").as_bytes());
     }
     if optional_object_bool(cookie, "httpOnly")?.unwrap_or(false) {
-        header.push_str("; HttpOnly");
+        header.extend_from_slice(b"; HttpOnly");
     }
     if optional_object_bool(cookie, "secure")?.unwrap_or(false) {
-        header.push_str("; Secure");
+        header.extend_from_slice(b"; Secure");
     }
     Ok(header)
 }
@@ -1529,16 +1503,18 @@ fn bidi_create_user_context_browser_context_id(
 fn bidi_get_tree_command(
     command: &BidiCommand,
     context: &BidiDevToolsCommandContext,
-) -> Result<DevToolsCommand, BidiError> {
+) -> Result<AutomationCommand, BidiError> {
     let root = optional_nullable_string(&command.params, "root")?.map(DevToolsTargetId::from);
     let max_depth = bidi_get_tree_max_depth(&command.params)?;
     if let Some(root) = root {
-        return Ok(DevToolsCommand::GetFrameTree(DevToolsGetFrameTreeCommand {
-            context: context.command_context(Some(root)),
-            max_depth,
-        }));
+        return Ok(AutomationCommand::GetFrameTree(
+            DevToolsGetFrameTreeCommand {
+                context: context.command_context(Some(root)),
+                max_depth,
+            },
+        ));
     }
-    Ok(DevToolsCommand::GetFrameTrees(
+    Ok(AutomationCommand::GetFrameTrees(
         DevToolsGetFrameTreesCommand {
             context: context.command_context(None),
             max_depth,
@@ -2053,9 +2029,11 @@ fn bidi_handle_user_prompt_command(
     Ok(DevToolsHandleJavaScriptDialogCommand {
         context: context.command_context(Some(DevToolsTargetId::from(target_id))),
         accept: optional_bool(&command.params, "accept")?.unwrap_or(true),
-        prompt_text: optional_string(&command.params, "userText")?
-            .unwrap_or_default()
-            .to_owned(),
+        prompt_text: Some(
+            optional_string(&command.params, "userText")?
+                .unwrap_or_default()
+                .to_owned(),
+        ),
     })
 }
 
@@ -2070,9 +2048,15 @@ fn bidi_capture_screenshot_command(
     Ok(DevToolsCaptureScreenshotCommand {
         context: context.command_context(Some(DevToolsTargetId::from(target_id))),
         format,
-        quality: None,
+        quality: command
+            .params
+            .get("format")
+            .and_then(|format| format.get("quality"))
+            .and_then(Value::as_f64)
+            .map(|quality| (quality * 100.0).round() as u8),
         clip,
-        capture_beyond_viewport: true,
+        capture_beyond_viewport: command.params.get("origin").and_then(Value::as_str)
+            == Some("document"),
         optimize_for_speed: false,
     })
 }
@@ -2806,12 +2790,7 @@ fn bidi_result_ownership(ownership: Option<&Value>) -> Result<DevToolsResultOwne
 }
 
 fn required_string<'a>(params: &'a Value, field: &str) -> Result<&'a str, BidiError> {
-    params.get(field).and_then(Value::as_str).ok_or_else(|| {
-        BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("{field} must be a string"),
-        )
-    })
+    required_string_value(params.get(field), field)
 }
 
 fn required_nullable_string(params: &Value, field: &str) -> Result<Option<String>, BidiError> {
@@ -2836,95 +2815,14 @@ fn required_nullable_string(params: &Value, field: &str) -> Result<Option<String
 }
 
 fn validate_bidi_locale(locale: &str) -> Result<(), BidiError> {
-    if locale.is_empty() || !locale.is_ascii() {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("invalid locale {locale}"),
-        ));
-    }
-    let subtags = locale.split('-').collect::<Vec<_>>();
-    if subtags.iter().any(|subtag| subtag.is_empty()) {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("invalid locale {locale}"),
-        ));
-    }
-    let Some(language) = subtags.first() else {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("invalid locale {locale}"),
-        ));
-    };
-    if !(2..=3).contains(&language.len())
-        || !language.chars().all(|value| value.is_ascii_alphabetic())
-    {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("invalid locale {locale}"),
-        ));
-    }
-    let mut index = 1;
-    if subtags.get(index).is_some_and(|subtag| {
-        subtag.len() == 4 && subtag.chars().all(|value| value.is_ascii_alphabetic())
-    }) {
-        index += 1;
-    }
-    if subtags.get(index).is_some_and(|subtag| {
-        (subtag.len() == 2 && subtag.chars().all(|value| value.is_ascii_alphabetic()))
-            || (subtag.len() == 3 && subtag.chars().all(|value| value.is_ascii_digit()))
-    }) {
-        index += 1;
-    }
-    while let Some(subtag) = subtags.get(index) {
-        if subtag.len() == 1 {
-            let singleton = subtag.as_bytes()[0].to_ascii_lowercase();
-            if singleton == b'x' || !subtag.chars().all(|value| value.is_ascii_alphanumeric()) {
-                return Err(BidiError::new(
-                    BidiErrorCode::InvalidArgument,
-                    format!("invalid locale {locale}"),
-                ));
-            }
-            index += 1;
-            let extension_start = index;
-            while let Some(extension) = subtags.get(index) {
-                if extension.len() == 1 {
-                    break;
-                }
-                if !(2..=8).contains(&extension.len())
-                    || !extension.chars().all(|value| value.is_ascii_alphanumeric())
-                {
-                    return Err(BidiError::new(
-                        BidiErrorCode::InvalidArgument,
-                        format!("invalid locale {locale}"),
-                    ));
-                }
-                index += 1;
-            }
-            if index == extension_start {
-                return Err(BidiError::new(
-                    BidiErrorCode::InvalidArgument,
-                    format!("invalid locale {locale}"),
-                ));
-            }
-            continue;
-        }
-        let is_variant = (5..=8).contains(&subtag.len())
-            && subtag.chars().all(|value| value.is_ascii_alphanumeric())
-            || (subtag.len() == 4
-                && subtag
-                    .chars()
-                    .next()
-                    .is_some_and(|value| value.is_ascii_digit())
-                && subtag.chars().all(|value| value.is_ascii_alphanumeric()));
-        if !is_variant {
-            return Err(BidiError::new(
+    icu_locale_core::Locale::try_from_str(locale)
+        .map(|_| ())
+        .map_err(|_| {
+            BidiError::new(
                 BidiErrorCode::InvalidArgument,
                 format!("invalid locale {locale}"),
-            ));
-        }
-        index += 1;
-    }
-    Ok(())
+            )
+        })
 }
 
 fn normalized_bidi_timezone(timezone: String) -> Result<String, BidiError> {
@@ -2953,62 +2851,14 @@ fn normalized_bidi_timezone(timezone: String) -> Result<String, BidiError> {
             "invalid timezone",
         ));
     }
-    if !is_valid_named_timezone(&timezone) {
-        return Err(BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            "invalid timezone",
-        ));
-    }
+    // This adapter only normalizes BiDi syntax. The process environment
+    // controller validates names against the same ICU database that Date/Intl
+    // use. System zoneinfo and region heuristics can disagree with that data.
     Ok(timezone)
 }
 
 fn is_timezone_name_char(value: char) -> bool {
     value.is_ascii_alphanumeric() || matches!(value, '_' | '-' | '+' | '/')
-}
-
-fn is_valid_named_timezone(timezone: &str) -> bool {
-    if matches!(timezone, "UTC" | "Etc/UTC" | "GMT") {
-        return true;
-    }
-    if timezone.starts_with('/')
-        || timezone.ends_with('/')
-        || timezone.contains("//")
-        || timezone.ends_with("/Bielefeld")
-    {
-        return false;
-    }
-    if let Some(valid) = timezone_exists_in_system_zoneinfo(timezone) {
-        return valid;
-    }
-    [
-        "Africa/",
-        "America/",
-        "Antarctica/",
-        "Arctic/",
-        "Asia/",
-        "Atlantic/",
-        "Australia/",
-        "Europe/",
-        "Indian/",
-        "Pacific/",
-        "Etc/",
-        "Brazil/",
-        "Canada/",
-        "Chile/",
-        "Mexico/",
-        "US/",
-    ]
-    .iter()
-    .any(|prefix| timezone.starts_with(prefix))
-}
-
-fn timezone_exists_in_system_zoneinfo(timezone: &str) -> Option<bool> {
-    let root = std::path::Path::new("/usr/share/zoneinfo");
-    if !root.is_dir() {
-        return None;
-    }
-    let path = root.join(timezone);
-    path.is_file().then_some(true)
 }
 
 fn is_timezone_offset_string(timezone: &str) -> bool {
@@ -3107,15 +2957,7 @@ fn required_bool_value(value: &Value, field: &str) -> Result<bool, BidiError> {
 }
 
 fn optional_string<'a>(params: &'a Value, field: &str) -> Result<Option<&'a str>, BidiError> {
-    let Some(value) = params.get(field) else {
-        return Ok(None);
-    };
-    value.as_str().map(Some).ok_or_else(|| {
-        BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("{field} must be a string"),
-        )
-    })
+    optional_string_value(params.get(field), field)
 }
 
 pub(crate) fn required_object_value<'a>(
@@ -3141,12 +2983,7 @@ pub(crate) fn required_object_string<'a>(
     params: &'a serde_json::Map<String, Value>,
     field: &str,
 ) -> Result<&'a str, BidiError> {
-    params.get(field).and_then(Value::as_str).ok_or_else(|| {
-        BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("{field} must be a string"),
-        )
-    })
+    required_string_value(params.get(field), field)
 }
 
 fn required_object_finite_number(
@@ -3214,15 +3051,7 @@ pub(crate) fn optional_object_string<'a>(
     params: &'a serde_json::Map<String, Value>,
     field: &str,
 ) -> Result<Option<&'a str>, BidiError> {
-    let Some(value) = params.get(field) else {
-        return Ok(None);
-    };
-    value.as_str().map(Some).ok_or_else(|| {
-        BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("{field} must be a string"),
-        )
-    })
+    optional_string_value(params.get(field), field)
 }
 
 pub(crate) fn optional_object_bool(
@@ -3247,12 +3076,18 @@ pub(crate) fn optional_object_uint(
     let Some(value) = params.get(field) else {
         return Ok(None);
     };
-    value.as_u64().map(Some).ok_or_else(|| {
-        BidiError::new(
-            BidiErrorCode::InvalidArgument,
-            format!("{field} must be a uint"),
-        )
-    })
+    // BiDi js-uint is a JavaScript safe integer, not the full Rust u64
+    // range. Integer-valued JSON numbers such as 1.0 are valid as well.
+    value
+        .as_f64()
+        .filter(|value| (0.0..=MAX_SAFE_INTEGER as f64).contains(value) && value.fract() == 0.0)
+        .map(|value| Some(value as u64))
+        .ok_or_else(|| {
+            BidiError::new(
+                BidiErrorCode::InvalidArgument,
+                format!("{field} must be an integer between 0 and {MAX_SAFE_INTEGER}"),
+            )
+        })
 }
 
 pub(crate) fn required_network_bytes_value(
@@ -3751,4 +3586,28 @@ fn is_bidi_realm_type(realm_type: &str) -> bool {
             | "paint-worklet"
             | "audio-worklet"
     )
+}
+
+fn required_string_value<'a>(value: Option<&'a Value>, field: &str) -> Result<&'a str, BidiError> {
+    value.and_then(Value::as_str).ok_or_else(|| {
+        BidiError::new(
+            BidiErrorCode::InvalidArgument,
+            format!("{field} must be a string"),
+        )
+    })
+}
+
+fn optional_string_value<'a>(
+    value: Option<&'a Value>,
+    field: &str,
+) -> Result<Option<&'a str>, BidiError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value.as_str().map(Some).ok_or_else(|| {
+        BidiError::new(
+            BidiErrorCode::InvalidArgument,
+            format!("{field} must be a string"),
+        )
+    })
 }

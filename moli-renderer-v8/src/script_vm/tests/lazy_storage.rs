@@ -37,7 +37,6 @@ fn blank_window_only_materializes_bootstrap_required_interface_objects() {
         ("NavigationHistoryEntry", 1),
         ("NavigationActivation", 1),
         ("EventTarget", 1),
-        ("CharacterData", 1),
         ("Node", 1),
         ("Document", 1),
         ("HTMLDocument", 1),
@@ -48,10 +47,6 @@ fn blank_window_only_materializes_bootstrap_required_interface_objects() {
         ("Element", 1),
         ("HTMLElement", 1),
         ("HTMLScriptElement", 1),
-        ("Text", 1),
-        ("Comment", 1),
-        ("ProcessingInstruction", 1),
-        ("CDATASection", 1),
     ];
 
     let mut vm = new_storage_test_vm("https://lazy-blank-window.test/");
@@ -206,6 +201,84 @@ fn first_internal_wrapper_builds_template_without_public_constructor_lookup() {
 }
 
 #[test]
+fn detached_character_data_wrappers_materialize_only_the_owner_realm_intrinsics() {
+    for (interface, method, arguments) in [
+        ("Text", "createTextNode", "'text'"),
+        ("Comment", "createComment", "'comment'"),
+        (
+            "ProcessingInstruction",
+            "createProcessingInstruction",
+            "'target', 'data'",
+        ),
+        ("CDATASection", "createCDATASection", "'cdata'"),
+    ] {
+        let mut vm = new_parsed_test_vm(
+            "https://lazy-node-owner-realm.test/",
+            "<!doctype html><iframe id=child></iframe>",
+        );
+        vm.eval(
+            r#"
+            const other = document.getElementById('child').contentWindow;
+            globalThis.lazyNodeOwner = other.document.implementation.createDocument(null, 'root');
+            true;
+            "#,
+        )
+        .expect("windowless owner realm should initialize without CharacterData wrappers");
+        assert_eq!(
+            node_factory_realm_readiness(&mut vm, interface),
+            ((false, false), (false, false)),
+            "{interface}",
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                vm.eval(&format!(
+                    r#"(() => {{
+                      const node = Document.prototype.{method}.call(lazyNodeOwner, {arguments});
+                      return node.ownerDocument === lazyNodeOwner &&
+                        !Object.hasOwn(node, Symbol.toStringTag) &&
+                        Object.getPrototypeOf(node).constructor.name === '{interface}';
+                    }})()"#
+                ))
+                .expect("borrowed factory should use owner realm intrinsics"),
+                "true",
+                "{interface}",
+            );
+            assert_eq!(
+                node_factory_realm_readiness(&mut vm, interface),
+                ((false, false), (true, true)),
+                "{interface}",
+            );
+        }
+    }
+}
+
+fn node_factory_realm_readiness(
+    vm: &mut ScriptVm,
+    interface: &str,
+) -> ((bool, bool), (bool, bool)) {
+    vm.with_default_context_scope_and_checkpoint_for_test(|scope, _host_ptr| {
+        let local = (
+            crate::context_bootstrap::realm_interface_is_materialized(scope, interface),
+            crate::context_bootstrap::realm_interface_is_materialized(scope, "CharacterData"),
+        );
+        let global = scope.get_current_context().global(scope);
+        let key = v8::String::new(scope, "lazyNodeOwner").unwrap();
+        let value = global.get(scope, key.into()).unwrap();
+        let owner = v8::Local::<v8::Object>::try_from(value).unwrap();
+        let context = owner.get_creation_context(scope).unwrap();
+        let scope = &mut v8::ContextScope::new(scope, context);
+        Ok((
+            local,
+            (
+                crate::context_bootstrap::realm_interface_is_materialized(scope, interface),
+                crate::context_bootstrap::realm_interface_is_materialized(scope, "CharacterData"),
+            ),
+        ))
+    })
+    .expect("node realm materialization diagnostics")
+}
+
+#[test]
 fn every_declared_lazy_window_interface_materializes_with_data_property_shape() {
     let mut vm = new_storage_test_vm("https://lazy-all-window-interfaces.test/");
     let interface_names = vm
@@ -276,7 +349,7 @@ fn every_declared_lazy_window_interface_materializes_with_data_property_shape() 
 fn many_unused_child_realms_keep_storage_surfaces_unmaterialized() {
     const CHILD_COUNT: usize = 16;
 
-    let mut vm = new_storage_test_vm("https://lazy-unused-child-realms.test/");
+    let mut vm = new_storage_html_test_vm("https://lazy-unused-child-realms.test/");
     assert_eq!(
         vm.eval(&format!(
             r#"
@@ -583,6 +656,123 @@ fn lazy_dom_exception_uses_original_error_prototype_after_public_override() {
         constructor_materialization_count(&mut vm, "DOMException"),
         1
     );
+}
+
+#[test]
+fn native_dom_exception_uses_registered_prototype_after_public_override() {
+    let mut vm = new_storage_test_vm("https://native-dom-exception-intrinsic.test/");
+    vm.eval("void DOMException; globalThis.DOMException = function FakeDOMException() {}")
+        .expect("DOMException override should evaluate");
+
+    vm.with_default_context_scope_and_checkpoint_for_test(|scope, _host_ptr| {
+        let context = scope.get_current_context();
+        let intrinsic =
+            crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "DOMException")
+                .expect("DOMException intrinsic should be registered");
+        let exception = crate::context_bootstrap::new_dom_exception_value(
+            scope,
+            "native exception",
+            "DataError",
+        );
+        let exception = v8::Local::<v8::Object>::try_from(exception)
+            .expect("native DOMException should be an object");
+        let prototype = exception
+            .get_prototype(scope)
+            .expect("native DOMException should have a prototype");
+        assert!(prototype.strict_equals(intrinsic.into()));
+        assert_eq!(exception.get_creation_context(scope), Some(context));
+        Ok(())
+    })
+    .expect("native exception should use the realm registry");
+}
+
+#[test]
+fn native_dom_exception_materializes_without_reading_the_public_constructor() {
+    let mut vm = new_storage_test_vm("https://native-dom-exception-lazy.test/");
+    vm.eval(
+        r#"
+        globalThis.exceptionConstructorReads = 0;
+        delete globalThis.DOMException;
+        Object.defineProperty(globalThis, 'DOMException', {
+          configurable: true,
+          get() {
+            ++exceptionConstructorReads;
+            throw new Error('the public constructor must not be read');
+          }
+        });
+        "#,
+    )
+    .expect("public constructor override should evaluate");
+    assert_eq!(
+        constructor_materialization_count(&mut vm, "DOMException"),
+        0
+    );
+
+    vm.with_default_context_scope_and_checkpoint_for_test(|scope, _host_ptr| {
+        let exception = crate::context_bootstrap::new_dom_exception_value(
+            scope,
+            "native security failure",
+            "SecurityError",
+        );
+        let exception = v8::Local::<v8::Object>::try_from(exception).unwrap();
+        let intrinsic =
+            crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "DOMException")?;
+        assert!(
+            exception
+                .get_prototype(scope)
+                .unwrap()
+                .strict_equals(intrinsic.into())
+        );
+        Ok(())
+    })
+    .expect("native exception should materialize through its realm registry");
+    assert_eq!(vm.eval("exceptionConstructorReads").unwrap(), "0");
+    assert_eq!(
+        constructor_materialization_count(&mut vm, "DOMException"),
+        1
+    );
+}
+
+#[test]
+fn native_dom_exception_materializes_in_a_detached_realm() {
+    let mut vm = new_storage_test_vm("https://native-dom-exception-detached.test/");
+    assert_eq!(
+        constructor_materialization_count(&mut vm, "DOMException"),
+        0
+    );
+    let isolate = vm.renderer_document_isolate.clone();
+    let context = vm.current_main_world().unwrap().context.clone();
+    drop(vm);
+    isolate.with_renderer_document_isolate_mut(|isolate| {
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+        let scope = &mut scope.init();
+        let context = v8::Local::new(scope, &context);
+        context.detach_global();
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let exception = crate::context_bootstrap::new_dom_exception_value(
+            scope,
+            "native security failure",
+            "SecurityError",
+        );
+        let exception = v8::Local::<v8::Object>::try_from(exception).unwrap();
+        let intrinsic =
+            crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "DOMException")
+                .expect("detached realm must retain its intrinsic registry");
+        assert!(
+            exception
+                .get_prototype(scope)
+                .unwrap()
+                .strict_equals(intrinsic.into())
+        );
+        assert_eq!(exception.get_creation_context(scope), Some(context));
+        assert_eq!(
+            exception
+                .get(scope, crate::util::v8str(scope, "name").into())
+                .unwrap()
+                .to_rust_string_lossy(scope),
+            "SecurityError"
+        );
+    });
 }
 
 #[test]

@@ -1,11 +1,12 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
 use super::{
     ChildBrowsingContextBootstrap, ChildBrowsingContextSnapshot, ChildFrameAttachmentSnapshot,
-    JsContextHost, NavigationActivationSeed, NavigationHistoryDocumentId, NavigationHistoryEntryId,
+    NavigationActivationSeed, NavigationHistoryDocumentId, NavigationHistoryEntryId,
     NavigationHistoryEntryKey, NavigationHistoryEntrySeed, NavigationHistorySerializedEntry,
-    child_documents::CompletedFrameOwnerResourceTiming,
+    PageScriptHost, child_documents::CompletedFrameOwnerResourceTiming,
 };
 use crate::{
-    context_bootstrap::set_top_level_history_length_at_least_for_runtime_owner,
     document_runtime::{DocumentPolicyContainer, DocumentSandboxPolicy, DomHandle},
     frame_owner_model::{
         ChildFrameOwnerSnapshot, FrameDocumentTaskOwner, FrameId, FrameRealmId, FrameScriptJob,
@@ -20,7 +21,7 @@ use moli_page_types::{
     apply_child_browsing_context_navigation_to_entry_seed as apply_child_navigation_to_seed,
     replace_child_browsing_context_navigation_in_entry_seed as replace_child_navigation_in_seed,
 };
-use std::collections::HashSet;
+use std::{cell::RefCell, collections::HashSet, rc::Rc};
 use url::Url;
 
 mod classic_scripts;
@@ -41,6 +42,7 @@ pub(in crate::native_bridge::context_host) use request_scope::{
 #[derive(Debug, Clone)]
 pub(super) struct ChildBrowsingContextEntry {
     frame_id: String,
+    retiring: bool,
     current_document_loader_id: Option<String>,
     name: Option<String>,
     id: Option<String>,
@@ -58,12 +60,11 @@ pub(super) struct ChildBrowsingContextEntry {
     performance_time_origin: ChildPerformanceTimeOrigin,
     pending_document_load_id: Option<u64>,
     classic_script_document_state: classic_scripts::ChildClassicScriptDocumentState,
-    document_domain_override: Option<String>,
+    document_domain_override: Rc<RefCell<Option<String>>>,
     credentialless: bool,
     service_worker_client_id: Option<ServiceWorkerClientId>,
     pending_service_worker_client_id: Option<ServiceWorkerClientId>,
     pending_service_worker_client_navigation: Option<ServiceWorkerClientNavigateContinuation>,
-    pending_top_level_history_length_increment: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -118,15 +119,19 @@ impl ChildBrowsingContextEntry {
     }
 
     pub(super) fn document_domain_override(&self) -> Option<String> {
+        self.document_domain_override.borrow().clone()
+    }
+
+    pub(super) fn shared_document_domain_override(&self) -> Rc<RefCell<Option<String>>> {
         self.document_domain_override.clone()
     }
 
     pub(super) fn set_document_domain_override(&mut self, domain: String) {
-        self.document_domain_override = Some(domain);
+        *self.document_domain_override.borrow_mut() = Some(domain);
     }
 
     pub(super) fn clear_document_domain_override(&mut self) {
-        self.document_domain_override = None;
+        self.document_domain_override = Rc::new(RefCell::new(None));
     }
 
     pub(super) fn window_name(&self) -> &str {
@@ -163,7 +168,18 @@ impl ChildBrowsingContextEntry {
         &self,
         bootstrap: &ChildBrowsingContextBootstrap,
     ) -> bool {
-        self.attribute_bootstrap != *bootstrap
+        match (&self.attribute_bootstrap, bootstrap) {
+            (
+                ChildBrowsingContextBootstrap::Srcdoc { markup: before, .. },
+                ChildBrowsingContextBootstrap::Srcdoc { markup: after, .. },
+            ) => {
+                // The inherited base URL is input to document creation, not
+                // a navigation attribute. Parent pushState/replaceState must
+                // not replace the child Document or retire its queued tasks.
+                before != after
+            }
+            (before, after) => before != after,
+        }
     }
 
     pub(super) fn pending_attribute_bootstrap_commit(&self) -> bool {
@@ -278,19 +294,21 @@ impl ChildBrowsingContextEntry {
         self.document_sandbox_policy().allows_scripts
     }
 
-    pub(super) fn response_content_security_policies(&self) -> &[String] {
+    pub(super) fn response_content_security_policies(&self) -> &[ContentSecurityPolicy] {
         self.document_policy_container
             .response_content_security_policies
             .as_slice()
     }
 
-    pub(super) fn document_content_security_policies(&self) -> &[String] {
+    pub(super) fn document_content_security_policies(&self) -> &[ContentSecurityPolicy] {
         self.document_policy_container
             .document_content_security_policies
             .as_slice()
     }
 
-    pub(super) fn response_content_security_report_only_policies(&self) -> &[String] {
+    pub(super) fn response_content_security_report_only_policies(
+        &self,
+    ) -> &[ContentSecurityPolicy] {
         self.document_policy_container
             .response_content_security_report_only_policies
             .as_slice()
@@ -339,7 +357,7 @@ impl ChildBrowsingContextEntry {
         self.document_policy_container.permissions_policy = self
             .document_policy_container
             .permissions_policy
-            .intersect(policy_container.permissions_policy);
+            .intersect(&policy_container.permissions_policy);
         self.set_document_credentialless_state(credentialless, credentialless_storage_nonce);
         self.set_document_sandbox_policy(sandbox);
     }
@@ -381,7 +399,7 @@ impl ChildBrowsingContextEntry {
         self.document_policy_container.permissions_policy = self
             .document_policy_container
             .permissions_policy
-            .intersect(snapshot.policy_container.permissions_policy);
+            .intersect(&snapshot.policy_container.permissions_policy);
         self.set_document_credentialless_state(credentialless, credentialless_storage_nonce);
         self.set_document_sandbox_policy(sandbox);
     }
@@ -684,7 +702,42 @@ impl ChildBrowsingContextEntry {
         let same_document_update = committed_current_document_id.is_none()
             || committed_current_document_id == next_current_document_id
             || self.pending_attribute_bootstrap_commit;
-        self.navigation_entry_seed = entry_seed.clone();
+        let updates_outgoing_document = same_document_update
+            && entry_seed.session_history.commit == moli_page_types::SessionHistoryCommit::Attach
+            && self
+                .navigation_entry_seed
+                .session_history
+                .admitted_entry
+                .is_some()
+            && committed_current_document_id
+                != child_navigation_current_document_id(&self.navigation_entry_seed);
+        if updates_outgoing_document {
+            // An accepted traversal owns the destination and activation. State
+            // updates in the outgoing Document only refresh its retained entry;
+            // they cannot replace the pending destination with the live cursor.
+            if let Some(updated) = entry_seed
+                .entries
+                .iter()
+                .find(|entry| entry.history_index == entry_seed.current_index)
+            {
+                let refresh = |entry: &mut NavigationHistorySerializedEntry| {
+                    if entry.key == updated.key && entry.document_id == updated.document_id {
+                        *entry = updated.clone();
+                    }
+                };
+                for entry in &mut self.navigation_entry_seed.entries {
+                    refresh(entry);
+                }
+                if let Some(activation) = &mut self.navigation_entry_seed.activation {
+                    refresh(&mut activation.entry);
+                    if let Some(from) = &mut activation.from {
+                        refresh(from);
+                    }
+                }
+            }
+        } else {
+            self.navigation_entry_seed = entry_seed.clone();
+        }
         if same_document_update {
             self.committed_navigation_entry_seed = entry_seed;
             self.pending_attribute_bootstrap_commit = false;
@@ -697,20 +750,12 @@ impl ChildBrowsingContextEntry {
         self.navigation_entry_seed = entry_seed;
     }
 
-    pub(super) fn replace_navigation_entry_seed_and_clear_pending_history_increment(
-        &mut self,
-        entry_seed: NavigationHistoryEntrySeed,
-    ) {
-        self.replace_navigation_entry_seed(entry_seed);
-        self.clear_pending_top_level_history_length_increment();
-    }
-
     pub(super) fn apply_navigation_to_entry_seed(&mut self, url: &Url) {
-        apply_child_navigation_to_seed(&mut self.navigation_entry_seed, url, None, None);
+        apply_child_navigation_to_seed(&mut self.navigation_entry_seed, url);
     }
 
     pub(super) fn replace_navigation_in_entry_seed(&mut self, url: &Url) {
-        replace_child_navigation_in_seed(&mut self.navigation_entry_seed, url, None, None);
+        replace_child_navigation_in_seed(&mut self.navigation_entry_seed, url);
     }
 
     pub(super) fn apply_javascript_url_navigation_to_entry_seed(&mut self) {
@@ -733,7 +778,6 @@ impl ChildBrowsingContextEntry {
 
     pub(super) fn apply_deferred_navigation_to_entry_seed(&mut self, url: &Url) {
         self.apply_navigation_to_entry_seed(url);
-        self.clear_pending_top_level_history_length_increment();
     }
 
     pub(super) fn clear_navigation_activation(&mut self) {
@@ -743,7 +787,8 @@ impl ChildBrowsingContextEntry {
     pub(super) fn navigation_seed_is_initial_about_blank_commit(&self) -> bool {
         self.navigation_entry_seed.current_index == 0
             && self.navigation_entry_seed.entries.len() == 1
-            && self.navigation_entry_seed.entries[0].url == "about:blank"
+            && Url::parse(&self.navigation_entry_seed.entries[0].url)
+                .is_ok_and(|url| moli_url::is_about_blank(&url))
     }
 
     pub(super) fn navigation_seed_is_initial_attribute_target(&self, url: &Url) -> bool {
@@ -758,8 +803,10 @@ impl ChildBrowsingContextEntry {
             .entries
             .push(NavigationHistorySerializedEntry {
                 url: url.as_str().to_owned(),
-                history_state_json: None,
-                navigation_state_json: None,
+                inherited_origin: None,
+                history_state: None,
+                navigation_state: None,
+                scroll_restoration: Default::default(),
                 referrer_policy: None,
                 document_id: NavigationHistoryDocumentId::allocate(),
                 history_index: 1,
@@ -884,27 +931,8 @@ impl ChildBrowsingContextEntry {
         self.pending_document_load_id == Some(load_id)
     }
 
-    pub(super) fn mark_pending_top_level_history_length_increment(&mut self) {
-        self.pending_top_level_history_length_increment = true;
-    }
-
-    pub(super) fn pending_top_level_history_length_increment(&self) -> bool {
-        self.pending_top_level_history_length_increment
-    }
-
-    pub(super) fn clear_pending_top_level_history_length_increment(&mut self) {
-        self.pending_top_level_history_length_increment = false;
-    }
-
-    pub(super) fn take_pending_top_level_history_length_increment(&mut self) -> bool {
-        let increment = self.pending_top_level_history_length_increment;
-        self.clear_pending_top_level_history_length_increment();
-        increment
-    }
-
     pub(super) fn clear_pending_form_submission_navigation(&mut self) {
         self.pending_live_navigation = None;
-        self.clear_pending_top_level_history_length_increment();
     }
 
     pub(super) fn has_pending_live_navigation(&self) -> bool {
@@ -1107,7 +1135,7 @@ impl ChildBrowsingContextEntry {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn pending_live_child_browsing_context_navigation_snapshot(
         &self,
     ) -> Vec<(DomHandle, ChildBrowsingContextBootstrap)> {
@@ -1201,6 +1229,7 @@ impl JsContextHost {
         form: DomHandle,
         target: DomHandle,
     ) {
+        crate::context_bootstrap::web_mcp::bind_child_navigation(self, form, target);
         let targets = self
             .pending_form_submission_child_targets
             .entry(form)
@@ -1221,7 +1250,7 @@ impl JsContextHost {
     pub(crate) fn child_browsing_context_content_security_policies(
         &self,
         handle: DomHandle,
-    ) -> Option<&[String]> {
+    ) -> Option<&[ContentSecurityPolicy]> {
         self.child_browsing_contexts
             .get(&handle)
             .map(|entry| entry.document_content_security_policies())

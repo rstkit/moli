@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 
 #[cfg(test)]
 thread_local! {
@@ -273,7 +274,7 @@ pub(crate) fn adopted_style_sheet_objects_from_array_object<'s>(
     (0..length)
         .filter_map(|index| {
             let object = array.get_index(scope, index)?.try_into().ok()?;
-            get_private_value(scope, object, CSS_STYLE_SHEET_BRAND_SLOT).map(|_| object)
+            web_api_interfaces::CSSStyleSheet::is_instance(scope, object).then_some(object)
         })
         .collect()
 }
@@ -838,7 +839,7 @@ pub(crate) fn css_style_sheet_selector_namespace_context<'s>(
 
 pub(crate) fn sync_document_adopted_style_sheet_installations<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut crate::native_bridge::JsContextHost,
+    host_ptr: *mut crate::native_bridge::PageScriptHost,
     style_document: crate::document_runtime::DomHandle,
     sheets: v8::Local<'s, v8::Object>,
 ) {
@@ -861,7 +862,7 @@ pub(crate) fn sync_document_adopted_style_sheet_installations<'s>(
 
 pub(crate) fn sync_shadow_root_adopted_style_sheet_installations<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host_ptr: *mut crate::native_bridge::JsContextHost,
+    host_ptr: *mut crate::native_bridge::PageScriptHost,
     root: crate::document_runtime::DomHandle,
     sheets: v8::Local<'s, v8::Object>,
 ) {
@@ -946,7 +947,7 @@ pub(crate) fn css_style_sheet_replace_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    if get_private_value(scope, args.this(), CSS_STYLE_SHEET_BRAND_SLOT).is_none() {
+    if !web_api_interfaces::CSSStyleSheet::is_instance(scope, args.this()) {
         let promise = rejected_type_error_promise(
             scope,
             "Failed to execute 'replace' on 'CSSStyleSheet': Illegal invocation.",
@@ -1033,7 +1034,7 @@ pub(crate) fn ensure_css_style_sheet_object<'s>(
     interface: &'static str,
     member: &'static str,
 ) -> bool {
-    if get_private_value(scope, object, CSS_STYLE_SHEET_BRAND_SLOT).is_some() {
+    if web_api_interfaces::CSSStyleSheet::is_instance(scope, object) {
         return true;
     }
     throw_type_error(
@@ -1094,7 +1095,7 @@ pub(crate) fn ensure_style_sheet_list_object<'s>(
     object: v8::Local<'s, v8::Object>,
     member: &'static str,
 ) -> bool {
-    if get_private_value(scope, object, STYLE_SHEET_LIST_BRAND_SLOT).is_some() {
+    if web_api_interfaces::StyleSheetList::is_instance(scope, object) {
         return true;
     }
     throw_type_error(
@@ -1114,12 +1115,9 @@ pub(crate) fn style_sheet_list_length<'s>(
 pub(crate) fn new_style_sheet_list_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> v8::Local<'s, v8::Object> {
-    StyleSheetListDeclaration {
-        brand: (),
-        length: (),
-    }
-    .bind(scope)
-    .expect("StyleSheetList declaration should bind")
+    StyleSheetListDeclaration { length: () }
+        .bind(scope)
+        .expect("StyleSheetList declaration should bind")
 }
 
 pub(crate) fn set_style_sheet_list_contents<'s>(

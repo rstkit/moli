@@ -1,26 +1,28 @@
+use std::sync::Arc;
+
 use url::Url;
 
 use super::{ModuleAttributesKey, ModuleKind, ModuleMapKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ModuleSource {
-    Text(String),
-    Binary(Vec<u8>),
+    /// The fetch pipeline and synthetic evaluation share this immutable allocation.
+    Text(Arc<str>),
+    /// Retained Wasm bytes share the fetch allocation across clones.
+    Binary(Arc<[u8]>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModuleGraphFetchedSource {
     final_url: Url,
-    redirected: bool,
     response_referrer_policy: Option<String>,
     source: ModuleSource,
 }
 
 impl ModuleGraphFetchedSource {
-    pub(crate) fn new(final_url: Url, redirected: bool, source: ModuleSource) -> Self {
+    pub(crate) fn new(final_url: Url, source: ModuleSource) -> Self {
         Self {
             final_url,
-            redirected,
             response_referrer_policy: None,
             source,
         }
@@ -36,10 +38,6 @@ impl ModuleGraphFetchedSource {
 
     pub(crate) fn final_url(&self) -> &Url {
         &self.final_url
-    }
-
-    pub(crate) fn redirected(&self) -> bool {
-        self.redirected
     }
 
     pub(crate) fn response_referrer_policy(&self) -> Option<&str> {
@@ -60,9 +58,10 @@ impl ModuleGraphFetchedSource {
                 self.final_url.clone(),
                 request_key.attributes().clone(),
             ),
-            ModuleKind::ModulePreloadText => {
-                ModuleMapKey::modulepreload_text(self.final_url.clone())
-            }
+            ModuleKind::Text => ModuleMapKey::text_with_attributes(
+                self.final_url.clone(),
+                request_key.attributes().clone(),
+            ),
             ModuleKind::WebAssembly => ModuleMapKey::webassembly(self.final_url.clone()),
         }
     }
@@ -82,12 +81,12 @@ impl ModuleGraphFetchedSource {
 }
 
 impl ModuleSource {
-    pub(crate) fn text(source: String) -> Self {
-        Self::Text(source)
+    pub(crate) fn text(source: impl Into<Arc<str>>) -> Self {
+        Self::Text(source.into())
     }
 
-    pub(crate) fn binary(bytes: Vec<u8>) -> Self {
-        Self::Binary(bytes)
+    pub(crate) fn binary(bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self::Binary(bytes.into())
     }
 
     pub(crate) fn text_source(&self) -> Option<&str> {

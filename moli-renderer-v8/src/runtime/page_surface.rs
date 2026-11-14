@@ -1,5 +1,5 @@
+use super::protocol_output::{RendererCommandResponseAuthority, RendererCommandResponseLease};
 use super::*;
-use crate::devtools::ingress::main::RendererInspectorMainFirstDispatchGuard;
 use crate::native_bridge::{
     PendingRuntimeObservableConsoleSourceEvent, RuntimeObservableContextToken,
 };
@@ -8,23 +8,34 @@ use crate::protocol_types::{
     ChildFrameDocumentOpenedSnapshot, ChildFrameTreeEventSnapshot, ChildFrameTreeSnapshot,
 };
 use crate::types::{ScriptObservableOutput, ScriptObservableOutputItem};
-use anyhow::bail;
+use anyhow::{Context as _, Result, bail};
+use moli_inspector_json::InspectorJson;
 pub use moli_page_types::{
     DevToolsSessionKey, DocumentNodeObjectSnapshot, DocumentNodeSnapshot,
     RendererAgentAttachmentId, RendererDevToolsAgentToken,
     RendererDomDebuggerEventListenerBreakpoint, RendererDomDebuggerXhrBreakpoint,
     RendererInspectorProtocolConfiguration, RendererInspectorProtocolConfigurationCommand,
-    RendererInspectorSessionRestoreSnapshot, SameDocumentHistoryUpdate, V8InspectorSessionState,
+    RendererInspectorSessionRestoreSnapshot, V8InspectorSessionState,
 };
+use moli_protocol_cdp_defs::LocalCdpEvent;
 use moli_shared_worker::SharedWorkerInstanceId;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     rc::Rc,
 };
 use tokio::sync::oneshot;
+
+mod auxiliary_document_response;
+pub(crate) use auxiliary_document_response::AuxiliaryDocumentResponseReceiver;
+pub use auxiliary_document_response::RendererAuxiliaryDocumentResponse;
+mod element_click;
+pub use element_click::{
+    RendererElementClickError, RendererElementClickTarget, RendererPreparedPointerClick,
+};
 
 mod javascript_dialog;
 mod popup_activation;
@@ -32,8 +43,10 @@ mod window_document_source;
 pub use javascript_dialog::{
     RendererJavaScriptDialogId, RendererJavaScriptDialogSource, RendererPendingJavaScriptDialog,
 };
+pub use popup_activation::RendererPopupActivationParts;
 pub use popup_activation::{
-    RendererPendingPopupActivation, RendererPopupActivationSource, RendererPopupDisposition,
+    RendererNavigationInitiator, RendererPendingPopupActivation, RendererPopupActivationSource,
+    RendererPopupDisposition,
 };
 pub use window_document_source::RendererWindowDocumentSource;
 
@@ -49,7 +62,7 @@ pub struct RendererPageView {
 pub struct RendererPendingDownloadResponse {
     pub final_url: String,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub body: Vec<u8>,
 }
 
@@ -244,7 +257,6 @@ impl RendererPendingFileChooserActivation {
 pub struct RendererPendingSameDocumentNavigation {
     pub url: String,
     pub navigation_type: String,
-    pub history_update: SameDocumentHistoryUpdate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,15 +318,19 @@ pub struct RendererDocumentSourcedTopLevelLocationNavigation {
     source_document: RendererDocumentLifecycleIdentity,
     request: Box<RendererTopLevelNavigationRequest>,
     runtime_command_cause: Option<RendererRuntimeCommandCausalIdentity>,
+    navigation_initiator: Option<RendererNavigationInitiator>,
+    initial_document_environment: Option<RendererCapturedDocumentEnvironment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RendererTopLevelNavigationRequest {
+    web_mcp_invocation: Option<moli_page_types::RendererWebMcpNavigation>,
     url: String,
     request_method: String,
-    request_body: Option<Vec<u8>>,
+    request_body: Option<bytes::Bytes>,
     request_headers: Vec<(String, String)>,
     browser_navigation_kind: moli_fetch::BrowserNavigationRequestKind,
+    history_mutation: moli_page_types::NavigationHistoryMutation,
 }
 
 impl RendererDocumentSourcedTopLevelLocationNavigation {
@@ -342,7 +358,7 @@ impl RendererDocumentSourcedTopLevelLocationNavigation {
         source_document: RendererDocumentLifecycleIdentity,
         url: String,
         request_method: String,
-        request_body: Option<Vec<u8>>,
+        request_body: Option<bytes::Bytes>,
         request_headers: Vec<(String, String)>,
         browser_navigation_kind: moli_fetch::BrowserNavigationRequestKind,
         runtime_command_cause: Option<RendererRuntimeCommandCausalIdentity>,
@@ -350,18 +366,64 @@ impl RendererDocumentSourcedTopLevelLocationNavigation {
         Self {
             source_document,
             request: Box::new(RendererTopLevelNavigationRequest {
+                web_mcp_invocation: None,
                 url,
                 request_method,
                 request_body,
                 request_headers,
                 browser_navigation_kind,
+                history_mutation: moli_page_types::NavigationHistoryMutation::Push,
             }),
             runtime_command_cause,
+            navigation_initiator: None,
+            initial_document_environment: None,
         }
+    }
+
+    pub(crate) fn with_navigation_source(
+        mut self,
+        initiator: Option<RendererNavigationInitiator>,
+        environment: Option<RendererCapturedDocumentEnvironment>,
+    ) -> Self {
+        self.navigation_initiator = initiator;
+        self.initial_document_environment = environment;
+        self
+    }
+
+    pub fn navigation_initiator(&self) -> Option<&RendererNavigationInitiator> {
+        self.navigation_initiator.as_ref()
+    }
+
+    pub fn initial_document_environment(&self) -> Option<&RendererCapturedDocumentEnvironment> {
+        self.initial_document_environment.as_ref()
     }
 
     pub fn source_document(&self) -> RendererDocumentLifecycleIdentity {
         self.source_document
+    }
+
+    pub fn with_web_mcp_invocation(
+        mut self,
+        id: Option<moli_page_types::RendererWebMcpNavigation>,
+    ) -> Self {
+        self.request.web_mcp_invocation = id;
+        self
+    }
+
+    pub fn web_mcp_invocation(&self) -> Option<moli_page_types::RendererWebMcpNavigation> {
+        self.request.web_mcp_invocation.clone()
+    }
+
+    pub fn with_history_mutation(
+        mut self,
+        mutation: moli_page_types::NavigationHistoryMutation,
+    ) -> Self {
+        self.request.history_mutation = mutation;
+        self
+    }
+
+    pub fn history_mutation(&self) -> moli_page_types::NavigationHistoryMutation {
+        self.request.history_mutation
     }
 
     pub fn url(&self) -> &str {
@@ -372,8 +434,8 @@ impl RendererDocumentSourcedTopLevelLocationNavigation {
         &self.request.request_method
     }
 
-    pub fn request_body(&self) -> Option<&[u8]> {
-        self.request.request_body.as_deref()
+    pub fn request_body(&self) -> Option<&bytes::Bytes> {
+        self.request.request_body.as_ref()
     }
 
     pub fn request_headers(&self) -> &[(String, String)] {
@@ -420,18 +482,33 @@ pub struct RendererDragData {
     pub drag_operations_mask: i32,
 }
 
+/// String data of a drag that started while the client intercepts drags.
+///
+/// Files and directories are not carried. String items include native defaults
+/// and any changes made through `DataTransfer.setData` during `dragstart`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RendererInterceptedDrag {
+    pub items: Vec<RendererDragDataItem>,
+    pub drag_operations_mask: i32,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RendererInputDispatchOutcome {
     pub handled: bool,
     pub triggered_top_level_navigation: bool,
     pub pending_download: Option<RendererPendingDownloadActivation>,
     pub pending_file_chooser: Option<RendererPendingFileChooserActivation>,
+    /// Set when `dragstart` ran uncanceled and the command asked to intercept
+    /// drags. The renderer then leaves `dragenter`, `dragover` and `drop` to
+    /// `RendererPageCommand::DispatchDragEventAtPoint`.
+    pub intercepted_drag: Option<RendererInterceptedDrag>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RendererPointerEventProperties {
     pub pointer_id: i32,
     pub pointer_type: String,
+    pub is_primary: bool,
     pub pressure: f64,
     pub tangential_pressure: f64,
     pub tilt_x: f64,
@@ -444,6 +521,7 @@ impl Default for RendererPointerEventProperties {
         Self {
             pointer_id: 1,
             pointer_type: "mouse".to_owned(),
+            is_primary: true,
             pressure: 0.0,
             tangential_pressure: 0.0,
             tilt_x: 0.0,
@@ -659,6 +737,7 @@ fn dedicated_worker_navigation_response_eq(
         && left.redirected == right.redirected
         && left.redirect_chain == right.redirect_chain
         && left.from_cache == right.from_cache
+        && left.cache_state == right.cache_state
         && left.negotiated_http_version == right.negotiated_http_version
         && left.network_request_headers() == right.network_request_headers()
 }
@@ -732,7 +811,7 @@ pub enum RendererServiceWorkerFetchDiagnosticResult {
         final_url: String,
         status: u16,
         status_text: String,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         body_len: usize,
     },
     Failure {
@@ -812,7 +891,13 @@ pub struct RendererMainDocumentCommit {
     pub unreachable_url: Option<String>,
     pub security_origin: String,
     pub secure_context_type: String,
+    /// Selected request referrer, including an explicitly suppressed empty value.
+    pub document_referrer: Option<String>,
     pub timestamp: f64,
+    /// Browser-owned session-history cursor and length at this document's commit.
+    pub session_history_position: Option<moli_session_history::SessionHistoryPosition>,
+    /// Browser-selected related page group, including history restoration.
+    pub browsing_context_group: Option<super::RendererBrowsingContextGroup>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -829,12 +914,7 @@ pub enum RendererRuntimeInspectorMessage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RendererRuntimeInspectorProtocolMessage {
-    renderer_call_id: Option<moli_page_types::RendererCallId>,
-    value: Value,
-}
-
-pub struct RendererRuntimeInspectorProtocolMessageValueMut<'a> {
-    message: &'a mut RendererRuntimeInspectorProtocolMessage,
+    payload: InspectorJson,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -930,17 +1010,22 @@ impl RendererRuntimeCommandOutput {
         self.messages.is_empty()
     }
 
-    pub fn protocol_response(&self, call_id: i32) -> Option<&Value> {
+    pub fn protocol_response_payload(&self, call_id: i32) -> Option<&InspectorJson> {
         self.messages.iter().find_map(|message| match message {
             RendererRuntimeInspectorMessage::Protocol(message)
                 if message
                     .renderer_call_id()
                     .is_some_and(|id| id.get() == call_id) =>
             {
-                Some(message.value())
+                Some(message.payload())
             }
             _ => None,
         })
+    }
+
+    pub fn protocol_response(&self, call_id: i32) -> Option<&Value> {
+        self.protocol_response_payload(call_id)
+            .map(InspectorJson::value)
     }
 
     pub fn into_protocol_response(self, call_id: i32) -> Option<Value> {
@@ -963,7 +1048,7 @@ impl RendererRuntimeCommandOutput {
         self.messages.extend(messages);
     }
 
-    pub(crate) fn push_inspector_message(&mut self, message: Value) {
+    pub(crate) fn push_inspector_message(&mut self, message: impl Into<InspectorJson>) {
         self.messages
             .push(RendererRuntimeInspectorMessage::from_v8_inspector_message(
                 message,
@@ -982,18 +1067,26 @@ impl RendererRuntimeCommandOutput {
 }
 
 impl RendererRuntimeInspectorMessage {
-    pub fn from_v8_inspector_message(message: Value) -> Self {
-        if let Some(event) =
-            crate::protocol_types::RuntimeContextRestoreEvent::from_v8_inspector_message(
-                message.clone(),
-            )
-        {
+    pub fn from_v8_inspector_message(message: impl Into<InspectorJson>) -> Self {
+        let message = message.into();
+        if let Some(event) = runtime_context_restore_event_from_json(&message) {
             return Self::RuntimeContext(event);
         }
         Self::Protocol(RendererRuntimeInspectorProtocolMessage::new(message))
     }
 
-    pub fn protocol(message: Value) -> Self {
+    pub(crate) fn context_event(
+        &self,
+    ) -> Option<Cow<'_, crate::protocol_types::RuntimeContextRestoreEvent>> {
+        match self {
+            Self::RuntimeContext(event) => Some(Cow::Borrowed(event)),
+            Self::Protocol(message) => {
+                runtime_context_restore_event_from_json(message.payload()).map(Cow::Owned)
+            }
+        }
+    }
+
+    pub fn protocol(message: impl Into<InspectorJson>) -> Self {
         Self::Protocol(RendererRuntimeInspectorProtocolMessage::new(message))
     }
 
@@ -1003,7 +1096,7 @@ impl RendererRuntimeInspectorMessage {
         string_charge: impl Fn(&str) -> usize,
     ) -> usize {
         match self {
-            Self::Protocol(message) => json_charge(message.value()),
+            Self::Protocol(message) => message.payload().retained_bytes(json_charge),
             Self::RuntimeContext(event) => {
                 event.renderer_transport_charge_bytes_with(string_charge)
             }
@@ -1028,83 +1121,83 @@ impl RendererRuntimeInspectorMessage {
                 .is_some_and(|origin| !origin.is_empty())
     }
 
-    pub fn into_v8_inspector_message(self) -> Value {
+    pub fn into_v8_inspector_json(self) -> InspectorJson {
         match self {
-            Self::Protocol(message) => message.into_value(),
+            Self::Protocol(message) => message.into_payload(),
             Self::RuntimeContext(event) => {
-                runtime_context_restore_event_v8_inspector_message(event)
+                runtime_context_restore_event_v8_inspector_message(event).into()
             }
         }
     }
 
+    pub fn into_v8_inspector_message(self) -> Value {
+        self.into_v8_inspector_json().into_value()
+    }
+
     pub fn has_v8_inspector_method(&self) -> bool {
         match self {
-            Self::Protocol(message) => message.value().get("method").is_some(),
+            Self::Protocol(message) => message.payload().method().is_some(),
             Self::RuntimeContext(_) => true,
         }
     }
 }
 
 impl RendererRuntimeInspectorProtocolMessage {
-    pub fn new(value: Value) -> Self {
-        let renderer_call_id = renderer_call_id_from_protocol_message(&value);
+    pub fn new(payload: impl Into<InspectorJson>) -> Self {
         Self {
-            renderer_call_id,
-            value,
+            payload: payload.into(),
         }
     }
 
     pub fn renderer_call_id(&self) -> Option<moli_page_types::RendererCallId> {
-        self.renderer_call_id
+        renderer_call_id_from_protocol_message(&self.payload)
     }
 
     pub fn value(&self) -> &Value {
-        &self.value
+        self.payload.value()
     }
 
-    pub fn value_mut(&mut self) -> RendererRuntimeInspectorProtocolMessageValueMut<'_> {
-        RendererRuntimeInspectorProtocolMessageValueMut { message: self }
+    pub fn payload(&self) -> &InspectorJson {
+        &self.payload
+    }
+
+    pub fn into_payload(self) -> InspectorJson {
+        self.payload
+    }
+
+    pub fn set_frontend_id(&mut self, id: u64) {
+        self.payload.set_id(id);
+    }
+
+    pub fn value_mut(&mut self) -> &mut Value {
+        self.payload.value_mut()
     }
 
     pub fn into_value(self) -> Value {
-        self.value
+        self.payload.into_value()
     }
 }
 
-impl std::ops::Deref for RendererRuntimeInspectorProtocolMessageValueMut<'_> {
-    type Target = Value;
-
-    fn deref(&self) -> &Self::Target {
-        &self.message.value
-    }
-}
-
-impl std::ops::DerefMut for RendererRuntimeInspectorProtocolMessageValueMut<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.message.value
-    }
-}
-
-impl Drop for RendererRuntimeInspectorProtocolMessageValueMut<'_> {
-    fn drop(&mut self) {
-        self.message.renderer_call_id = renderer_call_id_from_protocol_message(&self.message.value);
-    }
-}
-
-impl std::ops::Deref for RendererRuntimeInspectorProtocolMessage {
-    type Target = Value;
-
-    fn deref(&self) -> &Self::Target {
-        self.value()
+fn runtime_context_restore_event_from_json(
+    message: &InspectorJson,
+) -> Option<crate::protocol_types::RuntimeContextRestoreEvent> {
+    match message.method()? {
+        "Runtime.executionContextCreated"
+        | "Runtime.executionContextDestroyed"
+        | "Runtime.executionContextsCleared" => {
+            crate::protocol_types::RuntimeContextRestoreEvent::from_v8_inspector_message(
+                message.value().clone(),
+            )
+        }
+        _ => None,
     }
 }
 
 fn renderer_call_id_from_protocol_message(
-    value: &Value,
+    value: &InspectorJson,
 ) -> Option<moli_page_types::RendererCallId> {
     value
-        .get("id")
-        .and_then(Value::as_i64)
+        .id_i64()
         .and_then(|id| i32::try_from(id).ok())
         .map(moli_page_types::RendererCallId::new)
 }
@@ -1137,7 +1230,7 @@ fn runtime_context_restore_event_v8_inspector_message(
                 );
             }
             json!({
-                "method": "Runtime.executionContextCreated",
+                "method": LocalCdpEvent::RuntimeExecutionContextCreated.method(),
                 "params": {
                     "context": {
                         "id": context_id,
@@ -1156,7 +1249,7 @@ fn runtime_context_restore_event_v8_inspector_message(
                 ..
             } = event;
             json!({
-                "method": "Runtime.executionContextDestroyed",
+                "method": LocalCdpEvent::RuntimeExecutionContextDestroyed.method(),
                 "params": {
                     "executionContextId": context_id,
                     "executionContextUniqueId": realm_id,
@@ -1165,7 +1258,7 @@ fn runtime_context_restore_event_v8_inspector_message(
         }
         crate::protocol_types::RuntimeContextRestoreEvent::Cleared(_event) => {
             json!({
-                "method": "Runtime.executionContextsCleared",
+                "method": LocalCdpEvent::RuntimeExecutionContextsCleared.method(),
                 "params": {},
             })
         }
@@ -1268,14 +1361,20 @@ impl RendererRuntimeInspectorMessageBatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RendererDomMutationEventBatch {
+    pub agent_token: RendererDevToolsAgentToken,
     pub session: DevToolsSessionKey,
     pub events: Vec<RendererDomMutationEvent>,
     renderer_agent_attachment_id: Option<RendererAgentAttachmentId>,
 }
 
 impl RendererDomMutationEventBatch {
-    pub fn new(session: DevToolsSessionKey, events: Vec<RendererDomMutationEvent>) -> Self {
+    pub fn new(
+        agent_token: RendererDevToolsAgentToken,
+        session: DevToolsSessionKey,
+        events: Vec<RendererDomMutationEvent>,
+    ) -> Self {
         Self {
+            agent_token,
             session,
             events,
             renderer_agent_attachment_id: None,
@@ -1374,7 +1473,7 @@ impl RendererCommandTurnOutputRecorder {
         &self,
         agent_token: RendererDevToolsAgentToken,
         session: DevToolsSessionKey,
-        message: Value,
+        message: impl Into<InspectorJson>,
     ) {
         self.push_record(PendingRendererOutputRecord::observation(
             None,
@@ -1515,6 +1614,9 @@ pub struct RendererCommandTurnCompletion {
 }
 
 impl RendererCommandTurnCompletion {
+    pub fn native_response_was_published(&self) -> bool {
+        matches!(self.reply, RendererPageReply::NativeCommandPublished)
+    }
     pub fn reply(&self) -> &RendererPageReply {
         &self.reply
     }
@@ -1574,13 +1676,6 @@ impl RendererCommandTurnCompletion {
 pub struct RendererCommandTurnOutput {
     completion: RendererCommandTurnCompletion,
     renderer_output_predecessor: Option<RendererOutputFence>,
-    // A nested synchronous DevTools agent call must keep its per-session Main
-    // receiver slot until the protocol actor owns the settled result. This is
-    // deliberately distinct from a post-response continuation: dropping the
-    // result at the protocol handoff is enough to preserve receiver order,
-    // while waiting for the frontend response would deadlock multi-stage
-    // commands that need to enter the same receiver again.
-    protocol_handoff: Option<Box<RendererInspectorMainFirstDispatchGuard>>,
 }
 
 impl RendererCommandTurnOutput {
@@ -1589,7 +1684,7 @@ impl RendererCommandTurnOutput {
         page_state: Arc<RendererPageState>,
         runtime_command_output: RendererRuntimeCommandOutput,
         post_response_continuation: Option<RendererPageCommandPostResponseContinuation>,
-        renderer_output_predecessor: Option<RendererOutputFence>,
+        mut renderer_output_predecessor: Option<RendererOutputFence>,
     ) -> Result<Self> {
         let reply = match reply {
             RendererPageReply::RuntimeInspectorProtocolMessages(reply_messages) => {
@@ -1605,6 +1700,27 @@ impl RendererCommandTurnOutput {
                 reply
             }
         };
+        let reply = match reply {
+            RendererPageReply::NativeCommandReady(ready) => {
+                // Settlement has already published this turn's earlier facts.
+                // Publish the ready reply here, before a later Main command
+                // can append its output, regardless of adapter waiter polling.
+                let terminal = ready.publish(&page_state)?;
+                if let Some(prefix) = &renderer_output_predecessor {
+                    assert_eq!(
+                        terminal.cursor(),
+                        terminal.cursor().latest_in_same_stream(prefix.cursor()),
+                        "native terminal must cover its settled output prefix",
+                    );
+                }
+                // The terminal lease is declared before the covered prefix
+                // is released. Only this final boundary leaves the renderer;
+                // typed/composite replies still retain independent leases.
+                renderer_output_predecessor = Some(terminal);
+                RendererPageReply::NativeCommandPublished
+            }
+            reply => reply,
+        };
         Ok(Self {
             completion: RendererCommandTurnCompletion {
                 reply,
@@ -1612,23 +1728,9 @@ impl RendererCommandTurnOutput {
                 post_response_continuation,
             },
             renderer_output_predecessor,
-            protocol_handoff: None,
         })
     }
 
-    pub(crate) fn hold_until_protocol_handoff(
-        mut self,
-        handoff: RendererInspectorMainFirstDispatchGuard,
-    ) -> Self {
-        debug_assert!(
-            self.protocol_handoff.is_none(),
-            "a renderer command turn may hold only one protocol handoff"
-        );
-        self.protocol_handoff = Some(Box::new(handoff));
-        self
-    }
-
-    #[doc(hidden)]
     pub fn bind_renderer_agent_attachment(&mut self, id: RendererAgentAttachmentId) {
         if let RendererPageReply::RuntimeInspectorProtocolMessages(output) =
             &mut self.completion.reply
@@ -1670,7 +1772,6 @@ impl RendererCommandTurnOutput {
         let Self {
             completion,
             renderer_output_predecessor,
-            protocol_handoff: _,
         } = self;
         (completion, renderer_output_predecessor)
     }
@@ -2204,7 +2305,7 @@ impl RendererRuntimeObservableSourceQueue {
     pub(crate) fn take_report_observable_output(
         &mut self,
         default_execution_context_id: Option<i64>,
-        default_context_token: RuntimeObservableContextToken,
+        default_context_token: Option<RuntimeObservableContextToken>,
     ) -> ScriptObservableOutput {
         let mut output = ScriptObservableOutput::default();
         let mut default_console_message_count = 0usize;
@@ -2229,7 +2330,7 @@ impl RendererRuntimeObservableSourceQueue {
             }
         }
         for event in &self.pending_console_events {
-            if event.context_token() != default_context_token {
+            if Some(event.context_token()) != default_context_token {
                 continue;
             }
             if default_console_message_count >= self.report_default_console_message_count {
@@ -2459,6 +2560,28 @@ mod page_diagnostics_snapshot_tests {
     }
 
     #[test]
+    fn lifecycle_errors_remain_reportable_before_a_script_context_exists() {
+        let mut queue = RendererRuntimeObservableSourceQueue::default();
+        queue.record_lifecycle_error("native resource failed".to_owned());
+        assert_eq!(
+            queue
+                .take_report_observable_output(None, None)
+                .into_items()
+                .collect::<Vec<_>>(),
+            vec![ScriptObservableOutputItem::LifecycleError(
+                "native resource failed".to_owned()
+            )],
+        );
+        assert_eq!(
+            queue
+                .take_report_observable_output(None, None)
+                .into_items()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn runtime_observable_source_queue_owns_lifecycle_errors() {
         let mut queue = RendererRuntimeObservableSourceQueue::default();
         queue.record_lifecycle_error("first failure".to_owned());
@@ -2486,8 +2609,10 @@ mod page_diagnostics_snapshot_tests {
             ],
         );
 
-        let report_output = queue
-            .take_report_observable_output(Some(5), RuntimeObservableContextToken::from_raw(50));
+        let report_output = queue.take_report_observable_output(
+            Some(5),
+            Some(RuntimeObservableContextToken::from_raw(50)),
+        );
         let report_items: Vec<_> = report_output.into_items().collect();
         assert_eq!(
             report_items,
@@ -2519,8 +2644,10 @@ mod page_diagnostics_snapshot_tests {
             ));
         queue.record_lifecycle_error("first failure".to_owned());
 
-        let report_output = queue
-            .take_report_observable_output(Some(5), RuntimeObservableContextToken::from_raw(50));
+        let report_output = queue.take_report_observable_output(
+            Some(5),
+            Some(RuntimeObservableContextToken::from_raw(50)),
+        );
         let report_items: Vec<_> = report_output.into_items().collect();
         assert_eq!(
             report_items,
@@ -2546,8 +2673,10 @@ mod page_diagnostics_snapshot_tests {
             ));
         queue.record_lifecycle_error("second failure".to_owned());
 
-        let report_output = queue
-            .take_report_observable_output(Some(5), RuntimeObservableContextToken::from_raw(50));
+        let report_output = queue.take_report_observable_output(
+            Some(5),
+            Some(RuntimeObservableContextToken::from_raw(50)),
+        );
         let report_items: Vec<_> = report_output.into_items().collect();
         assert_eq!(
             report_items,
@@ -2572,8 +2701,10 @@ mod page_diagnostics_snapshot_tests {
             ),
         );
 
-        let report_output = queue
-            .take_report_observable_output(Some(5), RuntimeObservableContextToken::from_raw(50));
+        let report_output = queue.take_report_observable_output(
+            Some(5),
+            Some(RuntimeObservableContextToken::from_raw(50)),
+        );
         let report_items: Vec<_> = report_output.into_items().collect();
         assert_eq!(
             report_items,
@@ -2595,8 +2726,10 @@ mod page_diagnostics_snapshot_tests {
             ]),
             Vec::new(),
         );
-        let report_output = queue
-            .take_report_observable_output(Some(5), RuntimeObservableContextToken::from_raw(50));
+        let report_output = queue.take_report_observable_output(
+            Some(5),
+            Some(RuntimeObservableContextToken::from_raw(50)),
+        );
         assert!(
             report_output.is_empty(),
             "pending default console output must not be reported again after it resolves into source items"
@@ -2758,11 +2891,11 @@ pub struct PendingWorkerRuntimeInspectorSessionResponse {
 }
 
 impl PendingWorkerRuntimeInspectorSessionResponse {
-    pub async fn wait(self) -> Result<(RendererOutputFence, bool), String> {
+    pub async fn wait(self) -> Result<(RendererOutputFence, bool)> {
         self.settlement
             .await
             .map(RendererRuntimeInspectorSessionResponseSettlement::into_parts)
-            .map_err(|_| "WorkerRuntimeInspectorResponseCanceled".to_owned())
+            .context(WorkerInspectorError::ResponseCanceled)
     }
 }
 
@@ -2777,7 +2910,7 @@ impl CompletedWorkerRuntimeInspectorCommandDispatch {
     }
 
     pub(crate) fn finish(
-        dispatch: Result<Vec<RendererRuntimeInspectorMessage>, String>,
+        dispatch: Result<Vec<RendererRuntimeInspectorMessage>>,
         settlement: oneshot::Receiver<RendererRuntimeInspectorSessionResponseSettlement>,
         error_response: RendererRuntimeInspectorResponseSender,
     ) -> Self {
@@ -2789,7 +2922,7 @@ impl CompletedWorkerRuntimeInspectorCommandDispatch {
                     "id": call_id,
                     "error": {
                         "code": -32000,
-                        "message": message,
+                        "message": message.to_string(),
                     }
                 }));
                 Vec::new()
@@ -2924,7 +3057,7 @@ pub(crate) struct RendererRuntimeCommandOutputRecorder(
 struct RendererRuntimeCommandOutputRecorderState {
     causal_identity: RendererRuntimeCommandCausalIdentity,
     output: RendererRuntimeCommandOutput,
-    response: Option<(RendererRuntimeInspectorResponseSender, Value)>,
+    response: Option<(RendererRuntimeInspectorResponseSender, InspectorJson)>,
 }
 
 impl std::fmt::Debug for RendererRuntimeCommandOutputRecorder {
@@ -2972,10 +3105,10 @@ impl RendererRuntimeCommandOutputRecorder {
             .borrow()
             .response
             .as_ref()
-            .is_some_and(|(_, message)| message.get("error").is_none())
+            .is_some_and(|(_, message)| !message.has_field("error"))
     }
 
-    pub(crate) fn push_inspector_message(&self, message: Value) {
+    pub(crate) fn push_inspector_message(&self, message: impl Into<InspectorJson>) {
         self.0.borrow_mut().output.push_inspector_message(message);
     }
 
@@ -2986,8 +3119,9 @@ impl RendererRuntimeCommandOutputRecorder {
     pub(crate) fn park_response(
         &self,
         sender: RendererRuntimeInspectorResponseSender,
-        message: Value,
+        message: impl Into<InspectorJson>,
     ) {
+        let message = message.into();
         let mut state = self.0.borrow_mut();
         debug_assert_eq!(state.causal_identity.call_id(), sender.call_id());
         assert!(
@@ -3032,46 +3166,26 @@ impl RendererRuntimeCommandOutputRecorder {
                     "message": message,
                 }
             })
+            .into()
         });
         output.push_inspector_message(message);
         sender.finalize_output(output)
     }
 }
 
-struct RendererRuntimeInspectorResponseChannelState {
-    next_lease_id: u64,
-    active_lease_id: Option<u64>,
-    open: bool,
-    tx: Option<oneshot::Sender<RendererRuntimeInspectorAsyncCompletion>>,
-    session_response_settlement_tx:
-        Option<oneshot::Sender<RendererRuntimeInspectorSessionResponseSettlement>>,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RendererRuntimeInspectorResponseChannel {
     delivery: moli_page_types::RendererInspectorResponseDelivery,
-    state: Arc<Mutex<RendererRuntimeInspectorResponseChannelState>>,
+    authority: RendererCommandResponseAuthority<
+        RendererRuntimeInspectorAsyncCompletion,
+        RendererRuntimeInspectorSessionResponseSettlement,
+    >,
 }
 
-impl std::fmt::Debug for RendererRuntimeInspectorResponseChannel {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.lock();
-        formatter
-            .debug_struct("RendererRuntimeInspectorResponseChannel")
-            .field("delivery", &self.delivery)
-            .field("active_lease_id", &state.active_lease_id)
-            .field("has_receiver", &state.tx.is_some())
-            .finish()
-    }
-}
-
-impl PartialEq for RendererRuntimeInspectorResponseChannel {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
-    }
-}
-
-impl Eq for RendererRuntimeInspectorResponseChannel {}
+type RendererRuntimeInspectorResponseLease = RendererCommandResponseLease<
+    RendererRuntimeInspectorAsyncCompletion,
+    RendererRuntimeInspectorSessionResponseSettlement,
+>;
 
 impl RendererRuntimeInspectorResponseChannel {
     pub fn new() -> (
@@ -3082,13 +3196,7 @@ impl RendererRuntimeInspectorResponseChannel {
         (
             Self {
                 delivery: moli_page_types::RendererInspectorResponseDelivery::AdapterReply,
-                state: Arc::new(Mutex::new(RendererRuntimeInspectorResponseChannelState {
-                    next_lease_id: 1,
-                    active_lease_id: None,
-                    open: true,
-                    tx: Some(tx),
-                    session_response_settlement_tx: None,
-                })),
+                authority: RendererCommandResponseAuthority::adapter(tx),
             },
             rx,
         )
@@ -3108,13 +3216,7 @@ impl RendererRuntimeInspectorResponseChannel {
             moli_page_types::RendererInspectorResponseDelivery::SessionSink => (
                 Self {
                     delivery,
-                    state: Arc::new(Mutex::new(RendererRuntimeInspectorResponseChannelState {
-                        next_lease_id: 1,
-                        active_lease_id: None,
-                        open: true,
-                        tx: None,
-                        session_response_settlement_tx: None,
-                    })),
+                    authority: RendererCommandResponseAuthority::session(),
                 },
                 None,
             ),
@@ -3135,19 +3237,7 @@ impl RendererRuntimeInspectorResponseChannel {
         call_id: i32,
         attachment_id: Option<RendererAgentAttachmentId>,
     ) -> Option<RendererRuntimeInspectorResponseSender> {
-        let lease_id = {
-            let mut state = self.state.lock();
-            if !state.open {
-                return None;
-            }
-            let lease_id = state.next_lease_id;
-            state.next_lease_id = lease_id
-                .checked_add(1)
-                .expect("renderer response lease id exhausted");
-            state.active_lease_id = Some(lease_id);
-            lease_id
-        };
-        let lease = RendererRuntimeInspectorResponseLease::new(lease_id, self.clone());
+        let lease = self.authority.activate()?;
         let destination = match self.delivery {
             moli_page_types::RendererInspectorResponseDelivery::AdapterReply => {
                 RendererRuntimeInspectorResponseDestination::AdapterReply(lease)
@@ -3157,6 +3247,7 @@ impl RendererRuntimeInspectorResponseChannel {
             }
         };
         Some(RendererRuntimeInspectorResponseSender {
+            abandoned_object_group: None,
             call_id,
             attachment_id,
             destination,
@@ -3170,133 +3261,11 @@ impl RendererRuntimeInspectorResponseChannel {
     /// publishing while the protocol session still owns terminal completion.
     /// A response that already claimed the channel wins and returns `false`.
     pub fn try_revoke_active_lease(&self) -> bool {
-        let mut state = self.state.lock();
-        if !state.open || state.active_lease_id.is_none() {
-            return false;
-        }
-        state.active_lease_id = None;
-        true
+        self.authority.try_revoke_active_lease()
     }
 
     pub fn cancel(&self) {
-        let mut state = self.state.lock();
-        state.open = false;
-        state.active_lease_id = None;
-        state.tx.take();
-        state.session_response_settlement_tx.take();
-    }
-
-    fn send(
-        &self,
-        lease_id: u64,
-        completion: RendererRuntimeInspectorAsyncCompletion,
-    ) -> Result<(), RendererRuntimeInspectorAsyncCompletion> {
-        let tx = {
-            let mut state = self.state.lock();
-            if state.active_lease_id != Some(lease_id) {
-                return Err(completion);
-            }
-            state.open = false;
-            state.active_lease_id = None;
-            state.tx.take()
-        };
-        let Some(tx) = tx else {
-            return Err(completion);
-        };
-        tx.send(completion)
-    }
-
-    fn take_session_response_settlement_receiver(
-        &self,
-        lease_id: u64,
-    ) -> Option<oneshot::Receiver<RendererRuntimeInspectorSessionResponseSettlement>> {
-        let mut state = self.state.lock();
-        if !state.open
-            || state.active_lease_id != Some(lease_id)
-            || state.session_response_settlement_tx.is_some()
-        {
-            return None;
-        }
-        let (tx, rx) = oneshot::channel();
-        state.session_response_settlement_tx = Some(tx);
-        Some(rx)
-    }
-
-    fn cancel_lease(&self, lease_id: u64) -> bool {
-        let mut state = self.state.lock();
-        if !state.open || state.active_lease_id != Some(lease_id) {
-            return false;
-        }
-        state.open = false;
-        state.active_lease_id = None;
-        state.tx.take();
-        state.session_response_settlement_tx.take();
-        true
-    }
-
-    fn claim_session_lease(
-        &self,
-        lease_id: u64,
-    ) -> Result<Option<oneshot::Sender<RendererRuntimeInspectorSessionResponseSettlement>>, ()>
-    {
-        let mut state = self.state.lock();
-        if !state.open || state.active_lease_id != Some(lease_id) {
-            return Err(());
-        }
-        state.open = false;
-        state.active_lease_id = None;
-        Ok(state.session_response_settlement_tx.take())
-    }
-}
-
-#[derive(Debug)]
-struct RendererRuntimeInspectorResponseLeaseLifetime {
-    lease_id: u64,
-    channel: RendererRuntimeInspectorResponseChannel,
-}
-
-impl Drop for RendererRuntimeInspectorResponseLeaseLifetime {
-    fn drop(&mut self) {
-        self.channel.cancel_lease(self.lease_id);
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RendererRuntimeInspectorResponseLease {
-    lifetime: Arc<RendererRuntimeInspectorResponseLeaseLifetime>,
-}
-
-impl RendererRuntimeInspectorResponseLease {
-    fn new(lease_id: u64, channel: RendererRuntimeInspectorResponseChannel) -> Self {
-        Self {
-            lifetime: Arc::new(RendererRuntimeInspectorResponseLeaseLifetime { lease_id, channel }),
-        }
-    }
-
-    fn send_adapter_reply(
-        self,
-        completion: RendererRuntimeInspectorAsyncCompletion,
-    ) -> Result<(), RendererRuntimeInspectorAsyncCompletion> {
-        self.lifetime
-            .channel
-            .send(self.lifetime.lease_id, completion)
-    }
-
-    fn take_session_response_settlement_receiver(
-        &self,
-    ) -> Option<oneshot::Receiver<RendererRuntimeInspectorSessionResponseSettlement>> {
-        self.lifetime
-            .channel
-            .take_session_response_settlement_receiver(self.lifetime.lease_id)
-    }
-
-    fn claim_session(
-        &self,
-    ) -> Result<Option<oneshot::Sender<RendererRuntimeInspectorSessionResponseSettlement>>, ()>
-    {
-        self.lifetime
-            .channel
-            .claim_session_lease(self.lifetime.lease_id)
+        self.authority.cancel();
     }
 }
 
@@ -3417,7 +3386,7 @@ impl RendererRuntimeInspectorResponseDestination {
                                     |renderer_call_id| renderer_call_id.get() == completion.call_id,
                                 ) =>
                             {
-                                Some(response.value())
+                                Some(response.payload())
                             }
                             _ => None,
                         });
@@ -3427,7 +3396,8 @@ impl RendererRuntimeInspectorResponseDestination {
                 if responses.next().is_some() {
                     return Err(completion);
                 }
-                let response_succeeded = response.get("error").is_none();
+                // The business view can synthesize an error without changing the wire.
+                let response_succeeded = !response.has_field("error");
                 let fence = host.publish(completion)?;
                 let settlement = RendererRuntimeInspectorSessionResponseSettlement::new(
                     fence,
@@ -3462,6 +3432,7 @@ enum RendererRuntimeInspectorResponsePublicationBoundary {
 
 #[derive(Clone)]
 pub struct RendererRuntimeInspectorResponseSender {
+    abandoned_object_group: Option<String>,
     call_id: i32,
     attachment_id: Option<RendererAgentAttachmentId>,
     destination: RendererRuntimeInspectorResponseDestination,
@@ -3477,25 +3448,33 @@ impl std::fmt::Debug for RendererRuntimeInspectorResponseSender {
 }
 
 impl RendererRuntimeInspectorResponseSender {
-    pub fn new(call_id: i32, tx: oneshot::Sender<RendererRuntimeInspectorAsyncCompletion>) -> Self {
-        let channel = RendererRuntimeInspectorResponseChannel {
-            delivery: moli_page_types::RendererInspectorResponseDelivery::AdapterReply,
-            state: Arc::new(Mutex::new(RendererRuntimeInspectorResponseChannelState {
-                next_lease_id: 2,
-                active_lease_id: Some(1),
-                open: true,
-                tx: Some(tx),
-                session_response_settlement_tx: None,
-            })),
-        };
-        Self {
-            call_id,
-            attachment_id: None,
-            destination: RendererRuntimeInspectorResponseDestination::AdapterReply(
-                RendererRuntimeInspectorResponseLease::new(1, channel),
-            ),
-            publication_boundary: RendererRuntimeInspectorResponsePublicationBoundary::Immediate,
+    /// Only an internal operation which owns this private group may opt in.
+    /// Frontend CDP object groups are never inferred from request JSON here.
+    pub fn with_abandoned_object_group_cleanup(mut self, group: Option<String>) -> Self {
+        self.abandoned_object_group = group;
+        self
+    }
+
+    pub(crate) fn abandoned_object_group(&self) -> Option<&str> {
+        self.abandoned_object_group.as_deref()
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        match &self.destination {
+            RendererRuntimeInspectorResponseDestination::AdapterReply(lease)
+            | RendererRuntimeInspectorResponseDestination::DevToolsSessionPending(lease)
+            | RendererRuntimeInspectorResponseDestination::DevToolsSession { lease, .. } => {
+                lease.is_open()
+            }
         }
+    }
+
+    pub fn new(call_id: i32, tx: oneshot::Sender<RendererRuntimeInspectorAsyncCompletion>) -> Self {
+        RendererRuntimeInspectorResponseChannel {
+            delivery: moli_page_types::RendererInspectorResponseDelivery::AdapterReply,
+            authority: RendererCommandResponseAuthority::adapter(tx),
+        }
+        .activate_sender(call_id, None)
     }
 
     pub fn call_id(&self) -> i32 {
@@ -3585,7 +3564,10 @@ impl RendererRuntimeInspectorResponseSender {
         ))
     }
 
-    pub fn send(self, message: Value) -> Result<(), RendererRuntimeInspectorAsyncCompletion> {
+    pub fn send(
+        self,
+        message: impl Into<InspectorJson>,
+    ) -> Result<(), RendererRuntimeInspectorAsyncCompletion> {
         self.send_output(RendererRuntimeCommandOutput::from_inspector_message(
             RendererRuntimeInspectorMessage::from_v8_inspector_message(message),
         ))
@@ -3600,6 +3582,7 @@ impl RendererRuntimeInspectorResponseSender {
             attachment_id,
             destination,
             publication_boundary,
+            abandoned_object_group: _,
         } = self;
         if let Some(attachment_id) = attachment_id {
             output.bind_renderer_agent_attachment(attachment_id);
@@ -3647,6 +3630,7 @@ impl RendererRuntimeInspectorResponseSender {
             attachment_id: _,
             destination,
             publication_boundary: _,
+            abandoned_object_group: _,
         } = self;
         match destination {
             RendererRuntimeInspectorResponseDestination::AdapterReply(_) => {
@@ -3721,6 +3705,108 @@ mod renderer_runtime_inspector_response_channel_tests {
             vec![record],
         )
         .into()
+    }
+
+    fn assert_raw_session_sink_settlement(raw: &str, expected_success: bool) {
+        let payload = InspectorJson::from_slice(raw.as_bytes()).unwrap();
+        assert!(!payload.is_materialized());
+        let page_id = PageId::new_for_testing(31);
+        let stream = RendererOutputStreamIdentity::new_page_for_protocol_test(page_id);
+        let (transport, mut transport_rx) = crate::runtime::renderer_output_transport_channel();
+        let journal = RendererTurnOutputJournal::new_with_transport(stream, transport);
+        assert!(matches!(
+            transport_rx.try_recv(),
+            Ok(RendererOutputTransportMessage::StreamControl(
+                RendererOutputStreamControl::Opened { stream: opened }
+            )) if opened == stream
+        ));
+        let attachment = RendererAgentAttachmentId::allocate();
+        let (channel, receiver) = RendererRuntimeInspectorResponseChannel::new_for_delivery(
+            moli_page_types::RendererInspectorResponseDelivery::SessionSink,
+        );
+        assert!(receiver.is_none());
+        let sender = channel
+            .activate_sender(7, Some(attachment))
+            .route_to_devtools_session_output(RendererDevToolsSessionOutputHost::new(
+                RendererDevToolsAgentToken::allocate(),
+                DevToolsSessionKey::Attached("SID-raw-settlement".to_owned()),
+                attachment,
+                journal,
+            ));
+        let mut settlement_rx = sender
+            .take_session_response_settlement_receiver()
+            .expect("session output retains its terminal settlement waiter");
+        let output = RendererRuntimeCommandOutput::from_inspector_message(
+            RendererRuntimeInspectorMessage::protocol(payload.clone()),
+        );
+        let (remaining, publication) = sender.finalize_output(output).into_parts();
+        assert!(remaining.is_empty());
+        let (fence, succeeded) = publication
+            .expect("the owner must commit the parked response")
+            .commit(None)
+            .expect("the matching session must accept its response")
+            .expect("session delivery returns a settlement")
+            .into_parts();
+        assert_eq!(succeeded, expected_success);
+        let (notified_fence, notified_success) = settlement_rx
+            .try_recv()
+            .expect("publication must settle the frontend call")
+            .into_parts();
+        assert_eq!(notified_success, expected_success);
+        assert_eq!(notified_fence.cursor(), fence.cursor());
+        assert!(!payload.is_materialized());
+
+        let RendererOutputTransportMessage::Publication(publication) =
+            transport_rx.try_recv().expect("one terminal publication")
+        else {
+            panic!("expected the session response publication");
+        };
+        assert_eq!(publication.cursor(), fence.cursor());
+        let [record] = publication.records() else {
+            panic!("the response must remain one atomic record");
+        };
+        let RendererOutputItem::Observation(RendererProtocolObservation::RuntimeInspector(batch)) =
+            record.item()
+        else {
+            panic!("the response must use the Runtime Inspector stream");
+        };
+        assert_eq!(batch.renderer_agent_attachment_id(), Some(attachment));
+        let [RendererRuntimeInspectorMessage::Protocol(response)] = batch.messages.as_slice()
+        else {
+            panic!("the session must publish exactly one protocol response");
+        };
+        assert!(!response.payload().is_materialized());
+        assert_eq!(response.payload().to_string(), raw);
+    }
+
+    #[test]
+    fn raw_session_sink_large_success_stays_opaque() {
+        let raw = format!(
+            r#"{{"id":7,"result":{{"result":{{"type":"string","value":"{}"}}}}}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        assert_raw_session_sink_settlement(&raw, true);
+    }
+
+    #[test]
+    fn raw_session_sink_deep_success_uses_wire_status() {
+        let raw = format!(
+            r#"{{"id":7,"result":{{"result":{{"type":"object","value":{}0{}}}}}}}"#,
+            "[".repeat(150),
+            "]".repeat(150)
+        );
+        let business_view = InspectorJson::from_slice(raw.as_bytes()).unwrap();
+        assert_eq!(business_view.value()["error"]["code"], -32603);
+        assert!(!business_view.has_field("error"));
+        assert_raw_session_sink_settlement(&raw, true);
+    }
+
+    #[test]
+    fn raw_session_sink_error_stays_opaque() {
+        assert_raw_session_sink_settlement(
+            r#"{"id":7,"error":{"code":-32000,"message":"\ud800","data":{"detail":"\udfff"}}}"#,
+            false,
+        );
     }
 
     #[tokio::test]
@@ -3841,6 +3927,7 @@ mod renderer_runtime_inspector_response_channel_tests {
             attachment_id,
             destination,
             publication_boundary: _,
+            abandoned_object_group: _,
         } = sender;
         let mut output = output(1);
         if let Some(attachment_id) = attachment_id {
@@ -4445,6 +4532,26 @@ pub struct RendererRuntimeRealmInfo {
     pub grant_universal_access: Option<bool>,
 }
 
+/// A native DOM-agent reference, resolved against the current Page document.
+/// CDP frontend IDs must be published in their Inspector session. Internal
+/// automation may explicitly resolve an unpublished binding. Backend IDs use
+/// the Page's live node registry; protocol object handles require their own
+/// resolution before entering this boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RendererDomNodeReference {
+    /// A CDP node ID that must already be visible to this session.
+    FrontendNodeId {
+        inspector_session_id: Option<String>,
+        frontend_node_id: u32,
+    },
+    /// An internal automation binding; it does not imply CDP publication.
+    InternalFrontendNodeBinding {
+        inspector_session_id: Option<String>,
+        frontend_node_id: u32,
+    },
+    BackendNodeId(u32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RendererDocumentNodeAttributesResolution {
     Found(Vec<(String, String)>),
@@ -4479,7 +4586,6 @@ pub enum RendererDocumentQuerySelectorResolution {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RendererDocumentQuerySelectorNode {
-    pub live_node_id: crate::dom::NodeId,
     pub frontend_node_id: u32,
     pub backend_node_id: u32,
 }
@@ -4738,6 +4844,17 @@ pub(crate) enum RendererInspectorPageCommand {
         deferred_response: RendererRuntimeInspectorResponseSender,
     },
     RuntimeEnableEvents,
+    RuntimeDisableEvents,
+    RuntimeBindingEvents {
+        binding: crate::protocol_types::RuntimeBindingRegistration,
+        remove: bool,
+    },
+    /// The V8 session already executed removal. Only native restore metadata
+    /// remains to be committed before publishing the original native terminal.
+    CommitRuntimeBindingRemoval {
+        name: String,
+        output: Result<RendererRuntimeCommandOutput, String>,
+    },
     ApplyRuntimeProtocolState {
         session_restore_snapshots: Vec<RendererInspectorSessionRestoreSnapshot>,
         isolated_worlds: Vec<crate::protocol_types::RuntimeIsolatedWorldDefinition>,
@@ -4758,6 +4875,9 @@ pub(crate) enum RendererInspectorPageCommand {
         pierce: bool,
     },
     ComputedStylePropertiesForObjectId {
+        object_id: String,
+    },
+    PrepareElementClick {
         object_id: String,
     },
     ScrollObjectNodeIntoViewIfNeeded {
@@ -4786,6 +4906,11 @@ pub(crate) enum RendererInspectorPageCommand {
         object_id: String,
         depth: i32,
         pierce: bool,
+        bind_frontend_nodes: bool,
+    },
+    RequestDocumentNodeForObjectId {
+        include_whitespace: bool,
+        object_id: String,
     },
     AccessibilityTreePayloadsForObjectId {
         object_id: String,
@@ -4813,6 +4938,18 @@ pub(crate) enum RendererInspectorPageCommand {
 
 #[non_exhaustive]
 pub enum RendererPageCommand {
+    WebMcp {
+        session: DevToolsSessionKey,
+        command: moli_page_types::RendererWebMcpCommand,
+    },
+    // The call fits inline; its operation boxes the recursively contained page command.
+    Native(RendererCdpCall),
+    /// Checks the original root Document on the renderer before executing an
+    /// operation admitted while its browser-side Page is still being adopted.
+    ForDocument {
+        source_document: RendererDocumentLifecycleIdentity,
+        command: Box<RendererPageCommand>,
+    },
     Inspector(RendererInspectorCommandEnvelope),
     EvaluateExpression {
         expression: String,
@@ -4864,10 +5001,14 @@ pub enum RendererPageCommand {
     },
     NavigateTopLevelSameDocument {
         url: String,
+        replace_current: bool,
     },
     RefreshFullPageState,
     PageDiagnosticsSnapshot,
     HasPendingLocationNavigation,
+    DispatchPreparedElementClick(RendererPreparedPointerClick),
+    #[cfg(feature = "ace-protocol")]
+    AcePageTask(Box<dyn crate::ace_page_task::AcePageTask>),
     DispatchMouseEventAtPoint {
         x: f64,
         y: f64,
@@ -4879,6 +5020,8 @@ pub enum RendererPageCommand {
         delta_y: f64,
         pointer: RendererPointerEventProperties,
         modifiers: u8,
+        /// `Input.setInterceptDrags` state of the issuing DevTools session.
+        intercept_drags: bool,
     },
     DispatchTouchEvent {
         points: Vec<RendererTouchPoint>,
@@ -4893,6 +5036,7 @@ pub enum RendererPageCommand {
         modifiers: u8,
     },
     ClearActiveDragDataTransfer,
+    CancelDragging,
     InsertTextIntoActiveControl(String),
     DispatchKeyEvent {
         event_name: String,
@@ -4975,23 +5119,23 @@ pub enum RendererPageCommand {
     #[cfg(test)]
     TakeDocumentLifecycleEvents,
     StopDocumentLifecycle,
-    ComputedStylePropertiesForBackendNodeId {
-        backend_node_id: u32,
+    ComputedStyleProperties {
+        reference: RendererDomNodeReference,
     },
     SetInlineStyleSheetTextForStyleSheetId {
         inspector_session_id: Option<String>,
         style_sheet_id: String,
         text: String,
     },
-    ScrollBackendNodeIntoViewIfNeeded {
-        backend_node_id: u32,
+    ScrollNodeIntoViewIfNeeded {
+        reference: RendererDomNodeReference,
         rect: Option<moli_page_types::DomScrollIntoViewRect>,
     },
     ClientRectForBackendNodeId {
         backend_node_id: u32,
     },
-    DocumentGeometryForBackendNodeId {
-        backend_node_id: u32,
+    DocumentGeometryForNode {
+        reference: RendererDomNodeReference,
     },
     DocumentHitTest {
         inspector_session_id: Option<String>,
@@ -5003,19 +5147,19 @@ pub enum RendererPageCommand {
     NodeHasGeometryForBackendNodeId {
         backend_node_id: u32,
     },
-    RemoveDocumentBackendNodeId {
-        backend_node_id: u32,
+    RemoveDocumentNode {
+        reference: RendererDomNodeReference,
     },
-    MutateDocumentBackendNodeAttribute {
-        backend_node_id: u32,
+    MutateDocumentNodeAttribute {
+        reference: RendererDomNodeReference,
         mutation: RendererDomAttributeMutation,
     },
     EditDocumentNode {
         inspector_session_id: Option<String>,
         edit: RendererDomEdit,
     },
-    FocusDocumentBackendNode {
-        backend_node_id: u32,
+    FocusDocumentNode {
+        reference: RendererDomNodeReference,
     },
     TriggerAutofill(RendererAutofillTriggerRequest),
     ResetNavigationHistory,
@@ -5024,15 +5168,18 @@ pub enum RendererPageCommand {
         files: Vec<crate::dom::native::SelectedFile>,
         append: bool,
     },
+    DocumentNodeExistsForBackendNodeId {
+        backend_node_id: u32,
+    },
     DocumentNodeSnapshotForBackendNodeId {
         backend_node_id: u32,
         depth: i32,
         pierce: bool,
     },
-    DocumentNodeSnapshotForBackendNodeIdInInspectorSession {
+    DocumentNodeSnapshotForNodeInInspectorSession {
         inspector_session_id: Option<String>,
         include_whitespace: bool,
-        backend_node_id: u32,
+        reference: RendererDomNodeReference,
         depth: i32,
         pierce: bool,
     },
@@ -5049,10 +5196,10 @@ pub enum RendererPageCommand {
         top_frame_id: String,
         options: RendererDomSnapshotCaptureOptions,
     },
-    DocumentChildNodeSnapshotEventsForBackendNodeId {
+    DocumentChildNodeSnapshotEventsForNode {
         inspector_session_id: Option<String>,
         include_whitespace: bool,
-        backend_node_id: u32,
+        reference: RendererDomNodeReference,
         depth: i32,
         pierce: bool,
     },
@@ -5062,25 +5209,25 @@ pub enum RendererPageCommand {
         selector: String,
         multiple: bool,
     },
-    DocumentQuerySelectorForChildFrameBackendNodeId {
+    DocumentQuerySelectorForChildFrameNode {
         inspector_session_id: Option<String>,
         include_whitespace: bool,
         frame_id: String,
-        root_backend_node_id: u32,
+        root: RendererDomNodeReference,
         selector: String,
         multiple: bool,
     },
-    DocumentQuerySelectorForBackendNodeId {
+    DocumentQuerySelectorForNode {
         inspector_session_id: Option<String>,
         include_whitespace: bool,
-        root_backend_node_id: u32,
+        root: RendererDomNodeReference,
         selector: String,
         multiple: bool,
     },
-    DocumentQuerySelectorWithChildNodeSnapshotEventsForBackendNodeId {
+    DocumentQuerySelectorWithChildNodeSnapshotEventsForNode {
         inspector_session_id: Option<String>,
         include_whitespace: bool,
-        root_backend_node_id: u32,
+        root: RendererDomNodeReference,
         selector: String,
         multiple: bool,
     },
@@ -5109,8 +5256,7 @@ pub enum RendererPageCommand {
         frontend_node_id: u32,
     },
     DocumentFrontendNodeBinding {
-        inspector_session_id: Option<String>,
-        frontend_node_id: u32,
+        reference: RendererDomNodeReference,
     },
     RegisterDocumentBidiNodeBinding {
         inspector_session_id: Option<String>,
@@ -5125,35 +5271,38 @@ pub enum RendererPageCommand {
         inspector_session_id: Option<String>,
         backend_node_id: u32,
     },
-    DocumentNodeAttributesForBackendNodeId {
-        backend_node_id: u32,
+    DocumentNodeAttributes {
+        reference: RendererDomNodeReference,
     },
-    DocumentNodeTextForBackendNodeId {
-        backend_node_id: u32,
+    DocumentNodeText {
+        reference: RendererDomNodeReference,
     },
-    DocumentNodePropertyForBackendNodeId {
-        backend_node_id: u32,
+    DocumentNodeProperty {
+        reference: RendererDomNodeReference,
         name: String,
+    },
+    AccessibilityTreeNodes {
+        frame_id: Option<String>,
     },
     AccessibilityTreePayloadsForDocument {
         max_depth: Option<i32>,
     },
     AccessibilityNodePayloadForDocument,
-    AccessibilityTreePayloadsForBackendNodeId {
-        backend_node_id: u32,
+    AccessibilityTreePayloadsForNode {
+        reference: RendererDomNodeReference,
         max_depth: Option<i32>,
     },
-    AccessibilityNodePayloadForBackendNodeId {
-        backend_node_id: u32,
+    AccessibilityNodePayloadForNode {
+        reference: RendererDomNodeReference,
     },
-    AccessibilityNodeAndAncestorPayloadsForBackendNodeId {
-        backend_node_id: u32,
+    AccessibilityNodeAndAncestorPayloadsForNode {
+        reference: RendererDomNodeReference,
     },
-    AccessibilityChildNodePayloadsForBackendNodeId {
-        backend_node_id: u32,
+    AccessibilityChildNodePayloadsForNode {
+        reference: RendererDomNodeReference,
     },
-    AccessibilityPartialTreePayloadsForBackendNodeId {
-        backend_node_id: u32,
+    AccessibilityPartialTreePayloadsForNode {
+        reference: RendererDomNodeReference,
         fetch_relatives: bool,
     },
     AccessibilityTreePayloadsForChildFrame {
@@ -5176,15 +5325,19 @@ pub enum RendererPageCommand {
     OuterHtmlForDocument {
         include_shadow_dom: bool,
     },
-    OuterHtmlForBackendNodeId {
-        backend_node_id: u32,
+    OuterHtmlForNode {
+        reference: RendererDomNodeReference,
         include_shadow_dom: bool,
     },
-    RenderPageDump {
-        options: RendererPageDumpOptions,
+    RenderMarkdown {
+        options: RendererMarkdownOptions,
     },
-    SerializeHtml,
+    SerializeDocument {
+        options: RendererHtmlSerializeOptions,
+    },
     LayoutMetrics,
+    PublishLayout,
+    PrintToPdf(RendererPrintToPdfRequest),
     CaptureScreenshot(RendererCaptureScreenshotRequest),
     CaptureScreencastFrame(RendererCaptureScreencastFrameRequest),
     BlobBytesForUuid {
@@ -5195,19 +5348,7 @@ pub enum RendererPageCommand {
         backend_node_ids: Vec<u32>,
     },
     DocumentStorageKeySnapshot,
-    SearchTextByLines {
-        text: String,
-        query: String,
-        case_sensitive: bool,
-        is_regex: bool,
-    },
-    SearchChildFrameResourceByLines {
-        frame_id: String,
-        url: String,
-        query: String,
-        case_sensitive: bool,
-        is_regex: bool,
-    },
+    SearchResourceByLines(Box<RendererResourceSearchRequest>),
     ChildFrameTreeSnapshot,
     ChildFrameOwnerNodeReference {
         inspector_session_id: Option<String>,
@@ -5221,8 +5362,8 @@ pub enum RendererPageCommand {
         internal_id: u64,
         url: Option<Url>,
         method: Option<String>,
-        body: Option<Option<String>>,
-        headers: Option<Vec<(String, String)>>,
+        body: Option<Option<bytes::Bytes>>,
+        headers: Option<moli_fetch::RequestHeaderOverride>,
         intercept_response: bool,
         handle_auth_requests: bool,
     },
@@ -5244,13 +5385,13 @@ pub enum RendererPageCommand {
     FulfillPendingSubresourceFetch {
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     },
     ContinuePendingSubresourceResponse {
         internal_id: u64,
         response_code: Option<u16>,
-        response_headers: Option<Vec<(String, String)>>,
+        response_headers: Option<Vec<(String, Vec<u8>)>>,
     },
     FailPendingSubresourceResponse {
         internal_id: u64,
@@ -5259,7 +5400,7 @@ pub enum RendererPageCommand {
     FulfillPendingSubresourceResponse {
         internal_id: u64,
         response_code: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body: RendererSyntheticResponseBody,
     },
     ReceiveSyntheticWebSocketText {
@@ -5277,10 +5418,8 @@ pub enum RendererPageCommand {
     },
     PendingSubresourceRequestCount,
     SetFetchSubresourceInterception {
-        enabled: bool,
-        resource_type: Option<crate::SubresourceResourceType>,
+        classes: crate::SubresourceInterceptionClasses,
     },
-    SetJavaScriptDialogHandlerEnabled(bool),
     ReplaceBrowserResourceRuntime {
         resource_runtime: crate::network::BrowserResourceRuntime,
         navigator_identity: moli_browser_profile::BrowserIdentityProfile,
@@ -5298,9 +5437,9 @@ pub enum RendererPageCommand {
     },
     PrepareAppManifestLoad,
     PublishAppManifestLoad(Box<crate::RendererAppManifestLoadPublication>),
-    SetExtraHttpHeaders(Vec<(String, String)>),
+    SetExtraHttpHeaders(moli_fetch::RequestHeaders),
     SetNetworkRequestPolicy {
-        extra_http_headers: Vec<(String, String)>,
+        extra_http_headers: moli_fetch::RequestHeaders,
         bypass_service_worker: bool,
         cache_disabled: bool,
         blocked_url_patterns: Vec<String>,
@@ -5308,11 +5447,14 @@ pub enum RendererPageCommand {
     SetPermissionOverrides(Vec<crate::protocol_types::PermissionOverrideRegistration>),
     SetIdleOverride(Option<crate::protocol_types::EmulatedIdleOverride>),
     SetNavigatorOverrides(moli_page_types::NavigatorOverrides),
-    SetLocaleOverride(Option<String>),
-    SetTimezoneOverride(Option<String>),
+    SetNavigatorAndDocumentActivity {
+        navigator_overrides: moli_page_types::NavigatorOverrides,
+        document_activity: moli_page_types::DocumentActivity,
+    },
+    SetDocumentActivity(moli_page_types::DocumentActivity),
     SetScriptExecutionDisabled(bool),
+    SetScrollbarsHidden(bool),
     SetBypassContentSecurityPolicy(bool),
-    SetCpuThrottlingRate(f64),
     SetEmulatedMedia(crate::protocol_types::EmulatedMediaOverrides),
     SetViewportSurface(Option<crate::protocol_types::ViewportSurface>),
     SetNetworkOffline(bool),
@@ -5422,6 +5564,24 @@ impl RendererPageCommand {
         )
     }
 
+    pub fn runtime_disable_events(inspector_session_id: Option<String>) -> Self {
+        Self::inspector_command(
+            inspector_session_id,
+            RendererInspectorPageCommand::RuntimeDisableEvents,
+        )
+    }
+
+    pub fn runtime_binding_events(
+        inspector_session_id: Option<String>,
+        binding: crate::protocol_types::RuntimeBindingRegistration,
+        remove: bool,
+    ) -> Self {
+        Self::inspector_command(
+            inspector_session_id,
+            RendererInspectorPageCommand::RuntimeBindingEvents { binding, remove },
+        )
+    }
+
     pub fn apply_runtime_protocol_state(
         inspector_session_id: Option<String>,
         session_restore_snapshots: Vec<RendererInspectorSessionRestoreSnapshot>,
@@ -5489,6 +5649,13 @@ impl RendererPageCommand {
         Self::inspector_command(
             inspector_session_id,
             RendererInspectorPageCommand::ComputedStylePropertiesForObjectId { object_id },
+        )
+    }
+
+    pub fn prepare_element_click(inspector_session_id: Option<String>, object_id: String) -> Self {
+        Self::inspector_command(
+            inspector_session_id,
+            RendererInspectorPageCommand::PrepareElementClick { object_id },
         )
     }
 
@@ -5565,6 +5732,7 @@ impl RendererPageCommand {
         object_id: String,
         depth: i32,
         pierce: bool,
+        bind_frontend_nodes: bool,
     ) -> Self {
         Self::inspector_command(
             inspector_session_id,
@@ -5573,6 +5741,21 @@ impl RendererPageCommand {
                 object_id,
                 depth,
                 pierce,
+                bind_frontend_nodes,
+            },
+        )
+    }
+
+    pub fn request_document_node_for_object_id(
+        inspector_session_id: Option<String>,
+        include_whitespace: bool,
+        object_id: String,
+    ) -> Self {
+        Self::inspector_command(
+            inspector_session_id,
+            RendererInspectorPageCommand::RequestDocumentNodeForObjectId {
+                include_whitespace,
+                object_id,
             },
         )
     }
@@ -5661,12 +5844,25 @@ impl RendererPageCommand {
     }
 
     pub fn bind_inspector_attachment(&mut self, attachment: RendererAgentAttachmentId) {
+        if let Self::Native(command) = self {
+            command
+                .operation
+                .command
+                .bind_inspector_attachment(attachment);
+            return;
+        }
         if let Self::Inspector(envelope) = self {
             envelope.bind_attachment(attachment);
         }
     }
 
     pub(crate) fn interruptible_by_javascript_dialog(&self) -> bool {
+        if let Self::Native(command) = self {
+            return command
+                .operation
+                .command
+                .interruptible_by_javascript_dialog();
+        }
         #[cfg(test)]
         if matches!(self, Self::TakeDocumentLifecycleEvents) {
             return true;
@@ -5684,8 +5880,10 @@ impl RendererPageCommand {
 
     pub(crate) fn cdp_nav_timing_label(&self) -> Option<&'static str> {
         match self {
+            Self::Native(command) => command.operation.command.cdp_nav_timing_label(),
             Self::Inspector(envelope) => envelope.cdp_nav_timing_label(),
             Self::DocumentStorageKeySnapshot => Some("DocumentStorageKeySnapshot"),
+            Self::SearchResourceByLines(..) => Some("SearchResourceByLines"),
             Self::CreateIsolatedWorldRuntimeActivity { .. } => {
                 Some("CreateIsolatedWorldRuntimeActivity")
             }
@@ -5701,29 +5899,30 @@ impl RendererPageCommand {
             Self::ChildFrameDocumentRootNodeReference { .. } => {
                 Some("ChildFrameDocumentRootNodeReference")
             }
+            Self::DocumentNodeExistsForBackendNodeId { .. } => {
+                Some("DocumentNodeExistsForBackendNodeId")
+            }
             Self::DocumentNodeSnapshotForBackendNodeId { .. } => {
                 Some("DocumentNodeSnapshotForBackendNodeId")
             }
-            Self::DocumentNodeSnapshotForBackendNodeIdInInspectorSession { .. } => {
-                Some("DocumentNodeSnapshotForBackendNodeIdInInspectorSession")
+            Self::DocumentNodeSnapshotForNodeInInspectorSession { .. } => {
+                Some("DocumentNodeSnapshotForNodeInInspectorSession")
             }
             Self::DocumentNodeSnapshotForDocument { .. } => Some("DocumentNodeSnapshotForDocument"),
             Self::DiscardDomAgentFrontendBindings { .. } => Some("DiscardDomAgentFrontendBindings"),
             Self::DomSnapshotCapture { .. } => Some("DomSnapshotCapture"),
-            Self::DocumentChildNodeSnapshotEventsForBackendNodeId { .. } => {
-                Some("DocumentChildNodeSnapshotEventsForBackendNodeId")
+            Self::DocumentChildNodeSnapshotEventsForNode { .. } => {
+                Some("DocumentChildNodeSnapshotEventsForNode")
             }
             Self::DocumentQuerySelectorForDocument { .. } => {
                 Some("DocumentQuerySelectorForDocument")
             }
-            Self::DocumentQuerySelectorForChildFrameBackendNodeId { .. } => {
-                Some("DocumentQuerySelectorForChildFrameBackendNodeId")
+            Self::DocumentQuerySelectorForChildFrameNode { .. } => {
+                Some("DocumentQuerySelectorForChildFrameNode")
             }
-            Self::DocumentQuerySelectorForBackendNodeId { .. } => {
-                Some("DocumentQuerySelectorForBackendNodeId")
-            }
-            Self::DocumentQuerySelectorWithChildNodeSnapshotEventsForBackendNodeId { .. } => {
-                Some("DocumentQuerySelectorWithChildNodeSnapshotEventsForBackendNodeId")
+            Self::DocumentQuerySelectorForNode { .. } => Some("DocumentQuerySelectorForNode"),
+            Self::DocumentQuerySelectorWithChildNodeSnapshotEventsForNode { .. } => {
+                Some("DocumentQuerySelectorWithChildNodeSnapshotEventsForNode")
             }
             Self::DocumentPerformSearch { .. } => Some("DocumentPerformSearch"),
             Self::DocumentGetSearchResults { .. } => Some("DocumentGetSearchResults"),
@@ -5738,35 +5937,28 @@ impl RendererPageCommand {
             Self::DocumentBidiNodeSharedIdForBackendNodeId { .. } => {
                 Some("DocumentBidiNodeSharedIdForBackendNodeId")
             }
-            Self::DocumentNodeAttributesForBackendNodeId { .. } => {
-                Some("DocumentNodeAttributesForBackendNodeId")
-            }
-            Self::DocumentNodeTextForBackendNodeId { .. } => {
-                Some("DocumentNodeTextForBackendNodeId")
-            }
-            Self::DocumentNodePropertyForBackendNodeId { .. } => {
-                Some("DocumentNodePropertyForBackendNodeId")
-            }
+            Self::DocumentNodeAttributes { .. } => Some("DocumentNodeAttributes"),
+            Self::DocumentNodeText { .. } => Some("DocumentNodeText"),
+            Self::DocumentNodeProperty { .. } => Some("DocumentNodeProperty"),
+            Self::AccessibilityTreeNodes { .. } => Some("AccessibilityTreeNodes"),
             Self::AccessibilityTreePayloadsForDocument { .. } => {
                 Some("AccessibilityTreePayloadsForDocument")
             }
             Self::AccessibilityNodePayloadForDocument => {
                 Some("AccessibilityNodePayloadForDocument")
             }
-            Self::AccessibilityTreePayloadsForBackendNodeId { .. } => {
-                Some("AccessibilityTreePayloadsForBackendNodeId")
+            Self::AccessibilityTreePayloadsForNode { .. } => {
+                Some("AccessibilityTreePayloadsForNode")
             }
-            Self::AccessibilityNodePayloadForBackendNodeId { .. } => {
-                Some("AccessibilityNodePayloadForBackendNodeId")
+            Self::AccessibilityNodePayloadForNode { .. } => Some("AccessibilityNodePayloadForNode"),
+            Self::AccessibilityNodeAndAncestorPayloadsForNode { .. } => {
+                Some("AccessibilityNodeAndAncestorPayloadsForNode")
             }
-            Self::AccessibilityNodeAndAncestorPayloadsForBackendNodeId { .. } => {
-                Some("AccessibilityNodeAndAncestorPayloadsForBackendNodeId")
+            Self::AccessibilityChildNodePayloadsForNode { .. } => {
+                Some("AccessibilityChildNodePayloadsForNode")
             }
-            Self::AccessibilityChildNodePayloadsForBackendNodeId { .. } => {
-                Some("AccessibilityChildNodePayloadsForBackendNodeId")
-            }
-            Self::AccessibilityPartialTreePayloadsForBackendNodeId { .. } => {
-                Some("AccessibilityPartialTreePayloadsForBackendNodeId")
+            Self::AccessibilityPartialTreePayloadsForNode { .. } => {
+                Some("AccessibilityPartialTreePayloadsForNode")
             }
             Self::AccessibilityTreePayloadsForChildFrame { .. } => {
                 Some("AccessibilityTreePayloadsForChildFrame")
@@ -5775,27 +5967,24 @@ impl RendererPageCommand {
                 Some("AccessibilityNodePayloadForChildFrame")
             }
             Self::OuterHtmlForDocument { .. } => Some("OuterHtmlForDocument"),
-            Self::OuterHtmlForBackendNodeId { .. } => Some("OuterHtmlForBackendNodeId"),
-            Self::RenderPageDump { .. } => Some("RenderPageDump"),
-            Self::SerializeHtml => Some("SerializeHtml"),
+            Self::OuterHtmlForNode { .. } => Some("OuterHtmlForNode"),
+            Self::RenderMarkdown { .. } => Some("RenderMarkdown"),
+            Self::SerializeDocument { .. } => Some("SerializeDocument"),
             Self::LayoutMetrics => Some("LayoutMetrics"),
+            Self::PublishLayout => Some("PublishLayout"),
+            Self::PrintToPdf(_) => Some("PrintToPdf"),
             Self::CaptureScreenshot(_) => Some("CaptureScreenshot"),
             Self::CaptureScreencastFrame(_) => Some("CaptureScreencastFrame"),
-            Self::ScrollBackendNodeIntoViewIfNeeded { .. } => {
-                Some("ScrollBackendNodeIntoViewIfNeeded")
-            }
+            Self::ScrollNodeIntoViewIfNeeded { .. } => Some("ScrollNodeIntoViewIfNeeded"),
             Self::ClientRectForBackendNodeId { .. } => Some("ClientRectForBackendNodeId"),
-            Self::DocumentGeometryForBackendNodeId { .. } => {
-                Some("DocumentGeometryForBackendNodeId")
-            }
+            Self::DocumentGeometryForNode { .. } => Some("DocumentGeometryForNode"),
             Self::DocumentHitTest { .. } => Some("DocumentHitTest"),
             Self::NodeHasGeometryForBackendNodeId { .. } => Some("NodeHasGeometryForBackendNodeId"),
-            Self::RemoveDocumentBackendNodeId { .. } => Some("RemoveDocumentBackendNodeId"),
+            Self::RemoveDocumentNode { .. } => Some("RemoveDocumentNode"),
             Self::EditDocumentNode { .. } => Some("EditDocumentNode"),
             Self::TriggerAutofill(_) => Some("TriggerAutofill"),
-            Self::ComputedStylePropertiesForBackendNodeId { .. } => {
-                Some("ComputedStylePropertiesForBackendNodeId")
-            }
+            Self::WebMcp { .. } => Some("WebMCP"),
+            Self::ComputedStyleProperties { .. } => Some("ComputedStyleProperties"),
             Self::SetFileInputFilesForBackendNodeId { .. } => {
                 Some("SetFileInputFilesForBackendNodeId")
             }
@@ -6006,25 +6195,25 @@ pub struct RendererDocumentChildNodeSnapshotEvents {
     pub events: Vec<RendererDocumentChildNodeSnapshotEvent>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RendererPageDumpFormat {
-    Html,
-    Markdown,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RendererPageDumpStripOptions {
+pub struct RendererContentStripOptions {
     pub js: bool,
     pub ui: bool,
     pub css: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RendererPageDumpOptions {
-    pub format: RendererPageDumpFormat,
-    pub strip: RendererPageDumpStripOptions,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RendererHtmlSerializeOptions {
+    pub strip: RendererContentStripOptions,
     pub with_base: bool,
     pub with_frames: bool,
+    /// No default truncation. Limits count final, nested-escaped output bytes.
+    pub max_output_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RendererMarkdownOptions {
+    pub strip: RendererContentStripOptions,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -6070,36 +6259,12 @@ impl RendererRuntimeEvaluationResult {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RendererCapturedScreenshot {
-    pub mime_type: String,
-    pub width: u32,
-    pub height: u32,
-    pub bytes: Arc<[u8]>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RendererCaptureScreenshotReply {
-    Captured(RendererCapturedScreenshot),
-    LayoutDisabled,
-    NoDocument,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RendererCapturedScreencastFrame {
-    pub image: RendererCapturedScreenshot,
-    pub visual_state: RendererVisualStateToken,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RendererCaptureScreencastFrameReply {
-    Captured(RendererCapturedScreencastFrame),
-    Unchanged,
-    LayoutDisabled,
-    NoDocument,
-}
-
 pub enum RendererPageReply {
+    WebMcp(std::result::Result<Option<u64>, moli_page_types::RendererWebMcpError>),
+    NativeCommandReady(Box<RendererNativeCommandReadyResponse>),
+    NativeCommandPublished,
+    ElementClickPreparation(Result<RendererElementClickTarget, RendererElementClickError>),
+    ElementClickDispatch(Result<RendererInputDispatchOutcome, RendererElementClickError>),
     RuntimeEvaluationResult(RendererRuntimeEvaluationResult),
     RuntimeInspectorProtocolMessages(RendererRuntimeCommandOutput),
     RuntimeConsoleMessageSnapshots(Vec<RuntimeConsoleMessageSnapshot>),
@@ -6110,6 +6275,10 @@ pub enum RendererPageReply {
     ExecutionContextIds(Vec<i64>),
     OptionalExecutionContextId(Option<i64>),
     OptionalDocumentNodeObjectSnapshot(Box<Option<DocumentNodeObjectSnapshot>>),
+    DocumentNodeRequested {
+        node_id: Option<u32>,
+        child_node_snapshot_events: Option<RendererDocumentChildNodeSnapshotEvents>,
+    },
     OptionalDomSnapshotCapturePayload(Option<RendererDomSnapshotCapturePayload>),
     OptionalDocumentChildNodeSnapshots(Option<RendererDocumentChildNodeSnapshots>),
     OptionalDocumentChildNodeSnapshotEvents(Option<RendererDocumentChildNodeSnapshotEvents>),
@@ -6119,7 +6288,10 @@ pub enum RendererPageReply {
         RendererDocumentQuerySelectorWithChildNodeSnapshotEvents,
     ),
     DocumentPerformSearch(RendererDomSearchRegistration),
-    DocumentSearchResults(RendererDomSearchResultsResolution),
+    DocumentSearchResults {
+        resolution: RendererDomSearchResultsResolution,
+        child_node_snapshot_events: Option<RendererDocumentChildNodeSnapshotEvents>,
+    },
     DocumentSearchResultsDiscarded,
     DocumentNodeStackTracesEnabled,
     DocumentNodeStackTrace(RendererDomNodeStackTraceResolution),
@@ -6130,6 +6302,7 @@ pub enum RendererPageReply {
     DocumentNodeAttributesResolution(RendererDocumentNodeAttributesResolution),
     DocumentNodeTextResolution(RendererDocumentNodeTextResolution),
     DocumentNodePropertyResolution(RendererDocumentNodePropertyResolution),
+    OptionalAccessibilityNodes(Option<Vec<moli_dom::accessibility::AccessibilityNode>>),
     OptionalAccessibilityPayloads(Option<Vec<Value>>),
     OptionalAccessibilityPayload(Option<Value>),
     OptionalAccessibilityPayloadsForObjectId(Option<RendererAccessibilityPayloadsForObjectId>),
@@ -6161,16 +6334,23 @@ pub enum RendererPageReply {
     DocumentLifecycleEvents(Vec<RendererDocumentLifecycleEvent>),
     PendingSubresourceContinueOutcome(crate::PendingSubresourceContinueOutcome),
     PageDiagnosticsSnapshot(RendererPageDiagnosticsSnapshot),
+    #[cfg(feature = "ace-protocol")]
+    AcePageTask(Box<crate::ace_page_task::AcePageTaskExecution>),
     InputDispatchOutcome(RendererInputDispatchOutcome),
     SetDocumentContentResult(RendererSetDocumentContentResult),
     ScrollIntoViewResult(RendererScrollIntoViewResult),
     Bool(bool),
     OptionalBool(Option<bool>),
     OptionalString(Option<String>),
+    SerializedDocument {
+        url: String,
+        html: String,
+    },
     OptionalU64(Option<u64>),
     Usize(usize),
     CookieFacadeSnapshot(Box<RendererPageCookieFacadeSnapshotReply>),
     LayoutMetrics(RendererLayoutMetrics),
+    PrintToPdf(RendererPrintToPdfReply),
     CaptureScreenshot(RendererCaptureScreenshotReply),
     CaptureScreencastFrame(RendererCaptureScreencastFrameReply),
     Unit,
@@ -6247,6 +6427,7 @@ impl RendererPageTable {
             vm_creation_id,
             view_generation,
             page_state: Arc::new(RendererPageState {
+                snapshot_revision: Default::default(),
                 requested_url,
                 navigation_initiator_url: None,
                 navigation_redirected: false,
@@ -6254,11 +6435,13 @@ impl RendererPageTable {
                 navigation_redirect_chain: Vec::new(),
                 final_url,
                 document_title,
+                document_activity: Default::default(),
                 status,
                 headers: Vec::new(),
                 script_execution: Arc::new(ScriptExecutionReport::default()),
                 idle_override: None,
                 service_worker_client_id: 0,
+                document_isolate_identity: 0,
                 dedicated_worker_running_worker_isolate_count: 0,
                 performance_metric_snapshot: RendererPerformanceMetricSnapshot::default(),
             }),
@@ -6314,6 +6497,12 @@ impl RendererPageTable {
         self.entry(page_id).and_then(|entry| entry.active_record())
     }
 
+    pub(super) fn active_vm_creation_id(&self, page_id: PageId) -> Option<u64> {
+        self.entry(page_id)
+            .filter(RendererPageEntry::is_active)
+            .map(|entry| entry.vm_creation_id())
+    }
+
     pub(crate) fn len(&self) -> usize {
         let state = self.inner.lock();
         state
@@ -6333,5 +6522,31 @@ impl RendererPageTable {
         self.entry(page_id)
             .filter(|entry| entry.is_active())
             .and_then(|entry| entry.in_flight_command_epoch)
+    }
+}
+
+impl RendererPageReply {
+    pub(crate) fn input_dispatch_outcomes(&self) -> &[RendererInputDispatchOutcome] {
+        match self {
+            Self::InputDispatchOutcome(outcome) | Self::ElementClickDispatch(Ok(outcome)) => {
+                std::slice::from_ref(outcome)
+            }
+            #[cfg(feature = "ace-protocol")]
+            Self::AcePageTask(result) => &result.input_outcomes,
+            Self::NativeCommandReady(ready) => ready.input_dispatch_outcomes(),
+            _ => &[],
+        }
+    }
+
+    pub(crate) fn input_dispatch_outcomes_mut(&mut self) -> &mut [RendererInputDispatchOutcome] {
+        match self {
+            Self::InputDispatchOutcome(outcome) | Self::ElementClickDispatch(Ok(outcome)) => {
+                std::slice::from_mut(outcome)
+            }
+            #[cfg(feature = "ace-protocol")]
+            Self::AcePageTask(result) => &mut result.input_outcomes,
+            Self::NativeCommandReady(ready) => ready.input_dispatch_outcomes_mut(),
+            _ => &mut [],
+        }
     }
 }

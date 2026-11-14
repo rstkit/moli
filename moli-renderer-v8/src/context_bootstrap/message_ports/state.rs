@@ -1,4 +1,5 @@
 use super::*;
+use crate::web_api_interfaces;
 use crate::{
     message_port_runtime::{MessagePortOwner, SharedMessagePortRegistry},
     types::MessagePortId,
@@ -11,6 +12,13 @@ use crate::{
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 const MESSAGE_PORT_ID_SLOT: &str = "__lmMessagePortId";
+
+/// A closed connection remains transferable; a neutered wrapper does not.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TransferredMessagePort {
+    Endpoint(MessagePortId),
+    Closed,
+}
 
 /// Operation-entry binding for one Window or Worker realm.
 ///
@@ -115,34 +123,26 @@ impl MessagePortRealmBinding {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(prototype = "Object", interface = web_api_interfaces::MessagePort)]
 struct MessagePortObjectDeclaration<'scope> {
     #[webapi(prototype)]
     prototype: v8::Local<'scope, v8::Object>,
 
     #[webapi(slot = MESSAGE_PORT_ID_SLOT)]
-    port_id: v8::Local<'scope, v8::BigInt>,
+    port_id: v8::Local<'scope, v8::Value>,
 
     #[webapi(slot = MESSAGE_PORT_PEER_SLOT, init = "undefined")]
     peer: (),
 
     #[webapi(slot = MESSAGE_PORT_ONMESSAGE_HANDLER_SLOT, init = "null")]
     onmessage_handler: (),
-    #[webapi(slot = MESSAGE_PORT_ONMESSAGE_ORDER_SLOT, init = "undefined")]
-    onmessage_order: (),
 
     #[webapi(slot = MESSAGE_PORT_ONMESSAGEERROR_HANDLER_SLOT, init = "null")]
     onmessageerror_handler: (),
-    #[webapi(slot = MESSAGE_PORT_ONMESSAGEERROR_ORDER_SLOT, init = "undefined")]
-    onmessageerror_order: (),
 
     #[webapi(slot = MESSAGE_PORT_ONCLOSE_HANDLER_SLOT, init = "null")]
     onclose_handler: (),
-    #[webapi(slot = MESSAGE_PORT_ONCLOSE_ORDER_SLOT, init = "undefined")]
-    onclose_order: (),
 
-    #[webapi(slot = MESSAGE_PORT_NEXT_LISTENER_ORDER_SLOT, init = 0)]
-    next_listener_order: (),
     #[webapi(slot = MESSAGE_PORT_STARTED_SLOT, init = false)]
     started: (),
     #[webapi(slot = MESSAGE_PORT_CLOSED_SLOT, init = false)]
@@ -150,7 +150,7 @@ struct MessagePortObjectDeclaration<'scope> {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MessagePort", enumerable)]
+#[webapi(interface = web_api_interfaces::MessagePort, enumerable, receiver)]
 struct MessagePortPrototypeDeclaration {
     #[webapi(method, length = 1, callback = message_port_post_message_callback)]
     post_message: (),
@@ -158,14 +158,6 @@ struct MessagePortPrototypeDeclaration {
     start: (),
     #[webapi(method, length = 0, callback = message_port_close_callback)]
     close: (),
-    #[webapi(method, length = 2, callback = message_port_add_event_listener_callback)]
-    add_event_listener: (),
-    #[webapi(
-        method,
-        length = 2,
-        callback = message_port_remove_event_listener_callback
-    )]
-    remove_event_listener: (),
     #[webapi(
         accessor_property,
         getter = message_port_onmessage_getter_callback,
@@ -190,7 +182,7 @@ struct MessagePortPrototypeDeclaration {
 }
 
 #[derive(WebApiFunctionTemplate)]
-#[webapi(name = "MessageChannel")]
+#[webapi(interface = web_api_interfaces::MessageChannel, receiver)]
 struct MessageChannelPrototypeDeclaration {
     #[webapi(
         accessor_property,
@@ -253,25 +245,48 @@ pub(in crate::context_bootstrap::message_ports) fn new_message_port_object<'s>(
     port_id: MessagePortId,
     realm: &MessagePortRealmBinding,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    let port = message_port_object_declaration(scope, port_id)?
-        .bind(scope)
-        .ok()?;
+    let port = new_message_port_wrapper(scope, Some(port_id))?;
     if !realm.register_wrapper(scope, port_id, port) {
         return None;
     }
     Some(port)
 }
 
+pub(in crate::context_bootstrap::message_ports) fn new_detached_message_port_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let port = new_message_port_wrapper(scope, None)?;
+    set_message_port_bool_slot(scope, port, MESSAGE_PORT_CLOSED_SLOT, true);
+    Some(port)
+}
+
+fn new_message_port_wrapper<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    port_id: Option<MessagePortId>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let port = message_port_object_declaration(scope, port_id)?
+        .bind(scope)
+        .ok()?;
+    // Event listeners belong to the JS EventTarget, independently of the
+    // transferable communication endpoint and its queue attachment.
+    initialize_simple_event_target(scope, port);
+
+    Some(port)
+}
+
 fn message_port_object_declaration<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    port_id: MessagePortId,
+    port_id: Option<MessagePortId>,
 ) -> Option<MessagePortObjectDeclaration<'s>> {
     let prototype = super::super::exposed_interfaces::ensure_intrinsic_interface_prototype(
         scope,
         "MessagePort",
     )
     .ok()?;
-    let port_id = v8::BigInt::new_from_u64(scope, port_id);
+    let port_id = match port_id {
+        Some(port_id) => v8::BigInt::new_from_u64(scope, port_id).into(),
+        None => v8::undefined(scope).into(),
+    };
     Some(MessagePortObjectDeclaration::new(prototype, port_id))
 }
 
@@ -279,12 +294,40 @@ pub(crate) fn message_port_id_from_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     port: v8::Local<'s, v8::Object>,
 ) -> Option<MessagePortId> {
-    let value = get_private_value(scope, port, MESSAGE_PORT_ID_SLOT)?;
+    match message_port_transfer_from_object(scope, port)? {
+        TransferredMessagePort::Endpoint(id) => Some(id),
+        TransferredMessagePort::Closed => None,
+    }
+}
+
+pub(crate) fn message_port_transfer_from_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    port: v8::Local<'s, v8::Object>,
+) -> Option<TransferredMessagePort> {
+    let value = message_port_slot_value(scope, port, MESSAGE_PORT_ID_SLOT)?;
+    // null is a closed connection, undefined is an already transferred port.
+    if value.is_null() {
+        return Some(TransferredMessagePort::Closed);
+    }
     if let Ok(big) = v8::Local::<v8::BigInt>::try_from(value) {
         let (n, lossless) = big.u64_value();
-        return lossless.then_some(n);
+        return lossless.then_some(TransferredMessagePort::Endpoint(n));
     }
     None
+}
+
+pub(crate) fn new_disconnected_message_port_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<(MessagePortId, v8::Local<'s, v8::Object>)> {
+    let realm = MessagePortRealmBinding::current(scope)?;
+    let port_id = realm
+        .registry()
+        .create_disconnected_message_port(realm.owner());
+    let Some(port) = new_message_port_object(scope, port_id, &realm) else {
+        realm.discard_channel(scope, port_id);
+        return None;
+    };
+    Some((port_id, port))
 }
 
 pub(crate) fn ensure_message_port_wrapper_for_id<'s>(
@@ -317,11 +360,10 @@ pub(crate) fn detach_transferred_message_port<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     port: v8::Local<'s, v8::Object>,
 ) {
-    let Some(port_id) = message_port_id_from_object(scope, port) else {
-        return;
-    };
-    forget_message_port_wrapper(scope, port_id);
-    set_private_value(
+    if let Some(port_id) = message_port_id_from_object(scope, port) {
+        forget_message_port_wrapper(scope, port_id);
+    }
+    set_message_port_slot_value(
         scope,
         port,
         MESSAGE_PORT_ID_SLOT,
@@ -335,18 +377,10 @@ pub(in crate::context_bootstrap) fn close_message_port_object<'s>(
     port: v8::Local<'s, v8::Object>,
 ) {
     if let Some(port_id) = message_port_id_from_object(scope, port) {
-        let retained_for_queued_delivery = current_message_port_registry(scope)
-            .is_some_and(|registry| registry.contains_message_port(port_id));
-        if !retained_for_queued_delivery {
-            forget_message_port_wrapper(scope, port_id);
-        }
+        forget_message_port_wrapper(scope, port_id);
+        // Closing a neutered wrapper must not make it transferable again.
+        set_message_port_slot_value(scope, port, MESSAGE_PORT_ID_SLOT, v8::null(scope).into());
     }
-    set_private_value(
-        scope,
-        port,
-        MESSAGE_PORT_ID_SLOT,
-        v8::undefined(scope).into(),
-    );
     set_message_port_bool_slot(scope, port, MESSAGE_PORT_CLOSED_SLOT, true);
 }
 
@@ -363,8 +397,18 @@ pub(crate) fn detach_message_port_owner_for_transfer(
     scope: &mut v8::PinScope<'_, '_>,
     port_id: MessagePortId,
 ) {
+    retire_message_port_if_owner_is_stale(scope, port_id);
     if let Some(registry) = current_message_port_registry(scope) {
         registry.detach_message_port_owner_for_transfer(port_id);
+    }
+}
+
+pub(in crate::context_bootstrap::message_ports) fn retire_message_port_if_owner_is_stale(
+    scope: &mut v8::PinScope<'_, '_>,
+    port_id: MessagePortId,
+) {
+    if let Some(host_ptr) = context_host_ptr_from_global_bridge(scope) {
+        unsafe { &mut *host_ptr }.retire_message_port_if_owner_is_stale(port_id);
     }
 }
 
@@ -387,63 +431,6 @@ pub(in crate::context_bootstrap::message_ports) fn forget_message_port_wrapper(
         return;
     }
     forget_worker_message_port_wrapper(scope, port_id);
-}
-
-pub(in crate::context_bootstrap::message_ports) fn message_port_onmessage<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Function>> {
-    message_port_event_handler(scope, port, MESSAGE_PORT_ONMESSAGE_HANDLER_SLOT)
-}
-
-pub(in crate::context_bootstrap::message_ports) fn message_port_onmessage_order<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-) -> Option<f64> {
-    message_port_event_handler_order(scope, port, MESSAGE_PORT_ONMESSAGE_ORDER_SLOT)
-}
-
-pub(in crate::context_bootstrap::message_ports) fn message_port_onmessageerror<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Function>> {
-    message_port_event_handler(scope, port, MESSAGE_PORT_ONMESSAGEERROR_HANDLER_SLOT)
-}
-
-pub(in crate::context_bootstrap::message_ports) fn message_port_onmessageerror_order<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-) -> Option<f64> {
-    message_port_event_handler_order(scope, port, MESSAGE_PORT_ONMESSAGEERROR_ORDER_SLOT)
-}
-
-pub(in crate::context_bootstrap::message_ports) fn message_port_onclose<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Function>> {
-    message_port_event_handler(scope, port, MESSAGE_PORT_ONCLOSE_HANDLER_SLOT)
-}
-
-pub(in crate::context_bootstrap::message_ports) fn message_port_onclose_order<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-) -> Option<f64> {
-    message_port_event_handler_order(scope, port, MESSAGE_PORT_ONCLOSE_ORDER_SLOT)
-}
-
-pub(in crate::context_bootstrap::message_ports) fn next_message_port_listener_order<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-) -> f64 {
-    let order =
-        message_port_number_slot(scope, port, MESSAGE_PORT_NEXT_LISTENER_ORDER_SLOT).unwrap_or(0.0);
-    set_message_port_number_slot(
-        scope,
-        port,
-        MESSAGE_PORT_NEXT_LISTENER_ORDER_SLOT,
-        order + 1.0,
-    );
-    order
 }
 
 pub(in crate::context_bootstrap::message_ports) fn message_port_is_started<'s>(
@@ -480,7 +467,7 @@ fn message_port_onmessage_setter_callback<'s>(
         args.this(),
         args.get(0),
         MESSAGE_PORT_ONMESSAGE_HANDLER_SLOT,
-        MESSAGE_PORT_ONMESSAGE_ORDER_SLOT,
+        "message",
     );
     rv.set_undefined();
 }
@@ -518,7 +505,7 @@ fn message_port_onmessageerror_setter_callback<'s>(
         args.this(),
         args.get(0),
         MESSAGE_PORT_ONMESSAGEERROR_HANDLER_SLOT,
-        MESSAGE_PORT_ONMESSAGEERROR_ORDER_SLOT,
+        "messageerror",
     );
     rv.set_undefined();
 }
@@ -533,7 +520,7 @@ fn message_port_onclose_setter_callback<'s>(
         args.this(),
         args.get(0),
         MESSAGE_PORT_ONCLOSE_HANDLER_SLOT,
-        MESSAGE_PORT_ONCLOSE_ORDER_SLOT,
+        "close",
     );
     rv.set_undefined();
 }
@@ -552,46 +539,21 @@ fn message_port_event_handler_value<'s>(
     }
 }
 
-fn message_port_event_handler<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-    handler_slot: &'static str,
-) -> Option<v8::Local<'s, v8::Function>> {
-    message_port_event_handler_value(scope, port, handler_slot)
-        .try_into()
-        .ok()
-}
-
-fn message_port_event_handler_order<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-    order_slot: &'static str,
-) -> Option<f64> {
-    message_port_number_slot(scope, port, order_slot)
-        .filter(|order| order.is_finite() && *order >= 0.0)
-}
-
 fn set_message_port_event_handler<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     port: v8::Local<'s, v8::Object>,
     value: v8::Local<'s, v8::Value>,
     handler_slot: &'static str,
-    order_slot: &'static str,
+    event_type: &str,
 ) {
-    if value.is_function() || value.is_object() {
-        if message_port_event_handler_order(scope, port, order_slot).is_none() {
-            let order = next_message_port_listener_order(scope, port);
-            set_message_port_number_slot(scope, port, order_slot, order);
+    simple_object_event_set_handler(scope, port, event_type, handler_slot, value);
+    // Setting onmessage enables the queue permanently, including assigning
+    // null or a non-callable value. Listener registration alone does not.
+    if handler_slot == MESSAGE_PORT_ONMESSAGE_HANDLER_SLOT {
+        set_message_port_started(scope, port, true);
+        if let Some(port_id) = message_port_id_from_object(scope, port) {
+            schedule_message_port_delivery(scope, port_id);
         }
-        set_message_port_slot_value(scope, port, handler_slot, value);
-        if let Some(port_id) = message_port_id_from_object(scope, port)
-            && let Some(registry) = current_message_port_registry(scope)
-        {
-            registry.wake_message_port_if_pending(port_id);
-        }
-    } else {
-        set_message_port_slot_value(scope, port, handler_slot, v8::null(scope).into());
-        set_message_port_slot_value(scope, port, order_slot, v8::undefined(scope).into());
     }
 }
 
@@ -606,14 +568,14 @@ pub(in crate::context_bootstrap) fn set_internal_message_port_handlers<'s>(
         port,
         onmessage.into(),
         MESSAGE_PORT_ONMESSAGE_HANDLER_SLOT,
-        MESSAGE_PORT_ONMESSAGE_ORDER_SLOT,
+        "message",
     );
     set_message_port_event_handler(
         scope,
         port,
         onmessageerror.into(),
         MESSAGE_PORT_ONMESSAGEERROR_HANDLER_SLOT,
-        MESSAGE_PORT_ONMESSAGEERROR_ORDER_SLOT,
+        "messageerror",
     );
 }
 
@@ -621,7 +583,7 @@ pub(in crate::context_bootstrap) fn set_internal_message_port_handlers<'s>(
 /// machinery but never successfully published. Unlike author-visible close,
 /// this removes both endpoint records in one registry operation, then releases
 /// any corresponding wrappers retained by the current realm before returning.
-pub(in crate::context_bootstrap) fn discard_message_port_channel(
+pub(crate) fn discard_message_port_channel(
     scope: &mut v8::PinScope<'_, '_>,
     port_id: MessagePortId,
 ) {
@@ -654,6 +616,7 @@ fn message_port_slot_value<'s>(
     port: v8::Local<'s, v8::Object>,
     slot: &str,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    let port = moli_webapi_declare::web_api_object_target(scope, port)?;
     get_private_value(scope, port, slot)
 }
 
@@ -663,24 +626,10 @@ fn set_message_port_slot_value<'s>(
     slot: &str,
     value: v8::Local<'s, v8::Value>,
 ) {
+    let Some(port) = moli_webapi_declare::web_api_object_target(scope, port) else {
+        return;
+    };
     set_private_value(scope, port, slot, value);
-}
-
-fn message_port_number_slot<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-    slot: &str,
-) -> Option<f64> {
-    message_port_slot_value(scope, port, slot)?.number_value(scope)
-}
-
-fn set_message_port_number_slot<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    port: v8::Local<'s, v8::Object>,
-    slot: &str,
-    value: f64,
-) {
-    set_message_port_slot_value(scope, port, slot, v8::Number::new(scope, value).into());
 }
 
 fn message_port_bool_slot<'s>(

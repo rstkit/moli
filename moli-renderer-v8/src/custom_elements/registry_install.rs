@@ -1,14 +1,18 @@
 use super::registry_runtime::CUSTOM_ELEMENTS_REGISTRY_CHILD_HANDLE_SLOT;
+use crate::web_api_interfaces;
 use crate::{
-    context_bootstrap::{WindowLazySurface, rematerialize_window_lazy_surface_if_cached},
+    context_bootstrap::{
+        WindowLazySurface, ensure_intrinsic_interface_prototype,
+        rematerialize_window_lazy_surface_if_cached,
+    },
     document_runtime::DomHandle,
-    util::{get_private_value, set_private_value, v8str},
+    util::{get_private_value, set_private_value},
 };
 use anyhow::Result;
 use moli_webapi_declare::WebApiObject;
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(interface = web_api_interfaces::CustomElementRegistry, prototype = "Object")]
 struct CustomElementsRegistryDeclaration<'scope> {
     #[webapi(prototype)]
     prototype: v8::Local<'scope, v8::Object>,
@@ -78,8 +82,8 @@ fn new_custom_elements_registry_for_owner<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     child_handle: Option<DomHandle>,
 ) -> Result<v8::Local<'s, v8::Object>> {
-    let global = scope.get_current_context().global(scope);
-    let registry = new_custom_elements_registry(scope, global)?;
+    let registry = new_custom_elements_registry(scope)?;
+    super::registry_runtime::mark_custom_elements_registry_owner(scope, registry);
     let Some(child_handle) = child_handle else {
         return Ok(registry);
     };
@@ -95,16 +99,8 @@ fn new_custom_elements_registry_for_owner<'s>(
 
 fn new_custom_elements_registry<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    global: v8::Local<'s, v8::Object>,
 ) -> Result<v8::Local<'s, v8::Object>> {
-    let ctor = global
-        .get(scope, v8str(scope, "CustomElementRegistry").into())
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-        .ok_or_else(|| anyhow::anyhow!("failed to load CustomElementRegistry constructor"))?;
-    let prototype = ctor
-        .get(scope, v8str(scope, "prototype").into())
-        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
-        .ok_or_else(|| anyhow::anyhow!("failed to load CustomElementRegistry prototype"))?;
+    let prototype = ensure_intrinsic_interface_prototype(scope, "CustomElementRegistry")?;
     CustomElementsRegistryDeclaration::new(prototype)
         .bind(scope)
         .map_err(anyhow::Error::from)

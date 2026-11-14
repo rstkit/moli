@@ -20,7 +20,7 @@ pub(crate) fn load_cached_streaming_response_lookup(
     request_url: &Url,
     cookie_header: Option<&str>,
 ) -> Result<Option<CachedStreamingResponseLookup>> {
-    if !request.cache_mode().allows_http_cache_lookup() {
+    if !request.effective_cache_mode().allows_http_cache_lookup() {
         return Ok(None);
     }
     let Some((store, key)) =
@@ -54,6 +54,9 @@ pub(crate) fn load_cached_streaming_response_lookup(
         key,
         cached,
         force_validate,
+        request
+            .effective_cache_mode()
+            .allows_stale_http_cache_response(),
     )))
 }
 
@@ -94,7 +97,7 @@ pub(crate) fn create_streaming_cache_body_writer_for_response_parts(
     request_url: &Url,
     cookie_header: Option<&str>,
     status: u16,
-    headers: &[(String, String)],
+    headers: &[(String, Vec<u8>)],
 ) -> Result<Option<HttpCacheBodyWriter>> {
     let Some((store, key)) =
         cache_store_and_key_for_request(config, request, request_url, cookie_header)
@@ -107,6 +110,7 @@ pub(crate) fn create_streaming_cache_body_writer_for_response_parts(
         request_url,
         request_url,
         status,
+        None,
         headers,
         false,
     ) else {
@@ -122,7 +126,8 @@ pub(crate) fn finish_streaming_cached_response(
     cookie_header: Option<&str>,
     final_url: &Url,
     status: u16,
-    headers: &[(String, String)],
+    status_text: Option<&str>,
+    headers: &[(String, Vec<u8>)],
     redirected: bool,
     writer: HttpCacheBodyWriter,
 ) -> Result<()> {
@@ -136,6 +141,7 @@ pub(crate) fn finish_streaming_cached_response(
         request_url,
         final_url,
         status,
+        status_text,
         headers,
         redirected,
     ) else {
@@ -151,6 +157,7 @@ fn cached_streaming_record_from_entry(
     key: String,
     entry: HttpCachedEntryReader,
     force_validate: bool,
+    allow_stale: bool,
 ) -> CachedStreamingResponseLookup {
     let metadata = entry.metadata.clone();
     CachedStreamingResponseLookup {
@@ -162,6 +169,8 @@ fn cached_streaming_record_from_entry(
         body: entry.body,
         expires_at_unix_ms: entry.metadata.expires_at_unix_ms,
         force_validate,
+        allow_stale,
+        cache_state: crate::ResponseCacheState::Local,
     }
 }
 
@@ -181,7 +190,9 @@ fn cache_lookup_force_validate(
     request_url: &Url,
     cached: &HttpCachedEntryReader,
 ) -> bool {
-    request.cache_mode().requires_http_cache_validation()
+    request
+        .effective_cache_mode()
+        .requires_http_cache_validation()
         || (request_cache_control_requires_validation(config, request, request_url)
             && !cached_response_is_fresh_immutable(
                 &cached.metadata.headers,

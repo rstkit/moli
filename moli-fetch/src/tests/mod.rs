@@ -1,7 +1,22 @@
+mod cache_request_controls;
+mod cache_request_controls_modes;
+mod cache_request_modes;
 mod cookie_context;
 mod cookie_store;
+mod corp;
+mod fetch_metadata;
+mod header_bytes;
+mod header_eof;
+mod mixed_transport;
+mod redirect_auth;
+mod redirect_policy;
+mod request_security;
+mod response_metadata;
+mod response_progress;
+mod response_timing;
 mod support;
 mod tls_credentials;
+mod websocket_transport;
 
 use anyhow::{Context, Result};
 use curl::easy::Handler;
@@ -28,15 +43,16 @@ use crate::{
     FetchClientHandle, FetchConfig, FetchPriorityHint, FetchRuntimeJoinStatus,
     NegotiatedHttpVersion, NetworkFetchFailureContext, RawResponse, Request, RequestAuth,
     RequestAuthScheme, RequestAuthTarget, RequestCacheMode, RequestCredentialsMode, RequestMode,
-    RequestRedirectMode, RequestResourceType, Response, ResponseBody, ResponseHead,
-    ScriptFetchRequestMetadata, ScriptFetchSchedulerPriority, StreamingResponseCollector,
-    SubresourceRequestMetadata, WebBotAuthProfile, WebBotAuthSigner, http_cache_stats,
-    runtime::FetchRuntimeOwner,
+    RequestRedirectHandling, RequestRedirectMode, RequestResourceType, Response, ResponseBody,
+    ResponseHead, ScriptFetchRequestMetadata, ScriptFetchSchedulerPriority,
+    StreamingResponseCollector, SubresourceRequestMetadata, WebBotAuthProfile, WebBotAuthSigner,
+    http_cache_stats, runtime::FetchRuntimeOwner,
 };
 
 use self::support::{
     EmptyHttpHttpsUpgradeServer, Http2ProtocolFallbackServer, ScriptedH2Server, ScriptedHttpServer,
-    ScriptedHttps11Server, ScriptedResponse, unique_test_cache_dir, wait_for_runtime_owner_count,
+    ScriptedHttps11Server, ScriptedResponse, spawn_socks4_proxy, spawn_socks5_proxy,
+    unique_test_cache_dir, wait_for_runtime_owner_count,
 };
 
 const ENV_PROXY_CHILD_TEST: &str = "MOLI_FETCH_ENV_PROXY_CHILD";
@@ -58,14 +74,16 @@ fn test_web_bot_auth_signer() -> WebBotAuthSigner {
 
 fn sample_response_head() -> ResponseHead {
     ResponseHead {
+        status_text: None,
         final_url: Url::parse("http://example.test/final").unwrap(),
         status: 203,
-        headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+        headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
         request_cookie_report: None,
         cookie_set_reports: Vec::new(),
         redirected: false,
         redirect_chain: Vec::new(),
         from_cache: false,
+        cache_state: Default::default(),
         negotiated_http_version: None,
     }
 }
@@ -109,32 +127,162 @@ fn fetch_raw_with_network_metadata_for_test(
 
 #[test]
 fn response_head_round_trips_through_text_and_raw_materialized_responses() {
-    let head = sample_response_head();
-    let response =
-        Response::from_head_and_body(head.clone(), "hello".to_owned(), b"hello".to_vec());
+    for status_text in [None, Some("Custom message"), Some("")] {
+        let mut head = sample_response_head();
+        head.status_text = status_text.map(str::to_owned);
+        let response =
+            Response::from_head_and_body(head.clone(), "hello".to_owned(), b"hello".to_vec());
+        assert_eq!(response.clone().head().status_text, head.status_text);
+        assert_eq!(
+            response.clone().into_parts().0.status_text,
+            head.status_text
+        );
 
-    let raw = response.into_materialized_raw_response();
-    assert_eq!(raw.final_url, head.final_url);
-    assert_eq!(raw.status, head.status);
-    assert_eq!(raw.headers, head.headers);
-    assert_eq!(raw.body_bytes(), b"hello");
+        let raw = response.into_materialized_raw_response();
+        assert_eq!(raw.final_url, head.final_url);
+        assert_eq!(raw.status, head.status);
+        assert_eq!(raw.clone().into_parts().0.status_text, head.status_text);
+        assert_eq!(raw.headers, head.headers);
+        assert_eq!(raw.body_bytes(), b"hello");
 
-    let text = raw.into_lossy_materialized_text_response();
-    assert_eq!(text.final_url, head.final_url);
-    assert_eq!(text.status, head.status);
-    assert_eq!(text.headers, head.headers);
-    assert_eq!(text.body_text(), "hello");
-    assert_eq!(text.body_bytes(), b"hello");
+        let text = raw.into_lossy_materialized_text_response();
+        assert_eq!(text.final_url, head.final_url);
+        assert_eq!(text.status, head.status);
+        assert_eq!(text.head().status_text, head.status_text);
+        assert_eq!(text.headers, head.headers);
+        assert_eq!(text.body_text(), "hello");
+        assert_eq!(text.body_bytes(), b"hello");
+    }
 }
 
 #[test]
-fn request_redirect_mode_controls_follow_flag() {
-    let request = Request::new("GET", "https://example.test/start", None, Vec::new())
-        .unwrap()
-        .with_redirect_mode(RequestRedirectMode::Manual);
+fn http_status_messages_preserve_bytes_and_explicit_empty_values() {
+    for (line, status, expected) in [
+        (b"HTTP/1.0 402 FIVE BUCKS\r\n".as_slice(), 402, "FIVE BUCKS"),
+        (b"HTTP/1.1 699 WAY OUTTA RANGE\r\n", 699, "WAY OUTTA RANGE"),
+        (b"HTTP/1.1 200\r\n", 200, ""),
+        (
+            b"HTTP/1.1 200   Keep  inner spaces   \r\n",
+            200,
+            "Keep  inner spaces",
+        ),
+        (b"HTTP/1.1 200 \ttab\tinside\t \r\n", 200, "\ttab\tinside\t"),
+        (
+            b"HTTP/1.1 200 \xa0caf\xe9\xff\r\n",
+            200,
+            "\u{a0}caf\u{e9}\u{ff}",
+        ),
+        (b"HTTP/2 200 \r\n", 200, ""),
+        (b"HTTP/3 200 \r\n", 200, ""),
+    ] {
+        let parsed = crate::response::parse_http_response_status_line(line).unwrap();
+        assert_eq!(parsed.status, status);
+        assert_eq!(parsed.status_text, expected);
+    }
 
-    assert_eq!(request.redirect_mode, RequestRedirectMode::Manual);
-    assert!(!request.follow_redirects);
+    let mut head = sample_response_head();
+    head.status = 200;
+    assert_eq!(head.status_text(), "OK");
+    head.negotiated_http_version = Some(NegotiatedHttpVersion::Http2);
+    assert_eq!(head.status_text(), "");
+    head.status_text = Some("Explicit override".to_owned());
+    assert_eq!(head.status_text(), "Explicit override");
+    head.negotiated_http_version = Some(NegotiatedHttpVersion::Http11);
+    head.status_text = Some(String::new());
+    assert_eq!(head.status_text(), "");
+}
+
+#[tokio::test]
+async fn http_status_messages_survive_buffered_and_streamed_transport() -> Result<()> {
+    for (status, received, expected) in [
+        (200, "Different OK", "Different OK"),
+        (200, "", ""),
+        (200, "  Keep  inner spaces  ", "Keep  inner spaces"),
+        (200, "tab\tinside", "tab\tinside"),
+        (699, "WAY OUTTA RANGE", "WAY OUTTA RANGE"),
+    ] {
+        let server = ScriptedHttpServer::spawn(vec![
+            ScriptedResponse::status(status, received)
+                .with_body("body");
+            3
+        ]);
+        let client = FetchClient::new(&FetchConfig::default(), new_shared_browser_cookie_store());
+        for mode in ["buffered", "html", "raw"] {
+            let request = Request::get(&server.url())?;
+            let (head, body) = match mode {
+                "buffered" => client.fetch(request.with_single_hop()).await?.into_body(),
+                "html" => client.fetch_html_stream(request).await?.into_body(),
+                _ => client
+                    .fetch_raw_stream_with_cancel(request, FetchCancelHandle::new())
+                    .await?
+                    .into_body(),
+            };
+            assert_eq!(head.status, status, "{mode}");
+            assert_eq!(head.status_text.as_deref(), Some(expected), "{mode}");
+            assert_eq!(body.into_materialized_bytes().await?, b"body", "{mode}");
+        }
+        assert_eq!(server.hits(), 3);
+        assert!(client.shutdown().is_clean());
+        server.shutdown();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_status_messages_survive_disk_cache_across_streaming_modes() -> Result<()> {
+    for first_mode in ["html", "raw"] {
+        for status_text in ["Cached message", ""] {
+            let cache_dir = unique_test_cache_dir();
+            let server = ScriptedHttpServer::spawn(vec![
+                ScriptedResponse::status(200, status_text)
+                    .with_header("Cache-Control", "max-age=60")
+                    .with_body("cached body"),
+            ]);
+            let mut config = FetchConfig::default();
+            config.set_http_cache_dir(Some(cache_dir.display().to_string()));
+            for (index, mode) in [first_mode, "html", "raw", "materialized"]
+                .into_iter()
+                .enumerate()
+            {
+                // Reopen the client so every subsequent read comes from disk.
+                let client = FetchClient::new(&config, new_shared_browser_cookie_store());
+                let request = Request::get(&server.url())?;
+                let (head, body) = match mode {
+                    "html" => client.fetch_html_stream(request).await?.into_body(),
+                    "raw" => client
+                        .fetch_raw_stream_with_cancel(request, FetchCancelHandle::new())
+                        .await?
+                        .into_body(),
+                    _ => client.fetch(request).await?.into_body(),
+                };
+                assert_eq!(head.from_cache, index != 0, "{first_mode} to {mode}");
+                assert_eq!(head.status_text.as_deref(), Some(status_text), "{mode}");
+                assert_eq!(body.into_materialized_bytes().await?, b"cached body");
+                assert!(client.shutdown().is_clean());
+            }
+            assert_eq!(server.hits(), 1);
+            server.shutdown();
+            fs::remove_dir_all(cache_dir)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn single_hop_requests_preserve_redirect_mode() {
+    for mode in [
+        RequestRedirectMode::Follow,
+        RequestRedirectMode::Manual,
+        RequestRedirectMode::Error,
+    ] {
+        let request = Request::get("https://example.test/start")
+            .unwrap()
+            .with_redirect_mode(mode);
+        let hop = request.with_single_hop();
+
+        assert_eq!(hop.redirect_mode(), mode);
+        assert!(!hop.transport_follows_redirects());
+    }
 }
 
 #[tokio::test]
@@ -147,7 +295,7 @@ async fn http_transport_rejects_file_urls_in_every_response_mode() -> Result<()>
     let client = FetchClient::new(&config, new_shared_browser_cookie_store());
 
     let buffered_error = client
-        .fetch(Request::get(FILE_URL)?.with_follow_redirects(false))
+        .fetch(Request::get(FILE_URL)?.with_single_hop())
         .await
         .expect_err("buffered transport must reject file URL");
     assert!(format!("{buffered_error:#}").contains(EXPECTED));
@@ -167,6 +315,36 @@ async fn http_transport_rejects_file_urls_in_every_response_mode() -> Result<()>
 }
 
 #[test]
+fn cloned_requests_and_preserving_redirects_share_upload_storage() -> Result<()> {
+    let upload = vec![0, 255, 195, 40, 128, 65];
+    let original_storage = upload.as_ptr().wrapping_add(1);
+    let body = bytes::Bytes::from(upload).slice(1..5);
+    let request = Request::new_bytes(
+        "POST",
+        "https://example.test/upload",
+        Some(body.clone()),
+        Vec::new(),
+    )?;
+
+    for status in [307, 308] {
+        let mut redirected = request.clone();
+        redirected.apply_redirect_status(status);
+        let retained = redirected.body.as_ref().unwrap();
+        assert_eq!(retained.as_ptr(), original_storage);
+        assert_eq!(retained, &body);
+        assert_eq!(redirected.method, "POST");
+    }
+
+    let mut rewritten = request.clone();
+    rewritten.apply_redirect_status(303);
+    assert_eq!(rewritten.method, "GET");
+    assert!(rewritten.body.is_none());
+    assert_eq!(request.body.as_ref().unwrap().as_ptr(), original_storage);
+    assert_eq!(request.body.as_ref().unwrap(), &body);
+    Ok(())
+}
+
+#[test]
 fn request_apply_redirect_status_rewrites_post_to_get_and_drops_body_headers() {
     let mut request = Request::new(
         "POST",
@@ -182,6 +360,10 @@ fn request_apply_redirect_status_rewrites_post_to_get_and_drops_body_headers() {
     request.apply_redirect_status(303);
 
     assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.cookie_context,
+        NetworkCookieRequestContext::subresource("GET")
+    );
     assert!(request.body.is_none());
     assert!(
         !request
@@ -283,6 +465,35 @@ fn response_body_keeps_invalid_utf8_bytes_beside_lossy_text() {
             ..
         } if bytes == &[b'a', 0xff, b'b']
     ));
+}
+
+#[test]
+fn response_byte_parts_transfer_utf8_storage_without_copying() {
+    let head = sample_response_head();
+    let bytes = b"module source".to_vec();
+    let storage = bytes.as_ptr();
+    let response = Response::from_head_and_lossy_body_bytes(head.clone(), bytes);
+
+    let (split_head, bytes) = response.into_byte_parts();
+
+    assert_eq!(split_head.final_url, head.final_url);
+    assert_eq!(split_head.status, head.status);
+    assert_eq!(split_head.headers, head.headers);
+    assert_eq!(bytes, b"module source");
+    assert_eq!(bytes.as_ptr(), storage, "UTF-8 storage must be transferred");
+}
+
+#[test]
+fn response_byte_parts_preserve_exact_non_utf8_storage() {
+    let bytes = vec![b'a', 0xff, b'b'];
+    let storage = bytes.as_ptr();
+    let response = Response::from_head_and_lossy_body_bytes(sample_response_head(), bytes);
+    assert_eq!(response.body_text(), "a\u{fffd}b");
+
+    let (_, bytes) = response.into_byte_parts();
+
+    assert_eq!(bytes, [b'a', 0xff, b'b']);
+    assert_eq!(bytes.as_ptr(), storage, "exact bytes must be transferred");
 }
 
 #[tokio::test]
@@ -561,7 +772,7 @@ async fn streaming_response_collector_ignores_interim_headers_before_final_start
         started.headers,
         vec![(
             "content-type".to_owned(),
-            "text/html; charset=utf-8".to_owned()
+            b"text/html; charset=utf-8".to_vec()
         )]
     );
     Ok(())
@@ -990,10 +1201,9 @@ async fn fetch_raw_preserves_binary_body_bytes() -> Result<()> {
 
     assert_eq!(response.status, 200);
     assert!(
-        response
-            .headers
-            .iter()
-            .any(|(name, value)| { name == "content-type" && value == "application/octet-stream" })
+        response.headers.iter().any(|(name, value)| {
+            name == "content-type" && value == b"application/octet-stream"
+        })
     );
     assert_eq!(response.body_bytes(), BODY);
 
@@ -1045,7 +1255,7 @@ async fn fetch_raw_stream_yields_headers_before_delayed_body_and_preserves_bytes
     assert!(response.redirect_chain.is_empty());
     assert!(response.cookie_set_reports.is_empty());
     assert!(response.headers.iter().any(|(name, value)| {
-        name == "content-disposition" && value == "attachment; filename=\"streamed.bin\""
+        name == "content-disposition" && value == b"attachment; filename=\"streamed.bin\""
     }));
 
     let mut body = Vec::new();
@@ -1138,7 +1348,7 @@ async fn manual_http_redirect_to_file_remains_observable_without_being_followed(
 
     assert_eq!(response.status, 302);
     assert!(response.headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("location") && value == "file:///moli-policy-must-not-open"
+        name.eq_ignore_ascii_case("location") && value == b"file:///moli-policy-must-not-open"
     }));
     assert_eq!(server.hits(), 1);
     server.shutdown();
@@ -1146,47 +1356,62 @@ async fn manual_http_redirect_to_file_remains_observable_without_being_followed(
 }
 
 #[tokio::test]
-async fn fetch_raw_stream_manual_redirect_returns_redirect_response() -> Result<()> {
-    let server = ScriptedHttpServer::spawn(vec![
-        ScriptedResponse::status(302, "Found")
-            .with_header("Location", "/final.bin")
-            .with_body("redirect-body"),
-        ScriptedResponse::ok("final-body").with_header("Content-Type", "application/octet-stream"),
-    ]);
-    let client = FetchClient::new(&FetchConfig::default(), new_shared_browser_cookie_store());
-    let mut response = client
-        .fetch_raw_stream_with_cancel(
-            Request::get(&server.url_path("/redirect.bin"))?
-                .with_redirect_mode(RequestRedirectMode::Manual),
-            FetchCancelHandle::new(),
-        )
-        .await?;
+async fn fetch_raw_stream_obeys_redirect_handling_for_each_hop() -> Result<()> {
+    for handling in [
+        RequestRedirectHandling::Follow,
+        RequestRedirectHandling::FollowByCaller,
+        RequestRedirectHandling::Manual,
+        RequestRedirectHandling::Error,
+    ] {
+        let server = ScriptedHttpServer::spawn(vec![
+            ScriptedResponse::status(302, "Found")
+                .with_header("Location", "/final.bin")
+                .with_body("redirect-body"),
+            ScriptedResponse::ok("final-body")
+                .with_header("Content-Type", "application/octet-stream"),
+        ]);
+        let client = FetchClient::new(&FetchConfig::default(), new_shared_browser_cookie_store());
+        let mut response = client
+            .fetch_raw_stream_with_cancel(
+                Request::get(&server.url_path("/redirect.bin"))?.with_redirect_handling(handling),
+                FetchCancelHandle::new(),
+            )
+            .await?;
 
-    assert_eq!(response.status, 302);
-    assert_eq!(
-        response.final_url.as_str(),
-        server.url_path("/redirect.bin")
-    );
-    assert!(!response.redirected);
-    assert!(response.redirect_chain.is_empty());
-    assert!(
-        response.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("location") && value == "/final.bin"
-        })
-    );
+        if handling == RequestRedirectHandling::Follow {
+            assert_eq!(response.status, 200);
+            assert_eq!(response.final_url.as_str(), server.url_path("/final.bin"));
+            assert!(response.redirected);
+            assert_eq!(response.redirect_chain.len(), 1);
+        } else {
+            // This is the raw transport: manual/error policy decisions and
+            // caller-owned redirect loops consume the returned redirect head.
+            assert_eq!(response.status, 302);
+            assert_eq!(
+                response.final_url.as_str(),
+                server.url_path("/redirect.bin")
+            );
+            assert!(!response.redirected);
+            assert!(response.redirect_chain.is_empty());
+            assert!(response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("location") && value == b"/final.bin"
+            }));
+        }
 
-    let mut body = Vec::new();
-    while let Some(chunk) = response.next_chunk().await {
-        body.extend_from_slice(&chunk);
+        let mut body = Vec::new();
+        while let Some(chunk) = response.next_chunk().await {
+            body.extend_from_slice(&chunk);
+        }
+        response.finish().await?;
+        if handling == RequestRedirectHandling::Follow {
+            assert_eq!(body, b"final-body");
+            assert_eq!(server.requests().len(), 2);
+        } else {
+            assert!(body.is_empty());
+            assert_eq!(server.requests().len(), 1);
+        }
+        server.shutdown();
     }
-    response.finish().await?;
-    assert!(body.is_empty());
-    assert_eq!(
-        server.requests().len(),
-        1,
-        "manual raw redirect must not follow to the final URL"
-    );
-    server.shutdown();
     Ok(())
 }
 
@@ -1273,7 +1498,8 @@ fn web_bot_auth_resigns_restarts_redirects_and_subresources() -> Result<()> {
         Vec::new(),
     )?
     .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
-    .with_initiator_url(&final_url);
+    .with_initiator_url(&final_url)
+    .with_request_origin(moli_url::WebOrigin::from_url(&final_url));
     assert_eq!(
         fetch_response_for_test(&client, subresource)?.body_text(),
         "asset"
@@ -1479,6 +1705,150 @@ async fn fetch_raw_stream_finishes_null_body_status_without_connection_close() -
 }
 
 #[tokio::test]
+async fn fetch_redirects_recompute_bodyless_put_content_length() -> Result<()> {
+    for status in [301, 302, 303, 307, 308] {
+        let server = ScriptedHttpServer::spawn(vec![
+            ScriptedResponse::status(status, "Redirect").with_header("Location", "/final"),
+            ScriptedResponse::ok("done"),
+        ]);
+        let client = FetchClient::new(&FetchConfig::default(), new_shared_browser_cookie_store());
+        let response = client
+            .fetch_raw(Request::new(
+                "PUT",
+                &server.url_path("/start"),
+                None,
+                vec![],
+            )?)
+            .await?;
+        assert_eq!(response.status, 200);
+        assert!(response.redirected);
+        let requests = server.requests();
+        server.shutdown();
+        assert_eq!(requests.len(), 2, "{status}: {requests:?}");
+        let final_method = if status == 303 { "GET" } else { "PUT" };
+        for (request, method, path) in [
+            (&requests[0], "PUT", "/start"),
+            (&requests[1], final_method, "/final"),
+        ] {
+            assert!(request.starts_with(&format!("{method} {path} HTTP/1.1\r\n")));
+            assert_eq!(
+                request_head_header_value(request, "content-length"),
+                if method == "PUT" { Some("0") } else { None },
+                "{status}: {request}"
+            );
+            assert_eq!(request_head_header_value(request, "content-type"), None);
+            assert_eq!(
+                request_head_header_value(request, "transfer-encoding"),
+                None
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn request_headers_distinguish_empty_values_from_absent_upload_content_type() -> Result<()> {
+    let mut cases = Vec::new();
+    for buffered in [false, true] {
+        for method in [
+            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "YO",
+        ] {
+            for body in [
+                None,
+                Some(bytes::Bytes::new()),
+                Some(bytes::Bytes::from_static(b"payload")),
+            ] {
+                if matches!(method, "GET" | "HEAD") && body.is_some() {
+                    continue;
+                }
+                for content_type in [None, Some(""), Some("application/example")] {
+                    cases.push((buffered, method, body.clone(), content_type));
+                }
+            }
+        }
+    }
+    // Digest can probe with an empty upload before sending the body, even when
+    // the fixture accepts the first request. Inspect both requests on the wire.
+    let server = ScriptedHttps11Server::spawn(vec![ScriptedResponse::ok(""); cases.len() * 2]);
+    let mut config = FetchConfig::default();
+    config.set_tls_verify_host(false);
+    config.set_default_request_headers(vec![("X-Default-Empty".to_owned(), String::new())]);
+    let client = FetchClient::new(&config, new_shared_browser_cookie_store());
+
+    for (index, (buffered, method, body, content_type)) in cases.iter().enumerate() {
+        let mut headers = vec![("X-Empty".to_owned(), String::new())];
+        if let Some(content_type) = content_type {
+            headers.push(("Content-Type".to_owned(), (*content_type).to_owned()));
+        }
+        let mut request = Request::new_bytes(
+            method,
+            &server.url_path(&format!("/empty-headers/{index}")),
+            body.clone(),
+            headers,
+        )?;
+        if *buffered {
+            request = request.with_auth(RequestAuth {
+                target: RequestAuthTarget::Server,
+                scheme: RequestAuthScheme::Digest,
+                username: "user".to_owned(),
+                password: "pass".to_owned(),
+            });
+        }
+        assert_eq!(request.auth_requires_buffered_transport(), *buffered);
+        assert_eq!(client.fetch_raw(request).await?.status, 200);
+    }
+
+    let requests = server.request_heads();
+    server.shutdown();
+    let mut seen = BTreeSet::new();
+    for request in &requests {
+        let index = request_path(request)
+            .strip_prefix("/empty-headers/")
+            .expect("fixture request path")
+            .parse::<usize>()?;
+        seen.insert(index);
+        let case = &cases[index];
+        let (_, method, body, content_type) = case;
+        assert!(request.starts_with(&format!("{method} /empty-headers/{index} HTTP/1.1\r\n")));
+        let values = |name: &str| {
+            request
+                .split("\r\n")
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.trim())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("x-empty"), [""], "{case:?}: {request}");
+        assert_eq!(values("x-default-empty"), [""], "{case:?}: {request}");
+        assert_eq!(
+            values("content-type"),
+            content_type.iter().copied().collect::<Vec<_>>(),
+            "{case:?}: {request}"
+        );
+        if body.as_ref().is_none_or(bytes::Bytes::is_empty) {
+            let expected_length = if body.is_some() || matches!(*method, "POST" | "PUT") {
+                vec!["0"]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                values("content-length"),
+                expected_length,
+                "{case:?}: {request}"
+            );
+            assert!(
+                values("transfer-encoding").is_empty(),
+                "{case:?}: {request}"
+            );
+        }
+    }
+    assert_eq!(seen, (0..cases.len()).collect());
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_redirect_303_rewrites_post_to_get_and_drops_body_headers() -> Result<()> {
     let server = ScriptedHttpServer::spawn(vec![
         ScriptedResponse::status(303, "See Other").with_header("Location", "/final"),
@@ -1633,57 +2003,83 @@ async fn cache_mode_bypass_skips_fresh_cache_read_and_replaces_entry() -> Result
 }
 
 #[tokio::test]
-async fn fetch_raw_stream_uses_disk_cache_for_redirect_hops() -> Result<()> {
-    let cache_dir = unique_test_cache_dir();
-    let server = ScriptedHttpServer::spawn(vec![
-        ScriptedResponse::status(301, "Moved Permanently")
-            .with_header("Location", "/final")
-            .with_header("Cache-Control", "max-age=60"),
-        ScriptedResponse::ok("final-body")
-            .with_header("Content-Type", "application/octet-stream")
-            .with_header("Cache-Control", "max-age=60"),
-    ]);
-    let mut config = FetchConfig::default();
-    config.set_http_cache_dir(Some(cache_dir.display().to_string()));
-
-    let client = FetchClient::new(&config, new_shared_browser_cookie_store());
-    let mut first = client
-        .fetch_raw_stream_with_cancel(
-            Request::get(&server.url_path("/redirect"))?,
-            FetchCancelHandle::new(),
-        )
-        .await?;
-    assert!(!first.from_cache);
-    assert_eq!(first.redirect_chain.len(), 1);
-    assert!(!first.redirect_chain[0].from_cache);
-    let mut first_body = Vec::new();
-    while let Some(chunk) = first.next_chunk().await {
-        first_body.extend_from_slice(&chunk);
+async fn cached_redirects_keep_dispatched_requests_without_transport_extra_info() -> Result<()> {
+    for transport in ["buffered", "html", "raw", "callback"] {
+        let cache_dir = unique_test_cache_dir();
+        let server = ScriptedHttpServer::spawn(vec![
+            ScriptedResponse::status(301, "Moved Permanently")
+                .with_header("Location", "/final")
+                .with_header("Cache-Control", "max-age=60"),
+            ScriptedResponse::ok("final-body")
+                .with_header("Content-Type", "application/octet-stream")
+                .with_header("Cache-Control", "max-age=60"),
+        ]);
+        let mut config = FetchConfig::default();
+        config.set_http_cache_dir(Some(cache_dir.display().to_string()));
+        for cached in [false, true] {
+            let client = FetchClient::new(&config, new_shared_browser_cookie_store());
+            let request = Request::new(
+                "GET",
+                &server.url_path("/redirect"),
+                None,
+                vec![("Accept".to_owned(), "application/initial".to_owned())],
+            )?
+            .with_redirect_headers(Some(
+                vec![("Accept".to_owned(), "text/plain".to_owned())].into(),
+            ));
+            // The callback transport reads the cache but does not populate it.
+            let (head, body) = match if cached { transport } else { "raw" } {
+                "buffered" => client.fetch(request).await?.into_body(),
+                "html" => client.fetch_html_stream(request).await?.into_body(),
+                "raw" => client
+                    .fetch_raw_stream_with_cancel(request, FetchCancelHandle::new())
+                    .await?
+                    .into_body(),
+                "callback" => {
+                    let (tx, rx) = oneshot::channel();
+                    client.fetch_with_cancel_callback(
+                        request,
+                        FetchCancelHandle::new(),
+                        move |result| {
+                            let _ = tx.send(result);
+                        },
+                    )?;
+                    rx.await??.into_body()
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(body.into_materialized_bytes().await?, b"final-body");
+            assert_eq!(head.from_cache, cached, "{transport}");
+            assert_eq!(head.redirect_chain.len(), 1);
+            let redirect = &head.redirect_chain[0];
+            assert_eq!(redirect.from_cache, cached, "{transport}");
+            if cached {
+                assert!(redirect.request_extra_info.is_none());
+                assert!(!redirect.network_extra_info_available);
+            }
+            let dispatched = redirect
+                .dispatched_request
+                .as_ref()
+                .expect("a cached destination still has a request");
+            assert_eq!(dispatched.method, "GET");
+            assert!(dispatched.body.is_none());
+            assert!(
+                dispatched
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case("Accept")
+                        && value == "text/plain")
+            );
+            assert!(client.shutdown().is_clean());
+        }
+        assert_eq!(
+            server.hits(),
+            2,
+            "{transport}: cache hits must stay off the network"
+        );
+        server.shutdown();
+        std::fs::remove_dir_all(cache_dir)?;
     }
-    first.finish().await?;
-
-    let client = FetchClient::new(&config, new_shared_browser_cookie_store());
-    let mut second = client
-        .fetch_raw_stream_with_cancel(
-            Request::get(&server.url_path("/redirect"))?,
-            FetchCancelHandle::new(),
-        )
-        .await?;
-    assert!(second.from_cache);
-    assert_eq!(second.redirect_chain.len(), 1);
-    assert!(second.redirect_chain[0].from_cache);
-    let mut second_body = Vec::new();
-    while let Some(chunk) = second.next_chunk().await {
-        second_body.extend_from_slice(&chunk);
-    }
-    second.finish().await?;
-
-    assert_eq!(first_body, b"final-body");
-    assert_eq!(second_body, b"final-body");
-    assert_eq!(server.hits(), 2);
-
-    server.shutdown();
-    let _ = std::fs::remove_dir_all(cache_dir);
     Ok(())
 }
 
@@ -1825,6 +2221,253 @@ fn fetch_client_rejects_private_network_targets() {
 }
 
 #[test]
+fn fetch_client_checks_the_shared_dns_answer_for_domains() {
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(String::new()));
+    config.set_network_blocking(true, vec![]);
+
+    let error = fetch_with_config_for_test(&config, Request::get("http://localhost/").unwrap())
+        .expect_err("the shared localhost DNS answer must be rejected before curl connects");
+    let error_chain = format!("{error:#}");
+
+    assert!(
+        error_chain.contains("blocked private network address"),
+        "unexpected error: {error_chain}"
+    );
+}
+
+#[test]
+fn fetch_client_allows_proxy_resolved_target_under_address_policy() {
+    let proxy = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("proxied-private-target")]);
+    let proxy_port = Url::parse(&proxy.origin())
+        .unwrap()
+        .port()
+        .expect("proxy URL should include a port");
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(format!("http://localhost:{proxy_port}")));
+    config.set_network_blocking(true, vec![]);
+
+    let response = fetch_with_config_for_test(
+        &config,
+        Request::get("http://127.0.0.1/proxy-resolved-target").unwrap(),
+    )
+    .expect("the trusted proxy owns request-target DNS and address admission");
+
+    assert_eq!(response.body_text(), "proxied-private-target");
+    assert_eq!(proxy.hits(), 1);
+    proxy.shutdown();
+}
+
+#[test]
+fn fetch_client_uses_host_resolve_for_proxy_endpoint() {
+    let proxy = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("fixed-proxy")]);
+    let proxy_port = Url::parse(&proxy.origin())
+        .unwrap()
+        .port()
+        .expect("proxy URL should include a port");
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(format!("http://proxy.invalid:{proxy_port}")));
+    config.set_http_host_resolve(vec![format!(
+        "proxy.invalid:{proxy_port}:127.0.0.2,127.0.0.1"
+    )]);
+
+    let response = fetch_with_config_for_test(
+        &config,
+        Request::get("http://remote-target.invalid/through-fixed-proxy").unwrap(),
+    )
+    .expect("a fixed proxy endpoint must bypass DNS without fixing the remote target");
+
+    assert_eq!(response.body_text(), "fixed-proxy");
+    assert_eq!(proxy.hits(), 1);
+    proxy.shutdown();
+}
+
+#[test]
+fn fetch_client_sends_bearer_auth_only_as_http_proxy_header() {
+    let proxy = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("authenticated-proxy")]);
+    let mut config = FetchConfig::default();
+    config.set_proxy_options(Some(proxy.origin()), Some("proxy-token".to_owned()));
+
+    let response = fetch_with_config_for_test(
+        &config,
+        Request::get("http://proxy-auth-target.invalid/path").unwrap(),
+    )
+    .expect("HTTP proxy should receive bearer authentication");
+    let requests = proxy.requests();
+
+    assert_eq!(response.body_text(), "authenticated-proxy");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].contains("\r\nProxy-Authorization: Bearer proxy-token\r\n"),
+        "unexpected proxy request: {:?}",
+        requests[0]
+    );
+    proxy.shutdown();
+}
+
+#[test]
+fn fetch_client_rejects_host_resolve_for_remote_proxy_target() {
+    let proxy = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("unexpected")]);
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(proxy.origin()));
+    config.set_http_host_resolve(vec!["target.invalid:80:127.0.0.1".to_owned()]);
+
+    let error = fetch_with_config_for_test(
+        &config,
+        Request::get("http://target.invalid/ignored-override").unwrap(),
+    )
+    .expect_err("a remote-DNS proxy cannot honor a target host-resolve override");
+
+    assert!(error.to_string().contains("would be ignored"), "{error:#}");
+    assert_eq!(proxy.hits(), 0);
+    proxy.shutdown();
+}
+
+#[test]
+fn fetch_client_rejects_http_header_auth_for_socks_proxy() {
+    let mut config = FetchConfig::default();
+    config.set_proxy_options(
+        Some("socks5://127.0.0.1:1".to_owned()),
+        Some("proxy-token".to_owned()),
+    );
+
+    let error = fetch_with_config_for_test(
+        &config,
+        Request::get("http://target.invalid/through-socks").unwrap(),
+    )
+    .expect_err("SOCKS proxy authentication must not use an HTTP header");
+
+    let error_chain = format!("{error:#}");
+    assert!(
+        error_chain.contains("Proxy-Authorization headers require an HTTP(S) proxy"),
+        "{error_chain}"
+    );
+}
+
+#[test]
+fn fetch_client_socks5_sends_target_hostname_to_proxy() {
+    let upstream = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("through-socks")]);
+    let upstream_url = Url::parse(&upstream.origin()).unwrap();
+    let upstream_port = upstream_url
+        .port()
+        .expect("upstream URL should include a port");
+    let upstream_addr = format!("127.0.0.1:{upstream_port}")
+        .parse()
+        .expect("upstream socket address");
+    let (proxy_url, request_rx, proxy) = spawn_socks5_proxy(upstream_addr);
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(proxy_url));
+    config.set_http_no_proxy(Some(String::new()));
+
+    let response = fetch_with_config_for_test(
+        &config,
+        Request::get(&format!(
+            "http://http-target.invalid:{upstream_port}/through-socks"
+        ))
+        .unwrap(),
+    )
+    .expect("socks5 must use remote DNS and relay the HTTP request");
+    let (requested_host, requested_port) = request_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("SOCKS request should arrive");
+    proxy.join().expect("fetch SOCKS proxy should finish");
+
+    assert_eq!(response.body_text(), "through-socks");
+    assert_eq!(requested_host, "http-target.invalid");
+    assert_eq!(requested_port, upstream_port);
+    upstream.shutdown();
+}
+
+#[test]
+fn fetch_client_socks4_sends_target_hostname_to_proxy() {
+    let upstream = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("through-socks4")]);
+    let upstream_url = Url::parse(&upstream.origin()).unwrap();
+    let upstream_port = upstream_url
+        .port()
+        .expect("upstream URL should include a port");
+    let upstream_addr = format!("127.0.0.1:{upstream_port}")
+        .parse()
+        .expect("upstream socket address");
+    let (proxy_url, request_rx, proxy) = spawn_socks4_proxy(upstream_addr);
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(proxy_url));
+    config.set_http_no_proxy(Some(String::new()));
+
+    let response = fetch_with_config_for_test(
+        &config,
+        Request::get(&format!(
+            "http://http-socks4-target.invalid:{upstream_port}/through-socks4"
+        ))
+        .unwrap(),
+    )
+    .expect("socks4 must use remote DNS and relay the HTTP request");
+    let (requested_host, requested_port) = request_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("SOCKS4 request should arrive");
+    proxy.join().expect("fetch SOCKS4 proxy should finish");
+
+    assert_eq!(response.body_text(), "through-socks4");
+    assert_eq!(requested_host, "http-socks4-target.invalid");
+    assert_eq!(requested_port, upstream_port);
+    upstream.shutdown();
+}
+
+#[test]
+fn fetch_redirect_reselects_direct_or_proxy_endpoint_per_hop() {
+    let proxy = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("redirected-through-proxy")]);
+    let proxy_port = Url::parse(&proxy.origin())
+        .unwrap()
+        .port()
+        .expect("proxy URL should include a port");
+    let direct = ScriptedHttpServer::spawn(vec![
+        ScriptedResponse::status(302, "Found")
+            .with_header("Location", "http://redirect-target.invalid/final"),
+    ]);
+    let direct_url = Url::parse(&direct.url()).unwrap();
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some(format!("http://localhost:{proxy_port}")));
+    config.set_http_no_proxy(Some("127.0.0.1".to_owned()));
+
+    let response = fetch_with_config_for_test(
+        &config,
+        Request::get(direct_url.as_str())
+            .unwrap()
+            .with_redirect_mode(crate::RequestRedirectMode::Follow),
+    )
+    .expect("redirect should switch from direct origin DNS to proxy endpoint DNS");
+
+    assert_eq!(response.body_text(), "redirected-through-proxy");
+    assert_eq!(direct.hits(), 1);
+    assert_eq!(proxy.hits(), 1);
+    direct.shutdown();
+    proxy.shutdown();
+}
+
+#[test]
+fn fetch_client_applies_selected_no_proxy_route_to_curl() {
+    let server = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("direct")]);
+    let port = Url::parse(&server.url())
+        .unwrap()
+        .port()
+        .expect("scripted server URL should include a port");
+    let mut config = FetchConfig::default();
+    config.set_http_proxy(Some("http://127.0.0.1:1".to_owned()));
+    config.set_http_no_proxy(Some("localhost".to_owned()));
+
+    let response = fetch_with_config_for_test(
+        &config,
+        Request::get(&format!("http://localhost:{port}/direct")).unwrap(),
+    )
+    .expect(
+        "the selected direct route must use shared origin DNS and disable curl proxy evaluation",
+    );
+
+    assert_eq!(response.body_text(), "direct");
+    assert_eq!(server.hits(), 1);
+    server.shutdown();
+}
+
+#[test]
 fn fetch_client_rejects_private_network_targets_via_host_resolve_override() {
     let server = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("should-not-be-reached")]);
     let port = Url::parse(&server.url())
@@ -1911,12 +2554,14 @@ fn fetch_client_rejects_http_bad_ports_before_network_io() {
 }
 
 #[test]
-fn fetch_client_preserves_libcurl_env_proxy_fallback() {
+fn fetch_client_preserves_env_proxy_fallback() {
     let proxy = ScriptedHttpServer::spawn(vec![ScriptedResponse::ok("proxied-env")]);
-    let proxy_origin = proxy.origin();
+    let mut proxy_url = Url::parse(&proxy.origin()).unwrap();
+    proxy_url.set_host(Some("localhost")).unwrap();
+    let proxy_origin = proxy_url.to_string();
     let output = Command::new(std::env::current_exe().expect("test binary path"))
         .arg("--exact")
-        .arg("tests::env_proxy_child_uses_libcurl_env_proxy_fallback")
+        .arg("tests::env_proxy_child_uses_selected_env_proxy_route")
         .arg("--ignored")
         .arg("--nocapture")
         .env(ENV_PROXY_CHILD_TEST, "1")
@@ -1951,8 +2596,8 @@ fn fetch_client_preserves_libcurl_env_proxy_fallback() {
 }
 
 #[test]
-#[ignore = "spawned by fetch_client_preserves_libcurl_env_proxy_fallback"]
-fn env_proxy_child_uses_libcurl_env_proxy_fallback() -> Result<()> {
+#[ignore = "spawned by fetch_client_preserves_env_proxy_fallback"]
+fn env_proxy_child_uses_selected_env_proxy_route() -> Result<()> {
     if std::env::var_os(ENV_PROXY_CHILD_TEST).is_none() {
         return Ok(());
     }
@@ -1988,10 +2633,7 @@ async fn direct_localhost_uses_shared_dns_across_all_curl_transports() -> Result
     let client = FetchClient::new(&config, new_shared_browser_cookie_store());
 
     let buffered = client
-        .fetch(
-            Request::get(&format!("http://localhost:{port}/buffered"))?
-                .with_follow_redirects(false),
-        )
+        .fetch(Request::get(&format!("http://localhost:{port}/buffered"))?.with_single_hop())
         .await?;
     assert_eq!(buffered.body_text(), "buffered-dns");
 
@@ -2480,7 +3122,8 @@ fn fetch_client_cache_vary_referer_partitions_hits() {
             Request::new("GET", &server.url(), None, Vec::new())
                 .unwrap()
                 .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
-                .with_initiator_url(referrer),
+                .with_initiator_url(referrer)
+                .with_request_origin(moli_url::WebOrigin::from_url(referrer)),
         )
         .unwrap()
     };
@@ -2638,8 +3281,8 @@ fn critical_client_hints_restart_navigation_before_exposing_the_first_response()
             .headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("location"))
-            .map(|(_, value)| value.as_str()),
-        Some(restart.to_url.as_str())
+            .map(|(_, value)| value.as_slice()),
+        Some(restart.to_url.as_str().as_bytes())
     );
     assert!(!restart.redirect_has_extra_info);
     assert!(restart.cookie_set_reports.is_empty());
@@ -2674,7 +3317,8 @@ fn critical_client_hints_restart_navigation_before_exposing_the_first_response()
     let navigation_url = Url::parse(&server.url())?;
     let subresource = Request::new("POST", &server.url(), Some("probe".to_owned()), Vec::new())?
         .with_browser_request_metadata(BrowserRequestMetadata::Fetch)
-        .with_initiator_url(&navigation_url);
+        .with_initiator_url(&navigation_url)
+        .with_request_origin(moli_url::WebOrigin::from_url(&navigation_url));
     let subresource = fetch_response_for_test(&client, subresource)?;
     assert_eq!(subresource.body_text(), "subresource");
 
@@ -2685,7 +3329,7 @@ fn critical_client_hints_restart_navigation_before_exposing_the_first_response()
     let later = requests[2].to_ascii_lowercase();
     assert!(!first.contains("sec-ch-ua-arch:"));
     for expected in [
-        "sec-ch-ua-full-version: \"145.0.0.0\"",
+        "sec-ch-ua-full-version: \"156.0.8078.74\"",
         "sec-ch-ua-full-version-list:",
         "sec-ch-ua-arch: \"x86\"",
         "sec-ch-ua-bitness: \"64\"",
@@ -3071,6 +3715,7 @@ fn fetch_client_stylesheet_referrer_policy_uses_vary_referer_on_cache_hits() {
             },
         )
         .with_initiator_url(&document_url)
+        .with_request_origin(moli_url::WebOrigin::from_url(&document_url))
     };
 
     let first = fetch_with_config_for_test(&config, request("origin")).unwrap();
@@ -3228,6 +3873,7 @@ fn fetch_client_skips_stylesheet_cache_for_vary_origin() {
             .with_request_mode(RequestMode::Cors)
             .with_credentials_mode(RequestCredentialsMode::SameOrigin)
             .with_initiator_url(&initiator)
+            .with_request_origin(moli_url::WebOrigin::from_url(&initiator))
     };
 
     let first = fetch_with_config_for_test(&config, request()).unwrap();
@@ -3667,7 +4313,7 @@ fn network_metadata_captures_transport_generated_request_headers() {
         .expect("raw response observation");
     assert_eq!(response.status(), 200);
     assert_eq!(
-        header_value(response.headers(), "Cache-Control"),
+        moli_web_mime::response_header_value(response.headers(), "Cache-Control").as_deref(),
         Some("no-store")
     );
 
@@ -3692,6 +4338,7 @@ async fn network_metadata_failure_preserves_request_sent_before_empty_response()
     let cookie_store = new_shared_browser_cookie_store();
     cookie_store
         .lock()
+        .unwrap()
         .set_document_cookie(&url, "failedRequestCookie=present; Path=/");
     let client = FetchClient::new(&FetchConfig::default(), cookie_store);
 
@@ -3849,11 +4496,19 @@ fn network_metadata_keeps_raw_304_separate_from_merged_cached_response() {
         fetch_raw_with_network_metadata_for_test(&client, Request::get(&server.url()).unwrap())
             .unwrap();
     assert_eq!(first.response().status, 200);
+    assert_eq!(
+        first.response().cache_state,
+        crate::ResponseCacheState::None
+    );
     let second =
         fetch_raw_with_network_metadata_for_test(&client, Request::get(&server.url()).unwrap())
             .unwrap();
 
     assert_eq!(second.response().status, 200);
+    assert_eq!(
+        second.response().cache_state,
+        crate::ResponseCacheState::Validated
+    );
     assert_eq!(second.response().body_bytes(), b"cached");
     let exchange = second
         .observation_journal()
@@ -4006,7 +4661,8 @@ fn fetch_response_stores_partitioned_cookie_under_request_top_level_site() -> Re
     let response = fetch_response_for_test(
         &client,
         Request::new("GET", request_url.as_str(), None, Vec::new())?
-            .with_initiator_url(&first_top_level),
+            .with_initiator_url(&first_top_level)
+            .with_request_origin(moli_url::WebOrigin::from_url(&first_top_level)),
     )?;
 
     assert_eq!(response.status, 200);
@@ -4235,7 +4891,8 @@ fn fetch_client_cache_revalidates_with_etag() {
 fn fetch_client_cache_updates_freshness_after_not_modified() {
     let cache_dir = unique_test_cache_dir();
     let server = ScriptedHttpServer::spawn(vec![
-        ScriptedResponse::ok("hit-1")
+        ScriptedResponse::status(200, "Original cached message")
+            .with_body("hit-1")
             .with_header("Cache-Control", "max-age=0")
             .with_header("ETag", "\"v1\""),
         ScriptedResponse::status(304, "Not Modified")
@@ -4254,6 +4911,16 @@ fn fetch_client_cache_updates_freshness_after_not_modified() {
     assert_eq!(first.body_text(), "hit-1");
     assert_eq!(second.body_text(), "hit-1");
     assert_eq!(third.body_text(), "hit-1");
+    assert_eq!(first.cache_state, crate::ResponseCacheState::None);
+    assert_eq!(second.cache_state, crate::ResponseCacheState::Validated);
+    assert_eq!(third.cache_state, crate::ResponseCacheState::Local);
+    for response in [&first, &second, &third] {
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.status_text.as_deref(),
+            Some("Original cached message")
+        );
+    }
     assert_eq!(
         server.hits(),
         2,
@@ -4288,7 +4955,8 @@ fn fetch_client_cache_revalidates_same_document_reload() {
         Request::get(&server.url())
             .unwrap()
             .with_browser_navigation_kind(BrowserNavigationRequestKind::Reload)
-            .with_initiator_url(&reload_url),
+            .with_initiator_url(&reload_url)
+            .with_request_origin(moli_url::WebOrigin::from_url(&reload_url)),
     )
     .unwrap();
 
@@ -4330,7 +4998,8 @@ fn fetch_client_cache_immutable_ignores_same_document_reload_validation_when_fre
         Request::get(&server.url())
             .unwrap()
             .with_browser_navigation_kind(BrowserNavigationRequestKind::Reload)
-            .with_initiator_url(&reload_url),
+            .with_initiator_url(&reload_url)
+            .with_request_origin(moli_url::WebOrigin::from_url(&reload_url)),
     )
     .unwrap();
 
@@ -4366,7 +5035,8 @@ fn fetch_client_cache_immutable_revalidates_after_expiry() {
         Request::get(&server.url())
             .unwrap()
             .with_browser_navigation_kind(BrowserNavigationRequestKind::Reload)
-            .with_initiator_url(&reload_url),
+            .with_initiator_url(&reload_url)
+            .with_request_origin(moli_url::WebOrigin::from_url(&reload_url)),
     )
     .unwrap();
 
@@ -4526,8 +5196,8 @@ fn fetch_client_cache_preserves_content_length_when_merging_304() {
             .headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map(|(_, value)| value.as_str()),
-        Some("5"),
+            .map(|(_, value)| value.as_slice()),
+        Some(b"5".as_slice()),
         "304 Content-Length must not replace the cached 200 Content-Length"
     );
 
@@ -4567,8 +5237,8 @@ fn fetch_client_cache_skips_connection_nominated_headers_when_merging_304() {
             .headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("x-transient"))
-            .map(|(_, value)| value.as_str()),
-        Some("cached-value"),
+            .map(|(_, value)| value.as_slice()),
+        Some(b"cached-value".as_slice()),
         "304 Connection-nominated fields must not replace cached metadata"
     );
 
@@ -4844,6 +5514,72 @@ async fn fetch_with_cancel_aborts_inflight_streaming_transfer() -> Result<()> {
     );
 
     server.await.expect("cancel test server should finish");
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_raw_cancellation_closes_streaming_and_digest_transports() -> Result<()> {
+    for digest in [false, true] {
+        for before_headers in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let (started, received) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await?;
+                read_http_request_head(&mut stream).await?;
+                if !before_headers {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\npartial").await?;
+                }
+                let _ = started.send(());
+                let mut byte = [0u8; 1];
+                let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut byte))
+                    .await
+                    .context(
+                        "cancelled raw transport must close without completing its response",
+                    )?;
+                // Cancellation may close an unread socket with either FIN or
+                // RST. Both prove that the held response cannot continue.
+                assert!(
+                    matches!(read, Ok(0))
+                        || read.as_ref().is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionReset),
+                    "cancelled raw transport remained open: {read:?}"
+                );
+                anyhow::Ok(())
+            });
+            let client =
+                FetchClient::new(&FetchConfig::default(), new_shared_browser_cookie_store());
+            let cancel = FetchCancelHandle::new();
+            let mut request = Request::get(&format!("http://{addr}/held"))?;
+            if digest {
+                request = request.with_auth(RequestAuth {
+                    target: RequestAuthTarget::Server,
+                    scheme: RequestAuthScheme::Digest,
+                    username: "user".to_owned(),
+                    password: "pass".to_owned(),
+                });
+            }
+            let fetch = {
+                let client = client.clone();
+                let cancellation = cancel.clone();
+                tokio::spawn(async move {
+                    client
+                        .fetch_raw_with_cancel_and_network_metadata(request, cancellation)
+                        .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), received).await??;
+            assert!(
+                !fetch.is_finished(),
+                "the fixture must keep the response incomplete"
+            );
+            cancel.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(5), fetch)
+                .await??
+                .unwrap_err();
+            assert!(crate::is_fetch_cancelled(&error), "{error:#}");
+            server.await??;
+        }
+    }
     Ok(())
 }
 
@@ -5154,6 +5890,8 @@ fn fetch_runtime_negotiates_http2_over_tls() {
         fetch_response_for_test(&client, Request::get(&server.url_path("/h2")).unwrap()).unwrap();
 
     assert_eq!(response.body_text(), "h2-ok");
+    assert_eq!(response.status_text.as_deref(), Some(""));
+    assert_eq!(response.head().status_text(), "");
     assert_eq!(
         response.negotiated_http_version,
         Some(NegotiatedHttpVersion::Http2)
@@ -5196,6 +5934,8 @@ async fn fetch_runtime_raw_stream_reports_negotiated_http2() -> Result<()> {
             FetchCancelHandle::new(),
         )
         .await?;
+    assert_eq!(response.status_text.as_deref(), Some(""));
+    assert_eq!(response.head().status_text(), "");
     assert_eq!(
         response.negotiated_http_version,
         Some(NegotiatedHttpVersion::Http2)
@@ -5263,7 +6003,7 @@ fn fetch_runtime_retries_buffered_get_over_http11_after_http2_protocol_error() -
     let mut config = FetchConfig::default();
     config.set_tls_verify_host(false);
     let client = FetchClient::new(&config, new_shared_browser_cookie_store());
-    let request = Request::get(&server.url())?.with_follow_redirects(false);
+    let request = Request::get(&server.url())?.with_single_hop();
 
     let response = fetch_response_for_test(&client, request)?;
 
@@ -5353,7 +6093,7 @@ fn fetch_runtime_retries_buffered_empty_http_navigation_over_https() -> Result<(
     config.set_tls_verify_host(false);
     config.set_http_host_resolve(vec![server.resolve_entry()]);
     let client = FetchClient::new(&config, new_shared_browser_cookie_store());
-    let request = Request::get(&server.url())?.with_follow_redirects(false);
+    let request = Request::get(&server.url())?.with_single_hop();
 
     let response = fetch_response_for_test(&client, request)?;
 
@@ -5376,7 +6116,7 @@ fn assert_https_upgrade_redirect(redirect_chain: &[crate::RedirectInfo]) {
     assert_eq!(redirect.to_url.scheme(), "https");
     assert!(
         redirect.headers.iter().any(|(name, value)| {
-            name == "non-authoritative-reason" && value == "HttpsUpgrades"
+            name == "non-authoritative-reason" && value == b"HttpsUpgrades"
         })
     );
 }
@@ -5790,8 +6530,13 @@ fn fetch_runtime_owner_panic_returns_payload_and_identity_and_other_owners_still
         .backtrace()
         .expect("semantic owner panic must retain its panic-site backtrace");
     assert!(!backtrace.trim().is_empty());
+    // Toolchains can demangle inherent methods as Type::method or <Type>::method.
+    // Require the same fully qualified owner and method in a single frame.
     assert!(
-        backtrace.contains("RuntimeOwner::handle_command"),
+        backtrace.lines().any(|frame| {
+            frame.contains("moli_fetch::runtime::RuntimeOwner::handle_command")
+                || frame.contains("<moli_fetch::runtime::RuntimeOwner>::handle_command")
+        }),
         "panic backtrace should identify the semantic owner command boundary: {backtrace}"
     );
     assert_eq!(
@@ -5839,3 +6584,9 @@ fn panicking_fetch_runtime_owner_drop_does_not_replace_an_outer_unwind() {
         "Drop during unwind must log the owner panic once without panicking"
     );
 }
+
+mod range_encoding;
+
+mod referrer_redirects;
+
+mod redirect_cookie_context;

@@ -4,22 +4,35 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::super::fetch_support::{
-    ClaimedSubresourceContinueRequest, DocumentBodySource, InFlightSubresourceFetchRequest,
-    PausedDocumentTransfer, PausedDocumentTransfers, PendingFetchAuthNavigation,
-    PendingFetchNavigation, PendingFetchResponseBodyStreamRead,
-    PendingFetchResponseBodyStreamReadDispatch, PendingFetchResponseBodyStreamReadStart,
-    PendingSubresourceFetchAuthRequest, PendingSubresourceFetchOwnerKind,
-    PendingSubresourceFetchRequest, PendingSubresourceFetchResponseRequest,
-    ResponseStageUrlMatchPolicy, fetch_subresource_interception_config_for_patterns,
-    matching_fetch_pattern,
+    ClaimedSubresourceContinueRequest, CompletedDocumentBodyRead, InFlightSubresourceFetchRequest,
+    PausedDocumentTransfer, PausedDocumentTransfers, PendingDocumentBodyRead,
+    PendingFetchAuthNavigation, PendingFetchNavigation, PendingFetchResponseBodyStreamRead,
+    PendingFetchResponseBodyStreamReadStart, PendingSubresourceFetchAuthRequest,
+    PendingSubresourceFetchOwnerKind, PendingSubresourceFetchRequest,
+    PendingSubresourceFetchResponseRequest, ResponseStageUrlMatchPolicy,
+    fetch_subresource_interception_config_for_patterns, matching_fetch_pattern,
 };
 pub(super) use super::super::fetch_support::{
-    FetchInterceptionPattern, FetchRequestStage, FetchResourceTypeFilter, OpenBodyStreamError,
+    FetchInterceptionPattern, FetchRequestStage, FetchResourceTypeFilter,
 };
+use super::DocumentNavigationToken;
 use super::navigation_outcome::NavigationDispatchState;
 use super::runtime_slot::TargetRuntimeSlot;
-use crate::devtools_runtime::{DevToolsNetworkInterceptId, DevToolsNetworkResourceType};
+use crate::automation::{DevToolsNetworkInterceptId, DevToolsNetworkResourceType};
+#[cfg(test)]
+use crate::conn::DocumentBodySource;
 use moli_fetch::url_pattern_matches;
+
+/// Requests transferred out of a target's pause maps for finite cleanup.
+#[derive(Debug, Default)]
+pub(crate) struct DrainedFetchRequests {
+    pub(crate) navigations: Vec<PendingFetchNavigation>,
+    pub(crate) auth_navigations: Vec<PendingFetchAuthNavigation>,
+    pub(crate) response_transfers: Vec<PausedDocumentTransfer>,
+    pub(crate) subresource_requests: Vec<(String, PendingSubresourceFetchRequest)>,
+    pub(crate) subresource_auth_requests: Vec<(String, PendingSubresourceFetchAuthRequest)>,
+    pub(crate) subresource_responses: Vec<(String, PendingSubresourceFetchResponseRequest)>,
+}
 
 #[derive(Debug, Default)]
 pub struct TargetFetchState {
@@ -34,6 +47,36 @@ pub struct TargetFetchState {
 }
 
 impl TargetFetchState {
+    fn take_superseded_document_navigations(
+        &mut self,
+        current: &DocumentNavigationToken,
+    ) -> Vec<(Option<DocumentNavigationToken>, NavigationDispatchState)> {
+        let mut retired = Vec::new();
+        for (id, pending) in self
+            .pending_fetch_navigations
+            .extract_if(|_, pending| pending.document_navigation_token.as_ref() != Some(current))
+        {
+            self.pending_fetch_request_ids.remove(&id);
+            retired.push((pending.document_navigation_token, pending.navigation));
+        }
+        for (id, pending) in self
+            .pending_fetch_auth_navigations
+            .extract_if(|_, pending| pending.document_navigation_token.as_ref() != Some(current))
+        {
+            self.pending_fetch_request_ids.remove(&id);
+            retired.push((pending.document_navigation_token, pending.navigation));
+        }
+        for transfer in self
+            .pending_fetch_response_transfers
+            .drain_superseded(current)
+        {
+            self.pending_fetch_request_ids
+                .remove(transfer.fetch_request_id());
+            retired.push(transfer.into_navigation());
+        }
+        retired
+    }
+
     fn pending_action_matches(
         pending: &PendingSubresourceFetchRequest,
         session_id: Option<&str>,
@@ -262,6 +305,12 @@ impl TargetFetchState {
     }
 
     fn prune_request_stage_chains_for_session(&mut self, session_id: Option<&str>) {
+        for pending in self.pending_fetch_navigations.values_mut() {
+            pending.remaining_request_stages.retain(|stage| {
+                !stage.owner_kind.drains_on_fetch_disable()
+                    || stage.session_id.as_deref() != session_id
+            });
+        }
         for pending in self.pending_subresource_fetches.values_mut() {
             if let Some(chain) = pending.request_stage_chain.as_mut() {
                 chain.remaining_sessions.retain(|stage| {
@@ -333,17 +382,7 @@ impl TargetFetchState {
         }
     }
 
-    fn drain_pending_request_maps(
-        &mut self,
-        clear_in_flight: bool,
-    ) -> (
-        Vec<PendingFetchNavigation>,
-        Vec<PendingFetchAuthNavigation>,
-        Vec<PausedDocumentTransfer>,
-        Vec<(String, PendingSubresourceFetchRequest)>,
-        Vec<(String, PendingSubresourceFetchAuthRequest)>,
-        Vec<(String, PendingSubresourceFetchResponseRequest)>,
-    ) {
+    fn drain_pending_request_maps(&mut self, clear_in_flight: bool) -> DrainedFetchRequests {
         let pending_navigations = std::mem::take(&mut self.pending_fetch_navigations)
             .into_values()
             .collect::<Vec<_>>();
@@ -397,14 +436,14 @@ impl TargetFetchState {
         {
             self.pending_fetch_request_ids.remove(fetch_request_id);
         }
-        (
-            pending_navigations,
-            pending_auth_navigations,
-            pending_response_navigations,
-            pending_subresource_fetches,
-            pending_subresource_auths,
-            pending_subresource_responses,
-        )
+        DrainedFetchRequests {
+            navigations: pending_navigations,
+            auth_navigations: pending_auth_navigations,
+            response_transfers: pending_response_navigations,
+            subresource_requests: pending_subresource_fetches,
+            subresource_auth_requests: pending_subresource_auths,
+            subresource_responses: pending_subresource_responses,
+        }
     }
 
     pub(crate) fn register_pending_fetch_navigation_request(
@@ -530,6 +569,7 @@ impl TargetFetchState {
             .insert(request_id, pending);
     }
 
+    #[cfg(test)]
     pub(crate) fn register_pending_fetch_response_navigation(
         &mut self,
         request_id: String,
@@ -542,7 +582,7 @@ impl TargetFetchState {
             .register_pending_navigation(request_id, document_navigation_token, navigation, body);
     }
 
-    pub(crate) fn take_pending_fetch_response_transfer_for_terminal_action(
+    pub(crate) fn take_fetch_response_transfer_for_cancellation(
         &mut self,
         request_id: &str,
     ) -> Option<PausedDocumentTransfer> {
@@ -551,11 +591,15 @@ impl TargetFetchState {
         Some(transfer)
     }
 
-    pub(crate) fn take_pending_fetch_response_transfer(
+    pub(crate) fn take_available_fetch_response_transfer(
         &mut self,
         request_id: &str,
     ) -> Option<PausedDocumentTransfer> {
-        self.pending_fetch_response_transfers.take(request_id)
+        let transfer = self
+            .pending_fetch_response_transfers
+            .take_available(request_id)?;
+        self.pending_fetch_request_ids.remove(request_id);
+        Some(transfer)
     }
 
     pub(crate) fn register_pending_fetch_response_transfer(
@@ -581,30 +625,42 @@ impl TargetFetchState {
         runtime_slot: &mut TargetRuntimeSlot,
         request_id: &str,
         handle: String,
-    ) -> Result<Option<String>, String> {
-        let Some(transfer) = self.take_pending_fetch_response_transfer(request_id) else {
+    ) -> anyhow::Result<Option<String>> {
+        let Some(transfer) = self.take_available_fetch_response_transfer(request_id) else {
             return Ok(None);
         };
         let opened = match transfer.open_body_stream(handle) {
             Ok(opened) => opened,
-            Err(OpenBodyStreamError::NotOpenable(transfer)) => {
+            Err(transfer) => {
                 self.register_pending_fetch_response_transfer(request_id.to_owned(), *transfer);
                 return Ok(None);
-            }
-            Err(OpenBodyStreamError::Failed { transfer, message }) => {
-                self.register_pending_fetch_response_transfer(request_id.to_owned(), *transfer);
-                return Err(message);
             }
         };
 
         let handle = opened.handle;
-        let buffered_bytes = opened.buffered_bytes;
+        let buffered_body = opened.buffered_body;
         self.register_pending_fetch_response_transfer(request_id.to_owned(), opened.transfer);
-        if let Some(bytes) = buffered_bytes {
-            runtime_slot.insert_io_stream(handle.clone(), bytes, 0);
+        if let Some(body) = buffered_body {
+            runtime_slot.insert_io_stream_body_source(handle.clone(), body, 0);
         }
 
         Ok(Some(handle))
+    }
+
+    pub(crate) fn start_pending_fetch_response_body_read(
+        &mut self,
+        request_id: &str,
+    ) -> Option<PendingDocumentBodyRead> {
+        self.pending_fetch_response_transfers
+            .start_body_read(request_id)
+    }
+
+    pub(crate) fn finish_pending_fetch_response_body_read<T>(
+        &mut self,
+        completed: CompletedDocumentBodyRead<T>,
+    ) -> Option<anyhow::Result<T>> {
+        self.pending_fetch_response_transfers
+            .finish_body_read(completed)
     }
 
     pub(crate) fn start_pending_fetch_response_body_stream_read(
@@ -613,27 +669,8 @@ impl TargetFetchState {
         offset: Option<usize>,
         size: Option<usize>,
     ) -> PendingFetchResponseBodyStreamReadStart {
-        let Some((request_id, transfer)) =
-            self.take_pending_fetch_response_body_stream_by_handle(handle)
-        else {
-            return PendingFetchResponseBodyStreamReadStart::NotFound;
-        };
-
-        if let Some(offset) = offset
-            && offset != transfer.body_stream_offset().unwrap_or(0)
-        {
-            self.register_pending_fetch_response_transfer(request_id, transfer);
-            return PendingFetchResponseBodyStreamReadStart::OffsetNotSupported;
-        }
-
-        PendingFetchResponseBodyStreamReadStart::Pending(Box::new(
-            PendingFetchResponseBodyStreamReadDispatch::new(
-                request_id,
-                handle.to_owned(),
-                transfer,
-                size,
-            ),
-        ))
+        self.pending_fetch_response_transfers
+            .start_body_stream_read(handle, offset, size)
     }
 
     pub(crate) fn finish_pending_fetch_response_body_stream_read(
@@ -641,21 +678,21 @@ impl TargetFetchState {
         runtime_slot: &mut TargetRuntimeSlot,
         completed: super::super::fetch_support::CompletedFetchResponseBodyStreamReadDispatch,
     ) -> PendingFetchResponseBodyStreamRead {
-        let request_id = completed.request_id().to_owned();
-        let handle = completed.handle().to_owned();
-        match completed.into_completed() {
-            Ok((bytes, eof, transfer)) => {
-                self.register_pending_fetch_response_transfer(request_id, transfer);
+        let Some(result) = self.finish_pending_fetch_response_body_read(completed.completed) else {
+            return PendingFetchResponseBodyStreamRead::NotFound;
+        };
+        match result {
+            Ok((bytes, eof)) => {
                 if eof {
-                    runtime_slot.insert_io_stream(handle, Vec::new(), 0);
+                    runtime_slot.insert_io_stream_body_source(
+                        completed.handle,
+                        crate::conn::CapturedBody::from_bytes(Vec::new()),
+                        0,
+                    );
                 }
                 PendingFetchResponseBodyStreamRead::Read { bytes, eof }
             }
-            Err(completed) => {
-                let (transfer, message) = *completed;
-                self.register_pending_fetch_response_transfer(request_id, transfer);
-                PendingFetchResponseBodyStreamRead::Failed(message)
-            }
+            Err(error) => PendingFetchResponseBodyStreamRead::Failed(error),
         }
     }
 
@@ -682,6 +719,21 @@ impl TargetFetchState {
         Some(pending)
     }
 
+    pub(crate) fn rollback_in_flight_subresource_fetch_request(
+        &mut self,
+        internal_id: u64,
+        network_request_id: &str,
+    ) {
+        if self
+            .in_flight_subresource_fetches
+            .get(&internal_id)
+            .is_some_and(|request| request.pending.network_request_id == network_request_id)
+        {
+            self.in_flight_subresource_fetches.remove(&internal_id);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_in_flight_subresource_fetch_request(
         &mut self,
         internal_id: u64,
@@ -705,10 +757,31 @@ impl TargetFetchState {
         session_id: Option<&str>,
         allow_pending_completion: bool,
     ) -> Option<ClaimedSubresourceContinueRequest> {
+        if allow_pending_completion {
+            // Native cancellation also invalidates response/auth interception
+            // ids, including bodies retained while an iframe was paused.
+            for (request_id, _) in self
+                .pending_subresource_fetch_auths
+                .extract_if(|_, pending| {
+                    pending.internal_id == internal_id && &pending.page_owner == expected_page_owner
+                })
+            {
+                self.pending_fetch_request_ids.remove(&request_id);
+            }
+            for (request_id, _) in
+                self.pending_subresource_fetch_responses
+                    .extract_if(|_, pending| {
+                        pending.internal_id == internal_id
+                            && &pending.page_owner == expected_page_owner
+                    })
+            {
+                self.pending_fetch_request_ids.remove(&request_id);
+            }
+        }
         let in_flight_matches = self
             .in_flight_subresource_fetches
             .get(&internal_id)
-            .and_then(|in_flight| in_flight.pending.installed_page_owner())
+            .and_then(|in_flight| in_flight.pending.page_owner())
             == Some(expected_page_owner);
         if in_flight_matches {
             return self
@@ -726,7 +799,7 @@ impl TargetFetchState {
                 .find_map(|(request_id, pending)| {
                     (pending.internal_id == internal_id
                         && Self::pending_action_matches(pending, session_id)
-                        && pending.installed_page_owner() == Some(expected_page_owner))
+                        && pending.page_owner() == Some(expected_page_owner))
                     .then(|| request_id.clone())
                 })?;
         self.take_pending_subresource_fetch_request(&request_id, session_id)
@@ -747,7 +820,7 @@ impl TargetFetchState {
         self.in_flight_subresource_fetches
             .get(&internal_id)?
             .pending
-            .installed_page_owner()
+            .page_owner()
     }
 
     pub(crate) fn register_pending_subresource_fetch_request(
@@ -868,30 +941,14 @@ impl TargetFetchState {
         Some(pending)
     }
 
-    pub(crate) fn drain_pending_requests(
-        &mut self,
-    ) -> (
-        Vec<PendingFetchNavigation>,
-        Vec<PendingFetchAuthNavigation>,
-        Vec<PausedDocumentTransfer>,
-        Vec<(String, PendingSubresourceFetchRequest)>,
-        Vec<(String, PendingSubresourceFetchAuthRequest)>,
-        Vec<(String, PendingSubresourceFetchResponseRequest)>,
-    ) {
+    pub(crate) fn drain_pending_requests(&mut self) -> DrainedFetchRequests {
         self.drain_pending_request_maps(true)
     }
 
     pub(crate) fn drain_pending_requests_for_disable_session(
         &mut self,
         session_id: Option<&str>,
-    ) -> (
-        Vec<PendingFetchNavigation>,
-        Vec<PendingFetchAuthNavigation>,
-        Vec<PausedDocumentTransfer>,
-        Vec<(String, PendingSubresourceFetchRequest)>,
-        Vec<(String, PendingSubresourceFetchAuthRequest)>,
-        Vec<(String, PendingSubresourceFetchResponseRequest)>,
-    ) {
+    ) -> DrainedFetchRequests {
         let pending_navigations = self.drain_pending_fetch_navigations_for_session(session_id);
         let pending_auth_navigations =
             self.drain_pending_fetch_auth_navigations_for_session(session_id);
@@ -915,14 +972,14 @@ impl TargetFetchState {
         self.prune_auth_stage_chains_for_session(session_id);
         self.clear_orphan_pending_request_ids_for_disable(session_id);
 
-        (
-            pending_navigations,
-            pending_auth_navigations,
-            pending_response_navigations,
-            pending_subresource_fetches,
-            pending_subresource_auths,
-            pending_subresource_responses,
-        )
+        DrainedFetchRequests {
+            navigations: pending_navigations,
+            auth_navigations: pending_auth_navigations,
+            response_transfers: pending_response_navigations,
+            subresource_requests: pending_subresource_fetches,
+            subresource_auth_requests: pending_subresource_auths,
+            subresource_responses: pending_subresource_responses,
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1003,6 +1060,7 @@ pub struct TargetFetchConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TargetFetchSessionConfig {
+    wait_lifetime: crate::conn::CommandWaitLifetimeOwner,
     handle_auth_requests: bool,
     patterns: Vec<FetchInterceptionPattern>,
 }
@@ -1066,11 +1124,21 @@ impl TargetFetchConfig {
 
     pub(crate) fn subresource_interception_config(
         &self,
-    ) -> (bool, Option<moli_core::page::SubresourceResourceType>) {
-        fetch_subresource_interception_config_for_patterns(
-            self.enabled || self.handle_auth_requests,
-            &self.patterns,
+    ) -> moli_core::page::SubresourceInterceptionClasses {
+        if auth_interception_url_patterns(
+            fetch_sessions_handle_auth_requests(&self.fetch_sessions),
+            &self.network_intercepts,
         )
+        .next()
+        .is_some()
+        {
+            // Auth challenges are matched by URL alone, regardless of the
+            // resource classes named by Fetch.enable patterns. The renderer
+            // must route every class through the protocol so no class scope
+            // can silently disable Fetch.authRequired pauses.
+            return moli_core::page::SubresourceInterceptionClasses::ALL;
+        }
+        fetch_subresource_interception_config_for_patterns(self.enabled, &self.patterns)
     }
 
     pub(crate) fn subresource_interception_snapshot(
@@ -1079,7 +1147,6 @@ impl TargetFetchConfig {
         TargetFetchSubresourceInterceptionSnapshot {
             enabled: self.enabled,
             event_session_id: self.session_id.clone(),
-            handle_auth_requests: self.handle_auth_requests,
             fetch_sessions: self.fetch_sessions.clone(),
             fetch_session_order: self.fetch_session_order.clone(),
             patterns: self.patterns().to_vec(),
@@ -1126,7 +1193,7 @@ impl TargetFetchConfig {
     }
 
     pub(crate) fn matches_auth_required(&self, url: &Url) -> bool {
-        matches_auth_required(self.handle_auth_requests, &self.network_intercepts, url)
+        matches_auth_required(&self.fetch_sessions, &self.network_intercepts, url)
     }
 
     pub(crate) fn matching_auth_required_network_intercepts(
@@ -1158,8 +1225,8 @@ impl TargetFetchConfig {
             })
     }
 
-    #[cfg(test)]
     pub(crate) fn reset(&mut self) {
+        self.revoke_wait_lifetimes();
         *self = Self::default();
     }
 
@@ -1172,9 +1239,15 @@ impl TargetFetchConfig {
         if !self.fetch_sessions.contains_key(&session_id) {
             self.fetch_session_order.push(session_id.clone());
         }
+        let wait_lifetime = self
+            .fetch_sessions
+            .get(&session_id)
+            .map(|config| config.wait_lifetime.clone())
+            .unwrap_or_default();
         self.fetch_sessions.insert(
             session_id,
             TargetFetchSessionConfig {
+                wait_lifetime,
                 handle_auth_requests,
                 patterns,
             },
@@ -1184,13 +1257,29 @@ impl TargetFetchConfig {
 
     pub(crate) fn remove_fetch_session(&mut self, session_id: Option<&str>) -> bool {
         let key = session_id.map(str::to_owned);
-        let removed = self.fetch_sessions.remove(&key).is_some();
-        if removed {
+        if let Some(config) = self.fetch_sessions.remove(&key) {
+            config.wait_lifetime.revoke();
             self.fetch_session_order
                 .retain(|ordered_session_id| ordered_session_id != &key);
             self.rebuild_effective_state();
+            return true;
         }
-        removed
+        false
+    }
+
+    pub(crate) fn command_wait_lifetime(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<crate::conn::CommandWaitLifetime> {
+        self.fetch_sessions
+            .get(&session_id.map(str::to_owned))
+            .map(|config| config.wait_lifetime.lifetime())
+    }
+
+    fn revoke_wait_lifetimes(&self) {
+        for config in self.fetch_sessions.values() {
+            config.wait_lifetime.revoke();
+        }
     }
 
     pub(crate) fn add_network_intercept(
@@ -1232,10 +1321,7 @@ impl TargetFetchConfig {
                     .values()
                     .find_map(|intercept| intercept.session_id.clone())
             });
-        self.handle_auth_requests = self
-            .fetch_sessions
-            .values()
-            .any(|config| config.handle_auth_requests)
+        self.handle_auth_requests = fetch_sessions_handle_auth_requests(&self.fetch_sessions)
             || self
                 .network_intercepts
                 .values()
@@ -1275,11 +1361,16 @@ pub struct TargetFetchOwner {
     pending: TargetFetchState,
 }
 
+impl Drop for TargetFetchOwner {
+    fn drop(&mut self) {
+        self.config.revoke_wait_lifetimes();
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TargetFetchSubresourceInterceptionSnapshot {
     enabled: bool,
     event_session_id: Option<String>,
-    handle_auth_requests: bool,
     fetch_sessions: BTreeMap<Option<String>, TargetFetchSessionConfig>,
     fetch_session_order: Vec<Option<String>>,
     patterns: Vec<FetchInterceptionPattern>,
@@ -1314,6 +1405,19 @@ impl TargetFetchSubresourceInterceptionSnapshot {
         self.fetch_session_order
             .iter()
             .filter_map(|session_id| self.fetch_sessions.get_key_value(session_id))
+    }
+
+    pub(crate) fn fetch_session_ids(
+        &self,
+        default_session_id: Option<&str>,
+    ) -> Vec<Option<String>> {
+        self.ordered_fetch_sessions()
+            .map(|(session_id, _)| {
+                session_id
+                    .clone()
+                    .or_else(|| default_session_id.map(str::to_owned))
+            })
+            .collect()
     }
 
     pub(crate) fn event_session_id<'a>(
@@ -1607,11 +1711,7 @@ impl TargetFetchSubresourceInterceptionSnapshot {
         &self,
         url: &Url,
     ) -> Option<PendingSubresourceFetchOwnerKind> {
-        if self
-            .fetch_sessions
-            .values()
-            .any(|config| config.handle_auth_requests)
-        {
+        if fetch_sessions_handle_auth_requests(&self.fetch_sessions) {
             return Some(PendingSubresourceFetchOwnerKind::Fetch);
         }
         (!matching_auth_required_network_intercepts(&self.network_intercepts, url).is_empty())
@@ -1631,7 +1731,7 @@ impl TargetFetchSubresourceInterceptionSnapshot {
     }
 
     pub(crate) fn matches_auth_required(&self, url: &Url) -> bool {
-        matches_auth_required(self.handle_auth_requests, &self.network_intercepts, url)
+        matches_auth_required(&self.fetch_sessions, &self.network_intercepts, url)
     }
 
     pub(crate) fn matching_auth_required_network_intercepts(
@@ -1639,6 +1739,19 @@ impl TargetFetchSubresourceInterceptionSnapshot {
         url: &Url,
     ) -> Vec<DevToolsNetworkInterceptId> {
         matching_auth_required_network_intercepts(&self.network_intercepts, url)
+    }
+
+    pub(crate) fn has_request_stage_candidate(
+        &self,
+        resource_type: DevToolsNetworkResourceType,
+    ) -> bool {
+        self.enabled
+            && self.patterns.iter().any(|pattern| {
+                pattern.request_stage == FetchRequestStage::Request
+                    && pattern
+                        .resource_type_filter
+                        .is_none_or(|filter| filter.matches_resource_type(resource_type))
+            })
     }
 
     pub(crate) fn has_response_stage_candidate(
@@ -1685,20 +1798,37 @@ fn matching_network_intercepts(
         .collect()
 }
 
+/// Effective auth URL patterns shared by renderer eligibility and per-request
+/// matching. Fetch handlers and network rules contribute independently.
+fn auth_interception_url_patterns(
+    fetch_handles_auth_requests: bool,
+    intercepts: &BTreeMap<String, TargetNetworkInterceptConfig>,
+) -> impl Iterator<Item = &str> {
+    let all_urls = fetch_handles_auth_requests.then_some("*");
+    all_urls.into_iter().chain(
+        intercepts
+            .values()
+            .filter(|intercept| intercept.handle_auth_requests)
+            .flat_map(|intercept| intercept.auth_url_patterns.iter().map(String::as_str)),
+    )
+}
+
 fn matches_auth_required(
-    handle_auth_requests: bool,
+    fetch_sessions: &BTreeMap<Option<String>, TargetFetchSessionConfig>,
     intercepts: &BTreeMap<String, TargetNetworkInterceptConfig>,
     url: &Url,
 ) -> bool {
-    if !handle_auth_requests {
-        return false;
-    }
-    if intercepts.is_empty() {
-        return true;
-    }
-    intercepts
-        .values()
-        .any(|intercept| network_intercept_matches_auth_required(intercept, url))
+    auth_interception_url_patterns(
+        fetch_sessions_handle_auth_requests(fetch_sessions),
+        intercepts,
+    )
+    .any(|pattern| url_pattern_matches(pattern, url.as_str()))
+}
+
+fn fetch_sessions_handle_auth_requests(
+    sessions: &BTreeMap<Option<String>, TargetFetchSessionConfig>,
+) -> bool {
+    sessions.values().any(|config| config.handle_auth_requests)
 }
 
 fn matching_auth_required_network_intercepts(
@@ -1724,6 +1854,12 @@ fn network_intercept_matches_auth_required(
 }
 
 impl TargetFetchOwner {
+    pub(crate) fn subresource_response_is_paused(&self, request_id: &str) -> bool {
+        self.pending
+            .pending_subresource_fetch_responses
+            .contains_key(request_id)
+    }
+
     pub(crate) fn pending_state(&self) -> &TargetFetchState {
         &self.pending
     }
@@ -1764,7 +1900,6 @@ impl TargetFetchOwner {
         self.config.remove_network_intercept(intercept_id)
     }
 
-    #[cfg(test)]
     pub(crate) fn reset_config(&mut self) {
         self.config.reset();
     }
@@ -1826,7 +1961,7 @@ impl TargetFetchOwner {
 
     pub(crate) fn subresource_interception_config(
         &self,
-    ) -> (bool, Option<moli_core::page::SubresourceResourceType>) {
+    ) -> moli_core::page::SubresourceInterceptionClasses {
         self.config.subresource_interception_config()
     }
 
@@ -1851,6 +1986,13 @@ impl TargetFetchOwner {
         {
             self.pending.pending_fetch_request_ids.remove(&request_id);
         }
+    }
+
+    pub(crate) fn take_superseded_document_navigations(
+        &mut self,
+        current: &DocumentNavigationToken,
+    ) -> Vec<(Option<DocumentNavigationToken>, NavigationDispatchState)> {
+        self.pending.take_superseded_document_navigations(current)
     }
 
     pub(crate) fn consume_pending_request_action(
@@ -1887,6 +2029,7 @@ impl TargetFetchOwner {
             .register_pending_fetch_auth_navigation(request_id, pending);
     }
 
+    #[cfg(test)]
     pub(crate) fn register_pending_fetch_response_navigation(
         &mut self,
         request_id: String,
@@ -1902,20 +2045,20 @@ impl TargetFetchOwner {
         );
     }
 
-    pub(crate) fn take_pending_fetch_response_transfer_for_terminal_action(
+    pub(crate) fn take_fetch_response_transfer_for_cancellation(
         &mut self,
         request_id: &str,
     ) -> Option<PausedDocumentTransfer> {
         self.pending
-            .take_pending_fetch_response_transfer_for_terminal_action(request_id)
+            .take_fetch_response_transfer_for_cancellation(request_id)
     }
 
-    pub(crate) fn take_pending_fetch_response_transfer(
+    pub(crate) fn take_available_fetch_response_transfer(
         &mut self,
         request_id: &str,
     ) -> Option<PausedDocumentTransfer> {
         self.pending
-            .take_pending_fetch_response_transfer(request_id)
+            .take_available_fetch_response_transfer(request_id)
     }
 
     pub(crate) fn register_pending_fetch_response_transfer(
@@ -1972,6 +2115,16 @@ impl TargetFetchOwner {
             .take_pending_subresource_fetch_response_request(request_id, session_id)
     }
 
+    pub(crate) fn rollback_in_flight_subresource_fetch_request(
+        &mut self,
+        internal_id: u64,
+        network_request_id: &str,
+    ) {
+        self.pending
+            .rollback_in_flight_subresource_fetch_request(internal_id, network_request_id);
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_in_flight_subresource_fetch_request(
         &mut self,
         internal_id: u64,
@@ -2077,7 +2230,7 @@ impl TargetFetchOwner {
         runtime_slot: &mut TargetRuntimeSlot,
         request_id: &str,
         handle: String,
-    ) -> Result<Option<String>, String> {
+    ) -> anyhow::Result<Option<String>> {
         self.pending
             .open_pending_fetch_response_body_stream(runtime_slot, request_id, handle)
     }
@@ -2090,6 +2243,22 @@ impl TargetFetchOwner {
     ) -> PendingFetchResponseBodyStreamReadStart {
         self.pending
             .start_pending_fetch_response_body_stream_read(handle, offset, size)
+    }
+
+    pub(crate) fn start_pending_fetch_response_body_read(
+        &mut self,
+        request_id: &str,
+    ) -> Option<PendingDocumentBodyRead> {
+        self.pending
+            .start_pending_fetch_response_body_read(request_id)
+    }
+
+    pub(crate) fn finish_pending_fetch_response_body_read<T>(
+        &mut self,
+        completed: CompletedDocumentBodyRead<T>,
+    ) -> Option<anyhow::Result<T>> {
+        self.pending
+            .finish_pending_fetch_response_body_read(completed)
     }
 
     pub(crate) fn finish_pending_fetch_response_body_stream_read(
@@ -2166,17 +2335,6 @@ impl TargetFetchOwner {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_fetch_response_prepared_renderer_agent_for_test(
-        &self,
-        request_id: &str,
-    ) -> Option<moli_core::page::RendererDevToolsAgentToken> {
-        self.pending
-            .pending_fetch_response_transfers
-            .get(request_id)
-            .and_then(PausedDocumentTransfer::prepared_renderer_agent_token)
-    }
-
-    #[cfg(test)]
     pub(crate) fn active_fetch_response_body_stream_request_id_for_test(
         &self,
         handle: &str,
@@ -2186,30 +2344,14 @@ impl TargetFetchOwner {
             .active_body_stream_request_id(handle)
     }
 
-    pub(crate) fn drain_pending_requests(
-        &mut self,
-    ) -> (
-        Vec<PendingFetchNavigation>,
-        Vec<PendingFetchAuthNavigation>,
-        Vec<PausedDocumentTransfer>,
-        Vec<(String, PendingSubresourceFetchRequest)>,
-        Vec<(String, PendingSubresourceFetchAuthRequest)>,
-        Vec<(String, PendingSubresourceFetchResponseRequest)>,
-    ) {
+    pub(crate) fn drain_pending_requests(&mut self) -> DrainedFetchRequests {
         self.pending.drain_pending_requests()
     }
 
     pub(crate) fn drain_pending_requests_for_disable_session(
         &mut self,
         session_id: Option<&str>,
-    ) -> (
-        Vec<PendingFetchNavigation>,
-        Vec<PendingFetchAuthNavigation>,
-        Vec<PausedDocumentTransfer>,
-        Vec<(String, PendingSubresourceFetchRequest)>,
-        Vec<(String, PendingSubresourceFetchAuthRequest)>,
-        Vec<(String, PendingSubresourceFetchResponseRequest)>,
-    ) {
+    ) -> DrainedFetchRequests {
         self.pending
             .drain_pending_requests_for_disable_session(session_id)
     }
@@ -2222,12 +2364,57 @@ impl TargetFetchOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod supersession;
     use crate::conn::{
         CapturedBody, FetchAuthChallenge, NavigationResultProjection,
         PendingSubresourceFetchAuthStage, PendingSubresourceFetchAuthStageChain,
         PendingSubresourceFetchRequestStage, PendingSubresourceFetchRequestStageChain,
     };
     use moli_core::page::SubresourceResourceType;
+
+    #[test]
+    fn fetch_handler_wait_lifetime_survives_updates_but_not_disable_or_owner_exit() {
+        let mut owner = TargetFetchOwner::default();
+        owner.configure(Some("first".into()), false, Vec::new());
+        owner.configure(Some("second".into()), false, Vec::new());
+        let first = owner.config.command_wait_lifetime(Some("first")).unwrap();
+        let second = owner.config.command_wait_lifetime(Some("second")).unwrap();
+        owner.configure(Some("first".into()), true, Vec::new());
+        assert!(
+            first.is_active(),
+            "updating an existing handler does not revoke it"
+        );
+        let retained_snapshot = owner.config_snapshot();
+        assert!(owner.remove_fetch_session(Some("first")));
+        assert!(!first.is_active());
+        assert!(
+            second.is_active(),
+            "disabling first does not close another handler"
+        );
+        owner.configure(Some("first".into()), false, Vec::new());
+        let replacement = owner.config.command_wait_lifetime(Some("first")).unwrap();
+        assert!(replacement.is_active());
+        assert!(
+            !first.is_active(),
+            "re-enabling the same session cannot revive an old wait"
+        );
+        let second_snapshot = owner.config_snapshot();
+        drop(owner);
+        assert!(!replacement.is_active());
+        assert!(!second.is_active());
+        assert!(
+            !retained_snapshot
+                .command_wait_lifetime(Some("first"))
+                .unwrap()
+                .is_active()
+        );
+        assert!(
+            !second_snapshot
+                .command_wait_lifetime(Some("first"))
+                .unwrap()
+                .is_active()
+        );
+    }
 
     fn test_url(path: &str) -> Url {
         Url::parse(&format!("https://example.test/{path}")).unwrap()
@@ -2258,9 +2445,7 @@ mod tests {
         owner_kind: PendingSubresourceFetchOwnerKind,
     ) -> PendingSubresourceFetchRequest {
         PendingSubresourceFetchRequest {
-            residence: crate::conn::PendingSubresourceFetchResidence::InstalledPage(
-                test_page_owner(),
-            ),
+            residence: crate::conn::PendingSubresourceFetchResidence::Page(test_page_owner()),
             owner_session_id: owner_session_id.map(str::to_owned),
             action_session_id: owner_session_id.map(str::to_owned),
             owner_kind,
@@ -2292,6 +2477,7 @@ mod tests {
         owner_kind: PendingSubresourceFetchOwnerKind,
     ) -> PendingSubresourceFetchAuthRequest {
         PendingSubresourceFetchAuthRequest {
+            command_target: None,
             page_owner: test_page_owner(),
             owner_session_id: owner_session_id.map(str::to_owned),
             action_session_id: owner_session_id.map(str::to_owned),
@@ -2305,7 +2491,7 @@ mod tests {
             websocket_socket_id: None,
             url: test_url("auth"),
             method: "GET".to_owned(),
-            request_headers: Vec::new(),
+            request_headers: Vec::new().into(),
             request_body: None,
             request_cookie_report: None,
             challenge: FetchAuthChallenge {
@@ -2336,6 +2522,7 @@ mod tests {
         owner_kind: PendingSubresourceFetchOwnerKind,
     ) -> PendingSubresourceFetchResponseRequest {
         PendingSubresourceFetchResponseRequest {
+            command_target: None,
             page_owner: test_page_owner(),
             owner_session_id: owner_session_id.map(str::to_owned),
             action_session_id: owner_session_id.map(str::to_owned),
@@ -2349,7 +2536,7 @@ mod tests {
             websocket_socket_id: None,
             url: test_url("response"),
             method: "GET".to_owned(),
-            request_headers: Vec::new(),
+            request_headers: Vec::new().into(),
             request_body: None,
             request_cookie_report: None,
             response_status: 200,
@@ -2366,6 +2553,7 @@ mod tests {
         owner_session_id: Option<&str>,
     ) -> PendingFetchAuthNavigation {
         PendingFetchAuthNavigation {
+            auth_retry_budget: Default::default(),
             owner_session_id: owner_session_id.map(str::to_owned),
             action_session_id: owner_session_id.map(str::to_owned),
             interception_session_id: owner_session_id.map(str::to_owned),
@@ -2374,6 +2562,12 @@ mod tests {
             response_stage_request_id: request_id.to_owned(),
             document_navigation_token: None,
             navigation: NavigationDispatchState {
+                web_mcp_invocation: None,
+                navigation_initiator: None,
+                initial_document_environment: None,
+                auxiliary_document_response: None,
+                redirect_chain: Vec::new(),
+                redirect_headers: None,
                 navigate_id: Some(1),
                 owner: owner_session_id
                     .map(crate::conn::CommandOwnerScope::for_session)
@@ -2390,11 +2584,12 @@ mod tests {
                 request_id: Some(format!("NETWORK-{request_id}")),
                 loader_id: "LOADER-1".to_owned(),
                 request_announced: false,
+                announced_redirects: 0,
                 requested_url: test_url("auth-page"),
                 request_method: "GET".to_owned(),
                 request_body: None,
                 request_body_bytes: None,
-                request_headers: Vec::new(),
+                request_headers: Vec::new().into(),
                 request_load_policy: crate::conn::NavigationRequestLoadPolicy::DocumentInitiated,
                 timestamp: 0.0,
                 source_document_security: Default::default(),
@@ -2414,6 +2609,73 @@ mod tests {
     }
 
     #[test]
+    fn native_completion_retires_pause_ids_only_for_the_matching_request_and_page() {
+        let mut fetch = TargetFetchState::default();
+        let page = test_page_owner();
+        let replacement = crate::conn::TargetPageResidenceIdentity::new_for_test(
+            page.browser_context_id().to_owned(),
+            page.target_id().map(str::to_owned),
+            2,
+        );
+        for (name, internal_id, page, session) in [
+            ("matching-a", 7, &page, "SID-A"),
+            ("matching-b", 7, &page, "SID-B"),
+            ("other-page", 7, &replacement, "SID-A"),
+            ("other-request", 8, &page, "SID-A"),
+        ] {
+            let mut auth = pending_subresource_auth(internal_id, Some(session));
+            auth.page_owner = page.clone();
+            fetch.register_pending_subresource_fetch_auth_request(format!("AUTH-{name}"), auth);
+            let mut response = pending_subresource_response(internal_id, Some(session));
+            response.page_owner = page.clone();
+            fetch.register_pending_subresource_fetch_response_request(
+                format!("RESP-{name}"),
+                response,
+            );
+        }
+
+        assert!(
+            fetch
+                .claim_subresource_continue_request(&page, 7, Some("SID-A"), false)
+                .is_none()
+        );
+        assert_eq!(fetch.pending_fetch_request_ids.len(), 8);
+        assert_eq!(fetch.pending_subresource_fetch_auths.len(), 4);
+        assert_eq!(fetch.pending_subresource_fetch_responses.len(), 4);
+
+        let _ = fetch.claim_subresource_continue_request(&page, 7, Some("SID-A"), true);
+        assert_eq!(fetch.pending_subresource_fetch_auths.len(), 2);
+        assert_eq!(fetch.pending_subresource_fetch_responses.len(), 2);
+        assert_eq!(
+            fetch.pending_fetch_request_ids,
+            HashSet::from([
+                "AUTH-other-page".to_owned(),
+                "RESP-other-page".to_owned(),
+                "AUTH-other-request".to_owned(),
+                "RESP-other-request".to_owned(),
+            ]),
+            "native completion must retire every handler's id without touching other requests"
+        );
+        for id in [
+            "AUTH-matching-a",
+            "RESP-matching-a",
+            "AUTH-matching-b",
+            "RESP-matching-b",
+        ] {
+            assert_eq!(
+                fetch.consume_pending_request_action(id),
+                Err("RequestNotFound")
+            );
+        }
+
+        let _ = fetch.claim_subresource_continue_request(&page, 7, Some("SID-A"), true);
+        assert_eq!(fetch.pending_fetch_request_ids.len(), 4);
+        let _ = fetch.claim_subresource_continue_request(&replacement, 7, Some("SID-A"), true);
+        let _ = fetch.claim_subresource_continue_request(&page, 8, Some("SID-A"), true);
+        assert!(fetch.is_empty());
+    }
+
+    #[test]
     fn disable_session_drain_preserves_other_session_subresource_pending_state() {
         let mut owner = TargetFetchOwner::default();
         owner.register_pending_subresource_fetch_request(
@@ -2423,22 +2685,26 @@ mod tests {
 
         let mut pending_b = pending_subresource_fetch(2, Some("SID-B"));
         pending_b.request_stage_chain = Some(Box::new(PendingSubresourceFetchRequestStageChain {
+            header_override: None,
             url: test_url("api"),
             method: "GET".to_owned(),
-            headers: Vec::new(),
+            headers: Vec::new().into(),
             body: None,
+            body_override: None,
             request_cookie_report: None,
             remaining_sessions: vec![
                 PendingSubresourceFetchRequestStage {
                     session_id: Some("SID-A".to_owned()),
                     owner_kind: PendingSubresourceFetchOwnerKind::Fetch,
                     request_id: "FETCH-A-LATER".to_owned(),
+                    redirected_request_id: None,
                     blocked_intercepts: Vec::new(),
                 },
                 PendingSubresourceFetchRequestStage {
                     session_id: Some("SID-C".to_owned()),
                     owner_kind: PendingSubresourceFetchOwnerKind::Fetch,
                     request_id: "FETCH-C-LATER".to_owned(),
+                    redirected_request_id: None,
                     blocked_intercepts: Vec::new(),
                 },
             ],
@@ -2472,14 +2738,14 @@ mod tests {
             ResponseStageUrlMatchPolicy::MatchFinalUrl,
         );
 
-        let (
-            pending_navigations,
-            pending_auth_navigations,
-            pending_response_navigations,
-            pending_fetches,
-            pending_auths,
-            pending_responses,
-        ) = owner.drain_pending_requests_for_disable_session(Some("SID-A"));
+        let DrainedFetchRequests {
+            navigations: pending_navigations,
+            auth_navigations: pending_auth_navigations,
+            response_transfers: pending_response_navigations,
+            subresource_requests: pending_fetches,
+            subresource_auth_requests: pending_auths,
+            subresource_responses: pending_responses,
+        } = owner.drain_pending_requests_for_disable_session(Some("SID-A"));
 
         assert!(pending_navigations.is_empty());
         assert!(pending_auth_navigations.is_empty());
@@ -2556,8 +2822,10 @@ mod tests {
         }));
         owner.register_pending_fetch_auth_navigation("AUTH-B".to_owned(), pending);
 
-        let (_, pending_auth_navigations, _, _, _, _) =
-            owner.drain_pending_requests_for_disable_session(Some("SID-A"));
+        let DrainedFetchRequests {
+            auth_navigations: pending_auth_navigations,
+            ..
+        } = owner.drain_pending_requests_for_disable_session(Some("SID-A"));
 
         assert!(
             pending_auth_navigations.is_empty(),
@@ -2593,22 +2861,26 @@ mod tests {
         );
         network_owned_pending.request_stage_chain =
             Some(Box::new(PendingSubresourceFetchRequestStageChain {
+                header_override: None,
                 url: test_url("api"),
                 method: "GET".to_owned(),
-                headers: Vec::new(),
+                headers: Vec::new().into(),
                 body: None,
+                body_override: None,
                 request_cookie_report: None,
                 remaining_sessions: vec![
                     PendingSubresourceFetchRequestStage {
                         session_id: Some("SID-A".to_owned()),
                         owner_kind: PendingSubresourceFetchOwnerKind::Fetch,
                         request_id: "FETCH-STAGE-SAME-SESSION".to_owned(),
+                        redirected_request_id: None,
                         blocked_intercepts: Vec::new(),
                     },
                     PendingSubresourceFetchRequestStage {
                         session_id: Some("SID-A".to_owned()),
                         owner_kind: PendingSubresourceFetchOwnerKind::NetworkOrBidi,
                         request_id: "NETWORK-STAGE-SAME-SESSION".to_owned(),
+                        redirected_request_id: None,
                         blocked_intercepts: Vec::new(),
                     },
                 ],
@@ -2657,8 +2929,12 @@ mod tests {
             ResponseStageUrlMatchPolicy::MatchFinalUrl,
         );
 
-        let (_, _, _, pending_fetches, pending_auths, pending_responses) =
-            owner.drain_pending_requests_for_disable_session(Some("SID-A"));
+        let DrainedFetchRequests {
+            subresource_requests: pending_fetches,
+            subresource_auth_requests: pending_auths,
+            subresource_responses: pending_responses,
+            ..
+        } = owner.drain_pending_requests_for_disable_session(Some("SID-A"));
 
         assert_eq!(pending_fetches.len(), 1);
         assert_eq!(pending_fetches[0].0, "FETCH-OWNED");

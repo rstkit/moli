@@ -1,13 +1,14 @@
+use crate::web_api_interfaces;
 use moli_storage_service::StorageBucketLocator;
+use moli_v8_util::reject_promise_with_type_error as reject_type_error;
 use moli_webapi_declare::{WebApiFunctionTemplate, WebApiObject};
 
 use super::opfs::resolve_opfs_root_with_handle_access;
 use crate::native_bridge::OwnerDispatchScope;
 use crate::opfs_owner_tasks::OpfsHandleAccessContext;
-use crate::util::{context_host_ptr_from_global_bridge, get_private_value, v8_string};
+use crate::util::{context_host_ptr_from_global_bridge, get_private_value};
 use crate::webidl;
 
-const STORAGE_ACCESS_HANDLE_BRAND_SLOT: &str = "__moliStorageAccessHandleBrand";
 const STORAGE_ACCESS_HANDLE_GET_DIRECTORY_SLOT: &str = "__moliStorageAccessHandleGetDirectory";
 const STORAGE_ACCESS_HANDLE_STORAGE_KEY_SLOT: &str = "__moliStorageAccessHandleStorageKey";
 
@@ -110,14 +111,8 @@ impl StorageAccessTypes {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "StorageAccessHandle", require_prototype)]
+#[webapi(interface = web_api_interfaces::StorageAccessHandle, require_prototype)]
 struct StorageAccessHandleObjectDeclaration {
-    #[webapi(
-        slot,
-        name = STORAGE_ACCESS_HANDLE_BRAND_SLOT,
-        constructor_default = true
-    )]
-    brand: bool,
     #[webapi(slot = STORAGE_ACCESS_HANDLE_GET_DIRECTORY_SLOT)]
     get_directory: bool,
     #[webapi(slot = STORAGE_ACCESS_HANDLE_STORAGE_KEY_SLOT)]
@@ -125,7 +120,7 @@ struct StorageAccessHandleObjectDeclaration {
 }
 
 #[derive(Default, WebApiFunctionTemplate)]
-#[webapi(name = "StorageAccessHandle", enumerable)]
+#[webapi(interface = web_api_interfaces::StorageAccessHandle, enumerable)]
 struct StorageAccessHandlePrototypeDeclaration {
     #[webapi(
         method,
@@ -277,9 +272,7 @@ fn storage_access_handle_get_directory_callback<'s>(
         return;
     };
     rv.set(resolver.get_promise(scope).into());
-    if !get_private_value(scope, args.this(), STORAGE_ACCESS_HANDLE_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-    {
+    if !web_api_interfaces::StorageAccessHandle::is_instance(scope, args.this()) {
         reject_type_error(scope, resolver, "Illegal invocation");
         return;
     }
@@ -356,17 +349,6 @@ fn storage_access_handle_get_directory_callback<'s>(
         locator,
         OpfsHandleAccessContext::window(identity, storage_key),
     );
-}
-
-fn reject_type_error<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    resolver: v8::Local<'s, v8::PromiseResolver>,
-    message: &str,
-) {
-    let error = v8_string(scope, message)
-        .map(|message| v8::Exception::type_error(scope, message))
-        .unwrap_or_else(|| v8::undefined(scope).into());
-    let _ = resolver.reject(scope, error);
 }
 
 fn reject_dom_exception<'s>(

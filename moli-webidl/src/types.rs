@@ -3,6 +3,47 @@ use crate::WebIdlDictionary;
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct EnumValue<T>(pub T);
 
+/// A dictionary value converted using its `WebIdlDictionary` implementation.
+///
+/// Null and undefined are parsed as an empty dictionary, including member
+/// defaults and required-member validation. No Rust `Default` is required.
+pub struct Dictionary<T>(pub T);
+
+/// A platform object validated against native WebIDL interface identity.
+///
+/// Argument and dictionary derives unwrap this to `v8::Local<v8::Object>`.
+/// Validation preserves the original object, including registered native proxies.
+#[derive(Debug, Clone, Copy)]
+pub struct InterfaceObject<'s>(pub v8::Local<'s, v8::Object>);
+
+/// Native interface metadata supplied by `#[webidl(interface = Type)]`.
+///
+/// The name comes from `Type::NAME` and the predicate defaults to
+/// `Type::is_instance`. `brand_check = path` overrides only the predicate.
+/// Predicates must check native identity without invoking author code.
+#[derive(Clone, Copy)]
+pub struct InterfaceOptions {
+    pub name: &'static str,
+    pub brand_check: for<'s, 'i> fn(&mut v8::PinScope<'s, 'i>, v8::Local<'s, v8::Object>) -> bool,
+}
+
+impl Default for InterfaceOptions {
+    /// Without explicit interface metadata, conversion rejects every object.
+    fn default() -> Self {
+        Self {
+            name: "interface",
+            brand_check: |_, _| false,
+        }
+    }
+}
+
+/// WebIDL Uint8Array conversion policy. Resizable and growable buffers are
+/// rejected; fixed shared storage requires an explicit `[AllowShared]` opt-in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Uint8ArrayOptions {
+    pub allow_shared: bool,
+}
+
 /// WebIDL `DOMString` represented at the Rust boundary as UTF-8 `String`.
 ///
 /// This intentionally follows Deno's practical boundary model rather than
@@ -11,6 +52,11 @@ pub struct EnumValue<T>(pub T);
 /// as lone surrogates are not preserved once the value crosses into Rust.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DomString(pub String);
+
+/// Lossless WebIDL DOMString storage for APIs whose identity depends on the
+/// original UTF-16 units, including unpaired surrogates.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DomString16(pub Vec<u16>);
 
 impl From<DomString> for String {
     fn from(value: DomString) -> Self {
@@ -129,6 +175,10 @@ impl From<&[u8]> for BufferSource {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Boolean(pub bool);
 
+/// WebIDL octet with the default modulo-256 integer conversion.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Octet(pub u8);
+
 impl From<Boolean> for bool {
     fn from(value: Boolean) -> Self {
         value.0
@@ -143,8 +193,15 @@ pub struct EventListenerOptions {
 }
 
 #[derive(WebIdlDictionary)]
-#[webidl(prefix = "AddEventListenerOptions")]
+#[webidl(prefix = "EventListenerOptions")]
 pub(crate) struct EventListenerOptionsMembers {
+    #[webidl(default = false)]
+    pub(crate) capture: bool,
+}
+
+#[derive(WebIdlDictionary)]
+#[webidl(prefix = "AddEventListenerOptions")]
+pub(crate) struct AddEventListenerOptionsMembers {
     #[webidl(default = false)]
     pub(crate) capture: bool,
     #[webidl(default = false)]
@@ -157,6 +214,25 @@ pub struct UnrestrictedDouble(pub f64);
 
 impl From<UnrestrictedDouble> for f64 {
     fn from(value: UnrestrictedDouble) -> Self {
+        value.0
+    }
+}
+
+/// A binary32 WebIDL number that permits infinities and NaN after rounding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnrestrictedFloat(pub f32);
+
+impl From<UnrestrictedFloat> for f32 {
+    fn from(value: UnrestrictedFloat) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Float(pub f32);
+
+impl From<Float> for f32 {
+    fn from(value: Float) -> Self {
         value.0
     }
 }
@@ -197,11 +273,38 @@ impl From<UnsignedLong> for u32 {
     }
 }
 
+/// WebIDL `[Clamp] long long`, bounded by JavaScript's exact integer range.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ClampedLongLong(pub i64);
+
+impl From<ClampedLongLong> for i64 {
+    fn from(value: ClampedLongLong) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct ClampedUnsignedLong(pub u32);
+impl From<ClampedUnsignedLong> for u32 {
+    fn from(value: ClampedUnsignedLong) -> Self {
+        value.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct EnforceRangeUnsignedLong(pub u32);
 
 impl From<EnforceRangeUnsignedLong> for u32 {
     fn from(value: EnforceRangeUnsignedLong) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Short(pub i16);
+
+impl From<Short> for i16 {
+    fn from(value: Short) -> Self {
         value.0
     }
 }
@@ -215,11 +318,30 @@ impl From<UnsignedShort> for u16 {
     }
 }
 
+/// WebIDL `[EnforceRange] unsigned short`, truncating before the range check.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct EnforceRangeUnsignedShort(pub u16);
+
+impl From<EnforceRangeUnsignedShort> for u16 {
+    fn from(value: EnforceRangeUnsignedShort) -> Self {
+        value.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ClampedUnsignedShort(pub u16);
 
 impl From<ClampedUnsignedShort> for u16 {
     fn from(value: ClampedUnsignedShort) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct LongLong(pub i64);
+
+impl From<LongLong> for i64 {
+    fn from(value: LongLong) -> Self {
         value.0
     }
 }
@@ -238,6 +360,14 @@ pub struct EnforceRangeUnsignedLongLong(pub u64);
 
 impl From<EnforceRangeUnsignedLongLong> for u64 {
     fn from(value: EnforceRangeUnsignedLongLong) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct EnforceRangeLongLong(pub i64);
+impl From<EnforceRangeLongLong> for i64 {
+    fn from(value: EnforceRangeLongLong) -> Self {
         value.0
     }
 }

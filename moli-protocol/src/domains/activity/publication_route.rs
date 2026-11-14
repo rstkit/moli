@@ -42,12 +42,47 @@ pub(crate) enum RendererPublicationRoute {
 }
 
 /// A current Page can project its complete renderer stream. A replaced Page
-/// remains routable only for final Network facts whose request correlations
-/// are retained by the target; every other historical record is stale.
+/// remains routable for final Network facts and terminal command responses
+/// whose exact correlations are retained by the target/session. Other
+/// historical records must not affect the replacement document.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RendererPublicationProjection {
     CurrentOwner,
-    RetiringNetworkOnly,
+    RetiringNetworkAndResponses,
+}
+
+impl RendererPublicationProjection {
+    /// Retirement revokes new document actions and notifications, not the
+    /// obligation to deliver a terminal response. The pending-call registry
+    /// still decides whether its exact attachment/call is owed, and consumes
+    /// that correlation once. Network records retain their own document check.
+    pub(super) fn admit_record(self, item: &mut moli_core::RendererOutputItem) -> bool {
+        use moli_core::{RendererOutputItem, RendererProtocolObservation};
+        if self == Self::CurrentOwner {
+            return true;
+        }
+        match item {
+            RendererOutputItem::NativeTerminal(_) => true,
+            RendererOutputItem::OwnerAction(
+                moli_core::RendererOwnerAction::DedicatedWorkerTargetLifecycle(
+                    moli_core::page::RendererDedicatedWorkerTargetEvent::Destroyed { .. },
+                ),
+            ) => true,
+            RendererOutputItem::Observation(RendererProtocolObservation::Network { .. }) => true,
+            RendererOutputItem::Observation(RendererProtocolObservation::RuntimeInspector(
+                batch,
+            )) => {
+                batch.messages.retain(|message| {
+                    matches!(message,
+                        moli_core::page::RendererRuntimeInspectorMessage::Protocol(message)
+                            if message.renderer_call_id().is_some()
+                    )
+                });
+                !batch.messages.is_empty()
+            }
+            _ => false,
+        }
+    }
 }
 
 impl RendererPublicationRoute {
@@ -155,7 +190,7 @@ impl RendererPublicationOwner {
                             *renderer_page,
                             page_owner.page_attachment_id(),
                         ) {
-                            Some(RendererPublicationProjection::RetiringNetworkOnly)
+                            Some(RendererPublicationProjection::RetiringNetworkAndResponses)
                         } else {
                             None
                         }
@@ -165,6 +200,20 @@ impl RendererPublicationOwner {
                          route_target_id: String,
                          session_id: Option<String>| {
                             projection_for(runtime_slot).map(|projection| {
+                                // Preparing an attachment can declare the primary
+                                // before its frontend route commits. Keep the Page
+                                // source usable for other sessions during that wait.
+                                let session_id = session_id.filter(|session_id| {
+                                    matches!(
+                                        conn.session_route(Some(session_id)),
+                                        Some(CdpSessionRoute::PageTarget {
+                                            browser_context_id,
+                                            target_id,
+                                            session_key: moli_page_types::DevToolsSessionKey::Primary,
+                                        }) if browser_context_id == browser_context.id
+                                            && target_id == route_target_id
+                                    )
+                                });
                                 RendererPublicationRoute::for_target(
                                     browser_context.id.clone(),
                                     route_target_id,

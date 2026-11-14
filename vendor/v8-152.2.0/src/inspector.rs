@@ -82,6 +82,15 @@ unsafe extern "C" {
   );
 
   fn v8_inspector__V8InspectorSession__DELETE(this: *mut RawV8InspectorSession);
+  fn v8_inspector__V8InspectorSession__stop(session: *mut RawV8InspectorSession);
+  fn v8_inspector__V8InspectorSession__resume(
+    session: *mut RawV8InspectorSession,
+    terminate_on_resume: bool,
+  );
+  fn v8_inspector__V8InspectorSession__setSkipAllPauses(
+    session: *mut RawV8InspectorSession,
+    skip: bool,
+  );
   fn v8_inspector__V8InspectorSession__dispatchProtocolMessage(
     session: *mut RawV8InspectorSession,
     message: StringView,
@@ -962,6 +971,32 @@ impl V8InspectorSession {
         reason,
         detail,
       );
+    }
+  }
+
+  /// Stops this session's debugger agent without resuming other sessions that
+  /// still accept a pause. Inspector objects are released on session drop.
+  pub fn stop(&self) {
+    unsafe { v8_inspector__V8InspectorSession__stop(self.raw.as_ptr()) };
+  }
+
+  /// Resumes paused execution, optionally terminating it as it unwinds.
+  pub fn resume(&self, terminate_on_resume: bool) {
+    unsafe {
+      v8_inspector__V8InspectorSession__resume(
+        self.raw.as_ptr(),
+        terminate_on_resume,
+      );
+    }
+  }
+
+  /// Sets the session's pause policy, including before Debugger is enabled.
+  ///
+  /// This is the native equivalent of `Debugger.setSkipAllPauses`. Subsequent
+  /// protocol commands and session state restoration remain under V8's control.
+  pub fn set_skip_all_pauses(&self, skip: bool) {
+    unsafe {
+      v8_inspector__V8InspectorSession__setSkipAllPauses(self.raw.as_ptr(), skip);
     }
   }
 

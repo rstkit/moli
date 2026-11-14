@@ -1,6 +1,6 @@
 use crate::document_runtime::{DocumentSubresourceCspKind, DomHandle};
 use crate::dom::native::Node;
-use crate::native_bridge::{ImageLoadEventId, JsContextHost, WindowDocumentTaskTarget};
+use crate::native_bridge::{ImageLoadEventId, PageScriptHost, WindowDocumentTaskTarget};
 use crate::page_task_queue::{
     PageImageLoadEventTargetEffect, RendererPageImageLoadEventKind,
     RendererPageImageLoadEventTaskId,
@@ -9,7 +9,7 @@ use crate::types::{ImageRequestCorsMode, ImageRequestKey, SubresourceRequestInit
 use crate::util::v8_string;
 use moli_browser_profile::DEFAULT_WINDOW_SURFACE_PROFILE;
 
-use crate::context_bootstrap::evaluate_match_media_query_list_with_viewport;
+use crate::style_engine::media_list::evaluate_media_query_list;
 
 use super::super::super::node::node_runtime_and_handle_from_object_or_detached;
 use super::super::geometry::compute_mock_client_rect;
@@ -25,7 +25,7 @@ enum ImageLoadQueueTrigger {
 
 pub(crate) fn queue_image_load_event_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     queue_image_load_event(
@@ -39,7 +39,7 @@ pub(crate) fn queue_image_load_event_if_needed(
 
 pub(crate) fn queue_image_load_event_after_document_adoption(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     queue_image_load_event(
@@ -53,7 +53,7 @@ pub(crate) fn queue_image_load_event_after_document_adoption(
 
 pub(crate) fn queue_image_load_event_if_needed_with_initiator(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     request_initiator_type: SubresourceRequestInitiatorType,
 ) {
@@ -68,7 +68,7 @@ pub(crate) fn queue_image_load_event_if_needed_with_initiator(
 
 pub(crate) fn queue_revealed_lazy_image_loads(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     document: DomHandle,
 ) {
     let handles = {
@@ -92,7 +92,7 @@ pub(crate) fn queue_revealed_lazy_image_loads(
 
 pub(crate) fn queue_image_load_event_for_loading_change(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     queue_image_load_event(
@@ -106,7 +106,7 @@ pub(crate) fn queue_image_load_event_for_loading_change(
 
 fn queue_image_load_event(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     trigger: ImageLoadQueueTrigger,
     request_initiator_type: SubresourceRequestInitiatorType,
@@ -163,6 +163,32 @@ fn queue_image_load_event(
         let _ = runtime.process_image_decode_requests_for_element(scope, handle);
         return;
     };
+    let request_url = if invalid_empty_source {
+        Err("an empty image source cannot be fetched".to_owned())
+    } else {
+        url::Url::parse(&selected_source).map_err(|error| error.to_string())
+    };
+    // Cached pixels must pass the requesting element's current Document policy
+    // before they can satisfy its load or decode work.
+    if let Ok(request_url) = &request_url
+        && runtime
+            .check_element_subresource_csp(
+                scope,
+                handle,
+                request_url,
+                DocumentSubresourceCspKind::Image,
+            )
+            .blocks_request()
+    {
+        let followup = runtime.complete_pending_image_load_local_resource_if_matches(
+            handle,
+            pending.id(),
+            false,
+        );
+        queue_image_load_terminal_followup_if_ready(runtime_ptr, handle, pending.id(), followup);
+        let _ = runtime.process_image_decode_requests_for_element(scope, handle);
+        return;
+    }
     // Register the current request before reconsidering decode() promises. An
     // image may receive src and decode() while detached, then be inserted in
     // the same script job. Processing the promise before this registration
@@ -176,46 +202,17 @@ fn queue_image_load_event(
         queue_image_load_terminal_followup_if_ready(runtime_ptr, handle, pending.id(), followup);
         return;
     }
-    let start = if invalid_empty_source {
-        Err("an empty image source cannot be fetched".to_owned())
-    } else {
-        url::Url::parse(&selected_source)
-            .map_err(|error| error.to_string())
-            .and_then(|request_url| {
-                if runtime
-                    .check_top_document_subresource_csp(
-                        scope,
-                        &request_url,
-                        DocumentSubresourceCspKind::Image,
-                    )
-                    .blocks_request()
-                {
-                    return Ok(crate::network_host::ImageElementResourceFetchStart::Failed);
-                }
-                crate::network_host::start_image_element_resource_fetch(
-                    scope,
-                    runtime,
-                    handle,
-                    pending.id(),
-                    request_url,
-                )
-            })
-    };
+    let start = request_url.and_then(|request_url| {
+        crate::network_host::start_image_element_resource_fetch(
+            scope,
+            runtime,
+            handle,
+            pending.id(),
+            request_url,
+        )
+    });
     match start {
         Ok(crate::network_host::ImageElementResourceFetchStart::Pending) => {}
-        Ok(crate::network_host::ImageElementResourceFetchStart::Failed) => {
-            let followup = runtime.complete_pending_image_load_local_resource_if_matches(
-                handle,
-                pending.id(),
-                false,
-            );
-            queue_image_load_terminal_followup_if_ready(
-                runtime_ptr,
-                handle,
-                pending.id(),
-                followup,
-            );
-        }
         Ok(crate::network_host::ImageElementResourceFetchStart::PolicySkipped) => {
             let followup = runtime.complete_pending_image_load_local_resource_if_matches(
                 handle,
@@ -229,13 +226,15 @@ fn queue_image_load_event(
                 followup,
             );
         }
-        Ok(crate::network_host::ImageElementResourceFetchStart::Local { response }) => {
-            let descriptor = crate::network_host::image_response_descriptor(&response);
+        Ok(crate::network_host::ImageElementResourceFetchStart::Local {
+            descriptor,
+            encoded,
+        }) => {
             let completion = runtime.complete_pending_image_load_local_response_if_matches(
                 handle,
                 pending.id(),
                 descriptor,
-                response.body_bytes(),
+                encoded,
             );
             queue_image_load_terminal_followup_if_ready(
                 runtime_ptr,
@@ -266,7 +265,7 @@ fn queue_image_load_event(
     }
 }
 
-pub(crate) fn image_selected_source(runtime: &JsContextHost, handle: DomHandle) -> Option<String> {
+pub(crate) fn image_selected_source(runtime: &PageScriptHost, handle: DomHandle) -> Option<String> {
     image_selected_source_candidate(runtime, handle).map(|candidate| candidate.url)
 }
 
@@ -277,7 +276,7 @@ struct SelectedImageSource {
 }
 
 fn image_selected_source_candidate(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<SelectedImageSource> {
     let node = runtime.dom_host().node(handle)?;
@@ -287,7 +286,7 @@ fn image_selected_source_candidate(
             .attribute("href")
             .or_else(|| element.attribute("xlink:href"))
             .map(str::trim)
-            .filter(|href| !href.is_empty())
+            .filter(|href| image_source_is_fetchable(href))
             .map(|href| SelectedImageSource {
                 url: href.to_owned(),
                 density: 1.0,
@@ -313,7 +312,7 @@ fn image_selected_source_candidate(
     element
         .attribute("src")
         .map(str::trim)
-        .filter(|src| !src.is_empty())
+        .filter(|src| image_source_is_fetchable(src))
         .map(|src| SelectedImageSource {
             url: src.to_owned(),
             density: 1.0,
@@ -321,7 +320,7 @@ fn image_selected_source_candidate(
 }
 
 fn image_selected_picture_source(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<SelectedImageSource> {
     let parent = runtime.dom_host().node(handle)?.parent_node()?;
@@ -342,7 +341,7 @@ fn image_selected_picture_source(
         }
         if let Some(media) = source.attribute("media")
             && !media.trim().is_empty()
-            && !evaluate_match_media_query_list_with_viewport(
+            && !evaluate_media_query_list(
                 media,
                 Some(runtime.emulated_media()),
                 runtime.style_viewport(),
@@ -368,7 +367,7 @@ fn image_selected_picture_source(
 }
 
 fn image_load_is_suppressed_for_non_active_parent(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> bool {
     runtime
@@ -377,14 +376,14 @@ fn image_load_is_suppressed_for_non_active_parent(
         .is_some_and(|node| !node.is_connected() && node.parent_node().is_some())
 }
 
-pub(crate) fn image_selected_source_url(runtime: &JsContextHost, handle: DomHandle) -> String {
+pub(crate) fn image_selected_source_url(runtime: &PageScriptHost, handle: DomHandle) -> String {
     image_selected_resource(runtime, handle)
         .map(|selected| selected.url)
         .unwrap_or_default()
 }
 
 fn image_selected_resource(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<SelectedImageSource> {
     let mut selected = image_selected_source_candidate(runtime, handle)?;
@@ -421,7 +420,7 @@ fn image_selected_resource(
 }
 
 pub(crate) fn image_selected_request_key(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<ImageRequestKey> {
     let selected = image_selected_resource(runtime, handle)?;
@@ -445,7 +444,7 @@ pub(crate) struct ImageAttributeMutationPlan {
 }
 
 pub(crate) fn plan_image_attribute_mutation(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     name: &str,
     next_value: Option<&str>,
@@ -501,7 +500,7 @@ pub(crate) fn plan_image_attribute_mutation(
 
 pub(crate) fn apply_image_attribute_mutation_plan(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     plan: ImageAttributeMutationPlan,
 ) {
     {
@@ -520,7 +519,7 @@ pub(crate) fn apply_image_attribute_mutation_plan(
     }
 }
 
-pub(crate) fn reset_image_load_dispatch(runtime: &mut JsContextHost, handle: DomHandle) {
+pub(crate) fn reset_image_load_dispatch(runtime: &mut PageScriptHost, handle: DomHandle) {
     let _ = runtime.cancel_pending_image_load_event(handle);
     let _ = runtime.retire_image_resource_for_element(handle);
     if let Some(element) = runtime
@@ -532,7 +531,7 @@ pub(crate) fn reset_image_load_dispatch(runtime: &mut JsContextHost, handle: Dom
     }
 }
 
-pub(crate) fn mark_image_load_dispatched(runtime: &mut JsContextHost, handle: DomHandle) {
+pub(crate) fn mark_image_load_dispatched(runtime: &mut PageScriptHost, handle: DomHandle) {
     if let Some(element) = runtime
         .dom_host_mut()
         .node_mut(handle)
@@ -544,7 +543,7 @@ pub(crate) fn mark_image_load_dispatched(runtime: &mut JsContextHost, handle: Do
 
 pub(crate) fn record_image_resource_performance_entry_for_handle(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) {
     let url = image_selected_source_url(runtime, handle);
@@ -561,8 +560,8 @@ pub(crate) fn record_image_resource_performance_entry_for_handle(
 
 pub(crate) fn apply_authorized_image_load_event_in_context(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &mut JsContextHost,
-    runtime_ptr: *mut JsContextHost,
+    runtime: &mut PageScriptHost,
+    runtime_ptr: *mut PageScriptHost,
     task_id: RendererPageImageLoadEventTaskId,
     target: WindowDocumentTaskTarget,
     kind: RendererPageImageLoadEventKind,
@@ -597,7 +596,7 @@ pub(crate) fn apply_authorized_image_load_event_in_context(
 
 fn dispatch_queued_image_load_event(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     pending: crate::native_bridge::PendingImageLoadEvent,
     kind: RendererPageImageLoadEventKind,
@@ -631,7 +630,7 @@ fn dispatch_queued_image_load_event(
 }
 
 pub(crate) fn queue_image_load_network_terminal_followup(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     sequence: ImageLoadEventId,
     followup: Option<RendererPageImageLoadEventKind>,
@@ -640,7 +639,7 @@ pub(crate) fn queue_image_load_network_terminal_followup(
 }
 
 fn queue_image_load_terminal_followup_if_ready(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     sequence: ImageLoadEventId,
     followup: Option<RendererPageImageLoadEventKind>,
@@ -663,7 +662,7 @@ fn queue_image_load_terminal_followup_if_ready(
     }
 }
 
-fn connected_empty_src_without_srcset(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn connected_empty_src_without_srcset(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime.dom_host().node(handle).is_some_and(|node| {
         node.is_connected()
             && node.as_element().is_some_and(|element| {
@@ -672,13 +671,6 @@ fn connected_empty_src_without_srcset(runtime: &JsContextHost, handle: DomHandle
                     && element.attribute("srcset").is_none()
             })
     })
-}
-
-#[derive(Clone, Copy, Debug)]
-enum SrcsetDescriptorState {
-    InDescriptor,
-    InParens,
-    AfterDescriptor,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -701,6 +693,7 @@ fn selected_srcset_candidate(
     viewport: ImageSelectionViewport,
 ) -> Option<SelectedImageSource> {
     let mut candidates = parse_srcset_candidates(srcset);
+    candidates.retain(|candidate| image_source_is_fetchable(&candidate.url));
     if candidates.is_empty() {
         return None;
     }
@@ -751,6 +744,10 @@ fn selected_srcset_candidate(
         })
 }
 
+fn image_source_is_fetchable(source: &str) -> bool {
+    !source.is_empty() && source != "undefined"
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ImageSelectionViewport {
     width: f64,
@@ -758,7 +755,7 @@ struct ImageSelectionViewport {
     device_pixel_ratio: f64,
 }
 
-fn image_selection_viewport(runtime: &JsContextHost, handle: DomHandle) -> ImageSelectionViewport {
+fn image_selection_viewport(runtime: &PageScriptHost, handle: DomHandle) -> ImageSelectionViewport {
     let viewport = runtime
         .dom_host()
         .owner_document_handle(handle)
@@ -777,145 +774,21 @@ fn image_selection_viewport(runtime: &JsContextHost, handle: DomHandle) -> Image
 }
 
 fn parse_srcset_candidates(input: &str) -> Vec<SrcsetCandidate> {
-    let mut index = 0usize;
-    let mut candidates = Vec::new();
-    while index < input.len() {
-        index += input[index..]
-            .find(|ch| !is_html_space_or_comma(ch))
-            .unwrap_or(input.len() - index);
-        if index >= input.len() {
-            break;
-        }
-
-        let url_start = index;
-        index += input[index..]
-            .find(is_html_space)
-            .unwrap_or(input.len() - index);
-        let mut url = &input[url_start..index];
-        if url.ends_with(',') {
-            url = url.trim_end_matches(',');
-            if !url.is_empty() {
-                candidates.push(SrcsetCandidate {
-                    url: url.to_owned(),
-                    descriptor: SrcsetDescriptor::default(),
-                });
-            }
-            continue;
-        }
-
-        index += input[index..]
-            .find(|ch| !is_html_space(ch))
-            .unwrap_or(input.len() - index);
-        let (descriptors, next_index) = tokenize_srcset_descriptors(input, index);
-        index = next_index;
-        if let Some(descriptor) = parse_srcset_descriptors(&descriptors) {
-            candidates.push(SrcsetCandidate {
-                url: url.to_owned(),
+    // Tokenization and descriptor validation are shared with document export.
+    // Selection retains its existing typed representation and viewport policy.
+    moli_html2md::parse_srcset(input)
+        .into_iter()
+        .filter_map(|candidate| {
+            let descriptor = SrcsetDescriptor {
+                width: candidate.width.map(u32::try_from).transpose().ok()?,
+                density: candidate.density,
+            };
+            Some(SrcsetCandidate {
+                url: candidate.url.to_owned(),
                 descriptor,
-            });
-        }
-    }
-    candidates
-}
-
-fn tokenize_srcset_descriptors(input: &str, mut index: usize) -> (Vec<String>, usize) {
-    let mut descriptors = Vec::new();
-    let mut current = String::new();
-    let mut state = SrcsetDescriptorState::InDescriptor;
-    while index < input.len() {
-        let ch = input[index..].chars().next().expect("valid char boundary");
-        match state {
-            SrcsetDescriptorState::InDescriptor if is_html_space(ch) => {
-                if !current.is_empty() {
-                    descriptors.push(std::mem::take(&mut current));
-                    state = SrcsetDescriptorState::AfterDescriptor;
-                }
-                index += ch.len_utf8();
-            }
-            SrcsetDescriptorState::InDescriptor if ch == ',' => {
-                if !current.is_empty() {
-                    descriptors.push(current);
-                }
-                index += ch.len_utf8();
-                return (descriptors, index);
-            }
-            SrcsetDescriptorState::InDescriptor if ch == '(' => {
-                current.push(ch);
-                state = SrcsetDescriptorState::InParens;
-                index += ch.len_utf8();
-            }
-            SrcsetDescriptorState::InDescriptor => {
-                current.push(ch);
-                index += ch.len_utf8();
-            }
-            SrcsetDescriptorState::InParens if ch == ')' => {
-                current.push(ch);
-                state = SrcsetDescriptorState::InDescriptor;
-                index += ch.len_utf8();
-            }
-            SrcsetDescriptorState::InParens => {
-                current.push(ch);
-                index += ch.len_utf8();
-            }
-            SrcsetDescriptorState::AfterDescriptor if is_html_space(ch) => {
-                index += ch.len_utf8();
-            }
-            SrcsetDescriptorState::AfterDescriptor => {
-                state = SrcsetDescriptorState::InDescriptor;
-            }
-        }
-    }
-    if !current.is_empty() {
-        descriptors.push(current);
-    }
-    (descriptors, index)
-}
-
-fn parse_srcset_descriptors(descriptors: &[String]) -> Option<SrcsetDescriptor> {
-    let mut width = None;
-    let mut density = None;
-    let mut future_compat_h = None;
-
-    for descriptor in descriptors {
-        let last = descriptor.chars().last()?;
-        let value = &descriptor[..descriptor.len() - last.len_utf8()];
-        match last {
-            'w' if is_valid_non_negative_integer(value) && width.is_none() && density.is_none() => {
-                let parsed = value.parse::<u32>().ok()?;
-                if parsed == 0 {
-                    return None;
-                }
-                width = Some(parsed);
-            }
-            'x' if is_valid_floating_point_number(value)
-                && width.is_none()
-                && density.is_none()
-                && future_compat_h.is_none() =>
-            {
-                let parsed = value.parse::<f64>().ok()?;
-                if !parsed.is_finite() || parsed < 0.0 {
-                    return None;
-                }
-                density = Some(parsed);
-            }
-            'h' if is_valid_non_negative_integer(value)
-                && future_compat_h.is_none()
-                && density.is_none() =>
-            {
-                let parsed = value.parse::<u32>().ok()?;
-                if parsed == 0 {
-                    return None;
-                }
-                future_compat_h = Some(parsed);
-            }
-            _ => return None,
-        }
-    }
-
-    if future_compat_h.is_some() && width.is_none() {
-        return None;
-    }
-    Some(SrcsetDescriptor { width, density })
+            })
+        })
+        .collect()
 }
 
 fn source_size_for_sizes_attribute(
@@ -988,7 +861,7 @@ fn parse_source_size_length(length: &str, viewport: ImageSelectionViewport) -> O
     None
 }
 
-fn image_allows_auto_sizes(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn image_allows_auto_sizes(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -997,7 +870,7 @@ fn image_allows_auto_sizes(runtime: &JsContextHost, handle: DomHandle) -> bool {
         .is_some_and(|loading| loading.eq_ignore_ascii_case("lazy"))
 }
 
-fn image_auto_source_size(runtime: &JsContextHost, handle: DomHandle) -> Option<f64> {
+fn image_auto_source_size(runtime: &PageScriptHost, handle: DomHandle) -> Option<f64> {
     let element = runtime.dom_host().node(handle)?.as_element()?;
     if let Some(width) = element
         .attribute("width")
@@ -1009,7 +882,7 @@ fn image_auto_source_size(runtime: &JsContextHost, handle: DomHandle) -> Option<
     auto_source_size_from_style(style, parent_auto_size_width(runtime, handle))
 }
 
-fn parent_auto_size_width(runtime: &JsContextHost, handle: DomHandle) -> Option<f64> {
+fn parent_auto_size_width(runtime: &PageScriptHost, handle: DomHandle) -> Option<f64> {
     // Like lazy-load admission above, `sizes=auto` selection must not trigger a
     // layout demand merely to decide which resource to fetch. This compatibility
     // estimate is local to responsive-image selection.
@@ -1143,65 +1016,6 @@ fn inline_style_value<'a>(style: &'a str, property: &str) -> Option<&'a str> {
     })
 }
 
-fn is_html_space_or_comma(ch: char) -> bool {
-    ch == ',' || is_html_space(ch)
-}
-
-fn is_html_space(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{0009}' | '\u{000a}' | '\u{000c}' | '\u{000d}' | '\u{0020}'
-    )
-}
-
-fn is_valid_non_negative_integer(value: &str) -> bool {
-    !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn is_valid_floating_point_number(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let mut index = 0usize;
-    if bytes.get(index) == Some(&b'-') {
-        index += 1;
-    }
-    let integer_start = index;
-    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-        index += 1;
-    }
-    let integer_digits = index - integer_start;
-    let mut fraction_digits = 0usize;
-    let mut saw_decimal_point = false;
-    if bytes.get(index) == Some(&b'.') {
-        saw_decimal_point = true;
-        index += 1;
-        let fraction_start = index;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-        }
-        fraction_digits = index - fraction_start;
-    }
-    if integer_digits == 0 && fraction_digits == 0 {
-        return false;
-    }
-    if saw_decimal_point && fraction_digits == 0 {
-        return false;
-    }
-    if matches!(bytes.get(index), Some(b'e' | b'E')) {
-        index += 1;
-        if matches!(bytes.get(index), Some(b'+' | b'-')) {
-            index += 1;
-        }
-        let exponent_start = index;
-        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
-            index += 1;
-        }
-        if exponent_start == index {
-            return false;
-        }
-    }
-    index == bytes.len()
-}
-
 pub(in crate::native_bridge) fn image_current_src_getter_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -1232,7 +1046,7 @@ fn image_current_src_value<'s>(
     ))
 }
 
-fn image_current_src_value_for_handle(runtime: &JsContextHost, handle: DomHandle) -> String {
+fn image_current_src_value_for_handle(runtime: &PageScriptHost, handle: DomHandle) -> String {
     let complete = runtime
         .dom_host()
         .node(handle)
@@ -1262,6 +1076,23 @@ mod tests {
     }
 
     #[test]
+    fn srcset_parentheses_do_not_nest() {
+        let candidates = parse_srcset_candidates("a.png ((x), b.png 2x");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].url, "b.png");
+    }
+
+    #[test]
+    fn srcset_parser_rejects_unicode_descriptor_spaces() {
+        for input in ["a.png \u{3000}2x, b.png 1x", "a.png 2x\u{a0}, b.png 1x"] {
+            let candidates = parse_srcset_candidates(input);
+            assert_eq!(candidates.len(), 1, "{input}");
+            assert_eq!(candidates[0].url, "b.png");
+            assert_eq!(candidates[0].descriptor.density, Some(1.0));
+        }
+    }
+
+    #[test]
     fn srcset_parser_uses_html_ascii_whitespace() {
         assert_eq!(
             select("\t\tdata:,a\t\t1x\t\t", None).as_deref(),
@@ -1280,6 +1111,18 @@ mod tests {
         assert_eq!(select("data:,a 0w", None), None);
         assert_eq!(select("data:,a 1h", None), None);
         assert_eq!(select("data:,a 1w 1h", None).as_deref(), Some("data:,a"));
+    }
+
+    #[test]
+    fn image_selection_drops_undefined_template_binding_sources() {
+        assert_eq!(select("undefined", None), None);
+        assert_eq!(select("undefined 1x", None), None);
+        assert_eq!(
+            select("undefined 1x, actual.png 2x", None).as_deref(),
+            Some("actual.png")
+        );
+        assert!(!image_source_is_fetchable("undefined"));
+        assert!(image_source_is_fetchable("undefined.png"));
     }
 
     #[test]

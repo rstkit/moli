@@ -176,6 +176,7 @@ pub(super) fn build_router() -> Router {
             get(location_nav_chain_source_page),
         )
         .route("/location-nav/chain-mid", get(location_nav_chain_mid_page))
+        .route("/location-nav/load-chain", get(location_nav_load_chain_page))
         .route(
             "/location-nav/chain-timeout-source",
             get(location_nav_chain_timeout_source_page),
@@ -235,8 +236,8 @@ pub(super) fn build_router() -> Router {
             get(history_back_ignores_page_tampered_queue_microtask_page),
         )
         .route(
-            "/compat/history-back-forward-same-turn-coalesces",
-            get(history_back_forward_same_turn_coalesces_page),
+            "/compat/history-back-forward-same-turn-traverses-in-order",
+            get(history_back_forward_same_turn_traverses_in_order_page),
         )
         .route(
             "/compat/history-state-mutation-does-not-mutate-stored-snapshot",
@@ -679,6 +680,10 @@ pub(super) fn build_router() -> Router {
         .route(
             "/compat/chrome-cssstylesheet-rule-mutation",
             get(chrome_cssstylesheet_rule_mutation_page),
+        )
+        .route(
+            "/compat/chrome-cssstylesheet-rule-mutation-v2",
+            get(chrome_cssstylesheet_rule_mutation_v2_page),
         )
         .route(
             "/compat/chrome-delete-rule-no-crash",
@@ -1125,6 +1130,10 @@ pub(super) fn build_router() -> Router {
             get(parse_time_async_classic_chunked_page),
         )
         .route(
+            "/compat/parse-time-async-classic-chunked-executed",
+            get(parse_time_async_classic_chunked_executed),
+        )
+        .route(
             "/compat/parse-time-async-classic-slow-chunked-tail",
             get(parse_time_async_classic_slow_chunked_tail_page),
         )
@@ -1309,6 +1318,14 @@ pub(super) fn build_router() -> Router {
             get(runtime_inserted_stylesheet_load_syncs_parser_snapshot_page),
         )
         .route(
+            "/assets/runtime_stylesheet_snapshot_applied",
+            get(runtime_stylesheet_snapshot_applied),
+        )
+        .route(
+            "/assets/runtime_stylesheet_snapshot_gated.css",
+            get(asset_runtime_stylesheet_snapshot_gated_css),
+        )
+        .route(
             "/compat/runtime-inserted-stylesheet-load-triggers-location-replace",
             get(runtime_inserted_stylesheet_load_triggers_location_replace_page),
         )
@@ -1415,6 +1432,10 @@ pub(super) fn build_router() -> Router {
         .route(
             "/compat/runtime-owned-external-in-order-load-after-domcontentloaded",
             get(runtime_owned_external_in_order_load_after_domcontentloaded_page),
+        )
+        .route(
+            "/compat/runtime-owned-external-in-order-load-after-domcontentloaded-release",
+            get(release_runtime_owned_external_in_order_load_after_domcontentloaded),
         )
         .route(
             "/compat/runtime-owned-external-in-order-with-defer-stays-after-domcontentloaded",
@@ -2130,12 +2151,20 @@ pub(super) fn build_router() -> Router {
             get(asset_parse_time_async_script),
         )
         .route(
+            "/assets/parse_time_async_chunked.js",
+            get(asset_parse_time_async_chunked_script),
+        )
+        .route(
             "/assets/parse_time_async_load_order.js",
             get(asset_parse_time_async_load_order_script),
         )
         .route(
             "/assets/runtime_owned_in_order_load.js",
             get(asset_runtime_owned_in_order_load_script),
+        )
+        .route(
+            "/assets/runtime_owned_in_order_load_after_dcl_gated.js",
+            get(asset_runtime_owned_in_order_load_after_dcl_gated_script),
         )
         .route(
             "/assets/missing_runtime_owned_in_order_error.js",
@@ -2178,12 +2207,20 @@ pub(super) fn build_router() -> Router {
             get(asset_parse_time_async_task_first_script),
         )
         .route(
+            "/assets/parse_time_async_task_first_executed",
+            get(asset_parse_time_async_task_first_executed),
+        )
+        .route(
             "/assets/parse_time_async_task_second.js",
             get(asset_parse_time_async_task_second_script),
         )
         .route(
             "/assets/parse_time_async_task_visibility_first.js",
             get(asset_parse_time_async_task_visibility_first_script),
+        )
+        .route(
+            "/assets/parse_time_async_task_visibility_first_executed",
+            get(asset_parse_time_async_task_visibility_first_executed),
         )
         .route(
             "/assets/parse_time_async_task_visibility_second.js",
@@ -2294,6 +2331,14 @@ pub(super) fn build_router() -> Router {
             get(asset_dynamic_preparation_context_open_script),
         )
         .route(
+            "/assets/dynamic_preparation_context_replaced",
+            get(asset_dynamic_preparation_context_replaced),
+        )
+        .route(
+            "/assets/runtime_owned_async_fast_executed",
+            get(asset_runtime_owned_async_fast_executed),
+        )
+        .route(
             "/assets/document_write_implicit_replace_async.js",
             get(asset_document_write_implicit_replace_async_script),
         )
@@ -2364,6 +2409,22 @@ pub(super) fn build_router() -> Router {
         .route(
             "/assets/blocking_stylesheet_alternate_probe.js",
             get(asset_blocking_stylesheet_alternate_probe_script),
+        )
+        .route(
+            "/assets/runtime_inline_module_executed",
+            get(asset_runtime_inline_module_executed),
+        )
+        .route(
+            "/assets/runtime_inline_module_gated.css",
+            get(asset_runtime_inline_module_gated_css),
+        )
+        .route(
+            "/assets/blocking_stylesheet_alternate_probe_executed",
+            get(asset_blocking_stylesheet_alternate_probe_executed),
+        )
+        .route(
+            "/assets/blocking_stylesheet_alternate_gated.css",
+            get(asset_blocking_stylesheet_alternate_gated_css),
         )
         .route(
             "/assets/dynamic_blocking_stylesheet_runtime.js",

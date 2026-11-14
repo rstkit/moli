@@ -1,7 +1,6 @@
-use super::{
-    JsContextHost, OwnerDispatchScope, child_frame_runtime::WINDOW_EVENT_HANDLER_PROPERTIES,
-};
+use super::{OwnerDispatchScope, PageScriptHost};
 use crate::{
+    context_bootstrap::{error_event_handler_arguments, event_is_error_event},
     document_runtime::DomHandle,
     document_runtime::EventTargetHandle,
     exception_reporting::invoke_event_handler,
@@ -14,7 +13,7 @@ use crate::{
         ACTIVE_CHILD_WINDOW_HANDLE_SLOT, EventCallbackId, PreparedEventCallback,
         element::EventAttributeHandlerScope, element::compile_event_attribute_handler_for_owner,
     },
-    util::{get_private_value, object_bool_property, set_private_value, v8_string, v8str},
+    util::{get_private_value, set_private_value, v8_string, v8str},
 };
 use std::{collections::HashSet, convert::TryFrom};
 
@@ -56,7 +55,7 @@ struct ReadyChildWindowEventListenerInvocation {
     callback: PreparedEventCallback,
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     fn child_window_event_requires_runtime_dispatch(
         &self,
         handle: DomHandle,
@@ -95,20 +94,6 @@ impl JsContextHost {
             .checked_add(1)
             .expect("child window event registration id overflow");
         ChildWindowEventRegistrationId(self.next_child_window_event_registration_id)
-    }
-
-    pub(in crate::native_bridge::context_host) fn clear_child_window_document_event_state(
-        &mut self,
-        scope: &mut v8::PinScope<'_, '_>,
-        handle: DomHandle,
-    ) {
-        if let Some(window) = self.child_window_proxy_records.live_window(scope, handle) {
-            let null = v8::null(scope).into();
-            for name in WINDOW_EVENT_HANDLER_PROPERTIES {
-                let _ = window.set(scope, v8str(scope, name).into(), null);
-            }
-        }
-        self.clear_child_window_event_listeners(handle);
     }
 
     pub(crate) fn child_window_event_listener_callback_ids(
@@ -212,6 +197,7 @@ impl JsContextHost {
             callback_relevant_context,
             incumbent_context,
         );
+        self.capture_event_callback_initiator(scope, callback_id);
         let previous_callback_id = self
             .child_window_event_listeners
             .get_mut(&handle)
@@ -373,7 +359,7 @@ impl JsContextHost {
         ) else {
             return false;
         };
-        let host_ptr = self as *mut JsContextHost;
+        let host_ptr = self as *mut PageScriptHost;
         self.dispatch_public_event(
             scope,
             host_ptr,
@@ -494,8 +480,16 @@ impl JsContextHost {
         } else {
             window.into()
         };
-        let _ = event.set(scope, v8str(scope, "target").into(), target);
-        let _ = event.set(scope, v8str(scope, "currentTarget").into(), window.into());
+        let _ = crate::context_bootstrap::event_backing(scope, event).set(
+            scope,
+            v8str(scope, "target").into(),
+            target,
+        );
+        let _ = crate::context_bootstrap::event_backing(scope, event).set(
+            scope,
+            v8str(scope, "currentTarget").into(),
+            window.into(),
+        );
 
         if event_type == "load" {
             install_child_body_load_attribute_handler_if_needed(scope, self, handle);
@@ -626,7 +620,7 @@ impl JsContextHost {
         );
         let returned = invoke_prepared_event_callback(
             scope,
-            self as *mut JsContextHost,
+            self as *mut PageScriptHost,
             false,
             event_type,
             &format!("child window {event_type} listener"),
@@ -747,46 +741,31 @@ fn child_window_event_callback_arguments<'s>(
 ) -> Vec<v8::Local<'s, v8::Value>> {
     if registration_kind == ChildWindowEventRegistrationKind::EventHandlerProperty
         && event_type == "error"
+        && let Some(arguments) = error_event_handler_arguments(scope, event)
     {
-        vec![
-            event
-                .get(scope, v8str(scope, "message").into())
-                .unwrap_or_else(|| v8::undefined(scope).into()),
-            event
-                .get(scope, v8str(scope, "filename").into())
-                .unwrap_or_else(|| v8::undefined(scope).into()),
-            event
-                .get(scope, v8str(scope, "lineno").into())
-                .unwrap_or_else(|| v8::Number::new(scope, 0.0).into()),
-            event
-                .get(scope, v8str(scope, "colno").into())
-                .unwrap_or_else(|| v8::Number::new(scope, 0.0).into()),
-            event
-                .get(scope, v8str(scope, "error").into())
-                .unwrap_or_else(|| v8::null(scope).into()),
-        ]
+        arguments.to_vec()
     } else {
         vec![event.into()]
     }
 }
 
-fn apply_child_window_event_handler_return(
-    scope: &mut v8::PinScope<'_, '_>,
+fn apply_child_window_event_handler_return<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     event_type: &str,
-    event: v8::Local<'_, v8::Object>,
+    event: v8::Local<'s, v8::Object>,
     returned: Option<v8::Global<v8::Value>>,
 ) {
     let Some(returned) = returned else {
         return;
     };
     let returned = v8::Local::new(scope, returned);
-    let should_cancel = if event_type == "error" {
+    let should_cancel = if event_type == "error" && event_is_error_event(scope, event) {
         returned.is_boolean() && returned.boolean_value(scope)
     } else {
         returned.is_boolean() && !returned.boolean_value(scope)
     };
-    if should_cancel && object_bool_property(scope, event, "cancelable").unwrap_or(false) {
-        let _ = event.set(
+    if should_cancel && crate::context_bootstrap::event_bool_attribute(scope, event, "cancelable") {
+        let _ = crate::context_bootstrap::event_backing(scope, event).set(
             scope,
             v8str(scope, "defaultPrevented").into(),
             v8::Boolean::new(scope, true).into(),
@@ -796,7 +775,7 @@ fn apply_child_window_event_handler_return(
 
 fn install_child_body_load_attribute_handler_if_needed<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    host: &mut JsContextHost,
+    host: &mut PageScriptHost,
     handle: DomHandle,
 ) {
     let Some(source) = host
@@ -824,7 +803,7 @@ fn install_child_body_load_attribute_handler_if_needed<'s>(
     {
         return;
     }
-    let host_ptr: *mut JsContextHost = host;
+    let host_ptr: *mut PageScriptHost = host;
     let Some(handler) = compile_event_attribute_handler_for_owner(
         scope,
         host_ptr,
@@ -906,7 +885,7 @@ fn dispatch_child_body_storage_attribute<'s>(
         return;
     };
     let Some(handler) = v8::Script::compile(scope, script_source, None)
-        .and_then(|script| script.run(scope))
+        .and_then(|script| crate::script_execution::execute_compiled_script(scope, script))
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
     else {
         return;

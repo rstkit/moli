@@ -1,13 +1,15 @@
 use super::*;
+use crate::web_api_interfaces;
 use moli_browser_profile::BrowserIdentityProfile;
-use moli_webapi_declare::{ObjectLiteralDeclaration, WebApiObject};
+use moli_storage_service::SqlBucketOperation;
+use moli_v8_util::reject_promise_with_type_error as reject_type_error;
+use moli_webapi_declare::{ObjectLiteralDeclaration, WebApiFunctionTemplate, WebApiObject};
 
 use crate::context_bootstrap::navigator_runtime::{
-    STORAGE_BUCKET_MANAGER_BRAND_SLOT, STORAGE_BUCKET_MANAGER_CHILD_HANDLE_SLOT,
-    STORAGE_BUCKET_MANAGER_POPUP_ID_SLOT, STORAGE_MANAGER_BRAND_SLOT,
+    STORAGE_BUCKET_MANAGER_CHILD_HANDLE_SLOT, STORAGE_BUCKET_MANAGER_POPUP_ID_SLOT,
     STORAGE_MANAGER_CHILD_HANDLE_SLOT, STORAGE_MANAGER_POPUP_ID_SLOT,
     current_protocol_user_gesture_activation, navigator_identity_profile,
-    navigator_receiver_branded, set_navigator_identity_profile,
+    set_navigator_identity_profile,
 };
 use crate::context_bootstrap::storage_buckets::{
     IMPLICIT_DEFAULT_BUCKET_INTERNAL_NAME, StorageBucketCacheId, StorageBucketCacheMatch,
@@ -21,7 +23,10 @@ use crate::document_runtime::DomHandle;
 use crate::util::{get_private_value, set_private_value};
 use crate::webidl;
 
+mod bucket_maintenance;
 mod legacy_storage_quota;
+pub(in crate::context_bootstrap) use bucket_maintenance::settle_storage_bucket_operation;
+use bucket_maintenance::{dispatch_sql_bucket_operation, dispatch_sql_expired_bucket_cleanup};
 
 pub(crate) use legacy_storage_quota::{
     LegacyStorageQuotaCallbackOutcome, LegacyStorageQuotaCallbackTask,
@@ -33,19 +38,15 @@ pub(in crate::context_bootstrap) use legacy_storage_quota::{
 
 const PERMISSION_STATUS_NAME_SLOT: &str = "__moliPermissionStatusName";
 const PERMISSION_STATUS_STATE_SLOT: &str = "__moliPermissionStatusState";
-const PERMISSION_STATUS_BRAND_SLOT: &str = "__moliPermissionStatusBrand";
 const VIBRATION_PATTERN_LENGTH_MAX: usize = 99;
 const VIBRATION_DURATION_MS_MAX: u32 = 10_000;
-const STORAGE_BUCKET_BRAND_SLOT: &str = "__moliStorageBucketBrand";
 const STORAGE_BUCKET_CACHES_OBJECT_SLOT: &str = "__moliStorageBucketCachesObject";
 const STORAGE_BUCKET_ID_SLOT: &str = "__moliStorageBucketId";
 const STORAGE_BUCKET_NAME_SLOT: &str = "__moliStorageBucketName";
 const STORAGE_BUCKET_ORIGIN_SLOT: &str = "__moliStorageBucketOrigin";
 const STORAGE_BUCKET_STORAGE_KEY_SLOT: &str = "__moliStorageBucketStorageKey";
-const STORAGE_BUCKET_CACHE_BRAND_SLOT: &str = "__moliStorageBucketCacheBrand";
 const STORAGE_BUCKET_CACHE_NAME_SLOT: &str = "__moliStorageBucketCacheName";
 const STORAGE_BUCKET_CACHE_ID_SLOT: &str = "__moliStorageBucketCacheId";
-const STORAGE_BUCKET_CACHE_STORAGE_BRAND_SLOT: &str = "__moliStorageBucketCacheStorageBrand";
 const GLOBAL_CACHE_STORAGE_SLOT: &str = "__moliGlobalCacheStorage";
 const STORAGE_BUCKET_CACHE_PUT_RESOLVER_SLOT: &str = "__moliStorageBucketCachePutResolver";
 const STORAGE_BUCKET_CACHE_PUT_BUCKET_ORIGIN_SLOT: &str = "__moliStorageBucketCachePutBucketOrigin";
@@ -60,28 +61,21 @@ const STORAGE_BUCKET_CACHE_PUT_REQUEST_METHOD_SLOT: &str =
     "__moliStorageBucketCachePutRequestMethod";
 const STORAGE_BUCKET_CACHE_PUT_REQUEST_HEADERS_SLOT: &str =
     "__moliStorageBucketCachePutRequestHeaders";
-const STORAGE_BUCKET_CACHE_PUT_RESPONSE_TYPE_SLOT: &str = "__moliStorageBucketCachePutResponseType";
-const STORAGE_BUCKET_CACHE_PUT_RESPONSE_URL_SLOT: &str = "__moliStorageBucketCachePutResponseUrl";
-const STORAGE_BUCKET_CACHE_PUT_RESPONSE_REDIRECTED_SLOT: &str =
-    "__moliStorageBucketCachePutResponseRedirected";
-const STORAGE_BUCKET_CACHE_PUT_RESPONSE_STATUS_SLOT: &str =
-    "__moliStorageBucketCachePutResponseStatus";
-const STORAGE_BUCKET_CACHE_PUT_RESPONSE_STATUS_TEXT_SLOT: &str =
-    "__moliStorageBucketCachePutResponseStatusText";
-const STORAGE_BUCKET_CACHE_PUT_RESPONSE_HEADERS_SLOT: &str =
-    "__moliStorageBucketCachePutResponseHeaders";
-pub(in crate::context_bootstrap) const NAVIGATOR_UA_DATA_BRAND_SLOT: &str =
-    "__moliNavigatorUADataBrand";
+const STORAGE_BUCKET_CACHE_PUT_RESPONSE_HEAD_SLOT: &str = "__moliStorageBucketCachePutResponseHead";
 const NAVIGATOR_UA_DATA_USER_AGENT_SLOT: &str = "__moliNavigatorUADataUserAgent";
-pub(in crate::context_bootstrap) const MEDIA_DEVICES_BRAND_SLOT: &str = "__moliMediaDevicesBrand";
-pub(in crate::context_bootstrap) const PERMISSIONS_BRAND_SLOT: &str = "__moliPermissionsBrand";
-const NAVIGATOR_BATTERY_STATUS_BRAND_SLOT: &str = "__moliBatteryStatusBrand";
 
-#[derive(Default, WebApiObject)]
-#[webapi(interface = "Object", own_to_string_tag = "CacheStorage")]
-struct StorageBucketCacheStorageObjectDeclaration {
-    #[webapi(slot = STORAGE_BUCKET_CACHE_STORAGE_BRAND_SLOT, init = true)]
-    brand: (),
+#[derive(WebApiObject)]
+#[webapi(interface = web_api_interfaces::CacheStorage)]
+struct StorageBucketCacheStorageObjectDeclaration<'scope> {
+    #[webapi(prototype)]
+    prototype: v8::Local<'scope, v8::Object>,
+}
+
+// These Promise-returning operations share branded_promise_resolver, which
+// rejects invalid receivers before conversion in a callee-realm Promise.
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::CacheStorage, enumerable)]
+struct CacheStoragePrototypeDeclaration {
     #[webapi(
         method,
         callback = storage_bucket_cache_storage_match_callback,
@@ -115,14 +109,19 @@ struct StorageBucketCacheStorageObjectDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", own_to_string_tag = "Cache")]
-struct StorageBucketCacheObjectDeclaration {
-    #[webapi(slot = STORAGE_BUCKET_CACHE_BRAND_SLOT, init = true)]
-    brand: (),
+#[webapi(interface = web_api_interfaces::Cache)]
+struct StorageBucketCacheObjectDeclaration<'scope> {
+    #[webapi(prototype)]
+    prototype: v8::Local<'scope, v8::Object>,
     #[webapi(slot = STORAGE_BUCKET_CACHE_NAME_SLOT)]
     cache_name: String,
     #[webapi(slot = STORAGE_BUCKET_CACHE_ID_SLOT)]
     cache_id: String,
+}
+
+#[derive(WebApiFunctionTemplate)]
+#[webapi(interface = web_api_interfaces::Cache, enumerable)]
+struct CachePrototypeDeclaration {
     #[webapi(method, callback = storage_bucket_cache_put_callback, length = 2)]
     put: (),
     #[webapi(method, callback = storage_bucket_cache_match_callback, length = 1)]
@@ -135,12 +134,26 @@ struct StorageBucketCacheObjectDeclaration {
     delete: (),
 }
 
-#[derive(WebApiObject)]
-#[webapi(interface = "PermissionStatus")]
-struct PermissionStatusObjectDeclaration {
-    #[webapi(slot = PERMISSION_STATUS_BRAND_SLOT, init = true)]
-    brand: (),
+pub(in crate::context_bootstrap) fn install_cache_template_bindings<'s>(
+    scope: &mut v8::PinScope<'s, '_, ()>,
+    template: v8::Local<'s, v8::FunctionTemplate>,
+    name: &str,
+) {
+    let prototype = template.prototype_template(scope);
+    match name {
+        "CacheStorage" => {
+            CacheStoragePrototypeDeclaration::initialize_prototype_template(scope, prototype);
+        }
+        "Cache" => {
+            CachePrototypeDeclaration::initialize_prototype_template(scope, prototype);
+        }
+        _ => {}
+    }
+}
 
+#[derive(WebApiObject)]
+#[webapi(interface = web_api_interfaces::PermissionStatus)]
+struct PermissionStatusObjectDeclaration {
     #[webapi(slot = PERMISSION_STATUS_NAME_SLOT)]
     name: String,
 
@@ -169,7 +182,7 @@ struct MidiPermissionDescriptorMembers {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NavigatorUaBrandEntryDeclaration {
     #[webapi(data_property, enumerable)]
     brand: String,
@@ -179,11 +192,8 @@ struct NavigatorUaBrandEntryDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "NavigatorUAData")]
+#[webapi(interface = web_api_interfaces::NavigatorUAData)]
 struct NavigatorUaDataObjectDeclaration {
-    #[webapi(slot = NAVIGATOR_UA_DATA_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(slot = NAVIGATOR_UA_DATA_USER_AGENT_SLOT)]
     user_agent: String,
 
@@ -198,7 +208,7 @@ struct NavigatorUaDataObjectDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NavigatorUaDataSnapshotDeclaration {
     #[webapi(data_property, enumerable)]
     brands: Vec<NavigatorUaBrandEntryDeclaration>,
@@ -211,7 +221,7 @@ struct NavigatorUaDataSnapshotDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct NavigatorUaDataHighEntropySnapshotDeclaration {
     #[webapi(data_property, enumerable)]
     architecture: Option<String>,
@@ -248,7 +258,7 @@ struct NavigatorUaDataHighEntropySnapshotDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "StorageEstimate")]
+#[webapi(fragment, prototype = "StorageEstimate")]
 struct StorageEstimateObjectDeclaration<'scope> {
     #[webapi(data_property, enumerable)]
     quota: f64,
@@ -261,7 +271,7 @@ struct StorageEstimateObjectDeclaration<'scope> {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct StorageUsageDetailsObjectDeclaration {
     #[webapi(data_property = "indexedDB", enumerable)]
     indexed_db: Option<f64>,
@@ -272,11 +282,8 @@ struct StorageUsageDetailsObjectDeclaration {
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object", data_properties)]
+#[webapi(interface = web_api_interfaces::BatteryManager, data_properties, receiver)]
 struct NavigatorBatteryStatusObjectDeclaration {
-    #[webapi(slot = NAVIGATOR_BATTERY_STATUS_BRAND_SLOT, init = true)]
-    brand: (),
-
     #[webapi(data_property, enumerable)]
     charging: bool,
     #[webapi(data_property, enumerable)]
@@ -286,34 +293,25 @@ struct NavigatorBatteryStatusObjectDeclaration {
     #[webapi(data_property, enumerable)]
     level: f64,
 
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(accessor_property, enumerable, getter = simple_event_target_handler_getter_callback, setter = simple_event_target_handler_setter_callback, data = v8str(scope, "onchargingchange"), setter_data = v8str(scope, "onchargingchange"))]
     onchargingchange: (),
 
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(accessor_property, enumerable, getter = simple_event_target_handler_getter_callback, setter = simple_event_target_handler_setter_callback, data = v8str(scope, "onchargingtimechange"), setter_data = v8str(scope, "onchargingtimechange"))]
     onchargingtimechange: (),
 
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(accessor_property, enumerable, getter = simple_event_target_handler_getter_callback, setter = simple_event_target_handler_setter_callback, data = v8str(scope, "ondischargingtimechange"), setter_data = v8str(scope, "ondischargingtimechange"))]
     ondischargingtimechange: (),
 
-    #[webapi(data_property, enumerable, init = "null")]
+    #[webapi(accessor_property, enumerable, getter = simple_event_target_handler_getter_callback, setter = simple_event_target_handler_setter_callback, data = v8str(scope, "onlevelchange"), setter_data = v8str(scope, "onlevelchange"))]
     onlevelchange: (),
 
-    #[webapi(method, length = 2, callback = battery_event_target_noop_callback)]
-    add_event_listener: (),
-
-    #[webapi(method, length = 2, callback = battery_event_target_noop_callback)]
-    remove_event_listener: (),
-
-    #[webapi(method, length = 1, callback = battery_dispatch_event_callback)]
-    dispatch_event: (),
+    #[webapi(slot = SIMPLE_EVENT_TARGET_LISTENERS_SLOT, init = "null_object")]
+    event_listeners: (),
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "StorageBucket")]
-struct StorageBucketObjectDeclaration {
-    #[webapi(slot, name = STORAGE_BUCKET_BRAND_SLOT, constructor_default = true)]
-    brand: bool,
-}
+#[webapi(interface = web_api_interfaces::StorageBucket)]
+struct StorageBucketObjectDeclaration {}
 
 #[derive(Debug)]
 struct StorageBucketHandle {
@@ -335,16 +333,88 @@ struct CacheRequestInfo {
     headers: Vec<(String, String)>,
 }
 
-#[derive(Debug, Default)]
+// Convert the union during IDL conversion; read native state and resolve the
+// URL after every query option has been converted.
+enum CacheRequestInput<'s> {
+    Native(v8::Local<'s, v8::Object>),
+    Url(String),
+}
+
+impl<'s> webidl::WebIdlConverter<'s> for CacheRequestInput<'s> {
+    type Options = ();
+
+    fn convert(
+        scope: &mut v8::PinScope<'s, '_>,
+        value: v8::Local<'s, v8::Value>,
+        context: webidl::Context,
+        _: &(),
+    ) -> Result<Self, webidl::WebIdlError> {
+        if let Ok(object) = v8::Local::<v8::Object>::try_from(value)
+            && crate::network_host::is_branded_request_object(scope, object)
+        {
+            return Ok(Self::Native(object));
+        }
+        webidl::convert::<webidl::UsvString>(scope, value, context).map(|value| Self::Url(value.0))
+    }
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Cache")]
+struct CacheQueryArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    request: CacheRequestInput<'s>,
+    #[webidl(dictionary)]
+    options: CacheQueryOptions,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Cache")]
+struct OptionalCacheQueryArgs<'s> {
+    #[webidl(converter = "raw")]
+    request: Option<CacheRequestInput<'s>>,
+    #[webidl(dictionary)]
+    options: CacheQueryOptions,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "CacheStorage.match")]
+struct CacheStorageQueryArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    request: CacheRequestInput<'s>,
+    #[webidl(dictionary)]
+    options: MultiCacheQueryOptions,
+}
+
+#[derive(webidl::WebIdlArgs)]
+#[webidl(prefix = "Cache.put")]
+struct CachePutArgs<'s> {
+    #[webidl(required, converter = "raw")]
+    request: CacheRequestInput<'s>,
+    #[webidl(required, interface = web_api_interfaces::Response)]
+    response: v8::Local<'s, v8::Object>,
+}
+
+#[derive(Debug, Default, webidl::WebIdlDictionary)]
+#[webidl(prefix = "CacheQueryOptions")]
 struct CacheQueryOptions {
+    #[webidl(default = false)]
     ignore_search: bool,
+    #[webidl(default = false)]
     ignore_method: bool,
+    #[webidl(default = false)]
     ignore_vary: bool,
+}
+
+#[derive(webidl::WebIdlDictionary)]
+#[webidl(prefix = "MultiCacheQueryOptions")]
+struct MultiCacheQueryOptions {
+    #[webidl(inherit)]
+    base: CacheQueryOptions,
     cache_name: Option<String>,
 }
 
 #[derive(WebApiObject)]
-#[webapi(interface = "Object")]
+#[webapi(plain)]
 struct StorageBucketCachePutPendingDataDeclaration<'scope> {
     #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESOLVER_SLOT)]
     resolver: v8::Local<'scope, v8::PromiseResolver>,
@@ -376,23 +446,8 @@ struct StorageBucketCachePutPendingDataDeclaration<'scope> {
     #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_REQUEST_HEADERS_SLOT)]
     request_headers_json: String,
 
-    #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESPONSE_TYPE_SLOT)]
-    response_type: String,
-
-    #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESPONSE_URL_SLOT)]
-    response_url: String,
-
-    #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESPONSE_REDIRECTED_SLOT)]
-    response_redirected: bool,
-
-    #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESPONSE_STATUS_SLOT)]
-    response_status: f64,
-
-    #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESPONSE_STATUS_TEXT_SLOT)]
-    response_status_text: String,
-
-    #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESPONSE_HEADERS_SLOT)]
-    response_headers_json: String,
+    #[webapi(slot = STORAGE_BUCKET_CACHE_PUT_RESPONSE_HEAD_SLOT)]
+    response_head_json: String,
 }
 
 enum StorageBucketCachedResponseMaterialization<'scope> {
@@ -405,9 +460,6 @@ enum StorageBucketCachedResponseMaterialization<'scope> {
 
 struct StorageManagerOwnerContext {
     storage_key: String,
-    area_key: Option<String>,
-    host_ptr: Option<*mut crate::native_bridge::JsContextHost>,
-    popup_id: Option<u64>,
 }
 
 #[derive(webidl::WebIdlArgs)]
@@ -456,22 +508,14 @@ pub(in crate::context_bootstrap) fn navigator_send_beacon_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !navigator_receiver_branded(scope, args.this()) {
-        crate::util::throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     crate::network_host::navigator_send_beacon_callback(scope, args, rv);
 }
 
 pub(in crate::context_bootstrap) fn navigator_java_enabled_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
+    _args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !navigator_receiver_branded(scope, args.this()) {
-        crate::util::throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     rv.set(v8::Boolean::new(scope, false).into());
 }
 
@@ -510,10 +554,6 @@ pub(in crate::context_bootstrap) fn navigator_vibrate_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !navigator_receiver_branded(scope, args.this()) {
-        crate::util::throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(mut parsed) = webidl::parse_args::<NavigatorVibrateArgs>(scope, &args) else {
         return;
     };
@@ -529,52 +569,17 @@ pub(in crate::context_bootstrap) fn navigator_vibrate_callback<'s>(
 
 pub(in crate::context_bootstrap) fn navigator_get_battery_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
+    _args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
-    if !navigator_receiver_branded(scope, args.this()) {
-        reject_type_error(scope, resolver, "Illegal invocation");
-        rv.set(resolver.get_promise(scope).into());
-        return;
-    }
     let battery = NavigatorBatteryStatusObjectDeclaration::new(true, 0.0, f64::INFINITY, 1.0)
         .bind(scope)
         .expect("Navigator battery status declaration should bind");
     let _ = resolver.resolve(scope, battery.into());
     rv.set(resolver.get_promise(scope).into());
-}
-
-fn battery_event_target_noop_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    if !battery_status_receiver_branded(scope, args.this()) {
-        crate::util::throw_type_error(scope, "Illegal invocation");
-    }
-}
-
-fn battery_dispatch_event_callback<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    if !battery_status_receiver_branded(scope, args.this()) {
-        crate::util::throw_type_error(scope, "Illegal invocation");
-        return;
-    }
-    rv.set(v8::Boolean::new(scope, true).into());
-}
-
-fn battery_status_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, NAVIGATOR_BATTERY_STATUS_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }
 
 pub(in crate::context_bootstrap) fn navigator_permissions_query_callback<'s>(
@@ -588,11 +593,6 @@ pub(in crate::context_bootstrap) fn navigator_permissions_query_callback<'s>(
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
-    if !permissions_receiver_branded(scope, args.this()) {
-        reject_type_error(scope, resolver, "Illegal invocation");
-        rv.set(resolver.get_promise(scope).into());
-        return;
-    }
     let permission_name = match permission_query_name(scope, args.get(0)) {
         Ok(permission_name) => permission_name,
         Err(error) => {
@@ -632,22 +632,16 @@ fn permission_query_name<'s>(
     Ok(descriptor.name)
 }
 
-fn permissions_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, PERMISSIONS_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
-}
-
 fn build_permission_status_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
     state: &str,
 ) -> v8::Local<'s, v8::Object> {
-    PermissionStatusObjectDeclaration::new(name.to_owned(), state.to_owned())
+    let status = PermissionStatusObjectDeclaration::new(name.to_owned(), state.to_owned())
         .bind(scope)
-        .expect("PermissionStatus declaration should bind")
+        .expect("PermissionStatus declaration should bind");
+    initialize_simple_event_target(scope, status);
+    status
 }
 
 pub(in crate::context_bootstrap) fn permission_status_name_getter_callback<'s>(
@@ -757,14 +751,7 @@ fn storage_manager_promise_resolver<'s>(
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     method: &'static str,
 ) -> Option<v8::Local<'s, v8::PromiseResolver>> {
-    branded_promise_resolver(
-        scope,
-        args,
-        rv,
-        "StorageManager",
-        method,
-        STORAGE_MANAGER_BRAND_SLOT,
-    )
+    branded_promise_resolver(scope, args, rv, "StorageManager", method)
 }
 
 fn storage_manager_context_or_reject<'s>(
@@ -806,9 +793,6 @@ fn storage_manager_owner_context<'s>(
                 let storage_context = host.storage_context_for_lightweight_popup(popup_id)?;
                 return Some(StorageManagerOwnerContext {
                     storage_key: storage_context.storage_key().serialized_storage_key(),
-                    area_key: Some(storage_context.web_storage_area_key().to_owned()),
-                    host_ptr: Some(host_ptr),
-                    popup_id: Some(popup_id),
                 });
             } else {
                 host.top_document_storage_context()
@@ -816,19 +800,11 @@ fn storage_manager_owner_context<'s>(
         };
         return Some(StorageManagerOwnerContext {
             storage_key: context.storage_key().serialized_storage_key(),
-            area_key: Some(context.web_storage_area_key().to_owned()),
-            host_ptr: Some(host_ptr),
-            popup_id: None,
         });
     }
     let storage_key = crate::worker::worker_storage_key(scope)?;
     let storage_key = storage_key.serialized_storage_key();
-    Some(StorageManagerOwnerContext {
-        storage_key,
-        area_key: None,
-        host_ptr: None,
-        popup_id: None,
-    })
+    Some(StorageManagerOwnerContext { storage_key })
 }
 
 fn storage_manager_child_handle<'s>(
@@ -852,26 +828,6 @@ fn storage_manager_usage_bytes(
     scope: &mut v8::PinScope<'_, '_>,
     context: &StorageManagerOwnerContext,
 ) -> StorageUsageSnapshot {
-    let web_storage_usage = context
-        .host_ptr
-        .zip(context.area_key.as_deref())
-        .map(|(host_ptr, area_key)| {
-            let host = unsafe { &*host_ptr };
-            let local_usage = {
-                let store = host.web_storage_store();
-                store.lock().usage_bytes(area_key)
-            };
-            let session_usage = if let Some(popup_id) = context.popup_id {
-                host.lightweight_popup_session_storage_store(popup_id)
-                    .map(|store| store.lock().usage_bytes(area_key))
-                    .unwrap_or(0)
-            } else {
-                let store = host.session_storage_store();
-                store.lock().usage_bytes(area_key)
-            };
-            local_usage.saturating_add(session_usage) as u64
-        })
-        .unwrap_or(0);
     let locator = moli_storage_service::StorageBucketLocator::default_bucket(&context.storage_key);
     let bucket_usage = storage_bucket_quota_owner_for_locator(scope, &locator)
         .and_then(|owner| owner.usage_snapshot().ok());
@@ -893,8 +849,7 @@ fn storage_manager_usage_bytes(
             )
         });
     StorageUsageSnapshot {
-        total: web_storage_usage
-            .saturating_add(indexed_db_usage)
+        total: indexed_db_usage
             .saturating_add(cache_storage_usage)
             .saturating_add(opfs_usage),
         quota,
@@ -943,6 +898,20 @@ pub(in crate::context_bootstrap) fn storage_bucket_manager_open_callback<'s>(
     else {
         return;
     };
+    if dispatch_sql_bucket_operation(
+        scope,
+        resolver,
+        SqlBucketOperation::Open {
+            storage_key: storage_key.clone(),
+            name: name.clone(),
+            expires: options.expires,
+            durability: options.durability,
+            quota: options.quota,
+            persisted: options.persisted,
+        },
+    ) {
+        return;
+    }
     let expired = with_storage_bucket_store_entry(scope, |store| {
         store.delete_bucket_if_expired(&storage_key, &name, now_ms)
     });
@@ -1009,6 +978,15 @@ pub(in crate::context_bootstrap) fn storage_bucket_manager_keys_callback<'s>(
     else {
         return;
     };
+    if dispatch_sql_bucket_operation(
+        scope,
+        resolver,
+        SqlBucketOperation::Keys {
+            storage_key: storage_key.clone(),
+        },
+    ) {
+        return;
+    }
     let expired = with_storage_bucket_store_entry(scope, |store| {
         store.delete_expired_buckets(&storage_key, storage_bucket_now_ms())
     });
@@ -1075,6 +1053,16 @@ pub(in crate::context_bootstrap) fn storage_bucket_manager_delete_callback<'s>(
     else {
         return;
     };
+    if dispatch_sql_bucket_operation(
+        scope,
+        resolver,
+        SqlBucketOperation::Delete {
+            storage_key: storage_key.clone(),
+            name: name.clone(),
+        },
+    ) {
+        return;
+    }
     let deleted =
         with_storage_bucket_store_entry(scope, |store| store.delete_bucket(&storage_key, &name));
     let cleanup = match deleted {
@@ -1107,14 +1095,7 @@ fn storage_bucket_manager_resolver<'s>(
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     method: &'static str,
 ) -> Option<v8::Local<'s, v8::PromiseResolver>> {
-    let resolver = branded_promise_resolver(
-        scope,
-        args,
-        rv,
-        "StorageBucketManager",
-        method,
-        STORAGE_BUCKET_MANAGER_BRAND_SLOT,
-    )?;
+    let resolver = branded_promise_resolver(scope, args, rv, "StorageBucketManager", method)?;
     if !storage_bucket_manager_owner_is_live(scope, args.this()) {
         reject_illegal_invocation(scope, resolver, "StorageBucketManager", method);
         return None;
@@ -1183,7 +1164,7 @@ fn storage_bucket_manager_owner_is_live<'s>(
     if let Some(handle) = storage_bucket_manager_child_handle(scope, manager) {
         return context_host_ptr_from_global_bridge(scope).is_some_and(|host_ptr| {
             // SAFETY: context_host_ptr_from_global_bridge returns the live
-            // JsContextHost pointer owned by the current V8 context.
+            // PageScriptHost pointer owned by the current V8 context.
             unsafe { (&*host_ptr).child_browsing_context_is_live(handle) }
         });
     }
@@ -1225,10 +1206,6 @@ pub(in crate::context_bootstrap) fn storage_bucket_name_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !storage_bucket_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let value = get_private_value(scope, args.this(), STORAGE_BUCKET_NAME_SLOT)
         .unwrap_or_else(|| v8str(scope, "").into());
     rv.set(value);
@@ -1239,10 +1216,6 @@ pub(in crate::context_bootstrap) fn storage_bucket_indexed_db_getter_callback<'s
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !storage_bucket_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let Some(handle) = storage_bucket_handle(scope, args.this()) else {
         rv.set_undefined();
         return;
@@ -1258,10 +1231,6 @@ pub(in crate::context_bootstrap) fn storage_bucket_caches_getter_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !storage_bucket_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     if let Some(value) = get_private_value(scope, args.this(), STORAGE_BUCKET_CACHES_OBJECT_SLOT) {
         rv.set(value);
         return;
@@ -1520,26 +1489,14 @@ fn storage_bucket_cache_storage_match_callback<'s>(
     else {
         return;
     };
-    let request = match cache_request_info_argument(scope, &args, 0) {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            reject_type_error(
-                scope,
-                resolver,
-                "CacheStorage.match requires a request key.",
-            );
-            return;
-        }
-        Err(error) => {
-            reject_type_error(scope, resolver, &error);
-            return;
-        }
-    };
-    let Some(options) = cache_query_options(scope, &args, 1) else {
-        reject_type_error(scope, resolver, "CacheStorage.match options are invalid.");
+    let Some(parsed) = cache_arguments::<CacheStorageQueryArgs>(scope, &args, resolver) else {
         return;
     };
-    let query = storage_bucket_cache_query(request, &options);
+    let Some(request) = cache_request_info(scope, parsed.request, resolver) else {
+        return;
+    };
+    let options = parsed.options;
+    let query = storage_bucket_cache_query(request, &options.base);
     let Some(handle) =
         storage_bucket_cache_storage_live_handle(scope, args.this(), resolver, "match")
     else {
@@ -1703,26 +1660,18 @@ fn storage_bucket_cache_put_callback<'s>(
     let Some(resolver) = storage_bucket_cache_resolver(scope, &args, &mut rv, "put") else {
         return;
     };
-    let request = match cache_request_info_argument(scope, &args, 0) {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            reject_type_error(scope, resolver, "Cache.put requires a request key.");
-            return;
-        }
-        Err(error) => {
-            reject_type_error(scope, resolver, &error);
-            return;
-        }
+    let Some(parsed) = cache_arguments::<CachePutArgs>(scope, &args, resolver) else {
+        return;
+    };
+    let Some(request) = cache_request_info(scope, parsed.request, resolver) else {
+        return;
     };
     if !request.method.eq_ignore_ascii_case("GET") {
         reject_type_error(scope, resolver, "Cache.put only accepts GET requests.");
         return;
     }
-    if args.length() <= 1 || args.get(1).is_null_or_undefined() {
-        reject_type_error(scope, resolver, "Cache.put requires a response.");
-        return;
-    }
-    let Some(response) = storage_bucket_cached_response_from_value(scope, args.get(1), resolver)
+    let Some(response) =
+        storage_bucket_cached_response_from_value(scope, parsed.response.into(), resolver)
     else {
         return;
     };
@@ -1828,16 +1777,8 @@ fn storage_bucket_cache_put_pending_body<'s>(
         request_method: request.method,
         request_headers_json: serde_json::to_string(&request.headers)
             .unwrap_or_else(|_| "[]".to_owned()),
-        response_type: head.response_type,
-        response_url: head
-            .final_url
-            .map(|url| url.to_string())
-            .unwrap_or_default(),
-        response_redirected: head.redirected,
-        response_status: f64::from(head.status),
-        response_status_text: head.status_text,
-        response_headers_json: serde_json::to_string(&head.headers)
-            .unwrap_or_else(|_| "[]".to_owned()),
+        response_head_json: serde_json::to_string(&head)
+            .expect("native Response head should serialize"),
     }
     .bind(scope)
     .expect("Cache.put pending body data should bind");
@@ -1894,15 +1835,7 @@ fn storage_bucket_cache_put_body_fulfilled_callback<'s>(
             return;
         }
     };
-    let response = StorageBucketCachedResponse {
-        response_type: pending.response_type,
-        url: pending.response_url,
-        redirected: pending.response_redirected,
-        status: pending.response_status,
-        status_text: pending.response_status_text,
-        headers: pending.response_headers,
-        body,
-    };
+    let response = pending.response_head.with_body(body);
     storage_bucket_cache_put_store_response(
         scope,
         pending.resolver,
@@ -1920,29 +1853,14 @@ fn storage_bucket_cache_put_body_rejected_callback<'s>(
     let Some(pending) = storage_bucket_cache_put_pending_data(scope, args.data()) else {
         return;
     };
-    let reason = args
-        .get(0)
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown rejection".to_owned());
-    reject_type_error(
-        scope,
-        pending.resolver,
-        &format!("Cache.put failed to materialize Response body: {reason}"),
-    );
+    let _ = pending.resolver.reject(scope, args.get(0));
 }
 
 struct StorageBucketCachePutPendingData<'scope> {
     resolver: v8::Local<'scope, v8::PromiseResolver>,
     handle: StorageBucketCacheHandle,
     request: CacheRequestInfo,
-    response_type: String,
-    response_url: String,
-    response_redirected: bool,
-    response_status: u16,
-    response_status_text: String,
-    response_headers: Vec<(String, String)>,
+    response_head: moli_fetch_types::FetchResponseHead,
 }
 
 fn storage_bucket_cache_put_pending_data<'s>(
@@ -1977,28 +1895,12 @@ fn storage_bucket_cache_put_pending_data<'s>(
         data_private_string(scope, data, STORAGE_BUCKET_CACHE_PUT_REQUEST_HEADERS_SLOT)?;
     let request_headers =
         serde_json::from_str::<Vec<(String, String)>>(&request_headers_json).unwrap_or_default();
-    let response_type =
-        data_private_string(scope, data, STORAGE_BUCKET_CACHE_PUT_RESPONSE_TYPE_SLOT)?;
-    let response_url =
-        data_private_string(scope, data, STORAGE_BUCKET_CACHE_PUT_RESPONSE_URL_SLOT)?;
-    let response_redirected = data_private_bool(
+    let response_head = serde_json::from_str(&data_private_string(
         scope,
         data,
-        STORAGE_BUCKET_CACHE_PUT_RESPONSE_REDIRECTED_SLOT,
-    );
-    let response_status =
-        get_private_value(scope, data, STORAGE_BUCKET_CACHE_PUT_RESPONSE_STATUS_SLOT)
-            .and_then(|value| value.number_value(scope))
-            .map(|value| value as u16)?;
-    let response_status_text = data_private_string(
-        scope,
-        data,
-        STORAGE_BUCKET_CACHE_PUT_RESPONSE_STATUS_TEXT_SLOT,
-    )?;
-    let response_headers_json =
-        data_private_string(scope, data, STORAGE_BUCKET_CACHE_PUT_RESPONSE_HEADERS_SLOT)?;
-    let response_headers =
-        serde_json::from_str::<Vec<(String, String)>>(&response_headers_json).unwrap_or_default();
+        STORAGE_BUCKET_CACHE_PUT_RESPONSE_HEAD_SLOT,
+    )?)
+    .ok()?;
     let bucket = StorageBucketHandle {
         identity: StorageBucketIdentity::new(&bucket_origin, &bucket_name, bucket_id),
         indexed_db_storage_key: bucket_storage_key,
@@ -2015,12 +1917,7 @@ fn storage_bucket_cache_put_pending_data<'s>(
             method: request_method,
             headers: request_headers,
         },
-        response_type,
-        response_url,
-        response_redirected,
-        response_status,
-        response_status_text,
-        response_headers,
+        response_head,
     })
 }
 
@@ -2034,14 +1931,6 @@ fn data_private_string<'s>(
         .map(|value| value.to_rust_string_lossy(scope))
 }
 
-fn data_private_bool<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    data: v8::Local<'s, v8::Object>,
-    slot: &'static str,
-) -> bool {
-    get_private_value(scope, data, slot).is_some_and(|value| value.boolean_value(scope))
-}
-
 fn storage_bucket_cache_match_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -2050,21 +1939,13 @@ fn storage_bucket_cache_match_callback<'s>(
     let Some(resolver) = storage_bucket_cache_resolver(scope, &args, &mut rv, "match") else {
         return;
     };
-    let request = match cache_request_info_argument(scope, &args, 0) {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            reject_type_error(scope, resolver, "Cache.match requires a request key.");
-            return;
-        }
-        Err(error) => {
-            reject_type_error(scope, resolver, &error);
-            return;
-        }
-    };
-    let Some(options) = cache_query_options(scope, &args, 1) else {
-        reject_type_error(scope, resolver, "Cache.match options are invalid.");
+    let Some(parsed) = cache_arguments::<CacheQueryArgs>(scope, &args, resolver) else {
         return;
     };
+    let Some(request) = cache_request_info(scope, parsed.request, resolver) else {
+        return;
+    };
+    let options = parsed.options;
     let query = storage_bucket_cache_query(request, &options);
     let Some(handle) = storage_bucket_cache_live_handle(scope, args.this(), resolver, "match")
     else {
@@ -2109,17 +1990,19 @@ fn storage_bucket_cache_match_all_callback<'s>(
     let Some(resolver) = storage_bucket_cache_resolver(scope, &args, &mut rv, "matchAll") else {
         return;
     };
-    let request = match cache_request_info_argument(scope, &args, 0) {
-        Ok(request) => request,
-        Err(error) => {
-            reject_type_error(scope, resolver, &error);
-            return;
-        }
-    };
-    let Some(options) = cache_query_options(scope, &args, 1) else {
-        reject_type_error(scope, resolver, "Cache.matchAll options are invalid.");
+    let Some(parsed) = cache_arguments::<OptionalCacheQueryArgs>(scope, &args, resolver) else {
         return;
     };
+    let request = match parsed.request {
+        Some(input) => {
+            let Some(request) = cache_request_info(scope, input, resolver) else {
+                return;
+            };
+            Some(request)
+        }
+        None => None,
+    };
+    let options = parsed.options;
     let query = request.map(|request| storage_bucket_cache_query(request, &options));
     let Some(handle) = storage_bucket_cache_live_handle(scope, args.this(), resolver, "matchAll")
     else {
@@ -2180,17 +2063,19 @@ fn storage_bucket_cache_keys_callback<'s>(
     let Some(resolver) = storage_bucket_cache_resolver(scope, &args, &mut rv, "keys") else {
         return;
     };
-    let request = match cache_request_info_argument(scope, &args, 0) {
-        Ok(request) => request,
-        Err(error) => {
-            reject_type_error(scope, resolver, &error);
-            return;
-        }
-    };
-    let Some(options) = cache_query_options(scope, &args, 1) else {
-        reject_type_error(scope, resolver, "Cache.keys options are invalid.");
+    let Some(parsed) = cache_arguments::<OptionalCacheQueryArgs>(scope, &args, resolver) else {
         return;
     };
+    let request = match parsed.request {
+        Some(input) => {
+            let Some(request) = cache_request_info(scope, input, resolver) else {
+                return;
+            };
+            Some(request)
+        }
+        None => None,
+    };
+    let options = parsed.options;
     let query = request.map(|request| storage_bucket_cache_query(request, &options));
     let Some(handle) = storage_bucket_cache_live_handle(scope, args.this(), resolver, "keys")
     else {
@@ -2234,21 +2119,13 @@ fn storage_bucket_cache_delete_callback<'s>(
     let Some(resolver) = storage_bucket_cache_resolver(scope, &args, &mut rv, "delete") else {
         return;
     };
-    let request = match cache_request_info_argument(scope, &args, 0) {
-        Ok(Some(request)) => request,
-        Ok(None) => {
-            reject_type_error(scope, resolver, "Cache.delete requires a request key.");
-            return;
-        }
-        Err(error) => {
-            reject_type_error(scope, resolver, &error);
-            return;
-        }
-    };
-    let Some(options) = cache_query_options(scope, &args, 1) else {
-        reject_type_error(scope, resolver, "Cache.delete options are invalid.");
+    let Some(parsed) = cache_arguments::<CacheQueryArgs>(scope, &args, resolver) else {
         return;
     };
+    let Some(request) = cache_request_info(scope, parsed.request, resolver) else {
+        return;
+    };
+    let options = parsed.options;
     let query = storage_bucket_cache_query(request, &options);
     let Some(handle) = storage_bucket_cache_live_handle(scope, args.this(), resolver, "delete")
     else {
@@ -2346,6 +2223,16 @@ pub(in crate::context_bootstrap) fn storage_bucket_set_expires_callback<'s>(
     ) else {
         return;
     };
+    if dispatch_sql_bucket_operation(
+        scope,
+        resolver,
+        SqlBucketOperation::SetExpires {
+            identity: handle.identity.clone(),
+            expires,
+        },
+    ) {
+        return;
+    }
     let result = with_storage_bucket_store_entry(scope, |store| {
         store.set_bucket_expires_for_identity(&handle.identity, expires)
     });
@@ -2445,27 +2332,12 @@ fn storage_bucket_resolver<'s>(
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     method: &'static str,
 ) -> Option<v8::Local<'s, v8::PromiseResolver>> {
-    let resolver = branded_promise_resolver(
-        scope,
-        args,
-        rv,
-        "StorageBucket",
-        method,
-        STORAGE_BUCKET_BRAND_SLOT,
-    )?;
+    let resolver = branded_promise_resolver(scope, args, rv, "StorageBucket", method)?;
     if !storage_bucket_receiver_execution_context_is_live(scope, args.this()) {
         reject_storage_bucket_invalid_state(scope, resolver, method);
         return None;
     }
     Some(resolver)
-}
-
-fn storage_bucket_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, STORAGE_BUCKET_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }
 
 fn build_storage_bucket_object<'s>(
@@ -2487,8 +2359,12 @@ fn build_storage_bucket_cache_storage_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     handle: &StorageBucketHandle,
 ) -> v8::Local<'s, v8::Object> {
-    let object = v8::Object::new(scope);
-    let _ = StorageBucketCacheStorageObjectDeclaration::default().bind_into(scope, object);
+    let prototype =
+        crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "CacheStorage")
+            .expect("CacheStorage intrinsic prototype should be available");
+    let object = StorageBucketCacheStorageObjectDeclaration::new(prototype)
+        .bind(scope)
+        .expect("CacheStorage declaration should bind");
     set_storage_bucket_handle_slots(scope, object, handle);
     object
 }
@@ -2499,10 +2375,15 @@ fn build_storage_bucket_cache_object<'s>(
     cache_name: &str,
     cache_id: StorageBucketCacheId,
 ) -> v8::Local<'s, v8::Object> {
-    let object = v8::Object::new(scope);
-    let _ =
-        StorageBucketCacheObjectDeclaration::new(cache_name.to_owned(), cache_id.get().to_string())
-            .bind_into(scope, object);
+    let prototype = crate::context_bootstrap::ensure_intrinsic_interface_prototype(scope, "Cache")
+        .expect("Cache intrinsic prototype should be available");
+    let object = StorageBucketCacheObjectDeclaration::new(
+        prototype,
+        cache_name.to_owned(),
+        cache_id.get().to_string(),
+    )
+    .bind(scope)
+    .expect("Cache declaration should bind");
     set_storage_bucket_handle_slots(scope, object, bucket);
     if let Some(store) = current_storage_bucket_store(scope) {
         let identity = bucket.identity.clone();
@@ -2562,14 +2443,7 @@ fn storage_bucket_cache_storage_resolver<'s>(
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     method: &'static str,
 ) -> Option<v8::Local<'s, v8::PromiseResolver>> {
-    let resolver = branded_promise_resolver(
-        scope,
-        args,
-        rv,
-        "CacheStorage",
-        method,
-        STORAGE_BUCKET_CACHE_STORAGE_BRAND_SLOT,
-    )?;
+    let resolver = branded_promise_resolver(scope, args, rv, "CacheStorage", method)?;
     if !storage_bucket_receiver_execution_context_is_live(scope, args.this()) {
         reject_storage_bucket_invalid_state(scope, resolver, method);
         return None;
@@ -2583,14 +2457,7 @@ fn storage_bucket_cache_resolver<'s>(
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     method: &'static str,
 ) -> Option<v8::Local<'s, v8::PromiseResolver>> {
-    let resolver = branded_promise_resolver(
-        scope,
-        args,
-        rv,
-        "Cache",
-        method,
-        STORAGE_BUCKET_CACHE_BRAND_SLOT,
-    )?;
+    let resolver = branded_promise_resolver(scope, args, rv, "Cache", method)?;
     if !storage_bucket_receiver_execution_context_is_live(scope, args.this()) {
         reject_storage_bucket_invalid_state(scope, resolver, method);
         return None;
@@ -2621,12 +2488,11 @@ fn branded_promise_resolver<'s>(
     rv: &mut v8::ReturnValue<'_, v8::Value>,
     interface: &'static str,
     method: &'static str,
-    brand_slot: &'static str,
 ) -> Option<v8::Local<'s, v8::PromiseResolver>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     rv.set(resolver.get_promise(scope).into());
-    if !get_private_value(scope, args.this(), brand_slot)
-        .is_some_and(|value| value.boolean_value(scope))
+    if !web_api_interfaces::descriptor(interface)
+        .is_some_and(|interface| interface.is_instance(scope, args.this()))
     {
         reject_illegal_invocation(scope, resolver, interface, method);
         return None;
@@ -2715,11 +2581,33 @@ fn storage_bucket_handle_is_current<'s>(
     method: &'static str,
     stale_error: StorageBucketStaleError,
 ) -> bool {
+    let now_ms = storage_bucket_now_ms();
+    let current = with_storage_bucket_store_entry(scope, |store| {
+        store
+            .bucket_identity(handle.identity.storage_key(), handle.identity.name())
+            .as_ref()
+            == Some(&handle.identity)
+    });
+    if current == Some(false) {
+        reject_storage_bucket_stale_error(scope, resolver, method, stale_error);
+        return false;
+    }
+    let expired = with_storage_bucket_store_entry(scope, |store| {
+        store
+            .bucket_expires_for_identity(&handle.identity)
+            .flatten()
+            .is_some_and(|expires| expires <= now_ms)
+    })
+    .unwrap_or(false);
+    if expired && dispatch_sql_expired_bucket_cleanup(scope, &handle.identity) {
+        reject_storage_bucket_stale_error(scope, resolver, method, stale_error);
+        return false;
+    }
     let expired = with_storage_bucket_store_entry(scope, |store| {
         store.delete_bucket_if_expired(
             handle.identity.storage_key(),
             handle.identity.name(),
-            storage_bucket_now_ms(),
+            now_ms,
         )
     });
     match expired {
@@ -2852,17 +2740,24 @@ fn storage_bucket_cached_response_from_value<'s>(
                 return None;
             }
         };
-    let body =
-        match crate::network_host::materialize_response_object_body(scope, response, "Cache.put") {
-            crate::network_host::MaterializedResponseBody::Ready(body) => body,
-            crate::network_host::MaterializedResponseBody::Pending(promise) => {
-                return Some(StorageBucketCachedResponseMaterialization::Pending { head, promise });
-            }
-            crate::network_host::MaterializedResponseBody::Failure(error) => {
-                reject_type_error(scope, resolver, &error);
-                return None;
-            }
-        };
+    let body = match crate::network_host::materialize_response_object_body_preserving_error(
+        scope,
+        response,
+        "Cache.put",
+    ) {
+        Ok(crate::network_host::MaterializedResponseBody::Ready(body)) => body,
+        Ok(crate::network_host::MaterializedResponseBody::Pending(promise)) => {
+            return Some(StorageBucketCachedResponseMaterialization::Pending { head, promise });
+        }
+        Ok(crate::network_host::MaterializedResponseBody::Failure(error)) => {
+            reject_type_error(scope, resolver, &error);
+            return None;
+        }
+        Err(reason) => {
+            let _ = resolver.reject(scope, reason);
+            return None;
+        }
+    };
     Some(StorageBucketCachedResponseMaterialization::Ready(
         storage_bucket_cached_response_from_head_body(head, body),
     ))
@@ -2872,102 +2767,65 @@ fn storage_bucket_cached_response_from_head_body(
     head: crate::network_host::MaterializedResponseHead,
     body: Vec<u8>,
 ) -> StorageBucketCachedResponse {
-    StorageBucketCachedResponse {
-        response_type: head.response_type,
-        url: head
-            .final_url
-            .map(|url| url.to_string())
-            .unwrap_or_default(),
-        redirected: head.redirected,
-        status: head.status,
-        status_text: head.status_text,
-        headers: head.headers,
-        body,
+    head.with_body(body)
+}
+
+fn cache_request_info<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    input: CacheRequestInput<'s>,
+    resolver: v8::Local<'s, v8::PromiseResolver>,
+) -> Option<CacheRequestInfo> {
+    match input {
+        CacheRequestInput::Native(object) => {
+            let Some(url) = crate::network_host::request_slot_string(
+                scope,
+                object,
+                crate::network_host::REQUEST_URL_SLOT,
+            ) else {
+                reject_type_error(scope, resolver, "Cache request URL is unavailable.");
+                return None;
+            };
+            Some(CacheRequestInfo {
+                url,
+                method: crate::network_host::request_method(scope, object),
+                headers: crate::network_host::request_headers_entries(scope, object),
+            })
+        }
+        CacheRequestInput::Url(input) => {
+            match crate::network_host::try_resolve_request_constructor_url(scope, &input) {
+                Ok(url) => Some(CacheRequestInfo {
+                    url,
+                    method: "GET".to_owned(),
+                    headers: Vec::new(),
+                }),
+                Err(error) => {
+                    reject_type_error(scope, resolver, &error.to_string());
+                    None
+                }
+            }
+        }
     }
 }
 
-fn cache_request_info_argument<'s>(
+fn cache_arguments<'s, T: webidl::WebIdlArguments<'s>>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Result<Option<CacheRequestInfo>, String> {
-    if args.length() <= index {
-        return Ok(None);
+    resolver: v8::Local<'s, v8::PromiseResolver>,
+) -> Option<T> {
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut scope = try_catch.init();
+    match webidl::try_parse_args::<T>(&mut scope, args) {
+        Ok(parsed) => Some(parsed),
+        Err(error) => {
+            webidl::throw_error(&mut scope, &error);
+            let exception = scope
+                .exception()
+                .unwrap_or_else(|| v8::undefined(&scope).into());
+            scope.reset();
+            let _ = resolver.reject(&scope, exception);
+            None
+        }
     }
-    let value = args.get(index);
-    if let Ok(object) = v8::Local::<v8::Object>::try_from(value)
-        && crate::network_host::is_branded_request_object(scope, object)
-        && let Some(url) = crate::network_host::request_slot_string(
-            scope,
-            object,
-            crate::network_host::REQUEST_URL_SLOT,
-        )
-    {
-        let method = crate::network_host::request_method(scope, object);
-        let headers = crate::network_host::request_headers_entries(scope, object);
-        return Ok(Some(CacheRequestInfo {
-            url,
-            method,
-            headers,
-        }));
-    }
-    let Some(input) = value
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-    else {
-        return Ok(None);
-    };
-    crate::network_host::try_resolve_request_constructor_url(scope, &input).map(|url| {
-        Some(CacheRequestInfo {
-            url,
-            method: "GET".to_owned(),
-            headers: Vec::new(),
-        })
-    })
-}
-
-fn cache_query_options<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'s>,
-    index: i32,
-) -> Option<CacheQueryOptions> {
-    if args.length() <= index || args.get(index).is_null_or_undefined() {
-        return Some(CacheQueryOptions::default());
-    }
-    let options = args.get(index).to_object(scope)?;
-    let cache_name = cache_query_cache_name_option(scope, options)?;
-    let ignore_method = cache_query_boolean_option(scope, options, "ignoreMethod")?;
-    let ignore_search = cache_query_boolean_option(scope, options, "ignoreSearch")?;
-    let ignore_vary = cache_query_boolean_option(scope, options, "ignoreVary")?;
-    Some(CacheQueryOptions {
-        ignore_search,
-        ignore_method,
-        ignore_vary,
-        cache_name,
-    })
-}
-
-fn cache_query_boolean_option(
-    scope: &mut v8::PinScope<'_, '_>,
-    options: v8::Local<'_, v8::Object>,
-    name: &str,
-) -> Option<bool> {
-    options
-        .get(scope, v8_string(scope, name)?.into())
-        .map(|value| value.boolean_value(scope))
-}
-
-fn cache_query_cache_name_option(
-    scope: &mut v8::PinScope<'_, '_>,
-    options: v8::Local<'_, v8::Object>,
-) -> Option<Option<String>> {
-    let value = options.get(scope, v8str(scope, "cacheName").into())?;
-    if value.is_undefined() {
-        return Some(None);
-    }
-    value
-        .to_string(scope)
-        .map(|value| Some(value.to_rust_string_lossy(scope)))
 }
 
 fn storage_bucket_cache_query(
@@ -2988,52 +2846,36 @@ fn build_storage_bucket_cached_response_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     response: StorageBucketCachedResponse,
 ) -> Option<v8::Local<'s, v8::Object>> {
-    if matches!(response.response_type.as_str(), "opaque" | "opaqueredirect") {
+    let moli_fetch_types::FetchResponse { head, body } = response;
+    if !head.metadata.response_type.is_readable() {
         return crate::network_host::build_filtered_cached_response_object(
             scope,
-            &response.response_type,
-            &response.url,
-            response.body,
+            head.metadata,
+            body,
         );
     }
-    let body: v8::Local<'s, v8::Value> = if matches!(response.status, 204 | 205 | 304) {
+    let body: v8::Local<'s, v8::Value> = if matches!(head.status, 204 | 205 | 304) {
         v8::null(scope).into()
     } else {
-        crate::blob::array_buffer_from_bytes(scope, response.body)?.into()
+        crate::blob::array_buffer_from_bytes(scope, body)?.into()
     };
     let init = ObjectLiteralDeclaration::bind(scope);
     init.set_string_property(
         scope,
         "status",
-        v8::Integer::new(scope, response.status as i32).into(),
+        v8::Integer::new(scope, head.status as i32).into(),
     );
-    let status_text = v8_string(scope, &response.status_text)?;
+    let status_text = v8_string(scope, &head.status_text)?;
     init.set_string_property(scope, "statusText", status_text.into());
-    let headers = headers_entries_to_init_array(scope, &response.headers);
+    let headers =
+        headers_entries_to_init_array(scope, &moli_fetch::headers_to_byte_strings(&head.headers));
     init.set_string_property(scope, "headers", headers.into());
     let global = scope.get_current_context().global(scope);
     let constructor = global
         .get(scope, v8str(scope, "Response").into())
         .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
     let response_obj = constructor.new_instance(scope, &[body, init.into_value()])?;
-    crate::network_host::set_response_slot_string(
-        scope,
-        response_obj,
-        crate::network_host::RESPONSE_TYPE_SLOT,
-        &response.response_type,
-    );
-    crate::network_host::set_response_slot_string(
-        scope,
-        response_obj,
-        crate::network_host::RESPONSE_URL_SLOT,
-        &response.url,
-    );
-    crate::network_host::set_response_slot_bool(
-        scope,
-        response_obj,
-        crate::network_host::RESPONSE_REDIRECTED_SLOT,
-        response.redirected,
-    );
+    crate::network_host::set_response_metadata(scope, response_obj, &head.metadata);
     Some(response_obj)
 }
 
@@ -3041,19 +2883,14 @@ fn cache_entries_to_request_array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     entries: &[StorageBucketCacheMatch],
 ) -> Option<v8::Local<'s, v8::Array>> {
-    let global = scope.get_current_context().global(scope);
-    let constructor = global
-        .get(scope, v8str(scope, "Request").into())
-        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())?;
     let requests = v8::Array::new(scope, entries.len() as i32);
     for (index, entry) in entries.iter().enumerate() {
-        let request_url = v8_string(scope, &entry.request_url)?;
-        let init = ObjectLiteralDeclaration::bind(scope);
-        let method = v8_string(scope, &entry.request.method)?;
-        init.set_string_property(scope, "method", method.into());
-        let headers = headers_entries_to_init_array(scope, &entry.request.headers);
-        init.set_string_property(scope, "headers", headers.into());
-        let request = constructor.new_instance(scope, &[request_url.into(), init.into_value()])?;
+        let request = crate::network_host::build_cached_request_object(
+            scope,
+            &entry.request_url,
+            &entry.request.method,
+            &entry.request.headers,
+        )?;
         if requests.set_index(scope, index as u32, request.into()) != Some(true) {
             return None;
         }
@@ -3095,6 +2932,7 @@ fn cache_entry_usage_bytes(
         .saturating_add(response.body.len() as u64)
         .saturating_add(
             response
+                .head
                 .headers
                 .iter()
                 .map(|(name, value)| name.len().saturating_add(value.len()) as u64)
@@ -3349,29 +3187,19 @@ fn reject_storage_bucket_quota_exceeded<'s>(
     let _ = resolver.reject(scope, error);
 }
 
-fn reject_type_error<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    resolver: v8::Local<'s, v8::PromiseResolver>,
-    message: &str,
-) {
-    let error = v8_string(scope, message)
-        .map(|message| v8::Exception::type_error(scope, message))
-        .unwrap_or_else(|| v8::undefined(scope).into());
-    let _ = resolver.reject(scope, error);
-}
-
 fn strings_to_array<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     values: &[String],
 ) -> v8::Local<'s, v8::Array> {
-    let array = v8::Array::new(scope, values.len() as i32);
-    for (index, value) in values.iter().enumerate() {
-        let Some(value) = v8_string(scope, value) else {
-            continue;
-        };
-        let _ = array.set_index(scope, index as u32, value.into());
+    let mut elements = Vec::with_capacity(values.len());
+    for value in values {
+        elements.push(
+            v8_string(scope, value)
+                .expect("storage name should allocate")
+                .into(),
+        );
     }
-    array
+    v8::Array::new_with_elements(scope, &elements)
 }
 
 pub(in crate::context_bootstrap) fn navigator_ua_data_to_json_callback<'s>(
@@ -3379,10 +3207,6 @@ pub(in crate::context_bootstrap) fn navigator_ua_data_to_json_callback<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if !navigator_ua_data_receiver_branded(scope, args.this()) {
-        throw_type_error(scope, "Illegal invocation");
-        return;
-    }
     let identity = navigator_ua_data_identity(scope, args.this());
     rv.set(build_navigator_ua_data_snapshot(scope, &identity, None).into());
 }
@@ -3395,11 +3219,6 @@ pub(in crate::context_bootstrap) fn navigator_ua_data_get_high_entropy_values_ca
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
-    if !navigator_ua_data_receiver_branded(scope, args.this()) {
-        reject_type_error(scope, resolver, "Illegal invocation");
-        rv.set(resolver.get_promise(scope).into());
-        return;
-    }
     let requested = match navigator_ua_data_high_entropy_keys(scope, &args) {
         Ok(requested) => requested,
         Err(exception) => {
@@ -3434,14 +3253,6 @@ fn navigator_ua_data_high_entropy_keys<'s>(
             Err(exception)
         }
     }
-}
-
-fn navigator_ua_data_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, NAVIGATOR_UA_DATA_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }
 
 pub(in crate::context_bootstrap) fn build_navigator_ua_data_object<'s>(
@@ -3566,28 +3377,15 @@ fn build_storage_usage_details_object<'s>(
 
 pub(in crate::context_bootstrap) fn navigator_media_devices_get_user_media_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
+    _args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
-    if !media_devices_receiver_branded(scope, args.this()) {
-        reject_type_error(scope, resolver, "Illegal invocation");
-        rv.set(resolver.get_promise(scope).into());
-        return;
-    }
     let message = v8_string(scope, "Requested media device not found")
         .unwrap_or_else(|| v8_string(scope, "").unwrap());
     let error = v8::Exception::error(scope, message);
     let _ = resolver.reject(scope, error);
     rv.set(resolver.get_promise(scope).into());
-}
-
-fn media_devices_receiver_branded<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Object>,
-) -> bool {
-    get_private_value(scope, receiver, MEDIA_DEVICES_BRAND_SLOT)
-        .is_some_and(|value| value.boolean_value(scope))
 }

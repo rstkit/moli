@@ -52,6 +52,8 @@ mod text_track_default_mode;
 mod text_track_load;
 mod user_interaction;
 mod v8_foreground_task;
+#[cfg(test)]
+pub(crate) use v8_foreground_task::RendererPageV8ForegroundTaskSource;
 mod view_transition_update;
 mod webcrypto_task;
 mod websocket_event;
@@ -66,21 +68,19 @@ use crate::native_bridge::WindowDocumentTaskTarget;
 use crate::planning::SharedScriptSourceLoad;
 use crate::runtime::RendererDocumentToken;
 
-/// PageVm namespace plus the exact Window/Document captured by a queued task.
+/// PageVm namespace plus the exact target captured by a queued task.
 ///
 /// Task-source families keep their own typed ids and payloads, but they should
-/// not each redefine this authorization identity.
+/// not each redefine this authorization identity. Document-owned work uses the
+/// default target; global work can instead bind a Window execution context.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RendererPageWindowDocumentTaskOwner {
+pub(crate) struct RendererPageWindowDocumentTaskOwner<T = WindowDocumentTaskTarget> {
     root_document: RendererDocumentToken,
-    target: WindowDocumentTaskTarget,
+    target: T,
 }
 
-impl RendererPageWindowDocumentTaskOwner {
-    pub(crate) const fn new(
-        root_document: RendererDocumentToken,
-        target: WindowDocumentTaskTarget,
-    ) -> Self {
+impl<T: Copy> RendererPageWindowDocumentTaskOwner<T> {
+    pub(crate) const fn new(root_document: RendererDocumentToken, target: T) -> Self {
         Self {
             root_document,
             target,
@@ -91,23 +91,23 @@ impl RendererPageWindowDocumentTaskOwner {
         self.root_document
     }
 
-    pub(crate) const fn target(self) -> WindowDocumentTaskTarget {
+    pub(crate) const fn target(self) -> T {
         self.target
     }
 }
 
 /// Scheduler envelope for a concrete exact Window/Document task whose mutable
-/// V8/DOM payload remains in the creating `JsContextHost` ledger.
+/// V8/DOM payload remains in the creating `PageScriptHost` ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RendererPageWindowDocumentTask<I, K> {
-    owner: RendererPageWindowDocumentTaskOwner,
+pub(crate) struct RendererPageWindowDocumentTask<I, K, T = WindowDocumentTaskTarget> {
+    owner: RendererPageWindowDocumentTaskOwner<T>,
     task_id: I,
     kind: K,
 }
 
-impl<I: Copy, K: Copy> RendererPageWindowDocumentTask<I, K> {
+impl<I: Copy, K: Copy, T: Copy> RendererPageWindowDocumentTask<I, K, T> {
     pub(crate) const fn new(
-        owner: RendererPageWindowDocumentTaskOwner,
+        owner: RendererPageWindowDocumentTaskOwner<T>,
         task_id: I,
         kind: K,
     ) -> Self {
@@ -118,7 +118,7 @@ impl<I: Copy, K: Copy> RendererPageWindowDocumentTask<I, K> {
         }
     }
 
-    pub(crate) const fn owner(&self) -> RendererPageWindowDocumentTaskOwner {
+    pub(crate) const fn owner(&self) -> RendererPageWindowDocumentTaskOwner<T> {
         self.owner
     }
 
@@ -237,8 +237,8 @@ pub(crate) use self::file_entry_file_callback::{
 };
 pub(crate) use self::file_reading::{
     PageFileReadingTargetEffect, PageFileReadingTurnAction, PageFileReadingTurnOutcome,
-    RendererPageFileReadingOwner, RendererPageFileReadingSender, RendererPageFileReadingTask,
-    RendererPageFileReadingTaskId, RendererPageFileReadingTaskKind,
+    RendererPageFileReaderPhase, RendererPageFileReadingOwner, RendererPageFileReadingSender,
+    RendererPageFileReadingTask, RendererPageFileReadingTaskId, RendererPageFileReadingTaskKind,
 };
 pub(crate) use self::hash_change_delivery::{
     PageHashChangeDeliveryTargetEffect, PageHashChangeDeliveryTurnAction,
@@ -839,6 +839,7 @@ mod tests {
             source_result: Ok(source.into()),
             source_bytes: None,
             network_result: None,
+            network_request_handle: None,
         }
     }
 
@@ -847,13 +848,13 @@ mod tests {
             internal_id,
             request_url: Url::parse("https://example.com/api").unwrap(),
             request_method: "GET".to_owned(),
-            request_headers: Vec::new(),
+            request_headers: Vec::new().into(),
             request_body: None,
             response_status_text: None,
             skip_fetch_security_validation: false,
             response_filter: None,
             network_error_text: None,
-            result: Err("test failure".to_owned()),
+            result: Err("test failure".to_owned()).into(),
         }
     }
 

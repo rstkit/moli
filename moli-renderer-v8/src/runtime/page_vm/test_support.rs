@@ -1,3 +1,4 @@
+use crate::types::SubresourceInterceptionClasses;
 use std::{
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicU64, Ordering},
@@ -216,6 +217,23 @@ impl PageVmTaskExecutorTestHarness {
             .await
     }
 
+    /// Execute one exact main-Document native-module owner notification.
+    /// Tests use this after asserting that such a notification is ready so an
+    /// older unrelated Page task cannot obscure the modulepreload follow-up.
+    pub(crate) async fn run_one_native_module_owner_event_task_executor_turn(
+        &mut self,
+        loader: &ResourceRequestClient,
+    ) -> anyhow::Result<bool> {
+        self.selected_task_local_set
+            .run_until(self.page_vm.run_exact_selected_page_task_for_test(
+                PageSelectedTaskTestSelector::MainDocumentRuntime(
+                    crate::page_task_queue::PageMainDocumentRuntimeActionKind::NativeModuleOwnerEvent,
+                ),
+                loader,
+            ))
+            .await
+    }
+
     /// Advance Page timers only through the production selected-task
     /// dispatcher.
     ///
@@ -289,6 +307,18 @@ impl PageVmTaskExecutorTestHarness {
             completed += 1;
         }
         Ok(completed)
+    }
+
+    pub(crate) async fn run_one_file_reading_task_executor_turn(
+        &mut self,
+        loader: &ResourceRequestClient,
+    ) -> anyhow::Result<bool> {
+        self.selected_task_local_set
+            .run_until(self.page_vm.run_exact_selected_page_task_for_test(
+                PageSelectedTaskTestSelector::FileReading,
+                loader,
+            ))
+            .await
     }
 
     pub(crate) async fn run_one_dom_manipulation_task_executor_turn(
@@ -480,18 +510,6 @@ impl PageVmTaskExecutorTestHarness {
         .await
     }
 
-    pub(crate) async fn run_one_webcrypto_task_executor_turn(
-        &mut self,
-        loader: &ResourceRequestClient,
-    ) -> anyhow::Result<bool> {
-        self.selected_task_local_set
-            .run_until(self.page_vm.run_exact_selected_page_task_for_test(
-                PageSelectedTaskTestSelector::WebCryptoTask,
-                loader,
-            ))
-            .await
-    }
-
     pub(crate) fn run_one_child_realm_materialization_body_for_test(
         &mut self,
     ) -> anyhow::Result<Option<crate::page_task_queue::PageChildRealmMaterializationTurnOutcome>>
@@ -629,10 +647,21 @@ impl PageVmTaskExecutorTestHarness {
     /// wake. A wake only asks the fixture to re-check stable sources; it never
     /// authorizes terminal admission or task execution.
     pub(crate) async fn wait_for_task_executor_work_arrival(&mut self) -> bool {
-        tokio::select! {
-            wake = self.owner_wake_rx.recv() => wake.is_some(),
-            arrived = self.page_vm.wait_for_initial_page_runtime_wake() => arrived,
-        }
+        let Self {
+            selected_task_local_set,
+            owner_wake_rx,
+            page_vm,
+            ..
+        } = self;
+        // A local producer may need to resume before it can publish the wake.
+        selected_task_local_set
+            .run_until(async {
+                tokio::select! {
+                    wake = owner_wake_rx.recv() => wake.is_some(),
+                    arrived = page_vm.wait_for_initial_page_runtime_wake() => arrived,
+                }
+            })
+            .await
     }
 }
 
@@ -652,6 +681,7 @@ impl DerefMut for PageVmTaskExecutorTestHarness {
 
 fn minimal_test_page_vm_env_config() -> PageVmEnvConfig {
     PageVmEnvConfig {
+        window_identity: Default::default(),
         web_storage: crate::RendererWebStorageHandles::ephemeral(),
         root_frame_id: None,
         main_document_commit: None,
@@ -661,29 +691,64 @@ fn minimal_test_page_vm_env_config() -> PageVmEnvConfig {
         runtime_inspector_session_restore_snapshots: Vec::new(),
         runtime_isolated_worlds: Vec::new(),
         permission_overrides: Vec::new(),
-        extra_http_headers: Vec::new(),
+        extra_http_headers: Default::default(),
         navigator_identity: Default::default(),
         document_policy_container: Default::default(),
         document_default_language: None,
         document_last_modified: None,
-        locale_override: None,
-        timezone_override: None,
-        script_execution_disabled: false,
-        bypass_content_security_policy: false,
-        cpu_throttling_rate: 1.0,
-        emulated_media: crate::protocol_types::EmulatedMediaOverrides::default(),
-        idle_override: None,
-        navigator_overrides: Default::default(),
-        viewport_surface: None,
+        document_settings: Default::default(),
         network_offline: false,
         blocked_url_patterns: Vec::new(),
         indexed_db_manager: None,
         storage_bucket_store: None,
-        fetch_subresource_interception_enabled: false,
-        fetch_subresource_interception_resource_type: None,
-        layout_policy: crate::real_layout_test_policy(),
+        fetch_subresource_interception_classes: SubresourceInterceptionClasses::NONE,
+        layout_configuration: moli_page_types::LayoutConfiguration {
+            policy: crate::real_layout_test_policy(),
+            scrollbars_hidden: false,
+        },
         wpt_extensions_enabled: false,
         navigation_bootstrap_entry: None,
         reserved_service_worker_client_id: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc, time::Duration};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_for_work_drives_local_producers() {
+        let loader = ResourceRequestClient::new(&moli_fetch::FetchConfig::default())
+            .expect("test request client should initialize");
+        let mut page = PageVmTaskExecutorTestHarness::new(
+            Url::parse("https://local-producer.test/").unwrap(),
+            &loader,
+        );
+        let wake = page
+            .page_vm
+            .runtime_hooks
+            .owner_wake
+            .as_ref()
+            .expect("Page task fixture must have an owner wake route")
+            .clone();
+        let produced = Rc::new(Cell::new(false));
+        let producer_marker = produced.clone();
+        page.selected_task_local_set.spawn_local(async move {
+            tokio::task::yield_now().await;
+            producer_marker.set(true);
+            wake.signal_networking_task();
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !produced.get() {
+                assert!(
+                    page.wait_for_task_executor_work_arrival().await,
+                    "the local producer's wake route must stay open"
+                );
+            }
+        })
+        .await
+        .expect("waiting for work must drive the local producer that publishes its wake");
     }
 }

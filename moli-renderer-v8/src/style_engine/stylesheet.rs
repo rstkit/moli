@@ -103,15 +103,27 @@ pub(super) fn install_active_stylesheet(
     quirks_mode: QuirksMode,
 ) -> ActiveStylesheet {
     let stylesheet = author_stylesheet_for_source(shared_lock, source, quirks_mode);
-    let web_font_resources = native_font_face_rules_for_stylesheet(&stylesheet)
+    let rules = native_font_face_rules_for_stylesheet(&stylesheet);
+    source.retain_font_face_rule_identities(&rules);
+    let mut occurrences = std::collections::HashMap::new();
+    let web_font_resources = rules
         .into_iter()
         .filter_map(|rule| {
+            let occurrence = occurrences
+                .entry(rule.rule_fingerprint.clone())
+                .or_insert(0);
+            let slot =
+                source.font_face_registration_slot(&rule.rule, &rule.rule_fingerprint, *occurrence);
+            *occurrence += 1;
             let resource =
-                crate::css_resource_urls::stylesheet_web_font_resource_with_resolved_url(
+                crate::css_resource_urls::stylesheet_web_font_resource_with_resolved_sources(
                     &rule.rule_fingerprint,
-                    rule.request_url?,
+                    rule.sources,
                 )?;
-            Some(ActiveWebFontResource::new(rule.rule, resource))
+            Some(ActiveWebFontResource::new(
+                rule.rule,
+                resource.with_registration_slot(slot),
+            ))
         })
         .collect::<Vec<_>>();
     ActiveStylesheet::new(
@@ -134,11 +146,8 @@ pub(in crate::style_engine) fn style_source_metadata_for_stylesheet(
 ) -> StyleSourceMetadata {
     let guard = stylesheet.shared_lock.read();
     let quirks_mode = stylesheet.contents.read_with(&guard).quirks_mode;
-    let stylist = new_stylist_with_viewport_bits(
-        DEFAULT_VIEWPORT_WIDTH.to_bits(),
-        DEFAULT_VIEWPORT_HEIGHT.to_bits(),
-        DEFAULT_VIEWPORT_WIDTH.to_bits(),
-        DEFAULT_VIEWPORT_HEIGHT.to_bits(),
+    let stylist = new_stylist_with_viewport(
+        StyleViewport::default(),
         StyloStyleEnvironment::default(),
         quirks_mode,
     );
@@ -164,6 +173,7 @@ pub(crate) struct StylesheetFontFaceRuleProjection {
     pub(crate) rule_identity: u64,
     pub(crate) rule_fingerprint: String,
     pub(crate) descriptor: moli_css_parse::CssFontFace,
+    pub(crate) resource: Option<crate::css_resource_urls::StylesheetLoadBlockingResource>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,10 +187,10 @@ pub(crate) struct NativeStylesheetFontFaceRuleProjection {
     pub(crate) rule: ServoArc<Locked<FontFaceRule>>,
     pub(crate) rule_fingerprint: String,
     pub(crate) descriptor: moli_css_parse::CssFontFace,
-    /// First supported network source, resolved by Stylo in the exact parser
+    /// Supported sources, resolved by Stylo in the exact parser
     /// context that owns this rule. Imported rules therefore retain the base
     /// URL of their imported stylesheet rather than inheriting the root base.
-    pub(crate) request_url: Option<url::Url>,
+    pub(crate) sources: Vec<moli_css_parse::CssFontSource>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -196,18 +206,7 @@ pub(crate) fn native_font_face_projection_for_stylesheet(
 ) -> NativeStylesheetFontFaceProjection {
     let guard = stylesheet.shared_lock.read();
     let quirks_mode = stylesheet.contents.read_with(&guard).quirks_mode;
-    let viewport_width = viewport.width.unwrap_or(DEFAULT_VIEWPORT_WIDTH as f64) as f32;
-    let viewport_height = viewport.height.unwrap_or(DEFAULT_VIEWPORT_HEIGHT as f64) as f32;
-    let screen_width = viewport.screen_width.unwrap_or(f64::from(viewport_width)) as f32;
-    let screen_height = viewport.screen_height.unwrap_or(f64::from(viewport_height)) as f32;
-    let stylist = new_stylist_with_viewport_bits(
-        viewport_width.to_bits(),
-        viewport_height.to_bits(),
-        screen_width.to_bits(),
-        screen_height.to_bits(),
-        environment,
-        quirks_mode,
-    );
+    let stylist = new_stylist_with_viewport(viewport, environment, quirks_mode);
 
     let mut projection = NativeStylesheetFontFaceProjection::default();
     let contents = stylesheet.contents(&guard);
@@ -290,7 +289,7 @@ fn collect_font_face_rule_projections(
                         family: family.name.to_string(),
                         source: serialized_source,
                     },
-                    request_url: preferred_native_font_source_url(source),
+                    sources: native_font_sources(source),
                 });
             }
             continue;
@@ -299,17 +298,25 @@ fn collect_font_face_rule_projections(
     }
 }
 
-fn preferred_native_font_source_url(source_list: &SourceList) -> Option<url::Url> {
-    source_list.0.iter().find_map(|source| {
-        let Source::Url(source) = source else {
-            return None;
-        };
-        if !native_font_source_format_is_supported(source.format_hint.as_ref()) {
-            return None;
-        }
-        let url = source.url.url()?;
-        matches!(url.scheme(), "http" | "https" | "data" | "blob").then(|| (**url).clone())
-    })
+fn native_font_sources(source_list: &SourceList) -> Vec<moli_css_parse::CssFontSource> {
+    source_list
+        .0
+        .iter()
+        .filter_map(|source| {
+            if let Source::Local(name) = source {
+                return Some(moli_css_parse::CssFontSource::Local(name.name.to_string()));
+            }
+            let Source::Url(source) = source else {
+                return None;
+            };
+            if !native_font_source_format_is_supported(source.format_hint.as_ref()) {
+                return None;
+            }
+            let url = source.url.url()?;
+            matches!(url.scheme(), "http" | "https" | "data" | "blob")
+                .then(|| moli_css_parse::CssFontSource::Url(url.to_string()))
+        })
+        .collect()
 }
 
 fn native_font_source_format_is_supported(format: Option<&FontFaceSourceFormat>) -> bool {
@@ -323,10 +330,15 @@ fn native_font_source_format_is_supported(format: Option<&FontFaceSourceFormat>)
                 | FontFaceSourceFormatKeyword::Woff
                 | FontFaceSourceFormatKeyword::Woff2
         ),
-        Some(FontFaceSourceFormat::String(format)) => matches!(
-            format.to_ascii_lowercase().as_str(),
-            "collection" | "opentype" | "otf" | "truetype" | "ttf" | "woff" | "woff2"
-        ),
+        Some(FontFaceSourceFormat::String(format)) => {
+            let format = format.to_ascii_lowercase();
+            let format =
+                crate::css_resource_urls::legacy_variations_font_format(&format).unwrap_or(&format);
+            matches!(
+                format,
+                "collection" | "opentype" | "otf" | "truetype" | "ttf" | "woff" | "woff2"
+            )
+        }
     }
 }
 
@@ -349,11 +361,8 @@ fn style_source_metadata_for_css_text_with_origin(
         "",
     )));
     let guard = shared_lock.read();
-    let stylist = new_stylist_with_viewport_bits(
-        DEFAULT_VIEWPORT_WIDTH.to_bits(),
-        DEFAULT_VIEWPORT_HEIGHT.to_bits(),
-        DEFAULT_VIEWPORT_WIDTH.to_bits(),
-        DEFAULT_VIEWPORT_HEIGHT.to_bits(),
+    let stylist = new_stylist_with_viewport(
+        StyleViewport::default(),
         StyloStyleEnvironment::default(),
         QuirksMode::NoQuirks,
     );
@@ -379,46 +388,45 @@ fn style_source_metadata_from_cascade_data(cascade_data: &CascadeData) -> StyleS
     }
 }
 
-pub(super) fn new_stylist_with_viewport_bits(
-    viewport_width_bits: u32,
-    viewport_height_bits: u32,
-    screen_width_bits: u32,
-    screen_height_bits: u32,
+pub(super) fn new_stylist_with_viewport(
+    viewport: StyleViewport,
     environment: StyloStyleEnvironment,
     quirks_mode: QuirksMode,
 ) -> Stylist {
     Stylist::new(
-        new_style_device_with_viewport_bits(
-            viewport_width_bits,
-            viewport_height_bits,
-            screen_width_bits,
-            screen_height_bits,
-            environment,
-            quirks_mode,
-        ),
+        new_style_device_with_viewport(viewport, environment, quirks_mode),
         quirks_mode,
     )
 }
 
-pub(super) fn new_style_device_with_viewport_bits(
-    viewport_width_bits: u32,
-    viewport_height_bits: u32,
-    screen_width_bits: u32,
-    screen_height_bits: u32,
+pub(crate) fn initial_font_size_px() -> f64 {
+    f64::from(
+        Font::initial_values()
+            .clone_font_size()
+            .computed_size()
+            .px(),
+    )
+}
+
+pub(super) fn new_style_device_with_viewport(
+    viewport: StyleViewport,
     environment: StyloStyleEnvironment,
     quirks_mode: QuirksMode,
 ) -> Device {
-    let width = f32::from_bits(viewport_width_bits);
-    let height = f32::from_bits(viewport_height_bits);
-    let screen_width = f32::from_bits(screen_width_bits);
-    let screen_height = f32::from_bits(screen_height_bits);
+    let width = viewport.width.unwrap_or(f64::from(DEFAULT_VIEWPORT_WIDTH)) as f32;
+    let height = viewport
+        .height
+        .unwrap_or(f64::from(DEFAULT_VIEWPORT_HEIGHT)) as f32;
+    let ratio = viewport.device_pixel_ratio.unwrap_or(1.0) as f32;
+    let screen_width = viewport.screen_width.unwrap_or(f64::from(width)) as f32;
+    let screen_height = viewport.screen_height.unwrap_or(f64::from(height)) as f32;
     let initial_style = ComputedValues::initial_values_with_font_override(Font::initial_values());
     let mut device = Device::new(
         environment.stylo_media_type(),
         quirks_mode,
         Size2D::<f32, CSSPixel>::new(width, height),
-        Size2D::<f32, DevicePixel>::new(screen_width, screen_height),
-        Scale::<f32, CSSPixel, DevicePixel>::new(1.0),
+        Size2D::<f32, DevicePixel>::new(screen_width * ratio, screen_height * ratio),
+        Scale::<f32, CSSPixel, DevicePixel>::new(ratio),
         Box::new(HeadlessFontMetricsProvider),
         initial_style,
         environment.stylo_prefers_color_scheme(),
@@ -574,7 +582,9 @@ fn font_family_list_starts_with_ahem(font: &Font) -> bool {
         .iter()
         .next()
         .is_some_and(|family| match family {
-            SingleFontFamily::FamilyName(name) => name.name.as_ref().eq_ignore_ascii_case("Ahem"),
+            SingleFontFamily::FamilyName(name) => {
+                AsRef::<str>::as_ref(&name.name).eq_ignore_ascii_case("Ahem")
+            }
             SingleFontFamily::Generic(_) => false,
         })
 }

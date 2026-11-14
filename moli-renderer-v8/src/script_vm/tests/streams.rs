@@ -1,6 +1,60 @@
 use super::*;
 
+#[test]
+fn stream_dictionary_arguments_preserve_required_members_and_staged_strategy_validation() {
+    let mut vm = new_parsed_test_vm(
+        "https://stream-dictionary-args.test/",
+        "<!doctype html><body><iframe id=child></iframe></body>",
+    );
+    let result = vm.eval(r#"
+        (() => {
+          const assert = (ok, message) => { if (!ok) throw new Error(message); };
+          const child = document.getElementById('child').contentWindow;
+          const marker = {};
+          for (const realm of [window, child]) {
+            for (const C of [realm.CountQueuingStrategy, realm.ByteLengthQueuingStrategy]) {
+              for (const args of [[], [undefined], [null], [{}], [{highWaterMark: undefined}]]) {
+                let error;
+                try { new C(...args); } catch (caught) {error = caught;}
+                assert(error instanceof realm.TypeError, 'required highWaterMark in callee realm');
+              }
+              for (const highWaterMark of [NaN, Infinity, -1, 0]) {
+                assert(Object.is(new C({highWaterMark}).highWaterMark, highWaterMark), 'unrestricted highWaterMark');
+              }
+              let reads = 0;
+              const strategy = new C({
+                get highWaterMark() {reads++; return {valueOf() {reads++; return 2;}};},
+                get size() {throw 'size must not be read';}
+              });
+              assert(strategy.highWaterMark === 2 && reads === 2, 'one member read and one conversion');
+              let error;
+              try {new C({highWaterMark: {valueOf() {throw marker;}}});} catch (caught) {error = caught;}
+              assert(error === marker, 'numeric exception identity');
+            }
+            const reads = [];
+            let error;
+            try {
+              new realm.TransformStream({
+                get start() {reads.push('transformer');}
+              }, {
+                get highWaterMark() {reads.push('writable.highWaterMark'); return -1;},
+                get size() {reads.push('writable.size');}
+              }, {
+                get highWaterMark() {reads.push('readable.highWaterMark'); return 0;}
+              });
+            } catch (caught) {error = caught;}
+            assert(error instanceof realm.RangeError, 'strategy validation realm');
+            assert(reads.join() === 'writable.highWaterMark,writable.size', 'stop before readable strategy and transformer: ' + reads);
+          }
+          return 'ok';
+        })()
+    "#).unwrap();
+    assert_eq!(result, "ok");
+}
+
 mod compression;
+mod intrinsic_promises;
+mod transform_finish;
 
 fn stream_test_vm() -> StandaloneScriptVmHarness {
     new_storage_test_vm("https://stream-runtime.test/")
@@ -404,10 +458,12 @@ fn transform_stream_cancel_callback_uses_one_shared_terminal_residence() {
     }
   });
   const nestedCancelPromise = nested.readable.cancel(nestedCancelReason);
+  nested.writable.getWriter().closed.catch(error => {
+    events.push(`nested:closed:${error === nestedAbortReason}`);
+  });
   Promise.allSettled([nestedCancelPromise, nestedAbortPromise]).then(results => {
     events.push(
-      `nested:settled:${nestedCalls}:${results[0].reason === nestedAbortReason}:` +
-      `${results[1].reason === nestedAbortReason}`
+      `nested:settled:${nestedCalls}:${results[0].status}:${results[1].status}`
     );
   });
 })()
@@ -438,7 +494,8 @@ JSON.stringify({
   abortFulfilled:
     __transformCancelCallbackEvents.includes("abort:fulfilled"),
   nestedSharedFinish:
-    __transformCancelCallbackEvents.includes("nested:settled:1:true:true"),
+    __transformCancelCallbackEvents.includes("nested:settled:1:fulfilled:fulfilled") &&
+    __transformCancelCallbackEvents.includes("nested:closed:true"),
   unexpectedFlush:
     __transformCancelCallbackEvents.some(event =>
       event.includes("unexpected-flush")
@@ -3364,7 +3421,7 @@ fn transform_stream_writer_abort_reason_wins_over_following_readable_cancel() {
 }
 
 #[test]
-fn transform_stream_controller_error_after_readable_cancel_rejects_shared_finish_promise() {
+fn transform_stream_controller_error_after_readable_cancel_preserves_cancel_result() {
     let mut vm = stream_test_vm();
 
     vm.eval(
@@ -3402,7 +3459,7 @@ fn transform_stream_controller_error_after_readable_cancel_rejects_shared_finish
 
     assert_eq!(
         result,
-        r#"["cancel:controllerReason","closed:true:controllerReason"]"#
+        r#"["cancel:fulfilled","closed:true:controllerReason"]"#
     );
 }
 
@@ -3795,7 +3852,7 @@ fn readable_stream_pipe_through_duck_typed_pass_through_drains_async_pulls() {
 
     assert_eq!(
         result,
-        r#"{"result":"[1,2,3,4,5]","events":["pull:1","write:1","pull:2","pull:3","write:2","pull:4","write:3","pull:5","write:4","pull:6","write:5","close-writable","resolved"]}"#
+        r#"{"result":"[1,2,3,4,5]","events":["pull:1","write:1","pull:2","write:2","pull:3","write:3","pull:4","write:4","pull:5","write:5","pull:6","close-writable","resolved"]}"#
     );
 }
 
@@ -5456,4 +5513,262 @@ fn readable_stream_pipe_options_getter_errors_keep_entrypoint_semantics_and_orde
         events,
         r#"["pipeThrough:preventAbort:threw:preventAbort:preventAbort","pipeThrough:preventCancel:threw:preventCancel:preventAbort,preventCancel","pipeThrough:preventClose:threw:preventClose:preventAbort,preventCancel,preventClose","pipeThrough:signal:threw:signal:preventAbort,preventCancel,preventClose,signal","pipeTo:preventAbort:rejected:preventAbort:preventAbort","pipeTo:preventAbort:returned:true","pipeTo:preventCancel:rejected:preventCancel:preventAbort,preventCancel","pipeTo:preventCancel:returned:true","pipeTo:preventClose:rejected:preventClose:preventAbort,preventCancel,preventClose","pipeTo:preventClose:returned:true","pipeTo:signal:rejected:signal:preventAbort,preventCancel,preventClose,signal","pipeTo:signal:returned:true"]"#
     );
+}
+
+#[test]
+fn readable_cancel_uses_intrinsic_promise_chaining() {
+    let mut vm = new_storage_test_vm("https://shared-binding-regression.test/");
+    vm.eval(
+        r#"
+        globalThis.cancelResults = [];
+        globalThis.cancelThenReads = 0;
+        const reason = new Error('cancel reason');
+        const streams = [
+            new ReadableStream({cancel() { return 'ignored'; }}),
+            new ReadableStream({cancel() { throw reason; }})
+        ];
+        const descriptor = Object.getOwnPropertyDescriptor(Promise.prototype, 'then');
+        try {
+            Object.defineProperty(Promise.prototype, 'then', {configurable: true, get() {
+                cancelThenReads++;
+                throw new Error('internal chaining must not read public then');
+            }});
+            for (const stream of streams) {
+                const result = stream.cancel(reason);
+                descriptor.value.call(result,
+                    value => cancelResults.push(value === undefined),
+                    error => cancelResults.push(error === reason)
+                );
+            }
+        } finally {
+            Object.defineProperty(Promise.prototype, 'then', descriptor);
+        }
+    "#,
+    )
+    .unwrap();
+    for _ in 0..8 {
+        if vm.eval("cancelResults.length === 2").unwrap() == "true" {
+            break;
+        }
+    }
+    assert_eq!(
+        vm.eval("JSON.stringify([cancelThenReads, cancelResults])")
+            .unwrap(),
+        "[0,[true,true]]"
+    );
+}
+
+#[test]
+fn readable_stream_from_preserves_async_sequence_and_cancellation_semantics() {
+    let mut vm = stream_test_vm();
+
+    vm.eval(
+        r#"
+globalThis.__readableStreamFromResult = "";
+(async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(ReadableStream, "from");
+  const facts = {
+    surface: [
+      typeof descriptor.value,
+      descriptor.value.name,
+      descriptor.value.length,
+      descriptor.enumerable,
+      descriptor.writable,
+      descriptor.configurable
+    ]
+  };
+
+  let nullError = "none";
+  try {
+    ReadableStream.from(null);
+  } catch (error) {
+    nullError = error.name;
+  }
+  facts.nullError = nullError;
+
+  const openMarker = new Error("open marker");
+  let openIdentity = false;
+  try {
+    ReadableStream.from({
+      [Symbol.asyncIterator]() {
+        throw openMarker;
+      }
+    });
+  } catch (error) {
+    openIdentity = error === openMarker;
+  }
+  facts.openIdentity = openIdentity;
+
+  const syncReader = ReadableStream.from([
+    Promise.resolve("a"),
+    "b"
+  ]).getReader();
+  facts.syncValues = [
+    (await syncReader.read()).value,
+    (await syncReader.read()).value,
+    (await syncReader.read()).done
+  ];
+
+  let nextCalls = 0;
+  const asyncIterator = {
+    async next() {
+      nextCalls += 1;
+      return nextCalls === 1
+        ? { value: "async", done: false }
+        : { value: undefined, done: true };
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    }
+  };
+  const asyncReader = ReadableStream.from(asyncIterator).getReader();
+  facts.asyncValues = [
+    (await asyncReader.read()).value,
+    (await asyncReader.read()).done,
+    nextCalls
+  ];
+
+  const finishedReader = ReadableStream.from({
+    next() {
+      return Promise.resolve({
+        done: true,
+        get value() {
+          throw new Error("finished iteration value must not be read");
+        }
+      });
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    }
+  }).getReader();
+  facts.finishedSkipsValue = (await finishedReader.read()).done;
+
+  const nextMarker = new Error("next marker");
+  const rejectedReader = ReadableStream.from({
+    next() {
+      throw nextMarker;
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    }
+  }).getReader();
+  facts.nextIdentity = await rejectedReader.read().then(
+    () => false,
+    error => error === nextMarker
+  );
+
+  const cancelReason = new Error("cancel reason");
+  let returnReason;
+  let releaseReturn;
+  const cancelReader = ReadableStream.from({
+    next() {
+      throw new Error("next must not run");
+    },
+    return(reason) {
+      returnReason = reason;
+      return new Promise(resolve => {
+        releaseReturn = () => resolve({ done: true });
+      });
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    }
+  }).getReader();
+  let cancelSettled = false;
+  const cancelPromise = cancelReader.cancel(cancelReason).then(() => {
+    cancelSettled = true;
+  });
+  await Promise.resolve();
+  facts.cancelPending = !cancelSettled && returnReason === cancelReason;
+  releaseReturn();
+  await cancelPromise;
+  facts.cancelSettled = cancelSettled;
+
+  const undefinedReturnReader = ReadableStream.from({
+    next() {
+      throw new Error("next must not run");
+    },
+    return() {},
+    [Symbol.asyncIterator]() {
+      return this;
+    }
+  }).getReader();
+  facts.undefinedReturnRejects = await undefinedReturnReader.cancel().then(
+    () => false,
+    error => error instanceof TypeError
+  );
+
+  let reentrantReader;
+  let reentrantReturns = 0;
+  const reentrantStream = ReadableStream.from({
+    async next() {
+      await reentrantReader.cancel();
+      return { value: "ignored", done: false };
+    },
+    async return() {
+      reentrantReturns += 1;
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    }
+  });
+  reentrantReader = reentrantStream.getReader();
+  facts.reentrant = [
+    (await reentrantReader.read()).done,
+    reentrantReturns
+  ];
+
+  globalThis.__readableStreamFromResult = JSON.stringify(facts);
+})().catch(error => {
+  globalThis.__readableStreamFromResult = `ERROR:${error && error.stack || error}`;
+});
+"#,
+    )
+    .expect("ReadableStream.from setup should evaluate");
+
+    let mut result = String::new();
+    for _ in 0..32 {
+        result = vm
+            .eval("globalThis.__readableStreamFromResult")
+            .expect("ReadableStream.from reactions should drain");
+        if !result.is_empty() {
+            break;
+        }
+    }
+
+    assert_eq!(
+        result,
+        r#"{"surface":["function","from",1,true,true,true],"nullError":"TypeError","openIdentity":true,"syncValues":["a","b",true],"asyncValues":["async",true,2],"finishedSkipsValue":true,"nextIdentity":true,"cancelPending":true,"cancelSettled":true,"undefinedReturnRejects":true,"reentrant":[true,1]}"#
+    );
+}
+
+#[test]
+fn readable_stream_from_does_not_inherit_author_start_algorithms() {
+    let mut vm = stream_test_vm();
+    vm.eval(r#"
+      globalThis.internalSourceResult = null;
+      (async () => {
+        const before = Object.getOwnPropertyDescriptor(Object.prototype, 'start');
+        let reads = 0;
+        Object.defineProperty(Object.prototype, 'start', {
+          configurable: true,
+          get() { reads++; throw Error('inherited start must not run'); }
+        });
+        try {
+          const reader = ReadableStream.from([7]).getReader();
+          const first = await reader.read();
+          const last = await reader.read();
+          return JSON.stringify([first.value, first.done, last.done, reads]);
+        } finally {
+          if (before) Object.defineProperty(Object.prototype, 'start', before);
+          else delete Object.prototype.start;
+        }
+      })().then(value => internalSourceResult = value, error => internalSourceResult = String(error));
+    "#).unwrap();
+    for _ in 0..32 {
+        if vm.eval("String(internalSourceResult !== null)").unwrap() == "true" {
+            break;
+        }
+    }
+    assert_eq!(vm.eval("internalSourceResult").unwrap(), "[7,false,true,0]");
 }

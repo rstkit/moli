@@ -1,17 +1,23 @@
+mod buffers;
 mod callbacks;
 mod constructors;
 mod exceptions;
 mod json;
+mod microtasks;
 mod object_readers;
+mod promises;
 mod properties;
 mod strings;
 mod symbols;
 
+pub use buffers::*;
 pub use callbacks::*;
 pub use constructors::*;
 pub use exceptions::*;
 pub use json::*;
+pub use microtasks::*;
 pub use object_readers::*;
+pub use promises::*;
 pub use properties::*;
 pub use strings::*;
 pub use symbols::*;

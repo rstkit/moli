@@ -24,12 +24,14 @@ impl fmt::Debug for StreamingResponseLifetimeLease {
 pub struct StreamingHtmlResponse {
     pub final_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirected: bool,
     pub redirect_chain: Vec<RedirectInfo>,
     pub from_cache: bool,
+    pub cache_state: crate::ResponseCacheState,
     pub negotiated_http_version: Option<NegotiatedHttpVersion>,
     network_request_extra_info: Option<NetworkRequestExtraInfo>,
     body_chunks: mpsc::UnboundedReceiver<String>,
@@ -41,13 +43,14 @@ impl StreamingHtmlResponse {
     pub fn new(
         final_url: Url,
         status: u16,
-        headers: Vec<(String, String)>,
+        headers: Vec<(String, Vec<u8>)>,
         body_chunks: mpsc::UnboundedReceiver<String>,
         cancel_handle: FetchCancelHandle,
         completion: oneshot::Receiver<Result<()>>,
     ) -> Self {
         Self::new_with_head(
             ResponseHead {
+                status_text: None,
                 final_url,
                 status,
                 headers,
@@ -56,6 +59,7 @@ impl StreamingHtmlResponse {
                 redirected: false,
                 redirect_chain: Vec::new(),
                 from_cache: false,
+                cache_state: Default::default(),
                 negotiated_http_version: None,
             },
             body_chunks,
@@ -73,12 +77,14 @@ impl StreamingHtmlResponse {
         Self {
             final_url: head.final_url,
             status: head.status,
+            status_text: head.status_text,
             headers: head.headers,
             request_cookie_report: head.request_cookie_report,
             cookie_set_reports: head.cookie_set_reports,
             redirected: head.redirected,
             redirect_chain: head.redirect_chain,
             from_cache: head.from_cache,
+            cache_state: head.cache_state,
             negotiated_http_version: head.negotiated_http_version,
             network_request_extra_info: None,
             body_chunks,
@@ -91,12 +97,14 @@ impl StreamingHtmlResponse {
         ResponseHead {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             request_cookie_report: self.request_cookie_report.clone(),
             cookie_set_reports: self.cookie_set_reports.clone(),
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.clone(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         }
     }
@@ -163,12 +171,14 @@ impl Drop for StreamingHtmlResponse {
 pub struct StreamingRawResponse {
     pub final_url: Url,
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub status_text: Option<String>,
+    pub headers: Vec<(String, Vec<u8>)>,
     pub request_cookie_report: Option<StoredCookieQueryReport>,
     pub cookie_set_reports: Vec<StoredCookieSetReport>,
     pub redirected: bool,
     pub redirect_chain: Vec<RedirectInfo>,
     pub from_cache: bool,
+    pub cache_state: crate::ResponseCacheState,
     pub negotiated_http_version: Option<NegotiatedHttpVersion>,
     network_request_extra_info: Option<NetworkRequestExtraInfo>,
     body_chunks: mpsc::UnboundedReceiver<Vec<u8>>,
@@ -181,7 +191,7 @@ impl StreamingRawResponse {
     pub fn new(
         final_url: Url,
         status: u16,
-        headers: Vec<(String, String)>,
+        headers: Vec<(String, Vec<u8>)>,
         request_cookie_report: Option<StoredCookieQueryReport>,
         cookie_set_reports: Vec<StoredCookieSetReport>,
         redirected: bool,
@@ -193,12 +203,14 @@ impl StreamingRawResponse {
         Self {
             final_url,
             status,
+            status_text: None,
             headers,
             request_cookie_report,
             cookie_set_reports,
             redirected,
             redirect_chain,
             from_cache: false,
+            cache_state: Default::default(),
             negotiated_http_version: None,
             network_request_extra_info: None,
             body_chunks,
@@ -217,12 +229,14 @@ impl StreamingRawResponse {
         Self {
             final_url: head.final_url,
             status: head.status,
+            status_text: head.status_text,
             headers: head.headers,
             request_cookie_report: head.request_cookie_report,
             cookie_set_reports: head.cookie_set_reports,
             redirected: head.redirected,
             redirect_chain: head.redirect_chain,
             from_cache: head.from_cache,
+            cache_state: head.cache_state,
             negotiated_http_version: head.negotiated_http_version,
             network_request_extra_info: None,
             body_chunks,
@@ -307,12 +321,14 @@ impl StreamingRawResponse {
         ResponseHead {
             final_url: self.final_url.clone(),
             status: self.status,
+            status_text: self.status_text.clone(),
             headers: self.headers.clone(),
             request_cookie_report: self.request_cookie_report.clone(),
             cookie_set_reports: self.cookie_set_reports.clone(),
             redirected: self.redirected,
             redirect_chain: self.redirect_chain.clone(),
             from_cache: self.from_cache,
+            cache_state: self.cache_state,
             negotiated_http_version: self.negotiated_http_version,
         }
     }
@@ -370,14 +386,16 @@ mod tests {
 
     fn sample_response_head() -> ResponseHead {
         ResponseHead {
+            status_text: None,
             final_url: Url::parse("http://example.test/final").expect("test URL"),
             status: 203,
-            headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
+            headers: vec![("content-type".to_owned(), b"text/plain".to_vec())],
             request_cookie_report: None,
             cookie_set_reports: Vec::new(),
             redirected: false,
             redirect_chain: Vec::new(),
             from_cache: false,
+            cache_state: Default::default(),
             negotiated_http_version: None,
         }
     }

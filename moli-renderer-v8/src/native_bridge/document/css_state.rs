@@ -3,6 +3,8 @@ mod font_faces;
 mod projection;
 mod shared;
 mod style_sheets;
+#[cfg(test)]
+pub(crate) use font_faces::take_owner_font_face_projection_count_for_test;
 
 pub(super) use accessors::detached_document_fonts_getter;
 pub(in crate::native_bridge) use accessors::{
@@ -20,7 +22,7 @@ pub(crate) use projection::{
 
 pub(crate) fn sync_document_fonts_for_handle(
     scope: &mut v8::PinScope<'_, '_>,
-    host: &crate::native_bridge::JsContextHost,
+    host: &crate::native_bridge::PageScriptHost,
     document: crate::document_runtime::DomHandle,
 ) {
     let Some(holder) = crate::util::node_wrapper_from_handle(scope, document) else {

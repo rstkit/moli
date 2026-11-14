@@ -1,15 +1,11 @@
-use cssparser::{Parser, ParserInput, Token};
+use cssparser::{Parser, Token};
 
 pub fn normalize_root_margin(value: &str) -> Option<String> {
-    if value.trim().is_empty() {
-        return Some("0px 0px 0px 0px".to_owned());
-    }
-
-    let mut input = ParserInput::new(value);
-    let mut parser = Parser::new(&mut input);
+    let input = value;
+    let mut parser = Parser::new(input);
     let raw_parts = parser.parse_entirely(parse_root_margin_components).ok()?;
     let parts: Vec<&str> = match raw_parts.as_slice() {
-        [] => return None,
+        [] => return Some("0px 0px 0px 0px".to_owned()),
         [a] => vec![a.as_str(), a.as_str(), a.as_str(), a.as_str()],
         [a, b] => vec![a.as_str(), b.as_str(), a.as_str(), b.as_str()],
         [a, b, c] => vec![a.as_str(), b.as_str(), c.as_str(), b.as_str()],
@@ -36,36 +32,32 @@ pub fn root_margin_components(value: &str, root_width: f64) -> [f64; 4] {
     result
 }
 
-fn parse_root_margin_components<'i, 't>(
-    input: &mut Parser<'i, 't>,
-) -> Result<Vec<String>, cssparser::ParseError<'i, ()>> {
+fn parse_root_margin_components<'i>(
+    input: &mut Parser<'i>,
+) -> Result<Vec<String>, cssparser::ParseError<()>> {
     let mut parts = Vec::new();
     while !input.is_exhausted() {
         if parts.len() == 4 {
-            return Err(input.new_custom_error(()));
+            return Err(cssparser::ParseError::custom(()));
         }
         parts.push(parse_root_margin_component(input)?);
-    }
-    if parts.is_empty() {
-        return Err(input.new_custom_error(()));
     }
     Ok(parts)
 }
 
-fn parse_root_margin_component<'i, 't>(
-    input: &mut Parser<'i, 't>,
-) -> Result<String, cssparser::ParseError<'i, ()>> {
+fn parse_root_margin_component<'i>(
+    input: &mut Parser<'i>,
+) -> Result<String, cssparser::ParseError<()>> {
     match input.next()?.clone() {
-        Token::Number { value: 0.0, .. } => Ok("0px".to_owned()),
         Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("px") => {
             format_css_number(value)
                 .map(|number| format!("{number}px"))
-                .ok_or_else(|| input.new_custom_error(()))
+                .ok_or_else(|| cssparser::ParseError::custom(()))
         }
         Token::Percentage { unit_value, .. } => format_css_number(unit_value * 100.0)
             .map(|number| format!("{number}%"))
-            .ok_or_else(|| input.new_custom_error(())),
-        _ => Err(input.new_custom_error(())),
+            .ok_or_else(|| cssparser::ParseError::custom(())),
+        _ => Err(cssparser::ParseError::custom(())),
     }
 }
 
@@ -94,16 +86,15 @@ mod tests {
 
     #[test]
     fn parser_uses_cssparser_tokens() {
+        for value in ["", " \r\n\t\u{c}", "/**/", "/* unclosed", " /**/ \n /**/ "] {
+            assert_eq!(
+                normalize_root_margin(value).as_deref(),
+                Some("0px 0px 0px 0px"),
+                "{value:?}",
+            );
+        }
         assert_eq!(
-            normalize_root_margin("").as_deref(),
-            Some("0px 0px 0px 0px")
-        );
-        assert_eq!(
-            normalize_root_margin(" \n\t").as_deref(),
-            Some("0px 0px 0px 0px")
-        );
-        assert_eq!(
-            normalize_root_margin("10px /*comment*/ 5% 0 -2.5px").as_deref(),
+            normalize_root_margin("10px /*comment*/ 5% 0px -2.5px").as_deref(),
             Some("10px 5% 0px -2.5px")
         );
         assert_eq!(
@@ -114,6 +105,12 @@ mod tests {
 
     #[test]
     fn parser_rejects_non_margin_tokens() {
+        for value in [
+            "0", "+0", "-0", "0.0", "0e0", "1e-50", "1px 0", "0% 0 1px", "\u{a0}", "\u{2003}",
+            "\u{b}", "\u{85}", "\u{2028}", "\u{2029}", "()", "[]", "{}", ")", "]", "}",
+        ] {
+            assert_eq!(normalize_root_margin(value), None, "{value:?}");
+        }
         assert_eq!(normalize_root_margin("calc(1px)").as_deref(), None);
         assert_eq!(normalize_root_margin("1px, 2px").as_deref(), None);
         assert_eq!(normalize_root_margin("1em").as_deref(), None);

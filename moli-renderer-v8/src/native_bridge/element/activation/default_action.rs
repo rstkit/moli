@@ -1,14 +1,15 @@
 use crate::context_bootstrap::{
     LocationNavigationKind, navigate_location_object_with_source_element,
-    selection_value_for_window,
+    readonly_data_transfer_for_input, selection_value_for_window,
 };
 use crate::dom::{
-    forms::InputType,
+    forms::{ButtonTypeState, InputType},
     native::{Element, Node, SelectedFile},
 };
 use crate::util::{
-    call_object_method, get_private_value, node_wrapper_from_handle, object_bool_property,
-    object_number_property, object_property_as_object, utf16_len, v8_string, v8str,
+    call_object_method, node_wrapper_from_handle, object_number_property,
+    object_property_as_object, utf16_len, utf16_replace_units_range_lossy, utf16_units, v8_string,
+    v8str,
 };
 use crate::{
     RendererInputDispatchOutcome, RendererPendingDownloadActivation,
@@ -20,133 +21,57 @@ use crate::{
     runtime::RendererDocumentLifecycleIdentity,
 };
 
-use super::super::super::JsContextHost;
+use super::super::super::PageScriptHost;
 use super::super::forms::{FormAssociatedResetCallbackTiming, reset_form_default_action};
 use super::super::{
-    NodePublicEventDispatchOutcome, cache_input_files_from_selected_files,
-    construct_click_event_with_detail_and_modifiers, construct_command_event,
-    construct_simple_event, contenteditable_editing_host, dispatch_popover_toggle_events,
-    dispatch_public_event, element_attribute, element_has_attribute, form_associated_form_owner,
-    is_disabled_form_control, is_focusable, is_valid_submit_button,
-    label_activation_control_handle, observable_bounding_client_rect,
+    ClickEventSource, InputEventCoordinates, NodePublicEventDispatchOutcome, TextEditInputType,
+    cache_input_files_from_selected_files, closed_details_ancestors_to_reveal,
+    construct_click_event, construct_command_event, construct_drop_input_event,
+    construct_input_event, construct_simple_event, contenteditable_editing_host,
+    dispatch_beforeinput, dispatch_popover_toggle_events, dispatch_public_event, element_attribute,
+    element_has_attribute, form_associated_form_owner, is_disabled_form_control, is_focusable,
+    is_valid_submit_button, label_activation_control_handle,
     perform_popover_invoker_default_action, perform_summary_click_default_action,
-    replace_text_control_selection, resolve_url_like_attribute, scroll_node_into_view_at_start,
-    submit_form_with_submit_event, update_focus,
+    replace_text_control_selection, resolve_url_like_attribute,
+    resolved_reflected_element_attribute_handle, scroll_node_into_view_at_start,
+    set_reflected_boolean_attribute, submit_form_with_submit_event, update_focus,
 };
 use super::targets::{
-    SpecialBrowsingContextTarget, named_iframe_target_handle_for_navigation,
+    SpecialBrowsingContextTarget, browsing_context_window_for_dispatch_scope,
+    form_navigation_target_document, named_iframe_target_handle_for_navigation,
     navigate_hyperlink_source_browsing_context, navigate_hyperlink_target_browsing_context,
     navigate_target_browsing_context,
 };
 
-const BUTTON_COMMAND_FOR_ELEMENT_SLOT: &str = "__moliButtonCommandForElement";
-const BUTTON_POPOVER_TARGET_ELEMENT_SLOT: &str = "__moliButtonPopoverTargetElement";
-
-fn array_like_length(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<'_, v8::Object>) -> u32 {
-    object
-        .get(scope, v8str(scope, "length").into())
-        .and_then(|value| value.number_value(scope))
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .map(|value| value as u32)
-        .unwrap_or(0)
+fn data_transfer_selected_files<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    data_transfer: v8::Local<'s, v8::Object>,
+) -> Vec<SelectedFile> {
+    crate::context_bootstrap::native_data_transfer_files(scope, data_transfer)
+        .into_iter()
+        .filter_map(|file| crate::context_bootstrap::selected_file_from_object(scope, file))
+        .collect()
 }
 
-fn data_transfer_selected_files(
-    scope: &mut v8::PinScope<'_, '_>,
-    data_transfer: v8::Local<'_, v8::Object>,
-) -> Option<Vec<SelectedFile>> {
-    let files = data_transfer.get(scope, v8str(scope, "files").into())?;
-    let files = v8::Local::<v8::Object>::try_from(files).ok()?;
-    let mut selected = Vec::with_capacity(array_like_length(scope, files) as usize);
-    for index in 0..array_like_length(scope, files) {
-        let Some(value) = files.get_index(scope, index) else {
-            continue;
-        };
-        let Ok(file) = v8::Local::<v8::Object>::try_from(value) else {
-            continue;
-        };
-        let Some(file) = crate::context_bootstrap::selected_file_from_object(scope, file) else {
-            continue;
-        };
-        selected.push(file);
-    }
-    Some(selected)
-}
-
-fn data_transfer_text(
-    scope: &mut v8::PinScope<'_, '_>,
-    data_transfer: v8::Local<'_, v8::Object>,
-) -> Option<String> {
-    data_transfer_string(scope, data_transfer, "text")
-}
-
-fn data_transfer_html(
-    scope: &mut v8::PinScope<'_, '_>,
-    data_transfer: v8::Local<'_, v8::Object>,
-) -> Option<String> {
-    data_transfer_string(scope, data_transfer, "text/html")
-}
-
-fn data_transfer_string(
-    scope: &mut v8::PinScope<'_, '_>,
-    data_transfer: v8::Local<'_, v8::Object>,
-    mime_type: &str,
-) -> Option<String> {
-    let get_data = data_transfer.get(scope, v8str(scope, "getData").into())?;
-    let get_data = v8::Local::<v8::Function>::try_from(get_data).ok()?;
-    let text_type = v8_string(scope, mime_type)?;
-    let value = get_data.call(scope, data_transfer.into(), &[text_type.into()])?;
-    value
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-}
-
-fn data_transfer_string_property(
-    scope: &mut v8::PinScope<'_, '_>,
-    data_transfer: v8::Local<'_, v8::Object>,
-    property_name: &'static str,
-) -> Option<String> {
-    data_transfer
-        .get(scope, v8str(scope, property_name).into())?
-        .to_string(scope)
-        .map(|value| value.to_rust_string_lossy(scope))
-}
-
-fn drop_effect_allowed(effect_allowed: &str, drop_effect: &str) -> bool {
-    match drop_effect {
-        "none" => false,
-        "copy" => matches!(
-            effect_allowed,
-            "copy" | "copyLink" | "copyMove" | "all" | "uninitialized"
-        ),
-        "link" => matches!(
-            effect_allowed,
-            "link" | "copyLink" | "linkMove" | "all" | "uninitialized"
-        ),
-        "move" => matches!(
-            effect_allowed,
-            "move" | "copyMove" | "linkMove" | "all" | "uninitialized"
-        ),
-        _ => false,
-    }
-}
-
-fn data_transfer_allows_drop_default_action(
-    scope: &mut v8::PinScope<'_, '_>,
-    data_transfer: v8::Local<'_, v8::Object>,
+fn data_transfer_allows_drop_default_action<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    data_transfer: v8::Local<'s, v8::Object>,
 ) -> bool {
     let drop_effect =
-        data_transfer_string_property(scope, data_transfer, "dropEffect").unwrap_or_default();
-    let effect_allowed = data_transfer_string_property(scope, data_transfer, "effectAllowed")
-        .unwrap_or_else(|| "uninitialized".to_owned());
-    drop_effect_allowed(&effect_allowed, &drop_effect)
+        crate::context_bootstrap::native_data_transfer_drop_effect(scope, data_transfer);
+    let allowed =
+        crate::context_bootstrap::native_data_transfer_effect_allowed(scope, data_transfer);
+    moli_file_api::data_transfer::drop_effect_allowed_by_effect_allowed(
+        Some(&allowed),
+        &drop_effect,
+    )
 }
 
 fn event_default_prevented(
     scope: &mut v8::PinScope<'_, '_>,
     event: v8::Local<'_, v8::Object>,
 ) -> bool {
-    event
+    crate::context_bootstrap::event_backing(scope, event)
         .get(scope, v8str(scope, "defaultPrevented").into())
         .is_some_and(|value| value.boolean_value(scope))
 }
@@ -173,16 +98,14 @@ fn is_text_drop_target(element: &Element) -> bool {
     )
 }
 
-fn perform_file_input_drop_default_action(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+fn perform_file_input_drop_default_action<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
-    data_transfer: v8::Local<'_, v8::Object>,
+    data_transfer: v8::Local<'s, v8::Object>,
     allow_multiple: bool,
 ) -> bool {
-    let Some(mut files) = data_transfer_selected_files(scope, data_transfer) else {
-        return false;
-    };
+    let mut files = data_transfer_selected_files(scope, data_transfer);
     if files.is_empty() {
         return false;
     }
@@ -205,27 +128,24 @@ fn perform_file_input_drop_default_action(
     true
 }
 
-fn perform_text_drop_default_action(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+fn perform_text_drop_default_action<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
-    data_transfer: v8::Local<'_, v8::Object>,
+    data_transfer: v8::Local<'s, v8::Object>,
 ) -> bool {
-    let Some(text) = data_transfer_text(scope, data_transfer) else {
-        return false;
-    };
+    let text =
+        crate::context_bootstrap::native_data_transfer_get_data(scope, data_transfer, "text/plain");
     if text.is_empty() {
         return false;
     }
-    replace_text_control_selection(scope, runtime_ptr, handle, &text)
-}
-
-fn slice_chars(value: &str, start: usize, end: usize) -> String {
-    value
-        .chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
+    replace_text_control_selection(
+        scope,
+        runtime_ptr,
+        handle,
+        &text,
+        TextEditInputType::InsertFromDrop,
+    )
 }
 
 fn call_node_contains(
@@ -294,6 +214,7 @@ fn selected_text_node_range<'s>(
     {
         return None;
     }
+    // Selection offsets address UTF-16 code units, including within text nodes.
     let start = anchor_offset.min(focus_offset) as usize;
     let end = anchor_offset.max(focus_offset) as usize;
     Some((node, start, end))
@@ -311,11 +232,11 @@ fn replace_text_node_range(
         .and_then(|value| value.to_string(scope))
         .map(|value| value.to_rust_string_lossy(scope))
         .unwrap_or_default();
-    let next = format!(
-        "{}{}{}",
-        slice_chars(&value, 0, start),
-        replacement_text,
-        slice_chars(&value, end, value.chars().count())
+    let next = utf16_replace_units_range_lossy(
+        &utf16_units(&value),
+        start,
+        end.saturating_sub(start),
+        &utf16_units(replacement_text),
     );
     let Some(next_value) = v8_string(scope, &next) else {
         return false;
@@ -462,7 +383,18 @@ fn replace_selected_dom_range_with_html<'s>(
     selection: v8::Local<'s, v8::Object>,
     replacement_html: &str,
 ) -> bool {
-    let Some(range) = selected_dom_range(scope, target, selection) else {
+    let Some(range) = selected_dom_range(scope, target, selection).or_else(|| {
+        // A native selection drag can leave the Selection at its source.
+        // Preserve a range inside the editing host; otherwise insert the HTML
+        // at the host's end, just as the text fallback appends there.
+        let document = object_property_as_object(scope, target, "ownerDocument")?;
+        let range = call_object_method(scope, document, "createRange", &[])
+            .and_then(|range| v8::Local::<v8::Object>::try_from(range).ok())?;
+        call_object_method(scope, range, "selectNodeContents", &[target.into()])?;
+        let at_start = v8::Boolean::new(scope, false);
+        call_object_method(scope, range, "collapse", &[at_start.into()])?;
+        Some(range)
+    }) else {
         return false;
     };
     let Some(html) = v8_string(scope, replacement_html) else {
@@ -533,28 +465,92 @@ fn append_text_to_editing_host(
         .unwrap_or(false)
 }
 
+fn contenteditable_editing_host_in_document(
+    runtime: &PageScriptHost,
+    handle: DomHandle,
+    document: DomHandle,
+) -> Option<DomHandle> {
+    if runtime.dom_host().owner_document_handle(handle) != Some(document)
+        || !runtime.dom_host().is_connected(handle)
+    {
+        return None;
+    }
+    contenteditable_editing_host(runtime, handle)
+}
+
 pub(crate) fn replace_contenteditable_selection(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     replacement_text: &str,
+    input_type: TextEditInputType,
 ) -> bool {
+    let Some(document) = unsafe { &*runtime_ptr }
+        .dom_host()
+        .owner_document_handle(handle)
+    else {
+        return false;
+    };
+    // CDP starts in the top-level realm even when focus is inside a child
+    // Document. Editing must use that Document's Selection and Range realm.
+    if let Some(context) =
+        crate::native_bridge::node_owner_document_relevant_context(scope, runtime_ptr, handle)
+        && context != scope.get_current_context()
+    {
+        let scope = &mut v8::ContextScope::new(scope, context);
+        return replace_contenteditable_selection(
+            scope,
+            runtime_ptr,
+            handle,
+            replacement_text,
+            input_type,
+        );
+    }
+    if !dispatch_beforeinput(
+        scope,
+        runtime_ptr,
+        handle,
+        input_type,
+        input_type.data(replacement_text),
+    ) {
+        return false;
+    }
+    // beforeinput can disconnect or adopt the editor, or disable editing.
+    // Revalidate native state before changing its DOM or selection.
+    let Some(handle) =
+        contenteditable_editing_host_in_document(unsafe { &*runtime_ptr }, handle, document)
+    else {
+        return false;
+    };
+    replace_contenteditable_selection_after_beforeinput(
+        scope,
+        runtime_ptr,
+        handle,
+        replacement_text,
+        input_type,
+    )
+}
+
+pub(super) fn replace_contenteditable_selection_after_beforeinput(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    replacement_text: &str,
+    input_type: TextEditInputType,
+) -> bool {
+    let Some(handle) = contenteditable_editing_host(unsafe { &*runtime_ptr }, handle) else {
+        return false;
+    };
     let Some(target) = node_wrapper_from_handle(scope, handle) else {
         return false;
     };
-    let Some(before_input) = construct_simple_event(scope, "beforeinput", true, true, true) else {
-        return false;
-    };
-    let _ = dispatch_public_event(scope, runtime_ptr, handle, before_input);
-    if event_default_prevented(scope, before_input) {
-        return false;
-    }
     let inserted = if let Some(selection) = window_selection(scope) {
         if let Some((node, start, end)) = selected_text_node_range(scope, target, selection) {
             if !replace_text_node_range(scope, node, start, end, replacement_text) {
                 return false;
             }
-            let caret = start.saturating_add(replacement_text.chars().count()) as u32;
+            let caret = u32::try_from(start.saturating_add(utf16_len(replacement_text)))
+                .unwrap_or(u32::MAX);
             collapse_selection_to(scope, selection, node, caret);
             true
         } else {
@@ -572,7 +568,12 @@ pub(crate) fn replace_contenteditable_selection(
     if !inserted {
         return false;
     }
-    if let Some(event) = construct_simple_event(scope, "input", true, false, true) {
+    if let Some(event) = construct_input_event(
+        scope,
+        "input",
+        input_type,
+        input_type.data(replacement_text),
+    ) {
         let _ = dispatch_public_event(scope, runtime_ptr, handle, event);
     }
     true
@@ -580,8 +581,16 @@ pub(crate) fn replace_contenteditable_selection(
 
 pub(crate) fn select_contenteditable_contents(
     scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> bool {
+    if let Some(context) =
+        crate::native_bridge::node_owner_document_relevant_context(scope, runtime_ptr, handle)
+        && context != scope.get_current_context()
+    {
+        let scope = &mut v8::ContextScope::new(scope, context);
+        return select_contenteditable_contents(scope, runtime_ptr, handle);
+    }
     let Some(target) = node_wrapper_from_handle(scope, handle) else {
         return false;
     };
@@ -604,59 +613,95 @@ pub(crate) fn select_contenteditable_contents(
     call_object_method(scope, selection, "addRange", &[range.into()]).is_some()
 }
 
-fn perform_contenteditable_drop_default_action(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+fn perform_contenteditable_drop_default_action<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
-    data_transfer: v8::Local<'_, v8::Object>,
+    data_transfer: v8::Local<'s, v8::Object>,
 ) -> bool {
-    let Some(text) = data_transfer_text(scope, data_transfer) else {
-        return false;
-    };
-    let html = data_transfer_html(scope, data_transfer).filter(|html| !html.is_empty());
+    let text =
+        crate::context_bootstrap::native_data_transfer_get_data(scope, data_transfer, "text/plain");
+    let plaintext_only = element_attribute(unsafe { &*runtime_ptr }, handle, "contenteditable")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("plaintext-only"));
+    let html =
+        crate::context_bootstrap::native_data_transfer_get_data(scope, data_transfer, "text/html");
+    let html = (!html.is_empty()).then_some(html);
     if text.is_empty() && html.is_none() {
         return false;
     }
-    let Some(target) = node_wrapper_from_handle(scope, handle) else {
+    let Some(document) = unsafe { &*runtime_ptr }
+        .dom_host()
+        .owner_document_handle(handle)
+    else {
         return false;
     };
-    let Some(before_input) = construct_simple_event(scope, "beforeinput", true, true, true) else {
+    let Some(input_data_transfer) = readonly_data_transfer_for_input(scope, data_transfer) else {
+        return false;
+    };
+    let before_input = if plaintext_only {
+        construct_input_event(
+            scope,
+            "beforeinput",
+            TextEditInputType::InsertFromDrop,
+            Some(&text),
+        )
+    } else {
+        construct_drop_input_event(scope, "beforeinput", input_data_transfer)
+    };
+    let Some(before_input) = before_input else {
         return false;
     };
     let _ = dispatch_public_event(scope, runtime_ptr, handle, before_input);
     if event_default_prevented(scope, before_input) {
         return false;
     }
-    let Some(selection) = window_selection(scope) else {
-        return append_text_to_editing_host(scope, target, &text);
+    let Some(handle) =
+        contenteditable_editing_host_in_document(unsafe { &*runtime_ptr }, handle, document)
+    else {
+        return false;
     };
-    if let Some(html) = html
-        && replace_selected_dom_range_with_html(scope, target, selection, &html)
-    {
-        // HTML fragments are inserted as nodes, then the selection is collapsed after the fragment.
-    } else if let Some((node, start, end)) = selected_text_node_range(scope, target, selection) {
-        if !replace_text_node_range(scope, node, start, end, &text) {
-            return false;
+    let Some(target) = node_wrapper_from_handle(scope, handle) else {
+        return false;
+    };
+    // beforeinput can also change the editing host and its inherited mode.
+    let plaintext_only = element_attribute(unsafe { &*runtime_ptr }, handle, "contenteditable")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("plaintext-only"));
+    let inserted = if let Some(selection) = window_selection(scope) {
+        if !plaintext_only
+            && let Some(html) = html
+            && replace_selected_dom_range_with_html(scope, target, selection, &html)
+        {
+            true
+        } else if let Some((node, start, end)) = selected_text_node_range(scope, target, selection)
+        {
+            if !replace_text_node_range(scope, node, start, end, &text) {
+                return false;
+            }
+            let caret = u32::try_from(start.saturating_add(utf16_len(&text))).unwrap_or(u32::MAX);
+            collapse_selection_to(scope, selection, node, caret);
+            true
+        } else {
+            replace_selected_dom_range(
+                scope,
+                target,
+                selection,
+                &text,
+                TextRangeInsertionMode::Replacement,
+            ) || append_text_to_editing_host(scope, target, &text)
         }
-        let caret = start.saturating_add(text.chars().count()) as u32;
-        collapse_selection_to(scope, selection, node, caret);
-    } else if !replace_selected_dom_range(
-        scope,
-        target,
-        selection,
-        &text,
-        TextRangeInsertionMode::Replacement,
-    ) && !append_text_to_editing_host(scope, target, &text)
-    {
+    } else {
+        append_text_to_editing_host(scope, target, &text)
+    };
+    if !inserted {
         return false;
     }
-    if let Some(event) = construct_simple_event(scope, "input", true, false, true) {
+    if let Some(event) = construct_drop_input_event(scope, "input", input_data_transfer) {
         let _ = dispatch_public_event(scope, runtime_ptr, handle, event);
     }
     true
 }
 
-fn is_radio_input(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_radio_input(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -664,7 +709,7 @@ fn is_radio_input(runtime: &JsContextHost, handle: DomHandle) -> bool {
         .is_some_and(|element| element.is_html_input() && element.input_type() == InputType::Radio)
 }
 
-fn is_checkbox_input(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_checkbox_input(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -674,7 +719,15 @@ fn is_checkbox_input(runtime: &JsContextHost, handle: DomHandle) -> bool {
         })
 }
 
-fn radio_group_members(runtime: &JsContextHost, handle: DomHandle) -> Vec<DomHandle> {
+fn is_button_input(runtime: &PageScriptHost, handle: DomHandle) -> bool {
+    runtime
+        .dom_host()
+        .node(handle)
+        .and_then(Node::as_element)
+        .is_some_and(|element| element.is_html_input() && element.input_type() == InputType::Button)
+}
+
+fn radio_group_members(runtime: &PageScriptHost, handle: DomHandle) -> Vec<DomHandle> {
     let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
         return Vec::new();
     };
@@ -706,7 +759,7 @@ fn radio_group_members(runtime: &JsContextHost, handle: DomHandle) -> Vec<DomHan
 }
 
 fn radio_group_checked_snapshot(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Vec<(DomHandle, bool)> {
     radio_group_members(runtime, handle)
@@ -723,57 +776,106 @@ fn radio_group_checked_snapshot(
         .collect()
 }
 
-fn dispatch_click_event(
+pub(in crate::native_bridge::element) fn dispatch_click_event(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
-    x: f64,
-    y: f64,
+    coordinates: InputEventCoordinates,
     detail: i32,
     button: i32,
     buttons: i32,
     modifiers: u8,
-    trusted: bool,
+    source: ClickEventSource,
 ) -> Option<NodePublicEventDispatchOutcome> {
-    let event = construct_click_event_with_detail_and_modifiers(
-        scope, x, y, detail, button, buttons, modifiers,
-    )?;
-    crate::context_bootstrap::set_event_trusted(scope, event, trusted);
+    let event = {
+        let document = unsafe { &*runtime_ptr }
+            .dom_host()
+            .owner_document_handle(handle);
+        let view = document.and_then(|document| {
+            crate::native_bridge::document::document_associated_window_for_handle(
+                scope,
+                runtime_ptr,
+                document,
+            )
+        });
+        // The event Realm follows the current node Document, independently of
+        // the Realm of a borrowed click() method and of the nullable view.
+        let context =
+            crate::native_bridge::node_owner_document_relevant_context(scope, runtime_ptr, handle)?;
+        let scope = &mut v8::ContextScope::new(scope, context);
+        construct_click_event(
+            scope,
+            coordinates,
+            detail,
+            button,
+            buttons,
+            modifiers,
+            view,
+            source,
+        )?
+    };
+    crate::context_bootstrap::set_event_trusted(scope, event, source.is_trusted());
     Some(dispatch_public_event(scope, runtime_ptr, handle, event))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClickFocusBehavior {
+    Apply,
+    Preserve,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn click_handle_internal(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
-    x: f64,
-    y: f64,
+    coordinates: InputEventCoordinates,
     button: i32,
     buttons: i32,
     click_detail: i32,
     modifiers: u8,
-    user_initiated: bool,
+    source: ClickEventSource,
+    focus_behavior: ClickFocusBehavior,
 ) -> RendererInputDispatchOutcome {
+    let user_initiated = source.is_trusted();
     let runtime = unsafe { &*runtime_ptr };
-    if is_disabled_form_control(runtime, handle) {
+    if is_disabled_form_control(runtime, handle)
+        || runtime
+            .document_execution_context_for_node(handle)
+            .is_none()
+    {
         return RendererInputDispatchOutcome {
             handled: false,
             triggered_top_level_navigation: false,
             pending_download: None,
             pending_file_chooser: None,
+            intercepted_drag: None,
         };
     }
-    if user_initiated || synthetic_click_focuses_element(runtime, handle) {
-        let focus_handle = if is_focusable(runtime, handle) {
+    let focus_handle = if focus_behavior == ClickFocusBehavior::Apply
+        && (user_initiated || synthetic_click_focuses_element(runtime, handle))
+    {
+        if is_focusable(runtime, handle) {
             Some(handle)
         } else {
             contenteditable_editing_host(runtime, handle)
                 .filter(|host| is_focusable(runtime, *host))
-        };
-        if let Some(focus_handle) = focus_handle {
-            update_focus(scope, runtime_ptr, Some(focus_handle));
         }
+    } else {
+        None
+    };
+    if let Some(focus_handle) = focus_handle {
+        update_focus(scope, runtime_ptr, Some(focus_handle));
+    }
+    // Focus can run author code. Reborrow and revalidate before legacy
+    // preactivation changes checkedness, dirty flags or indeterminate state.
+    let runtime = unsafe { &*runtime_ptr };
+    if is_disabled_form_control(runtime, handle)
+        || runtime
+            .document_execution_context_for_node(handle)
+            .is_none()
+    {
+        return RendererInputDispatchOutcome::default();
     }
     // A click listener may change an input to or from `type=file`, and may then
     // synchronously call `document.open()`. Chromium decides whether to open a
@@ -798,13 +900,12 @@ fn click_handle_internal(
             scope,
             runtime_ptr,
             handle,
-            x,
-            y,
+            coordinates,
             click_detail,
             button,
             buttons,
             modifiers,
-            user_initiated,
+            source,
         ) && !outcome.allows_default()
         {
             let runtime = unsafe { &mut *runtime_ptr };
@@ -826,8 +927,8 @@ fn click_handle_internal(
             scope,
             runtime_ptr,
             handle,
-            x,
-            y,
+            coordinates.client_x,
+            coordinates.client_y,
             button,
             modifiers,
             user_initiated,
@@ -857,13 +958,12 @@ fn click_handle_internal(
             scope,
             runtime_ptr,
             handle,
-            x,
-            y,
+            coordinates,
             click_detail,
             button,
             buttons,
             modifiers,
-            user_initiated,
+            source,
         ) && !outcome.allows_default()
         {
             let runtime = unsafe { &mut *runtime_ptr };
@@ -887,8 +987,8 @@ fn click_handle_internal(
             scope,
             runtime_ptr,
             handle,
-            x,
-            y,
+            coordinates.client_x,
+            coordinates.client_y,
             button,
             modifiers,
             user_initiated,
@@ -909,13 +1009,12 @@ fn click_handle_internal(
         scope,
         runtime_ptr,
         handle,
-        x,
-        y,
+        coordinates,
         click_detail,
         button,
         buttons,
         modifiers,
-        user_initiated,
+        source,
     ) {
         let _listener_threw = outcome.had_exception();
         if !outcome.allows_default() {
@@ -935,8 +1034,8 @@ fn click_handle_internal(
                         scope,
                         runtime_ptr,
                         handle,
-                        x,
-                        y,
+                        coordinates.client_x,
+                        coordinates.client_y,
                         button,
                         modifiers,
                         user_initiated,
@@ -947,13 +1046,15 @@ fn click_handle_internal(
                             scope,
                             runtime_ptr,
                             control,
-                            0.0,
-                            0.0,
+                            InputEventCoordinates::default(),
                             0,
                             0,
                             0,
                             modifiers,
-                            user_initiated,
+                            source,
+                            // Label activation focuses its associated control,
+                            // even when the initiating script click does not.
+                            ClickFocusBehavior::Apply,
                         );
                         pending_file_chooser = control_outcome.pending_file_chooser;
                         control_outcome.pending_download
@@ -980,11 +1081,12 @@ fn click_handle_internal(
         triggered_top_level_navigation: false,
         pending_download: None,
         pending_file_chooser: None,
+        intercepted_drag: None,
     }
 }
 
 fn input_dispatch_outcome_after_click(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handled: bool,
     had_pending_top_level_navigation_before_click: bool,
     pending_download: Option<RendererPendingDownloadActivation>,
@@ -996,11 +1098,12 @@ fn input_dispatch_outcome_after_click(
             && unsafe { &*runtime_ptr }.has_pending_location_navigation(),
         pending_download,
         pending_file_chooser,
+        intercepted_drag: None,
     }
 }
 
 fn click_activation_default_action_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     target: DomHandle,
 ) -> Option<ClickActivationDefaultAction> {
     if let Some(control) = label_activation_control_handle(runtime, target) {
@@ -1021,7 +1124,7 @@ fn click_activation_default_action_handle(
 }
 
 fn hyperlink_activation_default_action_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     target: DomHandle,
 ) -> Option<DomHandle> {
     let mut current = Some(target);
@@ -1042,16 +1145,17 @@ enum ClickActivationDefaultAction {
     LabelControl(DomHandle),
 }
 
-fn element_has_click_activation_behavior(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn element_has_click_activation_behavior(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     element_is_anchor_with_href(runtime, handle)
         || is_html_option_element(runtime, handle)
         || is_valid_submit_button(runtime, handle)
         || is_valid_reset_button(runtime, handle)
+        || is_button_input(runtime, handle)
         || runtime.dom_host().is_html_element_named(handle, "button")
         || runtime.dom_host().is_html_element_named(handle, "summary")
 }
 
-fn element_has_activation_behavior(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn element_has_activation_behavior(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
         return false;
     };
@@ -1064,7 +1168,7 @@ fn element_has_activation_behavior(runtime: &JsContextHost, handle: DomHandle) -
 }
 
 pub(crate) fn dispatched_click_activation_target(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     target: DomHandle,
     bubbles: bool,
     composed: bool,
@@ -1084,7 +1188,7 @@ pub(crate) fn dispatched_click_activation_target(
         })
 }
 
-fn synthetic_click_focuses_element(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn synthetic_click_focuses_element(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -1097,16 +1201,17 @@ fn synthetic_click_focuses_element(runtime: &JsContextHost, handle: DomHandle) -
         })
 }
 
+#[cfg(test)]
 pub(crate) fn activate_handle_via_click(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     x: f64,
     y: f64,
     button: i32,
     buttons: i32,
 ) -> RendererInputDispatchOutcome {
-    click_handle_internal(
+    activate_handle_via_click_with_detail_and_modifiers(
         scope,
         runtime_ptr,
         handle,
@@ -1116,13 +1221,13 @@ pub(crate) fn activate_handle_via_click(
         buttons,
         0,
         0,
-        true,
     )
 }
 
+#[cfg(any(test, feature = "ace-protocol"))]
 pub(crate) fn activate_handle_via_click_with_detail_and_modifiers(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     x: f64,
     y: f64,
@@ -1135,19 +1240,89 @@ pub(crate) fn activate_handle_via_click_with_detail_and_modifiers(
         scope,
         runtime_ptr,
         handle,
-        x,
-        y,
+        InputEventCoordinates::from_root(x, y),
         button,
         buttons,
         click_detail,
         modifiers,
-        true,
+        ClickEventSource::Pointer,
+        ClickFocusBehavior::Apply,
+    )
+}
+
+pub(crate) fn activate_handle_via_keyboard(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    modifiers: u8,
+) -> RendererInputDispatchOutcome {
+    // Keyboard activation uses a trusted non-pointer click without moving focus.
+    // This also preserves focus on the text control during implicit submission.
+    click_handle_internal(
+        scope,
+        runtime_ptr,
+        handle,
+        InputEventCoordinates::default(),
+        0,
+        0,
+        0,
+        modifiers,
+        ClickEventSource::UserAgent,
+        ClickFocusBehavior::Preserve,
+    )
+}
+
+pub(crate) fn activate_handle_after_pointer_release(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    coordinates: InputEventCoordinates,
+    button: i32,
+    buttons: i32,
+    click_detail: i32,
+    modifiers: u8,
+) -> RendererInputDispatchOutcome {
+    // Ordinary pointer focus belongs to uncanceled mouse-down default action.
+    // Reapplying it here would undo a canceled pointerdown/mousedown. Label
+    // activation still applies its separate associated-control focus rule.
+    click_handle_internal(
+        scope,
+        runtime_ptr,
+        handle,
+        coordinates,
+        button,
+        buttons,
+        click_detail,
+        modifiers,
+        ClickEventSource::Pointer,
+        ClickFocusBehavior::Preserve,
+    )
+}
+
+pub(crate) fn activate_handle_after_touch_release(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    coordinates: InputEventCoordinates,
+    pointer_id: i32,
+) -> RendererInputDispatchOutcome {
+    click_handle_internal(
+        scope,
+        runtime_ptr,
+        handle,
+        coordinates,
+        0,
+        0,
+        1,
+        0,
+        ClickEventSource::Touch { pointer_id },
+        ClickFocusBehavior::Preserve,
     )
 }
 
 pub(crate) fn activate_handle_via_synthetic_click(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     x: f64,
     y: f64,
@@ -1158,19 +1333,19 @@ pub(crate) fn activate_handle_via_synthetic_click(
         scope,
         runtime_ptr,
         handle,
-        x,
-        y,
+        InputEventCoordinates::from_root(x, y),
         button,
         buttons,
         0,
         0,
-        false,
+        ClickEventSource::Script,
+        ClickFocusBehavior::Preserve,
     )
 }
 
 pub(crate) fn perform_click_default_action_for_dispatched_event(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     event: v8::Local<'_, v8::Object>,
 ) {
@@ -1178,9 +1353,15 @@ pub(crate) fn perform_click_default_action_for_dispatched_event(
     if is_disabled_form_control(runtime, handle) {
         return;
     }
-    let x = object_number_property(scope, event, "clientX").unwrap_or(0.0);
-    let y = object_number_property(scope, event, "clientY").unwrap_or(0.0);
-    let button = object_number_property(scope, event, "button").unwrap_or(0.0) as i32;
+    let x = crate::context_bootstrap::event_attribute(scope, event, "clientX")
+        .and_then(|value| value.number_value(scope))
+        .unwrap_or(0.0);
+    let y = crate::context_bootstrap::event_attribute(scope, event, "clientY")
+        .and_then(|value| value.number_value(scope))
+        .unwrap_or(0.0);
+    let button = crate::context_bootstrap::event_attribute(scope, event, "button")
+        .and_then(|value| value.number_value(scope))
+        .unwrap_or(0.0) as i32;
     let modifiers = mouse_event_modifier_bits(scope, event);
     let _ = perform_click_default_action(
         scope,
@@ -1197,7 +1378,7 @@ pub(crate) fn perform_click_default_action_for_dispatched_event(
 
 pub(crate) fn perform_auxiliary_link_default_action(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     target: DomHandle,
     button: i32,
     modifiers: u8,
@@ -1230,7 +1411,7 @@ pub(crate) enum DispatchedClickLegacyActivation {
 
 pub(crate) fn prepare_legacy_activation_for_dispatched_click(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<DispatchedClickLegacyActivation> {
     let runtime = unsafe { &*runtime_ptr };
@@ -1272,7 +1453,7 @@ pub(crate) fn prepare_legacy_activation_for_dispatched_click(
 
 pub(crate) fn finish_legacy_activation_for_dispatched_click(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     activation: DispatchedClickLegacyActivation,
     allows_default: bool,
 ) {
@@ -1316,7 +1497,7 @@ pub(crate) fn finish_legacy_activation_for_dispatched_click(
 
 fn dispatch_input_and_change_events(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     if !unsafe { &*runtime_ptr }.dom_host().is_connected(handle) {
@@ -1335,16 +1516,16 @@ fn mouse_event_modifier_bits(
     event: v8::Local<'_, v8::Object>,
 ) -> u8 {
     let mut modifiers = 0;
-    if object_bool_property(scope, event, "altKey").unwrap_or(false) {
+    if crate::context_bootstrap::event_bool_attribute(scope, event, "altKey") {
         modifiers |= 1;
     }
-    if object_bool_property(scope, event, "ctrlKey").unwrap_or(false) {
+    if crate::context_bootstrap::event_bool_attribute(scope, event, "ctrlKey") {
         modifiers |= 2;
     }
-    if object_bool_property(scope, event, "metaKey").unwrap_or(false) {
+    if crate::context_bootstrap::event_bool_attribute(scope, event, "metaKey") {
         modifiers |= 4;
     }
-    if object_bool_property(scope, event, "shiftKey").unwrap_or(false) {
+    if crate::context_bootstrap::event_bool_attribute(scope, event, "shiftKey") {
         modifiers |= 8;
     }
     modifiers
@@ -1352,7 +1533,7 @@ fn mouse_event_modifier_bits(
 
 fn perform_click_default_action(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     x: f64,
     y: f64,
@@ -1384,19 +1565,23 @@ fn perform_click_default_action(
             scope,
             runtime_ptr,
             control,
-            0.0,
-            0.0,
+            InputEventCoordinates::default(),
             0,
             0,
             0,
             modifiers,
-            user_initiated,
+            if user_initiated {
+                ClickEventSource::UserAgent
+            } else {
+                ClickEventSource::Script
+            },
+            ClickFocusBehavior::Apply,
         );
         return None;
     }
-    dispatch_button_command_event_if_needed(scope, runtime_ptr, handle);
+    let form_handle = form_associated_form_owner(runtime, handle);
     if is_valid_submit_button(runtime, handle)
-        && let Some(form_handle) = form_associated_form_owner(runtime, handle)
+        && let Some(form_handle) = form_handle
     {
         let previous = if is_image_submit_button(runtime, handle) {
             let (local_x, local_y) = match image_submitter_coordinate(runtime, handle, x, y) {
@@ -1423,7 +1608,7 @@ fn perform_click_default_action(
         return None;
     }
     if is_valid_reset_button(runtime, handle)
-        && let Some(form_handle) = form_associated_form_owner(runtime, handle)
+        && let Some(form_handle) = form_handle
     {
         if let Some(event) = construct_simple_event(scope, "reset", true, true, false)
             && dispatch_public_event(scope, runtime_ptr, form_handle, event).allows_default()
@@ -1437,6 +1622,18 @@ fn perform_click_default_action(
         }
         return None;
     }
+    if form_handle.is_some()
+        && runtime
+            .dom_host()
+            .node(handle)
+            .and_then(Node::as_element)
+            .is_some_and(|element| {
+                element.is_html_button() && element.button_type_state() == ButtonTypeState::Auto
+            })
+    {
+        return None;
+    }
+    dispatch_button_command_event_if_needed(scope, runtime_ptr, handle);
     if dispatch_button_popover_toggle_events_if_needed(scope, runtime_ptr, handle) {
         return None;
     }
@@ -1448,7 +1645,7 @@ fn perform_click_default_action(
 
 fn perform_option_click_default_action(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> bool {
     let runtime = unsafe { &*runtime_ptr };
@@ -1487,7 +1684,7 @@ fn perform_option_click_default_action(
     true
 }
 
-fn owner_select_for_option(runtime: &JsContextHost, handle: DomHandle) -> Option<DomHandle> {
+fn owner_select_for_option(runtime: &PageScriptHost, handle: DomHandle) -> Option<DomHandle> {
     if !is_html_option_element(runtime, handle) {
         return None;
     }
@@ -1506,7 +1703,7 @@ fn owner_select_for_option(runtime: &JsContextHost, handle: DomHandle) -> Option
     None
 }
 
-fn is_html_option_element(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_html_option_element(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -1514,7 +1711,7 @@ fn is_html_option_element(runtime: &JsContextHost, handle: DomHandle) -> bool {
         .is_some_and(Element::is_html_option)
 }
 
-fn element_is_anchor_with_href(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn element_is_anchor_with_href(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     if !element_has_attribute(runtime, handle, "href") {
         return false;
     }
@@ -1529,7 +1726,7 @@ fn element_is_anchor_with_href(runtime: &JsContextHost, handle: DomHandle) -> bo
 
 fn dispatch_button_command_event_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) {
     let runtime = unsafe { &*runtime_ptr };
@@ -1541,7 +1738,7 @@ fn dispatch_button_command_event_if_needed(
     else {
         return;
     };
-    let Some(target) = command_for_element_target(scope, runtime_ptr, handle) else {
+    let Some(target) = command_for_element_target(runtime_ptr, handle) else {
         return;
     };
     let Some(source) = node_wrapper_from_handle(scope, handle) else {
@@ -1559,14 +1756,14 @@ fn dispatch_button_command_event_if_needed(
 
 fn dispatch_button_popover_toggle_events_if_needed(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> bool {
     let runtime = unsafe { &*runtime_ptr };
     if !runtime.dom_host().is_html_element_named(handle, "button") {
         return false;
     }
-    let Some(target) = popover_target_element_target(scope, runtime_ptr, handle) else {
+    let Some(target) = popover_target_element_target(runtime_ptr, handle) else {
         return false;
     };
     dispatch_popover_toggle_events(scope, runtime_ptr, target, handle);
@@ -1574,111 +1771,32 @@ fn dispatch_button_popover_toggle_events_if_needed(
 }
 
 fn popover_target_element_target(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
-    if let Some(target) =
-        unsafe { &*runtime_ptr }.button_element_target(handle, BUTTON_POPOVER_TARGET_ELEMENT_SLOT)
-    {
-        return unsafe { &*runtime_ptr }
-            .dom_host()
-            .resolve_reference_target_chain(target);
-    }
-    if let Some(wrapper) = node_wrapper_from_handle(scope, handle)
-        && let Some(value) = get_private_value(scope, wrapper, BUTTON_POPOVER_TARGET_ELEMENT_SLOT)
-        && !value.is_null_or_undefined()
-    {
-        if let Ok(big) = v8::Local::<v8::BigInt>::try_from(value) {
-            let (index, lossless) = big.u64_value();
-            if lossless {
-                let target = DomHandle::new(index as usize);
-                if unsafe { &*runtime_ptr }.dom_host().node(target).is_some() {
-                    return unsafe { &*runtime_ptr }
-                        .dom_host()
-                        .resolve_reference_target_chain(target);
-                }
-            }
-        } else if let Some(index) = value.uint32_value(scope) {
-            let target = DomHandle::new(index as usize);
-            if unsafe { &*runtime_ptr }.dom_host().node(target).is_some() {
-                return unsafe { &*runtime_ptr }
-                    .dom_host()
-                    .resolve_reference_target_chain(target);
-            }
-        }
-    }
-    let runtime = unsafe { &*runtime_ptr };
-    let popover_target = element_attribute(runtime, handle, "popovertarget")?;
-    if popover_target.is_empty() {
-        return None;
-    }
-    reference_target_for_id(runtime, handle, &popover_target)
+    resolved_reflected_element_attribute_handle(unsafe { &*runtime_ptr }, handle, "popovertarget")
 }
 
 fn command_for_element_target(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<DomHandle> {
-    if let Some(target) =
-        unsafe { &*runtime_ptr }.button_element_target(handle, BUTTON_COMMAND_FOR_ELEMENT_SLOT)
-    {
-        return unsafe { &*runtime_ptr }
-            .dom_host()
-            .resolve_reference_target_chain(target);
-    }
-    if let Some(wrapper) = node_wrapper_from_handle(scope, handle)
-        && let Some(value) = get_private_value(scope, wrapper, BUTTON_COMMAND_FOR_ELEMENT_SLOT)
-        && !value.is_null_or_undefined()
-    {
-        if let Ok(big) = v8::Local::<v8::BigInt>::try_from(value) {
-            let (index, lossless) = big.u64_value();
-            if lossless {
-                let target = DomHandle::new(index as usize);
-                if unsafe { &*runtime_ptr }.dom_host().node(target).is_some() {
-                    return Some(target);
-                }
-            }
-        } else if let Some(index) = value.uint32_value(scope) {
-            let target = DomHandle::new(index as usize);
-            if unsafe { &*runtime_ptr }.dom_host().node(target).is_some() {
-                return Some(target);
-            }
-        }
-    }
-    let runtime = unsafe { &*runtime_ptr };
-    let command_for = element_attribute(runtime, handle, "commandfor")?;
-    if command_for.is_empty() {
-        return None;
-    }
-    reference_target_for_id(runtime, handle, &command_for)
+    resolved_reflected_element_attribute_handle(unsafe { &*runtime_ptr }, handle, "commandfor")
 }
 
-fn reference_target_for_id(
-    runtime: &JsContextHost,
-    handle: DomHandle,
-    id: &str,
-) -> Option<DomHandle> {
-    let root = runtime.dom_host().root_node_handle(handle)?;
-    let candidate = runtime
-        .dom_host()
-        .element_handle_by_id_in_subtree(root, id)?;
-    runtime.dom_host().resolve_reference_target_chain(candidate)
-}
-
-fn is_valid_reset_button(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_valid_reset_button(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
         .and_then(Node::as_element)
         .is_some_and(|element| {
             (element.is_html_input() && element.input_type() == InputType::Reset)
-                || (element.is_html_element("button") && element.attribute("type") == Some("reset"))
+                || (element.is_html_element("button")
+                    && element.button_type_state() == ButtonTypeState::Reset)
         })
 }
 
-fn is_image_submit_button(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn is_image_submit_button(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .node(handle)
@@ -1687,16 +1805,12 @@ fn is_image_submit_button(runtime: &JsContextHost, handle: DomHandle) -> bool {
 }
 
 fn image_submitter_coordinate(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
     client_x: f64,
     client_y: f64,
 ) -> Result<(u32, u32), moli_layout::LayoutError> {
-    let rect = observable_bounding_client_rect(
-        runtime,
-        handle,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    )?;
+    let rect = super::super::geometry::read_bounding_client_rect(runtime, handle)?;
     Ok((
         image_submitter_coordinate_component(client_x - rect.left, rect.width),
         image_submitter_coordinate_component(client_y - rect.top, rect.height),
@@ -1724,8 +1838,7 @@ fn image_submitter_coordinate_component(value: f64, max: f64) -> u32 {
 }
 
 fn send_anchor_ping_requests(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     destination_url: &str,
 ) {
@@ -1736,11 +1849,11 @@ fn send_anchor_ping_requests(
         .split_ascii_whitespace()
         .filter_map(|raw_url| base_url.join(raw_url).ok())
     {
-        crate::network_host::send_link_audit_ping(scope, runtime_ptr, ping_url, destination_url);
+        crate::network_host::send_link_audit_ping(runtime_ptr, handle, ping_url, destination_url);
     }
 }
 
-fn anchor_ping_urls(runtime: &JsContextHost, handle: DomHandle) -> Option<(url::Url, String)> {
+fn anchor_ping_urls(runtime: &PageScriptHost, handle: DomHandle) -> Option<(url::Url, String)> {
     let ping_urls = element_attribute(runtime, handle, "ping")?;
     if ping_urls.is_empty() {
         return None;
@@ -1750,16 +1863,14 @@ fn anchor_ping_urls(runtime: &JsContextHost, handle: DomHandle) -> Option<(url::
     {
         return None;
     }
-    let base_url = runtime
-        .dom_host()
-        .document_base_url()
-        .unwrap_or_else(|| runtime.host_document().url().clone());
+    let document = runtime.dom_host().owner_document_handle(handle)?;
+    let base_url = runtime.document_base_url_for_handle(document);
     Some((base_url, ping_urls))
 }
 
 pub(in crate::native_bridge) fn perform_file_chooser_default_action(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<RendererPendingFileChooserActivation> {
     let source = file_chooser_activation_source(scope, runtime_ptr, handle);
@@ -1774,7 +1885,7 @@ struct FileChooserActivationSource {
 
 fn file_chooser_activation_source(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<FileChooserActivationSource> {
     let runtime = unsafe { &*runtime_ptr };
@@ -1793,7 +1904,7 @@ fn file_chooser_activation_source(
 
 fn perform_file_chooser_default_action_with_source(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     source: Option<FileChooserActivationSource>,
 ) -> Option<RendererPendingFileChooserActivation> {
@@ -1825,7 +1936,7 @@ fn perform_file_chooser_default_action_with_source(
 }
 
 fn file_chooser_document_id_for_handle(
-    runtime: &JsContextHost,
+    runtime: &PageScriptHost,
     handle: DomHandle,
 ) -> Option<DocumentId> {
     let document_handle = runtime.dom_host().owner_document_handle(handle)?;
@@ -1842,7 +1953,7 @@ fn file_chooser_document_id_for_handle(
 
 fn anchor_click_default_action(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     button: i32,
     modifiers: u8,
@@ -1850,10 +1961,10 @@ fn anchor_click_default_action(
     pending_child_navigations_before_default: &[(DomHandle, ChildBrowsingContextBootstrap)],
 ) -> Option<RendererPendingDownloadActivation> {
     let resolved = resolve_url_like_attribute(unsafe { &*runtime_ptr }, handle, "href");
-    if resolved.is_empty() {
+    if resolved.is_empty() || url::Url::parse(&resolved).is_err() {
         return None;
     }
-    send_anchor_ping_requests(scope, runtime_ptr, handle, &resolved);
+    send_anchor_ping_requests(runtime_ptr, handle, &resolved);
     let runtime = unsafe { &*runtime_ptr };
     if element_has_attribute(runtime, handle, "download") {
         let suggested_filename =
@@ -1931,10 +2042,6 @@ fn anchor_click_default_action(
         && let Ok(url) = url::Url::parse(&resolved)
         && same_document_fragment_target(runtime.host_document().url(), &url)
     {
-        if let Err(error) = scroll_to_document_fragment_target(scope, runtime_ptr, runtime, &url) {
-            throw_activation_layout_error(scope, "scrolling to fragment", error);
-            return None;
-        }
         let global = scope.get_current_context().global(scope);
         if let Some(location) = global
             .get(scope, v8str(scope, "location").into())
@@ -1950,22 +2057,6 @@ fn anchor_click_default_action(
             );
         }
         return None;
-    }
-    if target_name.is_none() || special_target == Some(SpecialBrowsingContextTarget::Current) {
-        let source_element = node_wrapper_from_handle(scope, handle);
-        let can_intercept = url::Url::parse(&resolved)
-            .is_ok_and(|url| moli_url::same_origin(runtime.document_url(), &url));
-        if !crate::context_bootstrap::dispatch_top_level_navigation_event_with_source_element(
-            scope,
-            &resolved,
-            "push",
-            source_element,
-            can_intercept,
-            user_initiated,
-            None,
-        ) {
-            return None;
-        }
     }
     let source_element = node_wrapper_from_handle(scope, handle);
     if click_listener_changed_named_child_navigation(
@@ -1985,6 +2076,7 @@ fn anchor_click_default_action(
         target_name.as_deref(),
         &resolved,
         source_element,
+        user_initiated,
         popup_disposition,
     );
     None
@@ -1992,7 +2084,7 @@ fn anchor_click_default_action(
 
 fn anchor_download_activation(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     resolved: String,
     user_initiated: bool,
@@ -2036,10 +2128,10 @@ fn hyperlink_navigation_policy(
         InputNavigationPolicy::NewBackgroundSurface => {
             HyperlinkNavigationPolicy::Auxiliary(RendererPopupDisposition::Background)
         }
-        InputNavigationPolicy::NewWindow | InputNavigationPolicy::NewForegroundSurface => {
-            // The renderer target model has no separate window chrome. Preserve
-            // Chromium's selected-surface behavior by folding a new window into a
-            // foreground popup Page target.
+        InputNavigationPolicy::NewWindow => {
+            HyperlinkNavigationPolicy::Auxiliary(RendererPopupDisposition::NewWindow)
+        }
+        InputNavigationPolicy::NewForegroundSurface => {
             HyperlinkNavigationPolicy::Auxiliary(RendererPopupDisposition::Foreground)
         }
     }
@@ -2047,7 +2139,7 @@ fn hyperlink_navigation_policy(
 
 fn click_listener_changed_named_child_navigation(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     target_name: Option<&str>,
     resolved: &str,
@@ -2088,7 +2180,7 @@ fn click_listener_changed_named_child_navigation(
 }
 
 fn anchor_default_navigation_yields_to_pending_child_navigation(
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
     target_handle: DomHandle,
     resolved: &str,
@@ -2117,7 +2209,7 @@ fn anchor_default_navigation_yields_to_pending_child_navigation(
 
 fn navigation_owner_window_for_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
 ) -> Option<v8::Local<'s, v8::Object>> {
     let runtime = unsafe { &*runtime_ptr };
@@ -2126,7 +2218,11 @@ fn navigation_owner_window_for_handle<'s>(
         .node(handle)
         .and_then(Node::owner_document)?;
     if document_handle == runtime.document_handle() {
-        return Some(scope.get_current_context().global(scope));
+        return browsing_context_window_for_dispatch_scope(
+            scope,
+            runtime_ptr,
+            crate::native_bridge::OwnerDispatchScope::Top,
+        );
     }
     if let Some(popup_id) = runtime.lightweight_popup_id_for_document_handle(document_handle) {
         return runtime.lightweight_popup_window(scope, popup_id);
@@ -2146,10 +2242,9 @@ fn same_document_fragment_target(current: &url::Url, target: &url::Url) -> bool 
 
 pub(crate) fn scroll_to_url_fragment_or_top(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     target_url: &str,
 ) -> Result<(), moli_layout::LayoutError> {
-    let runtime = unsafe { &*runtime_ptr };
     let Ok(target_url) = url::Url::parse(target_url) else {
         return Ok(());
     };
@@ -2157,16 +2252,15 @@ pub(crate) fn scroll_to_url_fragment_or_top(
         crate::window_host::scroll_window_to(scope, runtime_ptr, 0.0, 0.0);
         return Ok(());
     }
-    if !scroll_to_document_fragment_target(scope, runtime_ptr, runtime, &target_url)? {
+    if !scroll_to_document_fragment_target(scope, runtime_ptr, &target_url)? {
         crate::window_host::scroll_window_to(scope, runtime_ptr, 0.0, 0.0);
     }
     Ok(())
 }
 
-fn scroll_to_document_fragment_target(
+pub(crate) fn scroll_to_document_fragment_target(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
-    runtime: &JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     target_url: &url::Url,
 ) -> Result<bool, moli_layout::LayoutError> {
     let Some(fragment) = target_url.fragment() else {
@@ -2175,14 +2269,32 @@ fn scroll_to_document_fragment_target(
     let fragment = percent_encoding::percent_decode_str(fragment)
         .decode_utf8_lossy()
         .into_owned();
-    let Some(target) = document_tree_fragment_target(runtime, &fragment) else {
+    let Some(target) = document_tree_fragment_target(unsafe { &*runtime_ptr }, &fragment) else {
         return Ok(false);
     };
+    reveal_details_ancestors_for_fragment_target(scope, runtime_ptr, target);
     let _ = scroll_node_into_view_at_start(scope, runtime_ptr, target)?;
     Ok(true)
 }
 
-fn document_tree_fragment_target(runtime: &JsContextHost, fragment: &str) -> Option<DomHandle> {
+fn reveal_details_ancestors_for_fragment_target(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    target: DomHandle,
+) {
+    let ancestors = closed_details_ancestors_to_reveal(unsafe { &*runtime_ptr }, target);
+    for details in ancestors {
+        let runtime = unsafe { &*runtime_ptr };
+        if !runtime.dom_host().is_connected(details)
+            || element_has_attribute(runtime, details, "open")
+        {
+            return;
+        }
+        set_reflected_boolean_attribute(scope, runtime_ptr, details, "open", true);
+    }
+}
+
+fn document_tree_fragment_target(runtime: &PageScriptHost, fragment: &str) -> Option<DomHandle> {
     let mut stack = Vec::new();
     let mut current = Some(runtime.dom_host().document_handle());
     while let Some(handle) = current {
@@ -2215,11 +2327,45 @@ fn element_matches_fragment_target(element: &Element, fragment: &str) -> bool {
                 .is_some_and(|name| name == fragment))
 }
 
-pub(crate) fn perform_drop_default_action(
-    scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+/// Editable controls and file inputs can accept compatible native drag data
+/// without an author canceling dragover. Inspect only store metadata here:
+/// JavaScript still sees a protected store until the actual drop event.
+pub(crate) fn accepts_drop_default_action<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
     handle: DomHandle,
-    data_transfer: v8::Local<'_, v8::Object>,
+    data_transfer: v8::Local<'s, v8::Object>,
+) -> bool {
+    let runtime = unsafe { &*runtime_ptr };
+    if !runtime.dom_host().is_connected(handle) || is_disabled_form_control(runtime, handle) {
+        return false;
+    }
+    let Some(element) = runtime.dom_host().node(handle).and_then(Node::as_element) else {
+        return false;
+    };
+    if element.is_html_input() && element.input_type() == InputType::File {
+        let count = crate::context_bootstrap::native_data_transfer_file_count(scope, data_transfer);
+        return count > 0 && (element.has_attribute("multiple") || count == 1);
+    }
+    let has_text =
+        crate::context_bootstrap::native_data_transfer_has_type(scope, data_transfer, "text/plain");
+    if element.is_html_input() || element.is_html_textarea() {
+        return is_text_drop_target(element) && has_text;
+    }
+    contenteditable_editing_host(runtime, handle).is_some()
+        && (has_text
+            || crate::context_bootstrap::native_data_transfer_has_type(
+                scope,
+                data_transfer,
+                "text/html",
+            ))
+}
+
+pub(crate) fn perform_drop_default_action<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    data_transfer: v8::Local<'s, v8::Object>,
 ) -> bool {
     let (is_file_input, allow_multiple, is_text_target, editing_host, focus_handle) = {
         let runtime = unsafe { &*runtime_ptr };
@@ -2281,7 +2427,7 @@ pub(crate) fn perform_drop_default_action(
 
 pub(in crate::native_bridge) fn navigate_form_target_browsing_context(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime_ptr: *mut JsContextHost,
+    runtime_ptr: *mut PageScriptHost,
     form_handle: DomHandle,
     target_name: Option<&str>,
     resolved_url: &str,
@@ -2311,27 +2457,44 @@ pub(in crate::native_bridge) fn navigate_form_target_browsing_context(
             && !has_noopener
             && (has_opener || special_target != Some(SpecialBrowsingContextTarget::Blank))
     };
-    if target_name.is_none() || special_target == Some(SpecialBrowsingContextTarget::Current) {
+    let target_document = {
         let runtime = unsafe { &*runtime_ptr };
-        let document_handle = runtime
+        runtime
             .dom_host()
-            .node(form_handle)
-            .and_then(Node::owner_document);
-        if let Some(document_handle) = document_handle
-            && document_handle != runtime.document_handle()
-            && let Some(child_handle) =
+            .owner_document_handle(form_handle)
+            .and_then(|source| form_navigation_target_document(runtime, source, target_name))
+    };
+    if let Some(document_handle) = target_document {
+        let runtime = unsafe { &*runtime_ptr };
+        if document_handle != runtime.document_handle() {
+            let Some(child_handle) =
                 runtime.child_browsing_context_handle_by_document_handle(scope, document_handle)
-        {
+            else {
+                return false;
+            };
             let runtime = unsafe { &mut *runtime_ptr };
-            return runtime.navigate_child_browsing_context_to_url(
-                scope,
-                child_handle,
-                resolved_url,
-            );
+            let navigated =
+                runtime.navigate_child_browsing_context_to_url(scope, child_handle, resolved_url);
+            if navigated {
+                crate::context_bootstrap::web_mcp::bind_child_navigation(
+                    runtime,
+                    form_handle,
+                    child_handle,
+                );
+            }
+            return navigated;
         }
+        let Some(window) = browsing_context_window_for_dispatch_scope(
+            scope,
+            runtime_ptr,
+            crate::native_bridge::OwnerDispatchScope::Top,
+        ) else {
+            return false;
+        };
         let source_element = node_wrapper_from_handle(scope, form_handle);
         if !crate::context_bootstrap::dispatch_top_level_navigation_event_with_source_element(
             scope,
+            window,
             resolved_url,
             "replace",
             source_element,
@@ -2345,6 +2508,10 @@ pub(in crate::native_bridge) fn navigate_form_target_browsing_context(
             return false;
         };
         unsafe { &mut *runtime_ptr }.record_pending_location_navigation(url, None);
+        crate::context_bootstrap::web_mcp::bind_root_navigation(
+            unsafe { &mut *runtime_ptr },
+            form_handle,
+        );
         return true;
     }
     navigate_target_browsing_context(
@@ -2412,7 +2579,7 @@ mod hyperlink_popup_disposition_tests {
                 SHIFT,
                 Some(CurrentInputEvent::mouse("mouseup", 0, SHIFT)),
             ),
-            HyperlinkNavigationPolicy::Auxiliary(RendererPopupDisposition::Foreground)
+            HyperlinkNavigationPolicy::Auxiliary(RendererPopupDisposition::NewWindow)
         );
         assert_eq!(
             hyperlink_navigation_policy(

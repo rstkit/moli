@@ -1,3 +1,5 @@
+use crate::content_security_policy::ContentSecurityPolicy;
+
 use moli_fetch::{FetchCancelHandle, Request, RequestCredentialsMode, ScriptFetchRequestMetadata};
 use moli_shared_worker::{
     SharedWorkerClientOwnerId, SharedWorkerCredentialsMode, SharedWorkerDescriptor,
@@ -37,8 +39,8 @@ pub(super) struct SharedWorkerLoadedScript {
     pub(super) source: String,
     pub(super) response_referrer_policy: Option<String>,
     pub(super) response_policy_context: Option<SubresourcePolicyContext>,
-    pub(super) response_content_security_policies: Vec<String>,
-    pub(super) response_content_security_report_only_policies: Vec<String>,
+    pub(super) response_content_security_policies: Vec<ContentSecurityPolicy>,
+    pub(super) response_content_security_report_only_policies: Vec<ContentSecurityPolicy>,
     pub(super) response_content_security_reporting_endpoints:
         ContentSecurityPolicyReportingEndpoints,
 }
@@ -85,7 +87,7 @@ pub(crate) struct SharedWorkerLaunchContext {
 pub(crate) struct SharedWorkerExecutionPolicy {
     pub(super) script_kind: WorkerScriptKind,
     pub(super) module_static_import_initiator_url: Url,
-    pub(super) module_static_import_content_security_policies: Vec<String>,
+    pub(super) module_static_import_content_security_policies: Vec<ContentSecurityPolicy>,
     pub(super) network_policy: WorkerNetworkPolicy,
     pub(super) policy_context: SubresourcePolicyContext,
     pub(super) worker_context_runtime: RendererWorkerContextRuntime,
@@ -102,7 +104,7 @@ pub(crate) struct SharedWorkerScriptRequestPolicy {
     pub(super) same_site_cookies: SharedWorkerSameSiteCookies,
     pub(super) document_referrer_policy: Option<String>,
     pub(super) network_partition_key: Option<String>,
-    pub(super) document_content_security_policies: Vec<String>,
+    pub(super) document_content_security_policies: Vec<ContentSecurityPolicy>,
 }
 
 impl SharedWorkerLaunchParams {
@@ -152,7 +154,8 @@ impl SharedWorkerLaunchParams {
             .launch_context
             .execution_policy
             .network_policy
-            .secure_context;
+            .secure_context
+            .resolve(&script_url);
         let storage_key = self.key.storage_key().serialized_storage_key();
         let client_id = if matches!(script_url.scheme(), "http" | "https") {
             Some(
@@ -217,7 +220,7 @@ impl SharedWorkerExecutionPolicy {
     pub(crate) fn new(
         script_kind: WorkerScriptKind,
         module_static_import_initiator_url: Url,
-        module_static_import_content_security_policies: Vec<String>,
+        module_static_import_content_security_policies: Vec<ContentSecurityPolicy>,
         network_policy: WorkerNetworkPolicy,
         policy_context: SubresourcePolicyContext,
         worker_context_runtime: RendererWorkerContextRuntime,
@@ -264,7 +267,7 @@ impl SharedWorkerScriptRequestPolicy {
         same_site_cookies: SharedWorkerSameSiteCookies,
         document_referrer_policy: Option<String>,
         network_partition_key: Option<String>,
-        document_content_security_policies: Vec<String>,
+        document_content_security_policies: Vec<ContentSecurityPolicy>,
     ) -> Self {
         Self {
             credentials_mode: shared_worker_script_credentials_mode(descriptor),
@@ -330,7 +333,7 @@ impl SharedWorkerLoadedScript {
 
     pub(super) fn with_response_content_security_policies(
         mut self,
-        response_content_security_policies: Vec<String>,
+        response_content_security_policies: Vec<ContentSecurityPolicy>,
     ) -> Self {
         self.response_content_security_policies = response_content_security_policies;
         self
@@ -338,7 +341,7 @@ impl SharedWorkerLoadedScript {
 
     pub(super) fn with_response_content_security_report_only_policies(
         mut self,
-        response_content_security_report_only_policies: Vec<String>,
+        response_content_security_report_only_policies: Vec<ContentSecurityPolicy>,
     ) -> Self {
         self.response_content_security_report_only_policies =
             response_content_security_report_only_policies;
@@ -474,8 +477,7 @@ fn loaded_shared_worker_script_from_fetch_response(
         response.body_bytes(),
     )?;
     let response_referrer_policy = response_referrer_policy(&response.headers);
-    let response_policy_context =
-        worker_policy_context_from_response(&response.final_url, &response.headers);
+    let response_policy_context = worker_policy_context_from_response(&response.headers);
     let response_content_security_policies =
         crate::content_security_policy::content_security_policy_headers(&response.headers);
     let response_content_security_report_only_policies =
@@ -527,8 +529,7 @@ fn loaded_shared_worker_script_from_navigation_response(
         &body_bytes,
     )?;
     let response_referrer_policy = response_referrer_policy(&head.headers);
-    let response_policy_context =
-        worker_policy_context_from_response(&head.final_url, &head.headers);
+    let response_policy_context = worker_policy_context_from_response(&head.headers);
     let response_content_security_policies =
         crate::content_security_policy::content_security_policy_headers(&head.headers);
     let response_content_security_report_only_policies =
@@ -562,8 +563,11 @@ fn shared_worker_script_request(
         .map(|request| {
             request
                 .with_credentials_mode(request_policy.credentials_mode)
+                .with_request_mode(moli_fetch::RequestMode::SameOrigin)
+                .with_browser_request_metadata(moli_fetch::BrowserRequestMetadata::SharedWorker)
                 .with_page_network_policy()
                 .with_initiator_url(initiator_url)
+                .with_request_origin(moli_url::WebOrigin::from_url(initiator_url))
                 .with_network_partition_key(request_policy.network_partition_key.clone())
                 .with_script_fetch_metadata(ScriptFetchRequestMetadata {
                     document_referrer_policy: request_policy.document_referrer_policy.clone(),
@@ -601,23 +605,17 @@ pub(super) fn load_shared_worker_blob_script_source(
         })
 }
 
-fn response_referrer_policy(headers: &[(String, String)]) -> Option<String> {
+fn response_referrer_policy(headers: &[(String, Vec<u8>)]) -> Option<String> {
     response_referrer_policy_from_headers(headers)
 }
 
-fn worker_policy_context_from_response(
-    final_url: &Url,
-    headers: &[(String, String)],
-) -> SubresourcePolicyContext {
+fn worker_policy_context_from_response(headers: &[(String, Vec<u8>)]) -> SubresourcePolicyContext {
     SubresourcePolicyContext {
         cross_origin_embedder_policy:
             crate::cross_origin_isolation::cross_origin_embedder_policy_from_headers(headers),
         document_isolation_policy:
             crate::cross_origin_isolation::document_isolation_policy_from_headers(headers),
-        cross_origin_isolated:
-            crate::cross_origin_isolation::response_headers_enable_cross_origin_isolation(
-                final_url, headers,
-            ),
+        cross_origin_isolated: false,
     }
 }
 
@@ -694,6 +692,11 @@ mod tests {
             )
             .unwrap();
             assert_eq!(request.credentials_mode, expected);
+            assert_eq!(request.request_mode, moli_fetch::RequestMode::SameOrigin);
+            assert_eq!(
+                request.browser_request_metadata(),
+                Some(moli_fetch::BrowserRequestMetadata::SharedWorker)
+            );
             assert!(request.uses_page_network_policy());
         }
     }
@@ -718,7 +721,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(request.cookie_context.site_context.is_cross_site());
+        assert!(request.cookie_context.site_context().is_cross_site());
     }
 
     #[test]
@@ -741,19 +744,18 @@ mod tests {
 
     #[test]
     fn shared_worker_response_policy_context_uses_response_headers() {
-        let headers = vec![
+        let headers: Vec<(String, Vec<u8>)> = vec![
             (
                 "Cross-Origin-Embedder-Policy".to_owned(),
-                "require-corp".to_owned(),
+                b"require-corp".to_vec(),
             ),
             (
                 "Document-Isolation-Policy".to_owned(),
-                "isolate-and-credentialless".to_owned(),
+                b"isolate-and-credentialless".to_vec(),
             ),
         ];
 
-        let final_url = Url::parse("https://worker.test/shared.js").unwrap();
-        let policy_context = worker_policy_context_from_response(&final_url, &headers);
+        let policy_context = worker_policy_context_from_response(&headers);
 
         assert_eq!(
             policy_context.cross_origin_embedder_policy,
@@ -763,7 +765,7 @@ mod tests {
             policy_context.document_isolation_policy,
             crate::cross_origin_isolation::DocumentIsolationPolicy::IsolateAndCredentialless
         );
-        assert!(policy_context.cross_origin_isolated);
+        assert!(!policy_context.cross_origin_isolated);
     }
 
     #[test]
@@ -819,9 +821,9 @@ mod tests {
 
     #[test]
     fn shared_worker_response_referrer_policy_combines_header_instances() {
-        let headers = vec![
-            ("Referrer-Policy".to_owned(), "no-referrer".to_owned()),
-            ("referrer-policy".to_owned(), "future-policy".to_owned()),
+        let headers: Vec<(String, Vec<u8>)> = vec![
+            ("Referrer-Policy".to_owned(), b"no-referrer".to_vec()),
+            ("referrer-policy".to_owned(), b"future-policy".to_vec()),
         ];
 
         assert_eq!(
@@ -832,9 +834,9 @@ mod tests {
 
     #[test]
     fn shared_worker_response_referrer_policy_uses_last_valid_token() {
-        let headers = vec![(
+        let headers: Vec<(String, Vec<u8>)> = vec![(
             "Referrer-Policy".to_owned(),
-            "not-yet-standardized, no-referrer".to_owned(),
+            b"not-yet-standardized, no-referrer".to_vec(),
         )];
 
         assert_eq!(
@@ -845,11 +847,11 @@ mod tests {
 
     #[test]
     fn shared_worker_response_referrer_policy_ignores_invalid_later_header() {
-        let headers = vec![
-            ("Referrer-Policy".to_owned(), "no-referrer".to_owned()),
+        let headers: Vec<(String, Vec<u8>)> = vec![
+            ("Referrer-Policy".to_owned(), b"no-referrer".to_vec()),
             (
                 "Referrer-Policy".to_owned(),
-                "not-yet-standardized".to_owned(),
+                b"not-yet-standardized".to_vec(),
             ),
         ];
 

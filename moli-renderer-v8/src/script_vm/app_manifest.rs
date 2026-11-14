@@ -13,7 +13,7 @@ use crate::{
     },
     document_runtime::DocumentSubresourceCspKind,
     dom::native::{DomHost, DomMutationEffects},
-    native_bridge::JsContextHost,
+    native_bridge::PageScriptHost,
     network::{
         RendererPreparedNetworkResourceLoad,
         loads::{ResourceLoadDisposition, ResourceLoadKind},
@@ -62,7 +62,7 @@ impl ScriptVm {
         } else {
             RequestCredentialsMode::Omit
         };
-        let request_headers = host.extra_http_headers().to_vec();
+        let request_headers = host.extra_http_headers().clone();
         let cancel_handle = FetchCancelHandle::new();
         let Some(load) = resource_loader.register_load(
             ResourceLoadKind::Manifest,
@@ -74,6 +74,7 @@ impl ScriptVm {
         let request = Request::new("GET", manifest_url.as_str(), None, request_headers.clone())
             .expect("a resolved app manifest URL should remain valid")
             .with_initiator_url(&document_url)
+            .with_request_origin(resource_loader.fetch_context().request_origin())
             .with_request_mode(RequestMode::Cors)
             .with_credentials_mode(credentials_mode)
             .with_redirect_mode(RequestRedirectMode::Follow)
@@ -82,6 +83,7 @@ impl ScriptVm {
             .with_page_network_policy();
         RendererAppManifestLoadPreparation::Ready(Box::new(RendererPreparedAppManifestLoad::new(
             document_url,
+            resource_loader.fetch_context().request_origin(),
             manifest_url,
             link_identity,
             RendererPreparedNetworkResourceLoad::new(
@@ -161,7 +163,7 @@ impl ScriptVm {
     }
 }
 
-impl JsContextHost {
+impl PageScriptHost {
     pub(crate) fn note_app_manifest_link_mutation(
         &mut self,
         dom_host: &DomHost,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::SubresourceInterceptionClasses;
 use crate::{
     PendingSubresourceContinueOutcome, RendererPageCommand, RendererPageReply,
     RendererSetDocumentContentResult, types::PendingSubresourceContinueEvent,
@@ -47,8 +48,9 @@ Promise.resolve().then(() => __passiveTimezoneCheckpoint += 1);
         )
         .expect("timezone checkpoint witness should queue a reaction");
 
-    page_vm
-        .set_timezone_override(Some("UTC"))
+    let environment = moli_v8_platform::ProcessEnvironmentOwner::default();
+    environment
+        .set_timezone(Some("UTC"))
         .expect("timezone surface should update without executing Page work");
 
     assert_eq!(
@@ -172,12 +174,11 @@ new MutationObserver(records => {
             .expect("test Page should expose its root frame")
             .to_owned();
 
-        let reply = page_vm
-            .dispatch_renderer_page_command_async(RendererPageCommand::SetDocumentContent {
+        let reply =
+            page_vm.dispatch_renderer_page_command(RendererPageCommand::SetDocumentContent {
                 frame_id,
                 html: "<main>after</main>".to_owned(),
-            })
-            .await?;
+            })?;
         assert!(matches!(
             reply,
             RendererPageReply::SetDocumentContentResult(RendererSetDocumentContentResult::Updated)
@@ -201,9 +202,9 @@ new MutationObserver(records => {
 async fn fetch_interception_command_completes_window_reactions_without_runtime_drain() {
     run_page_vm_async_test(async move {
         let mut page_vm = test_page_vm();
-        page_vm
-            .vm_mut()
-            .set_fetch_subresource_interception(true, Some(SubresourceResourceType::Fetch));
+        page_vm.vm_mut().set_fetch_subresource_interception(
+            SubresourceInterceptionClasses::for_resource_type(SubresourceResourceType::Fetch),
+        );
         page_vm.vm_mut().eval(
             r#"
 globalThis.__fetchCommandState = "pending";
@@ -232,14 +233,12 @@ Promise.resolve().then(() => __fetchCommandCheckpoint += 1);
             )?;
         page_vm.vm_mut().enqueue_test_pending_runtime_source_load();
 
-        let reply = page_vm
-            .dispatch_renderer_page_command_async(
-                RendererPageCommand::FailPendingSubresourceFetch {
-                    internal_id: pending[0].internal_id,
-                    error_text: "command checkpoint witness".to_owned(),
-                },
-            )
-            .await?;
+        let reply = page_vm.dispatch_renderer_page_command(
+            RendererPageCommand::FailPendingSubresourceFetch {
+                internal_id: pending[0].internal_id,
+                error_text: "command checkpoint witness".to_owned(),
+            },
+        )?;
         assert!(matches!(reply, RendererPageReply::Unit));
         assert_eq!(
             page_vm
@@ -270,9 +269,9 @@ Promise.resolve().then(() => __fetchCommandCheckpoint += 1);
 async fn offline_fetch_continue_publishes_completed_after_window_command_checkpoint() {
     run_page_vm_async_test(async move {
         let mut page_vm = test_page_vm();
-        page_vm
-            .vm_mut()
-            .set_fetch_subresource_interception(true, Some(SubresourceResourceType::Fetch));
+        page_vm.vm_mut().set_fetch_subresource_interception(
+            SubresourceInterceptionClasses::for_resource_type(SubresourceResourceType::Fetch),
+        );
         page_vm.vm_mut().eval(
             r#"
 globalThis.__offlineContinueState = "pending";
@@ -290,9 +289,8 @@ fetch("https://offline-command-checkpoint.test/resource").then(
             "the fixture should pause one Window Fetch"
         );
 
-        let reply = page_vm
-            .dispatch_renderer_page_command_async(RendererPageCommand::SetNetworkOffline(true))
-            .await?;
+        let reply =
+            page_vm.dispatch_renderer_page_command(RendererPageCommand::SetNetworkOffline(true))?;
         assert!(matches!(reply, RendererPageReply::Unit));
         page_vm
             .vm_mut()
@@ -305,19 +303,17 @@ Promise.resolve().then(() => __offlineContinueCheckpoint += 1);
             )?;
         page_vm.vm_mut().enqueue_test_pending_runtime_source_load();
 
-        let reply = page_vm
-            .dispatch_renderer_page_command_async(
-                RendererPageCommand::ContinuePendingSubresourceFetch {
-                    internal_id: pending[0].internal_id,
-                    url: None,
-                    method: None,
-                    body: None,
-                    headers: None,
-                    intercept_response: false,
-                    handle_auth_requests: false,
-                },
-            )
-            .await?;
+        let reply = page_vm.dispatch_renderer_page_command(
+            RendererPageCommand::ContinuePendingSubresourceFetch {
+                internal_id: pending[0].internal_id,
+                url: None,
+                method: None,
+                body: None,
+                headers: None,
+                intercept_response: false,
+                handle_auth_requests: false,
+            },
+        )?;
         assert!(matches!(
             reply,
             RendererPageReply::PendingSubresourceContinueOutcome(
@@ -376,15 +372,12 @@ Promise.resolve().then(() => __rejectedFetchCommandCheckpoint += 1);
 "#,
             )?;
 
-        let error = match page_vm
-            .dispatch_renderer_page_command_async(
-                RendererPageCommand::FailPendingSubresourceFetch {
-                    internal_id: u64::MAX,
-                    error_text: "missing request".to_owned(),
-                },
-            )
-            .await
-        {
+        let error = match page_vm.dispatch_renderer_page_command(
+            RendererPageCommand::FailPendingSubresourceFetch {
+                internal_id: u64::MAX,
+                error_text: "missing request".to_owned(),
+            },
+        ) {
             Ok(_) => panic!("an unknown interception request should be rejected"),
             Err(error) => error,
         };

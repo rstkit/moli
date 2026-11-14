@@ -1,44 +1,69 @@
-use crate::{document_runtime::DomHandle, native_bridge::JsContextHost, util::v8str};
+use crate::{document_runtime::DomHandle, native_bridge::PageScriptHost, scroll_options};
 
 use super::super::super::{
     document,
     node::{node_runtime_and_handle_from_object, node_runtime_and_handle_from_object_or_detached},
+    set_wrapped_handle_or_null_for_receiver,
 };
 use super::super::styles::raw_inline_style_property_value;
 use super::super::{queue_revealed_lazy_image_loads, queue_revealed_lazy_media_loads};
 use super::client_rect::ClientRect;
 use super::mock::compute_mock_client_rect;
-use super::provider::observable_element_metrics;
+use super::provider::read_element_metrics;
 use super::scroll::{
-    apply_observable_window_scroll, node_scroll_position, queue_scroll_observable_effects,
-    set_node_scroll_position,
+    apply_observable_window_scroll, node_scroll_position, set_node_scroll_position,
 };
-use super::scroll_into_view::{
-    ScrollIntoViewAlignment, scroll_node_into_view, scroll_node_into_view_if_needed,
-};
+use super::scroll_into_view::{scroll_node_into_view, scroll_node_into_view_if_needed};
 
 fn node_scroll_position_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
     horizontal: bool,
-) -> Result<f64, moli_layout::LayoutError> {
-    if let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, object) {
-        let metrics = observable_element_metrics(
-            unsafe { &*runtime_ptr },
-            handle,
-            moli_layout::LayoutFlushReason::SynchronousGeometry,
-        )?;
-        return Ok(metrics
-            .map(|metrics| {
-                if horizontal {
-                    f64::from(metrics.scroll_offset.x)
-                } else {
-                    f64::from(metrics.scroll_offset.y)
-                }
-            })
-            .unwrap_or(0.0));
+) -> f64 {
+    let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, object) else {
+        return 0.0;
+    };
+    let runtime = unsafe { &*runtime_ptr };
+    if !runtime.dom_host().is_connected(handle) {
+        return 0.0;
     }
-    Ok(0.0)
+    // Scroll properties expose live state immediately. Layout geometry and
+    // hit-testing keep the offset captured by the last visual publication.
+    let (left, top) = node_scroll_position(runtime, handle);
+    if horizontal { left } else { top }
+}
+
+fn set_observable_node_scroll_position(
+    scope: &mut v8::PinScope<'_, '_>,
+    runtime_ptr: *mut PageScriptHost,
+    handle: DomHandle,
+    left: f64,
+    top: f64,
+) {
+    let runtime = unsafe { &*runtime_ptr };
+    let document_root = runtime
+        .dom_host()
+        .owner_document_handle(handle)
+        .and_then(|document| {
+            runtime
+                .dom_host()
+                .dom()
+                .document_element_handle_for_document(document)
+        });
+    if document_root == Some(handle) {
+        let (current_left, current_top) = node_scroll_position(runtime, handle);
+        apply_observable_window_scroll(
+            scope,
+            runtime_ptr,
+            handle,
+            left,
+            top,
+            current_left,
+            current_top,
+        );
+    } else {
+        set_node_scroll_position(scope, runtime_ptr, handle, left, top, true);
+    }
 }
 
 fn node_scroll_position_setter_for_object<'s>(
@@ -60,152 +85,38 @@ fn node_scroll_position_setter_for_object<'s>(
     if receiver_is_detached {
         return Ok(());
     }
-    let runtime = unsafe { &mut *runtime_ptr };
+    let runtime = unsafe { &*runtime_ptr };
     let (minimum, maximum) = if runtime.layout_policy().uses_real_layout() {
-        observable_element_metrics(
-            runtime,
-            handle,
-            moli_layout::LayoutFlushReason::SynchronousGeometry,
-        )?
-        .map(|metrics| {
-            if horizontal {
-                (
-                    f64::from(metrics.minimum_scroll_offset.x),
-                    f64::from(metrics.maximum_scroll_offset.x),
-                )
-            } else {
-                (
-                    f64::from(metrics.minimum_scroll_offset.y),
-                    f64::from(metrics.maximum_scroll_offset.y),
-                )
-            }
-        })
-        .unwrap_or((0.0, 0.0))
+        read_element_metrics(runtime, handle)?
+            .map(|metrics| {
+                if horizontal {
+                    (
+                        f64::from(metrics.minimum_scroll_offset.x),
+                        f64::from(metrics.maximum_scroll_offset.x),
+                    )
+                } else {
+                    (
+                        f64::from(metrics.minimum_scroll_offset.y),
+                        f64::from(metrics.maximum_scroll_offset.y),
+                    )
+                }
+            })
+            .unwrap_or((0.0, 0.0))
     } else {
         // Mock intentionally preserves the old synthetic geometry behavior:
         // non-negative scroll values are stored even without real overflow.
         (0.0, f64::MAX)
     };
     let value = value.clamp(minimum, maximum);
-    let is_scrolling_element = runtime.dom_host().document_element_handle() == Some(handle);
-    let document = runtime.dom_host().owner_document_handle(handle);
-    let Some(element) = runtime
-        .dom_host_mut()
-        .node_mut(handle)
-        .and_then(|node| node.data_mut().as_element_mut())
-    else {
-        return Ok(());
-    };
-    let changed = if horizontal {
-        element.set_scroll_left(value)
-    } else {
-        element.set_scroll_top(value)
-    };
-    if changed {
-        if is_scrolling_element {
-            let current = crate::window_host::current_window_scroll_position(scope);
-            crate::window_host::scroll_window_to(
-                scope,
-                runtime_ptr,
-                if horizontal { value } else { current.0 },
-                if horizontal { current.1 } else { value },
-            );
-        } else {
-            queue_scroll_observable_effects(scope, runtime_ptr, document, false);
-        }
-    }
+    let (current_left, current_top) = node_scroll_position(runtime, handle);
+    set_observable_node_scroll_position(
+        scope,
+        runtime_ptr,
+        handle,
+        if horizontal { value } else { current_left },
+        if horizontal { current_top } else { value },
+    );
     Ok(())
-}
-
-fn parse_scroll_coordinates(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: &v8::FunctionCallbackArguments<'_>,
-    fallback_x: f64,
-    fallback_y: f64,
-) -> (f64, f64) {
-    if args.length() > 0
-        && args.get(0).is_object()
-        && !args.get(0).is_function()
-        && let Some(options) = args.get(0).to_object(scope)
-    {
-        let x = options
-            .get(scope, v8str(scope, "left").into())
-            .or_else(|| options.get(scope, v8str(scope, "x").into()))
-            .and_then(|value| value.number_value(scope).filter(|value| !value.is_nan()))
-            .unwrap_or(fallback_x);
-        let y = options
-            .get(scope, v8str(scope, "top").into())
-            .or_else(|| options.get(scope, v8str(scope, "y").into()))
-            .and_then(|value| value.number_value(scope).filter(|value| !value.is_nan()))
-            .unwrap_or(fallback_y);
-        return (x, y);
-    }
-
-    let x = args
-        .get(0)
-        .number_value(scope)
-        .filter(|value| !value.is_nan())
-        .unwrap_or(fallback_x);
-    let y = args
-        .get(1)
-        .number_value(scope)
-        .filter(|value| !value.is_nan())
-        .unwrap_or(fallback_y);
-    (x, y)
-}
-
-fn scroll_alignment_option(
-    scope: &mut v8::PinScope<'_, '_>,
-    options: v8::Local<'_, v8::Object>,
-    name: &'static str,
-    fallback: ScrollIntoViewAlignment,
-) -> ScrollIntoViewAlignment {
-    let Some(value) = options.get(scope, v8str(scope, name).into()) else {
-        return fallback;
-    };
-    match value.to_rust_string_lossy(scope).as_str() {
-        "start" => ScrollIntoViewAlignment::Start,
-        "center" => ScrollIntoViewAlignment::Center,
-        "end" => ScrollIntoViewAlignment::End,
-        "nearest" => ScrollIntoViewAlignment::Nearest,
-        _ => fallback,
-    }
-}
-
-fn element_scroll_into_view_alignments(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: &v8::FunctionCallbackArguments<'_>,
-) -> (ScrollIntoViewAlignment, ScrollIntoViewAlignment) {
-    if args.length() == 0 {
-        return (
-            ScrollIntoViewAlignment::Nearest,
-            ScrollIntoViewAlignment::Start,
-        );
-    }
-    let value = args.get(0);
-    if value.is_boolean() {
-        return if value.boolean_value(scope) {
-            (
-                ScrollIntoViewAlignment::Nearest,
-                ScrollIntoViewAlignment::Start,
-            )
-        } else {
-            (
-                ScrollIntoViewAlignment::Nearest,
-                ScrollIntoViewAlignment::End,
-            )
-        };
-    }
-    let Some(options) = value.to_object(scope) else {
-        return (
-            ScrollIntoViewAlignment::Nearest,
-            ScrollIntoViewAlignment::Start,
-        );
-    };
-    (
-        scroll_alignment_option(scope, options, "inline", ScrollIntoViewAlignment::Nearest),
-        scroll_alignment_option(scope, options, "block", ScrollIntoViewAlignment::Start),
-    )
 }
 
 fn scroll_node_to<'s>(
@@ -213,6 +124,14 @@ fn scroll_node_to<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     relative: bool,
 ) -> Result<(), moli_layout::LayoutError> {
+    if node_runtime_and_handle_from_object_or_detached(scope, args.this()).is_err() {
+        return Ok(());
+    }
+    let Some(coordinates) = scroll_options::coordinates(scope, &args) else {
+        return Ok(());
+    };
+    // Conversion may detach or replace the receiver's document. Resolve its
+    // native owner again before reading state or requesting layout.
     let Ok((runtime_ptr, handle)) =
         node_runtime_and_handle_from_object_or_detached(scope, args.this())
     else {
@@ -224,17 +143,8 @@ fn scroll_node_to<'s>(
         return Ok(());
     }
     let (current_left, current_top) = node_scroll_position(unsafe { &*runtime_ptr }, handle);
-    let (left, top) = if relative {
-        let (delta_left, delta_top) = parse_scroll_coordinates(scope, &args, 0.0, 0.0);
-        (current_left + delta_left, current_top + delta_top)
-    } else {
-        parse_scroll_coordinates(scope, &args, current_left, current_top)
-    };
-    let metrics = observable_element_metrics(
-        unsafe { &*runtime_ptr },
-        handle,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    )?;
+    let (left, top) = coordinates.resolve(current_left, current_top, relative);
+    let metrics = read_element_metrics(unsafe { &*runtime_ptr }, handle)?;
     let Some(metrics) = metrics else {
         return Ok(());
     };
@@ -246,23 +156,7 @@ fn scroll_node_to<'s>(
         f64::from(metrics.minimum_scroll_offset.y),
         f64::from(metrics.maximum_scroll_offset.y),
     );
-    if unsafe { &*runtime_ptr }
-        .dom_host()
-        .document_element_handle()
-        == Some(handle)
-    {
-        let _ = apply_observable_window_scroll(
-            scope,
-            runtime_ptr,
-            handle,
-            left,
-            top,
-            current_left,
-            current_top,
-        );
-    } else {
-        set_node_scroll_position(scope, runtime_ptr, handle, left, top, true);
-    }
+    set_observable_node_scroll_position(scope, runtime_ptr, handle, left, top);
     Ok(())
 }
 
@@ -272,11 +166,7 @@ fn node_box_metric_from_object<'s>(
     metric: &str,
 ) -> Result<i32, moli_layout::LayoutError> {
     if let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, object) {
-        let metrics = observable_element_metrics(
-            unsafe { &*runtime_ptr },
-            handle,
-            moli_layout::LayoutFlushReason::SynchronousGeometry,
-        )?;
+        let metrics = read_element_metrics(unsafe { &*runtime_ptr }, handle)?;
         return Ok(metrics
             .as_ref()
             .map(|metrics| layout_box_metric(metrics, metric))
@@ -351,7 +241,7 @@ fn set_box_metric_return_value<'s>(
 
 fn detached_child_document_box_metric(
     scope: &mut v8::PinScope<'_, '_>,
-    runtime: &mut JsContextHost,
+    runtime: &mut PageScriptHost,
     handle: DomHandle,
     metric: &str,
 ) -> Option<i32> {
@@ -372,7 +262,7 @@ fn detached_child_document_box_metric(
     })
 }
 
-fn detached_metric_element_has_zero_mock_box(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn detached_metric_element_has_zero_mock_box(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     matches!(
         raw_inline_style_property_value(runtime, handle, "display")
             .unwrap_or_default()
@@ -381,7 +271,7 @@ fn detached_metric_element_has_zero_mock_box(runtime: &JsContextHost, handle: Do
     ) || light_child_suppressed_by_shadow_host(runtime, handle)
 }
 
-fn light_child_suppressed_by_shadow_host(runtime: &JsContextHost, handle: DomHandle) -> bool {
+fn light_child_suppressed_by_shadow_host(runtime: &PageScriptHost, handle: DomHandle) -> bool {
     runtime
         .dom_host()
         .parent_node(handle)
@@ -448,17 +338,8 @@ pub(in crate::native_bridge) fn node_scroll_top_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    match node_scroll_position_value(scope, args.this(), false) {
-        Ok(value) => rv.set(v8::Number::new(scope, value).into()),
-        Err(error) => {
-            let message = format!("Layout failed while reading scrollTop: {error}");
-            if let Some(message) = crate::util::v8_string(scope, &message) {
-                let exception = v8::Exception::error(scope, message);
-                scope.throw_exception(exception);
-            }
-            rv.set(v8::Number::new(scope, 0.0).into());
-        }
-    }
+    let value = node_scroll_position_value(scope, args.this(), false);
+    rv.set(v8::Number::new(scope, value).into());
 }
 
 pub(in crate::native_bridge) fn node_scroll_top_setter_function<'s>(
@@ -483,17 +364,8 @@ pub(in crate::native_bridge) fn node_scroll_left_getter_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    match node_scroll_position_value(scope, args.this(), true) {
-        Ok(value) => rv.set(v8::Number::new(scope, value).into()),
-        Err(error) => {
-            let message = format!("Layout failed while reading scrollLeft: {error}");
-            if let Some(message) = crate::util::v8_string(scope, &message) {
-                let exception = v8::Exception::error(scope, message);
-                scope.throw_exception(exception);
-            }
-            rv.set(v8::Number::new(scope, 0.0).into());
-        }
-    }
+    let value = node_scroll_position_value(scope, args.this(), true);
+    rv.set(v8::Number::new(scope, value).into());
 }
 
 pub(in crate::native_bridge) fn node_scroll_left_setter_function<'s>(
@@ -561,11 +433,7 @@ pub(in crate::native_bridge) fn node_offset_parent_getter_function<'s>(
         return;
     };
     let runtime = unsafe { &mut *runtime_ptr };
-    let metrics = match observable_element_metrics(
-        runtime,
-        handle,
-        moli_layout::LayoutFlushReason::SynchronousGeometry,
-    ) {
+    let metrics = match read_element_metrics(runtime, handle) {
         Ok(metrics) => metrics,
         Err(error) => {
             let message = format!("Layout failed while reading offsetParent: {error}");
@@ -581,13 +449,7 @@ pub(in crate::native_bridge) fn node_offset_parent_getter_function<'s>(
         rv.set_null();
         return;
     };
-    match runtime
-        .native_bridge_mut()
-        .wrap_handle(scope, runtime_ptr, parent)
-    {
-        Some(parent) => rv.set(parent.into()),
-        None => rv.set_null(),
-    }
+    set_wrapped_handle_or_null_for_receiver(scope, &mut rv, runtime_ptr, args.this(), Some(parent));
 }
 
 pub(in crate::native_bridge) fn node_offset_top_getter_function<'s>(
@@ -620,18 +482,22 @@ pub(in crate::native_bridge) fn node_scroll_into_view_if_needed_callback(
     rv.set_undefined();
 }
 
-pub(in crate::native_bridge) fn node_scroll_into_view_callback(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+pub(in crate::native_bridge) fn node_scroll_into_view_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    if let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.this()) {
-        let (horizontal, vertical) = element_scroll_into_view_alignments(scope, &args);
-        if let Err(error) =
+    if node_runtime_and_handle_from_object_or_detached(scope, args.this()).is_err() {
+        return;
+    }
+    let Some((horizontal, vertical)) = scroll_options::into_view_alignments(scope, &args) else {
+        return;
+    };
+    if let Ok((runtime_ptr, handle)) = node_runtime_and_handle_from_object(scope, args.this())
+        && let Err(error) =
             scroll_node_into_view(scope, runtime_ptr, handle, None, horizontal, vertical)
-        {
-            throw_scroll_layout_error(scope, "scrollIntoView", error);
-        }
+    {
+        throw_scroll_layout_error(scope, "scrollIntoView", error);
     }
     reveal_lazy_images_for_scroll(scope, args.this());
     rv.set_undefined();

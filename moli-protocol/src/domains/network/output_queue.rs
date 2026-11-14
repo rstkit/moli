@@ -922,7 +922,7 @@ impl TargetWebSocketHandshakePlanPayload {
         Self {
             index,
             url: record.url().clone(),
-            request_headers: record.request_headers().to_vec(),
+            request_headers: record.request_headers().to_byte_strings(),
             response,
         }
     }
@@ -1373,7 +1373,7 @@ pub(crate) struct TargetSubresourceRequestStartedOutput {
     method: String,
     request_headers: Vec<(String, String)>,
     request_body: Option<String>,
-    request_body_bytes: Option<Vec<u8>>,
+    request_body_bytes: Option<bytes::Bytes>,
     resource_type: SubresourceResourceType,
     request_initiator_type: SubresourceRequestInitiatorType,
     request_cookie_report: Option<StoredCookieQueryReport>,
@@ -1395,9 +1395,9 @@ impl TargetSubresourceRequestStartedOutput {
             document_url: request.document_url().clone(),
             url: request.url().clone(),
             method: request.method().to_owned(),
-            request_headers: request.request_headers().to_vec(),
+            request_headers: request.request_headers().to_byte_strings(),
             request_body: request.request_body().map(str::to_owned),
-            request_body_bytes: request.request_body_bytes().map(<[u8]>::to_vec),
+            request_body_bytes: request.request_body_bytes().cloned(),
             resource_type: request.resource_type(),
             request_initiator_type: request.request_initiator_type(),
             request_cookie_report: request.request_cookie_report().cloned(),
@@ -1444,8 +1444,8 @@ impl TargetSubresourceRequestStartedOutput {
         self.request_body.as_deref()
     }
 
-    pub(crate) fn request_body_bytes(&self) -> Option<&[u8]> {
-        self.request_body_bytes.as_deref()
+    pub(crate) fn request_body_bytes(&self) -> Option<&bytes::Bytes> {
+        self.request_body_bytes.as_ref()
     }
 
     pub(crate) fn resource_type(&self) -> SubresourceResourceType {
@@ -1513,11 +1513,11 @@ pub(crate) struct TargetSubresourceResponseStartedOutput {
     delivery_order_index: usize,
     index: usize,
     request: Arc<TargetSubresourceRequestStartedOutput>,
-    redirect_chain: Vec<TargetSubresourceRedirectOutput>,
+    redirect_chain: Vec<NavigationRedirect>,
     final_url: Url,
     status: u16,
     status_text: Option<String>,
-    response_headers: Vec<(String, String)>,
+    response_headers: Vec<(String, Vec<u8>)>,
     cookie_set_reports: Vec<StoredCookieSetReport>,
     from_cache: bool,
     network_request_headers: Option<Vec<(String, String)>>,
@@ -1535,11 +1535,7 @@ impl TargetSubresourceResponseStartedOutput {
             delivery_order_index,
             index,
             request,
-            redirect_chain: response
-                .redirect_chain()
-                .iter()
-                .map(TargetSubresourceRedirectOutput::from_page_redirect)
-                .collect(),
+            redirect_chain: response.redirect_chain().to_vec(),
             final_url: response.final_url().clone(),
             status: response.status(),
             status_text: response.status_text().map(str::to_owned),
@@ -1569,7 +1565,7 @@ impl TargetSubresourceResponseStartedOutput {
         &self.request
     }
 
-    pub(crate) fn redirect_chain(&self) -> &[TargetSubresourceRedirectOutput] {
+    pub(crate) fn redirect_chain(&self) -> &[NavigationRedirect] {
         &self.redirect_chain
     }
 
@@ -1585,7 +1581,7 @@ impl TargetSubresourceResponseStartedOutput {
         self.status_text.as_deref()
     }
 
-    pub(crate) fn response_headers(&self) -> &[(String, String)] {
+    pub(crate) fn response_headers(&self) -> &[(String, Vec<u8>)] {
         &self.response_headers
     }
 
@@ -1759,7 +1755,7 @@ pub(crate) struct TargetSubresourceMetadataOutput {
     method: String,
     request_headers: Vec<(String, String)>,
     request_body: Option<String>,
-    request_body_bytes: Option<Vec<u8>>,
+    request_body_bytes: Option<bytes::Bytes>,
     resource_type: SubresourceResourceType,
     request_initiator_type: SubresourceRequestInitiatorType,
     request_cookie_report: Option<StoredCookieQueryReport>,
@@ -1788,9 +1784,9 @@ impl TargetSubresourceMetadataOutput {
             document_url: record.document_url().clone(),
             url: record.url().clone(),
             method: record.method().to_owned(),
-            request_headers: record.request_headers().to_vec(),
+            request_headers: record.request_headers().to_byte_strings(),
             request_body: record.request_body().map(str::to_owned),
-            request_body_bytes: record.request_body_bytes().map(|body| body.to_vec()),
+            request_body_bytes: record.request_body_bytes().cloned(),
             resource_type: record.resource_type(),
             request_initiator_type: record.request_initiator_type(),
             request_cookie_report: record.request_cookie_report().cloned(),
@@ -1852,8 +1848,8 @@ impl TargetSubresourceMetadataOutput {
         self.request_body.as_deref()
     }
 
-    pub(crate) fn request_body_bytes(&self) -> Option<&[u8]> {
-        self.request_body_bytes.as_deref()
+    pub(crate) fn request_body_bytes(&self) -> Option<&bytes::Bytes> {
+        self.request_body_bytes.as_ref()
     }
 
     pub(crate) fn resource_type(&self) -> SubresourceResourceType {
@@ -2131,11 +2127,11 @@ impl TargetSubresourceNetworkDeliveryOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TargetSubresourceMetadataOutcome {
     Success {
-        redirect_chain: Vec<TargetSubresourceRedirectOutput>,
+        redirect_chain: Vec<NavigationRedirect>,
         final_url: Url,
         status: u16,
         status_text: Option<String>,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
         response_body_len: usize,
     },
     Failure {
@@ -2154,10 +2150,7 @@ impl TargetSubresourceMetadataOutcome {
                 response_headers,
                 response_body,
             } => Self::Success {
-                redirect_chain: redirect_chain
-                    .iter()
-                    .map(TargetSubresourceRedirectOutput::from_page_redirect)
-                    .collect(),
+                redirect_chain: redirect_chain.clone(),
                 final_url: final_url.clone(),
                 status: *status,
                 status_text: status_text.clone(),
@@ -2167,33 +2160,6 @@ impl TargetSubresourceMetadataOutcome {
             SubresourceNetworkOutcome::Failure { error_text } => Self::Failure {
                 error_text: error_text.clone(),
             },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TargetSubresourceRedirectOutput {
-    pub(crate) from_url: Url,
-    pub(crate) to_url: Url,
-    pub(crate) status: u16,
-    pub(crate) headers: Vec<(String, String)>,
-    pub(crate) request_cookie_report: Option<StoredCookieQueryReport>,
-    pub(crate) cookie_set_reports: Vec<StoredCookieSetReport>,
-    pub(crate) from_cache: bool,
-    pub(crate) negotiated_http_version: Option<NegotiatedHttpVersion>,
-}
-
-impl TargetSubresourceRedirectOutput {
-    fn from_page_redirect(redirect: &NavigationRedirect) -> Self {
-        Self {
-            from_url: redirect.from_url.clone(),
-            to_url: redirect.to_url.clone(),
-            status: redirect.status,
-            headers: redirect.headers.clone(),
-            request_cookie_report: redirect.request_cookie_report.clone(),
-            cookie_set_reports: redirect.cookie_set_reports.clone(),
-            from_cache: redirect.from_cache,
-            negotiated_http_version: redirect.negotiated_http_version,
         }
     }
 }
@@ -2349,7 +2315,7 @@ impl TargetWebSocketHandshakeDeliveryOutput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TargetWebSocketHandshakeResponseOutput {
     status: u16,
-    response_headers: Vec<(String, String)>,
+    response_headers: Vec<(String, Vec<u8>)>,
 }
 
 impl TargetWebSocketHandshakeResponseOutput {
@@ -2357,7 +2323,7 @@ impl TargetWebSocketHandshakeResponseOutput {
         self.status
     }
 
-    pub(crate) fn response_headers(&self) -> &[(String, String)] {
+    pub(crate) fn response_headers(&self) -> &[(String, Vec<u8>)] {
         &self.response_headers
     }
 }
@@ -3240,7 +3206,7 @@ mod tests {
             Url::parse("https://example.com/").expect("document URL should parse"),
             url.clone(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             resource_type,
             None,
@@ -3271,14 +3237,14 @@ mod tests {
             Url::parse("https://example.com/").expect("document URL should parse"),
             url.clone(),
             "GET".to_owned(),
-            vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())],
+            vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())].into(),
             None,
             SubresourceResourceType::WebSocket,
             None,
             Vec::new(),
             url,
             101,
-            vec![("Upgrade".to_owned(), "websocket".to_owned())],
+            vec![("Upgrade".to_owned(), b"websocket".to_vec())],
             String::new(),
             Vec::new(),
         )
@@ -3295,7 +3261,7 @@ mod tests {
             Url::parse("https://example.com/").expect("document URL should parse"),
             Url::parse(url).expect("test URL should parse"),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::WebSocket,
             error_text.to_owned(),
@@ -3310,7 +3276,7 @@ mod tests {
             Url::parse("https://example.com/").expect("document URL should parse"),
             url.clone(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             None,
@@ -3329,7 +3295,7 @@ mod tests {
             Url::parse("https://example.com/").expect("document URL should parse"),
             Url::parse(url).expect("test URL should parse"),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             "net::ERR_FAILED".to_owned(),
@@ -3394,7 +3360,7 @@ mod tests {
             document_url,
             request_url.clone(),
             "GET".to_owned(),
-            vec![("accept".to_owned(), "image/png".to_owned())],
+            vec![("accept".to_owned(), "image/png".to_owned())].into(),
             None,
             SubresourceResourceType::Image,
             SubresourceRequestInitiatorType::Parser,
@@ -3405,7 +3371,7 @@ mod tests {
             Vec::new(),
             request_url,
             200,
-            vec![("content-type".to_owned(), "image/png".to_owned())],
+            vec![("content-type".to_owned(), b"image/png".to_vec())],
             Vec::new(),
         )
         .with_from_cache(true);
@@ -3530,7 +3496,7 @@ mod tests {
             document_url,
             request_url.clone(),
             "PATCH".to_owned(),
-            vec![("x-test".to_owned(), "yes".to_owned())],
+            vec![("x-test".to_owned(), "yes".to_owned())].into(),
             Some("payload".to_owned()),
             SubresourceResourceType::Fetch,
             SubresourceRequestInitiatorType::Script,
@@ -3591,7 +3557,7 @@ mod tests {
                 document_url,
                 request_url.clone(),
                 "GET".to_owned(),
-                Vec::new(),
+                Vec::new().into(),
                 None,
                 SubresourceResourceType::Xhr,
                 SubresourceRequestInitiatorType::Script,
@@ -3641,7 +3607,7 @@ mod tests {
             document_url,
             request_url.clone(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             SubresourceRequestInitiatorType::Script,
@@ -3700,7 +3666,7 @@ mod tests {
             document_url.clone(),
             start_url.clone(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             SubresourceRequestInitiatorType::Script,
@@ -3711,17 +3677,22 @@ mod tests {
             document_url,
             start_url.clone(),
             "GET".to_owned(),
-            Vec::new(),
+            Vec::new().into(),
             None,
             SubresourceResourceType::Fetch,
             Some(StoredCookieQueryReport::default()),
             vec![NavigationRedirect {
+                source: moli_fetch::RedirectSource::Network,
                 from_url: start_url.clone(),
                 to_url: final_url.clone(),
                 status: 307,
-                headers: vec![("location".to_owned(), final_url.to_string())],
+                headers: vec![(
+                    "location".to_owned(),
+                    final_url.as_str().as_bytes().to_vec(),
+                )],
                 network_extra_info_available: false,
                 request_extra_info: None,
+                dispatched_request: None,
                 response_extra_info: None,
                 redirect_has_extra_info: false,
                 request_cookie_report: None,
@@ -3826,7 +3797,7 @@ mod tests {
         url: &str,
         request_headers: Vec<(String, String)>,
         status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
     ) -> TargetSubresourceMetadataOutput {
         expected_subresource_metadata_with_delivery_order(
             index,
@@ -3846,7 +3817,7 @@ mod tests {
         url: &str,
         request_headers: Vec<(String, String)>,
         status: u16,
-        response_headers: Vec<(String, String)>,
+        response_headers: Vec<(String, Vec<u8>)>,
     ) -> TargetSubresourceMetadataOutput {
         let url = Url::parse(url).expect("test URL should parse");
         TargetSubresourceMetadataOutput {
@@ -3920,7 +3891,7 @@ mod tests {
                     "wss://example.com/socket",
                     vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())],
                     101,
-                    vec![("Upgrade".to_owned(), "websocket".to_owned())],
+                    vec![("Upgrade".to_owned(), b"websocket".to_vec())],
                 ),
                 expected_subresource_metadata_with_delivery_order(
                     2,
@@ -3989,7 +3960,7 @@ mod tests {
                     "wss://example.com/socket",
                     vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())],
                     101,
-                    vec![("Upgrade".to_owned(), "websocket".to_owned())],
+                    vec![("Upgrade".to_owned(), b"websocket".to_vec())],
                 ),
                 expected_subresource_metadata_with_delivery_order(
                     2,
@@ -4185,7 +4156,7 @@ mod tests {
                     "wss://example.com/socket",
                     vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())],
                     101,
-                    vec![("Upgrade".to_owned(), "websocket".to_owned())],
+                    vec![("Upgrade".to_owned(), b"websocket".to_vec())],
                 ),
             ]
         );
@@ -4232,7 +4203,7 @@ mod tests {
                     "wss://example.com/socket",
                     vec![("Sec-WebSocket-Version".to_owned(), "13".to_owned())],
                     101,
-                    vec![("Upgrade".to_owned(), "websocket".to_owned())],
+                    vec![("Upgrade".to_owned(), b"websocket".to_vec())],
                 ),
             ],
             "syncing only new websocket events should not rescan records or duplicate handshake state"
@@ -4432,7 +4403,7 @@ mod tests {
         assert_eq!(response.status(), 101);
         assert_eq!(
             response.response_headers(),
-            &[("Upgrade".to_owned(), "websocket".to_owned())]
+            &[("Upgrade".to_owned(), b"websocket".to_vec())]
         );
     }
 
